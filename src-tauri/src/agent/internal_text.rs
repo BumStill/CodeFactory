@@ -78,6 +78,7 @@ pub(crate) async fn generate_bounded_text(
             cancel: None,
             max_output_tokens: Some(max_output_tokens),
             retry_response_body: crate::http_util::RetryResponseBody::Redact,
+            provider_attempt: None,
         };
         let options = RoundOptions {
             require_tool: false,

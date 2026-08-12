@@ -25,7 +25,7 @@ import {
   useUpdaterStore,
 } from "./updater";
 
-const TARGET_BUILD = "git-sha-17901";
+const TARGET_BUILD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 function idleSafety(overrides: Partial<UpdateSafetyStatus> = {}): UpdateSafetyStatus {
   return {
@@ -99,9 +99,8 @@ describe("updater safe restart gate", () => {
     expect(mocks.invoke).toHaveBeenCalledWith("reserve_update_install", {
       targetVersion: "1.79.1",
       targetBuild: TARGET_BUILD,
-      claimPermit: null,
     });
-    expect(mocks.download).toHaveBeenCalledOnce();
+    expect(mocks.download).not.toHaveBeenCalled();
     expect(mocks.install).not.toHaveBeenCalled();
     expect(mocks.relaunch).not.toHaveBeenCalled();
     expect(useUpdaterStore.getState().phase).toMatchObject({
@@ -111,7 +110,7 @@ describe("updater safe restart gate", () => {
     });
   });
 
-  it("automatically installs after the executing session reaches a safe point", async () => {
+  it("queues update recovery without treating a null frontend permit as install authority", async () => {
     const update = {
       available: true,
       version: "1.79.1",
@@ -121,25 +120,26 @@ describe("updater safe restart gate", () => {
       install: mocks.install,
     };
     mocks.check.mockResolvedValue(update);
-    mocks.invoke
-      .mockResolvedValueOnce(idleSafety({
-        safe_to_restart: false,
-        restart_reserved: false,
-        active_chat_turns: 1,
-      }))
-      .mockResolvedValueOnce(idleSafety());
+    mocks.invoke.mockResolvedValue(idleSafety({
+      safe_to_restart: false,
+      restart_reserved: false,
+      active_chat_turns: 1,
+      update_objective_id: "objective-update-queued",
+      update_install_state: "queued",
+    }));
 
     await useUpdaterStore.getState().checkNow();
     await useUpdaterStore.getState().install();
     expect(useUpdaterStore.getState().phase.kind).toBe("waiting_for_safe_restart");
 
-    await vi.advanceTimersByTimeAsync(5_000);
-
-    expect(mocks.download).toHaveBeenCalledOnce();
-    expect(mocks.install).toHaveBeenCalledOnce();
-    expect(useUpdaterStore.getState().phase.kind).toBe("ready");
-    await vi.advanceTimersByTimeAsync(800);
-    expect(mocks.relaunch).toHaveBeenCalledOnce();
+    expect(mocks.invoke).toHaveBeenCalledWith("reserve_update_install", {
+      targetVersion: "1.79.1",
+      targetBuild: TARGET_BUILD,
+    });
+    expect(mocks.download).not.toHaveBeenCalled();
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(mocks.relaunch).not.toHaveBeenCalled();
+    expect(useUpdaterStore.getState().phase.kind).toBe("waiting_for_safe_restart");
   });
 
   it("fails closed and retries when the safety snapshot is unavailable", async () => {
@@ -165,14 +165,14 @@ describe("updater safe restart gate", () => {
     });
   });
 
-  it("releases the restart reservation when installation fails", async () => {
+  it("never accepts install_permitted as renderer authority without an exact permit", async () => {
     const update = {
       available: true,
       version: "1.79.1",
       body: "safe restart gate",
       rawJson: { build_git_sha: TARGET_BUILD },
       download: mocks.download,
-      install: mocks.install.mockRejectedValue(new Error("installer failed")),
+      install: mocks.install,
     };
     mocks.check.mockResolvedValue(update);
     mocks.invoke.mockResolvedValue(idleSafety());
@@ -183,12 +183,12 @@ describe("updater safe restart gate", () => {
     expect(mocks.invoke).toHaveBeenNthCalledWith(1, "reserve_update_install", {
       targetVersion: "1.79.1",
       targetBuild: TARGET_BUILD,
-      claimPermit: null,
     });
-    expect(mocks.invoke).toHaveBeenNthCalledWith(2, "release_update_install_reservation");
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+    expect(mocks.download).not.toHaveBeenCalled();
+    expect(mocks.install).not.toHaveBeenCalled();
     expect(useUpdaterStore.getState().phase).toMatchObject({
-      kind: "error",
-      message: "installer failed",
+      kind: "waiting_for_safe_restart",
     });
   });
 
@@ -204,7 +204,7 @@ describe("updater safe restart gate", () => {
     mocks.check.mockResolvedValue(update);
     mocks.invoke.mockResolvedValue(
       idleSafety({
-        update_install_state: "observe_only",
+        update_install_state: "still_unknown",
         update_objective_id: "objective-update-1",
       }),
     );
@@ -215,13 +215,12 @@ describe("updater safe restart gate", () => {
     expect(mocks.invoke).toHaveBeenCalledWith("reserve_update_install", {
       targetVersion: "1.79.1",
       targetBuild: TARGET_BUILD,
-      claimPermit: null,
     });
     expect(mocks.install).not.toHaveBeenCalled();
     expect(mocks.relaunch).not.toHaveBeenCalled();
     expect(useUpdaterStore.getState().phase).toMatchObject({
       kind: "waiting_for_safe_restart",
-      blockers: { update_install_state: "observe_only" },
+      blockers: { update_install_state: "still_unknown" },
     });
   });
 

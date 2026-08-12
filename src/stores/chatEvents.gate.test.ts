@@ -170,10 +170,24 @@ describe("completion gate stream events", () => {
       "assistant-1",
     );
 
-    expect(next.streaming).toBe(false);
+    expect(next.streaming).toBe(true);
     expect(next.messages[0].toolCalls?.map((tc) => tc.id)).toEqual(["t4"]);
     expect(next.messages[0].content).toContain("503 Service Unavailable");
-    expect(next.messages[0].durationMs).toBeGreaterThanOrEqual(0);
+    expect(next.messages[0].durationMs).toBeUndefined();
+
+    const settled = reduceChatStreamEvent(
+      next,
+      {
+        type: "turn_settled",
+        run_instance_id: "run-recovery-1",
+        root_turn_id: "root-recovery-1",
+        objective_id: "objective-recovery-1",
+        status: "waiting_system",
+      },
+      "assistant-1",
+    );
+    expect(settled.streaming).toBe(false);
+    expect(settled.messages[0].durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it("leaves other messages untouched", () => {

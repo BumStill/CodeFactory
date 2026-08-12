@@ -19,6 +19,7 @@ use codefactory_agent_loop::tool::{
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::HashSet;
+use std::path::{Component, Path};
 
 use crate::openrouter::types::{ToolCall, ToolDefinition};
 
@@ -27,6 +28,37 @@ enum MutationAdmission {
     Dispatch { receipt_id: Option<String> },
     Replay(ToolInvocationResult),
     Waiting(ToolInvocationResult),
+}
+
+#[derive(Debug, Clone)]
+struct FileObservationPlan {
+    safe_locator_json: String,
+    precondition_digest: String,
+    expected_postcondition_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationState {
+    Applied,
+    DefinitelyNotApplied,
+    StillUnknown,
+    Conflict,
+}
+
+impl ObservationState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::DefinitelyNotApplied => "definitely_not_applied",
+            Self::StillUnknown => "still_unknown",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+struct FileObservation {
+    state: ObservationState,
+    observed_digest: Option<String>,
 }
 
 fn canonical_json(value: &serde_json::Value) -> String {
@@ -73,6 +105,185 @@ fn opaque_digest(parts: &[&str]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
+fn bytes_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn absent_file_digest() -> String {
+    opaque_digest(&["file_content_sha256_v1", "absent"])
+}
+
+fn bash_has_unobservable_external_mutation(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let words = lower
+        .split(|character: char| character.is_whitespace() || matches!(character, ';' | '|' | '&'))
+        .map(|word| word.trim_matches(['\'', '"']))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let mutating_kubectl = words
+        .iter()
+        .position(|word| *word == "kubectl")
+        .is_some_and(|kubectl| {
+            words[kubectl + 1..].iter().any(|word| {
+                matches!(
+                    *word,
+                    "apply"
+                        | "create"
+                        | "delete"
+                        | "patch"
+                        | "replace"
+                        | "scale"
+                        | "set"
+                        | "annotate"
+                        | "label"
+                        | "taint"
+                        | "exec"
+                        | "cp"
+                        | "restart"
+                        | "undo"
+                )
+            })
+        });
+    let trimmed = lower.trim_end();
+    let background = lower.contains("nohup ")
+        || lower.contains("start-process ")
+        || (trimmed.ends_with('&') && !trimmed.ends_with("&&"));
+    bash_has_explicit_external_mutation(command) || mutating_kubectl || background
+}
+
+fn has_safe_relative_components(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+async fn prepare_file_observation(
+    tool_name: &str,
+    args: &serde_json::Value,
+    cwd: &Path,
+) -> Option<FileObservationPlan> {
+    let requested = args.get("path")?.as_str()?;
+    let workspace = cwd.canonicalize().ok()?;
+    let resolved = match tool_name {
+        "write_file" => {
+            crate::tools::workspace_path::resolve_writable(&workspace, requested).ok()?
+        }
+        "edit_file" => {
+            crate::tools::workspace_path::resolve_existing(&workspace, requested).ok()?
+        }
+        _ => return None,
+    };
+    let relative = resolved.strip_prefix(&workspace).ok()?;
+    if !has_safe_relative_components(relative) {
+        return None;
+    }
+    let relative = relative.to_str()?.replace('\\', "/");
+    let before = match tokio::fs::read(&resolved).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return None,
+    };
+    let before_exists = resolved.exists();
+    let precondition_digest = if before_exists {
+        bytes_digest(&before)
+    } else {
+        absent_file_digest()
+    };
+    let expected = match tool_name {
+        "write_file" => args.get("content")?.as_str()?.as_bytes().to_vec(),
+        "edit_file" => {
+            let original = String::from_utf8(before).ok()?;
+            let old_string = args.get("old_string")?.as_str()?;
+            let new_string = args.get("new_string")?.as_str()?;
+            let replace_all = args
+                .get("replace_all")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !replace_all {
+                let count = original.matches(old_string).count();
+                if count != 1 {
+                    return None;
+                }
+            }
+            if replace_all {
+                original.replace(old_string, new_string).into_bytes()
+            } else {
+                original.replacen(old_string, new_string, 1).into_bytes()
+            }
+        }
+        _ => return None,
+    };
+    Some(FileObservationPlan {
+        safe_locator_json: serde_json::json!({
+            "workspace_relative_path": relative,
+        })
+        .to_string(),
+        precondition_digest,
+        expected_postcondition_digest: bytes_digest(&expected),
+    })
+}
+
+async fn observe_file_contract(
+    cwd: &Path,
+    safe_locator_json: &str,
+    precondition_digest: &str,
+    expected_postcondition_digest: &str,
+) -> FileObservation {
+    let relative = serde_json::from_str::<serde_json::Value>(safe_locator_json)
+        .ok()
+        .and_then(|locator| {
+            locator
+                .get("workspace_relative_path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let Some(relative) = relative else {
+        return FileObservation {
+            state: ObservationState::StillUnknown,
+            observed_digest: None,
+        };
+    };
+    let relative_path = Path::new(&relative);
+    if !has_safe_relative_components(relative_path) {
+        return FileObservation {
+            state: ObservationState::StillUnknown,
+            observed_digest: None,
+        };
+    }
+    let resolved = match crate::tools::workspace_path::resolve_writable(cwd, &relative) {
+        Ok(path) => path,
+        Err(_) => {
+            return FileObservation {
+                state: ObservationState::StillUnknown,
+                observed_digest: None,
+            }
+        }
+    };
+    let digest = match tokio::fs::read(&resolved).await {
+        Ok(bytes) => bytes_digest(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent_file_digest(),
+        Err(_) => {
+            return FileObservation {
+                state: ObservationState::StillUnknown,
+                observed_digest: None,
+            }
+        }
+    };
+    let state = if digest == expected_postcondition_digest {
+        ObservationState::Applied
+    } else if digest == precondition_digest {
+        ObservationState::DefinitelyNotApplied
+    } else {
+        ObservationState::Conflict
+    };
+    FileObservation {
+        state,
+        observed_digest: Some(digest),
+    }
+}
+
 fn desktop_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (String, ToolKind) {
     let (command, typed_kind) =
         codefactory_agent_loop::policy::completion_command_and_kind(tool_name, args);
@@ -95,7 +306,7 @@ fn bash_has_explicit_external_mutation(command: &str) -> bool {
     let curl = lower
         .split(|character: char| character.is_whitespace() || matches!(character, ';' | '|' | '&'))
         .any(|word| word == "curl");
-    curl && [
+    curl && ([
         " -x post",
         " -xpost",
         " --request post",
@@ -113,11 +324,13 @@ fn bash_has_explicit_external_mutation(command: &str) -> bool {
         " --form",
         " --upload-file",
         " -d ",
-        " -f ",
-        " -t ",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+        // curl short options are case-sensitive: `-F` uploads a form while
+        // `-f` is the read-only fail-on-HTTP-error flag; likewise `-T` uploads.
+        || command.contains(" -F ")
+        || command.contains(" -T "))
 }
 
 fn bash_is_explicit_read_only(command: &str) -> bool {
@@ -220,6 +433,31 @@ fn waiting_result(command: &str, kind: ToolKind, code: &str) -> ToolInvocationRe
     }
 }
 
+fn replay_result(
+    command: &str,
+    kind: ToolKind,
+    observation_state: Option<ObservationState>,
+) -> ToolInvocationResult {
+    ToolInvocationResult {
+        content: "此前相同外部变更已由持久化回执确认完成；未重复执行。".into(),
+        is_error: false,
+        status: ToolExecutionStatus::Done,
+        command: command.to_string(),
+        kind,
+        return_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: None,
+        metadata: Some(serde_json::json!({
+            "receipt_replayed": true,
+            "observation_state": observation_state.map(ObservationState::as_str),
+            "system_owned": true,
+        })),
+        next_working_directory: None,
+        duration_ms: 0,
+    }
+}
+
 fn invocation_from_output(
     output: crate::tools::ToolOutput,
     command: String,
@@ -264,6 +502,18 @@ pub(super) struct DesktopToolBackend {
 }
 
 impl DesktopToolBackend {
+    async fn ensure_observation_schema(&self) -> Result<(), ToolError> {
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0012_tool_observation_contracts.sql"
+        ))
+        .execute(&self.db)
+        .await
+        .map_err(|error| ToolError {
+            message: format!("ensure tool observation schema: {error}"),
+        })?;
+        Ok(())
+    }
+
     async fn mutation_preflight(
         &self,
         call: &ToolCall,
@@ -271,7 +521,24 @@ impl DesktopToolBackend {
         ctx: &ToolCtx,
         command: &str,
         kind: ToolKind,
+        is_mcp_tool: bool,
     ) -> Result<MutationAdmission, ToolError> {
+        self.ensure_observation_schema().await?;
+        let lacks_external_observer = is_mcp_tool
+            || (call.function.name == "bash"
+                && args
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(bash_has_unobservable_external_mutation));
+        if lacks_external_observer {
+            return Ok(MutationAdmission::Waiting(waiting_result(
+                command,
+                kind,
+                "tool_observation_contract_missing",
+            )));
+        }
+        let file_observation =
+            prepare_file_observation(&call.function.name, args, &ctx.working_directory).await;
         let resource = if let Some(task_id) = ctx.task_id.as_deref() {
             Some(("task", "task_run", task_id, true))
         } else {
@@ -533,7 +800,7 @@ impl DesktopToolBackend {
         let idempotency_key =
             opaque_digest(&[&objective_id, &action_fingerprint, &binding_id, &generation]);
         if let Some(existing) = sqlx::query(
-            "SELECT status, summary_json FROM side_effect_receipts
+            "SELECT id, status, summary_json FROM side_effect_receipts
              WHERE objective_id=? AND action_fingerprint=? AND idempotency_key=?
              ORDER BY observed_at DESC LIMIT 1",
         )
@@ -545,6 +812,7 @@ impl DesktopToolBackend {
         .map_err(|error| ToolError {
             message: format!("load mutation replay receipt: {error}"),
         })? {
+            let existing_receipt_id: String = existing.get("id");
             let status: String = existing.get("status");
             if matches!(status.as_str(), "committed" | "reconciled") {
                 let summary_json: Option<String> = existing.get("summary_json");
@@ -554,35 +822,174 @@ impl DesktopToolBackend {
                     .ok_or_else(|| ToolError {
                         message: "committed mutation receipt has no valid replay summary".into(),
                     })?;
-                let status = match summary.get("status").and_then(|value| value.as_str()) {
-                    Some("done") => ToolExecutionStatus::Done,
-                    _ => {
-                        return Err(ToolError {
-                            message: "committed mutation receipt has an invalid status".into(),
-                        })
-                    }
-                };
-                let replay = ToolInvocationResult {
-                    content: "此前相同外部变更已由持久化回执确认完成；未重复执行。".into(),
-                    is_error: false,
-                    status,
-                    command: command.to_string(),
-                    kind,
-                    return_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    error: None,
-                    metadata: Some(serde_json::json!({
-                        "receipt_replayed": true,
-                        "system_owned": true,
-                    })),
-                    next_working_directory: None,
-                    duration_ms: 0,
-                };
+                if summary.get("status").and_then(|value| value.as_str()) != Some("done") {
+                    return Err(ToolError {
+                        message: "committed mutation receipt has an invalid status".into(),
+                    });
+                }
+                let replay = replay_result(command, kind, None);
                 tx.commit().await.map_err(|error| ToolError {
                     message: format!("commit mutation replay attribution: {error}"),
                 })?;
                 return Ok(MutationAdmission::Replay(replay));
+            }
+            if matches!(status.as_str(), "started" | "unknown") {
+                if let Some(contract) = sqlx::query(
+                    "SELECT safe_locator_json, precondition_digest,
+                            expected_postcondition_digest, last_dispatch_epoch
+                     FROM side_effect_observation_contracts WHERE receipt_id=?",
+                )
+                .bind(&existing_receipt_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| ToolError {
+                    message: format!("load file observation contract: {error}"),
+                })? {
+                    let safe_locator_json: String = contract.get("safe_locator_json");
+                    let precondition_digest: String = contract.get("precondition_digest");
+                    let expected_postcondition_digest: String =
+                        contract.get("expected_postcondition_digest");
+                    let observation = observe_file_contract(
+                        &ctx.working_directory,
+                        &safe_locator_json,
+                        &precondition_digest,
+                        &expected_postcondition_digest,
+                    )
+                    .await;
+                    let now = chrono::Utc::now().timestamp_millis();
+                    sqlx::query(
+                        "UPDATE side_effect_observation_contracts
+                         SET state=?, observed_digest=?,
+                             observation_count=observation_count+1, observed_at=?
+                         WHERE receipt_id=?",
+                    )
+                    .bind(observation.state.as_str())
+                    .bind(&observation.observed_digest)
+                    .bind(now)
+                    .bind(&existing_receipt_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| ToolError {
+                        message: format!("persist file observation: {error}"),
+                    })?;
+
+                    match observation.state {
+                        ObservationState::Applied => {
+                            let summary = serde_json::json!({"status": "done"}).to_string();
+                            sqlx::query(
+                                "UPDATE side_effect_receipts
+                                 SET status='reconciled', summary_json=?, observed_at=?
+                                 WHERE id=? AND status IN ('started','unknown')",
+                            )
+                            .bind(summary)
+                            .bind(now)
+                            .bind(&existing_receipt_id)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|error| ToolError {
+                                message: format!("reconcile applied file receipt: {error}"),
+                            })?;
+                            tx.commit().await.map_err(|error| ToolError {
+                                message: format!("commit applied file observation: {error}"),
+                            })?;
+                            return Ok(MutationAdmission::Replay(replay_result(
+                                command,
+                                kind,
+                                Some(ObservationState::Applied),
+                            )));
+                        }
+                        ObservationState::StillUnknown => {
+                            tx.commit().await.map_err(|error| ToolError {
+                                message: format!("commit unknown file observation: {error}"),
+                            })?;
+                            return Ok(MutationAdmission::Waiting(waiting_result(
+                                command,
+                                kind,
+                                "external_state_uncertain",
+                            )));
+                        }
+                        ObservationState::Conflict => {
+                            tx.commit().await.map_err(|error| ToolError {
+                                message: format!("commit conflicting file observation: {error}"),
+                            })?;
+                            return Ok(MutationAdmission::Waiting(waiting_result(
+                                command,
+                                kind,
+                                "tool_observation_conflict",
+                            )));
+                        }
+                        ObservationState::DefinitelyNotApplied => {
+                            let Some(permit) = ctx.mutation_permit.as_ref() else {
+                                tx.commit().await.map_err(|error| ToolError {
+                                    message: format!(
+                                        "commit not-applied file observation without permit: {error}"
+                                    ),
+                                })?;
+                                return Ok(MutationAdmission::Waiting(waiting_result(
+                                    command,
+                                    kind,
+                                    "external_state_uncertain",
+                                )));
+                            };
+                            let other_uncertain: i64 = sqlx::query_scalar(
+                                "SELECT COUNT(*) FROM side_effect_receipts
+                                 WHERE objective_id=? AND binding_id=? AND id<>?
+                                   AND status IN ('started','unknown')",
+                            )
+                            .bind(&objective_id)
+                            .bind(&binding_id)
+                            .bind(&existing_receipt_id)
+                            .fetch_one(&mut *tx)
+                            .await
+                            .map_err(|error| ToolError {
+                                message: format!("inspect competing mutation receipts: {error}"),
+                            })?;
+                            if other_uncertain > 0 {
+                                tx.commit().await.map_err(|error| ToolError {
+                                    message: format!(
+                                        "commit competing mutation observation: {error}"
+                                    ),
+                                })?;
+                                return Ok(MutationAdmission::Waiting(waiting_result(
+                                    command,
+                                    kind,
+                                    "external_state_uncertain",
+                                )));
+                            }
+                            let admitted = sqlx::query(
+                                "UPDATE side_effect_observation_contracts
+                                 SET last_dispatch_epoch=?, observed_at=?
+                                 WHERE receipt_id=? AND state='definitely_not_applied'
+                                   AND last_dispatch_epoch<?",
+                            )
+                            .bind(permit.claim_epoch)
+                            .bind(now)
+                            .bind(&existing_receipt_id)
+                            .bind(permit.claim_epoch)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|error| ToolError {
+                                message: format!("admit observed file retry: {error}"),
+                            })?;
+                            if admitted.rows_affected() != 1 {
+                                tx.commit().await.map_err(|error| ToolError {
+                                    message: format!("commit fenced file retry: {error}"),
+                                })?;
+                                return Ok(MutationAdmission::Waiting(waiting_result(
+                                    command,
+                                    kind,
+                                    "external_state_uncertain",
+                                )));
+                            }
+                            tx.commit().await.map_err(|error| ToolError {
+                                message: format!("commit observed file retry: {error}"),
+                            })?;
+                            return Ok(MutationAdmission::Dispatch {
+                                receipt_id: Some(existing_receipt_id),
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -633,6 +1040,37 @@ impl DesktopToolBackend {
         .map_err(|error| ToolError {
             message: format!("persist started mutation receipt: {error}"),
         })?;
+        if let Some(observation) = file_observation {
+            let dispatch_epoch = ctx
+                .mutation_permit
+                .as_ref()
+                .map(|permit| permit.claim_epoch)
+                .unwrap_or(0);
+            sqlx::query(
+                "INSERT INTO side_effect_observation_contracts
+                 (receipt_id, objective_id, binding_id, action_fingerprint,
+                  operation_domain, observer_kind, safe_locator_json,
+                  precondition_digest, expected_postcondition_digest, state,
+                  last_dispatch_epoch, observation_count, created_at, observed_at)
+                 VALUES (?, ?, ?, ?, 'tool_file', 'file_content_sha256_v1', ?, ?, ?,
+                         'definitely_not_applied', ?, 0, ?, ?)",
+            )
+            .bind(&receipt_id)
+            .bind(&objective_id)
+            .bind(&binding_id)
+            .bind(&action_fingerprint)
+            .bind(observation.safe_locator_json)
+            .bind(observation.precondition_digest)
+            .bind(observation.expected_postcondition_digest)
+            .bind(dispatch_epoch)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("persist file observation contract: {error}"),
+            })?;
+        }
         tx.commit().await.map_err(|error| ToolError {
             message: format!("commit started mutation receipt: {error}"),
         })?;
@@ -645,20 +1083,64 @@ impl DesktopToolBackend {
         &self,
         receipt_id: &str,
         result: Option<&ToolInvocationResult>,
+        ctx: &ToolCtx,
     ) -> Result<(), ToolError> {
-        let (status, summary_json) = match result {
-            Some(result) if result.status == ToolExecutionStatus::Done && !result.is_error => {
-                let summary = serde_json::json!({
-                    "status": "done",
-                });
-                ("committed", Some(summary.to_string()))
-            }
-            _ => ("unknown", None),
+        let contract = sqlx::query(
+            "SELECT safe_locator_json, precondition_digest, expected_postcondition_digest
+             FROM side_effect_observation_contracts WHERE receipt_id=?",
+        )
+        .bind(receipt_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|error| ToolError {
+            message: format!("load settling file observation contract: {error}"),
+        })?;
+        let mut post_dispatch_observation = None;
+        if let Some(contract) = contract {
+            let safe_locator_json: String = contract.get("safe_locator_json");
+            let precondition_digest: String = contract.get("precondition_digest");
+            let expected_postcondition_digest: String =
+                contract.get("expected_postcondition_digest");
+            let observation = observe_file_contract(
+                &ctx.working_directory,
+                &safe_locator_json,
+                &precondition_digest,
+                &expected_postcondition_digest,
+            )
+            .await;
+            sqlx::query(
+                "UPDATE side_effect_observation_contracts
+                 SET state=?, observed_digest=?,
+                     observation_count=observation_count+1, observed_at=?
+                 WHERE receipt_id=?",
+            )
+            .bind(observation.state.as_str())
+            .bind(&observation.observed_digest)
+            .bind(chrono::Utc::now().timestamp_millis())
+            .bind(receipt_id)
+            .execute(&self.db)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("persist settling file observation: {error}"),
+            })?;
+            post_dispatch_observation = Some(observation.state);
+        }
+        let succeeded = result
+            .is_some_and(|result| result.status == ToolExecutionStatus::Done && !result.is_error);
+        let observation_confirms_success =
+            post_dispatch_observation.is_none_or(|state| state == ObservationState::Applied);
+        let (status, summary_json) = if succeeded && observation_confirms_success {
+            let summary = serde_json::json!({
+                "status": "done",
+            });
+            ("committed", Some(summary.to_string()))
+        } else {
+            ("unknown", None)
         };
         let updated = sqlx::query(
             "UPDATE side_effect_receipts
              SET status=?, summary_json=?, observed_at=?
-             WHERE id=? AND status='started'",
+             WHERE id=? AND status IN ('started','unknown')",
         )
         .bind(status)
         .bind(summary_json)
@@ -703,16 +1185,21 @@ impl ToolBackend for DesktopToolBackend {
         ctx: &ToolCtx,
     ) -> Result<ToolInvocationResult, ToolError> {
         let mcp_server = self.mcp_manager.find_tool_server(&call.function.name).await;
+        let is_mcp_tool = mcp_server.is_some()
+            || self
+                .mcp_tool_names
+                .read()
+                .is_ok_and(|names| names.contains(&call.function.name));
         let (command, native_kind) = desktop_command_and_kind(&call.function.name, args);
-        let kind = if mcp_server.is_some() {
+        let kind = if is_mcp_tool {
             ToolKind::Mutation
         } else {
             native_kind
         };
-        let requires_receipt = mcp_server.is_some()
-            || native_requires_mutation_receipt(&call.function.name, args, &kind);
+        let requires_receipt =
+            is_mcp_tool || native_requires_mutation_receipt(&call.function.name, args, &kind);
         let admission = if requires_receipt {
-            self.mutation_preflight(call, args, ctx, &command, kind.clone())
+            self.mutation_preflight(call, args, ctx, &command, kind.clone(), is_mcp_tool)
                 .await?
         } else {
             MutationAdmission::Unbound
@@ -754,7 +1241,7 @@ impl ToolBackend for DesktopToolBackend {
                 Ok(output) => output,
                 Err(error) => {
                     if let Some(receipt_id) = receipt_id.as_deref() {
-                        self.settle_mutation_receipt(receipt_id, None).await?;
+                        self.settle_mutation_receipt(receipt_id, None, ctx).await?;
                     }
                     return Err(ToolError {
                         message: error.to_string(),
@@ -765,7 +1252,7 @@ impl ToolBackend for DesktopToolBackend {
 
         let result = invocation_from_output(output, command, kind);
         if let Some(receipt_id) = receipt_id.as_deref() {
-            self.settle_mutation_receipt(receipt_id, Some(&result))
+            self.settle_mutation_receipt(receipt_id, Some(&result), ctx)
                 .await?;
         }
         Ok(result)
@@ -1008,6 +1495,66 @@ mod tests {
         .unwrap();
     }
 
+    async fn prime_file_receipt_without_dispatch(
+        backend: &DesktopToolBackend,
+        ctx: &ToolCtx,
+        call_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> String {
+        let tool_call = call_with_args(call_id, tool_name, args);
+        register_tool_call(backend, &tool_call, args).await;
+        let (command, kind) = backend.classify(&tool_call, args);
+        match backend
+            .mutation_preflight(&tool_call, args, ctx, &command, kind, false)
+            .await
+            .expect("write-ahead mutation receipt")
+        {
+            MutationAdmission::Dispatch {
+                receipt_id: Some(receipt_id),
+            } => receipt_id,
+            _ => panic!("a fresh observable file mutation must be admitted exactly once"),
+        }
+    }
+
+    async fn claim_file_recovery(backend: &DesktopToolBackend, claim_epoch: i64) {
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE objectives
+             SET status='waiting_system', decision_type='waiting',
+                 remediation_id='remediation-tool-fencing',
+                 lease_owner='replacement-supervisor', lease_expires_at=?, updated_at=?
+             WHERE id=?",
+        )
+        .bind(now + 60_000)
+        .bind(now)
+        .bind(TEST_OBJECTIVE_ID)
+        .execute(&backend.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_remediations
+             (id, objective_id, binding_id, domain, status, failure_code,
+              failure_signature, strategy, approach_index, attempt_index,
+              next_observation_at, lease_owner, lease_expires_at,
+              created_at, updated_at)
+             VALUES ('remediation-tool-fencing', ?, ?, 'tool', 'claimed',
+                     'external_state_uncertain', 'sha256:file-observation-test',
+                     'observe_then_resume', 0, ?, ?,
+                     'replacement-supervisor', ?, ?, ?)",
+        )
+        .bind(TEST_OBJECTIVE_ID)
+        .bind(TEST_BINDING_ID)
+        .bind(claim_epoch)
+        .bind(now)
+        .bind(now + 60_000)
+        .bind(now)
+        .bind(now)
+        .execute(&backend.db)
+        .await
+        .unwrap();
+    }
+
     async fn assert_objective_bound_call_starts_receipt(
         tool_name: &str,
         call_id: &str,
@@ -1028,6 +1575,7 @@ mod tests {
                 &objective_ctx(std::path::Path::new(".")),
                 &command,
                 kind,
+                false,
             )
             .await
             .expect("mutation preflight must persist its dispatch fence");
@@ -1177,7 +1725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn side_effecting_bash_commands_cannot_bypass_the_receipt_fence() {
+    async fn explicit_external_bash_mutations_fail_before_started_receipt() {
         for (call_id, command) in [
             (
                 "bash-curl-post",
@@ -1188,18 +1736,380 @@ mod tests {
                 "bash-nohup",
                 "nohup sh -c 'touch launched.marker' >/dev/null 2>&1 &",
             ),
-            (
-                "bash-read-prefix-lookalike",
-                "lsmalware --perform-side-effect",
-            ),
         ] {
-            assert_objective_bound_call_starts_receipt(
-                "bash",
-                call_id,
-                &serde_json::json!({"command": command}),
-            )
-            .await;
+            let backend = objective_backend(false).await;
+            let args = serde_json::json!({"command": command});
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let (command, kind) = backend.classify(&call, &args);
+            let admission = backend
+                .mutation_preflight(
+                    &call,
+                    &args,
+                    &objective_ctx(std::path::Path::new(".")),
+                    &command,
+                    kind,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(admission, MutationAdmission::Waiting(_)));
+            let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+            assert_eq!(receipts, 0, "{call_id} must fail before a started receipt");
         }
+    }
+
+    #[tokio::test]
+    async fn conservative_local_bash_mutation_still_enters_generic_receipt_fence() {
+        assert_objective_bound_call_starts_receipt(
+            "bash",
+            "bash-read-prefix-lookalike",
+            &serde_json::json!({"command": "lsmalware --perform-side-effect"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unobservable_background_mutation_fails_closed_before_dispatch_or_started_receipt() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-launch.txt");
+        let command = if cfg!(windows) {
+            "Start-Process powershell -ArgumentList '-Command Set-Content must-not-launch.txt launched'"
+        } else {
+            "nohup sh -c 'printf launched > must-not-launch.txt' >/dev/null 2>&1 &"
+        };
+        let args = serde_json::json!({"command": command});
+        let tool_call = call_with_args("unobservable-background", "bash", &args);
+        register_tool_call(&backend, &tool_call, &args).await;
+
+        let out = backend
+            .execute(&tool_call, &args, &objective_ctx(dir.path()))
+            .await
+            .expect("missing observer is a system-owned wait");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(out.status, ToolExecutionStatus::Waiting);
+        assert_eq!(
+            out.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("tool_observation_contract_missing")
+        );
+        assert!(!marker.exists(), "the background process must never launch");
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0, "fail-closed is before a started receipt");
+        let side_effect_started: i64 =
+            sqlx::query_scalar("SELECT side_effect_started FROM objectives WHERE id=?")
+                .bind(TEST_OBJECTIVE_ID)
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(side_effect_started, 0);
+    }
+
+    #[tokio::test]
+    async fn undeclared_mcp_mutation_fails_closed_before_native_fallback_or_receipt() {
+        let backend = objective_backend(false).await;
+        backend
+            .mcp_tool_names
+            .write()
+            .unwrap()
+            .insert("mcp_without_observer".into());
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({"secret": "must-not-be-persisted"});
+        let tool_call = call_with_args("mcp-observer-missing", "mcp_without_observer", &args);
+        register_tool_call(&backend, &tool_call, &args).await;
+
+        let out = backend
+            .execute(&tool_call, &args, &objective_ctx(dir.path()))
+            .await
+            .expect("undeclared MCP mutation is held by the system");
+
+        assert_eq!(out.status, ToolExecutionStatus::Waiting);
+        assert_eq!(
+            out.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("tool_observation_contract_missing")
+        );
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn restarted_edit_observer_reconciles_applied_without_replaying() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("state.txt"), "before\n").unwrap();
+        let args = serde_json::json!({
+            "path": "state.txt",
+            "old_string": "before",
+            "new_string": "after"
+        });
+        let ctx = objective_ctx(dir.path());
+        prime_file_receipt_without_dispatch(
+            &backend,
+            &ctx,
+            "edit-before-applied-crash",
+            "edit_file",
+            &args,
+        )
+        .await;
+        // Simulate the exact crash window: the filesystem mutation committed,
+        // but the old future never settled its receipt.
+        std::fs::write(dir.path().join("state.txt"), "after\n").unwrap();
+        claim_file_recovery(&backend, 2).await;
+        let resumed = call_with_args("edit-after-applied-crash", "edit_file", &args);
+        register_tool_call(&backend, &resumed, &args).await;
+        let mut recovery_ctx = ctx.clone();
+        recovery_ctx.mutation_permit = Some(current_permit(2));
+
+        let out = backend
+            .execute(&resumed, &args, &recovery_ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, ToolExecutionStatus::Done);
+        assert!(
+            !out.is_error,
+            "an applied edit is replayed from its receipt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("state.txt")).unwrap(),
+            "after\n"
+        );
+        let (receipt_status, observation_state): (String, String) = sqlx::query_as(
+            "SELECT r.status, o.state
+             FROM side_effect_receipts r
+             JOIN side_effect_observation_contracts o ON o.receipt_id=r.id",
+        )
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(receipt_status, "reconciled");
+        assert_eq!(observation_state, "applied");
+    }
+
+    #[tokio::test]
+    async fn restarted_write_observer_reconciles_applied_with_redacted_contract() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let secret_content = "private-content-must-not-enter-contract\n";
+        let args = serde_json::json!({
+            "path": "nested/state.txt",
+            "content": secret_content
+        });
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        let ctx = objective_ctx(dir.path());
+        prime_file_receipt_without_dispatch(
+            &backend,
+            &ctx,
+            "write-before-applied-crash",
+            "write_file",
+            &args,
+        )
+        .await;
+        std::fs::write(dir.path().join("nested/state.txt"), secret_content).unwrap();
+        claim_file_recovery(&backend, 2).await;
+        let resumed = call_with_args("write-after-applied-crash", "write_file", &args);
+        register_tool_call(&backend, &resumed, &args).await;
+        let mut recovery_ctx = ctx.clone();
+        recovery_ctx.mutation_permit = Some(current_permit(2));
+
+        let out = backend
+            .execute(&resumed, &args, &recovery_ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, ToolExecutionStatus::Done);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nested/state.txt")).unwrap(),
+            secret_content
+        );
+        let (locator, before_digest, expected_digest, observed_digest, state): (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT safe_locator_json, precondition_digest,
+                    expected_postcondition_digest, observed_digest, state
+             FROM side_effect_observation_contracts",
+        )
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&locator).unwrap(),
+            serde_json::json!({"workspace_relative_path": "nested/state.txt"})
+        );
+        let workspace_path = dir.path().to_string_lossy().into_owned();
+        for persisted in [&locator, &before_digest, &expected_digest] {
+            assert!(!persisted.contains(secret_content));
+            assert!(!persisted.contains(workspace_path.as_str()));
+        }
+        assert!(before_digest.starts_with("sha256:"));
+        assert!(expected_digest.starts_with("sha256:"));
+        assert_eq!(observed_digest.as_deref(), Some(expected_digest.as_str()));
+        assert_eq!(state, "applied");
+    }
+
+    #[tokio::test]
+    async fn restarted_edit_observer_retries_definitely_not_applied_once_with_new_permit() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("state.txt"), "before\n").unwrap();
+        let args = serde_json::json!({
+            "path": "state.txt",
+            "old_string": "before",
+            "new_string": "after"
+        });
+        let ctx = objective_ctx(dir.path());
+        prime_file_receipt_without_dispatch(
+            &backend,
+            &ctx,
+            "edit-before-not-applied-crash",
+            "edit_file",
+            &args,
+        )
+        .await;
+        claim_file_recovery(&backend, 2).await;
+        let mut recovery_ctx = ctx.clone();
+        recovery_ctx.mutation_permit = Some(current_permit(2));
+
+        for call_id in ["edit-not-applied-resume", "edit-same-permit-replay"] {
+            let resumed = call_with_args(call_id, "edit_file", &args);
+            register_tool_call(&backend, &resumed, &args).await;
+            let out = backend
+                .execute(&resumed, &args, &recovery_ctx)
+                .await
+                .unwrap();
+            assert_eq!(out.status, ToolExecutionStatus::Done);
+            assert!(!out.is_error);
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("state.txt")).unwrap(),
+            "after\n"
+        );
+        let (receipts, last_dispatch_epoch, state): (i64, i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(o.last_dispatch_epoch), MAX(o.state)
+             FROM side_effect_receipts r
+             JOIN side_effect_observation_contracts o ON o.receipt_id=r.id",
+        )
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(receipts, 1);
+        assert_eq!(last_dispatch_epoch, 2);
+        assert_eq!(state, "applied");
+    }
+
+    #[tokio::test]
+    async fn restarted_edit_observer_detects_conflict_and_never_executes() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("state.txt"), "before\n").unwrap();
+        let args = serde_json::json!({
+            "path": "state.txt",
+            "old_string": "before",
+            "new_string": "after"
+        });
+        let ctx = objective_ctx(dir.path());
+        prime_file_receipt_without_dispatch(
+            &backend,
+            &ctx,
+            "edit-before-conflict-crash",
+            "edit_file",
+            &args,
+        )
+        .await;
+        std::fs::write(dir.path().join("state.txt"), "third-party\n").unwrap();
+        claim_file_recovery(&backend, 2).await;
+        let resumed = call_with_args("edit-after-conflict-crash", "edit_file", &args);
+        register_tool_call(&backend, &resumed, &args).await;
+        let mut recovery_ctx = ctx.clone();
+        recovery_ctx.mutation_permit = Some(current_permit(2));
+
+        let out = backend
+            .execute(&resumed, &args, &recovery_ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, ToolExecutionStatus::Waiting);
+        assert_eq!(
+            out.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("tool_observation_conflict")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("state.txt")).unwrap(),
+            "third-party\n"
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM side_effect_observation_contracts")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(state, "conflict");
+    }
+
+    #[tokio::test]
+    async fn restarted_file_observer_persists_still_unknown_when_locator_cannot_be_read() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        let args = serde_json::json!({"path": "state.txt", "content": "expected\n"});
+        let ctx = objective_ctx(&cwd);
+        prime_file_receipt_without_dispatch(
+            &backend,
+            &ctx,
+            "write-before-unreadable-crash",
+            "write_file",
+            &args,
+        )
+        .await;
+        claim_file_recovery(&backend, 2).await;
+        drop(dir);
+        let resumed = call_with_args("write-after-unreadable-crash", "write_file", &args);
+        register_tool_call(&backend, &resumed, &args).await;
+        let mut recovery_ctx = ctx;
+        recovery_ctx.mutation_permit = Some(current_permit(2));
+
+        let out = backend
+            .execute(&resumed, &args, &recovery_ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, ToolExecutionStatus::Waiting);
+        assert_eq!(
+            out.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("external_state_uncertain")
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM side_effect_observation_contracts")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(state, "still_unknown");
     }
 
     #[tokio::test]

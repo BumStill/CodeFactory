@@ -59,6 +59,18 @@ function q() {
   return useChatStore.getState().runtime[SID]?.queue ?? [];
 }
 
+function settle(
+  status: "completed" | "cancelled" | "waiting_system" | "waiting_user" | "failed_setup" = "completed",
+) {
+  streamMock.handler?.({
+    type: "turn_settled",
+    run_instance_id: "run-1",
+    root_turn_id: "root-1",
+    objective_id: "objective-1",
+    status,
+  });
+}
+
 describe("chat message queue (per-session)", () => {
   beforeEach(() => {
     resetStore();
@@ -122,13 +134,13 @@ describe("chat message queue (per-session)", () => {
   });
 
 
-  it("drains the next queued message only after an interrupted turn reaches terminal state", async () => {
+  it("drains the next queued message only after an interrupted turn is durably settled", async () => {
     await useChatStore.getState().sendMessage("first turn", SID);
     await useChatStore.getState().sendOrQueue("queued after stop");
     expect(q().map((x) => x.content)).toEqual(["queued after stop"]);
 
     invokeMock.mockClear();
-    useChatStore.getState().cancelStream();
+    await useChatStore.getState().cancelStream();
 
     expect(invokeMock).toHaveBeenCalledWith("cancel_chat", { sessionId: SID });
     expect(q()).toHaveLength(1);
@@ -138,6 +150,11 @@ describe("chat message queue (per-session)", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
 
     streamMock.handler?.({ type: "done", input_tokens: 0, output_tokens: 0 });
+    expect(q()).toHaveLength(1);
+    expect(useChatStore.getState().runtime[SID]?.streaming).toBe(true);
+    expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+
+    settle("cancelled");
     expect(q()).toHaveLength(0);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(invokeMock).toHaveBeenCalledWith(
@@ -146,16 +163,124 @@ describe("chat message queue (per-session)", () => {
     );
   });
 
-  it("reducer's done event flips streaming to false (drain trigger contract)", () => {
-    // The drain itself lives in chat.ts's handleStreamEvent — it inspects the
-    // session's runtime before/after the reducer. Here we just verify the
-    // reducer contract that drain depends on.
-    const before: SessionRuntime = { ...freshRuntime(), streaming: true };
-    const after = reduceChatStreamEvent(
+  it("only turn_settled flips streaming and clears a pending permission", () => {
+    const before: SessionRuntime = {
+      ...freshRuntime(),
+      streaming: true,
+      pendingPermission: {
+        intentId: "intent-tool-1",
+        toolCallId: "tool-1",
+        toolName: "bash",
+        args: { command: "git status" },
+      },
+    };
+    const afterTransportDone = reduceChatStreamEvent(
       before,
       { type: "done", input_tokens: 10, output_tokens: 20 },
       "msg-1",
     );
-    expect(after.streaming).toBe(false);
+    expect(afterTransportDone.streaming).toBe(true);
+    expect(afterTransportDone.pendingPermission?.toolCallId).toBe("tool-1");
+    expect(afterTransportDone.inputTokenTotal).toBe(10);
+    expect(afterTransportDone.outputTokenTotal).toBe(20);
+
+    const afterSettlement = reduceChatStreamEvent(
+      afterTransportDone,
+      {
+        type: "turn_settled",
+        run_instance_id: "run-1",
+        root_turn_id: "root-1",
+        objective_id: "objective-1",
+        status: "completed",
+      },
+      "msg-1",
+    );
+    expect(afterSettlement.streaming).toBe(false);
+    expect(afterSettlement.pendingPermission).toBeNull();
+  });
+
+  it("rolls back CHAT_RUN_BUSY bubbles and restores the rejected content to the queue", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("CHAT_RUN_BUSY: run already owns this session"));
+
+    await useChatStore.getState().sendMessage("do not lose me", SID);
+
+    const runtime = useChatStore.getState().runtime[SID];
+    // CHAT_RUN_BUSY proves another backend run still owns the session. Keep
+    // waiting for that run's settlement instead of declaring the chat idle.
+    expect(runtime?.streaming).toBe(true);
+    expect(runtime?.messages).toEqual([]);
+    expect(runtime?.queue.map((item) => item.content)).toEqual(["do not lose me"]);
+    const firstRootTurnId = runtime?.queue[0]?.rootTurnId;
+    expect(firstRootTurnId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    expect(invokeMock).toHaveBeenCalledWith("send_message", {
+      sessionId: SID,
+      content: "do not lose me",
+      rootTurnId: firstRootTurnId,
+    });
+    expect(useChatStore.getState()._streamingMsgId[SID]).toBeUndefined();
+  });
+
+  it("binds an idle and queued persisted message to one stable root identity", async () => {
+    await useChatStore.getState().sendMessage("stable idle root", SID);
+    const idleArgs = invokeMock.mock.calls.find(([cmd]) => cmd === "send_message")?.[1] as
+      | Record<string, unknown>
+      | undefined;
+    expect(idleArgs?.rootTurnId).toBe(
+      useChatStore.getState().runtime[SID]?.messages.find((message) => message.role === "user")?.id,
+    );
+
+    seed({ streaming: true, queue: [] });
+    await useChatStore.getState().sendOrQueue("stable queued root");
+    const queued = useChatStore.getState().runtime[SID]?.queue[0];
+    expect(queued?.rootTurnId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+  });
+
+  it("keeps permission state and reports a typed recovery when stop IPC fails", async () => {
+    await useChatStore.getState().sendMessage("long turn", SID);
+    seed({
+      pendingPermission: {
+        intentId: "intent-tool-stop",
+        toolCallId: "tool-stop",
+        toolName: "bash",
+        args: { command: "sleep 10" },
+      },
+    });
+    invokeMock.mockRejectedValueOnce(new Error("database unavailable"));
+
+    await useChatStore.getState().cancelStream();
+
+    const runtime = useChatStore.getState().runtime[SID];
+    const assistant = runtime?.messages[runtime.messages.length - 1];
+    expect(runtime?.streaming).toBe(true);
+    expect(runtime?.pendingPermission?.toolCallId).toBe("tool-stop");
+    expect(assistant?.content).toContain("停止请求未送达");
+    expect(assistant?.runtimeError).toEqual(
+      expect.objectContaining({ code: "CHAT_STOP_FAILED", recoverable: true }),
+    );
+  });
+
+  it("runs postmortem only for completed settlement backed by transport done", async () => {
+    seed({
+      messages: [{ id: "old", role: "user", content: "earlier", createdAt: 0 }],
+    });
+    await useChatStore.getState().sendMessage("first attempt", SID);
+    invokeMock.mockClear();
+
+    streamMock.handler?.({ type: "error", message: "recoverable transport failure" });
+    settle("completed");
+
+    expect(invokeMock).not.toHaveBeenCalledWith("mine_cross_session_patterns", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("run_postmortem", expect.anything());
+
+    await useChatStore.getState().sendMessage("second attempt", SID);
+    invokeMock.mockClear();
+    streamMock.handler?.({ type: "done", input_tokens: 1, output_tokens: 2 });
+    settle("completed");
+
+    expect(invokeMock).toHaveBeenCalledWith("mine_cross_session_patterns", { cwd: "/proj" });
   });
 });

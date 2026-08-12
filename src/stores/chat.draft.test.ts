@@ -96,14 +96,17 @@ describe("lazy draft session", () => {
       modelId: "deepseek-v4",
       text: "",
     } });
+    let firstMessageId: string | undefined;
     mocks.invoke.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "materialize_draft_session") {
-        expect(args).toEqual({
+        expect(args).toEqual(expect.objectContaining({
           draftId: "draft-1",
           cwd: null,
           modelId: "deepseek-v4",
           firstMessage: "第一条真实消息",
-        });
+          firstMessageId: expect.any(String),
+        }));
+        firstMessageId = args?.firstMessageId as string;
         return Promise.resolve(materialized);
       }
       if (cmd === "send_message") return Promise.resolve(undefined);
@@ -116,10 +119,13 @@ describe("lazy draft session", () => {
     ]);
 
     expect(mocks.invoke.mock.calls.filter(([cmd]) => cmd === "materialize_draft_session")).toHaveLength(1);
+    expect(firstMessageId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
     expect(mocks.invoke).toHaveBeenCalledWith("send_message", {
       sessionId: "draft-1",
       content: "第一条真实消息",
-      userMessagePersisted: true,
+      rootTurnId: firstMessageId,
     });
     expect(useChatStore.getState().draftSession).toBeNull();
     expect(useChatStore.getState().activeSession?.id).toBe("draft-1");
@@ -242,7 +248,7 @@ describe("lazy draft session", () => {
     expect(mocks.invoke).not.toHaveBeenCalledWith("update_session_model", expect.anything());
   });
 
-  it("keeps the draft and its text when materialization fails", async () => {
+  it("keeps the draft, text, and exact first-message identity across an uncertain retry", async () => {
     useChatStore.setState({ draftSession: {
       id: "draft-1",
       cwd: "/Users/x/project",
@@ -259,8 +265,33 @@ describe("lazy draft session", () => {
       id: "draft-1",
       cwd: "/Users/x/project",
       text: "不能丢失的需求",
+      firstMessageId: expect.any(String),
     }));
     expect(useChatStore.getState().activeSession).toBeNull();
     expect(mocks.onStream).not.toHaveBeenCalled();
+
+    const firstAttemptId = (
+      mocks.invoke.mock.calls.find(([cmd]) => cmd === "materialize_draft_session")?.[1] as
+        | Record<string, unknown>
+        | undefined
+    )?.firstMessageId;
+    mocks.invoke.mockImplementation((cmd: string) =>
+      cmd === "materialize_draft_session"
+        ? Promise.resolve(materialized)
+        : Promise.resolve(undefined),
+    );
+
+    const retry = await useChatStore.getState().sendOrQueue("不能丢失的需求");
+
+    expect(retry).toBe("sent");
+    const materializationIds = mocks.invoke.mock.calls
+      .filter(([cmd]) => cmd === "materialize_draft_session")
+      .map(([, args]) => (args as Record<string, unknown>).firstMessageId);
+    expect(materializationIds).toEqual([firstAttemptId, firstAttemptId]);
+    expect(mocks.invoke).toHaveBeenCalledWith("send_message", {
+      sessionId: "draft-1",
+      content: "不能丢失的需求",
+      rootTurnId: firstAttemptId,
+    });
   });
 });

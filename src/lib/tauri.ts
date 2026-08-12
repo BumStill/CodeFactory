@@ -115,12 +115,25 @@ export type StreamEvent =
     }
   | {
       type: "permission_request";
+      intent_id: string;
       tool_call_id: string;
       tool_name: string;
       args: unknown;
       expires_at?: number;
     }
   | { type: "done"; input_tokens: number; output_tokens: number }
+  | {
+      type: "turn_settled";
+      run_instance_id: string;
+      root_turn_id?: string | null;
+      objective_id?: string | null;
+      status:
+        | "completed"
+        | "cancelled"
+        | "waiting_system"
+        | "waiting_user"
+        | "failed_setup";
+    }
   | {
       type: "context_usage";
       used_tokens: number;

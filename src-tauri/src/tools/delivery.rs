@@ -15,7 +15,7 @@ use super::{ExecCtx, ToolOutput};
 use crate::agent::delivery::{
     self, DeliverOpts, DeliveryIdentitySnapshot, DeliveryMutationIntentToken,
     DeliveryMutationPermit, DeliveryMutationPermitVerifier, DeliveryRemote, MergeObservation,
-    ObservationStatus, OpenPrObservation, ReleaseUrgency,
+    OpenPrObservation, ReleaseUrgency,
 };
 use crate::agent::delivery_run::{
     self, CoreInputRequest, DeliveryIdentityRevision, DeliveryObservation, NewDeliveryRun,
@@ -756,9 +756,16 @@ async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
     process: &ProcessIdentity,
     remote: Option<&R>,
     takeover: &mut delivery::DeliveryTakeoverObservation,
-) -> Result<()> {
+) -> Result<bool> {
     let intents =
         delivery_run::list_unresolved_delivery_mutation_intents(db, &claimed.run_id).await?;
+    // A settled release intent still proves that durable DB begin happened.
+    // In particular, the old owner can commit the provider result and crash
+    // before upgrading the local receipt from `intent_release`. Looking only
+    // at unresolved intents would then authorize an unsafe second dispatch if
+    // the provider's read API is briefly eventually consistent.
+    let mut release_intent_seen =
+        delivery_run_has_release_mutation_intent(db, &claimed.run_id).await?;
     for intent in intents {
         let confirmation = match intent.rung.as_str() {
             "git_push" => {
@@ -955,26 +962,86 @@ async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
                 }
             }
             "provider_release_trigger" => {
+                release_intent_seen = true;
                 let remote = remote.ok_or_else(|| {
                     crate::errors::AppError::Other(
                         "unresolved release trigger has no read-only release observer".into(),
                     )
                 })?;
+                // `unknown` settlement records uncertainty detail and may
+                // replace the row's current evidence. The immutable started
+                // event retains the original operation envelope, so takeover
+                // resolves identity from that ledger rather than losing the
+                // workflow/ref/head boundary after an in-flight failure.
+                let started_evidence =
+                    started_delivery_mutation_evidence(db, &claimed.run_id, &intent.intent_id)
+                        .await?;
+                let target: delivery::ReleaseDispatchTarget = intent
+                    .evidence_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .or_else(|| {
+                        started_evidence
+                            .as_deref()
+                            .and_then(|value| serde_json::from_str(value).ok())
+                    })
+                    .ok_or_else(|| {
+                        crate::errors::AppError::Other(
+                            "unresolved release trigger lacks an exact workflow/ref/head envelope"
+                                .into(),
+                        )
+                    })?;
+                if target.git_ref != claimed.base_branch
+                    || target.workflow.trim().is_empty()
+                    || target.head_sha.trim().is_empty()
+                    || target.operation_key() != intent.operation_key
+                {
+                    return Err(crate::errors::AppError::Other(
+                        "unresolved release trigger identity does not match its durable workflow/ref/head operation"
+                            .into(),
+                    ));
+                }
                 match remote
-                    .verify_live(&claimed.expected_head_sha, None)
+                    .observe_release_dispatch(&target)
                     .await
                     .map_err(crate::errors::AppError::Other)?
                 {
-                    ObservationStatus::Success(detail) => json!({
+                    delivery::ReleaseDispatchObservation::Triggered {
+                        run_id,
+                        status,
+                        head_sha,
+                        detail,
+                    } if head_sha == target.head_sha => json!({
                         "confirmation": "release_observed",
-                        "head_sha": claimed.expected_head_sha,
+                        "workflow": target.workflow,
+                        "git_ref": target.git_ref,
+                        "head_sha": head_sha,
+                        "run_id": run_id,
+                        "status": status,
                         "detail_digest": format!("sha256:{:x}", Sha256::digest(detail.as_bytes())),
                     }),
-                    _ => {
+                    delivery::ReleaseDispatchObservation::Absent => {
                         return Err(crate::errors::AppError::Other(
-                            "unresolved release trigger has no positive live release observation"
+                            "unresolved release POST may still be in flight; exact absence is observation-only and never replay authority"
                                 .into(),
-                        ))
+                        ));
+                    }
+                    delivery::ReleaseDispatchObservation::Triggered { head_sha, .. } => {
+                        return Err(crate::errors::AppError::Other(format!(
+                            "observed release dispatch head {head_sha} does not match durable {}",
+                            target.head_sha
+                        )));
+                    }
+                    delivery::ReleaseDispatchObservation::HeadMismatch { observed_heads } => {
+                        return Err(crate::errors::AppError::Other(format!(
+                            "release workflow/ref has only nonmatching heads [{}]",
+                            observed_heads.join(", ")
+                        )));
+                    }
+                    delivery::ReleaseDispatchObservation::Unsupported(detail) => {
+                        return Err(crate::errors::AppError::Other(format!(
+                            "unresolved release trigger has no exact read-only observer: {detail}"
+                        )));
                     }
                 }
             }
@@ -1007,7 +1074,46 @@ async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
             )));
         }
     }
-    Ok(())
+    Ok(release_intent_seen)
+}
+
+async fn delivery_run_has_release_mutation_intent(
+    db: &sqlx::SqlitePool,
+    run_id: &str,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_mutation_intents
+         WHERE run_id=? AND rung='provider_release_trigger'",
+    )
+    .bind(run_id)
+    .fetch_one(db)
+    .await?;
+    Ok(count > 0)
+}
+
+async fn started_delivery_mutation_evidence(
+    db: &sqlx::SqlitePool,
+    run_id: &str,
+    intent_id: &str,
+) -> Result<Option<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT detail_json FROM delivery_run_events
+         WHERE run_id=? AND event_kind='mutation_intent_started'
+         ORDER BY created_at, id",
+    )
+    .bind(run_id)
+    .fetch_all(db)
+    .await?;
+    for detail in rows {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&detail) else {
+            continue;
+        };
+        if value.get("intent_id").and_then(serde_json::Value::as_str) != Some(intent_id) {
+            continue;
+        }
+        return Ok(value.get("evidence").map(serde_json::Value::to_string));
+    }
+    Ok(None)
 }
 
 /// Resume an expired recoverable wait after startup. The durable lease was
@@ -1109,7 +1215,7 @@ pub(crate) async fn resume_claimed_delivery(
         }
     };
 
-    if let Err(error) = reconcile_unresolved_delivery_mutation_intents(
+    let release_db_intent_seen = match reconcile_unresolved_delivery_mutation_intents(
         &db,
         &claimed,
         &process,
@@ -1118,9 +1224,52 @@ pub(crate) async fn resume_claimed_delivery(
     )
     .await
     {
+        Ok(seen) => seen,
+        Err(error) => {
+            let failure = DeliveryObservation {
+                head_branch: claimed.head_branch.clone(),
+                stage: "takeover_mutation_reconciliation".into(),
+                status: "platform_incident".into(),
+                wait_class: Some("external_state_uncertain".into()),
+                next_action: Some("observe_only_reconcile".into()),
+                reached_ceiling: claimed.reached_ceiling.clone(),
+                expected_head_sha: claimed.expected_head_sha.clone(),
+                canonical_pr_number: claimed.canonical_pr_number,
+                canonical_pr_url: claimed.canonical_pr_url.clone(),
+                canonical_head_sha: claimed.canonical_head_sha.clone(),
+                failure_signature: Some(format!("mutation_intent_reconciliation:{error}")),
+                core_input: None,
+                identity_revision: None,
+            };
+            let _ = delivery_run::record_delivery_observation(
+                &db,
+                &claimed.run_id,
+                &process,
+                claimed.claim_epoch,
+                &failure,
+                chrono::Utc::now().timestamp_millis(),
+                DELIVERY_LEASE_TTL_MS,
+            )
+            .await;
+            return Err(crate::errors::AppError::Other(format!(
+                "delivery takeover remains observe-only: {error}"
+            )));
+        }
+    };
+
+    if let Err(error) = delivery::reconcile_local_release_intent(
+        &cwd,
+        Some(&claimed.base_branch),
+        &claimed.head_branch,
+        &claimed.expected_head_sha,
+        !release_db_intent_seen,
+        remote.as_ref(),
+    )
+    .await
+    {
         let failure = DeliveryObservation {
             head_branch: claimed.head_branch.clone(),
-            stage: "takeover_mutation_reconciliation".into(),
+            stage: "takeover_release_reconciliation".into(),
             status: "platform_incident".into(),
             wait_class: Some("external_state_uncertain".into()),
             next_action: Some("observe_only_reconcile".into()),
@@ -1129,7 +1278,7 @@ pub(crate) async fn resume_claimed_delivery(
             canonical_pr_number: claimed.canonical_pr_number,
             canonical_pr_url: claimed.canonical_pr_url.clone(),
             canonical_head_sha: claimed.canonical_head_sha.clone(),
-            failure_signature: Some(format!("mutation_intent_reconciliation:{error}")),
+            failure_signature: Some(format!("release_intent_reconciliation:{error}")),
             core_input: None,
             identity_revision: None,
         };
@@ -1641,6 +1790,83 @@ mod tests {
 
     use super::*;
     use crate::agent::delivery::{DeliveryOutcome, RecoveryClass, StepResult};
+
+    struct LiveOnlyReleaseObserver {
+        dispatches: std::sync::atomic::AtomicUsize,
+        release_observation: std::sync::Mutex<Option<delivery::ReleaseDispatchObservation>>,
+        observed_targets: std::sync::Mutex<Vec<delivery::ReleaseDispatchTarget>>,
+    }
+
+    impl delivery::DeliveryRemote for LiveOnlyReleaseObserver {
+        fn capabilities(&self) -> delivery::DeliveryCapabilities {
+            delivery::DeliveryCapabilities {
+                review: true,
+                ci: true,
+                merge: true,
+                release: true,
+                live: true,
+            }
+        }
+
+        async fn open_or_get_pr(
+            &self,
+            _title: &str,
+            _body: &str,
+            _head: &str,
+            _base: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<delivery::DeliveryPr, String> {
+            unreachable!("release reconciliation is read-only")
+        }
+
+        async fn ci_status(&self, _sha: &str) -> std::result::Result<delivery::CiStatus, String> {
+            unreachable!("release reconciliation does not inspect CI")
+        }
+
+        async fn merge_pr(
+            &self,
+            _number: u64,
+            _method: crate::config::settings::MergeMethod,
+            _commit_message: Option<&delivery::MergeCommitMessage>,
+            _expected_head: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<delivery::MergeRequestResult, String> {
+            unreachable!("release reconciliation must never merge")
+        }
+
+        async fn trigger_release(
+            &self,
+            _head_sha: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<String, String> {
+            self.dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("unexpected dispatch".into())
+        }
+
+        async fn observe_release_dispatch(
+            &self,
+            target: &delivery::ReleaseDispatchTarget,
+        ) -> std::result::Result<delivery::ReleaseDispatchObservation, String> {
+            self.observed_targets.lock().unwrap().push(target.clone());
+            Ok(self
+                .release_observation
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(delivery::ReleaseDispatchObservation::Absent))
+        }
+
+        async fn verify_live(
+            &self,
+            _sha: &str,
+            _url: Option<&str>,
+        ) -> std::result::Result<delivery::ObservationStatus, String> {
+            Ok(delivery::ObservationStatus::Success(
+                "generic live endpoint happened to match".into(),
+            ))
+        }
+    }
 
     #[test]
     fn foreground_delivery_lease_owner_is_unique_per_invocation() {
@@ -2608,6 +2834,368 @@ mod tests {
         )
         .await
         .unwrap());
+    }
+
+    #[tokio::test]
+    async fn release_mutation_intent_rejects_nonmatching_workflow_ref_head_even_if_live_is_green() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let owner = ProcessIdentity::new("release-owner", "1.79.2", "17902");
+        let competitor = ProcessIdentity::new("release-competitor", "1.79.2", "17902");
+        let now = chrono::Utc::now().timestamp_millis();
+        let run = NewDeliveryRun {
+            id: "release-takeover-run".into(),
+            objective_id: "objective-opaque-release-takeover".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:release-takeover".into(),
+            repo_identity: "repo:release-takeover".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "expected-head".into(),
+            canonical_pr_number: Some(7),
+            canonical_pr_url: Some("https://example.invalid/pr/7".into()),
+            canonical_head_sha: Some("expected-head".into()),
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "merged".into(),
+            stage: "release".into(),
+            status: "waiting".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("observe_only_reconcile".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let epoch = delivery_run::create_delivery_run(&pool, &run, &owner, now, 60_000)
+            .await
+            .unwrap();
+        assert!(delivery_run::begin_delivery_mutation_intent(
+            &pool,
+            "release-intent",
+            &run.id,
+            &owner,
+            epoch,
+            "provider_release_trigger",
+            "sha256:not-the-exact-operation",
+            Some(
+                r#"{"workflow":"other-release.yml","git_ref":"other","expected_head":"other-head"}"#,
+            ),
+            now + 1,
+        )
+        .await
+        .unwrap());
+        assert!(delivery_run::mark_delivery_mutation_intent_unknown(
+            &pool,
+            "release-intent",
+            &owner,
+            epoch,
+            Some(r#"{"classification":"post_in_flight"}"#),
+            now + 2,
+        )
+        .await
+        .unwrap());
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(&run.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = delivery_run::plan_startup_recovery(&pool, &competitor, now + 3, 60_000)
+            .await
+            .unwrap()
+            .claimed
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut takeover = delivery::DeliveryTakeoverObservation {
+            identity: DeliveryIdentitySnapshot {
+                repo_identity: run.repo_identity.clone(),
+                worktree_identity: run.worktree_identity.clone(),
+                head_sha: run.expected_head_sha.clone(),
+                change_set_digest: run.change_set_digest.clone(),
+            },
+            remote_head_sha: Some(run.expected_head_sha.clone()),
+            canonical_pr_number: Some(7),
+            canonical_pr_url: Some("https://example.invalid/pr/7".into()),
+            canonical_head_sha: Some(run.expected_head_sha.clone()),
+        };
+        let remote = LiveOnlyReleaseObserver {
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+            release_observation: std::sync::Mutex::new(None),
+            observed_targets: std::sync::Mutex::new(Vec::new()),
+        };
+
+        reconcile_unresolved_delivery_mutation_intents(
+            &pool,
+            &claimed,
+            &competitor,
+            Some(&remote),
+            &mut takeover,
+        )
+        .await
+        .expect_err("generic live evidence must not reconcile a different workflow/ref/head");
+
+        assert_eq!(
+            remote.dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM delivery_mutation_intents WHERE intent_id='release-intent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "unknown");
+    }
+
+    #[tokio::test]
+    async fn in_flight_release_post_reconciles_only_the_exact_workflow_ref_head_without_redispatch()
+    {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let owner = ProcessIdentity::new("release-owner-exact", "1.79.2", "17902");
+        let competitor = ProcessIdentity::new("release-competitor-exact", "1.79.2", "17902");
+        let now = chrono::Utc::now().timestamp_millis();
+        let run = NewDeliveryRun {
+            id: "release-takeover-exact-run".into(),
+            objective_id: "objective-opaque-release-exact".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:release-exact".into(),
+            repo_identity: "repo:release-exact".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "delivery-feature-head".into(),
+            canonical_pr_number: Some(7),
+            canonical_pr_url: Some("https://example.invalid/pr/7".into()),
+            canonical_head_sha: Some("delivery-feature-head".into()),
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "merged".into(),
+            stage: "release".into(),
+            status: "waiting".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("observe_only_reconcile".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let epoch = delivery_run::create_delivery_run(&pool, &run, &owner, now, 60_000)
+            .await
+            .unwrap();
+        let target = delivery::ReleaseDispatchTarget {
+            workflow: "auto-release.yml".into(),
+            git_ref: run.base_branch.clone(),
+            head_sha: "release-main-head".into(),
+        };
+        let envelope = serde_json::to_string(&target).unwrap();
+        assert!(delivery_run::begin_delivery_mutation_intent(
+            &pool,
+            "release-exact-intent",
+            &run.id,
+            &owner,
+            epoch,
+            "provider_release_trigger",
+            &target.operation_key(),
+            Some(&envelope),
+            now + 1,
+        )
+        .await
+        .unwrap());
+        assert!(delivery_run::mark_delivery_mutation_intent_unknown(
+            &pool,
+            "release-exact-intent",
+            &owner,
+            epoch,
+            Some(r#"{"classification":"post_in_flight"}"#),
+            now + 2,
+        )
+        .await
+        .unwrap());
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(&run.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = delivery_run::plan_startup_recovery(&pool, &competitor, now + 3, 60_000)
+            .await
+            .unwrap()
+            .claimed
+            .into_iter()
+            .next()
+            .unwrap();
+        let remote = LiveOnlyReleaseObserver {
+            dispatches: std::sync::atomic::AtomicUsize::new(0),
+            release_observation: std::sync::Mutex::new(Some(
+                delivery::ReleaseDispatchObservation::Triggered {
+                    run_id: "workflow-run-42".into(),
+                    status: "in_progress".into(),
+                    head_sha: target.head_sha.clone(),
+                    detail: "https://example.invalid/actions/runs/42".into(),
+                },
+            )),
+            observed_targets: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut takeover = delivery::DeliveryTakeoverObservation {
+            identity: DeliveryIdentitySnapshot {
+                repo_identity: run.repo_identity.clone(),
+                worktree_identity: run.worktree_identity.clone(),
+                head_sha: run.expected_head_sha.clone(),
+                change_set_digest: run.change_set_digest.clone(),
+            },
+            remote_head_sha: Some(run.expected_head_sha.clone()),
+            canonical_pr_number: Some(7),
+            canonical_pr_url: Some("https://example.invalid/pr/7".into()),
+            canonical_head_sha: Some(run.expected_head_sha.clone()),
+        };
+
+        reconcile_unresolved_delivery_mutation_intents(
+            &pool,
+            &claimed,
+            &competitor,
+            Some(&remote),
+            &mut takeover,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*remote.observed_targets.lock().unwrap(), vec![target]);
+        assert_eq!(
+            remote.dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM delivery_mutation_intents WHERE intent_id='release-exact-intent'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "reconciled_committed");
+    }
+
+    #[tokio::test]
+    async fn committed_release_intent_still_fences_local_absence_replay() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let owner = ProcessIdentity::new("release-owner-committed", "1.79.2", "17902");
+        let competitor = ProcessIdentity::new("release-competitor-committed", "1.79.2", "17902");
+        let now = chrono::Utc::now().timestamp_millis();
+        let run = NewDeliveryRun {
+            id: "release-takeover-committed-run".into(),
+            objective_id: "objective-opaque-release-committed".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:release-committed".into(),
+            repo_identity: "repo:release-committed".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "delivery-feature-head".into(),
+            canonical_pr_number: Some(7),
+            canonical_pr_url: Some("https://example.invalid/pr/7".into()),
+            canonical_head_sha: Some("delivery-feature-head".into()),
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "merged".into(),
+            stage: "release".into(),
+            status: "waiting".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("observe_only_reconcile".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let epoch = delivery_run::create_delivery_run(&pool, &run, &owner, now, 60_000)
+            .await
+            .unwrap();
+        let target = delivery::ReleaseDispatchTarget {
+            workflow: "auto-release.yml".into(),
+            git_ref: run.base_branch.clone(),
+            head_sha: "release-main-head".into(),
+        };
+        assert!(delivery_run::begin_delivery_mutation_intent(
+            &pool,
+            "release-committed-intent",
+            &run.id,
+            &owner,
+            epoch,
+            "provider_release_trigger",
+            &target.operation_key(),
+            Some(&serde_json::to_string(&target).unwrap()),
+            now + 1,
+        )
+        .await
+        .unwrap());
+        assert!(delivery_run::resolve_delivery_mutation_intent_committed(
+            &pool,
+            "release-committed-intent",
+            &owner,
+            epoch,
+            Some(r#"{"dispatch":"accepted"}"#),
+            now + 2,
+        )
+        .await
+        .unwrap());
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(&run.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = delivery_run::plan_startup_recovery(&pool, &competitor, now + 3, 60_000)
+            .await
+            .unwrap()
+            .claimed
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut takeover = delivery::DeliveryTakeoverObservation {
+            identity: DeliveryIdentitySnapshot {
+                repo_identity: run.repo_identity.clone(),
+                worktree_identity: run.worktree_identity.clone(),
+                head_sha: run.expected_head_sha.clone(),
+                change_set_digest: run.change_set_digest.clone(),
+            },
+            remote_head_sha: Some(run.expected_head_sha.clone()),
+            canonical_pr_number: Some(7),
+            canonical_pr_url: run.canonical_pr_url.clone(),
+            canonical_head_sha: run.canonical_head_sha.clone(),
+        };
+
+        assert!(
+            reconcile_unresolved_delivery_mutation_intents(
+                &pool,
+                &claimed,
+                &competitor,
+                None::<&delivery::EitherRemote>,
+                &mut takeover,
+            )
+            .await
+            .unwrap(),
+            "a committed release dispatch still proves DB begin occurred and must fence local absence replay"
+        );
     }
 
     #[tokio::test]

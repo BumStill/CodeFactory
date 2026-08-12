@@ -91,7 +91,33 @@ where
     F: FnMut() -> RequestBuilder,
     N: FnMut(RetryNotice),
 {
-    for attempt in 1..=MODEL_HTTP_MAX_ATTEMPTS {
+    send_with_attempt_budget_and_notify_policy(
+        label,
+        || build_request(),
+        |notice| notify_retry(notice),
+        response_body,
+        MODEL_HTTP_MAX_ATTEMPTS,
+    )
+    .await
+}
+
+/// Execute a model request with an explicit POST budget. Durable provider
+/// attempts pass `1`: retrying a timeout inside an already in-flight attempt
+/// would otherwise create an unreceipted duplicate request. Callers without a
+/// write-ahead provider attempt retain the legacy bounded retry budget.
+pub async fn send_with_attempt_budget_and_notify_policy<F, N>(
+    label: &str,
+    mut build_request: F,
+    mut notify_retry: N,
+    response_body: RetryResponseBody,
+    max_attempts: usize,
+) -> Result<Response>
+where
+    F: FnMut() -> RequestBuilder,
+    N: FnMut(RetryNotice),
+{
+    let max_attempts = max_attempts.clamp(1, MODEL_HTTP_MAX_ATTEMPTS);
+    for attempt in 1..=max_attempts {
         match build_request()
             .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .send()
@@ -99,7 +125,7 @@ where
         {
             Ok(response) => {
                 let status = response.status();
-                if attempt < MODEL_HTTP_MAX_ATTEMPTS && is_retryable_status(status) {
+                if attempt < max_attempts && is_retryable_status(status) {
                     let detail = response.text().await.unwrap_or_default();
                     let delay = retry_delay(attempt);
                     let visible_detail = match response_body {
@@ -121,7 +147,7 @@ where
                             label,
                             status,
                             attempt,
-                            MODEL_HTTP_MAX_ATTEMPTS,
+                            max_attempts,
                             delay,
                         );
                     } else {
@@ -130,7 +156,7 @@ where
                             label,
                             status,
                             attempt,
-                            MODEL_HTTP_MAX_ATTEMPTS,
+                            max_attempts,
                             delay,
                             visible_detail
                         );
@@ -138,7 +164,7 @@ where
                     notify_retry(RetryNotice {
                         label: label.to_string(),
                         attempt,
-                        max_attempts: MODEL_HTTP_MAX_ATTEMPTS,
+                        max_attempts,
                         delay,
                         reason,
                     });
@@ -147,21 +173,21 @@ where
                 }
                 return Ok(response);
             }
-            Err(err) if attempt < MODEL_HTTP_MAX_ATTEMPTS && is_retryable_reqwest_error(&err) => {
+            Err(err) if attempt < max_attempts && is_retryable_reqwest_error(&err) => {
                 let delay = retry_delay(attempt);
                 let reason = format!("transport error: {err}");
                 tracing::warn!(
                     "{} transport failure on attempt {}/{}; retrying in {:?}: {}",
                     label,
                     attempt,
-                    MODEL_HTTP_MAX_ATTEMPTS,
+                    max_attempts,
                     delay,
                     err
                 );
                 notify_retry(RetryNotice {
                     label: label.to_string(),
                     attempt,
-                    max_attempts: MODEL_HTTP_MAX_ATTEMPTS,
+                    max_attempts,
                     delay,
                     reason,
                 });

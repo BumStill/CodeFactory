@@ -8,7 +8,6 @@
 
 import { create } from "zustand";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "../lib/tauri";
 
@@ -27,7 +26,16 @@ export interface UpdateSafetyStatus {
   managed_browser_sessions: number;
   terminal_sessions: number;
   update_objective_id?: string | null;
-  update_install_state?: "install_permitted" | "observe_only" | "applied" | null;
+  update_install_state?:
+    | "observe_only" // legacy read-only projection; never grants install authority
+    | "queued"
+    | "install_permitted"
+    | "definitely_not_applied"
+    | "still_unknown"
+    | "conflict"
+    | "applied"
+    | null;
+  update_receipt_id?: string | null;
   target_version?: string | null;
   target_build?: string | null;
 }
@@ -37,7 +45,13 @@ export interface UpdateInstallObservation {
   objective_id: string | null;
   target_version: string;
   target_build: string;
-  state: "install_permitted" | "observe_only" | "applied";
+  state:
+    | "install_permitted"
+    | "definitely_not_applied"
+    | "still_unknown"
+    | "conflict"
+    | "applied";
+  recovery_replay_count: number;
   observed_at: number;
 }
 
@@ -188,33 +202,12 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
       return;
     }
     try {
-      if (phase.kind === "available") {
-        set({ phase: { kind: "downloading", received: 0, total: null } });
-        await update.download((event) => {
-          switch (event.event) {
-            case "Started":
-              set({ phase: { kind: "downloading", received: 0, total: event.data.contentLength ?? null } });
-              break;
-            case "Progress":
-              set((s) =>
-                s.phase.kind === "downloading"
-                  ? { phase: { ...s.phase, received: s.phase.received + event.data.chunkLength } }
-                  : s,
-              );
-              break;
-            case "Finished":
-              break;
-          }
-        });
-      }
-
       let safety: UpdateSafetyStatus | null = null;
       let safetyCheckError: string | null = null;
       try {
         safety = await invoke<UpdateSafetyStatus>("reserve_update_install", {
           targetVersion: update.version,
           targetBuild,
-          claimPermit: null,
         });
       } catch (error) {
         // Unknown safety is unsafe. Keep retrying locally instead of asking the
@@ -234,48 +227,37 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
         return;
       }
 
-      if (
-        !safety?.safe_to_restart
-        || !safety.restart_reserved
-        || safety.update_install_state !== "install_permitted"
-      ) {
-        set({
-          phase: {
-            kind: "waiting_for_safe_restart",
-            update,
-            blockers: safety,
-            safetyCheckError,
-            checkedAt: Date.now(),
-          },
-        });
-        if (get().safeRetryHandle === null) {
-          const handle = window.setTimeout(() => {
-            set({ safeRetryHandle: null });
-            void get().install();
-          }, SAFE_RESTART_RETRY_MS);
-          set({ safeRetryHandle: handle });
-        }
-        return;
+      // The renderer only requests durable recovery. It never owns an Update
+      // mutation permit and therefore never downloads, installs, or relaunches
+      // the app. The backend supervisor observes the exact target binding and
+      // may install only with its current owner+epoch permit.
+      set({
+        phase: {
+          kind: "waiting_for_safe_restart",
+          update,
+          blockers: safety,
+          safetyCheckError,
+          checkedAt: Date.now(),
+        },
+      });
+      if (get().safeRetryHandle === null) {
+        const handle = window.setTimeout(() => {
+          set({ safeRetryHandle: null });
+          void get().install();
+        }, SAFE_RESTART_RETRY_MS);
+        set({ safeRetryHandle: handle });
       }
-
-      if (get().safeRetryHandle !== null) {
-        window.clearTimeout(get().safeRetryHandle!);
-        set({ safeRetryHandle: null });
-      }
-      set({ phase: { kind: "installing" } });
-      await update.install();
-      set({ phase: { kind: "ready" } });
-      setTimeout(() => {
-        void relaunch().catch(async (error) => {
-          await invoke("release_update_install_reservation").catch(console.error);
-          const message = error instanceof Error ? error.message : String(error);
-          set({ phase: { kind: "error", message, checkedAt: Date.now() } });
-        });
-      }, 800);
     } catch (err) {
-      await invoke("release_update_install_reservation").catch(console.error);
       const msg = err instanceof Error ? err.message : String(err);
-      set({ phase: { kind: "error", message: msg, checkedAt: Date.now() } });
+      set({
+        phase: {
+          kind: "waiting_for_safe_restart",
+          update,
+          blockers: null,
+          safetyCheckError: msg,
+          checkedAt: Date.now(),
+        },
+      });
     }
   },
 

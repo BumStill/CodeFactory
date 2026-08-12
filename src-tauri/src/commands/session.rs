@@ -54,6 +54,7 @@ async fn materialize_session_and_first_message(
     endpoint_id: &str,
     model_id: &str,
     model_policy: &str,
+    first_message_id: &str,
     first_message: &str,
     now: i64,
 ) -> Result<Session, AppError> {
@@ -62,7 +63,26 @@ async fn materialize_session_and_first_message(
         .fetch_optional(pool)
         .await?
     {
-        return Ok(existing);
+        let persisted = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT id, session_id, role, content FROM messages WHERE id = ?",
+        )
+        .bind(first_message_id)
+        .fetch_optional(pool)
+        .await?;
+        if persisted
+            == Some((
+                first_message_id.to_string(),
+                draft_id.to_string(),
+                "user".to_string(),
+                first_message.to_string(),
+            ))
+        {
+            return Ok(existing);
+        }
+        return Err(AppError::Other(
+            "DRAFT_MATERIALIZATION_IDENTITY_MISMATCH: existing session does not contain the exact first user message"
+                .into(),
+        ));
     }
 
     let mut tx = pool.begin().await?;
@@ -87,7 +107,7 @@ async fn materialize_session_and_first_message(
         "INSERT INTO messages (id, session_id, role, content, created_at)
          VALUES (?, ?, 'user', ?, ?)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(first_message_id)
     .bind(draft_id)
     .bind(first_message)
     .bind(now)
@@ -114,12 +134,15 @@ pub async fn materialize_draft_session(
     draft_id: String,
     cwd: Option<String>,
     model_id: String,
+    first_message_id: String,
     first_message: String,
     state: State<'_, AppState>,
 ) -> Result<Session, AppError> {
     if first_message.trim().is_empty() {
         return Err(AppError::Other("First message cannot be empty".into()));
     }
+    Uuid::parse_str(&first_message_id)
+        .map_err(|_| AppError::Other("First message identity must be a valid UUID".into()))?;
 
     let settings = state.settings.read().await.clone();
     let resolved_model = resolve_new_session_model(&settings, &model_id).ok_or_else(|| {
@@ -160,6 +183,7 @@ pub async fn materialize_draft_session(
         &settings.default_endpoint,
         &resolved_model,
         new_session_model_policy(&settings),
+        &first_message_id,
         &first_message,
         Utc::now().timestamp_millis(),
     )
@@ -1092,6 +1116,7 @@ mod tests {
             "deepseek",
             "deepseek-v4",
             "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d63",
             "第一条真实消息",
             123,
         )
@@ -1115,6 +1140,11 @@ mod tests {
             .unwrap();
         assert_eq!(session_count, 1);
         assert_eq!(message_count, 1);
+        let persisted_id: String = sqlx::query_scalar("SELECT id FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(persisted_id, "019f9bd3-e868-7c5a-94a8-74d551ea8d63");
     }
 
     #[tokio::test]
@@ -1143,6 +1173,7 @@ mod tests {
             "deepseek",
             "model",
             "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d64",
             "reject",
             123,
         )
@@ -1178,6 +1209,7 @@ mod tests {
                 "deepseek",
                 "model",
                 "prefer",
+                "019f9bd3-e868-7c5a-94a8-74d551ea8d65",
                 "只保存一次",
                 123,
             )
@@ -1191,6 +1223,77 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(message_count, 1);
+    }
+
+    #[tokio::test]
+    async fn materialization_fails_closed_when_existing_session_identity_mismatches() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        create_materialization_schema(&pool).await;
+
+        materialize_session_and_first_message(
+            &pool,
+            "draft-1",
+            "project",
+            "/tmp/project",
+            "deepseek",
+            "model",
+            "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d66",
+            "原始首消息",
+            123,
+        )
+        .await
+        .expect("first materialization");
+
+        let wrong_content = materialize_session_and_first_message(
+            &pool,
+            "draft-1",
+            "project",
+            "/tmp/project",
+            "deepseek",
+            "model",
+            "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d66",
+            "被替换的内容",
+            124,
+        )
+        .await;
+        assert!(wrong_content.is_err(), "content mismatch must fail closed");
+
+        let wrong_id = materialize_session_and_first_message(
+            &pool,
+            "draft-1",
+            "project",
+            "/tmp/project",
+            "deepseek",
+            "model",
+            "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d67",
+            "原始首消息",
+            124,
+        )
+        .await;
+        assert!(wrong_id.is_err(), "message id mismatch must fail closed");
+
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT id, session_id, role, content FROM messages WHERE session_id='draft-1'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "019f9bd3-e868-7c5a-94a8-74d551ea8d66".into(),
+                "draft-1".into(),
+                "user".into(),
+                "原始首消息".into(),
+            )]
+        );
     }
 
     async fn create_materialization_schema(pool: &sqlx::SqlitePool) {

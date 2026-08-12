@@ -30,6 +30,7 @@ export interface TurnActivityState {
 }
 
 export interface PendingPermission {
+  intentId: string;
   toolCallId: string;
   toolName: string;
   args: unknown;
@@ -53,9 +54,8 @@ export interface UIMessage {
   inputTokens?: number;
   outputTokens?: number;
   createdAt: number;
-  /** Wall-clock the turn took, frozen when the stream reached a terminal
-   *  state (done/error). Absent while still streaming (the UI ticks live off
-   *  `createdAt` instead) and for plain user messages. */
+  /** Wall-clock the turn took, frozen only when the durable run settles.
+   * Transport completion/error can still be followed by recovery work. */
   durationMs?: number;
   /** Internal completion-review provenance from the DB. Drafts and
    *  injected review instructions are excluded from the chat transcript. */
@@ -160,6 +160,10 @@ export interface ChatEventState {
   contextUsage: ContextUsage | null;
   /** Set whenever the backend just elided messages; UI shows a toast. */
   compressionToast: CompressionToast | null;
+  /** The current run emitted a successful transport-level `done`. Settlement
+   * may arrive later; only a completed settlement with this evidence may
+   * trigger post-mortem work. Optional for legacy/test state fixtures. */
+  transportDoneSucceeded?: boolean;
 }
 
 function updateMessageById(
@@ -279,6 +283,7 @@ export function reduceChatStreamEvent(
       return {
         ...state,
         pendingPermission: {
+          intentId: event.intent_id,
           toolCallId: event.tool_call_id,
           toolName: event.tool_name,
           args: event.args,
@@ -319,25 +324,19 @@ export function reduceChatStreamEvent(
     }
 
     case "done": {
-      const endedAt = Date.now();
       return {
         ...state,
-        streaming: false,
+        transportDoneSucceeded: true,
         inputTokenTotal: state.inputTokenTotal + event.input_tokens,
         outputTokenTotal: state.outputTokenTotal + event.output_tokens,
-        messages: updateMessageById(state.messages, msgId, (m) =>
-          m.durationMs == null ? { ...m, durationMs: Math.max(0, endedAt - m.createdAt) } : m,
-        ),
       };
     }
 
     case "error": {
-      const endedAt = Date.now();
       const modelRoutesExhausted = isModelRouteExhaustedError(event.message);
       return {
         ...state,
-        streaming: false,
-        pendingPermission: null,
+        transportDoneSucceeded: false,
         messages: updateMessageById(state.messages, msgId, (m) => {
           if (modelRoutesExhausted) {
             const presentation = presentChatInvocationError(event.message);
@@ -345,24 +344,20 @@ export function reduceChatStreamEvent(
               ...m,
               content: presentation.content,
               failureEvidence: presentation.failureEvidence,
-              durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
             };
           }
           return {
             ...m,
             content: m.content + `\n\nError: ${event.message}`,
-            durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
           };
         }),
       };
     }
 
     case "runtime_error": {
-      const endedAt = Date.now();
       return {
         ...state,
-        streaming: false,
-        pendingPermission: null,
+        transportDoneSucceeded: false,
         messages: updateMessageById(state.messages, msgId, (message) => ({
           ...message,
           content: event.message,
@@ -371,9 +366,21 @@ export function reduceChatStreamEvent(
             endpointId: event.endpoint_id,
             recoverable: event.recoverable,
           },
-          durationMs:
-            message.durationMs ?? Math.max(0, endedAt - message.createdAt),
         })),
+      };
+    }
+
+    case "turn_settled": {
+      const endedAt = Date.now();
+      return {
+        ...state,
+        streaming: false,
+        pendingPermission: null,
+        messages: updateMessageById(state.messages, msgId, (message) =>
+          message.durationMs == null
+            ? { ...message, durationMs: Math.max(0, endedAt - message.createdAt) }
+            : message,
+        ),
       };
     }
 

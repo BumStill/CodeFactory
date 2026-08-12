@@ -109,12 +109,14 @@ export function UpdaterBanner() {
           <div className="flex items-center gap-2">
             <RefreshCw size={14} />
             <span>
-              {phase.blockers?.update_install_state === "observe_only"
+              {phase.blockers?.update_install_state === "still_unknown" ||
+              phase.blockers?.update_install_state === "observe_only"
                 ? "正在核对上次安装结果…"
                 : "更新已下载，等待执行中的 session 到达安全点…"}
             </span>
           </div>
-          {phase.blockers?.update_install_state === "observe_only" ? (
+          {phase.blockers?.update_install_state === "still_unknown" ||
+          phase.blockers?.update_install_state === "observe_only" ? (
             <p className="text-caption text-gray-500">
               当前仅观察目标版本与 build_git_sha，不会重复安装未知结果。
             </p>

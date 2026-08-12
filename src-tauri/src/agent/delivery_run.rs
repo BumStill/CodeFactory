@@ -2390,7 +2390,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_0001_through_0008_preserves_rows_tables_indexes_and_integrity() {
+    async fn migration_0001_through_0009_preserves_rows_tables_indexes_and_integrity() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -2421,6 +2421,7 @@ mod tests {
             include_str!("../../migrations/0006_session_auto_title.sql"),
             include_str!("../../migrations/0007_unified_objective_control_plane.sql"),
             include_str!("../../migrations/0008_delivery_identity_revisions.sql"),
+            include_str!("../../migrations/0009_chat_run_controls.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         }
@@ -2452,6 +2453,9 @@ mod tests {
             "idx_delivery_mutation_intents_one_unresolved",
             "idx_delivery_mutation_intents_operation",
             "idx_tool_calls_objective_binding",
+            "chat_run_controls",
+            "idx_chat_run_controls_session",
+            "idx_chat_run_controls_cancel_requested",
         ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master

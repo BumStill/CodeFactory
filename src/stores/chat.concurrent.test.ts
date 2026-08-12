@@ -51,6 +51,15 @@ function lastContent(id: string) {
   const msgs = rt(id).messages;
   return msgs[msgs.length - 1]?.content;
 }
+function settle(id: string) {
+  streamHandlers[id]({
+    type: "turn_settled",
+    run_instance_id: `run-${id}`,
+    root_turn_id: `root-${id}`,
+    objective_id: `objective-${id}`,
+    status: "completed",
+  });
+}
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -98,9 +107,12 @@ describe("per-session streaming concurrency", () => {
     useChatStore.setState({ activeSession: B as never });
     await useChatStore.getState().sendMessage("hi B");
 
-    // A finishes while B is the foreground session.
+    // Transport completion is not settlement, even for a background session.
     streamHandlers.A({ type: "done", input_tokens: 1, output_tokens: 2 });
+    expect(rt("A").streaming).toBe(true);
+    expect(rt("B").streaming).toBe(true);
 
+    settle("A");
     expect(rt("A").streaming).toBe(false);
     expect(rt("B").streaming).toBe(true);
     // The active view (B) is unaffected — still streaming.
@@ -128,6 +140,9 @@ describe("per-session streaming concurrency", () => {
 
     await useChatStore.getState().sendMessage("finish this", "A");
     streamHandlers.A({ type: "done", input_tokens: 1, output_tokens: 2 });
+    expect(invokeMock).not.toHaveBeenCalledWith("mine_cross_session_patterns", expect.anything());
+
+    settle("A");
 
     // Deterministic local mining (no model call) runs out of the box …
     expect(invokeMock).toHaveBeenCalledWith("mine_cross_session_patterns", { cwd: "/p/A" });
@@ -152,6 +167,10 @@ describe("per-session streaming concurrency", () => {
 
     await useChatStore.getState().sendMessage("finish this", "B");
     streamHandlers.B({ type: "done", input_tokens: 1, output_tokens: 2 });
+    expect(invokeMock).not.toHaveBeenCalledWith("mine_cross_session_patterns", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("run_postmortem", expect.anything());
+
+    settle("B");
 
     // With opt-in on, BOTH the local miner and the remote post-mortem fire.
     expect(invokeMock).toHaveBeenCalledWith("mine_cross_session_patterns", { cwd: "/p/B" });

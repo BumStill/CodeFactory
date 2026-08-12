@@ -45,7 +45,9 @@ export function UpdateStatusPill() {
 
   if (phase.kind === "waiting_for_safe_restart") {
     const objectiveBlockers = describeUpdateObjectiveBlockers(phase.blockers);
-    const observingUnknownInstall = phase.blockers?.update_install_state === "observe_only";
+    const observingUnknownInstall =
+      phase.blockers?.update_install_state === "still_unknown" ||
+      phase.blockers?.update_install_state === "observe_only";
     return (
       <span
         className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/15 text-caption text-amber-800 dark:text-amber-300"

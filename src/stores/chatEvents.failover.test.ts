@@ -93,13 +93,27 @@ describe("model route failover stream events", () => {
       "assistant-1",
     );
 
-    expect(next.streaming).toBe(false);
+    expect(next.streaming).toBe(true);
     expect(next.messages[0].content).toContain("所有已配置且有凭据的模型端点都暂时不可用");
     expect(next.messages[0].content).toContain("目标与失败证据已保留");
     expect(next.messages[0].content).toContain("系统将按退避策略重新观测可用路由");
     expect(next.messages[0].content).not.toMatch(/重试|继续执行|回到对话/);
     expect(next.messages[0].failureEvidence).toContain("ChatGPT / gpt-5.5");
     expect(next.messages[0].failureEvidence).toContain("DeepSeek / deepseek-v4-pro");
+
+    const settled = reduceChatStreamEvent(
+      next,
+      {
+        type: "turn_settled",
+        run_instance_id: "run-failover-1",
+        root_turn_id: "root-failover-1",
+        objective_id: "objective-failover-1",
+        status: "waiting_system",
+      },
+      "assistant-1",
+    );
+    expect(settled.streaming).toBe(false);
+    expect(settled.messages[0].content).toBe(next.messages[0].content);
   });
 
   it("normalizes a pre-stream invoke rejection into the same actionable state", () => {

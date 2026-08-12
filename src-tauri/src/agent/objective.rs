@@ -168,6 +168,7 @@ pub struct ObjectiveSnapshot {
     pub lease_owner: Option<String>,
     pub lease_expires_at: Option<i64>,
     pub evidence_ref: Option<String>,
+    pub cancellation_provenance: Option<String>,
     pub last_progress_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -210,6 +211,7 @@ impl ObjectiveSnapshot {
             lease_owner: None,
             lease_expires_at: None,
             evidence_ref: None,
+            cancellation_provenance: None,
             last_progress_at: Some(now),
             created_at: now,
             updated_at: now,
@@ -274,6 +276,7 @@ impl ObjectiveSnapshot {
             lease_owner: row.try_get("lease_owner")?,
             lease_expires_at: row.try_get("lease_expires_at")?,
             evidence_ref: row.try_get("evidence_ref")?,
+            cancellation_provenance: row.try_get("cancellation_provenance")?,
             last_progress_at: row.try_get("last_progress_at")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -333,6 +336,9 @@ impl DecisionEnvelope {
     fn validate(&self, objective: &ObjectiveSnapshot) -> anyhow::Result<()> {
         if self.objective_id != objective.id || self.revision != objective.revision + 1 {
             bail!("objective decision revision/identity mismatch");
+        }
+        if objective.status.is_terminal() {
+            bail!("terminal objective cannot accept another decision");
         }
         let user_state = matches!(
             self.status,
@@ -466,7 +472,7 @@ impl DecisionRouter {
             } => {
                 decision.domain = domain;
                 decision.decision_type = match failure_code.as_str() {
-                    "platform_incident" | "permission_timeout" | "permission_channel_closed" => {
+                    "platform_incident" | "permission_timed_out" | "permission_channel_closed" => {
                         DecisionType::PlatformIncident
                     }
                     "failed_internal" | "panic" => DecisionType::FailedInternal,
@@ -489,6 +495,11 @@ impl DecisionRouter {
                 resume_cursor,
             } => {
                 decision.domain = domain;
+                // Keep the stable authorization identity while the restored
+                // capability is queued and claimed. Domain adapters bind their
+                // secret-free receipt to this key; clearing it here would split
+                // the OAuth callback from the very Objective it must resume.
+                decision.request_key = objective.request_key.clone();
                 decision.decision_type = DecisionType::ApplyRecommended;
                 decision.status = ObjectiveStatus::WaitingSystem;
                 decision.failure_code = Some(reason.clone());
@@ -747,6 +758,32 @@ pub fn decision_for_run_outcome_with_reason(
     }
 
     let (failure_code, domain) = match outcome.stop_reason {
+        StopReason::PlatformIncident
+            if matches!(
+                terminal_reason,
+                Some("permission_timed_out" | "permission_channel_closed")
+            ) =>
+        {
+            (
+                terminal_reason.expect("matched permission interruption"),
+                RecoveryDomain::Permission,
+            )
+        }
+        StopReason::PlatformIncident
+            if matches!(
+                terminal_reason,
+                Some(
+                    "context_compaction_exhausted"
+                        | "context_overflow_after_compaction"
+                        | "context_compression_unavailable"
+                )
+            ) =>
+        {
+            (
+                terminal_reason.expect("matched typed context recovery outcome"),
+                RecoveryDomain::Context,
+            )
+        }
         StopReason::PlatformIncident => ("platform_incident", RecoveryDomain::Tool),
         StopReason::FailedInternal => ("failed_internal", RecoveryDomain::Chat),
         StopReason::BudgetExhausted => ("run_budget_exhausted", RecoveryDomain::Chat),
@@ -969,9 +1006,35 @@ impl ObjectiveStore {
         kind: ObjectiveKind,
         requested_acceptance: &str,
     ) -> anyhow::Result<ObjectiveSnapshot> {
+        let mut tx = self.pool.begin().await?;
+        let objective = self
+            .ensure_or_continue_chat_objective_in_tx(
+                &mut tx,
+                session_id,
+                root_turn_id,
+                continuation_root_turn_id,
+                kind,
+                requested_acceptance,
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(objective)
+    }
+
+    /// Transaction-scoped form of chat Objective admission. Callers may bind
+    /// the transport root, durable run control, and Objective identity in one
+    /// commit; this helper never commits or reads through the pool.
+    pub(crate) async fn ensure_or_continue_chat_objective_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+        root_turn_id: &str,
+        continuation_root_turn_id: Option<&str>,
+        kind: ObjectiveKind,
+        requested_acceptance: &str,
+    ) -> anyhow::Result<ObjectiveSnapshot> {
         let now = Utc::now().timestamp_millis();
         let process_instance = current_process_instance();
-        let mut tx = self.pool.begin().await?;
         let mut legacy_root_to_reconcile = None;
 
         let current_binding = sqlx::query_scalar::<_, Option<String>>(
@@ -979,7 +1042,7 @@ impl ObjectiveStore {
         )
         .bind(root_turn_id)
         .bind(session_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| anyhow!("chat root turn missing while ensuring objective"))?
         .filter(|value| !value.is_empty());
@@ -988,7 +1051,7 @@ impl ObjectiveStore {
         if let Some(objective_id) = current_binding.as_ref() {
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives WHERE id=?")
                 .bind(objective_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
             if exists != 1 {
                 bail!("chat objective binding points to missing objective");
@@ -1003,7 +1066,7 @@ impl ObjectiveStore {
             )
             .bind(continuation_root_turn_id)
             .bind(session_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .ok_or_else(|| anyhow!("contextual continuation root turn is missing"))?
             .filter(|value| !value.is_empty());
@@ -1011,7 +1074,7 @@ impl ObjectiveStore {
                 let status =
                     sqlx::query_scalar::<_, String>("SELECT status FROM objectives WHERE id=?")
                         .bind(&continuation_binding)
-                        .fetch_optional(&mut *tx)
+                        .fetch_optional(&mut **tx)
                         .await?
                         .ok_or_else(|| anyhow!("contextual continuation objective is missing"))?;
                 if !matches!(status.as_str(), "completed" | "cancelled" | "legacy_orphan") {
@@ -1037,7 +1100,7 @@ impl ObjectiveStore {
                 && legacy_root_to_reconcile.is_none()
             {
                 ensure_objective_binding(
-                    &mut tx,
+                    &mut *tx,
                     &objective_id,
                     RecoveryDomain::Chat,
                     "chat_root_turn",
@@ -1045,15 +1108,16 @@ impl ObjectiveStore {
                     now,
                 )
                 .await?;
-                tx.commit().await?;
-                return self
-                    .get(&objective_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("bound chat objective disappeared"));
+                let row = sqlx::query("SELECT * FROM objectives WHERE id=?")
+                    .bind(&objective_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .context("read bound chat objective")?;
+                return ObjectiveSnapshot::from_row(&row);
             }
             let row = sqlx::query("SELECT * FROM objectives WHERE id=?")
                 .bind(&objective_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
             let objective = ObjectiveSnapshot::from_row(&row)?;
             let target_kind = if objective_kind_rank(kind) > objective_kind_rank(objective.kind) {
@@ -1089,7 +1153,7 @@ impl ObjectiveStore {
             .bind(now)
             .bind(&objective_id)
             .bind(objective.revision)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
             if updated.rows_affected() != 1 {
                 bail!("objective changed while binding contextual continuation");
@@ -1104,7 +1168,7 @@ impl ObjectiveStore {
             .bind(now)
             .bind(now)
             .bind(&objective_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
             if current_binding.is_none() {
                 let linked = sqlx::query(
@@ -1114,7 +1178,7 @@ impl ObjectiveStore {
                 .bind(&objective_id)
                 .bind(root_turn_id)
                 .bind(session_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
                 if linked.rows_affected() != 1 {
                     bail!("chat root objective binding changed concurrently");
@@ -1128,14 +1192,14 @@ impl ObjectiveStore {
                 .bind(&objective_id)
                 .bind(legacy_root_turn_id)
                 .bind(session_id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
                 if linked.rows_affected() != 1 {
                     bail!("legacy chat root objective binding changed concurrently");
                 }
             }
             ensure_objective_binding(
-                &mut tx,
+                &mut *tx,
                 &objective_id,
                 RecoveryDomain::Chat,
                 "chat_root_turn",
@@ -1145,7 +1209,7 @@ impl ObjectiveStore {
             .await?;
             if let Some(legacy_root_turn_id) = legacy_root_to_reconcile.as_deref() {
                 ensure_objective_binding(
-                    &mut tx,
+                    &mut *tx,
                     &objective_id,
                     RecoveryDomain::Chat,
                     "chat_root_turn",
@@ -1177,13 +1241,14 @@ impl ObjectiveStore {
                 .to_string(),
             )
             .bind(now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-            tx.commit().await?;
-            return self
-                .get(&objective_id)
-                .await?
-                .ok_or_else(|| anyhow!("continued chat objective disappeared"));
+            let row = sqlx::query("SELECT * FROM objectives WHERE id=?")
+                .bind(&objective_id)
+                .fetch_one(&mut **tx)
+                .await
+                .context("read continued chat objective")?;
+            return ObjectiveSnapshot::from_row(&row);
         }
 
         let candidate_id = Uuid::new_v4().to_string();
@@ -1207,7 +1272,7 @@ impl ObjectiveStore {
         .bind(now)
         .bind(now)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("ensure chat objective")?;
         let objective_id: String = sqlx::query_scalar(
@@ -1215,7 +1280,7 @@ impl ObjectiveStore {
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(objective_root_turn_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .context("read ensured chat objective")?;
         let linked = sqlx::query(
@@ -1224,7 +1289,7 @@ impl ObjectiveStore {
         .bind(&objective_id)
         .bind(root_turn_id)
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .context("bind chat objective")?;
         if linked.rows_affected() != 1 {
@@ -1238,7 +1303,7 @@ impl ObjectiveStore {
             .bind(&objective_id)
             .bind(legacy_root_turn_id)
             .bind(session_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
             if legacy_linked.rows_affected() != 1 {
                 bail!("legacy chat root turn changed while reconciling objective");
@@ -1260,11 +1325,11 @@ impl ObjectiveStore {
                 .to_string(),
             )
             .bind(now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         ensure_objective_binding(
-            &mut tx,
+            &mut *tx,
             &objective_id,
             RecoveryDomain::Chat,
             "chat_root_turn",
@@ -1274,7 +1339,7 @@ impl ObjectiveStore {
         .await?;
         if let Some(legacy_root_turn_id) = legacy_root_to_reconcile.as_deref() {
             ensure_objective_binding(
-                &mut tx,
+                &mut *tx,
                 &objective_id,
                 RecoveryDomain::Chat,
                 "chat_root_turn",
@@ -1283,10 +1348,12 @@ impl ObjectiveStore {
             )
             .await?;
         }
-        tx.commit().await?;
-        self.get(&objective_id)
-            .await?
-            .ok_or_else(|| anyhow!("ensured chat objective disappeared"))
+        let row = sqlx::query("SELECT * FROM objectives WHERE id=?")
+            .bind(&objective_id)
+            .fetch_one(&mut **tx)
+            .await
+            .context("read ensured chat objective")?;
+        ObjectiveSnapshot::from_row(&row)
     }
 
     pub async fn ensure_task_objective(
@@ -1370,6 +1437,181 @@ impl ObjectiveStore {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| ObjectiveSnapshot::from_row(&row)).transpose()
+    }
+
+    /// Persist an explicit user cancellation for one exact chat binding. The
+    /// Objective CAS, remediation settlement, and pointed DeliveryRun fence
+    /// share the same transaction through `apply_decision`; a stale runner can
+    /// still finish an already-in-flight read, but cannot pass another mutation
+    /// permit after this returns.
+    pub async fn cancel_chat_exact(
+        &self,
+        session_id: &str,
+        root_turn_id: &str,
+        objective_id: &str,
+    ) -> anyhow::Result<ObjectiveSnapshot> {
+        let binding_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_turn_state
+             WHERE session_id=? AND root_turn_id=? AND objective_id=?",
+        )
+        .bind(session_id)
+        .bind(root_turn_id)
+        .bind(objective_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if binding_count != 1 {
+            bail!("chat cancellation identity mismatch");
+        }
+        for _ in 0..4 {
+            let current = self
+                .get(objective_id)
+                .await?
+                .ok_or_else(|| anyhow!("chat cancellation objective missing"))?;
+            if current.session_id.as_deref() != Some(session_id) {
+                bail!("chat cancellation identity mismatch");
+            }
+            if matches!(
+                current.status,
+                ObjectiveStatus::Cancelled | ObjectiveStatus::Completed
+            ) {
+                return Ok(current);
+            }
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::Cancelled {
+                    domain: RecoveryDomain::Chat,
+                    provenance: "explicit_cancel".into(),
+                },
+            )?;
+            match self.apply_decision(current.revision, decision).await {
+                Ok(cancelled) => return Ok(cancelled),
+                Err(error) if error.to_string().contains("revision") => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        bail!("chat cancellation could not win a stable Objective revision")
+    }
+
+    /// Consume exact crash-left chat stop intents before any startup recovery
+    /// supervisor may claim the same Objective. Rows without a complete
+    /// root/opaque binding remain pending for explicit identity reconciliation;
+    /// they are never guessed from session recency.
+    pub async fn consume_pending_chat_cancellations(&self) -> anyhow::Result<usize> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, i64, String)>(
+            "SELECT control.run_instance_id, control.session_id,
+                    control.root_turn_id,
+                    COALESCE(control.objective_id, turn.objective_id),
+                    COALESCE(control.objective_revision, objective.revision),
+                    objective.status
+             FROM chat_run_controls control
+             JOIN chat_turn_state turn
+               ON turn.root_turn_id=control.root_turn_id
+              AND turn.session_id=control.session_id
+              AND turn.objective_id IS NOT NULL
+              AND (control.objective_id IS NULL
+                   OR turn.objective_id=control.objective_id)
+             JOIN objectives objective
+               ON objective.id=COALESCE(control.objective_id, turn.objective_id)
+             WHERE control.status='cancel_requested'
+               AND control.root_turn_id IS NOT NULL
+             ORDER BY control.cancel_requested_at, control.run_instance_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut consumed = 0;
+        for (
+            run_instance_id,
+            session_id,
+            root_turn_id,
+            objective_id,
+            objective_revision,
+            objective_status,
+        ) in rows
+        {
+            let now = Utc::now().timestamp_millis();
+            let bound = sqlx::query(
+                "UPDATE chat_run_controls
+                 SET objective_id=?, objective_revision=?, updated_at=?
+                 WHERE run_instance_id=? AND session_id=? AND root_turn_id=?
+                   AND status='cancel_requested'
+                   AND (objective_id IS NULL OR objective_id=?)
+                   AND EXISTS (
+                     SELECT 1 FROM chat_turn_state turn
+                     WHERE turn.root_turn_id=? AND turn.session_id=?
+                       AND turn.objective_id=?
+                   )",
+            )
+            .bind(&objective_id)
+            .bind(objective_revision)
+            .bind(now)
+            .bind(&run_instance_id)
+            .bind(&session_id)
+            .bind(&root_turn_id)
+            .bind(&objective_id)
+            .bind(&root_turn_id)
+            .bind(&session_id)
+            .bind(&objective_id)
+            .execute(&self.pool)
+            .await?;
+            if bound.rows_affected() != 1 {
+                bail!("startup chat cancellation identity changed before settlement");
+            }
+            let control_status = if objective_status == ObjectiveStatus::Completed.as_str() {
+                "completed"
+            } else {
+                let cancelled = self
+                    .cancel_chat_exact(&session_id, &root_turn_id, &objective_id)
+                    .await?;
+                if cancelled.status != ObjectiveStatus::Cancelled {
+                    bail!("startup chat cancellation did not reach terminal state");
+                }
+                "cancelled"
+            };
+            let updated = sqlx::query(
+                "UPDATE chat_run_controls
+                 SET status=?, settled_at=?, updated_at=?
+                 WHERE run_instance_id=? AND session_id=? AND root_turn_id=?
+                   AND objective_id=? AND status='cancel_requested'",
+            )
+            .bind(control_status)
+            .bind(now)
+            .bind(now)
+            .bind(&run_instance_id)
+            .bind(&session_id)
+            .bind(&root_turn_id)
+            .bind(&objective_id)
+            .execute(&self.pool)
+            .await?;
+            if updated.rows_affected() != 1 {
+                bail!("startup chat cancellation changed during settlement");
+            }
+            consumed += 1;
+        }
+        Ok(consumed)
+    }
+
+    /// A process-local chat future disappeared with the prior process. Retire
+    /// its transport ownership before stale Objective reconciliation so the
+    /// same session can be admitted exactly once after restart. The Objective
+    /// remains nonterminal and is transferred to system-owned recovery by the
+    /// following startup step; no user input or side effect is synthesized.
+    pub async fn reconcile_stale_chat_run_controls(
+        &self,
+        current_process_instance: &str,
+    ) -> anyhow::Result<usize> {
+        let now = Utc::now().timestamp_millis();
+        let updated = sqlx::query(
+            "UPDATE chat_run_controls
+             SET status='completed', settled_at=?, updated_at=?
+             WHERE status='active'
+               AND created_process_instance<>?",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(current_process_instance)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() as usize)
     }
 
     /// Lease due recovery work with compare-and-swap semantics. A stale
@@ -1553,12 +1795,11 @@ impl ObjectiveStore {
         let mut tx = self.pool.begin().await?;
         let remediation = sqlx::query(
             "UPDATE objective_remediations
-             SET lease_expires_at=?, last_progress_at=?, updated_at=?
+             SET lease_expires_at=?, updated_at=?
              WHERE id=? AND objective_id=? AND status='claimed' AND lease_owner=?
                AND attempt_index=? AND lease_expires_at>?",
         )
         .bind(lease_expires_at)
-        .bind(now)
         .bind(now)
         .bind(remediation_id)
         .bind(objective_id)
@@ -1573,12 +1814,11 @@ impl ObjectiveStore {
         }
         let objective = sqlx::query(
             "UPDATE objectives
-             SET lease_expires_at=?, last_progress_at=?, updated_at=?
+             SET lease_expires_at=?, updated_at=?
              WHERE id=? AND status='waiting_system' AND remediation_id=? AND lease_owner=?
                AND lease_expires_at>?",
         )
         .bind(lease_expires_at)
-        .bind(now)
         .bind(now)
         .bind(objective_id)
         .bind(remediation_id)
@@ -2115,6 +2355,37 @@ impl ObjectiveStore {
             .map(|evidence| evidence.evidence_ref.clone());
         let mut delivery_run_to_complete: Option<DeliveryCompletionCandidate> = None;
         let mut tx = self.pool.begin().await?;
+        // The decision transaction may be the only SQLite connection in a
+        // deterministic test or embedded deployment. Inspect schema through
+        // that same transaction; asking the pool for a second connection here
+        // deadlocks max_connections=1 and turns recovery into a 30s timeout.
+        let has_chat_cancel_projection: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name IN ('chat_run_controls','chat_turn_state')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let has_chat_cancel_projection = has_chat_cancel_projection == 2;
+        if decision.decision_type != DecisionType::Cancelled && has_chat_cancel_projection {
+            let pending_chat_cancellations: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)
+                 FROM chat_run_controls control
+                 JOIN chat_turn_state turn
+                   ON turn.root_turn_id=control.root_turn_id
+                  AND turn.session_id=control.session_id
+                  AND turn.objective_id IS NOT NULL
+                  AND (control.objective_id IS NULL
+                       OR control.objective_id=turn.objective_id)
+                 WHERE control.status='cancel_requested'
+                   AND COALESCE(control.objective_id, turn.objective_id)=?",
+            )
+            .bind(&decision.objective_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if pending_chat_cancellations > 0 {
+                bail!("objective decision fenced by durable chat cancellation");
+            }
+        }
         if let Some(permit) = permit {
             if permit.objective_id != decision.objective_id {
                 bail!("mutation permit objective does not match decision");
@@ -3042,6 +3313,17 @@ impl ObjectiveStore {
 pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     sqlx::raw_sql(include_str!(
         "../../migrations/0007_unified_objective_control_plane.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!("../../migrations/0009_chat_run_controls.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!("../../migrations/0010_permission_intents.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0011_provider_auth_recovery.sql"
     ))
     .execute(pool)
     .await?;
@@ -5160,6 +5442,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transactional_chat_objective_admission_rolls_back_every_control_plane_write() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, status) VALUES
+             ('turn-transaction-original', 'session-transaction', 'interrupted'),
+             ('turn-transaction-next', 'session-transaction', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let original = store
+            .ensure_chat_objective(
+                "session-transaction",
+                "turn-transaction-original",
+                ObjectiveKind::LocalMutation,
+                "validated_change",
+            )
+            .await
+            .unwrap();
+        let waiting = DecisionRouter::route(
+            &original,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "provider_timeout".into(),
+                failure_signature: "sha256:transaction-timeout".into(),
+                next_observation_at: Utc::now().timestamp_millis() + 60_000,
+                resume_cursor: Some("turn-transaction-original".into()),
+            },
+        )
+        .unwrap();
+        let waiting = store
+            .apply_decision(original.revision, waiting)
+            .await
+            .unwrap();
+        let remediation_id = waiting.remediation_id.clone().unwrap();
+        let baseline_event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objective_events WHERE objective_id=?")
+                .bind(&waiting.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let admitted = store
+            .ensure_or_continue_chat_objective_in_tx(
+                &mut tx,
+                "session-transaction",
+                "turn-transaction-next",
+                Some("turn-transaction-original"),
+                ObjectiveKind::Delivery,
+                "delivery_receipt",
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted.id, waiting.id);
+        assert_eq!(admitted.revision, waiting.revision + 1);
+        assert_eq!(admitted.status, ObjectiveStatus::Active);
+        assert_eq!(admitted.kind, ObjectiveKind::Delivery);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT objective_id FROM chat_turn_state
+                 WHERE root_turn_id='turn-transaction-next'",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+            waiting.id
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objective_bindings
+                 WHERE objective_id=? AND resource_kind='chat_root_turn'
+                   AND resource_id='turn-transaction-next'",
+            )
+            .bind(&waiting.id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM objective_remediations WHERE id=?",
+            )
+            .bind(&remediation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objective_events WHERE objective_id=?",
+            )
+            .bind(&waiting.id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+            baseline_event_count + 1
+        );
+        tx.rollback().await.unwrap();
+
+        let rolled_back = store.get(&waiting.id).await.unwrap().unwrap();
+        assert_eq!(rolled_back.revision, waiting.revision);
+        assert_eq!(rolled_back.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(rolled_back.kind, ObjectiveKind::LocalMutation);
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT objective_id FROM chat_turn_state
+                 WHERE root_turn_id='turn-transaction-next'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objective_bindings
+                 WHERE objective_id=? AND resource_kind='chat_root_turn'
+                   AND resource_id='turn-transaction-next'",
+            )
+            .bind(&waiting.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM objective_remediations WHERE id=?",
+            )
+            .bind(&remediation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "queued"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objective_events WHERE objective_id=?",
+            )
+            .bind(&waiting.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            baseline_event_count
+        );
+    }
+
+    #[tokio::test]
     async fn contextual_root_fails_closed_when_two_open_objectives_are_present() {
         let pool = pool().await;
         sqlx::query(
@@ -5396,6 +5841,16 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
+        let progress_before: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT remediation.last_progress_at, objective.last_progress_at
+             FROM objective_remediations remediation
+             JOIN objectives objective ON objective.id=remediation.objective_id
+             WHERE remediation.id=?",
+        )
+        .bind(&claim.remediation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         assert!(!store
             .renew_claimed_remediation(
@@ -5430,6 +5885,20 @@ mod tests {
         .unwrap();
         assert!(renewed_remediation_lease > before);
         assert_eq!(renewed_remediation_lease, renewed_objective_lease);
+        let progress_after: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT remediation.last_progress_at, objective.last_progress_at
+             FROM objective_remediations remediation
+             JOIN objectives objective ON objective.id=remediation.objective_id
+             WHERE remediation.id=?",
+        )
+        .bind(&claim.remediation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            progress_after, progress_before,
+            "lease liveness is not progress"
+        );
 
         let expired = Utc::now().timestamp_millis() - 1;
         sqlx::query("UPDATE objective_remediations SET lease_expires_at=? WHERE id=?")
@@ -5692,5 +6161,211 @@ mod tests {
             assert_eq!(decision.decision_type, expected_type);
             assert!(!decision.requires_user_action);
         }
+    }
+
+    #[test]
+    fn permission_transport_interruptions_keep_the_permission_recovery_domain() {
+        let objective = ObjectiveSnapshot::new(
+            "objective-permission-interruption",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "validated_change",
+        );
+        let outcome = RunOutcome {
+            final_text: String::new(),
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::PlatformIncident,
+        };
+
+        for reason in ["permission_timed_out", "permission_channel_closed"] {
+            let decision =
+                decision_for_run_outcome_with_reason(&objective, &outcome, Some(reason)).unwrap();
+            assert_eq!(decision.domain, RecoveryDomain::Permission);
+            assert_eq!(decision.decision_type, DecisionType::PlatformIncident);
+            assert_eq!(decision.status, ObjectiveStatus::WaitingSystem);
+            assert_eq!(decision.failure_code.as_deref(), Some(reason));
+            assert!(!decision.requires_user_action);
+        }
+    }
+
+    #[test]
+    fn typed_context_transport_outcomes_keep_the_context_recovery_domain() {
+        let objective = ObjectiveSnapshot::new(
+            "objective-context-interruption",
+            ObjectiveKind::Informational,
+            RecoveryDomain::Chat,
+            "answer",
+        );
+        let outcome = RunOutcome {
+            final_text: String::new(),
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::PlatformIncident,
+        };
+
+        for reason in [
+            "context_compaction_exhausted",
+            "context_overflow_after_compaction",
+            "context_compression_unavailable",
+        ] {
+            let decision =
+                decision_for_run_outcome_with_reason(&objective, &outcome, Some(reason)).unwrap();
+            assert_eq!(decision.domain, RecoveryDomain::Context);
+            assert_eq!(decision.decision_type, DecisionType::Waiting);
+            assert_eq!(decision.status, ObjectiveStatus::WaitingSystem);
+            assert_eq!(decision.failure_code.as_deref(), Some(reason));
+            assert!(!decision.requires_user_action);
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_intent_fences_a_late_finished_outcome_before_objective_cas() {
+        let pool = pool().await;
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-cancel-before-finished".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("session-cancel-before-finished".into()),
+                root_turn_id: Some("turn-cancel-before-finished".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "informational_answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id, status,
+              created_process_instance, cancel_requested_at, created_at, updated_at)
+             VALUES ('run-cancel-before-finished', ?, ?, ?, 'cancel_requested',
+                     'process-before-finished', ?, ?, ?)",
+        )
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let late = RunOutcome {
+            final_text: "late model answer".into(),
+            completion_evidence: CompletionEvidence {
+                completed: true,
+                ..Default::default()
+            },
+            input_tokens: 1,
+            output_tokens: 1,
+            stop_reason: StopReason::Finished,
+        };
+        let complete = decision_for_run_outcome(&objective, &late).unwrap();
+        let error = store
+            .apply_decision(objective.revision, complete)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cancellation"), "{error}");
+
+        assert_eq!(store.consume_pending_chat_cancellations().await.unwrap(), 1);
+        let cancelled = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(cancelled.status, ObjectiveStatus::Cancelled);
+        assert_eq!(
+            cancelled.cancellation_provenance.as_deref(),
+            Some("explicit_cancel")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_objective_rejects_late_finished_and_technical_failure_decisions() {
+        let pool = pool().await;
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        let store = ObjectiveStore::new(pool);
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-terminal-monotonic".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: None,
+                root_turn_id: None,
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "informational_answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let cancelled = DecisionRouter::route(
+            &objective,
+            RouteSignal::Cancelled {
+                domain: RecoveryDomain::Chat,
+                provenance: "explicit_cancel".into(),
+            },
+        )
+        .unwrap();
+        let cancelled = store
+            .apply_decision(objective.revision, cancelled)
+            .await
+            .unwrap();
+
+        let late = RunOutcome {
+            final_text: "late answer".into(),
+            completion_evidence: CompletionEvidence {
+                completed: true,
+                ..Default::default()
+            },
+            input_tokens: 1,
+            output_tokens: 1,
+            stop_reason: StopReason::Finished,
+        };
+        assert!(decision_for_run_outcome(&cancelled, &late)
+            .unwrap_err()
+            .to_string()
+            .contains("terminal"));
+        assert!(DecisionRouter::route(
+            &cancelled,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "late_agent_error".into(),
+                failure_signature: "sha256:late-agent-error".into(),
+                next_observation_at: Utc::now().timestamp_millis(),
+                resume_cursor: None,
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("terminal"));
+        assert_eq!(
+            store.get(&cancelled.id).await.unwrap().unwrap().status,
+            ObjectiveStatus::Cancelled
+        );
     }
 }

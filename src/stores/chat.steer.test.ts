@@ -53,6 +53,15 @@ function messages() {
 function queue() {
   return useChatStore.getState().runtime[SID]?.queue ?? [];
 }
+function settle() {
+  streamMock.handler?.({
+    type: "turn_settled",
+    run_instance_id: "run-1",
+    root_turn_id: "root-1",
+    objective_id: "objective-1",
+    status: "completed",
+  });
+}
 
 describe("steering a run in flight", () => {
   beforeEach(() => {
@@ -113,8 +122,14 @@ describe("steering a run in flight", () => {
     expect(messages().some((m) => m.steerPending)).toBe(true);
 
     invokeMock.mockClear();
-    // The turn ends before any round boundary drained it.
+    // Transport ends before any round boundary drained it, but the steer must
+    // remain attached until durable settlement says the run is truly over.
     streamMock.handler?.({ type: "done", input_tokens: 0, output_tokens: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(messages().some((m) => m.steerPending)).toBe(true);
+    expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+
+    settle();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     // The undelivered bubble is gone, replaced by a real turn carrying it.
@@ -133,6 +148,11 @@ describe("steering a run in flight", () => {
 
     invokeMock.mockClear();
     streamMock.handler?.({ type: "done", input_tokens: 0, output_tokens: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(messages().filter((m) => m.steerPending)).toHaveLength(3);
+    expect(invokeMock).not.toHaveBeenCalledWith("send_message", expect.anything());
+
+    settle();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(invokeMock).toHaveBeenCalledWith(

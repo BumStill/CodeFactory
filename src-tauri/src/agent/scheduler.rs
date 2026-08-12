@@ -144,6 +144,10 @@ fn settle_result_after_verification(
     VerificationAttemptDecision::Retry { error }
 }
 
+fn should_run_repo_verification(result: &SubagentResult) -> bool {
+    result.is_verified_loop_finish()
+}
+
 fn requested_task_acceptance(task: &tasks::TaskRun) -> String {
     task.acceptance_criteria_json
         .as_deref()
@@ -971,6 +975,42 @@ impl TaskScheduler {
                                     .await
                                     .ok();
 
+                                // Repository checks can corroborate a genuinely finished
+                                // AgentLoop run; they cannot overwrite its terminal reason.
+                                // In particular, a permission-channel/platform incident may
+                                // leave the checkout green while the requested action never
+                                // happened. Hand that exact run back to durable recovery before
+                                // acceptance or verification can manufacture completion.
+                                if !should_run_repo_verification(&result) {
+                                    let failure_code = result.recovery_failure_code();
+                                    let msg = format!(
+                                        "Subagent did not reach a verified Finished terminal \
+                                         ({failure_code}): {}",
+                                        result.summary
+                                    );
+                                    tasks::finish_task_attempt(
+                                        &pool,
+                                        &attempt_id,
+                                        "failed",
+                                        Some(failure_code),
+                                        Some(&msg),
+                                        Some(&result.summary),
+                                        None,
+                                    )
+                                    .await
+                                    .ok();
+                                    tracing::warn!(
+                                        task_id = %task_id,
+                                        attempt,
+                                        failure_code,
+                                        "scheduler preserved nonterminal subagent RunOutcome"
+                                    );
+                                    prev_error = Some(msg);
+                                    recovery_failure_code = failure_code;
+                                    final_outcome = Some(result);
+                                    break;
+                                }
+
                                 // ── Acceptance check ────────────────────────
                                 if let Some(ref ac) = result.acceptance_check {
                                     if !ac.passed {
@@ -1646,8 +1686,9 @@ fn emit_retry(app: &AppHandle, session_id: &str, task_id: &str, attempt: u32) {
 mod tests {
     use super::*;
     use crate::agent::objective::ObjectiveKind;
-    use crate::agent::subagent::SubagentResult;
+    use crate::agent::subagent::{SubagentResult, SubagentRunOutcome, SubagentStopReason};
     use crate::agent::verification::VerificationResult;
+    use codefactory_agent_core::CompletionEvidence;
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn task_objective_pool() -> SqlitePool {
@@ -1734,6 +1775,30 @@ mod tests {
             sub_session_id: "sub-1".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn green_repo_state_cannot_override_platform_incident_terminal() {
+        let result = SubagentResult {
+            // Deliberately simulate the old corrupt projection. The scheduler
+            // must trust the preserved RunOutcome, not this legacy bool.
+            completed: true,
+            summary: "checkout already happened to be green".into(),
+            run_outcome: Some(SubagentRunOutcome {
+                final_text: String::new(),
+                completion_evidence: CompletionEvidence {
+                    completed: true,
+                    ..CompletionEvidence::default()
+                },
+                input_tokens: 0,
+                output_tokens: 0,
+                stop_reason: SubagentStopReason::PlatformIncident,
+            }),
+            ..Default::default()
+        };
+
+        assert!(!should_run_repo_verification(&result));
+        assert_eq!(result.recovery_failure_code(), "platform_incident");
     }
 
     fn test_git(cwd: &std::path::Path, args: &[&str]) {

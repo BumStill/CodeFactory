@@ -84,9 +84,16 @@ interface ObjectiveHealthMetrics {
   system_owned: number;
   typed_user_attention: number;
   technical_user_handoff_violations: number;
+  technical_user_handoff_violations_24h: number;
+  avoidable_user_reprompts_24h: number;
   overdue_ownerless_remediations: number;
+  stalled_system_owned_objectives: number;
+  unavailable_domain_adapter_objectives: number;
   invalid_completions: number;
+  invalid_completions_24h: number;
   duplicate_committed_side_effect_receipts: number;
+  duplicate_committed_side_effect_receipts_24h: number;
+  requested_ceiling_downgrades_24h: number;
   recovery_decisions: number;
   recovered_objectives: number;
   recovery_latency_p50_ms: number | null;
@@ -100,6 +107,9 @@ interface ObjectiveHealthMetrics {
 interface ObjectiveHealthSnapshot {
   generated_at_ms: number;
   window_start_ms: number;
+  build_git_sha: string | null;
+  build_observation_started_at_ms?: number | null;
+  production_window_covered?: boolean;
   availability: ObjectiveHealthAvailability;
   unavailable_reason: string | null;
   metrics: ObjectiveHealthMetrics | null;
@@ -154,6 +164,7 @@ async function requestObjectiveHealthSnapshot(): Promise<ObjectiveHealthSnapshot
     return {
       generated_at_ms: now,
       window_start_ms: now - 86_400_000,
+      build_git_sha: null,
       availability: "unavailable",
       unavailable_reason: `Objective health observation unavailable: ${
         error instanceof Error ? error.message : String(error)
@@ -458,6 +469,19 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
   }
 
   const metrics = health.metrics;
+  const releaseGateViolations =
+    metrics.technical_user_handoff_violations_24h +
+    metrics.avoidable_user_reprompts_24h +
+    metrics.overdue_ownerless_remediations +
+    metrics.stalled_system_owned_objectives +
+    metrics.unavailable_domain_adapter_objectives +
+    metrics.invalid_completions_24h +
+    metrics.duplicate_committed_side_effect_receipts_24h +
+    metrics.requested_ceiling_downgrades_24h;
+  const releaseGatePassing =
+    Boolean(health.build_git_sha) &&
+    health.production_window_covered === true &&
+    releaseGateViolations === 0;
   const guardrails = [
     {
       testId: "objective-technical-handoffs",
@@ -470,6 +494,18 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
       label: "Overdue ownerless remediation",
       value: metrics.overdue_ownerless_remediations,
       detail: "Due system work without a valid owner lease.",
+    },
+    {
+      testId: "objective-stalled-system-owned",
+      label: "Stalled system-owned",
+      value: metrics.stalled_system_owned_objectives,
+      detail: "No durable progress within the bounded recovery window.",
+    },
+    {
+      testId: "objective-unavailable-adapters",
+      label: "Unavailable recovery adapters",
+      value: metrics.unavailable_domain_adapter_objectives,
+      detail: "Open work is assigned to a registered but non-executable domain.",
     },
     {
       testId: "objective-invalid-completions",
@@ -487,15 +523,37 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
 
   return (
     <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
-        <div className="inline-flex items-center gap-2 text-xs font-medium text-emerald-800 dark:text-emerald-300">
-          <CircleCheck size={14} />
-          Available
+      <div
+        data-testid="objective-release-gate"
+        data-status={releaseGatePassing ? "passing" : "blocked"}
+        className={`flex flex-wrap items-center justify-between gap-2 rounded border px-3 py-2 ${
+          releaseGatePassing
+            ? "border-emerald-500/20 bg-emerald-500/5"
+            : "border-red-500/40 bg-red-500/10"
+        }`}
+      >
+        <div
+          className={`inline-flex items-center gap-2 text-xs font-medium ${
+            releaseGatePassing
+              ? "text-emerald-800 dark:text-emerald-300"
+              : "text-red-800 dark:text-red-200"
+          }`}
+        >
+          {releaseGatePassing ? <CircleCheck size={14} /> : <AlertTriangle size={14} />}
+          {releaseGatePassing ? "24h non-interruption gate passing" : "24h non-interruption gate blocked"}
         </div>
         <div className="text-[10px] text-gray-600">
-          Observed {new Date(health.generated_at_ms).toLocaleString()}
+          {health.build_git_sha
+            ? `Build ${health.build_git_sha.slice(0, 12)}`
+            : "Development build · not production proof"}
+          {" · "}Observed {new Date(health.generated_at_ms).toLocaleString()}
         </div>
       </div>
+      {health.build_git_sha && health.production_window_covered !== true && (
+        <p className="text-[10px] text-amber-700 dark:text-amber-300">
+          Production observation window incomplete; zero counters are not yet 24h proof.
+        </p>
+      )}
 
       <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
         <ObjectiveHealthMetric testId="objective-open" label="Open Objectives" value={metrics.open} />
@@ -519,6 +577,33 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
             risk={metric.value > 0}
           />
         ))}
+      </div>
+
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
+        <ObjectiveHealthMetric
+          testId="objective-24h-technical-handoffs"
+          label="24h technical handoffs"
+          value={metrics.technical_user_handoff_violations_24h}
+          risk={metrics.technical_user_handoff_violations_24h > 0}
+        />
+        <ObjectiveHealthMetric
+          testId="objective-24h-avoidable-reprompts"
+          label="24h avoidable reprompts"
+          value={metrics.avoidable_user_reprompts_24h}
+          risk={metrics.avoidable_user_reprompts_24h > 0}
+        />
+        <ObjectiveHealthMetric
+          testId="objective-24h-duplicate-receipts"
+          label="24h duplicate side effects"
+          value={metrics.duplicate_committed_side_effect_receipts_24h}
+          risk={metrics.duplicate_committed_side_effect_receipts_24h > 0}
+        />
+        <ObjectiveHealthMetric
+          testId="objective-24h-ceiling-downgrades"
+          label="24h ceiling downgrades"
+          value={metrics.requested_ceiling_downgrades_24h}
+          risk={metrics.requested_ceiling_downgrades_24h > 0}
+        />
       </div>
 
       <div className="grid grid-cols-1 gap-2 md:grid-cols-[1.5fr_1fr_1fr]">

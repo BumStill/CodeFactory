@@ -14,8 +14,8 @@ mod http_util;
 mod knowledge;
 mod mcp;
 mod notify;
-mod panic_log;
 mod openrouter;
+mod panic_log;
 mod secrets;
 mod session_title;
 mod storage;
@@ -32,11 +32,36 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 
 pub type PendingPermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
-/// Per-chat-session cancel flags. Set by the `cancel_chat` command (the chat
-/// "stop" button) and polled cooperatively by the chat agent loop between
-/// rounds. Entirely separate from the task scheduler's cancel flags — stopping
-/// a chat turn never touches running tasks.
-pub type ChatCancelMap = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+/// Process-local handle for one chat runner. The flag remains the cooperative
+/// AgentLoop stop signal; SQLite owns the exact root/opaque-Objective identity.
+#[derive(Debug)]
+pub struct ChatRunControl {
+    pub run_instance_id: String,
+    pub cancel: Arc<AtomicBool>,
+    pub durable: bool,
+}
+
+impl ChatRunControl {
+    pub fn pending() -> Self {
+        Self {
+            run_instance_id: uuid::Uuid::new_v4().to_string(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            durable: true,
+        }
+    }
+
+    pub fn ephemeral() -> Self {
+        Self {
+            run_instance_id: uuid::Uuid::new_v4().to_string(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            durable: false,
+        }
+    }
+}
+
+/// Per-chat-session run controls. Entirely separate from the task scheduler's
+/// cancellation handles — stopping a chat turn never cancels delegated tasks.
+pub type ChatCancelMap = Arc<Mutex<HashMap<String, Arc<ChatRunControl>>>>;
 
 /// Make a once-per-day copy of the SQLite DB so a botched schema migration
 /// or accidental delete isn't unrecoverable. Files named
@@ -517,17 +542,12 @@ pub fn run() {
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
             );
             let app_version = app.package_info().version.to_string();
+            let delivery_settings = settings.clone();
             let process_identity = agent::delivery_run::ProcessIdentity::new(
                 process_instance.clone(),
                 &app_version,
                 option_env!("CODEFACTORY_BUILD_NUMBER").unwrap_or(&app_version),
             );
-            tools::delivery::spawn_delivery_recovery_supervisor(
-                pool.clone(),
-                settings.clone(),
-                process_identity,
-            );
-
             // Create a single McpManager and wrap in Arc so it can be shared with
             // the startup task and also managed by Tauri.
             let mcp_manager = Arc::new(mcp::McpManager::new());
@@ -567,9 +587,51 @@ pub fn run() {
             let scheduler_handles: commands::tasks::SchedulerHandles =
                 Arc::new(Mutex::new(HashMap::new()));
             app.manage(scheduler_handles);
+            let objective_store = agent::objective::ObjectiveStore::new(objective_pool.clone());
+            let cancelled_objectives = tauri::async_runtime::block_on(
+                objective_store.consume_pending_chat_cancellations(),
+            )?;
+            if cancelled_objectives > 0 {
+                tracing::info!(
+                    count = cancelled_objectives,
+                    "startup: persisted chat cancellations settled before recovery admission"
+                );
+            }
+            let stale_chat_runs = tauri::async_runtime::block_on(
+                objective_store.reconcile_stale_chat_run_controls(&process_instance),
+            )?;
+            if stale_chat_runs > 0 {
+                tracing::info!(
+                    count = stale_chat_runs,
+                    "startup: retired prior-process chat transports before objective recovery"
+                );
+            }
+            let provider_recoveries = tauri::async_runtime::block_on(
+                agent::objective_supervisor::reconcile_provider_recovery_on_startup(
+                    &objective_pool,
+                ),
+            )?;
+            if provider_recoveries > 0 {
+                tracing::info!(
+                    count = provider_recoveries,
+                    "startup: provider attempts moved to evidence-gated recovery before generic active reconciliation"
+                );
+            }
+            let stale_permission_prompts = tauri::async_runtime::block_on(
+                agent::permission_intent::PermissionIntentStore::new(objective_pool.clone())
+                    .reconcile_stale_process_channels(
+                        &process_instance,
+                        chrono::Utc::now().timestamp_millis(),
+                    ),
+            )?;
+            if stale_permission_prompts > 0 {
+                tracing::info!(
+                    count = stale_permission_prompts,
+                    "startup: prior-process permission prompts moved to typed recovery"
+                );
+            }
             let stale_objectives = tauri::async_runtime::block_on(
-                agent::objective::ObjectiveStore::new(objective_pool.clone())
-                    .reconcile_stale_active_objectives(&process_instance),
+                objective_store.reconcile_stale_active_objectives(&process_instance),
             )?;
             if stale_objectives > 0 {
                 tracing::info!(
@@ -577,6 +639,25 @@ pub fn run() {
                     "startup: active objectives moved to system-owned recovery"
                 );
             }
+            match tauri::async_runtime::block_on(codex_auth::observe_chatgpt_auth_on_startup(
+                &objective_pool,
+            )) {
+                Ok(result) if result.receipts_recorded > 0 => tracing::info!(
+                    queued = result.queued_objectives,
+                    receipts = result.receipts_recorded,
+                    "startup: ChatGPT Keychain capability reconciled before recovery admission"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    "startup: ChatGPT capability observation deferred"
+                ),
+            }
+            tools::delivery::spawn_delivery_recovery_supervisor(
+                objective_pool.clone(),
+                delivery_settings,
+                process_identity,
+            );
             agent::objective_supervisor::spawn_objective_recovery_supervisor(
                 app.handle().clone(),
                 objective_pool,
@@ -602,7 +683,10 @@ pub fn run() {
                 let bridge = std::sync::Arc::clone(&tools::browser_session::BRIDGE);
                 match bridge.start().await {
                     Ok(pairing) => {
-                        tracing::info!("startup: browser extension bridge listening on {}", pairing.port)
+                        tracing::info!(
+                            "startup: browser extension bridge listening on {}",
+                            pairing.port
+                        )
                     }
                     Err(error) => {
                         // Not fatal: everything except the extension backend works

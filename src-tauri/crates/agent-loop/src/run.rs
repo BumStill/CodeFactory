@@ -265,6 +265,10 @@ pub struct RunConfig {
     /// Whether to reactively back off + retry on a transient provider overload
     /// (Anthropic=true; OpenAI=false).
     pub overload_backoff: bool,
+    /// Two bounded delays after the first and second replay-safe overload.
+    /// A third overload always returns control to durable Provider recovery;
+    /// surfaces may inject zero delays in deterministic tests.
+    pub overload_retry_delays: [std::time::Duration; 2],
     /// Deny further READ-ONLY calls once the read-only allowance is spent
     /// (keystone slice 4.8c b5). The eval sidecar enables it; the desktop does
     /// not, so its behaviour is unchanged.
@@ -379,6 +383,69 @@ async fn publish_turn_activity(
         last_progress_at: None,
     });
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_context_recovery(
+    persistence: &dyn Persistence,
+    events: &dyn EventSink,
+    root_turn_id: Option<&str>,
+    outcome: crate::context::ContextRecoveryOutcome,
+    attempt_index: i64,
+    output_started: bool,
+    side_effect_started: bool,
+    gate: &codefactory_agent_core::CompletionGate,
+    tokens: (u64, u64),
+    final_text: &str,
+) -> Result<RunOutcome, LoopError> {
+    if let Some(root_turn_id) = root_turn_id {
+        persistence
+            .record_recovery_attempt(&RecoveryAttemptRow {
+                root_turn_id: root_turn_id.to_string(),
+                domain: "context".into(),
+                attempt_index,
+                failure_code: outcome.failure_code().into(),
+                failure_class: "context_capacity".into(),
+                output_started,
+                side_effect_started,
+                terminal_decision: "waiting_system".into(),
+            })
+            .await?;
+    }
+    publish_turn_activity(
+        persistence,
+        events,
+        root_turn_id,
+        "recovering",
+        "waiting",
+        "context_recovery_waiting",
+        "系统正在按当前模型窗口重新整理上下文",
+        Some("已保留当前目标与进度，等待安全续接"),
+        Some(outcome.terminal_reason()),
+    )
+    .await?;
+    let notice = "上下文窗口仍不足，当前目标与进度已保留并转入系统恢复队列。";
+    if persistence
+        .persist_gate_message_once(outcome.failure_code(), notice, "turn_notice")
+        .await?
+    {
+        events.emit(crate::types::StreamEvent::CompletionGateAction {
+            kind: "turn_notice".into(),
+            detail: notice.into(),
+        });
+    }
+    // `Done` closes this transport segment only. The desktop's later
+    // `TurnSettled` projection carries the durable WaitingSystem Objective.
+    events.emit(crate::types::StreamEvent::Done {
+        input_tokens: 0,
+        output_tokens: 0,
+    });
+    Ok(run_outcome_for_terminal(
+        gate,
+        StopReason::PlatformIncident,
+        tokens,
+        final_text,
+    ))
 }
 
 fn sanitized_tool_activity(name: &str) -> (&'static str, &'static str, &'static str) {
@@ -550,6 +617,7 @@ pub async fn run_agent_loop(
         wall_budget_applies: wall_budget,
         context_compression,
         overload_backoff,
+        overload_retry_delays,
         inspection_budget,
         replay_rejected_draft,
         tool_heartbeat_interval,
@@ -647,6 +715,10 @@ pub async fn run_agent_loop(
     let mut total_input_tokens = 0_u64;
     let mut total_output_tokens = 0_u64;
     let mut last_final_text = String::new();
+    // Sticky across all provider rounds in this run. `last_final_text` only
+    // tracks a terminal prose candidate; earlier assistant text paired with a
+    // tool call is still output and makes a blind Context replay unsafe.
+    let mut output_started_in_run = false;
     publish_turn_activity(
         persistence.as_ref(),
         events.as_ref(),
@@ -779,17 +851,21 @@ pub async fn run_agent_loop(
                 // surface keeps its own budget discipline: desktop = token-based
                 // elision (DefaultCompressor, byte-identical to before),
                 // sidecar = its destructive char-budget digest.
-                let compaction = compactor.compact(
+                let compaction = crate::services::compact_with_measurement(
+                    compactor.as_ref(),
                     std::mem::take(&mut messages),
                     system_prompt,
                     context_limit,
                     &active_tool_defs,
                 );
+                let did_shrink = compaction.shrank();
+                let tokens_freed = compaction.tokens_freed();
+                let elided_count = compaction.elided_count;
                 messages = compaction.messages;
-                if compaction.compacted {
+                if did_shrink {
                     events.emit(crate::types::StreamEvent::ContextCompressed {
-                        elided_count: compaction.elided_count,
-                        tokens_freed: compaction.tokens_freed,
+                        elided_count,
+                        tokens_freed,
                     });
                 }
             }
@@ -834,18 +910,56 @@ pub async fn run_agent_loop(
                         && crate::context::is_context_overflow(&e.to_string()) =>
                 {
                     let emergency_limit = (context_limit / 5).max(1) * 4;
-                    let compression = crate::context::compress_if_needed(
+                    let compression = crate::services::compact_with_measurement(
+                        compactor.as_ref(),
                         std::mem::take(&mut messages),
                         system_prompt,
                         emergency_limit,
+                        &active_tool_defs,
                     );
-                    if !compression.compressed {
-                        return Err(e.into());
+                    let did_shrink = compression.shrank();
+                    let tokens_freed = compression.tokens_freed();
+                    let elided_count = compression.elided_count;
+                    messages = compression.messages;
+                    let evidence = completion_gate.evidence();
+                    let output_started = output_started_in_run;
+                    let side_effect_started = evidence.last_mutation_sequence.is_some();
+                    if !did_shrink {
+                        return settle_context_recovery(
+                            persistence.as_ref(),
+                            events.as_ref(),
+                            root_turn_id.as_deref(),
+                            crate::context::ContextRecoveryOutcome::CompactionExhausted,
+                            1,
+                            output_started,
+                            side_effect_started,
+                            &completion_gate,
+                            (total_input_tokens, total_output_tokens),
+                            &last_final_text,
+                        )
+                        .await;
                     }
-                    messages = crate::protocol::repair_openai_tool_protocol(compression.messages);
+                    if let Some(root_turn_id) = root_turn_id.as_deref() {
+                        persistence
+                            .record_recovery_attempt(&RecoveryAttemptRow {
+                                root_turn_id: root_turn_id.to_string(),
+                                domain: "context".into(),
+                                attempt_index: 1,
+                                failure_code: "CONTEXT_OVERFLOW".into(),
+                                failure_class: "context_capacity".into(),
+                                output_started,
+                                side_effect_started,
+                                terminal_decision: "continue".into(),
+                            })
+                            .await?;
+                    }
+                    events.emit(crate::types::StreamEvent::ContextCompressed {
+                        elided_count,
+                        tokens_freed,
+                    });
                     let notice = format!(
-                        "上下文超出模型窗口,已压缩 {} 条历史(约释放 {} tokens)后重试。",
-                        compression.elided_count, compression.tokens_freed
+                        "上下文超出模型窗口，系统已进一步压缩 {} 条历史（约释放 {} tokens）并继续处理。",
+                        elided_count, tokens_freed
                     );
                     persistence
                         .persist_gate_message(&notice, "turn_notice")
@@ -854,9 +968,44 @@ pub async fn run_agent_loop(
                         kind: "turn_notice".into(),
                         detail: notice.clone(),
                     });
-                    transport
+                    match transport
                         .complete(&messages, &active_tool_defs, &round_options)
-                        .await?
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(next) if crate::context::is_context_overflow(&next.to_string()) => {
+                            return settle_context_recovery(
+                                persistence.as_ref(),
+                                events.as_ref(),
+                                root_turn_id.as_deref(),
+                                crate::context::ContextRecoveryOutcome::OverflowAfterCompaction,
+                                2,
+                                output_started,
+                                side_effect_started,
+                                &completion_gate,
+                                (total_input_tokens, total_output_tokens),
+                                &last_final_text,
+                            )
+                            .await;
+                        }
+                        Err(next) => return Err(next.into()),
+                    }
+                }
+                Err(e) if crate::context::is_context_overflow(&e.to_string()) => {
+                    let evidence = completion_gate.evidence();
+                    return settle_context_recovery(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        crate::context::ContextRecoveryOutcome::CompressionUnavailable,
+                        1,
+                        output_started_in_run,
+                        evidence.last_mutation_sequence.is_some(),
+                        &completion_gate,
+                        (total_input_tokens, total_output_tokens),
+                        &last_final_text,
+                    )
+                    .await;
                 }
                 // Transient provider saturation (529/overloaded, 503, rate
                 // limit): keep the authorized root turn alive with bounded
@@ -872,32 +1021,39 @@ pub async fn run_agent_loop(
                         .persist_gate_message_once("自动退避重试", &notice, "turn_notice")
                         .await?;
                     let mut last_err = e;
-                    let mut recovery_attempt = 0i64;
+                    let mut completed_failures = 1i64;
                     loop {
                         if is_cancelled(cancel.as_ref()) {
                             return Err(last_err.into());
                         }
-                        recovery_attempt += 1;
                         if let Some(root_turn_id) = root_turn_id.as_deref() {
                             persistence
                                 .record_recovery_attempt(&RecoveryAttemptRow {
                                     root_turn_id: root_turn_id.to_string(),
                                     domain: "provider".into(),
-                                    attempt_index: recovery_attempt,
+                                    attempt_index: completed_failures,
                                     failure_code: "PROVIDER_OVERLOADED".into(),
                                     failure_class: "transient_provider".into(),
                                     output_started: false,
                                     side_effect_started: false,
-                                    terminal_decision: "continue".into(),
+                                    terminal_decision: if completed_failures >= 3 {
+                                        "waiting_system".into()
+                                    } else {
+                                        "continue".into()
+                                    },
                                 })
                                 .await?;
                         }
-                        let delay = match recovery_attempt {
-                            1 => 20,
-                            2 => 40,
-                            _ => 60,
-                        };
-                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        if completed_failures >= 3 {
+                            return Err(TransportError::Retryable(format!(
+                                "PROVIDER_OVERLOAD_BUDGET_EXHAUSTED: {last_err}"
+                            ))
+                            .into());
+                        }
+                        let delay = overload_retry_delays[(completed_failures - 1) as usize];
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
                         match transport
                             .complete(&messages, &active_tool_defs, &round_options)
                             .await
@@ -909,6 +1065,7 @@ pub async fn run_agent_loop(
                                 if crate::context::is_provider_overloaded(&next.to_string()) =>
                             {
                                 last_err = next;
+                                completed_failures += 1;
                             }
                             Err(next) => return Err(next.into()),
                         }
@@ -922,6 +1079,7 @@ pub async fn run_agent_loop(
                 }
                 Err(e) => return Err(e.into()),
             };
+            output_started_in_run |= !text.is_empty();
             finalization_pending = false;
             blocker_summary_pending = false;
             require_tool_next = false;
@@ -1702,6 +1860,7 @@ pub async fn run_agent_loop(
                         }));
                     }
                 };
+                let mut system_owned_tool_wait_reason = None;
                 if matches!(
                     output.status,
                     crate::tool::ToolExecutionStatus::Waiting
@@ -1718,6 +1877,23 @@ pub async fn run_agent_loop(
                             delivery_failure_signature = Some(action.signature.clone());
                         }
                         delivery_recovery_action = Some(action);
+                    } else if tc.function.name != "deliver_changes"
+                        && output.metadata.as_ref().is_some_and(|metadata| {
+                            metadata
+                                .get("system_owned")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                        })
+                    {
+                        system_owned_tool_wait_reason = Some(
+                            output
+                                .metadata
+                                .as_ref()
+                                .and_then(|metadata| metadata.get("code"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("tool_system_recovery")
+                                .to_string(),
+                        );
                     } else {
                         blocked_tool_result = true;
                         if tc.function.name == "deliver_changes" {
@@ -1835,6 +2011,33 @@ pub async fn run_agent_loop(
                             "tool terminal activity update failed after outcome persistence"
                         );
                     }
+                }
+
+                if let Some(reason) = system_owned_tool_wait_reason.as_deref() {
+                    publish_turn_activity(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        root_turn_id.as_deref(),
+                        "recovering",
+                        "waiting",
+                        "tool_recovery_waiting",
+                        "外部状态尚未确认，系统正在只读对账",
+                        Some("等待安全观察器确认副作用状态"),
+                        Some(reason),
+                    )
+                    .await?;
+                    finish_cancelled_tool_batch(
+                        persistence.as_ref(),
+                        events.as_ref(),
+                        &tool_calls[tool_index + 1..],
+                    )
+                    .await?;
+                    return Ok(run_outcome_for_terminal(
+                        &completion_gate,
+                        StopReason::PlatformIncident,
+                        (total_input_tokens, total_output_tokens),
+                        &last_final_text,
+                    ));
                 }
 
                 result_messages.push(crate::types::ChatMessage {
@@ -2469,8 +2672,8 @@ mod tests {
     use crate::events::CollectingEventSink;
     use crate::journal::{NullBudget, PersistResult};
     use crate::services::{
-        AllowAllPermissions, NoOpFactChecker, NoOpHooks, PermissionDenial, PermissionDenialReason,
-        PermissionGateway,
+        AllowAllPermissions, CompactionOutcome, ContextCompactor, NoOpFactChecker, NoOpHooks,
+        PermissionDenial, PermissionDenialReason, PermissionGateway,
     };
     use crate::tool::{ToolBackend, ToolCtx, ToolInvocationResult};
     use crate::transport::{ModelResponse, ModelTransport, RoundOptions};
@@ -2513,6 +2716,15 @@ mod tests {
         fn requests(&self) -> Vec<Vec<ChatMessage>> {
             self.requests.lock().expect("requests").clone()
         }
+
+        fn from_results(responses: Vec<Result<ModelResponse, TransportError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                calls: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+                advertised_tools: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -2548,10 +2760,20 @@ mod tests {
         usage_ids: Mutex<Vec<String>>,
         tool_call_count: AtomicUsize,
         activity_fail_kind: Mutex<Option<String>>,
+        recovery_attempts: Mutex<Vec<RecoveryAttemptRow>>,
+        activities: Mutex<Vec<crate::journal::TurnActivityUpdate>>,
     }
 
     #[async_trait::async_trait]
     impl Persistence for RecordingPersistence {
+        async fn record_recovery_attempt(&self, attempt: &RecoveryAttemptRow) -> PersistResult<()> {
+            self.recovery_attempts
+                .lock()
+                .expect("recovery attempts")
+                .push(attempt.clone());
+            Ok(())
+        }
+
         async fn update_turn_activity(
             &self,
             update: &crate::journal::TurnActivityUpdate,
@@ -2570,6 +2792,10 @@ mod tests {
                     message: "injected activity failure".into(),
                 });
             }
+            self.activities
+                .lock()
+                .expect("activities")
+                .push(update.clone());
             Ok(1)
         }
 
@@ -2787,6 +3013,46 @@ mod tests {
         delay: std::time::Duration,
     }
 
+    #[derive(Default)]
+    struct SystemOwnedWaitingTools {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolBackend for SystemOwnedWaitingTools {
+        async fn list_schemas(&self) -> Vec<ToolDefinition> {
+            vec![tool_definition()]
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            _args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolInvocationResult, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolInvocationResult {
+                content: "外部状态尚未确认，系统将只读对账。".into(),
+                is_error: false,
+                status: crate::tool::ToolExecutionStatus::Waiting,
+                command: call.function.name.clone(),
+                kind: ToolKind::Mutation,
+                return_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+                metadata: Some(serde_json::json!({
+                    "code": "external_state_uncertain",
+                    "recoverable": true,
+                    "system_owned": true,
+                    "next_action": "observe_only_reconcile",
+                })),
+                next_working_directory: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
     #[async_trait::async_trait]
     impl ToolBackend for SlowErrorTools {
         async fn list_schemas(&self) -> Vec<ToolDefinition> {
@@ -2969,6 +3235,63 @@ mod tests {
         }
     }
 
+    /// Leaves the ordinary preflight untouched, then removes one old generated
+    /// message when the overflow arm asks for the stricter emergency budget.
+    /// The newest user input is intentionally preserved verbatim.
+    struct EmergencyShrinkingCompressor;
+
+    impl ContextCompactor for EmergencyShrinkingCompressor {
+        fn compact(
+            &self,
+            mut messages: Vec<ChatMessage>,
+            _system_prompt: &str,
+            context_limit: u32,
+            _tool_definitions: &[ToolDefinition],
+        ) -> CompactionOutcome {
+            if context_limit >= 100_000 {
+                return CompactionOutcome {
+                    messages,
+                    ..Default::default()
+                };
+            }
+            let before = crate::context::estimate_prompt_tokens(&messages, "test system");
+            if let Some(index) = messages
+                .iter()
+                .position(|message| message.role == "assistant")
+            {
+                messages.remove(index);
+            }
+            let after = crate::context::estimate_prompt_tokens(&messages, "test system");
+            CompactionOutcome {
+                messages,
+                compacted: after < before,
+                elided_count: usize::from(after < before),
+                tokens_freed: before.saturating_sub(after),
+            }
+        }
+    }
+
+    /// Adversarial seam implementation: claiming `compacted=true` must never
+    /// be trusted unless the exact provider prompt estimate is smaller.
+    struct LyingNoShrinkCompressor;
+
+    impl ContextCompactor for LyingNoShrinkCompressor {
+        fn compact(
+            &self,
+            messages: Vec<ChatMessage>,
+            _system_prompt: &str,
+            _context_limit: u32,
+            _tool_definitions: &[ToolDefinition],
+        ) -> CompactionOutcome {
+            CompactionOutcome {
+                messages,
+                compacted: true,
+                elided_count: 1,
+                tokens_freed: 999,
+            }
+        }
+    }
+
     fn usage(prompt_tokens: u32, completion_tokens: u32) -> Usage {
         serde_json::from_value(serde_json::json!({
             "prompt_tokens": prompt_tokens,
@@ -3044,6 +3367,10 @@ mod tests {
             wall_budget_applies: false,
             context_compression: true,
             overload_backoff: false,
+            overload_retry_delays: [
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(40),
+            ],
             inspection_budget: false,
             replay_rejected_draft: false,
             tool_heartbeat_interval: None,
@@ -3080,6 +3407,177 @@ mod tests {
             fact_checker: Arc::new(NoOpFactChecker),
             steer: Arc::new(crate::services::NoSteering),
         }
+    }
+
+    #[tokio::test]
+    async fn second_context_overflow_becomes_durable_context_owned_wait_without_third_request() {
+        let transport = Arc::new(ScriptedTransport::from_results(vec![
+            Err(TransportError::Fatal(
+                "maximum context length exceeded on first request".into(),
+            )),
+            Err(TransportError::Fatal(
+                "maximum context length exceeded after emergency compression".into(),
+            )),
+            Ok(response("unsafe third request", vec![], 0)),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut overflow_inputs = inputs();
+        overflow_inputs.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: MessageContent::Text("older request".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: MessageContent::Text("generated history ".repeat(20_000)),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: MessageContent::Text("current request must stay verbatim".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+        ];
+        let mut svc = services(transport.clone(), persistence.clone(), events.clone());
+        svc.compactor = Arc::new(EmergencyShrinkingCompressor);
+
+        let outcome = run_agent_loop(overflow_inputs, config(), svc)
+            .await
+            .expect("context exhaustion must transfer to durable system recovery");
+
+        assert_eq!(outcome.stop_reason, StopReason::PlatformIncident);
+        let requests = transport.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a second overflow is the hard retry bound"
+        );
+        let first = crate::context::estimate_prompt_tokens(&requests[0], "test system");
+        let second = crate::context::estimate_prompt_tokens(&requests[1], "test system");
+        assert!(
+            second < first,
+            "every emergency level must shrink the exact prompt"
+        );
+        assert!(requests[1].iter().any(|message| {
+            matches!(&message.content, MessageContent::Text(text) if text == "current request must stay verbatim")
+        }));
+        let attempts = persistence
+            .recovery_attempts
+            .lock()
+            .expect("recovery attempts");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].domain, "context");
+        assert_eq!(attempts[0].terminal_decision, "continue");
+        assert_eq!(attempts[1].domain, "context");
+        assert_eq!(attempts[1].terminal_decision, "waiting_system");
+        assert!(persistence
+            .activities
+            .lock()
+            .expect("activities")
+            .iter()
+            .any(|activity| activity.status == "waiting"
+                && activity.terminal_reason.as_deref()
+                    == Some("context_overflow_after_compaction")));
+        assert!(!persistence
+            .notices
+            .lock()
+            .expect("notices")
+            .iter()
+            .any(|(_, notice)| notice.contains("请继续")
+                || notice.contains("请重试")
+                || notice.contains("回复")));
+    }
+
+    #[tokio::test]
+    async fn emergency_compaction_that_does_not_shrink_never_retries_provider() {
+        let transport = Arc::new(ScriptedTransport::from_results(vec![
+            Err(TransportError::Fatal("context window exceeded".into())),
+            Ok(response("unsafe retry", vec![], 0)),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut svc = services(transport.clone(), persistence.clone(), events);
+        svc.compactor = Arc::new(LyingNoShrinkCompressor);
+
+        let outcome = run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect("non-shrinking compaction must fail closed into Context recovery");
+
+        assert_eq!(outcome.stop_reason, StopReason::PlatformIncident);
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "unchanged payload must not be resent"
+        );
+        assert!(persistence
+            .activities
+            .lock()
+            .expect("activities")
+            .iter()
+            .any(|activity| activity.status == "waiting"
+                && activity.terminal_reason.as_deref() == Some("context_compaction_exhausted")));
+        let attempts = persistence
+            .recovery_attempts
+            .lock()
+            .expect("recovery attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].failure_code, "CONTEXT_COMPACTION_EXHAUSTED");
+    }
+
+    #[tokio::test]
+    async fn context_recovery_remembers_output_from_an_earlier_tool_round() {
+        let transport = Arc::new(ScriptedTransport::from_results(vec![
+            Ok(response(
+                "visible progress before a read-only check",
+                vec![call(
+                    "verify-before-overflow",
+                    "bash",
+                    serde_json::json!({"command":"cargo test --lib"}),
+                )],
+                0,
+            )),
+            Err(TransportError::Fatal(
+                "maximum context length exceeded".into(),
+            )),
+            Err(TransportError::Fatal(
+                "maximum context length exceeded after compaction".into(),
+            )),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut svc = services(transport, persistence.clone(), events);
+        svc.compactor = Arc::new(EmergencyShrinkingCompressor);
+
+        let outcome = run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect("context failure remains system owned");
+
+        assert_eq!(outcome.stop_reason, StopReason::PlatformIncident);
+        let attempts = persistence
+            .recovery_attempts
+            .lock()
+            .expect("recovery attempts");
+        let terminal = attempts.last().expect("terminal context attempt");
+        assert_eq!(terminal.domain, "context");
+        assert!(
+            terminal.output_started,
+            "visible output from any earlier round must fence blind replay"
+        );
+        assert!(
+            !terminal.side_effect_started,
+            "a successful verification is observation, not a mutation"
+        );
     }
 
     #[tokio::test]
@@ -3164,6 +3662,47 @@ mod tests {
                 .all(|(_, content, _)| !content.contains("仍在运行")),
             "heartbeats must not create transcript messages"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_overload_budget_stops_after_three_failures_and_returns_system_owned_wait() {
+        let transport = Arc::new(ScriptedTransport::from_results(vec![
+            Err(TransportError::Retryable("HTTP 503 overloaded one".into())),
+            Err(TransportError::Retryable("HTTP 503 overloaded two".into())),
+            Err(TransportError::Retryable(
+                "HTTP 503 overloaded three".into(),
+            )),
+            Ok(response("unsafe fourth request", vec![], 0)),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let mut cfg = config();
+        cfg.overload_backoff = true;
+        cfg.overload_retry_delays = [std::time::Duration::ZERO, std::time::Duration::ZERO];
+
+        let error = run_agent_loop(
+            inputs(),
+            cfg,
+            services(
+                transport.clone(),
+                persistence.clone(),
+                Arc::new(CollectingEventSink::new()),
+            ),
+        )
+        .await
+        .expect_err("third overload must return to durable system-owned recovery");
+
+        assert!(error
+            .to_string()
+            .contains("PROVIDER_OVERLOAD_BUDGET_EXHAUSTED"));
+        assert_eq!(transport.advertised_tool_counts().len(), 3);
+        let attempts = persistence
+            .recovery_attempts
+            .lock()
+            .expect("recovery attempts");
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[0].terminal_decision, "continue");
+        assert_eq!(attempts[1].terminal_decision, "continue");
+        assert_eq!(attempts[2].terminal_decision, "waiting_system");
     }
 
     #[tokio::test]
@@ -3893,6 +4432,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_owned_unknown_tool_result_never_becomes_a_user_blocker_summary() {
+        let transport = Arc::new(ScriptedTransport::new(vec![response(
+            "执行两个外部变更",
+            vec![
+                call("t1", "scripted", serde_json::json!({})),
+                call("t2", "scripted", serde_json::json!({})),
+            ],
+            0,
+        )]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let tools = Arc::new(SystemOwnedWaitingTools::default());
+        let mut svc = services(transport.clone(), persistence.clone(), events.clone());
+        svc.tools = tools.clone();
+
+        let outcome = run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect("unknown external state must settle into durable system recovery");
+
+        assert_eq!(outcome.stop_reason, StopReason::PlatformIncident);
+        assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.requests().len(), 1, "no blocker-summary reprompt");
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult {
+                tool_call_id,
+                status,
+                ..
+            } if tool_call_id == "t2" && status == "cancelled"
+        )));
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                terminal_reason: Some(reason),
+                ..
+            } if status == "waiting" && reason == "external_state_uncertain"
+        )));
+        assert!(!persistence
+            .messages
+            .lock()
+            .expect("messages")
+            .iter()
+            .any(|(role, content, _)| role == "user" && content.contains("需要用户")));
+    }
+
+    #[tokio::test]
     async fn explicit_permission_denial_stops_equivalent_side_effects() {
         let transport = Arc::new(ScriptedTransport::new(vec![
             response(
@@ -4555,6 +5141,10 @@ mod tests {
             wall_budget_applies,
             context_compression: true,
             overload_backoff: false,
+            overload_retry_delays: [
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(40),
+            ],
             inspection_budget: false,
             replay_rejected_draft: false,
             tool_heartbeat_interval: Some(std::time::Duration::from_secs(30)),
@@ -4581,6 +5171,10 @@ mod tests {
             wall_budget_applies,
             context_compression: false,
             overload_backoff: true,
+            overload_retry_delays: [
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(40),
+            ],
             inspection_budget: true,
             replay_rejected_draft: true,
             tool_heartbeat_interval: None,

@@ -102,7 +102,7 @@ describe("SessionSidebar", () => {
     fakeChatState.runtime = {
       q1: {
         streaming: true,
-        pendingPermission: { toolCallId: "tc-1", toolName: "bash", args: {} },
+        pendingPermission: { intentId: "intent-tc-1", toolCallId: "tc-1", toolName: "bash", args: {} },
       },
     };
     try {

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::agent::failover::{RouteCandidate, RouteCandidatePlan};
@@ -18,6 +19,13 @@ use crate::session_title::{
     TITLE_SOURCE_PLACEHOLDER,
 };
 use crate::AppState;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatRunIdentity {
+    root_turn_id: String,
+    objective_id: String,
+    objective_revision: i64,
+}
 
 fn is_chatgpt_auth_expired(endpoint_name: &str, message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
@@ -193,19 +201,188 @@ pub(crate) async fn resolve_route_plan(
 
 #[tauri::command]
 pub async fn respond_to_permission(
-    tool_call_id: String,
+    app: AppHandle,
+    intent_id: String,
     allow: bool,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
-    let Some(sender) = state.pending_permissions.lock().await.remove(&tool_call_id) else {
-        return Err(AppError::Other(format!(
-            "Permission request '{tool_call_id}' is no longer active"
-        )));
-    };
+    let pool = state.db.read().await.clone();
+    let store = crate::agent::permission_intent::PermissionIntentStore::new(pool.clone());
+    let intent = store
+        .get(&intent_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+        .ok_or_else(|| AppError::Other("unknown durable permission intent".into()))?;
 
-    sender
-        .send(allow)
-        .map_err(|_| AppError::Other("Permission request receiver closed".into()))
+    let sender = state.pending_permissions.lock().await.remove(&intent_id);
+    if let Some(sender) = sender {
+        store
+            .record_user_response(
+                &intent.prompt_key(),
+                if allow {
+                    crate::agent::permission_intent::PermissionPromptResponse::Allow
+                } else {
+                    crate::agent::permission_intent::PermissionPromptResponse::Deny
+                },
+                Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        // The durable decision is authoritative. If the process-local waiter
+        // disappeared after removal from the registry, immediately adopt the
+        // exact response into the same Objective instead of inviting a retry
+        // or waiting for another application restart.
+        if sender.send(allow).is_err() {
+            let settlement = store
+                .reconcile_orphaned_response(&intent_id, Utc::now().timestamp_millis())
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))?;
+            let objective = crate::agent::objective::ObjectiveStore::new(pool.clone())
+                .get(&settlement.objective_id)
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))?
+                .ok_or_else(|| AppError::Other("permission Objective disappeared".into()))?;
+            if let Some(root_turn_id) = objective.root_turn_id.as_deref() {
+                project_chat_objective(
+                    &pool,
+                    &app,
+                    &format!("stream:{}", intent.session_id),
+                    root_turn_id,
+                    &objective,
+                )
+                .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // No process-local receiver means this is a supervisor-projected prompt.
+    // Settle the exact durable wait and schedule (or terminally deny) the same
+    // Objective in one transaction; never manufacture a new user turn.
+    let settlement = store
+        .settle_projected_response(
+            &intent_id,
+            if allow {
+                crate::agent::permission_intent::PermissionPromptResponse::Allow
+            } else {
+                crate::agent::permission_intent::PermissionPromptResponse::Deny
+            },
+            Utc::now().timestamp_millis(),
+        )
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    let objective = crate::agent::objective::ObjectiveStore::new(pool.clone())
+        .get(&settlement.objective_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+        .ok_or_else(|| AppError::Other("permission Objective disappeared".into()))?;
+    if objective.revision != settlement.objective_revision {
+        return Err(AppError::Other(
+            "permission Objective advanced before response projection".into(),
+        ));
+    }
+    if let Some(root_turn_id) = objective.root_turn_id.as_deref() {
+        project_chat_objective(
+            &pool,
+            &app,
+            &format!("stream:{}", intent.session_id),
+            root_turn_id,
+            &objective,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Reconcile one claimed Permission remediation. Interrupted channels only
+/// reproject the original prompt and typed Objective wait; an already-allowed
+/// exact receipt resumes the original Objective/root through the normal chat
+/// runner, whose permission gateway reserves that receipt before the action.
+pub(crate) async fn reconcile_permission_objective(
+    app: AppHandle,
+    pool: sqlx::SqlitePool,
+    objective: crate::agent::objective::ObjectiveSnapshot,
+    mutation_permit: codefactory_agent_loop::tool::MutationPermit,
+) -> Result<(), AppError> {
+    let now = Utc::now().timestamp_millis();
+    let store = crate::agent::permission_intent::PermissionIntentStore::new(pool.clone());
+    let binding_id = mutation_permit
+        .binding_id
+        .as_deref()
+        .ok_or_else(|| AppError::Other("Permission remediation has no exact binding".into()))?;
+    let resource_generation = mutation_permit.resource_generation.ok_or_else(|| {
+        AppError::Other("Permission remediation has no binding generation".into())
+    })?;
+    let resource_kind: String = sqlx::query_scalar(
+        "SELECT resource_kind FROM objective_bindings
+         WHERE id=? AND objective_id=? AND resource_generation=?",
+    )
+    .bind(binding_id)
+    .bind(&objective.id)
+    .bind(resource_generation)
+    .fetch_optional(&pool)
+    .await?
+    .ok_or_else(|| AppError::Other("Permission remediation binding is stale".into()))?;
+    match store
+        .observe_claimed_recovery(
+            &mutation_permit,
+            &crate::agent::objective::current_process_instance(),
+            now + 60_000,
+            now,
+        )
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+    {
+        crate::agent::permission_intent::PermissionClaimAction::ProjectPrompt(observation) => {
+            app.emit(
+                &format!("stream:{}", observation.snapshot.session_id),
+                crate::agent::permission_gateway::DesktopPermissionGateway::projected_prompt_event(
+                    &observation,
+                ),
+            )
+            .map_err(|error| AppError::Other(error.to_string()))?;
+            let waiting = crate::agent::objective::ObjectiveStore::new(pool.clone())
+                .get(&objective.id)
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))?
+                .ok_or_else(|| AppError::Other("permission Objective disappeared".into()))?;
+            match resource_kind.as_str() {
+                "chat_root_turn" => {
+                    let root_turn_id = waiting
+                        .root_turn_id
+                        .as_deref()
+                        .or(waiting.resume_cursor.as_deref())
+                        .ok_or_else(|| {
+                            AppError::Other("permission Objective has no chat cursor".into())
+                        })?;
+                    project_chat_objective(
+                        &pool,
+                        &app,
+                        &format!("stream:{}", observation.snapshot.session_id),
+                        root_turn_id,
+                        &waiting,
+                    )
+                    .await
+                }
+                "task_run" if waiting.task_id.is_some() => Ok(()),
+                _ => Err(AppError::Other(format!(
+                    "Permission remediation cannot project binding kind {resource_kind}"
+                ))),
+            }
+        }
+        crate::agent::permission_intent::PermissionClaimAction::ResumeAuthorizedAction => {
+            match resource_kind.as_str() {
+                "chat_root_turn" => resume_chat_objective(app, objective, mutation_permit).await,
+                "task_run" => {
+                    crate::commands::tasks::resume_task_objective(app, objective, mutation_permit)
+                        .await
+                }
+                _ => Err(AppError::Other(format!(
+                    "Permission remediation cannot execute binding kind {resource_kind}"
+                ))),
+            }
+        }
+    }
 }
 
 /// Request cancellation of the in-flight chat turn for `session_id`. Flips the
@@ -236,12 +413,338 @@ pub async fn delivery_channel_status(
 }
 
 #[tauri::command]
-pub async fn cancel_chat(session_id: String, state: State<'_, AppState>) -> Result<(), AppError> {
-    if let Some(flag) = state.chat_cancels.lock().await.get(&session_id) {
-        flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!("cancel_chat: requested stop for session {session_id}");
+pub async fn cancel_chat(
+    app: AppHandle,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let Some(control) = state.chat_cancels.lock().await.get(&session_id).cloned() else {
+        return Ok(());
+    };
+    if !control.durable {
+        control.cancel.store(true, Ordering::SeqCst);
+        tracing::info!("cancel_chat: requested ephemeral stop for session {session_id}");
+        return Ok(());
+    }
+    let pool = state.db.read().await.clone();
+    let identity = request_chat_run_cancel(&pool, &control.run_instance_id, &session_id).await?;
+    control.cancel.store(true, Ordering::SeqCst);
+    if let Some(identity) = identity {
+        tracing::debug!(
+            objective_id = %identity.objective_id,
+            objective_revision = identity.objective_revision,
+            "settling exact durable chat cancellation"
+        );
+        let cancelled = consume_requested_chat_cancel(&pool, &control.run_instance_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Other("chat cancellation identity disappeared before settlement".into())
+            })?;
+        project_chat_objective(
+            &pool,
+            &app,
+            &format!("stream:{session_id}"),
+            &identity.root_turn_id,
+            &cancelled,
+        )
+        .await?;
+    }
+    tracing::info!("cancel_chat: durably requested stop for session {session_id}");
+    Ok(())
+}
+
+async fn cancel_chat_objective_exact(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    root_turn_id: &str,
+    objective_id: &str,
+) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
+    crate::agent::objective::ObjectiveStore::new(pool.clone())
+        .cancel_chat_exact(session_id, root_turn_id, objective_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))
+}
+
+async fn request_chat_run_cancel(
+    pool: &sqlx::SqlitePool,
+    run_instance_id: &str,
+    session_id: &str,
+) -> Result<Option<ChatRunIdentity>, AppError> {
+    let now = Utc::now().timestamp_millis();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO chat_run_controls
+         (run_instance_id, session_id, status, created_process_instance,
+          cancel_requested_at, created_at, updated_at)
+         VALUES (?, ?, 'cancel_requested', ?, ?, ?, ?)
+         ON CONFLICT(run_instance_id) DO UPDATE SET
+           status=CASE
+             WHEN chat_run_controls.status='active' THEN 'cancel_requested'
+             ELSE chat_run_controls.status
+           END,
+           cancel_requested_at=COALESCE(chat_run_controls.cancel_requested_at,
+                                        excluded.cancel_requested_at),
+           updated_at=excluded.updated_at
+         WHERE chat_run_controls.session_id=excluded.session_id
+           AND chat_run_controls.status IN ('active','cancel_requested')",
+    )
+    .bind(run_instance_id)
+    .bind(session_id)
+    .bind(crate::agent::objective::current_process_instance())
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query(
+        "SELECT control.root_turn_id,
+                COALESCE(control.objective_id, turn.objective_id) AS objective_id,
+                COALESCE(control.objective_revision, objective.revision) AS objective_revision
+         FROM chat_run_controls control
+         LEFT JOIN chat_turn_state turn
+           ON turn.root_turn_id=control.root_turn_id
+          AND turn.session_id=control.session_id
+         LEFT JOIN objectives objective
+           ON objective.id=COALESCE(control.objective_id, turn.objective_id)
+         WHERE control.run_instance_id=? AND control.session_id=?
+           AND control.status='cancel_requested'",
+    )
+    .bind(run_instance_id)
+    .bind(session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let root_turn_id = row.try_get::<Option<String>, _>("root_turn_id")?;
+    let objective_id = row.try_get::<Option<String>, _>("objective_id")?;
+    let objective_revision = row.try_get::<Option<i64>, _>("objective_revision")?;
+    match (root_turn_id, objective_id, objective_revision) {
+        (Some(root_turn_id), Some(objective_id), Some(objective_revision)) => {
+            Ok(Some(ChatRunIdentity {
+                root_turn_id,
+                objective_id,
+                objective_revision,
+            }))
+        }
+        (None, None, None) | (Some(_), None, None) => Ok(None),
+        _ => Err(AppError::Other(
+            "chat run control has an incomplete Objective/root/revision identity".into(),
+        )),
+    }
+}
+
+async fn register_chat_run_control(
+    pool: &sqlx::SqlitePool,
+    control: &crate::ChatRunControl,
+    session_id: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now().timestamp_millis();
+    let cancelled = control.cancel.load(Ordering::SeqCst);
+    sqlx::query(
+        "INSERT INTO chat_run_controls
+         (run_instance_id, session_id, status, created_process_instance,
+          cancel_requested_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(run_instance_id) DO NOTHING",
+    )
+    .bind(&control.run_instance_id)
+    .bind(session_id)
+    .bind(if cancelled {
+        "cancel_requested"
+    } else {
+        "active"
+    })
+    .bind(crate::agent::objective::current_process_instance())
+    .bind(cancelled.then_some(now))
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    let persisted_session: String =
+        sqlx::query_scalar("SELECT session_id FROM chat_run_controls WHERE run_instance_id=?")
+            .bind(&control.run_instance_id)
+            .fetch_one(pool)
+            .await?;
+    if persisted_session != session_id {
+        return Err(AppError::Other(
+            "chat run instance was already bound to another session".into(),
+        ));
     }
     Ok(())
+}
+
+async fn bind_chat_run_root(
+    pool: &sqlx::SqlitePool,
+    run_instance_id: &str,
+    session_id: &str,
+    root_turn_id: &str,
+) -> Result<(), AppError> {
+    let updated = sqlx::query(
+        "UPDATE chat_run_controls
+         SET root_turn_id=?, updated_at=?
+         WHERE run_instance_id=? AND session_id=?
+           AND status IN ('active','cancel_requested')
+           AND (root_turn_id IS NULL OR root_turn_id=?)",
+    )
+    .bind(root_turn_id)
+    .bind(Utc::now().timestamp_millis())
+    .bind(run_instance_id)
+    .bind(session_id)
+    .bind(root_turn_id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Other(
+            "chat run root identity changed during setup".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn bind_chat_run_objective(
+    pool: &sqlx::SqlitePool,
+    run_instance_id: &str,
+    session_id: &str,
+    root_turn_id: &str,
+    objective_id: &str,
+    objective_revision: i64,
+) -> Result<Option<crate::agent::objective::ObjectiveSnapshot>, AppError> {
+    let updated = sqlx::query(
+        "UPDATE chat_run_controls
+         SET objective_id=?, objective_revision=?, updated_at=?
+         WHERE run_instance_id=? AND session_id=? AND root_turn_id=?
+           AND status IN ('active','cancel_requested')
+           AND (objective_id IS NULL OR objective_id=?)
+           AND EXISTS (
+             SELECT 1 FROM chat_turn_state turn
+             WHERE turn.root_turn_id=? AND turn.session_id=?
+               AND turn.objective_id=?
+           )",
+    )
+    .bind(objective_id)
+    .bind(objective_revision)
+    .bind(Utc::now().timestamp_millis())
+    .bind(run_instance_id)
+    .bind(session_id)
+    .bind(root_turn_id)
+    .bind(objective_id)
+    .bind(root_turn_id)
+    .bind(session_id)
+    .bind(objective_id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Other(
+            "chat run Objective identity changed during setup".into(),
+        ));
+    }
+    consume_requested_chat_cancel(pool, run_instance_id).await
+}
+
+async fn consume_requested_chat_cancel(
+    pool: &sqlx::SqlitePool,
+    run_instance_id: &str,
+) -> Result<Option<crate::agent::objective::ObjectiveSnapshot>, AppError> {
+    let identity = sqlx::query_as::<_, (String, String, String, i64)>(
+        "SELECT control.session_id, control.root_turn_id,
+                COALESCE(control.objective_id, turn.objective_id),
+                COALESCE(control.objective_revision, objective.revision)
+         FROM chat_run_controls control
+         LEFT JOIN chat_turn_state turn
+          ON turn.root_turn_id=control.root_turn_id
+          AND turn.session_id=control.session_id
+         JOIN objectives objective
+           ON objective.id=COALESCE(control.objective_id, turn.objective_id)
+         WHERE control.run_instance_id=? AND control.status='cancel_requested'
+           AND control.root_turn_id IS NOT NULL
+           AND COALESCE(control.objective_id, turn.objective_id) IS NOT NULL",
+    )
+    .bind(run_instance_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((session_id, root_turn_id, objective_id, objective_revision)) = identity else {
+        return Ok(None);
+    };
+    let bound = sqlx::query(
+        "UPDATE chat_run_controls SET objective_id=?, objective_revision=?, updated_at=?
+         WHERE run_instance_id=? AND session_id=? AND root_turn_id=?
+           AND status='cancel_requested'
+           AND (objective_id IS NULL OR objective_id=?)",
+    )
+    .bind(&objective_id)
+    .bind(objective_revision)
+    .bind(Utc::now().timestamp_millis())
+    .bind(run_instance_id)
+    .bind(&session_id)
+    .bind(&root_turn_id)
+    .bind(&objective_id)
+    .execute(pool)
+    .await?;
+    if bound.rows_affected() != 1 {
+        return Err(AppError::Other(
+            "chat cancellation identity changed before settlement".into(),
+        ));
+    }
+    let settled =
+        cancel_chat_objective_exact(pool, &session_id, &root_turn_id, &objective_id).await?;
+    let control_status = match settled.status {
+        crate::agent::objective::ObjectiveStatus::Cancelled => "cancelled",
+        crate::agent::objective::ObjectiveStatus::Completed => "completed",
+        _ => {
+            return Err(AppError::Other(
+                "chat cancellation did not reach a terminal Objective state".into(),
+            ));
+        }
+    };
+    let now = Utc::now().timestamp_millis();
+    let updated = sqlx::query(
+        "UPDATE chat_run_controls
+         SET status=?, settled_at=?, updated_at=?
+         WHERE run_instance_id=? AND session_id=? AND root_turn_id=?
+           AND objective_id=? AND status='cancel_requested'",
+    )
+    .bind(control_status)
+    .bind(now)
+    .bind(now)
+    .bind(run_instance_id)
+    .bind(&session_id)
+    .bind(&root_turn_id)
+    .bind(&objective_id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AppError::Other(
+            "chat cancellation intent changed during settlement".into(),
+        ));
+    }
+    Ok(Some(settled))
+}
+
+async fn settle_chat_run_control(
+    pool: &sqlx::SqlitePool,
+    run_instance_id: &str,
+) -> Result<Option<crate::agent::objective::ObjectiveSnapshot>, AppError> {
+    if let Some(cancelled) = consume_requested_chat_cancel(pool, run_instance_id).await? {
+        return Ok(Some(cancelled));
+    }
+    let now = Utc::now().timestamp_millis();
+    sqlx::query(
+        "UPDATE chat_run_controls
+         SET status=CASE
+               WHEN status='cancel_requested' THEN 'cancelled'
+               ELSE 'completed'
+             END,
+             settled_at=?, updated_at=?
+         WHERE run_instance_id=? AND status IN ('active','cancel_requested')",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(run_instance_id)
+    .execute(pool)
+    .await?;
+    Ok(None)
 }
 
 #[tauri::command]
@@ -255,15 +758,68 @@ pub async fn is_chat_running(
 async fn clear_chat_running_if_current(
     chat_cancels: &crate::ChatCancelMap,
     session_id: &str,
-    completed_flag: &Arc<AtomicBool>,
+    completed_control: &Arc<crate::ChatRunControl>,
 ) {
     let mut flags = chat_cancels.lock().await;
     if flags
         .get(session_id)
-        .is_some_and(|current| Arc::ptr_eq(current, completed_flag))
+        .is_some_and(|current| Arc::ptr_eq(current, completed_control))
     {
         flags.remove(session_id);
     }
+}
+
+async fn admit_chat_run(
+    chat_cancels: &crate::ChatCancelMap,
+    update_restart_reserved: &std::sync::atomic::AtomicBool,
+    session_id: &str,
+    control: Arc<crate::ChatRunControl>,
+) -> Result<(), AppError> {
+    let mut active = chat_cancels.lock().await;
+    if update_restart_reserved.load(Ordering::SeqCst) {
+        return Err(AppError::Other(
+            "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
+        ));
+    }
+    if active.contains_key(session_id) {
+        return Err(AppError::Other("CHAT_RUN_BUSY".into()));
+    }
+    active.insert(session_id.to_string(), control);
+    Ok(())
+}
+
+fn chat_settlement_status(objective: &crate::agent::objective::ObjectiveSnapshot) -> &'static str {
+    use crate::agent::objective::ObjectiveStatus;
+    match objective.status {
+        ObjectiveStatus::Completed => "completed",
+        ObjectiveStatus::Cancelled => "cancelled",
+        ObjectiveStatus::WaitingCoreInput
+        | ObjectiveStatus::WaitingAuthorization
+        | ObjectiveStatus::WaitingBusinessDecision => "waiting_user",
+        ObjectiveStatus::Active
+        | ObjectiveStatus::WaitingSystem
+        | ObjectiveStatus::LegacyOrphan => "waiting_system",
+    }
+}
+
+fn emit_chat_turn_settled(
+    app: &AppHandle,
+    event_name: &str,
+    control: &crate::ChatRunControl,
+    root_turn_id: Option<&str>,
+    objective_id: Option<&str>,
+    status: &str,
+) {
+    app.emit(
+        event_name,
+        StreamEvent::TurnSettled {
+            run_instance_id: control.run_instance_id.clone(),
+            root_turn_id: root_turn_id.map(str::to_string),
+            objective_id: objective_id.map(str::to_string),
+            status: status.to_string(),
+        },
+    )
+    .ok();
 }
 
 /// Await the actual agent future through a JoinHandle so panics and runtime
@@ -400,6 +956,7 @@ async fn settle_chat_objective_from_outcome(
     app: &AppHandle,
     event_name: &str,
     objective_id: &str,
+    expected_revision: i64,
     root_turn_id: &str,
     outcome: &codefactory_agent_loop::run::RunOutcome,
     mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
@@ -410,6 +967,16 @@ async fn settle_chat_objective_from_outcome(
         .await
         .map_err(|error| AppError::Other(error.to_string()))?
         .ok_or_else(|| AppError::Other(format!("objective {objective_id} missing")))?;
+    if current.status.is_terminal() {
+        project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
+        return Ok(current);
+    }
+    if current.revision != expected_revision {
+        return Err(AppError::Other(format!(
+            "stale chat runner revision: expected {expected_revision}, actual {}",
+            current.revision
+        )));
+    }
     let terminal_reason = sqlx::query_scalar::<_, String>(
         "SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id=?",
     )
@@ -440,6 +1007,7 @@ async fn settle_chat_objective_from_error(
     app: &AppHandle,
     event_name: &str,
     objective_id: &str,
+    expected_revision: i64,
     root_turn_id: &str,
     auth_expired: bool,
     error_text: &str,
@@ -452,6 +1020,16 @@ async fn settle_chat_objective_from_error(
         .await
         .map_err(|error| AppError::Other(error.to_string()))?
         .ok_or_else(|| AppError::Other(format!("objective {objective_id} missing")))?;
+    if current.status.is_terminal() {
+        project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
+        return Ok(current);
+    }
+    if current.revision != expected_revision {
+        return Err(AppError::Other(format!(
+            "stale chat runner revision: expected {expected_revision}, actual {}",
+            current.revision
+        )));
+    }
     let signal = if auth_expired {
         RouteSignal::AuthorizationRequired {
             domain: RecoveryDomain::Auth,
@@ -483,11 +1061,222 @@ async fn settle_chat_objective_from_error(
     Ok(revised)
 }
 
+/// A detached foreground runner cannot return a settlement error to its IPC
+/// caller. Re-read the durable Objective and, only when the same revision is
+/// still active, transfer the failure to system-owned recovery. A newer or
+/// already-settled revision is projected as-is; the stale runner never applies
+/// its result to that newer business state.
+async fn recover_chat_settlement_failure(
+    db: &sqlx::SqlitePool,
+    app: &AppHandle,
+    event_name: &str,
+    objective_id: &str,
+    expected_revision: i64,
+    root_turn_id: &str,
+    failure: &str,
+) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
+    use crate::agent::objective::{DecisionRouter, ObjectiveStatus, RecoveryDomain, RouteSignal};
+    let store = crate::agent::objective::ObjectiveStore::new(db.clone());
+    let current = store
+        .get(objective_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+        .ok_or_else(|| AppError::Other(format!("objective {objective_id} missing")))?;
+    if current.revision != expected_revision || current.status != ObjectiveStatus::Active {
+        project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
+        return Ok(current);
+    }
+    let decision = DecisionRouter::route(
+        &current,
+        RouteSignal::TechnicalFailure {
+            domain: RecoveryDomain::Chat,
+            failure_code: "chat_settlement_failed".into(),
+            failure_signature: format!("sha256:{:x}", Sha256::digest(failure.as_bytes())),
+            next_observation_at: Utc::now().timestamp_millis() + 5_000,
+            resume_cursor: Some(root_turn_id.to_string()),
+        },
+    )
+    .map_err(|error| AppError::Other(error.to_string()))?;
+    let revised = store
+        .apply_decision(expected_revision, decision)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
+    Ok(revised)
+}
+
 struct ChatRunningSetupGuard {
     chat_cancels: crate::ChatCancelMap,
     session_id: String,
-    flag: Arc<AtomicBool>,
+    control: Arc<crate::ChatRunControl>,
+    durable_db: Option<sqlx::SqlitePool>,
+    event_app: Option<AppHandle>,
     armed: bool,
+}
+
+struct ChatSetupConvergence {
+    root_turn_id: String,
+    objective: crate::agent::objective::ObjectiveSnapshot,
+}
+
+/// Converge an admitted turn whose foreground setup disappeared before the
+/// AgentLoop future was handed to its supervisor. This function deliberately
+/// derives identity from the durable run receipt instead of values captured by
+/// the dropping future: a cancel racing setup and a restart both observe the
+/// same root/Objective/revision tuple.
+async fn converge_aborted_chat_setup(
+    pool: &sqlx::SqlitePool,
+    control: &crate::ChatRunControl,
+    session_id: &str,
+) -> Result<Option<ChatSetupConvergence>, AppError> {
+    use crate::agent::objective::{DecisionRouter, ObjectiveStatus, RecoveryDomain, RouteSignal};
+
+    if control.cancel.load(Ordering::SeqCst) {
+        // The process-local flag is fast, but only this exact durable intent
+        // can fence startup recovery after a crash.
+        request_chat_run_cancel(pool, &control.run_instance_id, session_id).await?;
+    }
+    if let Some(cancelled) = consume_requested_chat_cancel(pool, &control.run_instance_id).await? {
+        let root_turn_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT root_turn_id FROM chat_run_controls
+             WHERE run_instance_id=? AND session_id=?",
+        )
+        .bind(&control.run_instance_id)
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten()
+        .ok_or_else(|| AppError::Other("cancelled chat setup lost its root identity".into()))?;
+        return Ok(Some(ChatSetupConvergence {
+            root_turn_id,
+            objective: cancelled,
+        }));
+    }
+
+    let identity = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<i64>)>(
+        "SELECT control.status, control.root_turn_id,
+                COALESCE(control.objective_id, turn.objective_id),
+                COALESCE(control.objective_revision, objective.revision)
+         FROM chat_run_controls control
+         LEFT JOIN chat_turn_state turn
+           ON turn.root_turn_id=control.root_turn_id
+          AND turn.session_id=control.session_id
+         LEFT JOIN objectives objective
+           ON objective.id=COALESCE(control.objective_id, turn.objective_id)
+         WHERE control.run_instance_id=? AND control.session_id=?",
+    )
+    .bind(&control.run_instance_id)
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((control_status, root_turn_id, objective_id, objective_revision)) = identity else {
+        // Admission itself never committed, so there is no durable Objective
+        // to recover and no frontend turn receipt to settle.
+        return Ok(None);
+    };
+    let identity = match (root_turn_id, objective_id, objective_revision) {
+        (Some(root_turn_id), Some(objective_id), Some(objective_revision)) => {
+            Some((root_turn_id, objective_id, objective_revision))
+        }
+        (None, None, None) | (Some(_), None, None) => None,
+        _ => {
+            return Err(AppError::Other(
+                "aborted chat setup has an incomplete Objective/root/revision identity".into(),
+            ));
+        }
+    };
+
+    let Some((root_turn_id, objective_id, objective_revision)) = identity else {
+        // This is the pre-admission registration window used to make an early
+        // stop durable. With no committed Objective, retiring the transport is
+        // sufficient and cannot orphan business work.
+        settle_chat_run_control(pool, &control.run_instance_id).await?;
+        return Ok(None);
+    };
+
+    let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+    let mut objective = store
+        .get(&objective_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+        .ok_or_else(|| AppError::Other(format!("objective {objective_id} missing")))?;
+    if objective.session_id.as_deref() != Some(session_id)
+        || objective.root_turn_id.as_deref() != Some(root_turn_id.as_str())
+    {
+        return Err(AppError::Other(
+            "aborted chat setup durable identity mismatch".into(),
+        ));
+    }
+
+    if objective.status == ObjectiveStatus::Active && objective.revision == objective_revision {
+        // Only the exact admitted revision may be transferred. If another
+        // actor already advanced the Objective, this stale setup guard merely
+        // retires its own transport receipt and projects the durable winner.
+        let decision = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "chat_setup_aborted".into(),
+                failure_signature: format!(
+                    "sha256:{:x}",
+                    Sha256::digest(
+                        format!("chat_setup_aborted:{}", control.run_instance_id).as_bytes()
+                    )
+                ),
+                next_observation_at: Utc::now().timestamp_millis() + 5_000,
+                resume_cursor: Some(root_turn_id.clone()),
+            },
+        )
+        .map_err(|error| AppError::Other(error.to_string()))?;
+        objective = store
+            .apply_decision(objective_revision, decision)
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?;
+    }
+
+    if let Some(cancelled) = settle_chat_run_control(pool, &control.run_instance_id).await? {
+        objective = cancelled;
+    }
+    if control_status == "cancel_requested" && objective.status != ObjectiveStatus::Cancelled {
+        return Err(AppError::Other(
+            "aborted chat setup cancellation did not converge".into(),
+        ));
+    }
+    Ok(Some(ChatSetupConvergence {
+        root_turn_id,
+        objective,
+    }))
+}
+
+async fn converge_and_project_aborted_chat_setup(
+    pool: &sqlx::SqlitePool,
+    chat_cancels: &crate::ChatCancelMap,
+    control: &Arc<crate::ChatRunControl>,
+    session_id: &str,
+    event_app: Option<&AppHandle>,
+) -> Result<(), AppError> {
+    let settlement = converge_aborted_chat_setup(pool, control, session_id).await?;
+    if let (Some(app), Some(settlement)) = (event_app, settlement) {
+        let event_name = format!("stream:{session_id}");
+        project_chat_objective(
+            pool,
+            app,
+            &event_name,
+            &settlement.root_turn_id,
+            &settlement.objective,
+        )
+        .await?;
+        emit_chat_turn_settled(
+            app,
+            &event_name,
+            control,
+            Some(&settlement.root_turn_id),
+            Some(&settlement.objective.id),
+            chat_settlement_status(&settlement.objective),
+        );
+    }
+    clear_chat_running_if_current(chat_cancels, session_id, control).await;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,6 +1301,452 @@ struct ChatContinuationSetup {
     expected_objective_id: Option<String>,
     driver: Option<String>,
     ambiguous: bool,
+}
+
+#[derive(Debug)]
+struct ChatAdmissionReceipt {
+    root_turn_id: String,
+    objective: crate::agent::objective::ObjectiveSnapshot,
+    contract: crate::agent::dispatch::ChatContract,
+    cancel_requested: bool,
+    continuation_driver: Option<String>,
+    already_settled: bool,
+}
+
+async fn resolve_open_chat_objective_continuation_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    root_turn_id: &str,
+    current_ordinal: i64,
+) -> Result<ChatContinuationResolution, AppError> {
+    let current_binding = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT objective_id FROM chat_turn_state
+         WHERE root_turn_id=? AND session_id=?",
+    )
+    .bind(root_turn_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten()
+    .filter(|value| !value.is_empty());
+    if let Some(objective_id) = current_binding {
+        return Ok(ChatContinuationResolution::AlreadyBound { objective_id });
+    }
+
+    let candidates = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT objective.id, objective.status, turn.root_turn_id, segment.id
+         FROM objectives objective
+         JOIN chat_turn_state turn ON turn.objective_id=objective.id
+         JOIN chat_task_segments segment ON segment.id=turn.task_segment_id
+         WHERE turn.session_id=? AND turn.root_turn_id<>?
+           AND objective.status NOT IN ('completed', 'cancelled', 'legacy_orphan')
+           AND segment.ordinal<?
+           AND segment.ordinal=(
+             SELECT MAX(prior_segment.ordinal)
+             FROM chat_turn_state prior_turn
+             JOIN chat_task_segments prior_segment ON prior_segment.id=prior_turn.task_segment_id
+             WHERE prior_turn.objective_id=objective.id
+               AND prior_turn.session_id=?
+               AND prior_turn.root_turn_id<>?
+               AND prior_segment.ordinal<?
+           )
+         ORDER BY objective.id
+         LIMIT 2",
+    )
+    .bind(session_id)
+    .bind(root_turn_id)
+    .bind(current_ordinal)
+    .bind(session_id)
+    .bind(root_turn_id)
+    .bind(current_ordinal)
+    .fetch_all(&mut **tx)
+    .await?;
+    if candidates.len() > 1 {
+        return Ok(ChatContinuationResolution::Ambiguous);
+    }
+    let Some((objective_id, objective_status, continuation_root_turn_id, previous_segment_id)) =
+        candidates.into_iter().next()
+    else {
+        return Ok(ChatContinuationResolution::None);
+    };
+    let delivery_status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM delivery_runs
+         WHERE objective_id=?
+           AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
+         ORDER BY updated_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&objective_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let driver = match (objective_status.as_str(), delivery_status.as_deref()) {
+        ("waiting_system", Some("waiting")) => "recoverable_waiting_open",
+        ("waiting_system", Some("awaiting_completion_arbitration")) => {
+            "completion_arbitration_open"
+        }
+        ("waiting_system", _) => "system_owned_remediation_open",
+        ("waiting_core_input", _) => "core_input_response",
+        ("waiting_authorization", _) => "authorization_response",
+        ("waiting_business_decision", _) => "business_decision_response",
+        _ => "authorized_objective_still_open",
+    }
+    .to_string();
+    Ok(ChatContinuationResolution::Unique {
+        objective_id,
+        continuation_root_turn_id,
+        previous_segment_id,
+        driver,
+    })
+}
+
+/// Commit the exact user input, execution projection, opaque Objective, and
+/// durable run ownership as one receipt before any route, credential,
+/// checkpoint, or provider work can fail. A retry may read the same identity;
+/// it never guesses the latest unfinished message or reopens a terminal turn.
+async fn admit_persisted_chat_turn(
+    pool: &sqlx::SqlitePool,
+    control: &crate::ChatRunControl,
+    session_id: &str,
+    requested_root_turn_id: Option<&str>,
+    content: &str,
+) -> Result<ChatAdmissionReceipt, AppError> {
+    if content.trim().is_empty() {
+        return Err(AppError::Other("chat input cannot be empty".into()));
+    }
+    let root_turn_id = requested_root_turn_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let now = Utc::now().timestamp_millis();
+    let mut tx = pool.begin().await?;
+    let session_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id=?")
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if session_exists != 1 {
+        return Err(AppError::Other("chat session identity is missing".into()));
+    }
+
+    let existing_message = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT session_id, role, content FROM messages WHERE id=?",
+    )
+    .bind(&root_turn_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((bound_session, role, stored_content)) = existing_message {
+        if (
+            bound_session.as_str(),
+            role.as_str(),
+            stored_content.as_str(),
+        ) != (session_id, "user", content)
+        {
+            return Err(AppError::Other(
+                "chat root message identity/content mismatch".into(),
+            ));
+        }
+    } else {
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES (?, ?, 'user', ?, ?)",
+        )
+        .bind(&root_turn_id)
+        .bind(session_id)
+        .bind(content)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let cancelled = control.cancel.load(Ordering::SeqCst);
+    sqlx::query(
+        "INSERT INTO chat_run_controls
+         (run_instance_id, session_id, root_turn_id, status,
+          created_process_instance, cancel_requested_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(run_instance_id) DO UPDATE SET
+           root_turn_id=excluded.root_turn_id,
+           status=CASE WHEN chat_run_controls.status='cancel_requested'
+                       THEN 'cancel_requested' ELSE chat_run_controls.status END,
+           updated_at=excluded.updated_at
+         WHERE chat_run_controls.session_id=excluded.session_id
+           AND chat_run_controls.status IN ('active','cancel_requested')
+           AND (chat_run_controls.root_turn_id IS NULL
+                OR chat_run_controls.root_turn_id=excluded.root_turn_id)",
+    )
+    .bind(&control.run_instance_id)
+    .bind(session_id)
+    .bind(&root_turn_id)
+    .bind(if cancelled {
+        "cancel_requested"
+    } else {
+        "active"
+    })
+    .bind(crate::agent::objective::current_process_instance())
+    .bind(cancelled.then_some(now))
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    let existing_segment = sqlx::query_as::<_, (String, i64)>(
+        "SELECT id, ordinal FROM chat_task_segments
+         WHERE session_id=? AND goal_root_turn_id=?",
+    )
+    .bind(session_id)
+    .bind(&root_turn_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (segment_id, ordinal) = if let Some(existing) = existing_segment {
+        existing
+    } else {
+        let ordinal: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM chat_task_segments WHERE session_id=?",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let segment_id = Uuid::new_v4().to_string();
+        let title: String = content.chars().take(60).collect();
+        sqlx::query(
+            "INSERT INTO chat_task_segments
+             (id, session_id, ordinal, title, status, goal_root_turn_id,
+              previous_segment_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 'active', ?, NULL, ?, ?)",
+        )
+        .bind(&segment_id)
+        .bind(session_id)
+        .bind(ordinal)
+        .bind(if title.trim().is_empty() {
+            "新任务"
+        } else {
+            &title
+        })
+        .bind(&root_turn_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        (segment_id, ordinal)
+    };
+
+    let existing_turn = sqlx::query_as::<_, (String, Option<String>, String)>(
+        "SELECT session_id, objective_id, status FROM chat_turn_state WHERE root_turn_id=?",
+    )
+    .bind(&root_turn_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((bound_session, _, _)) = existing_turn.as_ref() {
+        if bound_session != session_id {
+            return Err(AppError::Other(
+                "chat root turn is already bound to another session".into(),
+            ));
+        }
+    } else {
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, task_segment_id, revision, phase, status,
+              started_at, updated_at, recent_activity_kind, recent_activity_label)
+             VALUES (?, ?, ?, 1, 'planning', 'active', ?, ?,
+                     'turn_started', '正在理解任务')",
+        )
+        .bind(&root_turn_id)
+        .bind(session_id)
+        .bind(&segment_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let resolution =
+        resolve_open_chat_objective_continuation_in_tx(&mut tx, session_id, &root_turn_id, ordinal)
+            .await?;
+    if matches!(resolution, ChatContinuationResolution::Ambiguous) {
+        return Err(AppError::Other(
+            "CHAT_OBJECTIVE_IDENTITY_AMBIGUOUS: system reconciliation required".into(),
+        ));
+    }
+    let legacy_continuation = if matches!(resolution, ChatContinuationResolution::None)
+        && crate::agent::is_contextual_approval(content)
+    {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT segment.id, segment.goal_root_turn_id
+             FROM chat_task_segments segment
+             LEFT JOIN chat_turn_state turn
+               ON turn.root_turn_id=segment.goal_root_turn_id
+             WHERE segment.session_id=? AND segment.ordinal<?
+               AND (turn.objective_id IS NULL OR turn.objective_id='')
+             ORDER BY segment.ordinal DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(ordinal)
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        None
+    };
+    let setup = match resolution {
+        ChatContinuationResolution::AlreadyBound { objective_id } => ChatContinuationSetup {
+            continuation_root_turn_id: None,
+            previous_segment_id: None,
+            expected_objective_id: Some(objective_id),
+            driver: None,
+            ambiguous: false,
+        },
+        ChatContinuationResolution::Unique {
+            objective_id,
+            continuation_root_turn_id,
+            previous_segment_id,
+            driver,
+        } => ChatContinuationSetup {
+            continuation_root_turn_id: Some(continuation_root_turn_id),
+            previous_segment_id: Some(previous_segment_id),
+            expected_objective_id: Some(objective_id),
+            driver: Some(driver),
+            ambiguous: false,
+        },
+        ChatContinuationResolution::None => ChatContinuationSetup {
+            continuation_root_turn_id: legacy_continuation.as_ref().map(|(_, root)| root.clone()),
+            previous_segment_id: legacy_continuation.map(|(segment, _)| segment),
+            expected_objective_id: None,
+            driver: None,
+            ambiguous: false,
+        },
+        ChatContinuationResolution::Ambiguous => unreachable!(),
+    };
+
+    let assistant_candidates = sqlx::query_scalar::<_, String>(
+        "SELECT message.content FROM messages message
+         WHERE message.session_id=? AND message.role='assistant'
+           AND (message.completion_state IS NULL OR message.completion_state='')
+           AND NOT EXISTS (
+             SELECT 1 FROM gate_events gate
+             WHERE gate.message_id=message.id AND gate.kind='rejected_candidate')
+         ORDER BY message.created_at DESC, message.rowid DESC",
+    )
+    .bind(session_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let previous_assistant = assistant_candidates.into_iter().find(|message| {
+        !crate::agent::is_contextual_approval(content)
+            || crate::agent::proposal_capability(message).is_some()
+    });
+    let mut contract = crate::agent::decide_chat_contract(previous_assistant.as_deref(), content);
+    let delivery_authorized: i64 =
+        sqlx::query_scalar("SELECT delivery_authorized FROM sessions WHERE id=?")
+            .bind(session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if crate::agent::is_delivery_revocation(content) {
+        sqlx::query("UPDATE sessions SET delivery_authorized=0 WHERE id=?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+    } else if contract.capability == crate::agent::TurnCapability::Deliver {
+        sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id=?")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+    } else if delivery_authorized != 0 {
+        contract = crate::agent::with_persisted_delivery_authorization(contract, true);
+    }
+
+    let objective_kind = chat_objective_kind(contract.capability, content);
+    let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+    let objective = store
+        .ensure_or_continue_chat_objective_in_tx(
+            &mut tx,
+            session_id,
+            &root_turn_id,
+            setup.continuation_root_turn_id.as_deref(),
+            objective_kind,
+            requested_acceptance(objective_kind),
+        )
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    if setup
+        .expected_objective_id
+        .as_deref()
+        .is_some_and(|expected| expected != objective.id)
+    {
+        return Err(AppError::Other(
+            "opaque Objective identity changed during admission".into(),
+        ));
+    }
+    if let Some(previous_segment_id) = setup.previous_segment_id.as_deref() {
+        if previous_segment_id == segment_id {
+            return Err(AppError::Other(
+                "chat continuation refused a self-referential segment".into(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE chat_task_segments SET previous_segment_id=?
+             WHERE id=? AND session_id=? AND previous_segment_id IS NULL",
+        )
+        .bind(previous_segment_id)
+        .bind(&segment_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if let Some(driver) = setup.driver.as_deref() {
+        sqlx::query(
+            "UPDATE chat_turn_state SET user_reprompt_driver=?
+             WHERE root_turn_id=? AND session_id=? AND objective_id=?",
+        )
+        .bind(driver)
+        .bind(&root_turn_id)
+        .bind(session_id)
+        .bind(&objective.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let bound = sqlx::query(
+        "UPDATE chat_run_controls
+         SET objective_id=?, objective_revision=?, updated_at=?
+         WHERE run_instance_id=? AND session_id=? AND root_turn_id=?
+           AND status IN ('active','cancel_requested')
+           AND (objective_id IS NULL
+                OR (objective_id=? AND objective_revision=?))
+           AND EXISTS (
+             SELECT 1 FROM chat_turn_state turn
+             WHERE turn.root_turn_id=? AND turn.session_id=?
+               AND turn.objective_id=?)",
+    )
+    .bind(&objective.id)
+    .bind(objective.revision)
+    .bind(now)
+    .bind(&control.run_instance_id)
+    .bind(session_id)
+    .bind(&root_turn_id)
+    .bind(&objective.id)
+    .bind(objective.revision)
+    .bind(&root_turn_id)
+    .bind(session_id)
+    .bind(&objective.id)
+    .execute(&mut *tx)
+    .await?;
+    if bound.rows_affected() != 1 {
+        return Err(AppError::Other(
+            "chat run final Objective binding changed during admission".into(),
+        ));
+    }
+    let control_status: String =
+        sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id=?")
+            .bind(&control.run_instance_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let already_settled = existing_turn
+        .as_ref()
+        .is_some_and(|(_, _, status)| matches!(status.as_str(), "completed" | "cancelled"));
+    tx.commit().await?;
+    Ok(ChatAdmissionReceipt {
+        root_turn_id,
+        objective,
+        contract,
+        cancel_requested: control_status == "cancel_requested",
+        continuation_driver: setup.driver,
+        already_settled,
+    })
 }
 
 /// Resolve reprompt continuity from opaque Objective state, never message
@@ -603,13 +1838,52 @@ async fn resolve_open_chat_objective_continuation(
 }
 
 impl ChatRunningSetupGuard {
-    fn new(chat_cancels: crate::ChatCancelMap, session_id: String, flag: Arc<AtomicBool>) -> Self {
+    fn new(
+        chat_cancels: crate::ChatCancelMap,
+        session_id: String,
+        control: Arc<crate::ChatRunControl>,
+    ) -> Self {
         Self {
             chat_cancels,
             session_id,
-            flag,
+            control,
+            durable_db: None,
+            event_app: None,
             armed: true,
         }
+    }
+
+    fn attach_durable_db(&mut self, db: sqlx::SqlitePool) {
+        self.durable_db = Some(db);
+    }
+
+    fn attach_event_app(&mut self, app: AppHandle) {
+        self.event_app = Some(app);
+    }
+
+    /// Explicit early-return seam for every fallible operation after atomic
+    /// admission. Drop remains the panic/cancellation fallback, but ordinary
+    /// setup errors await their durable recovery receipt before the command
+    /// reports success to the frontend.
+    async fn settle_now(&mut self) -> Result<(), AppError> {
+        if !self.armed {
+            return Ok(());
+        }
+        let Some(db) = self.durable_db.as_ref() else {
+            return Err(AppError::Other(
+                "admitted chat setup has no durable database handle".into(),
+            ));
+        };
+        converge_and_project_aborted_chat_setup(
+            db,
+            &self.chat_cancels,
+            &self.control,
+            &self.session_id,
+            self.event_app.as_ref(),
+        )
+        .await?;
+        self.armed = false;
+        Ok(())
     }
 
     fn disarm(&mut self) {
@@ -624,9 +1898,43 @@ impl Drop for ChatRunningSetupGuard {
         }
         let chat_cancels = self.chat_cancels.clone();
         let session_id = self.session_id.clone();
-        let flag = self.flag.clone();
+        let control = self.control.clone();
+        let durable_db = self.durable_db.clone();
+        let event_app = self.event_app.clone();
         tokio::spawn(async move {
-            clear_chat_running_if_current(&chat_cancels, &session_id, &flag).await;
+            if control.durable {
+                if let Some(db) = durable_db {
+                    let mut retry_attempt = 0_u32;
+                    loop {
+                        match converge_and_project_aborted_chat_setup(
+                            &db,
+                            &chat_cancels,
+                            &control,
+                            &session_id,
+                            event_app.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                retry_attempt = retry_attempt.saturating_add(1);
+                                tracing::error!(
+                                    run_instance_id = %control.run_instance_id,
+                                    retry_attempt,
+                                    %error,
+                                    "failed to converge admitted chat setup; retrying without user input"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    100 * i64::from(retry_attempt.min(50)) as u64,
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            clear_chat_running_if_current(&chat_cancels, &session_id, &control).await;
         });
     }
 }
@@ -636,227 +1944,114 @@ pub async fn send_message(
     app: AppHandle,
     session_id: String,
     content: String,
-    user_message_persisted: Option<bool>,
+    root_turn_id: Option<String>,
     state: State<'_, AppState>,
     mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
     // Register cancellation before any database, model, or credential work so
     // a stop click cannot race the command's setup phase.
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut active = state.chat_cancels.lock().await;
-        if state
-            .update_restart_reserved
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(AppError::Other(
-                "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
-            ));
-        }
-        active.insert(session_id.clone(), cancel_flag.clone());
-    }
+    let run_control = Arc::new(crate::ChatRunControl::pending());
+    let cancel_flag = run_control.cancel.clone();
+    admit_chat_run(
+        &state.chat_cancels,
+        &state.update_restart_reserved,
+        &session_id,
+        run_control.clone(),
+    )
+    .await?;
     let mut running_setup_guard = ChatRunningSetupGuard::new(
         state.chat_cancels.clone(),
         session_id.clone(),
-        cancel_flag.clone(),
+        run_control.clone(),
     );
-
-    let settings = state.settings.read().await.clone();
-
-    // Persist user message unless draft materialization already wrote it in
-    // the same transaction as the session row.
-    let root_turn_id = {
-        let pool = state.db.read().await;
-        let inserted_id = if !user_message_persisted.unwrap_or(false) {
-            let msg_id = Uuid::new_v4().to_string();
-            let now = Utc::now().timestamp_millis();
-            sqlx::query(
-                "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?,?,?,?,?)",
-            )
-            .bind(&msg_id)
-            .bind(&session_id)
-            .bind("user")
-            .bind(&content)
-            .bind(now)
-            .execute(&*pool)
-            .await?;
-            Some(msg_id)
-        } else {
-            None
-        };
-
-        let root_turn_id = match inserted_id {
-            Some(id) => id,
-            None => {
-                sqlx::query_scalar::<_, String>(
-                    "SELECT id FROM messages
-                 WHERE session_id=? AND role='user' AND completion_state IS NULL
-                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                )
-                .bind(&session_id)
-                .fetch_one(&*pool)
-                .await?
-            }
-        };
-        root_turn_id
-    };
-
-    let continuation_setup = {
-        let pool = state.db.read().await;
-        let now = Utc::now().timestamp_millis();
-        let ordinal: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM chat_task_segments WHERE session_id=?",
-        )
-        .bind(&session_id)
-        .fetch_one(&*pool)
-        .await?;
-        let resolution =
-            resolve_open_chat_objective_continuation(&pool, &session_id, &root_turn_id, ordinal)
-                .await?;
-        let legacy_continuation = if matches!(resolution, ChatContinuationResolution::None)
-            && crate::agent::is_contextual_approval(&content)
-        {
-            // Keyword inference is retained only for a pre-0006 segment whose
-            // prior root has no opaque Objective binding. All new records use
-            // Objective state above, regardless of message wording.
-            sqlx::query_as::<_, (String, String)>(
-                "SELECT segment.id, segment.goal_root_turn_id
-                 FROM chat_task_segments segment
-                 LEFT JOIN chat_turn_state turn
-                   ON turn.root_turn_id=segment.goal_root_turn_id
-                 WHERE segment.session_id=? AND segment.ordinal<?
-                   AND (turn.objective_id IS NULL OR turn.objective_id='')
-                 ORDER BY segment.ordinal DESC LIMIT 1",
-            )
-            .bind(&session_id)
-            .bind(ordinal)
-            .fetch_optional(&*pool)
-            .await?
-        } else {
-            None
-        };
-        let segment_id = Uuid::new_v4().to_string();
-        let title: String = content.chars().take(60).collect();
-        sqlx::query(
-            "INSERT OR IGNORE INTO chat_task_segments
-             (id, session_id, ordinal, title, status, goal_root_turn_id, previous_segment_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?)",
-        )
-        .bind(&segment_id)
-        .bind(&session_id)
-        .bind(ordinal)
-        .bind(if title.trim().is_empty() {
-            "新任务"
-        } else {
-            &title
-        })
-        .bind(&root_turn_id)
-        .bind(Option::<String>::None)
-        .bind(now)
-        .bind(now)
-        .execute(&*pool)
-        .await?;
-        let segment_id: String = sqlx::query_scalar(
-            "SELECT id FROM chat_task_segments WHERE session_id=? AND goal_root_turn_id=?",
-        )
-        .bind(&session_id)
-        .bind(&root_turn_id)
-        .fetch_one(&*pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO chat_turn_state
-             (root_turn_id, session_id, task_segment_id, revision, phase, status,
-              started_at, updated_at, recent_activity_kind, recent_activity_label)
-             VALUES (?, ?, ?, 1, 'planning', 'active', ?, ?, 'turn_started', '正在理解任务')
-             ON CONFLICT(root_turn_id) DO UPDATE SET
-               revision=chat_turn_state.revision+1, phase='planning', status='active',
-               updated_at=excluded.updated_at, completed_at=NULL, terminal_reason=NULL",
-        )
-        .bind(&root_turn_id)
-        .bind(&session_id)
-        .bind(&segment_id)
-        .bind(now)
-        .bind(now)
-        .execute(&*pool)
-        .await?;
-        match resolution {
-            ChatContinuationResolution::AlreadyBound { objective_id } => ChatContinuationSetup {
-                continuation_root_turn_id: None,
-                previous_segment_id: None,
-                expected_objective_id: Some(objective_id),
-                driver: None,
-                ambiguous: false,
-            },
-            ChatContinuationResolution::Unique {
-                objective_id,
-                continuation_root_turn_id,
-                previous_segment_id,
-                driver,
-            } => ChatContinuationSetup {
-                continuation_root_turn_id: Some(continuation_root_turn_id),
-                previous_segment_id: Some(previous_segment_id),
-                expected_objective_id: Some(objective_id),
-                driver: Some(driver),
-                ambiguous: false,
-            },
-            ChatContinuationResolution::None => ChatContinuationSetup {
-                continuation_root_turn_id: legacy_continuation
-                    .as_ref()
-                    .map(|(_, root)| root.clone()),
-                previous_segment_id: legacy_continuation.map(|(segment, _)| segment),
-                expected_objective_id: None,
-                driver: None,
-                ambiguous: false,
-            },
-            ChatContinuationResolution::Ambiguous => {
-                sqlx::query(
-                    "UPDATE chat_turn_state
-                     SET phase='recovering', status='waiting_system',
-                         recent_activity_kind='system_identity_reconciliation',
-                         recent_activity_label='系统正在核对目标身份',
-                         user_reprompt_driver='system_owned_identity_incident', updated_at=?
-                    WHERE root_turn_id=? AND session_id=?",
-                )
-                .bind(now)
-                .bind(&root_turn_id)
-                .bind(&session_id)
-                .execute(&*pool)
-                .await?;
-                ChatContinuationSetup {
-                    continuation_root_turn_id: None,
-                    previous_segment_id: None,
-                    expected_objective_id: None,
-                    driver: Some("system_owned_identity_incident".into()),
-                    ambiguous: true,
+    let db = state.db.read().await.clone();
+    running_setup_guard.attach_durable_db(db.clone());
+    let admission = admit_persisted_chat_turn(
+        &db,
+        &run_control,
+        &session_id,
+        root_turn_id.as_deref(),
+        &content,
+    )
+    .await?;
+    let root_turn_id = admission.root_turn_id;
+    let objective = admission.objective;
+    let contract = admission.contract;
+    // From this point every early return owns a committed user/root/Objective
+    // receipt and therefore must end with one durable recovery/cancel result
+    // plus one TurnSettled projection.
+    running_setup_guard.attach_event_app(app.clone());
+    macro_rules! setup_or_recover {
+        ($expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => {
+                    let setup_error: AppError = error.into();
+                    tracing::warn!(
+                        run_instance_id = %run_control.run_instance_id,
+                        objective_id = %objective.id,
+                        error = %setup_error,
+                        "chat setup failed after atomic admission; transferring to system recovery"
+                    );
+                    if let Err(convergence_error) = running_setup_guard.settle_now().await {
+                        // The still-armed Drop path keeps retrying the same
+                        // durable identity after this command returns.
+                        tracing::error!(
+                            run_instance_id = %run_control.run_instance_id,
+                            error = %convergence_error,
+                            "chat setup recovery persistence deferred to guard retry"
+                        );
+                    }
+                    return Ok(());
                 }
             }
-        }
-    };
-
-    if continuation_setup.ambiguous {
-        let event_name = format!("stream:{session_id}");
-        app.emit(
-            &event_name,
-            StreamEvent::TurnActivityUpdated {
-                root_turn_id: root_turn_id.clone(),
-                revision: 1,
-                phase: "recovering".into(),
-                status: "waiting_system".into(),
-                recent_activity_kind: "system_identity_reconciliation".into(),
-                recent_activity_label: "系统正在核对目标身份".into(),
-                waiting_reason: Some("multiple_open_objectives".into()),
-                updated_at: Utc::now().timestamp_millis(),
-                terminal_reason: None,
-                objective_id: None,
-                objective_status: Some("waiting_system".into()),
-                recovery_owner: Some("objective-supervisor".into()),
-                next_observation_at: Some(Utc::now().timestamp_millis() + 5_000),
-                last_progress_at: None,
-            },
-        )
-        .ok();
+        };
+    }
+    if let Some(driver) = admission.continuation_driver.as_deref() {
+        tracing::info!(
+            objective_id = %objective.id,
+            root_turn_id = %root_turn_id,
+            continuation_driver = driver,
+            "chat turn admitted as an exact Objective continuation"
+        );
+    }
+    if admission.cancel_requested || admission.already_settled {
+        let settled = if admission.cancel_requested {
+            let cancelled = setup_or_recover!(
+                consume_requested_chat_cancel(&db, &run_control.run_instance_id).await
+            );
+            setup_or_recover!(cancelled.ok_or_else(|| {
+                AppError::Other("durable chat cancel disappeared after atomic admission".into())
+            }))
+        } else {
+            setup_or_recover!(settle_chat_run_control(&db, &run_control.run_instance_id).await);
+            objective.clone()
+        };
+        run_control.cancel.store(true, Ordering::SeqCst);
+        setup_or_recover!(
+            project_chat_objective(
+                &db,
+                &app,
+                &format!("stream:{session_id}"),
+                &root_turn_id,
+                &settled,
+            )
+            .await
+        );
+        clear_chat_running_if_current(&state.chat_cancels, &session_id, &run_control).await;
+        emit_chat_turn_settled(
+            &app,
+            &format!("stream:{session_id}"),
+            &run_control,
+            Some(&root_turn_id),
+            Some(&settled.id),
+            chat_settlement_status(&settled),
+        );
+        running_setup_guard.disarm();
         return Ok(());
     }
+
+    let settings = state.settings.read().await.clone();
 
     // Fetch session for cwd + model
     let session = {
@@ -864,8 +2059,9 @@ pub async fn send_message(
         sqlx::query_as::<_, crate::storage::Session>("SELECT * FROM sessions WHERE id = ?")
             .bind(&session_id)
             .fetch_one(&*pool)
-            .await?
+            .await
     };
+    let session = setup_or_recover!(session);
     // A placeholder can survive a crash between the first reply and its
     // background title request. Re-read the first real user message on every
     // later turn while the source is still placeholder so the next successful
@@ -873,7 +2069,7 @@ pub async fn send_message(
     // and a database CAS, so recovery cannot overwrite manual titles.
     let title_user_message = if session.title_source == TITLE_SOURCE_PLACEHOLDER {
         let pool = state.db.read().await;
-        sqlx::query_scalar::<_, String>(
+        let result = sqlx::query_scalar::<_, String>(
             "SELECT content FROM messages
              WHERE session_id = ? AND role = 'user'
                AND (completion_state IS NULL OR completion_state = '')
@@ -881,7 +2077,8 @@ pub async fn send_message(
         )
         .bind(&session_id)
         .fetch_optional(&*pool)
-        .await?
+        .await;
+        setup_or_recover!(result)
     } else {
         None
     };
@@ -925,28 +2122,30 @@ pub async fn send_message(
     // Freeze all locally usable routes for this turn. This is a runtime
     // availability plan only: it never overwrites the user's preferred
     // endpoint/model in Settings.
-    let turn_settings = settings_for_session_route(
+    let turn_settings = setup_or_recover!(settings_for_session_route(
         &settings,
         session.endpoint_id.as_deref(),
         &session.model_id,
         &session.model_policy,
-    )?;
+    ));
     // Fetch history as the agent should see it — excludes gate-rejected drafts.
     // It is also the capability source for the frozen turn plan.
     let history = {
         let pool = state.db.read().await;
-        crate::storage::load_agent_history(&pool, &session_id).await?
+        setup_or_recover!(crate::storage::load_agent_history(&pool, &session_id).await)
     };
     let requires_vision = history.iter().any(|message| {
         !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
     });
-    let (route_plan, excluded_routes) = resolve_route_plan(
-        &turn_settings,
-        &session.model_id,
-        &session.model_policy,
-        requires_vision,
-    )
-    .await?;
+    let (route_plan, excluded_routes) = setup_or_recover!(
+        resolve_route_plan(
+            &turn_settings,
+            &session.model_id,
+            &session.model_policy,
+            requires_vision,
+        )
+        .await
+    );
     let primary_route = route_plan
         .candidates()
         .first()
@@ -968,12 +2167,14 @@ pub async fn send_message(
         );
         let pool = state.db.read().await;
         let now = Utc::now().timestamp_millis();
-        sqlx::query("UPDATE sessions SET model_id = ?, updated_at = ? WHERE id = ?")
-            .bind(&resolved_model)
-            .bind(now)
-            .bind(&session_id)
-            .execute(&*pool)
-            .await?;
+        setup_or_recover!(
+            sqlx::query("UPDATE sessions SET model_id = ?, updated_at = ? WHERE id = ?")
+                .bind(&resolved_model)
+                .bind(now)
+                .bind(&session_id)
+                .execute(&*pool)
+                .await
+        );
         if let Ok(updated_session) =
             sqlx::query_as::<_, crate::storage::Session>("SELECT * FROM sessions WHERE id = ?")
                 .bind(&session_id)
@@ -993,49 +2194,9 @@ pub async fn send_message(
         excluded_routes.len(),
     );
 
-    // Framework-side plan/act dispatch (no user-facing mode toggle): if the
-    // previous assistant turn ended on a pending proposal and this message
-    // approves it, run THIS turn under the execute contract instead of
-    // plan-first — so the agent doesn't re-ask "Ready to proceed?" for work
-    // the user already greenlit. `history` already includes the just-inserted
-    // user message as its last element, so the most recent assistant message
-    // is the proposal we're checking.
-    let prev_assistant = history
-        .iter()
-        .rev()
-        .find(|m| {
-            m.role == "assistant"
-                && m.completion_state.is_none()
-                && (!crate::agent::is_contextual_approval(&content)
-                    || crate::agent::proposal_capability(&m.content).is_some())
-        })
-        .map(|m| m.content.clone());
-    // Full access is a permission policy only. It may reduce approval prompts
-    // after a tool is selected, but it must never turn a diagnostic question
-    // into an execute-contract turn.
-    let mut contract = crate::agent::decide_chat_contract(prev_assistant.as_deref(), &content);
-    // Session-persisted delivery authorization (DB-backed so it survives app
-    // restarts): once this session asked to deliver, later non-planning turns
-    // keep Deliver capability so follow-up work can ship without a repeat
-    // confirmation. A new explicit delivery request (re)grants it; a
-    // revocation clears it.
-    {
-        let db = state.db.read().await.clone();
-        let authorized = crate::agent::fetch_session_delivery_authorized(&db, &session_id).await;
-        if crate::agent::is_delivery_revocation(&content) {
-            crate::agent::set_session_delivery_authorized(&db, &session_id, false).await;
-        } else if contract.capability == crate::agent::TurnCapability::Deliver {
-            crate::agent::set_session_delivery_authorized(&db, &session_id, true).await;
-        } else if authorized {
-            contract = crate::agent::with_persisted_delivery_authorization(contract, true);
-        }
-    }
-    let mode = select_chat_mode(
-        settings.permissions.full_access,
-        prev_assistant.as_deref(),
-        &content,
-    );
-    debug_assert_eq!(mode, contract.mode);
+    // The execution contract and durable delivery grant were frozen in the
+    // admission transaction. Recomputing either here would split the control
+    // receipt from the provider run and could authorize a different revision.
     tracing::info!(
         "send_message: dispatch mode = {:?}, capability = {:?}",
         contract.mode,
@@ -1043,61 +2204,6 @@ pub async fn send_message(
     );
 
     let db = state.db.read().await.clone();
-    let objective_kind = chat_objective_kind(contract.capability, &content);
-    let objective = crate::agent::objective::ObjectiveStore::new(db.clone())
-        .ensure_or_continue_chat_objective(
-            &session_id,
-            &root_turn_id,
-            continuation_setup.continuation_root_turn_id.as_deref(),
-            objective_kind,
-            requested_acceptance(objective_kind),
-        )
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?;
-    if continuation_setup
-        .expected_objective_id
-        .as_deref()
-        .is_some_and(|expected| expected != objective.id)
-    {
-        return Err(AppError::Other(
-            "opaque Objective identity changed during continuation reconciliation".into(),
-        ));
-    }
-    if let Some(previous_segment_id) = continuation_setup.previous_segment_id.as_deref() {
-        if previous_segment_id
-            == sqlx::query_scalar::<_, String>(
-                "SELECT task_segment_id FROM chat_turn_state WHERE root_turn_id=?",
-            )
-            .bind(&root_turn_id)
-            .fetch_one(&db)
-            .await?
-        {
-            return Err(AppError::Other(
-                "chat continuation refused a self-referential segment".into(),
-            ));
-        }
-        sqlx::query(
-            "UPDATE chat_task_segments
-             SET previous_segment_id=?
-             WHERE session_id=? AND goal_root_turn_id=? AND previous_segment_id IS NULL",
-        )
-        .bind(previous_segment_id)
-        .bind(&session_id)
-        .bind(&root_turn_id)
-        .execute(&db)
-        .await?;
-        if let Some(driver) = continuation_setup.driver.as_deref() {
-            sqlx::query(
-                "UPDATE chat_turn_state SET user_reprompt_driver=?
-                 WHERE root_turn_id=? AND session_id=?",
-            )
-            .bind(driver)
-            .bind(&root_turn_id)
-            .bind(&session_id)
-            .execute(&db)
-            .await?;
-        }
-    }
     let objective_id = objective.id.clone();
     let settings_state = state.settings.clone();
     let settings_for_notify = state.settings.clone();
@@ -1110,7 +2216,9 @@ pub async fn send_message(
     let session_id_clone = session_id.clone();
     let root_turn_for_error = root_turn_id.clone();
     let objective_for_settlement = objective_id.clone();
+    let objective_revision_for_settlement = objective.revision;
     let chat_cancels = state.chat_cancels.clone();
+    let tracked_run_control = run_control.clone();
     let tracked_cancel_flag = cancel_flag.clone();
     let interjections = state.interjections.clone();
     let interjections_cleanup = state.interjections.clone();
@@ -1196,30 +2304,54 @@ pub async fn send_message(
                 }
             }
         }
-        match loop_result {
+        let mut settled_objective = match loop_result {
             Ok(outcome) => {
-                if let Err(error) = settle_chat_objective_from_outcome(
+                match settle_chat_objective_from_outcome(
                     &db_for_error,
                     &app_clone,
                     &event_name,
                     &objective_for_settlement,
+                    objective_revision_for_settlement,
                     &root_turn_for_error,
                     &outcome,
                     None,
                 )
                 .await
                 {
-                    tracing::error!("failed to settle chat objective: {error}");
+                    Ok(settled) => Some(settled),
+                    Err(error) => {
+                        tracing::error!("failed to settle chat objective: {error}");
+                        match recover_chat_settlement_failure(
+                            &db_for_error,
+                            &app_clone,
+                            &event_name,
+                            &objective_for_settlement,
+                            objective_revision_for_settlement,
+                            &root_turn_for_error,
+                            &error.to_string(),
+                        )
+                        .await
+                        {
+                            Ok(settled) => Some(settled),
+                            Err(recovery_error) => {
+                                tracing::error!(
+                                    "failed to recover chat settlement: {recovery_error}"
+                                );
+                                None
+                            }
+                        }
+                    }
                 }
             }
             Err(error_text) => {
                 tracing::error!("Agent loop error: {error_text}");
                 let auth_expired = is_chatgpt_auth_expired(&endpoint_for_error, &error_text);
-                if let Err(error) = settle_chat_objective_from_error(
+                let settled = match settle_chat_objective_from_error(
                     &db_for_error,
                     &app_clone,
                     &event_name,
                     &objective_for_settlement,
+                    objective_revision_for_settlement,
                     &root_turn_for_error,
                     auth_expired,
                     &error_text,
@@ -1227,8 +2359,30 @@ pub async fn send_message(
                 )
                 .await
                 {
-                    tracing::error!("failed to persist chat objective recovery: {error}");
-                }
+                    Ok(settled) => Some(settled),
+                    Err(error) => {
+                        tracing::error!("failed to persist chat objective recovery: {error}");
+                        match recover_chat_settlement_failure(
+                            &db_for_error,
+                            &app_clone,
+                            &event_name,
+                            &objective_for_settlement,
+                            objective_revision_for_settlement,
+                            &root_turn_for_error,
+                            &error.to_string(),
+                        )
+                        .await
+                        {
+                            Ok(settled) => Some(settled),
+                            Err(recovery_error) => {
+                                tracing::error!(
+                                    "failed to recover chat settlement: {recovery_error}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                };
                 {
                     let settings = settings_for_notify.read().await;
                     crate::notify::send(
@@ -1250,10 +2404,26 @@ pub async fn send_message(
                         )
                         .ok();
                 }
+                settled
             }
+        };
+        match settle_chat_run_control(&db_for_error, &tracked_run_control.run_instance_id).await {
+            Ok(cancelled @ Some(_)) => settled_objective = cancelled,
+            Ok(None) => {}
+            Err(error) => tracing::error!("failed to settle durable chat run control: {error}"),
         }
-        clear_chat_running_if_current(&chat_cancels, &session_for_error, &tracked_cancel_flag)
+        clear_chat_running_if_current(&chat_cancels, &session_for_error, &tracked_run_control)
             .await;
+        if let Some(settled) = settled_objective.as_ref() {
+            emit_chat_turn_settled(
+                &app_clone,
+                &event_name,
+                &tracked_run_control,
+                Some(&root_turn_for_error),
+                Some(&settled.id),
+                chat_settlement_status(settled),
+            );
+        }
         if let Some((title_route, title_user_message, assistant_summary)) = deferred_title_job {
             // The frontend drains an already-queued next message with a
             // zero-delay timer. Give that primary turn time to register; if it
@@ -1315,41 +2485,88 @@ pub(crate) async fn resume_chat_objective(
         .clone()
         .ok_or_else(|| AppError::Other("chat objective has no session identity".into()))?;
     let root_turn_id = objective
-        .root_turn_id
+        .resume_cursor
         .clone()
-        .ok_or_else(|| AppError::Other("chat objective has no root-turn identity".into()))?;
+        .or_else(|| objective.root_turn_id.clone())
+        .ok_or_else(|| AppError::Other("chat objective has no active resume cursor".into()))?;
 
     let state = app.state::<AppState>();
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut active = state.chat_cancels.lock().await;
-        if active.contains_key(&session_id) {
-            return Err(AppError::Other(
-                "chat session already has an active runner".into(),
-            ));
-        }
-        if state
-            .update_restart_reserved
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(AppError::Other(
-                "update restart reservation is active".into(),
-            ));
-        }
-        active.insert(session_id.clone(), cancel_flag.clone());
-    }
+    let run_control = Arc::new(crate::ChatRunControl::pending());
+    let cancel_flag = run_control.cancel.clone();
+    admit_chat_run(
+        &state.chat_cancels,
+        &state.update_restart_reserved,
+        &session_id,
+        run_control.clone(),
+    )
+    .await?;
     let mut running_guard = ChatRunningSetupGuard::new(
         state.chat_cancels.clone(),
         session_id.clone(),
-        cancel_flag.clone(),
+        run_control.clone(),
     );
     let db = state.db.read().await.clone();
+    running_guard.attach_durable_db(db.clone());
+    running_guard.attach_event_app(app.clone());
+    let current_binding: Option<String> = sqlx::query_scalar(
+        "SELECT objective_id FROM chat_turn_state
+         WHERE root_turn_id=? AND session_id=?",
+    )
+    .bind(&root_turn_id)
+    .bind(&session_id)
+    .fetch_optional(&db)
+    .await?
+    .flatten();
+    if current_binding.as_deref() != Some(objective.id.as_str()) {
+        return Err(AppError::Other(
+            "chat objective resume cursor is not bound to the claimed Objective".into(),
+        ));
+    }
+    register_chat_run_control(&db, &run_control, &session_id).await?;
+    bind_chat_run_root(
+        &db,
+        &run_control.run_instance_id,
+        &session_id,
+        &root_turn_id,
+    )
+    .await?;
+    if let Some(cancelled) = bind_chat_run_objective(
+        &db,
+        &run_control.run_instance_id,
+        &session_id,
+        &root_turn_id,
+        &objective.id,
+        objective.revision,
+    )
+    .await?
+    {
+        run_control.cancel.store(true, Ordering::SeqCst);
+        project_chat_objective(
+            &db,
+            &app,
+            &format!("stream:{session_id}"),
+            &root_turn_id,
+            &cancelled,
+        )
+        .await?;
+        clear_chat_running_if_current(&state.chat_cancels, &session_id, &run_control).await;
+        emit_chat_turn_settled(
+            &app,
+            &format!("stream:{session_id}"),
+            &run_control,
+            Some(&root_turn_id),
+            Some(&cancelled.id),
+            chat_settlement_status(&cancelled),
+        );
+        running_guard.disarm();
+        return Ok(());
+    }
     let settings_snapshot = state.settings.read().await.clone();
     let settings_state = state.settings.clone();
     let pending_permissions = state.pending_permissions.clone();
     let chat_cancels = state.chat_cancels.clone();
     let interjections = state.interjections.clone();
-    let tracked_cancel = cancel_flag.clone();
+    let tracked_run_control = run_control.clone();
     drop(state);
     let mcp_manager = Arc::clone(&*app.state::<Arc<McpManager>>());
 
@@ -1409,6 +2626,8 @@ pub(crate) async fn resume_chat_objective(
     };
 
     let event_name = format!("stream:{session_id}");
+    let force_context_compression =
+        crate::agent::claimed_context_compression_authorization(&objective, &mutation_permit);
     let app_for_run = app.clone();
     let db_for_run = db.clone();
     let session_for_run = session_id.clone();
@@ -1433,6 +2652,7 @@ pub(crate) async fn resume_chat_objective(
                 knowledge_library_ids: Vec::new(),
                 usage_surface: crate::agent::UsageSurface::Interactive,
                 mutation_permit: Some(permit_for_run),
+                force_context_compression,
             }),
             mode,
         )
@@ -1445,26 +2665,28 @@ pub(crate) async fn resume_chat_objective(
     })
     .await;
 
-    match loop_result {
-        Ok(outcome) => {
+    let mut settled_objective = match loop_result {
+        Ok(outcome) => Some(
             settle_chat_objective_from_outcome(
                 &db,
                 &app,
                 &event_name,
                 &objective.id,
+                objective.revision,
                 &root_turn_id,
                 &outcome,
                 Some(&mutation_permit),
             )
-            .await?;
-        }
+            .await?,
+        ),
         Err(error_text) => {
             let auth_expired = is_chatgpt_auth_expired(&endpoint_for_error, &error_text);
-            settle_chat_objective_from_error(
+            let settled = settle_chat_objective_from_error(
                 &db,
                 &app,
                 &event_name,
                 &objective.id,
+                objective.revision,
                 &root_turn_id,
                 auth_expired,
                 &error_text,
@@ -1483,10 +2705,27 @@ pub(crate) async fn resume_chat_objective(
                 )
                 .ok();
             }
+            Some(settled)
         }
+    };
+
+    if let Some(cancelled) =
+        settle_chat_run_control(&db, &tracked_run_control.run_instance_id).await?
+    {
+        settled_objective = Some(cancelled);
     }
 
-    clear_chat_running_if_current(&chat_cancels, &session_id, &tracked_cancel).await;
+    clear_chat_running_if_current(&chat_cancels, &session_id, &tracked_run_control).await;
+    if let Some(settled) = settled_objective.as_ref() {
+        emit_chat_turn_settled(
+            &app,
+            &event_name,
+            &tracked_run_control,
+            Some(&root_turn_id),
+            Some(&settled.id),
+            chat_settlement_status(settled),
+        );
+    }
     let reclaimed = crate::tools::browser_session::close_for_session(&session_id).await;
     if reclaimed > 0 {
         tracing::info!("objective resume reclaimed {reclaimed} browser session(s)");
@@ -1546,23 +2785,19 @@ pub async fn send_message_anonymous(
     mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
     // Match persisted chats: expose the cancellation flag before setup work.
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    {
-        let mut active = state.chat_cancels.lock().await;
-        if state
-            .update_restart_reserved
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(AppError::Other(
-                "应用更新已进入安全重启阶段，请等待自动恢复工作区".into(),
-            ));
-        }
-        active.insert(session_id.clone(), cancel_flag.clone());
-    }
+    let run_control = Arc::new(crate::ChatRunControl::ephemeral());
+    let cancel_flag = run_control.cancel.clone();
+    admit_chat_run(
+        &state.chat_cancels,
+        &state.update_restart_reserved,
+        &session_id,
+        run_control.clone(),
+    )
+    .await?;
     let mut running_setup_guard = ChatRunningSetupGuard::new(
         state.chat_cancels.clone(),
         session_id.clone(),
-        cancel_flag.clone(),
+        run_control.clone(),
     );
 
     let settings = state.settings.read().await.clone();
@@ -1639,7 +2874,7 @@ pub async fn send_message_anonymous(
     let event_name = format!("stream:{}", session_id);
     let session_id_clone = session_id.clone();
     let chat_cancels = state.chat_cancels.clone();
-    let tracked_cancel_flag = cancel_flag.clone();
+    let tracked_run_control = run_control.clone();
     let interjections = state.interjections.clone();
     let interjections_cleanup = state.interjections.clone();
     tokio::spawn(async move {
@@ -1670,6 +2905,7 @@ pub async fn send_message_anonymous(
             agent.run(full_history).await
         })
         .await;
+        let transport_succeeded = loop_result.is_ok();
         if let Err(error_text) = loop_result {
             tracing::error!("Anonymous agent loop error: {error_text}");
             app_clone
@@ -1681,8 +2917,23 @@ pub async fn send_message_anonymous(
                 )
                 .ok();
         }
-        clear_chat_running_if_current(&chat_cancels, &completed_session_id, &tracked_cancel_flag)
+        clear_chat_running_if_current(&chat_cancels, &completed_session_id, &tracked_run_control)
             .await;
+        let settlement_status = if tracked_run_control.cancel.load(Ordering::SeqCst) {
+            "cancelled"
+        } else if transport_succeeded {
+            "completed"
+        } else {
+            "failed_setup"
+        };
+        emit_chat_turn_settled(
+            &app_clone,
+            &event_name,
+            &tracked_run_control,
+            None,
+            None,
+            settlement_status,
+        );
         // Same race as the persisted path: a steer that arrived after the last
         // round boundary is dropped here rather than leaking into a later turn.
         crate::commands::interjections::drain_for_session(
@@ -2018,8 +3269,8 @@ mod tests {
     async fn completed_chat_only_clears_its_own_running_flag() {
         let flags: crate::ChatCancelMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let completed = Arc::new(AtomicBool::new(false));
-        let replacement = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(crate::ChatRunControl::pending());
+        let replacement = Arc::new(crate::ChatRunControl::pending());
         flags
             .lock()
             .await
@@ -2039,7 +3290,7 @@ mod tests {
     async fn failed_setup_guard_clears_only_the_flag_it_registered() {
         let flags: crate::ChatCancelMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let failed_setup = Arc::new(AtomicBool::new(false));
+        let failed_setup = Arc::new(crate::ChatRunControl::pending());
         flags
             .lock()
             .await
@@ -2056,8 +3307,8 @@ mod tests {
         .await
         .expect("setup cleanup should remove the failed run");
 
-        let stale_setup = Arc::new(AtomicBool::new(false));
-        let replacement = Arc::new(AtomicBool::new(false));
+        let stale_setup = Arc::new(crate::ChatRunControl::pending());
+        let replacement = Arc::new(crate::ChatRunControl::pending());
         flags
             .lock()
             .await
@@ -2074,6 +3325,589 @@ mod tests {
             flags.lock().await.get("replaced").unwrap(),
             &replacement,
         ));
+    }
+
+    #[tokio::test]
+    async fn admitted_setup_failure_moves_the_exact_objective_to_system_recovery() {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-setup-failure".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-setup-failure".into()),
+                root_turn_id: Some("turn-setup-failure".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-setup-failure', 'session-setup-failure', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let flags: crate::ChatCancelMap =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let control = Arc::new(crate::ChatRunControl::pending());
+        flags
+            .lock()
+            .await
+            .insert("session-setup-failure".into(), control.clone());
+        register_chat_run_control(&pool, &control, "session-setup-failure")
+            .await
+            .unwrap();
+        bind_chat_run_root(
+            &pool,
+            &control.run_instance_id,
+            "session-setup-failure",
+            "turn-setup-failure",
+        )
+        .await
+        .unwrap();
+        bind_chat_run_objective(
+            &pool,
+            &control.run_instance_id,
+            "session-setup-failure",
+            "turn-setup-failure",
+            &objective.id,
+            objective.revision,
+        )
+        .await
+        .unwrap();
+
+        let mut guard = ChatRunningSetupGuard::new(
+            flags.clone(),
+            "session-setup-failure".into(),
+            control.clone(),
+        );
+        guard.attach_durable_db(pool.clone());
+        guard
+            .settle_now()
+            .await
+            .expect("the explicit early-return seam must persist recovery");
+        assert!(!flags.lock().await.contains_key("session-setup-failure"));
+
+        let recovered = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(
+            recovered.failure_code.as_deref(),
+            Some("chat_setup_aborted")
+        );
+        assert_eq!(
+            recovered.resume_cursor.as_deref(),
+            Some("turn-setup-failure")
+        );
+        let open_remediations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=?
+               AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(open_remediations, 1);
+        let control_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id=?")
+                .bind(&control.run_instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(control_status, "completed");
+
+        let repeated = converge_aborted_chat_setup(&pool, &control, "session-setup-failure")
+            .await
+            .unwrap()
+            .expect("the terminal control keeps its exact durable identity");
+        assert_eq!(repeated.objective.id, objective.id);
+        assert_eq!(repeated.objective.revision, recovered.revision);
+        let still_one_remediation: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=?
+               AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still_one_remediation, 1);
+
+        let newer = store
+            .create(CreateObjective {
+                id: "objective-newer-setup-owner".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-newer-setup-owner".into()),
+                root_turn_id: Some("turn-newer-setup-owner".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-newer-setup-owner', 'session-newer-setup-owner', ?)",
+        )
+        .bind(&newer.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale_control = crate::ChatRunControl::pending();
+        register_chat_run_control(&pool, &stale_control, "session-newer-setup-owner")
+            .await
+            .unwrap();
+        bind_chat_run_root(
+            &pool,
+            &stale_control.run_instance_id,
+            "session-newer-setup-owner",
+            "turn-newer-setup-owner",
+        )
+        .await
+        .unwrap();
+        bind_chat_run_objective(
+            &pool,
+            &stale_control.run_instance_id,
+            "session-newer-setup-owner",
+            "turn-newer-setup-owner",
+            &newer.id,
+            newer.revision,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE objectives SET revision=revision+1 WHERE id=?")
+            .bind(&newer.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let projected =
+            converge_aborted_chat_setup(&pool, &stale_control, "session-newer-setup-owner")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(projected.objective.status, ObjectiveStatus::Active);
+        assert_eq!(projected.objective.revision, newer.revision + 1);
+        assert!(projected.objective.failure_code.is_none());
+    }
+
+    #[tokio::test]
+    async fn admitted_setup_cancel_wins_over_technical_recovery() {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-setup-cancel".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-setup-cancel".into()),
+                root_turn_id: Some("turn-setup-cancel".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-setup-cancel', 'session-setup-cancel', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let control = crate::ChatRunControl::pending();
+        register_chat_run_control(&pool, &control, "session-setup-cancel")
+            .await
+            .unwrap();
+        bind_chat_run_root(
+            &pool,
+            &control.run_instance_id,
+            "session-setup-cancel",
+            "turn-setup-cancel",
+        )
+        .await
+        .unwrap();
+        bind_chat_run_objective(
+            &pool,
+            &control.run_instance_id,
+            "session-setup-cancel",
+            "turn-setup-cancel",
+            &objective.id,
+            objective.revision,
+        )
+        .await
+        .unwrap();
+
+        request_chat_run_cancel(&pool, &control.run_instance_id, "session-setup-cancel")
+            .await
+            .unwrap();
+        let settled = converge_aborted_chat_setup(&pool, &control, "session-setup-cancel")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.root_turn_id, "turn-setup-cancel");
+        assert_eq!(settled.objective.status, ObjectiveStatus::Cancelled);
+        assert_eq!(
+            settled.objective.cancellation_provenance.as_deref(),
+            Some("explicit_cancel")
+        );
+        let control_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id=?")
+                .bind(&control.run_instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(control_status, "cancelled");
+        let active_remediations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=? AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_remediations, 0);
+    }
+
+    async fn durable_cancel_test_objective(
+        test_id: &str,
+    ) -> (sqlx::SqlitePool, crate::agent::objective::ObjectiveSnapshot) {
+        use crate::agent::objective::{
+            CreateObjective, DecisionRouter, ObjectiveKind, ObjectiveStore, RecoveryDomain,
+            RouteSignal,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: format!("objective-{test_id}"),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some(format!("session-{test_id}")),
+                root_turn_id: Some(format!("turn-{test_id}")),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "panic".into(),
+                failure_signature: format!("panic:{test_id}"),
+                next_observation_at: chrono::Utc::now().timestamp_millis() - 1,
+                resume_cursor: objective.root_turn_id.clone(),
+            },
+        )
+        .unwrap();
+        let waiting = store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        (pool, waiting)
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled() {
+        use crate::agent::objective::{ObjectiveStatus, ObjectiveStore};
+
+        let (pool, waiting) = durable_cancel_test_objective("durable-cancel").await;
+        let cancelled = cancel_chat_objective_exact(
+            &pool,
+            waiting.session_id.as_deref().unwrap(),
+            waiting.root_turn_id.as_deref().unwrap(),
+            &waiting.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled.status, ObjectiveStatus::Cancelled);
+        assert_eq!(
+            cancelled.cancellation_provenance.as_deref(),
+            Some("explicit_cancel")
+        );
+
+        let restart_claims = ObjectiveStore::new(pool.clone())
+            .claim_due_remediations("replacement-process", 8, 60_000)
+            .await
+            .unwrap();
+        assert!(restart_claims.is_empty());
+        let active_remediations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=? AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(&waiting.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_remediations, 0);
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_refuses_session_root_objective_identity_mismatch() {
+        use crate::agent::objective::{ObjectiveStatus, ObjectiveStore};
+
+        let (pool, waiting) = durable_cancel_test_objective("cancel-identity").await;
+        let error = cancel_chat_objective_exact(
+            &pool,
+            waiting.session_id.as_deref().unwrap(),
+            "turn-from-another-run",
+            &waiting.id,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("identity mismatch"), "{error}");
+        let unchanged = ObjectiveStore::new(pool)
+            .get(&waiting.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(unchanged.revision, waiting.revision);
+    }
+
+    #[tokio::test]
+    async fn startup_consumes_crash_left_chat_cancel_before_recovery_claim() {
+        use crate::agent::objective::{ObjectiveStatus, ObjectiveStore};
+
+        let (pool, waiting) = durable_cancel_test_objective("startup-cancel").await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, status,
+              created_process_instance, cancel_requested_at, created_at, updated_at)
+             VALUES ('run-startup-cancel', ?, ?, 'cancel_requested',
+                     'dead-process', ?, ?, ?)",
+        )
+        .bind(waiting.session_id.as_deref().unwrap())
+        .bind(waiting.root_turn_id.as_deref().unwrap())
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let store = ObjectiveStore::new(pool.clone());
+        assert_eq!(store.consume_pending_chat_cancellations().await.unwrap(), 1);
+        assert_eq!(store.consume_pending_chat_cancellations().await.unwrap(), 0);
+        let cancelled = store.get(&waiting.id).await.unwrap().unwrap();
+        assert_eq!(cancelled.status, ObjectiveStatus::Cancelled);
+        assert_eq!(
+            cancelled.cancellation_provenance.as_deref(),
+            Some("explicit_cancel")
+        );
+        assert!(store
+            .claim_due_remediations("replacement-process", 8, 60_000)
+            .await
+            .unwrap()
+            .is_empty());
+        let control_status: String = sqlx::query_scalar(
+            "SELECT status FROM chat_run_controls WHERE run_instance_id='run-startup-cancel'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(control_status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancel_before_setup_registration_is_not_lost_or_reassigned() {
+        use crate::agent::objective::{ObjectiveStatus, ObjectiveStore};
+
+        let (pool, waiting) = durable_cancel_test_objective("early-cancel").await;
+        let control = crate::ChatRunControl::pending();
+        let session_id = waiting.session_id.as_deref().unwrap();
+        let root_turn_id = waiting.root_turn_id.as_deref().unwrap();
+
+        assert!(
+            request_chat_run_cancel(&pool, &control.run_instance_id, session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        register_chat_run_control(&pool, &control, session_id)
+            .await
+            .unwrap();
+        bind_chat_run_root(&pool, &control.run_instance_id, session_id, root_turn_id)
+            .await
+            .unwrap();
+        let cancelled = bind_chat_run_objective(
+            &pool,
+            &control.run_instance_id,
+            session_id,
+            root_turn_id,
+            &waiting.id,
+            waiting.revision,
+        )
+        .await
+        .unwrap()
+        .expect("the pre-registration cancel must settle before model dispatch");
+        assert_eq!(cancelled.status, ObjectiveStatus::Cancelled);
+        let control_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id=?")
+                .bind(&control.run_instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(control_status, "cancelled");
+        assert!(ObjectiveStore::new(pool)
+            .claim_due_remediations("replacement-process", 8, 60_000)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn setup_guard_consumes_cancel_after_objective_creation_before_control_binding() {
+        use crate::agent::objective::{ObjectiveStatus, ObjectiveStore};
+
+        let (pool, waiting) = durable_cancel_test_objective("guard-cancel-window").await;
+        let flags: crate::ChatCancelMap =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let control = Arc::new(crate::ChatRunControl::pending());
+        let session_id = waiting.session_id.as_deref().unwrap();
+        let root_turn_id = waiting.root_turn_id.as_deref().unwrap();
+        flags
+            .lock()
+            .await
+            .insert(session_id.to_string(), control.clone());
+        register_chat_run_control(&pool, &control, session_id)
+            .await
+            .unwrap();
+        bind_chat_run_root(&pool, &control.run_instance_id, session_id, root_turn_id)
+            .await
+            .unwrap();
+
+        let identity = request_chat_run_cancel(&pool, &control.run_instance_id, session_id)
+            .await
+            .unwrap()
+            .expect("chat_turn_state should recover the opaque Objective identity");
+        assert_eq!(identity.objective_id, waiting.id);
+        let persisted_objective_id: Option<String> = sqlx::query_scalar(
+            "SELECT objective_id FROM chat_run_controls WHERE run_instance_id=?",
+        )
+        .bind(&control.run_instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(persisted_objective_id.is_none());
+
+        {
+            let mut guard =
+                ChatRunningSetupGuard::new(flags.clone(), session_id.to_string(), control.clone());
+            guard.attach_durable_db(pool.clone());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM chat_run_controls WHERE run_instance_id=?",
+                )
+                .bind(&control.run_instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if status == "cancelled" && !flags.lock().await.contains_key(session_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("setup guard must durably settle the crash-left cancel");
+
+        let cancelled = ObjectiveStore::new(pool.clone())
+            .get(&waiting.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, ObjectiveStatus::Cancelled);
+        let bound_objective_id: String = sqlx::query_scalar(
+            "SELECT objective_id FROM chat_run_controls WHERE run_instance_id=?",
+        )
+        .bind(&control.run_instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bound_objective_id, waiting.id);
     }
 
     #[test]

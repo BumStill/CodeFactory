@@ -2,10 +2,12 @@
 use crate::util::no_window::NoWindow;
 pub mod anthropic_client;
 pub mod attachments;
+pub(crate) mod auth_recovery;
 pub mod checkpoint;
 pub mod context;
 pub mod context_budget;
 mod context_policy;
+pub(crate) mod context_recovery;
 pub mod delivery;
 pub mod delivery_run;
 pub mod dispatch;
@@ -19,12 +21,15 @@ mod lifecycle_hooks;
 pub mod model_transport;
 pub mod objective;
 pub mod objective_supervisor;
-mod permission_gateway;
+pub(crate) mod permission_gateway;
+pub(crate) mod permission_intent;
 pub mod persistence;
+pub(crate) mod provider_recovery;
 pub mod scheduler;
 pub mod sse_buffer;
 pub mod subagent;
 mod tool_backend;
+pub(crate) mod update_recovery;
 pub mod user_context;
 pub mod verification;
 pub mod worktree;
@@ -640,6 +645,11 @@ impl UsageSurface {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ContextCompressionAuthorization {
+    permit: codefactory_agent_loop::tool::MutationPermit,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AgentExecutionContext {
     pub parent_session_id: Option<String>,
@@ -647,6 +657,40 @@ pub struct AgentExecutionContext {
     pub knowledge_library_ids: Vec<String>,
     pub usage_surface: UsageSurface,
     pub mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
+    /// Context-recovery-only override. Callers may set this only while holding
+    /// the exact claimed Objective remediation permit; ordinary foreground and
+    /// subagent runs keep the route's native compression policy.
+    pub(crate) force_context_compression: Option<ContextCompressionAuthorization>,
+}
+
+pub(crate) fn claimed_context_compression_authorization(
+    objective: &objective::ObjectiveSnapshot,
+    permit: &codefactory_agent_loop::tool::MutationPermit,
+) -> Option<ContextCompressionAuthorization> {
+    let eligible = objective.domain == objective::RecoveryDomain::Context
+        && objective.status == objective::ObjectiveStatus::WaitingSystem
+        && !objective.output_started
+        && !objective.side_effect_started
+        && permit.objective_id == objective.id
+        && permit.binding_id.is_some()
+        && permit.resource_generation.is_some();
+    eligible.then(|| ContextCompressionAuthorization {
+        permit: permit.clone(),
+    })
+}
+
+fn context_compression_for_run(
+    native_policy: bool,
+    execution_context: Option<&AgentExecutionContext>,
+) -> bool {
+    native_policy
+        || execution_context.is_some_and(|context| {
+            context
+                .force_context_compression
+                .as_ref()
+                .zip(context.mutation_permit.as_ref())
+                .is_some_and(|(authorization, permit)| authorization.permit == *permit)
+        })
 }
 
 fn knowledge_scope_for_tools(
@@ -1197,7 +1241,7 @@ impl AgentLoop {
             completion_instruction,
             fact_check_instruction,
             audit_session_id: self.audit_session_id(),
-            root_turn_id,
+            root_turn_id: root_turn_id.clone(),
             mutation_permit: self
                 .execution_context
                 .as_ref()
@@ -1213,8 +1257,15 @@ impl AgentLoop {
             recovery_limit: recovery_limit_for(self.mode),
             max_iterations: self.mode.max_iterations(),
             wall_budget_applies: wall_budget_applies(self.mode),
-            context_compression,
+            context_compression: context_compression_for_run(
+                context_compression,
+                self.execution_context.as_ref(),
+            ),
             overload_backoff,
+            overload_retry_delays: [
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(40),
+            ],
             // Desktop keeps its unlimited inspection allowance (slice 4.8c b5)
             // and does not replay rejected drafts — the UI already collapses
             // them (b12).
@@ -1243,14 +1294,21 @@ impl AgentLoop {
             cwd: self.cwd.clone(),
         };
         let svc = codefactory_agent_loop::run::LoopServices {
-            transport: std::sync::Arc::new(self.model_transport()),
+            transport: std::sync::Arc::new(
+                self.model_transport(
+                    root_turn_id.clone(),
+                    self.execution_context
+                        .as_ref()
+                        .and_then(|context| context.mutation_permit.clone()),
+                ),
+            ),
             tools: std::sync::Arc::new(tool_backend),
             persistence: std::sync::Arc::new(self.persistence()),
             events: self.events.clone(),
             budget: std::sync::Arc::new(codefactory_agent_loop::journal::NullBudget),
             // Today's token-based elision, unchanged (slice 4.8c seam).
             compactor: std::sync::Arc::new(codefactory_agent_loop::services::DefaultCompressor),
-            permission: std::sync::Arc::new(self.permission_gateway()),
+            permission: std::sync::Arc::new(self.permission_gateway(root_turn_id)),
             hooks,
             context_policy: std::sync::Arc::new(self.context_policy(expand_context_window)),
             fact_checker: std::sync::Arc::new(fact_checker::DesktopFactChecker { mode: self.mode }),
@@ -1378,11 +1436,24 @@ impl AgentLoop {
     /// Clones only `Arc` handles — settings, the event sink, the shared
     /// pending-permission map, and the SAME cancel `Arc` — and owns no
     /// `AppHandle`. Reads the live policy and prompts the frontend on `Ask`.
-    fn permission_gateway(&self) -> permission_gateway::DesktopPermissionGateway {
+    fn permission_gateway(
+        &self,
+        root_turn_id: Option<String>,
+    ) -> permission_gateway::DesktopPermissionGateway {
         permission_gateway::DesktopPermissionGateway {
             settings: self.settings.clone(),
             db: self.db.clone(),
             session_id: self.session_id.clone(),
+            root_turn_id,
+            task_id: self
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.task_id.clone()),
+            mutation_permit: self
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.mutation_permit.clone()),
+            anonymous: self.anonymous,
             events: self.events.clone(),
             pending_permissions: self.pending_permissions.clone(),
             cancel: self.cancel.clone(),
@@ -1396,7 +1467,11 @@ impl AgentLoop {
     /// cancel `Arc` (shared `AtomicBool`), and NO `AppHandle` (#166). The three
     /// run-loop call sites dispatch through this; the transport methods now live
     /// on [`model_transport::DesktopModelTransport`].
-    fn model_transport(&self) -> model_transport::RoutedDesktopModelTransport {
+    fn model_transport(
+        &self,
+        root_turn_id: Option<String>,
+        mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
+    ) -> model_transport::RoutedDesktopModelTransport {
         model_transport::RoutedDesktopModelTransport {
             http: self.http.clone(),
             events: self.events.clone(),
@@ -1405,6 +1480,14 @@ impl AgentLoop {
             cancel: self.cancel.clone(),
             turn_output_started: self.turn_output_started.clone(),
             turn_side_effect_started: self.turn_side_effect_started.clone(),
+            db: self.db.clone(),
+            root_turn_id,
+            mutation_permit,
+            anonymous: self.anonymous,
+            durable_provider_required: self
+                .execution_context
+                .as_ref()
+                .is_none_or(|context| context.usage_surface == UsageSurface::Interactive),
         }
     }
 
@@ -2897,10 +2980,78 @@ mod tests {
             knowledge_library_ids: Vec::new(),
             usage_surface: UsageSurface::Subagent,
             mutation_permit: None,
+            force_context_compression: None,
         };
 
         assert_eq!(knowledge_scope_for_tools(Some(&context)), Some(Vec::new()));
         assert_eq!(knowledge_scope_for_tools(None), None);
+    }
+
+    #[test]
+    fn context_compression_override_requires_a_claimed_recovery_permit() {
+        let mut context = AgentExecutionContext {
+            parent_session_id: None,
+            task_id: None,
+            knowledge_library_ids: Vec::new(),
+            usage_surface: UsageSurface::Interactive,
+            mutation_permit: None,
+            force_context_compression: None,
+        };
+        assert!(!context_compression_for_run(false, Some(&context)));
+        assert!(context_compression_for_run(true, None));
+
+        let permit = codefactory_agent_loop::tool::MutationPermit {
+            objective_id: "objective-context".into(),
+            remediation_id: "remediation-context".into(),
+            owner: "context-supervisor".into(),
+            claim_epoch: 1,
+            binding_id: Some("binding-context".into()),
+            resource_generation: Some(1),
+        };
+        context.mutation_permit = Some(permit.clone());
+        assert!(!context_compression_for_run(false, Some(&context)));
+        let mut objective = objective::ObjectiveSnapshot::new(
+            "objective-context",
+            objective::ObjectiveKind::Informational,
+            objective::RecoveryDomain::Context,
+            "answer",
+        );
+        objective.status = objective::ObjectiveStatus::WaitingSystem;
+        context.force_context_compression =
+            claimed_context_compression_authorization(&objective, &permit);
+        assert!(context_compression_for_run(false, Some(&context)));
+
+        context.mutation_permit.as_mut().unwrap().claim_epoch += 1;
+        assert!(!context_compression_for_run(false, Some(&context)));
+    }
+
+    #[test]
+    fn only_an_exact_effect_free_context_claim_enables_forced_compaction() {
+        let permit = codefactory_agent_loop::tool::MutationPermit {
+            objective_id: "objective-context".into(),
+            remediation_id: "remediation-context".into(),
+            owner: "context-supervisor".into(),
+            claim_epoch: 1,
+            binding_id: Some("binding-context".into()),
+            resource_generation: Some(1),
+        };
+        let mut objective = objective::ObjectiveSnapshot::new(
+            "objective-context",
+            objective::ObjectiveKind::Informational,
+            objective::RecoveryDomain::Context,
+            "answer",
+        );
+        objective.status = objective::ObjectiveStatus::WaitingSystem;
+        assert!(claimed_context_compression_authorization(&objective, &permit).is_some());
+
+        objective.domain = objective::RecoveryDomain::Chat;
+        assert!(claimed_context_compression_authorization(&objective, &permit).is_none());
+        objective.domain = objective::RecoveryDomain::Context;
+        objective.output_started = true;
+        assert!(claimed_context_compression_authorization(&objective, &permit).is_none());
+        objective.output_started = false;
+        objective.side_effect_started = true;
+        assert!(claimed_context_compression_authorization(&objective, &permit).is_none());
     }
 
     #[tokio::test]

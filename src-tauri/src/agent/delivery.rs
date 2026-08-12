@@ -606,6 +606,45 @@ pub enum MergeObservation {
     Unsupported,
 }
 
+/// Exact identity of one release dispatch. The target is written into the
+/// local `intent_release` receipt before the durable DeliveryRun mutation
+/// intent is begun, so a takeover can distinguish "no POST was possible" from
+/// "a POST may be in flight" without guessing from generic live state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseDispatchTarget {
+    pub workflow: String,
+    pub git_ref: String,
+    pub head_sha: String,
+}
+
+impl ReleaseDispatchTarget {
+    pub fn operation_key(&self) -> String {
+        external_operation_key(
+            "provider_release_trigger",
+            &[&self.workflow, &self.git_ref, &self.head_sha],
+        )
+    }
+}
+
+/// Read-only observation of the exact workflow/ref/head dispatch target.
+/// `Absent` is replay authority only for the narrow local-receipt/DB-gap
+/// window. A durable mutation intent treats absence as uncertainty because the
+/// prior POST may still be in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseDispatchObservation {
+    Absent,
+    Triggered {
+        run_id: String,
+        status: String,
+        head_sha: String,
+        detail: String,
+    },
+    HeadMismatch {
+        observed_heads: Vec<String>,
+    },
+    Unsupported(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeRequestResult {
     Queued,
@@ -885,8 +924,22 @@ pub trait DeliveryRemote {
     ) -> impl std::future::Future<Output = Result<MergeObservation, String>> {
         std::future::ready(Ok(MergeObservation::Unsupported))
     }
+    fn release_dispatch_target(&self, _head_sha: &str) -> Option<ReleaseDispatchTarget> {
+        None
+    }
+
+    fn observe_release_dispatch(
+        &self,
+        _target: &ReleaseDispatchTarget,
+    ) -> impl std::future::Future<Output = Result<ReleaseDispatchObservation, String>> {
+        std::future::ready(Ok(ReleaseDispatchObservation::Unsupported(
+            "exact release dispatch observer not configured".into(),
+        )))
+    }
+
     fn trigger_release(
         &self,
+        head_sha: &str,
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> impl std::future::Future<Output = Result<String, String>>;
 
@@ -1099,6 +1152,104 @@ fn write_delivery_receipt(
         &["config", "--local", &delivery_receipt_key(repo, sha), &raw],
     )?;
     Ok(raw)
+}
+
+fn encode_release_dispatch_target(target: &ReleaseDispatchTarget) -> Result<String, String> {
+    serde_json::to_string(target)
+        .map_err(|error| format!("序列化 release dispatch target 失败: {error}"))
+}
+
+fn decode_release_dispatch_target(
+    receipt: &DeliveryReceipt,
+) -> Result<ReleaseDispatchTarget, String> {
+    let raw = receipt.release_detail.as_deref().ok_or_else(|| {
+        "intent_release 回执缺少 workflow/ref/head envelope；只能继续只读观察".to_string()
+    })?;
+    let target: ReleaseDispatchTarget = serde_json::from_str(raw)
+        .map_err(|error| format!("intent_release dispatch envelope 损坏: {error}"))?;
+    if target.workflow.trim().is_empty()
+        || target.git_ref.trim().is_empty()
+        || target.head_sha.trim().is_empty()
+    {
+        return Err("intent_release dispatch envelope 的 workflow/ref/head 不完整".into());
+    }
+    Ok(target)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalReleaseIntentReconciliation {
+    NoIntent,
+    ProvenAbsent,
+    Triggered { detail: String },
+}
+
+/// Reconcile the local receipt around the one crash window that exists before
+/// the durable DB mutation intent is begun. Callers must first reconcile any
+/// durable mutation intent. Only an exact `Absent` observation may roll the
+/// receipt back to `merged`; triggered/unknown states never authorize replay.
+pub async fn reconcile_local_release_intent<R: DeliveryRemote>(
+    cwd: &Path,
+    default_branch_hint: Option<&str>,
+    expected_branch: &str,
+    delivery_head_sha: &str,
+    allow_absent_replay: bool,
+    remote: Option<&R>,
+) -> Result<LocalReleaseIntentReconciliation, String> {
+    let (repo, _) = resolve_delivery_repo(cwd, default_branch_hint, Some(expected_branch))?;
+    let Some(receipt) = read_delivery_receipt(&repo, delivery_head_sha)? else {
+        return Ok(LocalReleaseIntentReconciliation::NoIntent);
+    };
+    if receipt.state != "intent_release" {
+        return Ok(LocalReleaseIntentReconciliation::NoIntent);
+    }
+    let target = decode_release_dispatch_target(&receipt)?;
+    let remote = remote.ok_or_else(|| {
+        "intent_release requires an exact read-only release observer; no provider is available"
+            .to_string()
+    })?;
+    match remote.observe_release_dispatch(&target).await? {
+        ReleaseDispatchObservation::Absent if allow_absent_replay => {
+            let mut reconciled = receipt;
+            reconciled.state = "merged".into();
+            reconciled.release_detail = None;
+            write_delivery_receipt(&repo, delivery_head_sha, &reconciled)?;
+            Ok(LocalReleaseIntentReconciliation::ProvenAbsent)
+        }
+        ReleaseDispatchObservation::Absent => Err(
+            "exact release dispatch is absent, but a durable POST intent may exist; replay remains fenced"
+                .into(),
+        ),
+        ReleaseDispatchObservation::Triggered {
+            run_id,
+            status,
+            head_sha,
+            detail,
+        } if head_sha == target.head_sha => {
+            let observed_detail = format!(
+                "只读确认 release run {run_id} 已触发（workflow={}, ref={}, head={}, status={}）: {detail}",
+                target.workflow, target.git_ref, target.head_sha, status
+            );
+            let mut reconciled = receipt;
+            reconciled.state = "release_triggered".into();
+            reconciled.release_detail = Some(observed_detail.clone());
+            write_delivery_receipt(&repo, delivery_head_sha, &reconciled)?;
+            Ok(LocalReleaseIntentReconciliation::Triggered {
+                detail: observed_detail,
+            })
+        }
+        ReleaseDispatchObservation::Triggered { head_sha, .. } => Err(format!(
+            "release observer returned head {head_sha}, expected exact {}",
+            target.head_sha
+        )),
+        ReleaseDispatchObservation::HeadMismatch { observed_heads } => Err(format!(
+            "release workflow/ref is visible only for nonmatching heads [{}]; expected {}",
+            observed_heads.join(", "),
+            target.head_sha
+        )),
+        ReleaseDispatchObservation::Unsupported(detail) => Err(format!(
+            "release dispatch cannot be reconciled exactly: {detail}"
+        )),
+    }
 }
 
 fn fetch_updated_pr_head(repo: &RepoContext, expected_head: &str) -> Result<String, String> {
@@ -1354,7 +1505,11 @@ pub fn capture_delivery_identity(repo: &RepoContext) -> Result<DeliveryIdentityS
 }
 
 fn observe_remote_branch_head(repo: &RepoContext) -> Result<Option<String>, String> {
-    let reference = format!("refs/heads/{}", repo.branch);
+    observe_remote_ref_head(repo, &repo.branch)
+}
+
+fn observe_remote_ref_head(repo: &RepoContext, branch: &str) -> Result<Option<String>, String> {
+    let reference = format!("refs/heads/{branch}");
     let observed = git(
         &repo.root,
         &["ls-remote", "--heads", &repo.remote, &reference],
@@ -1415,15 +1570,10 @@ pub async fn observe_delivery_takeover<R: DeliveryRemote>(
     // observed HEAD would skip an old intent_merge/intent_release receipt and
     // allow an unreceipted local commit to erase the uncertainty boundary.
     let local_receipt = read_delivery_receipt(&repo, &persisted_identity.head_sha)?;
-    if local_receipt
-        .as_ref()
-        .is_some_and(|receipt| receipt.state == "intent_release")
-    {
-        return Err(
-            "an intent_release receipt requires release-specific observation before mutation"
-                .into(),
-        );
-    }
+    // `intent_release` is not rejected here. The durable takeover path must
+    // first reconcile any DB mutation intent, then run the exact release
+    // workflow/ref/head observer. Rejecting it in this base identity observer
+    // made the release-specific reconciler unreachable and stranded the run.
     if let (Some(expected_number), Some(receipt)) =
         (persisted_canonical_pr_number, local_receipt.as_ref())
     {
@@ -2588,15 +2738,49 @@ pub async fn deliver<R: DeliveryRemote>(
                 }
             }
         } else if receipt.state == "intent_release" {
-            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
-                "receipt",
-                format!(
-                    "检测到未完成的 {} 写前回执（PR/MR #{}）",
-                    receipt.state, receipt.pr_number
-                ),
-            ));
+            match reconcile_local_release_intent(
+                &repo.root,
+                Some(&repo.default_branch),
+                &repo.branch,
+                &sha,
+                false,
+                Some(remote),
+            )
+            .await
+            {
+                Ok(LocalReleaseIntentReconciliation::ProvenAbsent) => {
+                    outcome.steps.push(StepResult::ok(
+                        "reconcile",
+                        "只读确认 exact workflow/ref/head 未被 dispatch；本地 intent_release 位于 DB begin 前的 crash gap，安全续接一次",
+                    ));
+                }
+                Ok(LocalReleaseIntentReconciliation::Triggered { detail }) => {
+                    outcome.steps.push(StepResult::ok("reconcile", detail));
+                }
+                Ok(LocalReleaseIntentReconciliation::NoIntent) => {}
+                Err(error) => {
+                    return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                        "receipt",
+                        format!(
+                            "未完成的 intent_release 只能继续 exact workflow/ref/head 只读对账: {error}"
+                        ),
+                    ));
+                }
+            }
+            prior_receipt = match read_delivery_receipt(&repo, &sha) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                        "receipt",
+                        format!("release intent 对账后无法重读本地回执: {error}"),
+                    ));
+                }
+            };
         }
-        if receipt.state == "release_triggered" {
+        if prior_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.state == "release_triggered")
+        {
             // The current adapter may temporarily lack the release actuator,
             // but this exact context already has a durable release receipt.
             // Resume observation instead of incorrectly descending to merge.
@@ -3087,6 +3271,39 @@ pub async fn deliver<R: DeliveryRemote>(
             .push(StepResult::ok("release", format!("复用回执: {detail}")));
         outcome.release_receipt = serde_json::to_string(receipt).ok();
     } else {
+        let release_head_sha = match observe_remote_ref_head(&repo, &repo.default_branch) {
+            Ok(Some(head)) => head,
+            Ok(None) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "release",
+                    format!(
+                        "无法建立 release dispatch 身份: 远端基线分支 {} 不存在；未触发发布",
+                        repo.default_branch
+                    ),
+                ));
+            }
+            Err(error) => {
+                return outcome.remote_observation_failed(
+                    "release_observation",
+                    format!(
+                        "触发发布前无法只读解析 {} 的 exact head: {error}",
+                        repo.default_branch
+                    ),
+                );
+            }
+        };
+        let Some(release_target) = remote.release_dispatch_target(&release_head_sha) else {
+            return outcome.blocked_at(StepResult::blocked(
+                "release",
+                "release adapter 未提供可持久化的 exact workflow/ref/head identity；未触发发布",
+            ));
+        };
+        let release_target_envelope = match encode_release_dispatch_target(&release_target) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return outcome.blocked_at(StepResult::blocked("release", error));
+            }
+        };
         let intent = DeliveryReceipt {
             version: 1,
             state: "intent_release".into(),
@@ -3099,7 +3316,7 @@ pub async fn deliver<R: DeliveryRemote>(
             pr_url: outcome.pr_url.clone().unwrap_or_default(),
             pr_title: Some(pr_title.clone()),
             pr_body: Some(release_policy.durable_body.clone()),
-            release_detail: None,
+            release_detail: Some(release_target_envelope),
         };
         if let Err(step) = verify_mutation_permit(opts, "receipt_intent_release").await {
             return outcome.blocked_on_uncertain_side_effect(step);
@@ -3113,7 +3330,10 @@ pub async fn deliver<R: DeliveryRemote>(
         if let Err(step) = verify_mutation_permit(opts, "trigger_release").await {
             return outcome.blocked_on_uncertain_side_effect(step);
         }
-        match remote.trigger_release(opts.mutation_permit.as_ref()).await {
+        match remote
+            .trigger_release(&release_head_sha, opts.mutation_permit.as_ref())
+            .await
+        {
             Ok(detail) => {
                 outcome
                     .steps
@@ -3204,9 +3424,7 @@ async fn verify_release_live<R: DeliveryRemote>(
             steps.push(StepResult::ok("live", detail));
             Ok(steps)
         }
-        ObservationStatus::Pending(detail) => Err(format!(
-            "线上验证仍在等待: {detail};稍后重新调用 deliver_changes 续跑。"
-        )),
+        ObservationStatus::Pending(detail) => Err(format!("线上验证仍在等待: {detail}")),
         ObservationStatus::Failure(detail) => Err(format!("线上验证失败: {detail}")),
         ObservationStatus::Unsupported(detail) => Err(format!(
             "发布已触发,但没有可用的 live verifier: {detail};不能声明已上线。"
@@ -3228,9 +3446,7 @@ async fn wait_for_deployment<R: DeliveryRemote>(
             ObservationStatus::Unsupported(_) => return Ok(None),
             ObservationStatus::Pending(detail) => {
                 if std::time::Instant::now() >= deadline {
-                    return Err(format!(
-                        "部署在 {timeout_secs}s 内仍未完成: {detail};稍后重新调用 deliver_changes 续跑。"
-                    ));
+                    return Err(format!("部署在 {timeout_secs}s 内仍未完成: {detail}"));
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
@@ -3722,6 +3938,16 @@ struct HookOkResponse {
     detail: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HookReleaseObservationResponse {
+    status: String,
+    workflow: String,
+    git_ref: String,
+    head_sha: Option<String>,
+    run_id: Option<String>,
+    detail: Option<String>,
+}
+
 pub struct HookRemote {
     id: String,
     command: String,
@@ -3982,17 +4208,95 @@ impl DeliveryRemote for HookRemote {
         }
     }
 
+    fn release_dispatch_target(&self, head_sha: &str) -> Option<ReleaseDispatchTarget> {
+        let remote = default_remote(&self.cwd);
+        let git_ref = remote_default_branch(&self.cwd, &remote).unwrap_or_else(|| "main".into());
+        Some(ReleaseDispatchTarget {
+            workflow: format!("provider-hook:{}", self.id),
+            git_ref,
+            head_sha: head_sha.to_string(),
+        })
+    }
+
+    async fn observe_release_dispatch(
+        &self,
+        target: &ReleaseDispatchTarget,
+    ) -> Result<ReleaseDispatchObservation, String> {
+        let current_target = self
+            .release_dispatch_target(&target.head_sha)
+            .ok_or_else(|| "provider hook has no release dispatch identity".to_string())?;
+        if target.workflow != current_target.workflow || target.git_ref != current_target.git_ref {
+            return Err(format!(
+                "release target {}/{} does not match the current provider hook identity {}/{}",
+                target.workflow, target.git_ref, current_target.workflow, current_target.git_ref
+            ));
+        }
+        let value = self.run_json(json!({
+            "action": "observe_release_dispatch",
+            "workflow": target.workflow,
+            "git_ref": target.git_ref,
+            "head_sha": target.head_sha,
+        }))?;
+        let response: HookReleaseObservationResponse =
+            serde_json::from_value(value).map_err(|e| {
+                format!(
+                    "delivery provider hook '{}' release observation response invalid: {e}",
+                    self.id
+                )
+            })?;
+        if response.workflow != target.workflow || response.git_ref != target.git_ref {
+            return Err(format!(
+                "delivery provider hook '{}' observed a different release workflow/ref",
+                self.id
+            ));
+        }
+        let detail = response.detail.unwrap_or_default();
+        Ok(match response.status.as_str() {
+            "absent" => ReleaseDispatchObservation::Absent,
+            "triggered" | "queued" | "in_progress" | "completed" => {
+                let head_sha = response.head_sha.unwrap_or_default();
+                if head_sha != target.head_sha {
+                    ReleaseDispatchObservation::HeadMismatch {
+                        observed_heads: (!head_sha.is_empty())
+                            .then_some(head_sha)
+                            .into_iter()
+                            .collect(),
+                    }
+                } else {
+                    ReleaseDispatchObservation::Triggered {
+                        run_id: response.run_id.unwrap_or_else(|| "provider-hook".into()),
+                        status: response.status,
+                        head_sha,
+                        detail,
+                    }
+                }
+            }
+            "unsupported" => ReleaseDispatchObservation::Unsupported(detail),
+            other => return Err(format!("unknown release observation status '{other}'")),
+        })
+    }
+
     async fn trigger_release(
         &self,
+        head_sha: &str,
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<String, String> {
         let rung = "provider_release_trigger";
-        let operation_key = external_operation_key(rung, &[&self.id]);
-        let evidence = json!({ "provider": self.id }).to_string();
+        let target = self
+            .release_dispatch_target(head_sha)
+            .ok_or_else(|| "provider hook has no release dispatch identity".to_string())?;
+        let operation_key = target.operation_key();
+        let evidence = serde_json::to_string(&target)
+            .map_err(|error| format!("cannot serialize release dispatch target: {error}"))?;
         let intent =
             begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
         let result = (|| {
-            let value = self.run_json(json!({ "action": "trigger_release" }))?;
+            let value = self.run_json(json!({
+                "action": "trigger_release",
+                "workflow": target.workflow,
+                "git_ref": target.git_ref,
+                "head_sha": target.head_sha,
+            }))?;
             let response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
                 format!(
                     "delivery provider hook '{}' release response invalid: {e}",
@@ -4443,6 +4747,84 @@ fn github_release_live_from_value(
         "GitHub Release {tag} is published with {assets} assets and contains delivery commit {}",
         sha.get(..7).unwrap_or(sha)
     )))
+}
+
+fn parse_github_release_dispatch_runs(
+    value: &serde_json::Value,
+    target: &ReleaseDispatchTarget,
+) -> Result<ReleaseDispatchObservation, String> {
+    let rows = value
+        .get("workflow_runs")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+        .ok_or_else(|| "GitHub workflow run observation is not an array".to_string())?;
+    let mut nonmatching_heads = Vec::new();
+    for row in rows {
+        let event = row
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let git_ref = row
+            .get("head_branch")
+            .or_else(|| row.get("headBranch"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if event != "workflow_dispatch" || git_ref != target.git_ref {
+            continue;
+        }
+        let head_sha = row
+            .get("head_sha")
+            .or_else(|| row.get("headSha"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if head_sha != target.head_sha {
+            if !head_sha.is_empty() && !nonmatching_heads.contains(&head_sha) {
+                nonmatching_heads.push(head_sha);
+            }
+            continue;
+        }
+        let run_id = row
+            .get("id")
+            .or_else(|| row.get("databaseId"))
+            .map(|value| match value {
+                serde_json::Value::String(value) => value.clone(),
+                _ => value.to_string(),
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let status = row
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let conclusion = row
+            .get("conclusion")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("/{value}"))
+            .unwrap_or_default();
+        let url = row
+            .get("html_url")
+            .or_else(|| row.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        return Ok(ReleaseDispatchObservation::Triggered {
+            run_id,
+            status: format!("{status}{conclusion}"),
+            head_sha,
+            detail: if url.is_empty() {
+                "exact workflow_dispatch run observed".into()
+            } else {
+                url.to_string()
+            },
+        });
+    }
+    if nonmatching_heads.is_empty() {
+        Ok(ReleaseDispatchObservation::Absent)
+    } else {
+        Ok(ReleaseDispatchObservation::HeadMismatch {
+            observed_heads: nonmatching_heads,
+        })
+    }
 }
 
 /// [`DeliveryRemote`] over a logged-in `gh` CLI. All commands run in the repo
@@ -5044,18 +5426,52 @@ impl DeliveryRemote for GhCliRemote {
         self.merge_observation(number, expected_head)
     }
 
+    fn release_dispatch_target(&self, head_sha: &str) -> Option<ReleaseDispatchTarget> {
+        Some(ReleaseDispatchTarget {
+            workflow: self.release_workflow.clone(),
+            git_ref: self.default_branch.clone(),
+            head_sha: head_sha.to_string(),
+        })
+    }
+
+    async fn observe_release_dispatch(
+        &self,
+        target: &ReleaseDispatchTarget,
+    ) -> Result<ReleaseDispatchObservation, String> {
+        if target.workflow != self.release_workflow || target.git_ref != self.default_branch {
+            return Err("release target does not match the configured gh workflow/ref".into());
+        }
+        let raw = self.gh(&[
+            "run".into(),
+            "list".into(),
+            "--workflow".into(),
+            target.workflow.clone(),
+            "--branch".into(),
+            target.git_ref.clone(),
+            "--event".into(),
+            "workflow_dispatch".into(),
+            "--limit".into(),
+            "20".into(),
+            "--json".into(),
+            "databaseId,headBranch,headSha,status,conclusion,url,event".into(),
+        ])?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("gh run list returned non-JSON: {error}"))?;
+        parse_github_release_dispatch_runs(&value, target)
+    }
+
     async fn trigger_release(
         &self,
+        head_sha: &str,
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<String, String> {
         let rung = "provider_release_trigger";
-        let operation_key =
-            external_operation_key(rung, &[&self.release_workflow, &self.default_branch]);
-        let evidence = json!({
-            "workflow": self.release_workflow,
-            "git_ref": self.default_branch,
-        })
-        .to_string();
+        let target = self
+            .release_dispatch_target(head_sha)
+            .expect("gh release target is configured");
+        let operation_key = target.operation_key();
+        let evidence = serde_json::to_string(&target)
+            .map_err(|error| format!("cannot serialize release dispatch target: {error}"))?;
         let intent =
             begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
         match self.gh(&gh_workflow_run_args(
@@ -5258,15 +5674,37 @@ impl DeliveryRemote for EitherRemote {
             EitherRemote::Gitlab(r) => r.observe_merge(number, expected_head).await,
         }
     }
+    fn release_dispatch_target(&self, head_sha: &str) -> Option<ReleaseDispatchTarget> {
+        match self {
+            EitherRemote::Hook(r) => r.release_dispatch_target(head_sha),
+            EitherRemote::Gh(r) => r.release_dispatch_target(head_sha),
+            EitherRemote::Github(r) => r.release_dispatch_target(head_sha),
+            EitherRemote::Gitlab(r) => r.release_dispatch_target(head_sha),
+        }
+    }
+
+    async fn observe_release_dispatch(
+        &self,
+        target: &ReleaseDispatchTarget,
+    ) -> Result<ReleaseDispatchObservation, String> {
+        match self {
+            EitherRemote::Hook(r) => r.observe_release_dispatch(target).await,
+            EitherRemote::Gh(r) => r.observe_release_dispatch(target).await,
+            EitherRemote::Github(r) => r.observe_release_dispatch(target).await,
+            EitherRemote::Gitlab(r) => r.observe_release_dispatch(target).await,
+        }
+    }
+
     async fn trigger_release(
         &self,
+        head_sha: &str,
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<String, String> {
         match self {
-            EitherRemote::Hook(r) => r.trigger_release(mutation_permit).await,
-            EitherRemote::Gh(r) => r.trigger_release(mutation_permit).await,
-            EitherRemote::Github(r) => r.trigger_release(mutation_permit).await,
-            EitherRemote::Gitlab(r) => r.trigger_release(mutation_permit).await,
+            EitherRemote::Hook(r) => r.trigger_release(head_sha, mutation_permit).await,
+            EitherRemote::Gh(r) => r.trigger_release(head_sha, mutation_permit).await,
+            EitherRemote::Github(r) => r.trigger_release(head_sha, mutation_permit).await,
+            EitherRemote::Gitlab(r) => r.trigger_release(head_sha, mutation_permit).await,
         }
     }
 
@@ -5800,6 +6238,7 @@ impl DeliveryRemote for GitlabRemote {
 
     async fn trigger_release(
         &self,
+        _head_sha: &str,
         _mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<String, String> {
         Err("GitLab release dispatch is not built in; configure a delivery provider hook/plugin for this repository's release pipeline.".into())
@@ -6212,8 +6651,36 @@ impl DeliveryRemote for GithubRemote {
         }
     }
 
+    fn release_dispatch_target(&self, head_sha: &str) -> Option<ReleaseDispatchTarget> {
+        Some(ReleaseDispatchTarget {
+            workflow: self.release_workflow.clone(),
+            git_ref: self.default_branch.clone(),
+            head_sha: head_sha.to_string(),
+        })
+    }
+
+    async fn observe_release_dispatch(
+        &self,
+        target: &ReleaseDispatchTarget,
+    ) -> Result<ReleaseDispatchObservation, String> {
+        if target.workflow != self.release_workflow || target.git_ref != self.default_branch {
+            return Err("release target does not match the configured GitHub workflow/ref".into());
+        }
+        let branch =
+            url::form_urlencoded::byte_serialize(target.git_ref.as_bytes()).collect::<String>();
+        let value = self
+            .client
+            .get(&format!(
+                "/repos/{}/actions/workflows/{}/runs?branch={branch}&event=workflow_dispatch&per_page=20",
+                self.repo, target.workflow
+            ))
+            .await?;
+        parse_github_release_dispatch_runs(&value, target)
+    }
+
     async fn trigger_release(
         &self,
+        head_sha: &str,
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<String, String> {
         // workflow_dispatch on the repo's release workflow (needs a token with
@@ -6223,13 +6690,12 @@ impl DeliveryRemote for GithubRemote {
             self.repo, self.release_workflow
         );
         let rung = "provider_release_trigger";
-        let operation_key =
-            external_operation_key(rung, &[&self.release_workflow, &self.default_branch]);
-        let evidence = json!({
-            "workflow": self.release_workflow,
-            "git_ref": self.default_branch,
-        })
-        .to_string();
+        let target = self
+            .release_dispatch_target(head_sha)
+            .expect("GitHub release target is configured");
+        let operation_key = target.operation_key();
+        let evidence = serde_json::to_string(&target)
+            .map_err(|error| format!("cannot serialize release dispatch target: {error}"))?;
         let intent =
             begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
         let result = self
@@ -7172,6 +7638,52 @@ Release-Urgency: hold"
     }
 
     #[test]
+    fn triggered_but_not_live_release_remains_system_owned_observation_without_user_cta() {
+        let outcome = DeliveryOutcome {
+            steps: vec![
+                StepResult::ok("merge", "merged"),
+                StepResult::ok("release", "release triggered"),
+            ],
+            branch: Some("feat/x".into()),
+            commit_sha: Some("abc123".into()),
+            pr_url: Some("https://example.test/pr/1".into()),
+            pr_number: Some(1),
+            final_state: "delivered".into(),
+            stage: "release".into(),
+            code: "release_triggered".into(),
+            recoverable: false,
+            recovery_class: RecoveryClass::None,
+            retry_after_ms: None,
+            next_action: None,
+            reached_state: "release_triggered".into(),
+            requested_ceiling: "through_release".into(),
+            effective_ceiling: "through_release".into(),
+            capability_gap: None,
+            release_receipt: None,
+            summary: String::new(),
+        };
+
+        let waiting = block_unverified_release(
+            outcome,
+            "release 已触发，但目标构建仍在等待发布并形成 live 证据",
+        );
+
+        assert_eq!(waiting.final_state, "waiting");
+        assert_eq!(waiting.recovery_class, RecoveryClass::WaitRetryable);
+        assert!(waiting.recoverable);
+        assert!(waiting.retry_after_ms.is_some());
+        assert!(waiting
+            .next_action
+            .as_deref()
+            .is_some_and(|action| action.contains("核对同一 release")
+                && !action.contains("用户")
+                && !action.contains("请")));
+        assert!(!waiting.summary.contains("用户"));
+        assert!(!waiting.summary.contains("请"));
+        assert!(!waiting.summary.contains("重新调用"));
+    }
+
+    #[test]
     fn hook_status_parser_distinguishes_pending_failure_unsupported_and_success() {
         assert_eq!(
             parse_observation_status("success", None),
@@ -7188,6 +7700,70 @@ Release-Urgency: hold"
         assert_eq!(
             parse_observation_status("unsupported", None),
             ObservationStatus::Unsupported("not configured".into())
+        );
+    }
+
+    #[test]
+    fn github_release_dispatch_parser_never_promotes_nonmatching_event_ref_or_head() {
+        let target = ReleaseDispatchTarget {
+            workflow: "auto-release.yml".into(),
+            git_ref: "main".into(),
+            head_sha: "exact-head".into(),
+        };
+        let observed = serde_json::json!({
+            "workflow_runs": [
+                {
+                    "id": 1,
+                    "event": "push",
+                    "head_branch": "main",
+                    "head_sha": "exact-head",
+                    "status": "completed"
+                },
+                {
+                    "id": 2,
+                    "event": "workflow_dispatch",
+                    "head_branch": "other",
+                    "head_sha": "exact-head",
+                    "status": "completed"
+                },
+                {
+                    "id": 3,
+                    "event": "workflow_dispatch",
+                    "head_branch": "main",
+                    "head_sha": "other-head",
+                    "status": "completed"
+                }
+            ]
+        });
+
+        assert_eq!(
+            parse_github_release_dispatch_runs(&observed, &target).unwrap(),
+            ReleaseDispatchObservation::HeadMismatch {
+                observed_heads: vec!["other-head".into()]
+            }
+        );
+
+        let exact = serde_json::json!([{
+            "databaseId": 42,
+            "event": "workflow_dispatch",
+            "headBranch": "main",
+            "headSha": "exact-head",
+            "status": "in_progress",
+            "url": "https://example.invalid/actions/runs/42"
+        }]);
+        assert_eq!(
+            parse_github_release_dispatch_runs(&exact, &target).unwrap(),
+            ReleaseDispatchObservation::Triggered {
+                run_id: "42".into(),
+                status: "in_progress".into(),
+                head_sha: "exact-head".into(),
+                detail: "https://example.invalid/actions/runs/42".into(),
+            }
+        );
+
+        assert_eq!(
+            parse_github_release_dispatch_runs(&serde_json::json!([]), &target).unwrap(),
+            ReleaseDispatchObservation::Absent
         );
     }
 
@@ -7325,7 +7901,7 @@ else:
             .await
             .unwrap();
         assert_eq!(
-            remote.trigger_release(None).await.unwrap(),
+            remote.trigger_release("release-head", None).await.unwrap(),
             "corp release dispatched"
         );
         assert_eq!(
@@ -7341,6 +7917,27 @@ else:
                 .await
                 .unwrap(),
             ObservationStatus::Success("corp live verified".into())
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn provider_hook_release_observer_rejects_foreign_target_before_hook_execution() {
+        let root = make_repo("hook-release-foreign-target");
+        let remote = HookRemote::new("corp-mr".into(), "false".into(), root.clone());
+        let target = ReleaseDispatchTarget {
+            workflow: "provider-hook:retired-hook".into(),
+            git_ref: "main".into(),
+            head_sha: "release-head".into(),
+        };
+
+        let error = remote
+            .observe_release_dispatch(&target)
+            .await
+            .expect_err("a current hook must never observe a target owned by another hook");
+        assert!(
+            error.contains("does not match the current provider hook identity"),
+            "foreign target reached the hook instead of failing closed: {error}"
         );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -7526,6 +8123,7 @@ else:
         last_ci_sha: Mutex<Option<String>>,
         ci_sequence: Mutex<VecDeque<CiStatus>>,
         merge_readiness: Mutex<Option<MergeReadiness>>,
+        release_observation: Mutex<Option<ReleaseDispatchObservation>>,
     }
 
     fn stub_calls() -> Arc<StubCalls> {
@@ -7743,16 +8341,48 @@ else:
             commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
             Ok(head)
         }
+        fn release_dispatch_target(&self, head_sha: &str) -> Option<ReleaseDispatchTarget> {
+            Some(ReleaseDispatchTarget {
+                workflow: "stub-release.yml".into(),
+                git_ref: "main".into(),
+                head_sha: head_sha.to_string(),
+            })
+        }
+
+        async fn observe_release_dispatch(
+            &self,
+            _target: &ReleaseDispatchTarget,
+        ) -> Result<ReleaseDispatchObservation, String> {
+            Ok(self
+                .calls
+                .release_observation
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(ReleaseDispatchObservation::Absent))
+        }
+
         async fn trigger_release(
             &self,
+            head_sha: &str,
             mutation_permit: Option<&DeliveryMutationPermit>,
         ) -> Result<String, String> {
             let rung = "provider_release_trigger";
-            let operation_key = external_operation_key(rung, &["stub"]);
-            let evidence = json!({ "provider": "stub" }).to_string();
+            let target = self
+                .release_dispatch_target(head_sha)
+                .expect("stub release target");
+            let operation_key = target.operation_key();
+            let evidence = serde_json::to_string(&target).unwrap();
             let intent =
                 begin_external_mutation(mutation_permit, rung, &operation_key, &evidence).await?;
             self.calls.release.fetch_add(1, Ordering::SeqCst);
+            *self.calls.release_observation.lock().unwrap() =
+                Some(ReleaseDispatchObservation::Triggered {
+                    run_id: "stub-run".into(),
+                    status: "queued".into(),
+                    head_sha: head_sha.to_string(),
+                    detail: "stub release workflow dispatched".into(),
+                });
             commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
             Ok("release workflow dispatched".into())
         }
@@ -8383,6 +9013,57 @@ Release-Urgency: hold"
         assert_eq!(calls.rerun_ci.load(Ordering::SeqCst), 0);
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn takeover_does_not_reject_local_release_intent_before_release_reconciliation() {
+        let root = feature_branch_repo("takeover-local-release-intent");
+        let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+        let persisted_identity = capture_delivery_identity(&repo).unwrap();
+        let receipt = DeliveryReceipt {
+            version: 1,
+            state: "intent_release".into(),
+            remote: repo.remote.clone(),
+            remote_identity: receipt_remote_identity(&repo),
+            base_branch: repo.default_branch.clone(),
+            head_branch: repo.branch.clone(),
+            commit_sha: persisted_identity.head_sha.clone(),
+            pr_number: 7,
+            pr_url: "https://example/pr/7".into(),
+            pr_title: Some("fix: release takeover".into()),
+            pr_body: Some(String::new()),
+            release_detail: None,
+        };
+        write_delivery_receipt(&repo, &persisted_identity.head_sha, &receipt).unwrap();
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: Some((7, "https://example/pr/7".into())),
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let observation = observe_delivery_takeover(
+            &root,
+            Some("main"),
+            "feat/x",
+            &persisted_identity,
+            Some(7),
+            Some("https://example/pr/7"),
+            Some(&remote),
+        )
+        .await
+        .expect("base takeover must defer local release intent to the release-specific reconciler");
+
+        assert_eq!(observation.identity, persisted_identity);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        let persisted = read_delivery_receipt(&repo, &observation.identity.head_sha)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, "intent_release");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -9035,12 +9716,20 @@ Release-Urgency: hold"
     }
 
     #[tokio::test]
-    async fn release_intent_stays_fail_closed_until_release_observation_exists() {
-        let root = feature_branch_repo("intent-release-closed");
+    async fn local_release_intent_with_proven_absence_resumes_and_dispatches_exactly_once() {
+        let root = feature_branch_repo("intent-release-proven-absent");
         git(&root, &["add", "feature.rs"]).unwrap();
         git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
         let repo = resolve_repo(&root, Some("main")).unwrap();
         let sha = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let release_head = observe_remote_ref_head(&repo, &repo.default_branch)
+            .unwrap()
+            .expect("remote main head");
+        let release_target = ReleaseDispatchTarget {
+            workflow: "stub-release.yml".into(),
+            git_ref: repo.default_branch.clone(),
+            head_sha: release_head,
+        };
         let receipt = DeliveryReceipt {
             version: 1,
             state: "intent_release".into(),
@@ -9053,7 +9742,7 @@ Release-Urgency: hold"
             pr_url: "https://example/pr/7".into(),
             pr_title: None,
             pr_body: None,
-            release_detail: None,
+            release_detail: Some(encode_release_dispatch_target(&release_target).unwrap()),
         };
         write_delivery_receipt(&repo, &sha, &receipt).unwrap();
         let calls = stub_calls();
@@ -9065,6 +9754,19 @@ Release-Urgency: hold"
             caps: every_capability(),
             calls: calls.clone(),
         };
+        assert_eq!(
+            reconcile_local_release_intent(
+                &root,
+                Some("main"),
+                "feat/x",
+                &sha,
+                true,
+                Some(&remote),
+            )
+            .await
+            .unwrap(),
+            LocalReleaseIntentReconciliation::ProvenAbsent
+        );
         let out = deliver(
             &root,
             DeliveryCeiling::ThroughRelease,
@@ -9075,12 +9777,26 @@ Release-Urgency: hold"
             Some("main"),
         )
         .await;
-        assert_eq!(out.final_state, "waiting");
-        assert_eq!(out.code, "delivery_external_state_uncertain");
-        assert!(out.recoverable);
-        assert_eq!(out.recovery_class, RecoveryClass::ExternalStateUncertain);
-        assert!(out.retry_after_ms.is_some());
-        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        assert_ne!(out.final_state, "waiting", "{:?}", out.steps);
+        assert_eq!(out.reached_state, "release_triggered", "{:?}", out.steps);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 1);
+
+        let resumed = deliver(
+            &root,
+            DeliveryCeiling::ThroughRelease,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(
+            resumed.reached_state, "release_triggered",
+            "{:?}",
+            resumed.steps
+        );
+        assert_eq!(calls.release.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

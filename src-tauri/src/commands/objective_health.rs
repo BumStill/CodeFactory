@@ -15,6 +15,7 @@ use crate::errors::AppError;
 use crate::AppState;
 
 const HEALTH_WINDOW_MS: i64 = 86_400_000;
+const STALLED_PROGRESS_MS: i64 = 300_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,12 +34,22 @@ pub struct ObjectiveHealthMetrics {
     pub typed_user_attention: i64,
     /// Distinct Objective revisions that projected technical work to the user.
     pub technical_user_handoff_violations: i64,
+    /// The same violation scoped to the trailing production-review window.
+    pub technical_user_handoff_violations_24h: i64,
+    /// Real user turns attributed to an already-open, system-owned technical objective.
+    pub avoidable_user_reprompts_24h: i64,
     /// Due remediation rows without a currently valid owner lease.
     pub overdue_ownerless_remediations: i64,
+    pub stalled_system_owned_objectives: i64,
+    pub unavailable_domain_adapter_objectives: i64,
     /// Completed Objective rows that do not retain the completion predicate.
     pub invalid_completions: i64,
+    pub invalid_completions_24h: i64,
     /// Committed receipts beyond the first for one Objective/action fingerprint.
     pub duplicate_committed_side_effect_receipts: i64,
+    pub duplicate_committed_side_effect_receipts_24h: i64,
+    /// Delivery attempts whose persisted effective ceiling was below the user request.
+    pub requested_ceiling_downgrades_24h: i64,
     /// Lifetime technical recovery decisions in the available journal.
     pub recovery_decisions: i64,
     /// Lifetime distinct Objectives with a later active/completed event.
@@ -57,6 +68,9 @@ pub struct ObjectiveHealthMetrics {
 pub struct ObjectiveHealthSnapshot {
     pub generated_at_ms: i64,
     pub window_start_ms: i64,
+    /// Exact release build when compiled by the release workflow. Development
+    /// builds intentionally report `None` and cannot satisfy production proof.
+    pub build_git_sha: Option<String>,
     pub availability: ObjectiveHealthAvailability,
     pub unavailable_reason: Option<String>,
     /// `None` is intentional when unavailable; absence must not be read as zero.
@@ -68,6 +82,7 @@ impl ObjectiveHealthSnapshot {
         Self {
             generated_at_ms: now_ms,
             window_start_ms: now_ms.saturating_sub(HEALTH_WINDOW_MS),
+            build_git_sha: release_build_git_sha(),
             availability: ObjectiveHealthAvailability::Available,
             unavailable_reason: None,
             metrics: Some(metrics),
@@ -78,11 +93,23 @@ impl ObjectiveHealthSnapshot {
         Self {
             generated_at_ms: now_ms,
             window_start_ms: now_ms.saturating_sub(HEALTH_WINDOW_MS),
+            build_git_sha: release_build_git_sha(),
             availability: ObjectiveHealthAvailability::Unavailable,
             unavailable_reason: Some(reason.into()),
             metrics: None,
         }
     }
+}
+
+fn release_build_git_sha() -> Option<String> {
+    option_env!("CODEFACTORY_BUILD_GIT_SHA")
+        .filter(|value| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(ToOwned::to_owned)
 }
 
 const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
@@ -93,6 +120,7 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "revision",
             "status",
             "decision_type",
+            "domain",
             "requires_user_action",
             "recovery_owner",
             "remediation_id",
@@ -101,6 +129,8 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "completed_at",
             "lease_owner",
             "lease_expires_at",
+            "last_progress_at",
+            "created_at",
         ],
     ),
     (
@@ -136,8 +166,18 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
     ),
     (
         "side_effect_receipts",
-        &["objective_id", "action_fingerprint", "status"],
+        &[
+            "objective_id",
+            "action_fingerprint",
+            "status",
+            "observed_at",
+        ],
     ),
+    (
+        "chat_turn_state",
+        &["objective_id", "user_reprompt_driver", "updated_at"],
+    ),
+    ("tool_calls", &["tool_name", "metadata", "created_at"]),
 ];
 
 /// Query the durable Objective health surface at a caller-supplied clock.
@@ -334,6 +374,7 @@ async fn aggregate_health(
     pool: &SqlitePool,
     now_ms: i64,
 ) -> Result<ObjectiveHealthMetrics, sqlx::Error> {
+    let window_start_ms = now_ms.saturating_sub(HEALTH_WINDOW_MS);
     let open: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objectives
          WHERE status NOT IN ('completed','cancelled','legacy_orphan')",
@@ -370,6 +411,33 @@ async fn aggregate_health(
     .bind(now_ms)
     .fetch_one(pool)
     .await?;
+    let stalled_system_owned_objectives: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives
+         WHERE status IN ('active','waiting_system')
+           AND requires_user_action=0
+           AND COALESCE(last_progress_at, created_at)<=?",
+    )
+    .bind(now_ms.saturating_sub(STALLED_PROGRESS_MS))
+    .fetch_one(pool)
+    .await?;
+    let open_domains = sqlx::query_scalar::<_, String>(
+        "SELECT domain FROM objectives
+         WHERE status IN ('active','waiting_system') AND requires_user_action=0",
+    )
+    .fetch_all(pool)
+    .await?;
+    let unavailable_domain_adapter_objectives = open_domains
+        .into_iter()
+        .filter(|domain| {
+            crate::agent::objective::RecoveryDomain::ALL
+                .into_iter()
+                .find(|candidate| candidate.as_str() == domain)
+                .map(|domain| {
+                    !crate::agent::objective_supervisor::domain_has_executable_adapter(domain)
+                })
+                .unwrap_or(true)
+        })
+        .count() as i64;
     let invalid_completions: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objectives objective
          WHERE objective.status='completed' AND (
@@ -404,6 +472,43 @@ async fn aggregate_health(
     )
     .fetch_one(pool)
     .await?;
+    let invalid_completions_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives objective
+         WHERE objective.status='completed'
+           AND objective.completed_at BETWEEN ? AND ?
+           AND (
+             objective.decision_type<>'complete' OR
+             objective.requires_user_action<>0 OR
+             NULLIF(TRIM(objective.evidence_ref),'') IS NULL OR
+             NULLIF(TRIM(objective.reached_acceptance),'') IS NULL OR
+             NULLIF(TRIM(objective.recovery_owner),'') IS NOT NULL OR
+             NULLIF(TRIM(objective.remediation_id),'') IS NOT NULL OR
+             NULLIF(TRIM(objective.lease_owner),'') IS NOT NULL OR
+             objective.lease_expires_at IS NOT NULL OR
+             NOT EXISTS (
+               SELECT 1 FROM objective_decisions decision
+               WHERE decision.objective_id=objective.id
+                 AND decision.revision=objective.revision
+                 AND decision.decision_type='complete'
+                 AND decision.evidence_ref=objective.evidence_ref
+                 AND json_valid(decision.envelope_json)
+                 AND json_extract(decision.envelope_json, '$.decision_type')='complete'
+                 AND json_extract(decision.envelope_json, '$.status')='completed'
+                 AND json_extract(decision.envelope_json, '$.reached_acceptance')
+                     =objective.reached_acceptance
+             ) OR
+             NOT EXISTS (
+               SELECT 1 FROM objective_evidence evidence
+               WHERE evidence.objective_id=objective.id
+                 AND evidence.revision=objective.revision
+                 AND evidence.evidence_ref=objective.evidence_ref
+             )
+           )",
+    )
+    .bind(window_start_ms)
+    .bind(now_ms)
+    .fetch_one(pool)
+    .await?;
     let duplicate_committed_side_effect_receipts: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(receipt_count - 1), 0) FROM (
            SELECT COUNT(*) AS receipt_count
@@ -413,6 +518,19 @@ async fn aggregate_health(
            HAVING COUNT(*) > 1
          )",
     )
+    .fetch_one(pool)
+    .await?;
+    let duplicate_committed_side_effect_receipts_24h: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(receipt_count - 1), 0) FROM (
+           SELECT COUNT(*) AS receipt_count
+           FROM side_effect_receipts
+           WHERE status='committed' AND observed_at BETWEEN ? AND ?
+           GROUP BY objective_id, action_fingerprint
+           HAVING COUNT(*) > 1
+         )",
+    )
+    .bind(window_start_ms)
+    .bind(now_ms)
     .fetch_one(pool)
     .await?;
 
@@ -474,6 +592,45 @@ async fn aggregate_health(
         }
     }
 
+    let technical_user_handoff_violations_24h = decisions
+        .iter()
+        .filter(|decision| {
+            decision.created_at >= window_start_ms && decision.is_user_handoff_violation()
+        })
+        .map(|decision| (decision.objective_id.as_str(), decision.revision))
+        .collect::<HashSet<_>>()
+        .len() as i64;
+    let avoidable_user_reprompts_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat_turn_state
+         WHERE user_reprompt_driver IN (
+           'recoverable_waiting_open',
+           'completion_arbitration_open',
+           'system_owned_remediation_open',
+           'authorized_objective_still_open'
+         )
+           AND objective_id IS NOT NULL
+           AND updated_at BETWEEN ? AND ?",
+    )
+    .bind(window_start_ms)
+    .bind(now_ms)
+    .fetch_one(pool)
+    .await?;
+    let requested_ceiling_downgrades_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_calls
+         WHERE tool_name='deliver_changes'
+           AND created_at BETWEEN ? AND ?
+           AND metadata IS NOT NULL
+           AND json_valid(metadata)
+           AND NULLIF(json_extract(metadata, '$.requested_ceiling'), '') IS NOT NULL
+           AND NULLIF(json_extract(metadata, '$.effective_ceiling'), '') IS NOT NULL
+           AND json_extract(metadata, '$.requested_ceiling')
+               <> json_extract(metadata, '$.effective_ceiling')",
+    )
+    .bind(window_start_ms)
+    .bind(now_ms)
+    .fetch_one(pool)
+    .await?;
+
     let event_rows = sqlx::query(
         "SELECT objective_id, revision, created_at FROM objective_events
          WHERE created_at<=? AND status IN ('active','completed')
@@ -493,7 +650,6 @@ async fn aggregate_health(
             });
     }
 
-    let window_start_ms = now_ms.saturating_sub(HEALTH_WINDOW_MS);
     let recovery_decisions: Vec<&JournalDecision> = decisions
         .iter()
         .filter(|decision| decision.is_recovery_decision())
@@ -515,9 +671,16 @@ async fn aggregate_health(
         system_owned,
         typed_user_attention,
         technical_user_handoff_violations: handoff_revisions.len() as i64,
+        technical_user_handoff_violations_24h,
+        avoidable_user_reprompts_24h,
         overdue_ownerless_remediations,
+        stalled_system_owned_objectives,
+        unavailable_domain_adapter_objectives,
         invalid_completions,
+        invalid_completions_24h,
         duplicate_committed_side_effect_receipts,
+        duplicate_committed_side_effect_receipts_24h,
+        requested_ceiling_downgrades_24h,
         recovery_decisions: recovery_decisions.len() as i64,
         recovered_objectives,
         recovery_latency_p50_ms: nearest_rank_percentile(&recovery_latencies, 50),
@@ -588,6 +751,7 @@ mod tests {
                 revision INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 decision_type TEXT NOT NULL,
+                domain TEXT NOT NULL DEFAULT 'chat',
                 requires_user_action INTEGER NOT NULL,
                 recovery_owner TEXT,
                 remediation_id TEXT,
@@ -595,7 +759,9 @@ mod tests {
                 reached_acceptance TEXT,
                 completed_at INTEGER,
                 lease_owner TEXT,
-                lease_expires_at INTEGER
+                lease_expires_at INTEGER,
+                last_progress_at INTEGER,
+                created_at INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE objective_decisions (
                 id TEXT PRIMARY KEY,
@@ -629,7 +795,18 @@ mod tests {
              CREATE TABLE side_effect_receipts (
                 objective_id TEXT NOT NULL,
                 action_fingerprint TEXT NOT NULL,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                observed_at INTEGER NOT NULL
+             );
+             CREATE TABLE chat_turn_state (
+                objective_id TEXT,
+                user_reprompt_driver TEXT,
+                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE tool_calls (
+                tool_name TEXT NOT NULL,
+                metadata TEXT,
+                created_at INTEGER NOT NULL
              );",
         )
         .execute(pool)
@@ -654,8 +831,8 @@ mod tests {
             "INSERT INTO objectives
              (id, revision, status, decision_type, requires_user_action,
               recovery_owner, remediation_id, evidence_ref, reached_acceptance,
-              completed_at, lease_owner, lease_expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+              completed_at, lease_owner, lease_expires_at, last_progress_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
         )
         .bind(id)
         .bind(revision)
@@ -667,6 +844,8 @@ mod tests {
         .bind(evidence_ref)
         .bind(reached_acceptance)
         .bind(completed_at)
+        .bind(NOW_MS)
+        .bind(NOW_MS)
         .execute(pool)
         .await
         .unwrap();
@@ -764,9 +943,16 @@ mod tests {
         assert_eq!(metrics.system_owned, 0);
         assert_eq!(metrics.typed_user_attention, 0);
         assert_eq!(metrics.technical_user_handoff_violations, 0);
+        assert_eq!(metrics.technical_user_handoff_violations_24h, 0);
+        assert_eq!(metrics.avoidable_user_reprompts_24h, 0);
         assert_eq!(metrics.overdue_ownerless_remediations, 0);
+        assert_eq!(metrics.stalled_system_owned_objectives, 0);
+        assert_eq!(metrics.unavailable_domain_adapter_objectives, 0);
         assert_eq!(metrics.invalid_completions, 0);
+        assert_eq!(metrics.invalid_completions_24h, 0);
         assert_eq!(metrics.duplicate_committed_side_effect_receipts, 0);
+        assert_eq!(metrics.duplicate_committed_side_effect_receipts_24h, 0);
+        assert_eq!(metrics.requested_ceiling_downgrades_24h, 0);
         assert_eq!(metrics.recovery_decisions, 0);
         assert_eq!(metrics.recovered_objectives, 0);
         assert_eq!(metrics.recovery_latency_p50_ms, None);
@@ -778,14 +964,201 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actual_0006_schema_reports_available_zeroes() {
+    async fn stalled_and_non_executable_domain_work_is_visible_to_the_release_gate() {
         let pool = pool().await;
+        install_health_schema(&pool).await;
+
+        insert_objective(
+            &pool,
+            "stalled-permission",
+            2,
+            "waiting_system",
+            "platform_incident",
+            false,
+            Some("objective-supervisor:permission"),
+            Some("remediation-stalled"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE objectives
+             SET domain='permission', last_progress_at=?, created_at=?
+             WHERE id='stalled-permission'",
+        )
+        .bind(NOW_MS - 300_001)
+        .bind(NOW_MS - 300_001)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_objective(
+            &pool,
+            "fresh-chat",
+            2,
+            "waiting_system",
+            "waiting",
+            false,
+            Some("objective-supervisor:chat"),
+            Some("remediation-fresh"),
+            None,
+            None,
+            None,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE objectives SET domain='chat', last_progress_at=?, created_at=?
+             WHERE id='fresh-chat'",
+        )
+        .bind(NOW_MS - 1)
+        .bind(NOW_MS - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let metrics = query_objective_health(&pool, NOW_MS)
+            .await
+            .metrics
+            .expect("available metrics");
+        assert_eq!(metrics.stalled_system_owned_objectives, 1);
+        assert_eq!(metrics.unavailable_domain_adapter_objectives, 1);
+    }
+
+    #[tokio::test]
+    async fn production_window_detects_avoidable_reprompts_and_ceiling_downgrades_only_in_24h() {
+        let pool = pool().await;
+        install_health_schema(&pool).await;
+
+        for (id, driver, observed_at) in [
+            ("technical-current", "recoverable_waiting_open", NOW_MS - 1),
+            (
+                "technical-old",
+                "system_owned_remediation_open",
+                NOW_MS - HEALTH_WINDOW_MS - 1,
+            ),
+            ("typed-input", "core_input_response", NOW_MS - 1),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat_turn_state
+                 (objective_id, user_reprompt_driver, updated_at) VALUES (?, ?, ?)",
+            )
+            .bind(id)
+            .bind(driver)
+            .bind(observed_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, requested, effective, observed_at) in [
+            (
+                "current-downgrade",
+                "through_release",
+                "through_merge",
+                NOW_MS - 1,
+            ),
+            (
+                "old-downgrade",
+                "through_release",
+                "pr_only",
+                NOW_MS - HEALTH_WINDOW_MS - 1,
+            ),
+            (
+                "current-exact",
+                "through_release",
+                "through_release",
+                NOW_MS - 1,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO tool_calls (tool_name, metadata, created_at)
+                 VALUES ('deliver_changes', ?, ?)",
+            )
+            .bind(
+                json!({
+                    "id": id,
+                    "requested_ceiling": requested,
+                    "effective_ceiling": effective,
+                })
+                .to_string(),
+            )
+            .bind(observed_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let metrics = query_objective_health(&pool, NOW_MS)
+            .await
+            .metrics
+            .expect("available metrics");
+        assert_eq!(metrics.avoidable_user_reprompts_24h, 1);
+        assert_eq!(metrics.requested_ceiling_downgrades_24h, 1);
+    }
+
+    #[tokio::test]
+    async fn production_window_counts_only_recent_technical_user_handoffs() {
+        let pool = pool().await;
+        install_health_schema(&pool).await;
+        for (id, objective_id, created_at) in [
+            ("recent", "objective-recent", NOW_MS - 1),
+            ("old", "objective-old", NOW_MS - HEALTH_WINDOW_MS - 1),
+        ] {
+            insert_decision(
+                &pool,
+                id,
+                objective_id,
+                2,
+                "platform_incident",
+                true,
+                Some("objective-supervisor:provider"),
+                Some("remediation"),
+                json!({
+                    "decision_type":"platform_incident",
+                    "status":"waiting_system",
+                    "requires_user_action":true
+                }),
+                None,
+                created_at,
+            )
+            .await;
+        }
+
+        let metrics = query_objective_health(&pool, NOW_MS)
+            .await
+            .metrics
+            .expect("available metrics");
+        assert_eq!(metrics.technical_user_handoff_violations, 2);
+        assert_eq!(metrics.technical_user_handoff_violations_24h, 1);
+    }
+
+    #[tokio::test]
+    async fn actual_runtime_schema_reports_available_zeroes() {
+        let pool = pool().await;
+        sqlx::raw_sql(include_str!("../../migrations/0001_init.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0003_session_execution_governance.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::raw_sql(include_str!(
             "../../migrations/0007_unified_objective_control_plane.sql"
         ))
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("ALTER TABLE chat_turn_state ADD COLUMN user_reprompt_driver TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE tool_calls ADD COLUMN metadata TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let snapshot = query_objective_health(&pool, NOW_MS).await;
         assert_eq!(
@@ -1228,12 +1601,12 @@ mod tests {
              ('waiting', 100000001, NULL, NULL),
              ('completed', 1, NULL, NULL);
              INSERT INTO side_effect_receipts
-             (objective_id, action_fingerprint, status) VALUES
-             ('active', 'deliver:head-a', 'committed'),
-             ('active', 'deliver:head-a', 'committed'),
-             ('active', 'deliver:head-a', 'started'),
-             ('active', 'deliver:head-b', 'committed'),
-             ('waiting-system', 'deliver:head-a', 'committed');",
+             (objective_id, action_fingerprint, status, observed_at) VALUES
+             ('active', 'deliver:head-a', 'committed', 99999999),
+             ('active', 'deliver:head-a', 'committed', 99999999),
+             ('active', 'deliver:head-a', 'started', 99999999),
+             ('active', 'deliver:head-b', 'committed', 99999999),
+             ('waiting-system', 'deliver:head-a', 'committed', 99999999);",
         )
         .execute(&pool)
         .await
@@ -1252,7 +1625,9 @@ mod tests {
         assert_eq!(metrics.technical_user_handoff_violations, 3);
         assert_eq!(metrics.overdue_ownerless_remediations, 2);
         assert_eq!(metrics.invalid_completions, 1);
+        assert_eq!(metrics.invalid_completions_24h, 1);
         assert_eq!(metrics.duplicate_committed_side_effect_receipts, 1);
+        assert_eq!(metrics.duplicate_committed_side_effect_receipts_24h, 1);
         assert_eq!(metrics.recovery_decisions, 4);
         assert_eq!(metrics.recovered_objectives, 3);
         assert_eq!(metrics.recovery_latency_p50_ms, Some(300));

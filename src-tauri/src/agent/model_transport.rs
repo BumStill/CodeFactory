@@ -24,6 +24,9 @@ use std::sync::Arc;
 
 use codefactory_agent_core::{provider_rejects_required_tool_choice, sanitize_completion_summary};
 use reqwest::Client;
+use sha2::{Digest, Sha256};
+use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
 
 use codefactory_agent_loop::transport::{
     EffectiveRoute, ModelResponse, ModelTransport, RoundOptions, RouteChange as LoopRouteChange,
@@ -32,6 +35,10 @@ use codefactory_agent_loop::transport::{
 
 use super::events::EventSink;
 use super::failover::{classify_provider_failure, ActiveRouteState, RouteCandidate};
+use super::provider_recovery::{
+    OverloadBudgetDecision, ProviderAttemptSpec, ProviderEpisodeSpec, ProviderMutation,
+    ProviderOwnerPermit, ProviderRecoveryStore,
+};
 use super::{next_stream_item, openai_tool_controls, validate_openai_sse_completion, StreamPoll};
 use crate::config::settings::ApiStyle;
 use crate::errors::Result;
@@ -58,6 +65,9 @@ pub(super) struct DesktopModelTransport {
     /// Metadata prompts must not be echoed from transient Provider bodies into
     /// logs or retry events. Interactive requests retain their diagnostics.
     pub(super) retry_response_body: crate::http_util::RetryResponseBody,
+    /// Present only for Objective-bound interactive/recovery work. It owns the
+    /// exact write-ahead provider attempt and fences every POST/output/commit.
+    pub(super) provider_attempt: Option<ProviderAttemptRuntime>,
 }
 
 pub(super) struct RoutedDesktopModelTransport {
@@ -68,6 +78,28 @@ pub(super) struct RoutedDesktopModelTransport {
     pub(super) cancel: Option<Arc<AtomicBool>>,
     pub(super) turn_output_started: Arc<AtomicBool>,
     pub(super) turn_side_effect_started: Arc<AtomicBool>,
+    pub(super) db: SqlitePool,
+    pub(super) root_turn_id: Option<String>,
+    pub(super) mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
+    pub(super) anonymous: bool,
+    /// Foreground/recovered chat must never silently fall back to unreceipted
+    /// provider I/O. Legacy task/subagent surfaces remain optional until their
+    /// scheduler owner is represented by the unified mutation permit.
+    pub(super) durable_provider_required: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ProviderAttemptRuntime {
+    store: ProviderRecoveryStore,
+    permit: ProviderOwnerPermit,
+    attempt_id: String,
+    post_admitted: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderFailureAction {
+    RetrySafe,
+    DurableWaiting,
 }
 
 struct TrackingEventSink {
@@ -163,11 +195,388 @@ fn classify_transport_error(message: String) -> TransportError {
     }
 }
 
+fn provider_digest(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn provider_transport_error(context: &str, error: impl std::fmt::Display) -> TransportError {
+    TransportError::Fatal(format!("{context}: {error}"))
+}
+
+fn require_provider_applied<T>(
+    mutation: ProviderMutation<T>,
+    rung: &str,
+) -> std::result::Result<T, TransportError> {
+    match mutation {
+        ProviderMutation::Applied(value) => Ok(value),
+        ProviderMutation::Fenced => Err(TransportError::Fatal(format!(
+            "PROVIDER_OWNER_FENCED: durable owner changed before {rung}"
+        ))),
+    }
+}
+
+impl ProviderAttemptRuntime {
+    pub(super) async fn admit_post(&self) -> std::result::Result<(), TransportError> {
+        let mutation = self
+            .store
+            .mark_in_flight(
+                &self.permit,
+                &self.attempt_id,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| provider_transport_error("provider POST admission failed", error))?;
+        require_provider_applied(mutation, "provider POST")?;
+        self.post_admitted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub(super) async fn checkpoint_text(
+        &self,
+        content: &str,
+    ) -> std::result::Result<(), TransportError> {
+        let mutation = self
+            .store
+            .append_partial_output(
+                &self.permit,
+                &self.attempt_id,
+                content,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| {
+                provider_transport_error("provider output checkpoint failed", error)
+            })?;
+        require_provider_applied(mutation, "provider output emit")?;
+        Ok(())
+    }
+
+    pub(super) async fn checkpoint_output_event(&self) -> std::result::Result<(), TransportError> {
+        let mutation = self
+            .store
+            .latch_output_event(
+                &self.permit,
+                &self.attempt_id,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| provider_transport_error("provider output latch failed", error))?;
+        require_provider_applied(mutation, "provider output emit")?;
+        Ok(())
+    }
+
+    async fn commit_response(
+        &self,
+        response: &ModelResponse,
+    ) -> std::result::Result<(), TransportError> {
+        let tool_identity = response
+            .tool_calls
+            .iter()
+            .map(|call| {
+                serde_json::json!({
+                    "id": call.id,
+                    "name": call.function.name,
+                    "arguments_digest": provider_digest(&[call.function.arguments.as_bytes()]),
+                })
+            })
+            .collect::<Vec<_>>();
+        let response_identity = serde_json::to_vec(&serde_json::json!({
+            "text_digest": provider_digest(&[response.text.as_bytes()]),
+            "tools": tool_identity,
+            "reasoning_digest": response.reasoning.as_deref().map(|value| provider_digest(&[value.as_bytes()])),
+        }))
+        .map_err(|error| provider_transport_error("provider response digest failed", error))?;
+        let response_digest = provider_digest(&[&response_identity]);
+        let mutation = self
+            .store
+            .commit_response(
+                &self.permit,
+                &self.attempt_id,
+                &response_digest,
+                &response.text,
+                false,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| provider_transport_error("provider response commit failed", error))?;
+        require_provider_applied(mutation, "provider response commit")?;
+        Ok(())
+    }
+
+    async fn settle_failure(
+        &self,
+        error: &TransportError,
+    ) -> std::result::Result<ProviderFailureAction, TransportError> {
+        let text = error.message();
+        let overloaded = codefactory_agent_loop::context::is_provider_overloaded(text);
+        let explicit_response = text.to_ascii_lowercase().contains("http ")
+            || text.contains("后端请求失败（")
+            || text.contains("Bad Request");
+        let replayable = !self.post_admitted.load(Ordering::SeqCst) || explicit_response;
+        let (failure_class, failure_code) = if overloaded {
+            ("provider_overload", "provider_overloaded")
+        } else if text.to_ascii_lowercase().contains("auth")
+            || text.contains("401")
+            || text.contains("credential")
+        {
+            ("provider_auth", "provider_auth_unavailable")
+        } else if replayable {
+            ("provider_rejected", "provider_request_rejected")
+        } else {
+            ("provider_transport", "provider_external_state_uncertain")
+        };
+        let mutation = self
+            .store
+            .record_failure(
+                &self.permit,
+                &self.attempt_id,
+                failure_class,
+                failure_code,
+                replayable,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|store_error| {
+                provider_transport_error("provider failure receipt failed", store_error)
+            })?;
+        let decision = require_provider_applied(mutation, "provider failure settle")?;
+        Ok(match decision {
+            OverloadBudgetDecision::RetryAfter { .. } => ProviderFailureAction::RetrySafe,
+            OverloadBudgetDecision::DurableWaiting { .. } => ProviderFailureAction::DurableWaiting,
+        })
+    }
+}
+
 impl RoutedDesktopModelTransport {
+    async fn resolve_provider_owner(
+        &self,
+    ) -> std::result::Result<Option<ProviderOwnerPermit>, TransportError> {
+        if self.anonymous {
+            return Ok(None);
+        }
+        let Some(root_turn_id) = self.root_turn_id.as_deref() else {
+            if self.durable_provider_required {
+                return Err(TransportError::Fatal(
+                    "PROVIDER_DURABLE_IDENTITY_MISSING: chat has no root turn".into(),
+                ));
+            }
+            return Ok(None);
+        };
+
+        if let Some(permit) = self.mutation_permit.as_ref() {
+            let Some(binding_id) = permit.binding_id.as_deref() else {
+                return Err(TransportError::Fatal(
+                    "PROVIDER_DURABLE_IDENTITY_MISSING: remediation has no binding".into(),
+                ));
+            };
+            let Some(resource_generation) = permit.resource_generation else {
+                return Err(TransportError::Fatal(
+                    "PROVIDER_DURABLE_IDENTITY_MISSING: remediation has no binding generation"
+                        .into(),
+                ));
+            };
+            let row = sqlx::query(
+                "SELECT o.revision, o.session_id, o.root_turn_id
+                 FROM objectives o
+                 JOIN objective_bindings b ON b.id=? AND b.objective_id=o.id
+                 WHERE o.id=? AND b.resource_generation=?",
+            )
+            .bind(binding_id)
+            .bind(&permit.objective_id)
+            .bind(resource_generation)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|error| provider_transport_error("resolve provider remediation", error))?
+            .ok_or_else(|| {
+                TransportError::Fatal(
+                    "PROVIDER_DURABLE_IDENTITY_MISSING: remediation binding disappeared".into(),
+                )
+            })?;
+            let session_id: Option<String> = row.get("session_id");
+            let objective_root: Option<String> = row.get("root_turn_id");
+            if session_id.as_deref() != Some(self.session_id.as_str())
+                || objective_root.as_deref() != Some(root_turn_id)
+            {
+                return Err(TransportError::Fatal(
+                    "PROVIDER_DURABLE_IDENTITY_MISMATCH: remediation session/root changed".into(),
+                ));
+            }
+            return Ok(Some(ProviderOwnerPermit::remediation(
+                &permit.objective_id,
+                row.get::<i64, _>("revision"),
+                binding_id,
+                resource_generation,
+                &permit.remediation_id,
+                &permit.owner,
+                permit.claim_epoch,
+            )));
+        }
+
+        let row = sqlx::query(
+            "SELECT o.id AS objective_id, o.revision, b.id AS binding_id,
+                    b.resource_generation, c.run_instance_id
+             FROM chat_run_controls c
+             JOIN objectives o ON o.id=c.objective_id AND o.revision=c.objective_revision
+             JOIN objective_bindings b ON b.objective_id=o.id
+                AND b.resource_kind='chat_root_turn' AND b.resource_id=c.root_turn_id
+             WHERE c.session_id=? AND c.root_turn_id=? AND c.status='active'
+               AND o.session_id=c.session_id AND o.root_turn_id=c.root_turn_id
+               AND o.status='active'
+             ORDER BY b.resource_generation DESC LIMIT 2",
+        )
+        .bind(&self.session_id)
+        .bind(root_turn_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|error| provider_transport_error("resolve foreground provider owner", error))?;
+        if row.len() != 1 {
+            if self.durable_provider_required {
+                return Err(TransportError::Fatal(format!(
+                    "PROVIDER_DURABLE_IDENTITY_MISSING: expected one active chat binding, found {}",
+                    row.len()
+                )));
+            }
+            return Ok(None);
+        }
+        let row = &row[0];
+        let revision = row.get::<i64, _>("revision");
+        Ok(Some(ProviderOwnerPermit::chat_run(
+            row.get::<String, _>("objective_id"),
+            revision,
+            row.get::<String, _>("binding_id"),
+            row.get::<i64, _>("resource_generation"),
+            row.get::<String, _>("run_instance_id"),
+            revision,
+        )))
+    }
+
+    async fn prepare_provider_attempt(
+        &self,
+        route: &RouteCandidate,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        opts: &RoundOptions,
+    ) -> std::result::Result<Option<ProviderAttemptRuntime>, TransportError> {
+        let Some(permit) = self.resolve_provider_owner().await? else {
+            return Ok(None);
+        };
+        let latches = sqlx::query(
+            "SELECT b.output_started, b.side_effect_started,
+                    o.output_started AS objective_output_started,
+                    o.side_effect_started AS objective_side_effect_started
+             FROM objective_bindings b
+             JOIN objectives o ON o.id=b.objective_id
+             WHERE b.id=? AND b.objective_id=? AND b.resource_generation=?",
+        )
+        .bind(permit.binding_id())
+        .bind(permit.objective_id())
+        .bind(permit.resource_generation())
+        .fetch_one(&self.db)
+        .await
+        .map_err(|error| provider_transport_error("load provider safety latches", error))?;
+        if latches.get::<i64, _>("output_started") != 0
+            || latches.get::<i64, _>("objective_output_started") != 0
+        {
+            self.turn_output_started.store(true, Ordering::SeqCst);
+        }
+        if latches.get::<i64, _>("side_effect_started") != 0
+            || latches.get::<i64, _>("objective_side_effect_started") != 0
+        {
+            self.turn_side_effect_started.store(true, Ordering::SeqCst);
+        }
+        let root_turn_id = self.root_turn_id.as_deref().ok_or_else(|| {
+            TransportError::Fatal("PROVIDER_DURABLE_IDENTITY_MISSING: root turn missing".into())
+        })?;
+        let candidate_snapshot = self
+            .route_state
+            .candidate_identity_snapshot()
+            .into_iter()
+            .map(|(endpoint, model)| serde_json::json!({"endpoint": endpoint, "model": model}))
+            .collect::<Vec<_>>();
+        let candidate_snapshot_json =
+            serde_json::to_string(&candidate_snapshot).map_err(|error| {
+                provider_transport_error("serialize provider route snapshot", error)
+            })?;
+        let candidate_snapshot_digest = provider_digest(&[candidate_snapshot_json.as_bytes()]);
+        let policy =
+            sqlx::query_scalar::<_, String>("SELECT model_policy FROM sessions WHERE id=?")
+                .bind(&self.session_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(|error| provider_transport_error("load provider route policy", error))?
+                .filter(|policy| matches!(policy.as_str(), "fixed" | "prefer" | "auto"))
+                .unwrap_or_else(|| "fixed".into());
+        let episode_material = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            permit.objective_id(),
+            permit.objective_revision(),
+            permit.binding_id(),
+            permit.resource_generation(),
+            candidate_snapshot_digest
+        );
+        let episode_hash = provider_digest(&[episode_material.as_bytes()]);
+        let episode_id = format!(
+            "provider-episode-{}",
+            episode_hash.trim_start_matches("sha256:")
+        );
+        let store = ProviderRecoveryStore::new(self.db.clone());
+        let episode = ProviderEpisodeSpec {
+            id: episode_id.clone(),
+            session_id: self.session_id.clone(),
+            root_turn_id: root_turn_id.to_string(),
+            policy,
+            candidate_snapshot_digest,
+            candidate_snapshot_json,
+            resume_cursor: root_turn_id.to_string(),
+        };
+        let opened = store
+            .open_episode(&permit, &episode, chrono::Utc::now().timestamp_millis())
+            .await
+            .map_err(|error| provider_transport_error("open provider episode", error))?;
+        require_provider_applied(opened, "provider episode open")?;
+
+        let request_identity = serde_json::to_vec(&serde_json::json!({
+            "endpoint": route.endpoint_name,
+            "model": route.model_id,
+            "messages": messages,
+            "tools": tools,
+            "require_tool": opts.require_tool,
+            "reasoning_effort": opts.reasoning_effort,
+            "tool_outcomes_so_far": opts.tool_outcomes_so_far,
+        }))
+        .map_err(|error| provider_transport_error("digest provider request", error))?;
+        let attempt_id = Uuid::new_v4().to_string();
+        let attempt = ProviderAttemptSpec {
+            id: attempt_id.clone(),
+            episode_id,
+            endpoint: route.endpoint_name.clone(),
+            model: route.model_id.clone(),
+            request_digest: provider_digest(&[&request_identity]),
+            resume_cursor: root_turn_id.to_string(),
+        };
+        let begun = store
+            .begin_attempt(&permit, &attempt, chrono::Utc::now().timestamp_millis())
+            .await
+            .map_err(|error| provider_transport_error("prepare provider attempt", error))?;
+        require_provider_applied(begun, "provider attempt prepare")?;
+        Ok(Some(ProviderAttemptRuntime {
+            store,
+            permit,
+            attempt_id,
+            post_admitted: Arc::new(AtomicBool::new(false)),
+        }))
+    }
+
     async fn transport_for(
         &self,
         route: &RouteCandidate,
         output_started: Arc<AtomicBool>,
+        provider_attempt: Option<ProviderAttemptRuntime>,
     ) -> std::result::Result<DesktopModelTransport, TransportError> {
         let api_key = if matches!(route.api_style, ApiStyle::Chatgpt) {
             String::new()
@@ -223,6 +632,7 @@ impl RoutedDesktopModelTransport {
             cancel: self.cancel.clone(),
             max_output_tokens: None,
             retry_response_body: crate::http_util::RetryResponseBody::Include,
+            provider_attempt,
         })
     }
 }
@@ -234,6 +644,40 @@ impl DesktopModelTransport {
         self.cancel
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    fn provider_http_attempt_budget(&self) -> usize {
+        if self.provider_attempt.is_some() {
+            1
+        } else {
+            3
+        }
+    }
+
+    async fn admit_provider_post(&self) -> Result<()> {
+        if let Some(attempt) = self.provider_attempt.as_ref() {
+            if attempt.post_admitted.load(Ordering::SeqCst) {
+                return Err(crate::errors::AppError::Other(
+                    "PROVIDER_REQUEST_REWRITE_REQUIRES_NEW_ATTEMPT: a durable attempt admits exactly one POST"
+                        .into(),
+                ));
+            }
+            attempt
+                .admit_post()
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn checkpoint_provider_text(&self, text: &str) -> Result<()> {
+        if let Some(attempt) = self.provider_attempt.as_ref() {
+            attempt
+                .checkpoint_text(text)
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub(super) async fn call_openai_transport(
@@ -350,7 +794,8 @@ impl DesktopModelTransport {
             self.max_output_tokens,
         );
 
-        let mut response = crate::http_util::send_with_retry_and_notify_policy(
+        self.admit_provider_post().await?;
+        let mut response = crate::http_util::send_with_attempt_budget_and_notify_policy(
             "ChatGPT Responses stream request",
             || {
                 let mut request = self
@@ -369,11 +814,19 @@ impl DesktopModelTransport {
             },
             |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
             self.retry_response_body,
+            self.provider_http_attempt_budget(),
         )
         .await?;
+        if response.status().as_u16() == 401 && self.provider_attempt.is_some() {
+            crate::codex_auth::mark_auth_expired();
+            return Err(crate::errors::AppError::Other(
+                "AUTH_EXPIRED: ChatGPT 授权已过期；当前 POST 已入账，刷新后由 Auth/Provider 对账续接"
+                    .into(),
+            ));
+        }
         if response.status().as_u16() == 401 {
             (access_token, account_id) = crate::codex_auth::force_refresh_access_token().await?;
-            response = crate::http_util::send_with_retry_and_notify_policy(
+            response = crate::http_util::send_with_attempt_budget_and_notify_policy(
                 "ChatGPT Responses stream request after forced token refresh",
                 || {
                     let mut request = self
@@ -392,6 +845,7 @@ impl DesktopModelTransport {
                 },
                 |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
                 self.retry_response_body,
+                self.provider_http_attempt_budget(),
             )
             .await?;
             if response.status().as_u16() == 401 {
@@ -447,6 +901,7 @@ impl DesktopModelTransport {
                         if let Some(d) = ev.get("delta").and_then(|v| v.as_str()) {
                             if !d.is_empty() {
                                 if !finalization_response {
+                                    self.checkpoint_provider_text(d).await?;
                                     self.events.emit(StreamEvent::TextDelta {
                                         content: d.to_string(),
                                     });
@@ -555,6 +1010,9 @@ impl DesktopModelTransport {
                 text_buf = sanitize_completion_summary(&text_buf);
             }
             tool_calls.clear();
+            if !text_buf.is_empty() {
+                self.checkpoint_provider_text(&text_buf).await?;
+            }
             self.events.emit(StreamEvent::TextDelta {
                 content: text_buf.clone(),
             });
@@ -622,7 +1080,8 @@ impl DesktopModelTransport {
             }
         }
 
-        let mut response = crate::http_util::send_with_retry_and_notify_policy(
+        self.admit_provider_post().await?;
+        let mut response = crate::http_util::send_with_attempt_budget_and_notify_policy(
             "OpenAI-compatible chat stream request",
             || {
                 self.http
@@ -633,6 +1092,7 @@ impl DesktopModelTransport {
             },
             |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
             self.retry_response_body,
+            self.provider_http_attempt_budget(),
         )
         .await?;
 
@@ -643,6 +1103,15 @@ impl DesktopModelTransport {
         // itself answers 400 "use 'max_completion_tokens' instead", honor it
         // once — regardless of model name — and resend. Makes the fix
         // name-independent so it can't silently miss a model.
+        if response.status().as_u16() == 400
+            && body.get("max_tokens").is_some()
+            && self.provider_attempt.is_some()
+        {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(crate::errors::AppError::Other(format!(
+                "HTTP 400 Bad Request: durable provider attempt will not rewrite and replay: {err_text}"
+            )));
+        }
         if response.status().as_u16() == 400 && body.get("max_tokens").is_some() {
             let err_text = response.text().await.unwrap_or_default();
             if err_text.contains("max_completion_tokens") {
@@ -650,7 +1119,7 @@ impl DesktopModelTransport {
                     &mut body,
                     self.max_output_tokens.map(u64::from).unwrap_or(8192),
                 );
-                response = crate::http_util::send_with_retry_and_notify_policy(
+                response = crate::http_util::send_with_attempt_budget_and_notify_policy(
                     "OpenAI-compatible chat stream request after max_tokens adaptation",
                     || {
                         self.http
@@ -661,6 +1130,7 @@ impl DesktopModelTransport {
                     },
                     |notice| super::AgentLoop::emit_transport_retry(self.events.as_ref(), notice),
                     self.retry_response_body,
+                    self.provider_http_attempt_budget(),
                 )
                 .await?;
             } else {
@@ -738,6 +1208,7 @@ impl DesktopModelTransport {
                     let delta = choice.delta;
                     if let Some(t) = delta.content.filter(|s| !s.is_empty()) {
                         if !finalization_response {
+                            self.checkpoint_provider_text(&t).await?;
                             self.events
                                 .emit(StreamEvent::TextDelta { content: t.clone() });
                         }
@@ -802,6 +1273,9 @@ impl DesktopModelTransport {
                 text_buf = sanitize_completion_summary(&text_buf);
             }
             tool_calls.clear();
+            if !text_buf.is_empty() {
+                self.checkpoint_provider_text(&text_buf).await?;
+            }
             self.events.emit(StreamEvent::TextDelta {
                 content: text_buf.clone(),
             });
@@ -885,6 +1359,7 @@ impl DesktopModelTransport {
         require_tool: bool,
     ) -> Result<super::anthropic_client::AnthropicResponse> {
         let (system, wire_messages) = chat_messages_to_anthropic(messages);
+        self.admit_provider_post().await?;
         let first = super::anthropic_client::stream_anthropic(
             &self.http,
             &self.base_url,
@@ -900,12 +1375,17 @@ impl DesktopModelTransport {
             self.max_output_tokens.is_none(),
             self.cancel.as_ref(),
             self.events.as_ref(),
+            self.provider_attempt.as_ref(),
+            self.provider_http_attempt_budget(),
         )
         .await;
         let required_choice_unsupported = first.as_ref().err().is_some_and(|error| {
             require_tool && provider_rejects_required_tool_choice(&error.to_string())
         });
         if !required_choice_unsupported {
+            return first;
+        }
+        if self.provider_attempt.is_some() {
             return first;
         }
         super::anthropic_client::stream_anthropic(
@@ -923,6 +1403,8 @@ impl DesktopModelTransport {
             self.max_output_tokens.is_none(),
             self.cancel.as_ref(),
             self.events.as_ref(),
+            self.provider_attempt.as_ref(),
+            self.provider_http_attempt_budget(),
         )
         .await
     }
@@ -1022,13 +1504,36 @@ impl ModelTransport for RoutedDesktopModelTransport {
         loop {
             let route = self.route_state.current();
             let output_started = Arc::new(AtomicBool::new(false));
-            let transport = match self.transport_for(&route, output_started.clone()).await {
+            let provider_attempt = self
+                .prepare_provider_attempt(&route, messages, tools, opts)
+                .await?;
+            let transport = match self
+                .transport_for(&route, output_started.clone(), provider_attempt.clone())
+                .await
+            {
                 Ok(transport) => transport,
                 Err(TransportError::Fatal(reason)) => {
+                    if let Some(attempt) = provider_attempt.as_ref() {
+                        let error = TransportError::Fatal(reason.clone());
+                        let _ = attempt.settle_failure(&error).await?;
+                    }
                     self.route_state.record_current_failure(&reason);
                     return Err(TransportError::Fatal(reason));
                 }
                 Err(TransportError::Retryable(reason)) => {
+                    let action = match provider_attempt.as_ref() {
+                        Some(attempt) => {
+                            attempt
+                                .settle_failure(&TransportError::Retryable(reason.clone()))
+                                .await?
+                        }
+                        None => ProviderFailureAction::RetrySafe,
+                    };
+                    if action == ProviderFailureAction::DurableWaiting {
+                        return Err(TransportError::Retryable(
+                            "PROVIDER_RECOVERY_WAITING: provider overloaded".into(),
+                        ));
+                    }
                     if self.turn_output_started.load(Ordering::SeqCst)
                         || self.turn_side_effect_started.load(Ordering::SeqCst)
                     {
@@ -1046,6 +1551,9 @@ impl ModelTransport for RoutedDesktopModelTransport {
             };
             match transport.complete(messages, tools, opts).await {
                 Ok(mut response) => {
+                    if let Some(attempt) = provider_attempt.as_ref() {
+                        attempt.commit_response(&response).await?;
+                    }
                     self.route_state.mark_current_success();
                     response.effective_route = Some(effective_route(&route));
                     if let Some(first) = transitions.first() {
@@ -1073,10 +1581,26 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     return Ok(response);
                 }
                 Err(error @ TransportError::Fatal(_)) => {
+                    if let Some(attempt) = provider_attempt.as_ref() {
+                        let _ = attempt.settle_failure(&error).await?;
+                    }
                     self.route_state.record_current_failure(&error.to_string());
                     return Err(error);
                 }
                 Err(TransportError::Retryable(reason)) => {
+                    let action = match provider_attempt.as_ref() {
+                        Some(attempt) => {
+                            attempt
+                                .settle_failure(&TransportError::Retryable(reason.clone()))
+                                .await?
+                        }
+                        None => ProviderFailureAction::RetrySafe,
+                    };
+                    if action == ProviderFailureAction::DurableWaiting {
+                        return Err(TransportError::Retryable(
+                            "PROVIDER_RECOVERY_WAITING: provider overloaded".into(),
+                        ));
+                    }
                     // A provider can fail after yielding visible SSE. Replaying
                     // on another model would mix answers and can duplicate tool
                     // intent, so fail visibly without switching.
@@ -1232,6 +1756,12 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
+
+    fn unused_provider_db() -> SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_lazy("sqlite::memory:")
+            .expect("lazy sqlite pool")
+    }
 
     // ── chat_messages_to_anthropic golden pins (keystone slice 4.7 step 4) ──
     // The Anthropic representation switch is fully pinned HERE, before it is
@@ -1504,6 +2034,7 @@ mod tests {
             cancel: None,
             max_output_tokens: None,
             retry_response_body: crate::http_util::RetryResponseBody::Include,
+            provider_attempt: None,
         }
     }
 
@@ -1622,6 +2153,80 @@ mod tests {
         (base_url, hits)
     }
 
+    async fn durable_foreground_fixture(
+        suffix: &str,
+    ) -> (SqlitePool, crate::agent::objective::ObjectiveSnapshot) {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
+        };
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, model_policy TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let session_id = format!("durable-{suffix}-session");
+        let root_turn_id = format!("durable-{suffix}-root");
+        let objective_id = format!("durable-{suffix}-objective");
+        let binding_id = format!("durable-{suffix}-binding");
+        let run_id = format!("durable-{suffix}-run");
+        sqlx::query("INSERT INTO sessions(id, model_policy) VALUES (?, 'fixed')")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let objective = ObjectiveStore::new(pool.clone())
+            .create(CreateObjective {
+                id: objective_id,
+                kind: ObjectiveKind::Informational,
+                session_id: Some(session_id.clone()),
+                root_turn_id: Some(root_turn_id.clone()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES (?, ?, 'chat', 'chat_root_turn', ?, 1, ?, ?, ?, ?)",
+        )
+        .bind(&binding_id)
+        .bind(&objective.id)
+        .bind(&root_turn_id)
+        .bind(format!("sha256:{suffix}-binding"))
+        .bind(&root_turn_id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, 'active', 'test-process', ?, ?)",
+        )
+        .bind(run_id)
+        .bind(session_id)
+        .bind(root_turn_id)
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        (pool, objective)
+    }
+
     #[tokio::test]
     async fn routed_transport_visits_each_candidate_until_the_third_succeeds() {
         const DOWN: (&str, &str, &str) = (
@@ -1655,6 +2260,11 @@ mod tests {
             cancel: None,
             turn_output_started: Arc::new(AtomicBool::new(false)),
             turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            db: unused_provider_db(),
+            root_turn_id: None,
+            mutation_permit: None,
+            anonymous: false,
+            durable_provider_required: false,
         };
 
         let response = transport
@@ -1719,6 +2329,11 @@ mod tests {
             cancel: None,
             turn_output_started: Arc::new(AtomicBool::new(false)),
             turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            db: unused_provider_db(),
+            root_turn_id: None,
+            mutation_permit: None,
+            anonymous: false,
+            durable_provider_required: false,
         };
         let tools = vec![ToolDefinition {
             r#type: "function".into(),
@@ -1741,6 +2356,246 @@ mod tests {
             transport.route_state.current().endpoint_name,
             "partial-primary"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_provider_overload_stops_after_three_receipted_posts() {
+        const DOWN: (&str, &str, &str) = (
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":{"message":"Service Unavailable","code":"overloaded"}}"#,
+        );
+        let (pool, objective) = durable_foreground_fixture("overload").await;
+        let (base_url, hits) = serve_responses(vec![DOWN, DOWN, DOWN]);
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: objective.session_id.clone().unwrap(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                    "durable-overload-provider",
+                    "durable-overload-model",
+                    base_url,
+                )),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+
+        for attempt in 1..=3 {
+            let error = transport
+                .complete(&[], &[], &RoundOptions::default())
+                .await
+                .expect_err("overload must remain system-owned");
+            if attempt == 3 {
+                assert!(error.to_string().contains("PROVIDER_RECOVERY_WAITING"));
+                assert!(
+                    codefactory_agent_loop::context::is_provider_overloaded(&error.to_string()),
+                    "the routed transport must preserve overload classification so the outer loop receipts its third terminal attempt"
+                );
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_route_attempts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(matches!(
+            ProviderRecoveryStore::new(pool.clone())
+                .observe(&objective.id)
+                .await
+                .unwrap(),
+            super::super::provider_recovery::ProviderRecoveryDisposition::DurableWaiting { .. }
+        ));
+
+        transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect_err("waiting episode cannot issue a fourth POST");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn durable_partial_sse_restart_is_checkpointed_and_never_posts_again() {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
+        };
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, model_policy TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions(id, model_policy) VALUES ('durable-partial-session', 'fixed')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let objective_store = ObjectiveStore::new(pool.clone());
+        let objective = objective_store
+            .create(CreateObjective {
+                id: "durable-partial-objective".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("durable-partial-session".into()),
+                root_turn_id: Some("durable-partial-root".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('durable-partial-binding', ?, 'chat', 'chat_root_turn', ?, 1,
+                     'sha256:durable-partial-binding', ?, ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance, created_at, updated_at)
+             VALUES ('durable-partial-run', ?, ?, ?, 1, 'active', 'old-process', ?, ?)",
+        )
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (partial_url, partial_hits) = serve_truncated_chunked_sse();
+        let route = openai_candidate("durable-provider", "durable-model", partial_url);
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "durable-partial-session".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(route),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: Some("durable-partial-root".into()),
+            mutation_permit: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+        let tools = vec![ToolDefinition {
+            r#type: "function".into(),
+            function: codefactory_agent_loop::types::FunctionDefinition {
+                name: "noop".into(),
+                description: "test".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }];
+        transport
+            .complete(&[], &tools, &RoundOptions::default())
+            .await
+            .expect_err("truncated durable stream must wait for observation");
+        assert_eq!(partial_hits.load(Ordering::SeqCst), 1);
+        let checkpoint: (String, String) =
+            sqlx::query_as("SELECT state, content FROM provider_output_checkpoints LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(checkpoint, ("partial".into(), "partial".into()));
+
+        sqlx::query(
+            "UPDATE chat_run_controls SET status='completed', settled_at=?, updated_at=?
+             WHERE run_instance_id='durable-partial-run'",
+        )
+        .bind(now + 10)
+        .bind(now + 10)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            super::super::objective_supervisor::reconcile_provider_recovery_on_startup(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        let claim = objective_store
+            .claim_due_remediations("durable-partial-owner", 1, 60_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mutation_permit = codefactory_agent_loop::tool::MutationPermit {
+            objective_id: claim.objective.id.clone(),
+            remediation_id: claim.remediation_id,
+            owner: "durable-partial-owner".into(),
+            claim_epoch: claim.claim_epoch,
+            binding_id: claim.binding_id,
+            resource_generation: claim.resource_generation,
+        };
+        let (must_not_post_url, must_not_post_hits) = serve_responses(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"duplicate\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let resumed = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "durable-partial-session".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                    "durable-provider",
+                    "durable-model",
+                    must_not_post_url,
+                )),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            db: pool,
+            root_turn_id: Some("durable-partial-root".into()),
+            mutation_permit: Some(mutation_permit),
+            anonymous: false,
+            durable_provider_required: true,
+        };
+        resumed
+            .complete(&[], &tools, &RoundOptions::default())
+            .await
+            .expect_err("partial output may not be replayed after restart");
+        assert_eq!(must_not_post_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1784,6 +2639,11 @@ mod tests {
             cancel: None,
             turn_output_started: Arc::new(AtomicBool::new(false)),
             turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            db: unused_provider_db(),
+            root_turn_id: None,
+            mutation_permit: None,
+            anonymous: false,
+            durable_provider_required: false,
         };
 
         transport
@@ -1837,6 +2697,11 @@ mod tests {
             cancel: None,
             turn_output_started: Arc::new(AtomicBool::new(false)),
             turn_side_effect_started: Arc::new(AtomicBool::new(true)),
+            db: unused_provider_db(),
+            root_turn_id: None,
+            mutation_permit: None,
+            anonymous: false,
+            durable_provider_required: false,
         };
 
         let error = transport

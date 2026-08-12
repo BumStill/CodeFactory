@@ -54,7 +54,7 @@ function seedPending() {
     runtime: {
       A: {
         ...freshRuntime(),
-        pendingPermission: { toolCallId: "tc1", toolName: "write_file", args: {} },
+        pendingPermission: { intentId: "intent-tc1", toolCallId: "tc1", toolName: "write_file", args: {} },
       },
     },
   });
@@ -88,14 +88,14 @@ describe("respondPermission — session permission mode", () => {
     expect(useChatStore.getState().activeSession?.permission_mode).toBe("trusted");
     expect(invokeMock.mock.calls.some((c) => c[0] === "save_settings")).toBe(false);
     const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
-    expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
+    expect(respondCall![1]).toEqual({ intentId: "intent-tc1", allow: true });
   });
 
   it("allow-once never touches settings", async () => {
     await useChatStore.getState().respondPermission(true);
     expect(invokeMock.mock.calls.some((c) => c[0] === "save_settings")).toBe(false);
     const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
-    expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
+    expect(respondCall![1]).toEqual({ intentId: "intent-tc1", allow: true });
   });
 
   it("falls back to allow-once (not silently) when persisting trusted mode fails", async () => {
@@ -109,7 +109,7 @@ describe("respondPermission — session permission mode", () => {
 
     expect(consoleError).toHaveBeenCalled();
     const respondCall = invokeMock.mock.calls.find((c) => c[0] === "respond_to_permission");
-    expect(respondCall![1]).toEqual({ toolCallId: "tc1", allow: true });
+    expect(respondCall![1]).toEqual({ intentId: "intent-tc1", allow: true });
     consoleError.mockRestore();
   });
 });

@@ -196,6 +196,10 @@ where
         // desktop's token-based elision — that is what keeps scores comparable.
         context_compression: true,
         overload_backoff: false,
+        overload_retry_delays: [
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(40),
+        ],
         inspection_budget: true,
         replay_rejected_draft: true,
         tool_heartbeat_interval: None,

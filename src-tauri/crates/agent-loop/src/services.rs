@@ -160,6 +160,28 @@ pub struct CompactionOutcome {
     pub tokens_freed: u32,
 }
 
+/// One compaction pass measured against the exact prompt envelope before and
+/// after the pluggable compactor. `reported_compacted` is retained for audit;
+/// only [`Self::shrank`] authorizes another provider request.
+#[derive(Debug)]
+pub struct MeasuredCompactionOutcome {
+    pub messages: Vec<crate::types::ChatMessage>,
+    pub reported_compacted: bool,
+    pub elided_count: usize,
+    pub before_tokens: u32,
+    pub after_tokens: u32,
+}
+
+impl MeasuredCompactionOutcome {
+    pub fn shrank(&self) -> bool {
+        self.after_tokens < self.before_tokens
+    }
+
+    pub fn tokens_freed(&self) -> u32 {
+        self.before_tokens.saturating_sub(self.after_tokens)
+    }
+}
+
 /// How a surface keeps the prompt inside its context budget (keystone slice
 /// 4.8c). Called before EVERY model request, and it OWNS the history — the
 /// desktop elides oversized messages by token estimate
@@ -175,6 +197,37 @@ pub trait ContextCompactor: Send + Sync {
         context_limit: u32,
         tool_definitions: &[crate::types::ToolDefinition],
     ) -> CompactionOutcome;
+}
+
+/// Run one pluggable compactor and independently measure the exact provider
+/// prompt envelope. This is the safety boundary for reactive overflow retry:
+/// a custom surface cannot cause a duplicate request merely by returning
+/// `compacted=true` with unchanged messages.
+pub fn compact_with_measurement(
+    compactor: &dyn ContextCompactor,
+    messages: Vec<crate::types::ChatMessage>,
+    system_prompt: &str,
+    context_limit: u32,
+    tool_definitions: &[crate::types::ToolDefinition],
+) -> MeasuredCompactionOutcome {
+    let before_tokens = crate::context::estimate_prompt_tokens_with_tools(
+        &messages,
+        system_prompt,
+        tool_definitions,
+    );
+    let outcome = compactor.compact(messages, system_prompt, context_limit, tool_definitions);
+    let after_tokens = crate::context::estimate_prompt_tokens_with_tools(
+        &outcome.messages,
+        system_prompt,
+        tool_definitions,
+    );
+    MeasuredCompactionOutcome {
+        messages: outcome.messages,
+        reported_compacted: outcome.compacted,
+        elided_count: outcome.elided_count,
+        before_tokens,
+        after_tokens,
+    }
 }
 
 /// The desktop compactor: today's `compress_if_needed` + the OpenAI tool-call

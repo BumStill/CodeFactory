@@ -7,6 +7,7 @@
 
 use std::{future::Future, time::Duration};
 
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tauri::AppHandle;
 
@@ -21,12 +22,20 @@ const UNHANDLED_REOBSERVE_MS: i64 = 15_000;
 enum AdapterExecutor {
     Chat,
     Task,
+    Permission,
+    Provider,
+    Auth,
+    Update,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterCapability {
     ChatResume,
     TaskResume,
+    PermissionResume,
+    ProviderResume,
+    AuthResume,
+    UpdateResume,
     /// The domain is deliberately registered, but its domain-specific
     /// observer/reconciler has not yet proved a safe mutation path. Keeping a
     /// distinct capability is what prevents an identity-shaped Chat fallback.
@@ -92,6 +101,55 @@ impl ObjectiveDomainAdapter for RegisteredDomainAdapter {
             }
             AdapterCapability::TaskResume => {
                 DomainObservation::IdentityIncomplete("task_identity_incomplete")
+            }
+            AdapterCapability::PermissionResume
+                if claim.objective.session_id.is_some()
+                    && (claim.objective.root_turn_id.is_some()
+                        || claim.objective.task_id.is_some())
+                    && claim.binding_id.is_some()
+                    && claim.resource_generation.is_some() =>
+            {
+                DomainObservation::Ready(AdapterExecutor::Permission)
+            }
+            AdapterCapability::PermissionResume => {
+                DomainObservation::IdentityIncomplete("permission_identity_incomplete")
+            }
+            AdapterCapability::ProviderResume
+                if claim.objective.session_id.is_some()
+                    && claim.objective.root_turn_id.is_some()
+                    && claim.binding_id.is_some()
+                    && claim.resource_generation.is_some() =>
+            {
+                DomainObservation::Ready(AdapterExecutor::Provider)
+            }
+            AdapterCapability::ProviderResume => {
+                DomainObservation::IdentityIncomplete("provider_identity_incomplete")
+            }
+            AdapterCapability::AuthResume
+                if claim.objective.session_id.is_some()
+                    && claim.objective.root_turn_id.is_some()
+                    && claim.objective.request_key.is_some()
+                    && claim.binding_id.is_some()
+                    && claim.resource_generation.is_some() =>
+            {
+                DomainObservation::Ready(AdapterExecutor::Auth)
+            }
+            AdapterCapability::AuthResume => {
+                DomainObservation::IdentityIncomplete("auth_identity_incomplete")
+            }
+            AdapterCapability::UpdateResume
+                if claim.binding_id.is_some()
+                    && claim.resource_generation.is_some()
+                    && claim
+                        .objective
+                        .resume_cursor
+                        .as_deref()
+                        .is_some_and(|cursor| !cursor.trim().is_empty()) =>
+            {
+                DomainObservation::Ready(AdapterExecutor::Update)
+            }
+            AdapterCapability::UpdateResume => {
+                DomainObservation::IdentityIncomplete("update_identity_incomplete")
             }
             AdapterCapability::ObserveOnly => DomainObservation::CapabilityUnavailable,
         }
@@ -174,7 +232,7 @@ static DOMAIN_ADAPTERS: [RegisteredDomainAdapter; 12] = [
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Permission,
-        capability: AdapterCapability::ObserveOnly,
+        capability: AdapterCapability::PermissionResume,
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Task,
@@ -182,11 +240,11 @@ static DOMAIN_ADAPTERS: [RegisteredDomainAdapter; 12] = [
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Provider,
-        capability: AdapterCapability::ObserveOnly,
+        capability: AdapterCapability::ProviderResume,
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Auth,
-        capability: AdapterCapability::ObserveOnly,
+        capability: AdapterCapability::AuthResume,
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Browser,
@@ -206,11 +264,68 @@ static DOMAIN_ADAPTERS: [RegisteredDomainAdapter; 12] = [
     },
     RegisteredDomainAdapter {
         domain: RecoveryDomain::Update,
-        capability: AdapterCapability::ObserveOnly,
+        capability: AdapterCapability::UpdateResume,
     },
 ];
 
 static DEFAULT_ADAPTER_REGISTRY: AdapterRegistry<'static> = AdapterRegistry::new(&DOMAIN_ADAPTERS);
+
+pub(crate) async fn reconcile_provider_recovery_on_startup(
+    pool: &SqlitePool,
+) -> anyhow::Result<usize> {
+    use super::objective::{DecisionRouter, ObjectiveStatus, RouteSignal};
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let candidates = super::provider_recovery::ProviderRecoveryStore::new(pool.clone())
+        .startup_recovery_candidates(now)
+        .await?;
+    let store = ObjectiveStore::new(pool.clone());
+    let mut reconciled = 0;
+    for candidate in candidates {
+        let Some(current) = store.get(&candidate.objective_id).await? else {
+            continue;
+        };
+        if current.revision != candidate.objective_revision
+            || current.status != ObjectiveStatus::Active
+        {
+            continue;
+        }
+        let signature = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                format!(
+                    "provider-startup\0{}\0{}\0{}",
+                    candidate.objective_id, candidate.objective_revision, candidate.failure_code
+                )
+                .as_bytes()
+            )
+        );
+        let decision = DecisionRouter::route(
+            &current,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Provider,
+                failure_code: candidate.failure_code,
+                failure_signature: signature,
+                next_observation_at: candidate.next_observation_at,
+                resume_cursor: Some(candidate.root_turn_id),
+            },
+        )?;
+        match store.apply_decision(current.revision, decision).await {
+            Ok(_) => reconciled += 1,
+            Err(error) if error.to_string().contains("revision") => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(reconciled)
+}
+
+/// Single source of truth for health/release gates. A registered ObserveOnly
+/// placeholder is intentionally not an executable recovery capability.
+pub(crate) fn domain_has_executable_adapter(domain: RecoveryDomain) -> bool {
+    DEFAULT_ADAPTER_REGISTRY
+        .adapter_for(domain)
+        .is_ok_and(|adapter| adapter.capability != AdapterCapability::ObserveOnly)
+}
 
 fn mutation_permit(
     claim: &ClaimedRemediation,
@@ -350,6 +465,7 @@ where
 
 async fn process_claim(
     app: AppHandle,
+    pool: SqlitePool,
     store: ObjectiveStore,
     owner: String,
     claim: ClaimedRemediation,
@@ -381,6 +497,43 @@ async fn process_claim(
                             }
                             AdapterExecutor::Task => {
                                 crate::commands::tasks::resume_task_objective(
+                                    app,
+                                    objective,
+                                    execution_permit,
+                                )
+                                .await
+                            }
+                            AdapterExecutor::Permission => {
+                                crate::commands::chat::reconcile_permission_objective(
+                                    app,
+                                    pool,
+                                    objective,
+                                    execution_permit,
+                                )
+                                .await
+                            }
+                            AdapterExecutor::Provider => {
+                                require_provider_resume_evidence(&pool, &objective.id, false)
+                                    .await?;
+                                crate::commands::chat::resume_chat_objective(
+                                    app,
+                                    objective,
+                                    execution_permit,
+                                )
+                                .await
+                            }
+                            AdapterExecutor::Auth => {
+                                require_provider_resume_evidence(&pool, &objective.id, true)
+                                    .await?;
+                                crate::commands::chat::resume_chat_objective(
+                                    app,
+                                    objective,
+                                    execution_permit,
+                                )
+                                .await
+                            }
+                            AdapterExecutor::Update => {
+                                super::update_recovery::resume_update_objective(
                                     app,
                                     objective,
                                     execution_permit,
@@ -425,6 +578,47 @@ async fn process_claim(
     }
 }
 
+/// Domain-specific read-only reconciliation. Only durable evidence that no
+/// unresolved provider side effect/output can be replayed reaches the Chat
+/// executor. Auth additionally requires a current-revision capability receipt;
+/// neither path treats an identity-shaped Objective as sufficient proof.
+async fn require_provider_resume_evidence(
+    pool: &SqlitePool,
+    objective_id: &str,
+    require_auth_receipt: bool,
+) -> Result<(), crate::errors::AppError> {
+    if require_auth_receipt {
+        match super::auth_recovery::AuthRecoveryStore::new(pool.clone())
+            .observe(objective_id)
+            .await
+            .map_err(|error| {
+                crate::errors::AppError::Other(format!("auth recovery observation failed: {error}"))
+            })? {
+            super::auth_recovery::AuthRecoveryDisposition::QueueProvider { .. } => {}
+            disposition => {
+                return Err(crate::errors::AppError::Other(format!(
+                    "auth recovery remains observe-only: {disposition:?}"
+                )));
+            }
+        }
+    }
+
+    let disposition = super::provider_recovery::ProviderRecoveryStore::new(pool.clone())
+        .observe(objective_id)
+        .await
+        .map_err(|error| {
+            crate::errors::AppError::Other(format!("provider recovery observation failed: {error}"))
+        })?;
+    match disposition {
+        super::provider_recovery::ProviderRecoveryDisposition::ReadyToAttempt { .. }
+        | super::provider_recovery::ProviderRecoveryDisposition::ObserveOnlyPrepared { .. }
+        | super::provider_recovery::ProviderRecoveryDisposition::RetrySafe { .. } => Ok(()),
+        other => Err(crate::errors::AppError::Other(format!(
+            "provider recovery remains observe-only: {other:?}"
+        ))),
+    }
+}
+
 /// Claim one bounded batch and hand each exact claim to the caller. Keeping
 /// the polling boundary injectable lets restart/fault tests observe the real
 /// SQLite CAS without constructing a Tauri application or sleeping a loop.
@@ -458,14 +652,47 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             tracing::error!(%error, "objective supervisor adapter registry is invalid");
             return;
         }
-        let store = ObjectiveStore::new(pool);
+        // This runs exactly once per backend process, before any Update claim
+        // is admitted. A crash-left `install_started` receipt can therefore be
+        // classified against the newly-installed exact version+build without
+        // mistaking a live same-process installer for a replay opportunity.
+        match crate::commands::update_safety::current_app_identity(&app) {
+            Ok((current_version, current_build)) => {
+                match crate::commands::update_safety::observe_latest_update_install(
+                    &pool,
+                    &current_version,
+                    &current_build,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                {
+                    Ok(Some(receipt)) => tracing::info!(
+                        receipt_id = %receipt.id,
+                        state = ?receipt.state,
+                        "startup: reconciled updater write-ahead receipt before recovery admission"
+                    ),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "startup: updater receipt observation deferred"
+                    ),
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "startup: exact installed build identity unavailable; Update remains fenced"
+            ),
+        }
+        let store = ObjectiveStore::new(pool.clone());
         loop {
             let claim_app = app.clone();
+            let claim_pool = pool.clone();
             let claim_store = store.clone();
             let claim_owner = owner.clone();
             if let Err(error) = poll_once(&store, &owner, 8, LEASE_MS, move |claim| {
                 tauri::async_runtime::spawn(process_claim(
                     claim_app.clone(),
+                    claim_pool.clone(),
                     claim_store.clone(),
                     claim_owner.clone(),
                     claim,
@@ -588,6 +815,276 @@ mod tests {
     }
 
     #[test]
+    fn provider_and_auth_are_executable_only_through_domain_specific_reconcilers() {
+        assert!(domain_has_executable_adapter(RecoveryDomain::Provider));
+        assert!(domain_has_executable_adapter(RecoveryDomain::Auth));
+        assert_ne!(
+            DEFAULT_ADAPTER_REGISTRY
+                .adapter_for(RecoveryDomain::Provider)
+                .unwrap()
+                .capability,
+            AdapterCapability::ChatResume,
+            "provider recovery must not be an identity-shaped Chat fallback",
+        );
+        assert_ne!(
+            DEFAULT_ADAPTER_REGISTRY
+                .adapter_for(RecoveryDomain::Auth)
+                .unwrap()
+                .capability,
+            AdapterCapability::ChatResume,
+            "auth recovery must require a current capability receipt",
+        );
+    }
+
+    #[test]
+    fn update_is_executable_only_through_its_exact_target_reconciler() {
+        assert!(domain_has_executable_adapter(RecoveryDomain::Update));
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-update-adapter",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Update,
+            "installed_exact_update",
+        );
+        objective.resume_cursor = Some(crate::commands::update_safety::update_target_resource_id(
+            "1.80.0",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ));
+        let mut claim = claim_for(RecoveryDomain::Update, objective);
+        claim.binding_id = Some("binding-update-adapter".into());
+        claim.resource_generation = Some(1);
+        let adapter = DEFAULT_ADAPTER_REGISTRY
+            .adapter_for(RecoveryDomain::Update)
+            .unwrap();
+        assert_eq!(
+            adapter.reconcile(adapter.observe(&claim)),
+            ReconciledPlan {
+                action: ReconciledAction::Execute(AdapterExecutor::Update)
+            }
+        );
+    }
+
+    #[test]
+    fn permission_is_executable_only_through_opaque_bound_reconciler() {
+        assert!(domain_has_executable_adapter(RecoveryDomain::Permission));
+        let mut objective = ObjectiveSnapshot::new(
+            "6afc1ef3-48f6-4b2e-9650-6c66de11d16e",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Permission,
+            "validated_change",
+        );
+        objective.session_id = Some("session-permission-adapter".into());
+        objective.root_turn_id = Some("turn-permission-adapter".into());
+        let adapter = DEFAULT_ADAPTER_REGISTRY
+            .adapter_for(RecoveryDomain::Permission)
+            .unwrap();
+
+        let incomplete = claim_for(RecoveryDomain::Permission, objective.clone());
+        assert_eq!(
+            adapter.reconcile(adapter.observe(&incomplete)),
+            ReconciledPlan {
+                action: ReconciledAction::ReobserveOnly("permission_identity_incomplete")
+            }
+        );
+        let mut complete = incomplete;
+        complete.binding_id = Some("binding-permission-adapter".into());
+        complete.resource_generation = Some(1);
+        assert_eq!(
+            adapter.reconcile(adapter.observe(&complete)),
+            ReconciledPlan {
+                action: ReconciledAction::Execute(AdapterExecutor::Permission)
+            }
+        );
+        assert_ne!(
+            adapter.capability,
+            AdapterCapability::ChatResume,
+            "Permission recovery must inspect a durable exact intent before Chat/Task resume",
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_permission_claim_auto_reaches_exact_action_once_through_registry() {
+        use crate::agent::permission_intent::{
+            PermissionClaimAction, PermissionIntentRequest, PermissionIntentStatus,
+            PermissionIntentStore, PermissionPromptResponse, PermissionScope,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "7d3be932-1a8b-4654-8ead-84d19f2d0b68".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-permission-auto-resume".into()),
+                root_turn_id: Some("turn-permission-auto-resume".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "permission-supervisor-test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let binding_id = "binding-permission-auto-resume";
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, created_at, updated_at)
+             VALUES (?, ?, 'chat', 'chat_root_turn', ?, 1,
+                     'sha256:permission-auto-resume', ?, ?)",
+        )
+        .bind(binding_id)
+        .bind(&objective.id)
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let permission_store = PermissionIntentStore::new(pool.clone());
+        let interrupted = permission_store
+            .create_pending(
+                &PermissionIntentRequest {
+                    scope: PermissionScope {
+                        objective_id: objective.id.clone(),
+                        objective_revision: objective.revision,
+                        binding_id: binding_id.into(),
+                        resource_generation: 1,
+                    },
+                    session_id: objective.session_id.clone().unwrap(),
+                    provider_tool_call_id: "provider-permission-auto-resume".into(),
+                    tool_name: "browser_session".into(),
+                    args: serde_json::json!({"action":"click","selector":"#publish"}),
+                    bash_command: None,
+                    expires_at: now + 60_000,
+                    created_process_instance: "prior-process".into(),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        permission_store
+            .record_interruption(
+                &interrupted.prompt_key(),
+                PermissionIntentStatus::ChannelClosed,
+                now + 1,
+            )
+            .await
+            .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Permission,
+                failure_code: "permission_channel_closed".into(),
+                failure_signature: "sha256:permission-auto-resume".into(),
+                next_observation_at: now,
+                resume_cursor: objective.root_turn_id.clone(),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        let prompt_claim = store
+            .claim_due_remediations("permission-prompt-owner", 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let prompt_permit = mutation_permit(&prompt_claim, "permission-prompt-owner");
+        let projected = match permission_store
+            .observe_claimed_recovery(&prompt_permit, "current-process", now + 60_000, now + 2)
+            .await
+            .unwrap()
+        {
+            PermissionClaimAction::ProjectPrompt(observation) => observation,
+            other => panic!("expected prompt projection, got {other:?}"),
+        };
+        permission_store
+            .settle_projected_response(
+                &projected.snapshot.intent_id,
+                PermissionPromptResponse::Allow,
+                now + 3,
+            )
+            .await
+            .unwrap();
+        let authorized_claim = store
+            .claim_due_remediations("permission-action-owner", 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(authorized_claim.objective.id, objective.id);
+        let permit = mutation_permit(&authorized_claim, "permission-action-owner");
+        let adapter = DEFAULT_ADAPTER_REGISTRY
+            .adapter_for(RecoveryDomain::Permission)
+            .unwrap();
+        let mutation_count = Arc::new(AtomicUsize::new(0));
+        let observed_mutations = mutation_count.clone();
+        let observed_store = permission_store.clone();
+        let observed_permit = permit.clone();
+        let observed_action = projected.snapshot.action_signature.clone();
+        let observed_objective = authorized_claim.objective.clone();
+
+        drive_adapter(
+            adapter,
+            &store,
+            &authorized_claim,
+            &permit,
+            move |executor| async move {
+                assert_eq!(executor, AdapterExecutor::Permission);
+                assert_eq!(
+                    observed_store
+                        .observe_claimed_recovery(
+                            &observed_permit,
+                            "current-process",
+                            now + 60_000,
+                            now + 4,
+                        )
+                        .await
+                        .unwrap(),
+                    PermissionClaimAction::ResumeAuthorizedAction
+                );
+                let scope = PermissionScope {
+                    objective_id: observed_objective.id,
+                    objective_revision: observed_objective.revision,
+                    binding_id: observed_permit.binding_id.clone().unwrap(),
+                    resource_generation: observed_permit.resource_generation.unwrap(),
+                };
+                if observed_store
+                    .reserve_exact_recovery_allow(
+                        &scope,
+                        &observed_action,
+                        &observed_permit,
+                        now + 5,
+                    )
+                    .await
+                    .unwrap()
+                {
+                    observed_mutations.fetch_add(1, Ordering::SeqCst);
+                }
+                assert!(!observed_store
+                    .reserve_exact_recovery_allow(
+                        &scope,
+                        &observed_action,
+                        &observed_permit,
+                        now + 6,
+                    )
+                    .await
+                    .unwrap());
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(mutation_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn missing_or_duplicate_domain_registration_fails_closed() {
         let missing_update = AdapterRegistry::new(&DOMAIN_ADAPTERS[..11]);
         assert!(missing_update.validate().unwrap_err().contains("update"));
@@ -615,13 +1112,15 @@ mod tests {
         );
         objective.session_id = Some("session-provider".into());
         objective.root_turn_id = Some("turn-provider".into());
-        let claim = claim_for(RecoveryDomain::Provider, objective);
+        let mut claim = claim_for(RecoveryDomain::Provider, objective);
+        claim.binding_id = Some("binding-provider".into());
+        claim.resource_generation = Some(1);
         let adapter = DEFAULT_ADAPTER_REGISTRY.adapter_for(claim.domain).unwrap();
         assert_eq!(adapter.domain(), RecoveryDomain::Provider);
-        assert_eq!(adapter.capability, AdapterCapability::ObserveOnly);
+        assert_eq!(adapter.capability, AdapterCapability::ProviderResume);
         assert_eq!(
             adapter.reconcile(adapter.observe(&claim)).action,
-            ReconciledAction::ReobserveOnly("domain_adapter_capability_unavailable")
+            ReconciledAction::Execute(AdapterExecutor::Provider)
         );
     }
 
@@ -744,7 +1243,7 @@ mod tests {
                 kind: ObjectiveKind::LocalMutation,
                 session_id: Some("session-provider-observe-only".into()),
                 root_turn_id: Some("turn-provider-observe-only".into()),
-                domain: RecoveryDomain::Provider,
+                domain: RecoveryDomain::Context,
                 requested_acceptance: "validated_change".into(),
                 created_surface: "test".into(),
             })
@@ -753,7 +1252,7 @@ mod tests {
         let waiting = DecisionRouter::route(
             &objective,
             RouteSignal::TechnicalFailure {
-                domain: RecoveryDomain::Provider,
+                domain: RecoveryDomain::Context,
                 failure_code: "provider_unavailable".into(),
                 failure_signature: "sha256:provider-observe-only".into(),
                 next_observation_at: chrono::Utc::now().timestamp_millis() - 1,
@@ -773,7 +1272,7 @@ mod tests {
             .unwrap();
         let permit = mutation_permit(&claim, "provider-owner");
         let adapter = DEFAULT_ADAPTER_REGISTRY
-            .adapter_for(RecoveryDomain::Provider)
+            .adapter_for(RecoveryDomain::Context)
             .unwrap();
         let execute_count = Arc::new(AtomicUsize::new(0));
         let attempt_count = execute_count.clone();
@@ -885,6 +1384,303 @@ mod tests {
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].domain, RecoveryDomain::Chat);
         assert!(scheduled[0].claim_epoch > prior_claim.claim_epoch);
+    }
+
+    #[tokio::test]
+    async fn startup_partial_provider_attempt_is_routed_before_generic_chat_resume() {
+        use crate::agent::provider_recovery::{
+            ProviderAttemptSpec, ProviderEpisodeSpec, ProviderOwnerPermit, ProviderRecoveryStore,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-provider-startup-partial".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("session-provider-startup-partial".into()),
+                root_turn_id: Some("turn-provider-startup-partial".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('binding-provider-startup-partial', ?, 'chat', 'chat_root_turn', ?,
+                     1, 'sha256:provider-startup-partial', ?, ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance, created_at, updated_at)
+             VALUES ('run-provider-startup-partial', ?, ?, ?, 1, 'active',
+                     'prior-process', ?, ?)",
+        )
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let permit = ProviderOwnerPermit::chat_run(
+            &objective.id,
+            1,
+            "binding-provider-startup-partial",
+            1,
+            "run-provider-startup-partial",
+            1,
+        );
+        let provider = ProviderRecoveryStore::new(pool.clone());
+        provider
+            .open_episode(
+                &permit,
+                &ProviderEpisodeSpec {
+                    id: "episode-provider-startup-partial".into(),
+                    session_id: objective.session_id.clone().unwrap(),
+                    root_turn_id: objective.root_turn_id.clone().unwrap(),
+                    policy: "fixed".into(),
+                    candidate_snapshot_digest:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .into(),
+                    candidate_snapshot_json: r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
+                    resume_cursor: objective.root_turn_id.clone().unwrap(),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        provider
+            .begin_attempt(
+                &permit,
+                &ProviderAttemptSpec {
+                    id: "attempt-provider-startup-partial".into(),
+                    episode_id: "episode-provider-startup-partial".into(),
+                    endpoint: "test".into(),
+                    model: "test-model".into(),
+                    request_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .into(),
+                    resume_cursor: objective.root_turn_id.clone().unwrap(),
+                },
+                now + 1,
+            )
+            .await
+            .unwrap();
+        provider
+            .mark_in_flight(&permit, "attempt-provider-startup-partial", now + 2)
+            .await
+            .unwrap();
+        provider
+            .append_partial_output(
+                &permit,
+                "attempt-provider-startup-partial",
+                "visible fragment",
+                now + 3,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE chat_run_controls SET status='completed', settled_at=?, updated_at=?
+             WHERE run_instance_id='run-provider-startup-partial'",
+        )
+        .bind(now + 4)
+        .bind(now + 4)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reconcile_provider_recovery_on_startup(&pool).await.unwrap(),
+            1
+        );
+        let current = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(current.domain, RecoveryDomain::Provider);
+        assert_eq!(
+            current.failure_code.as_deref(),
+            Some("provider_partial_output_unresolved")
+        );
+        assert!(
+            require_provider_resume_evidence(&pool, &objective.id, false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ObserveOnlyPartial")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_receipt_and_replay_safe_provider_attempt_unlock_same_objective() {
+        use crate::agent::auth_recovery::{AuthCapabilityProbe, AuthObservationSource};
+        use crate::agent::provider_recovery::{
+            ProviderAttemptSpec, ProviderEpisodeSpec, ProviderOwnerPermit, ProviderRecoveryStore,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-auth-provider-resume".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("session-auth-provider-resume".into()),
+                root_turn_id: Some("turn-auth-provider-resume".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('binding-auth-provider-resume', ?, 'chat', 'chat_root_turn', ?, 1,
+                     'sha256:auth-provider-resume', ?, ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance, created_at, updated_at)
+             VALUES ('run-auth-provider-resume', ?, ?, ?, 1, 'active',
+                     'test-process', ?, ?)",
+        )
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let permit = ProviderOwnerPermit::chat_run(
+            &objective.id,
+            1,
+            "binding-auth-provider-resume",
+            1,
+            "run-auth-provider-resume",
+            1,
+        );
+        let provider = ProviderRecoveryStore::new(pool.clone());
+        provider
+            .open_episode(
+                &permit,
+                &ProviderEpisodeSpec {
+                    id: "episode-auth-provider-resume".into(),
+                    session_id: objective.session_id.clone().unwrap(),
+                    root_turn_id: objective.root_turn_id.clone().unwrap(),
+                    policy: "fixed".into(),
+                    candidate_snapshot_digest:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .into(),
+                    candidate_snapshot_json: r#"[{"endpoint":"chatgpt","model":"gpt-test"}]"#
+                        .into(),
+                    resume_cursor: objective.root_turn_id.clone().unwrap(),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        provider
+            .begin_attempt(
+                &permit,
+                &ProviderAttemptSpec {
+                    id: "attempt-auth-provider-resume".into(),
+                    episode_id: "episode-auth-provider-resume".into(),
+                    endpoint: "chatgpt".into(),
+                    model: "gpt-test".into(),
+                    request_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .into(),
+                    resume_cursor: objective.root_turn_id.clone().unwrap(),
+                },
+                now + 1,
+            )
+            .await
+            .unwrap();
+        provider
+            .record_failure(
+                &permit,
+                "attempt-auth-provider-resume",
+                "provider_auth",
+                "provider_auth_unavailable",
+                true,
+                now + 2,
+            )
+            .await
+            .unwrap();
+        let authorization = DecisionRouter::route(
+            &objective,
+            RouteSignal::AuthorizationRequired {
+                domain: RecoveryDomain::Auth,
+                request_key: format!("chatgpt-auth:{}", objective.id),
+                action_signature: format!("oauth:chatgpt:resume:{}", objective.id),
+                resume_cursor: objective.root_turn_id.clone(),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, authorization)
+            .await
+            .unwrap();
+        let observed = crate::codex_auth::observe_chatgpt_auth_capability(
+            &pool,
+            AuthObservationSource::Callback,
+            AuthCapabilityProbe::Ready {
+                identity_material: b"secret-never-persisted",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(observed.queued_objectives, 1);
+        assert_eq!(observed.receipts_recorded, 1);
+        let current = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(current.domain, RecoveryDomain::Auth);
+        require_provider_resume_evidence(&pool, &objective.id, true)
+            .await
+            .unwrap();
+        let serialized: String = sqlx::query_scalar(
+            "SELECT group_concat(capability_digest || request_key || credential_ref, '|')
+             FROM auth_capability_receipts",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!serialized.contains("secret-never-persisted"));
     }
 
     #[tokio::test]

@@ -337,6 +337,17 @@ impl ActiveRouteState {
         inner.candidates[inner.current_index].clone()
     }
 
+    /// Secret-free, immutable route identity used by the provider write-ahead
+    /// ledger. Credential refs, inline API keys, and base URLs are excluded.
+    pub fn candidate_identity_snapshot(&self) -> Vec<(String, String)> {
+        let inner = self.inner.lock().expect("active route mutex poisoned");
+        inner
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.endpoint_name.clone(), candidate.model_id.clone()))
+            .collect()
+    }
+
     pub fn take_initial_route_change(&self) -> Option<RouteChange> {
         self.inner
             .lock()

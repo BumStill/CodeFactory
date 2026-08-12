@@ -301,6 +301,7 @@ describe("ControlPlanePage", () => {
         return {
           generated_at_ms: 100_000_000,
           window_start_ms: 13_600_000,
+          build_git_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           availability: "available",
           unavailable_reason: null,
           metrics: {
@@ -308,9 +309,16 @@ describe("ControlPlanePage", () => {
             system_owned: 5,
             typed_user_attention: 2,
             technical_user_handoff_violations: 3,
+            technical_user_handoff_violations_24h: 2,
+            avoidable_user_reprompts_24h: 1,
             overdue_ownerless_remediations: 1,
+            stalled_system_owned_objectives: 2,
+            unavailable_domain_adapter_objectives: 4,
             invalid_completions: 2,
+            invalid_completions_24h: 1,
             duplicate_committed_side_effect_receipts: 1,
+            duplicate_committed_side_effect_receipts_24h: 1,
+            requested_ceiling_downgrades_24h: 1,
             recovery_decisions: 9,
             recovered_objectives: 8,
             recovery_latency_p50_ms: 1200,
@@ -345,7 +353,12 @@ describe("ControlPlanePage", () => {
     render(<ControlPlanePage onBack={vi.fn()} />);
 
     expect(await screen.findByText("Objective Continuity")).toBeInTheDocument();
-    expect(screen.getByText("Available")).toBeInTheDocument();
+    expect(screen.getByTestId("objective-release-gate")).toHaveAttribute(
+      "data-status",
+      "blocked",
+    );
+    expect(screen.getByText("24h non-interruption gate blocked")).toBeInTheDocument();
+    expect(screen.getByText(/Build aaaaaaaaaaaa/)).toBeInTheDocument();
     expect(screen.getByTestId("objective-open")).toHaveTextContent("7");
     expect(screen.getByTestId("objective-system-owned")).toHaveTextContent("5");
     expect(screen.getByTestId("objective-typed-attention")).toHaveTextContent("2");
@@ -357,6 +370,16 @@ describe("ControlPlanePage", () => {
       "data-severity",
       "risk",
     );
+    expect(screen.getByTestId("objective-stalled-system-owned")).toHaveTextContent("2");
+    expect(screen.getByTestId("objective-stalled-system-owned")).toHaveAttribute(
+      "data-severity",
+      "risk",
+    );
+    expect(screen.getByTestId("objective-unavailable-adapters")).toHaveTextContent("4");
+    expect(screen.getByTestId("objective-unavailable-adapters")).toHaveAttribute(
+      "data-severity",
+      "risk",
+    );
     expect(screen.getByTestId("objective-invalid-completions")).toHaveAttribute(
       "data-severity",
       "risk",
@@ -365,10 +388,83 @@ describe("ControlPlanePage", () => {
       "data-severity",
       "risk",
     );
+    expect(screen.getByTestId("objective-24h-technical-handoffs")).toHaveTextContent("2");
+    expect(screen.getByTestId("objective-24h-avoidable-reprompts")).toHaveTextContent("1");
+    expect(screen.getByTestId("objective-24h-duplicate-receipts")).toHaveTextContent("1");
+    expect(screen.getByTestId("objective-24h-ceiling-downgrades")).toHaveTextContent("1");
     expect(screen.getByText("3 / 4")).toBeInTheDocument();
     expect(screen.getByText("0.9s")).toBeInTheDocument();
     expect(screen.getByText("2.4s")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /retry|continue|重试|继续/i })).not.toBeInTheDocument();
+  });
+
+  it("blocks an identified zero-violation build until its full production window is observed", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_objective_health") {
+        return {
+          generated_at_ms: 100_000_000,
+          window_start_ms: 13_600_000,
+          build_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          build_observation_started_at_ms: 99_000_000,
+          production_window_covered: false,
+          availability: "available",
+          unavailable_reason: null,
+          metrics: {
+            open: 0,
+            system_owned: 0,
+            typed_user_attention: 0,
+            technical_user_handoff_violations: 0,
+            technical_user_handoff_violations_24h: 0,
+            avoidable_user_reprompts_24h: 0,
+            overdue_ownerless_remediations: 0,
+            stalled_system_owned_objectives: 0,
+            unavailable_domain_adapter_objectives: 0,
+            invalid_completions: 0,
+            invalid_completions_24h: 0,
+            duplicate_committed_side_effect_receipts: 0,
+            duplicate_committed_side_effect_receipts_24h: 0,
+            requested_ceiling_downgrades_24h: 0,
+            recovery_decisions: 0,
+            recovered_objectives: 0,
+            recovery_latency_p50_ms: null,
+            recovery_latency_p95_ms: null,
+            recovery_decisions_24h: 0,
+            recovered_objectives_24h: 0,
+            recovery_latency_p50_ms_24h: null,
+            recovery_latency_p95_ms_24h: null,
+          },
+        };
+      }
+      return {
+        generated_at: "2026-07-10T02:00:00Z",
+        cwd: "/Users/leo/Projects/CodeFactory",
+        authority: [],
+        memory: { pending: 0, accepted: 0, rejected: 0, preference_pending: 0, latest_pending: [] },
+        capabilities: [],
+        delivery: {
+          git_branch: "main",
+          is_dirty: false,
+          dirty_count: 0,
+          sync_gate_present: true,
+          sync_gate_configured: true,
+          release_workflow_present: true,
+          auto_release_present: true,
+          latest_release_tag: null,
+        },
+        risks: [],
+      };
+    });
+
+    render(<ControlPlanePage onBack={vi.fn()} />);
+
+    expect(await screen.findByText("Objective Continuity")).toBeInTheDocument();
+    expect(screen.getByTestId("objective-release-gate")).toHaveAttribute(
+      "data-status",
+      "blocked",
+    );
+    expect(screen.getByText("24h non-interruption gate blocked")).toBeInTheDocument();
+    expect(screen.getByText(/production observation window incomplete/i)).toBeInTheDocument();
+    expect(screen.getByText(/Build bbbbbbbbbbbb/)).toBeInTheDocument();
   });
 
   it("shows Objective health as unavailable without rendering missing metrics as zero", async () => {
@@ -377,6 +473,7 @@ describe("ControlPlanePage", () => {
         return {
           generated_at_ms: 100_000_000,
           window_start_ms: 13_600_000,
+          build_git_sha: null,
           availability: "unavailable",
           unavailable_reason: "objective health unavailable: missing required schema: objectives",
           metrics: null,
