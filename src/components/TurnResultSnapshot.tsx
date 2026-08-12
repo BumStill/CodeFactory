@@ -195,11 +195,11 @@ export function TurnResultSnapshot({
     >
       <div className="flex flex-wrap items-center gap-2 px-3 py-2.5">
         <StatusIcon size={15} aria-hidden="true" className={status.iconClass} />
-        <span className="text-[13px] font-semibold text-gray-200">{status.label}</span>
-        <span className="rounded-md bg-surface-3 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-gray-400">
+        <span className="text-note font-semibold text-gray-200">{status.label}</span>
+        <span className="rounded-md bg-surface-3 px-1.5 py-0.5 text-caption font-medium tabular-nums text-gray-400">
           {progress.completed}/{progress.total}
         </span>
-        <span className="text-[11px] text-gray-500">
+        <span className="text-caption text-gray-500">
           {evidence.operationCount} 项操作
           {durationMs != null ? ` · ${formatDuration(durationMs)}` : ""}
         </span>
@@ -217,7 +217,7 @@ export function TurnResultSnapshot({
                 setResultOpen((value) => !value);
               }
             }}
-            className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
+            className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-note text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
           >
             查看证据
             {onOpenEvidence
@@ -230,7 +230,7 @@ export function TurnResultSnapshot({
               aria-label="执行过程"
               aria-expanded={processExpanded}
               onClick={onToggleProcess}
-              className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
+              className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-note text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
             >
               <ListTree size={12} aria-hidden="true" />
               执行过程
@@ -241,7 +241,7 @@ export function TurnResultSnapshot({
             aria-label="结果摘要"
             aria-expanded={summaryOpen}
             onClick={() => setSummaryOpen((value) => !value)}
-            className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-[13px] text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
+            className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-note text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
           >
             <RefreshCw size={12} aria-hidden="true" />
             结果摘要
@@ -250,20 +250,20 @@ export function TurnResultSnapshot({
       </div>
 
       {attentionDetail && (
-        <p role="status" className="border-t border-border/50 bg-status-warning-soft px-3 py-2 text-[13px] leading-5 text-status-warning">
+        <p role="status" className="border-t border-border/50 bg-status-warning-soft px-3 py-2 text-note leading-5 text-status-warning">
           当前边界 · {attentionDetail}
         </p>
       )}
 
       {resultOpen && (
-        <div className="grid gap-3 border-t border-border/50 px-3 py-2.5 text-[13px] sm:grid-cols-2">
+        <div className="grid gap-3 border-t border-border/50 px-3 py-2.5 text-note sm:grid-cols-2">
           <div>
             <p className="mb-1 flex items-center gap-1 text-gray-400">
               <FileCode2 size={12} aria-hidden="true" />
               修改文件
             </p>
             {evidence.changedFiles.length > 0 ? (
-              <ul className="space-y-0.5 font-mono text-[12px] text-gray-300">
+              <ul className="space-y-0.5 font-mono text-label text-gray-300">
                 {evidence.changedFiles.map((path) => <li key={path} className="truncate">{path}</li>)}
               </ul>
             ) : <p className="text-gray-600">没有文件修改证据</p>}
@@ -274,7 +274,7 @@ export function TurnResultSnapshot({
               验证
             </p>
             {evidence.verificationCommands.length > 0 ? (
-              <ul className="space-y-0.5 font-mono text-[12px] text-gray-300">
+              <ul className="space-y-0.5 font-mono text-label text-gray-300">
                 {evidence.verificationCommands.map((command) => <li key={command} className="truncate">{command}</li>)}
               </ul>
             ) : <p className="text-gray-600">没有验证命令证据</p>}
@@ -303,13 +303,13 @@ export function TurnResultSnapshot({
             </p>
           </div>
           {evidence.truncated && (
-            <p className="text-[11px] text-gray-600 sm:col-span-2">仅显示前 {MAX_EVIDENCE_ITEMS} 项；完整证据仍在执行过程。</p>
+            <p className="text-caption text-gray-600 sm:col-span-2">仅显示前 {MAX_EVIDENCE_ITEMS} 项；完整证据仍在执行过程。</p>
           )}
         </div>
       )}
 
       {summaryOpen && (
-        <p role="status" className="border-t border-border/50 px-3 py-2 text-[13px] leading-5 text-gray-300">
+        <p role="status" className="border-t border-border/50 px-3 py-2 text-note leading-5 text-gray-300">
           {summary}
         </p>
       )}

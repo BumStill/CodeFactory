@@ -360,7 +360,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                 setValue(command.argumentHint ? `/${command.name} ` : command.usage);
                 ref.current?.focus();
               }}
-              className="grid w-full grid-cols-[7rem_minmax(0,1fr)] gap-3 px-3 py-2 text-left text-xs hover:bg-surface-3"
+              className="grid w-full grid-cols-[7rem_minmax(0,1fr)] gap-3 px-3 py-2 text-left text-label hover:bg-surface-3"
             >
               <span className="font-mono text-accent">{command.usage}</span>
               <span className="truncate text-gray-500">{command.description}</span>
@@ -384,7 +384,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                   thumbnailClassName="block h-20 w-28 rounded-lg bg-surface-2 object-cover transition-opacity hover:opacity-90"
                   title={a.path}
                 />
-                <figcaption className="mt-1 flex max-w-28 items-center gap-1 text-[11px] text-gray-400">
+                <figcaption className="mt-1 flex max-w-28 items-center gap-1 text-caption text-gray-400">
                   <span className="truncate">{a.name}</span>
                   <span className="shrink-0 text-gray-600">{(a.sizeBytes / 1024).toFixed(0)}KB</span>
                 </figcaption>
@@ -401,12 +401,12 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             ) : (
               <span
                 key={a.id}
-                className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-border bg-surface-3 px-2.5 text-[13px] text-gray-300"
+                className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-border bg-surface-3 px-2.5 text-note text-gray-300"
                 title={a.path}
               >
                 <Paperclip size={10} className="text-accent" />
                 <span className="max-w-[160px] truncate">{a.name}</span>
-                <span className="text-[11px] text-gray-600">
+                <span className="text-caption text-gray-600">
                   {(a.sizeBytes / 1024).toFixed(0)}KB
                 </span>
                 <button
@@ -422,12 +422,12 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
             )
           ))}
           {uploading && (
-            <span className="inline-flex items-center gap-1 text-[13px] text-gray-500">
+            <span className="inline-flex items-center gap-1 text-note text-gray-500">
               <Loader2 size={10} className="animate-spin motion-reduce:animate-none" /> 保存中…
             </span>
           )}
           {attachError && (
-            <span className="text-[13px] text-status-danger">{attachError}</span>
+            <span className="text-note text-status-danger">{attachError}</span>
           )}
         </div>
       )}
@@ -481,7 +481,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
               ? "选择项目，或输入 /cwd <path>"
               : "描述任务或继续对话…"
           }
-          className="min-h-8 max-h-[200px] flex-1 resize-none bg-transparent py-1 text-[15px] leading-6 text-gray-200 outline-none placeholder:text-gray-600 disabled:opacity-40"
+          className="min-h-8 max-h-[200px] flex-1 resize-none bg-transparent py-1 text-reading leading-6 text-gray-200 outline-none placeholder:text-gray-600 disabled:opacity-40"
         />
         {/* Two buttons during streaming: queue-send (default, primary)
             and cancel-stream (secondary, square icon). Outside streaming
@@ -521,7 +521,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
           )}
         </button>
       </div>
-      <div className="mt-1 flex min-h-4 items-center gap-2 text-[11px] text-gray-600 select-none">
+      <div className="mt-1 flex min-h-4 items-center gap-2 text-caption text-gray-600 select-none">
         {streaming && (
           <span>停止后续生成不会撤销已经完成的修改、提交或推送</span>
         )}

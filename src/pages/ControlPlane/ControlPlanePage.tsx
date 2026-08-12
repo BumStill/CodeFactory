@@ -111,7 +111,7 @@ function StatusBadge({ status }: { status: Status }) {
       ? "border-red-500/30 bg-red-500/10 text-red-800 dark:text-red-300"
       : "border-amber-500/30 bg-amber-500/10 text-amber-800 dark:text-amber-300";
   return (
-    <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium ${tone}`}>
+    <span className={`inline-flex items-center rounded border px-1.5 py-0.5 text-caption font-medium ${tone}`}>
       {label}
     </span>
   );
@@ -126,7 +126,7 @@ function Section({
 }) {
   return (
     <section className="border-t border-border py-4">
-      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-500">{title}</h2>
+      <h2 className="mb-3 text-label font-semibold uppercase tracking-wider text-gray-500">{title}</h2>
       {children}
     </section>
   );
@@ -138,12 +138,12 @@ function AuthorityGrid({ items }: { items: ControlPlaneItem[] }) {
       {items.map((item) => (
         <div key={item.id} className="rounded border border-border bg-surface-1 p-3">
           <div className="mb-1 flex items-center justify-between gap-2">
-            <div className="min-w-0 text-sm font-medium text-gray-200">{item.label}</div>
+            <div className="min-w-0 text-body font-medium text-gray-200">{item.label}</div>
             <StatusBadge status={item.status} />
           </div>
-          <p className="text-xs leading-relaxed text-gray-500">{item.detail}</p>
+          <p className="text-label leading-relaxed text-gray-500">{item.detail}</p>
           {item.path && (
-            <p className="mt-2 truncate font-mono text-[10px] text-gray-700" title={item.path}>
+            <p className="mt-2 truncate font-mono text-caption text-gray-700" title={item.path}>
               {item.path}
             </p>
           )}
@@ -159,14 +159,14 @@ function CapabilityGrid({ items }: { items: CapabilitySummary[] }) {
       {items.map((item) => (
         <div key={item.id} className="rounded border border-border bg-surface-1 p-3">
           <div className="mb-2 flex items-center justify-between gap-2">
-            <div className="truncate text-xs font-medium text-gray-300">{item.label}</div>
+            <div className="truncate text-label font-medium text-gray-300">{item.label}</div>
             <StatusBadge status={item.status} />
           </div>
-          <div className="text-xl font-semibold text-gray-100">
+          <div className="text-heading font-semibold text-gray-100">
             {item.enabled}
-            <span className="text-xs font-normal text-gray-600"> / {item.total}</span>
+            <span className="text-label font-normal text-gray-600"> / {item.total}</span>
           </div>
-          <p className="mt-2 text-[10px] leading-relaxed text-gray-600">{item.detail}</p>
+          <p className="mt-2 text-caption leading-relaxed text-gray-600">{item.detail}</p>
         </div>
       ))}
     </div>
@@ -256,8 +256,8 @@ function DeliveryPanel({ delivery }: { delivery: DeliverySummary }) {
     <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
       {rows.map(([label, value]) => (
         <div key={label} className="rounded border border-border bg-surface-1 p-3">
-          <div className="text-[10px] uppercase tracking-wider text-gray-600">{label}</div>
-          <div className="mt-1 truncate text-sm font-medium text-gray-200">{value}</div>
+          <div className="text-caption uppercase tracking-wider text-gray-600">{label}</div>
+          <div className="mt-1 truncate text-body font-medium text-gray-200">{value}</div>
         </div>
       ))}
     </div>
@@ -275,16 +275,16 @@ function MemoryPanel({ memory }: { memory: MemoryProposalSummary }) {
           <Metric label="Rejected" value={memory.rejected} />
           <Metric label="Preference" value={memory.preference_pending} />
         </div>
-        <p className="mt-3 text-[10px] text-gray-600">{total} lifecycle item(s) in this project scope.</p>
+        <p className="mt-3 text-caption text-gray-600">{total} lifecycle item(s) in this project scope.</p>
       </div>
       <div className="rounded border border-border bg-surface-1 p-3">
-        <div className="mb-2 text-xs font-medium text-gray-400">Latest pending proposals</div>
+        <div className="mb-2 text-label font-medium text-gray-400">Latest pending proposals</div>
         {memory.latest_pending.length === 0 ? (
-          <p className="text-xs text-gray-600">No pending memory proposals.</p>
+          <p className="text-label text-gray-600">No pending memory proposals.</p>
         ) : (
           <ul className="space-y-2">
             {memory.latest_pending.map((item, index) => (
-              <li key={`${index}-${item}`} className="line-clamp-2 text-xs leading-relaxed text-gray-400">
+              <li key={`${index}-${item}`} className="line-clamp-2 text-label leading-relaxed text-gray-400">
                 {item}
               </li>
             ))}
@@ -298,8 +298,8 @@ function MemoryPanel({ memory }: { memory: MemoryProposalSummary }) {
 function Metric({ label, value }: { label: string; value: number }) {
   return (
     <div>
-      <div className="text-[10px] uppercase tracking-wider text-gray-600">{label}</div>
-      <div className="text-lg font-semibold text-gray-100">{value}</div>
+      <div className="text-caption uppercase tracking-wider text-gray-600">{label}</div>
+      <div className="text-heading font-semibold text-gray-100">{value}</div>
     </div>
   );
 }
@@ -307,7 +307,7 @@ function Metric({ label, value }: { label: string; value: number }) {
 function RiskList({ risks }: { risks: ControlPlaneRisk[] }) {
   if (risks.length === 0) {
     return (
-      <div className="flex items-center gap-2 rounded border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300">
+      <div className="flex items-center gap-2 rounded border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-label text-emerald-800 dark:text-emerald-300">
         <CircleCheck size={14} />
         No control-plane risks detected in this snapshot.
       </div>
@@ -319,8 +319,8 @@ function RiskList({ risks }: { risks: ControlPlaneRisk[] }) {
         <div key={risk.id} className="flex items-start gap-2 rounded border border-amber-500/20 bg-amber-500/5 px-3 py-2">
           <AlertTriangle size={14} className="mt-0.5 flex-shrink-0 text-amber-700 dark:text-amber-300" />
           <div className="min-w-0">
-            <div className="text-xs font-medium text-amber-800 dark:text-amber-200">{risk.id}</div>
-            <div className="text-xs leading-relaxed text-gray-400">{risk.message}</div>
+            <div className="text-label font-medium text-amber-800 dark:text-amber-200">{risk.id}</div>
+            <div className="text-label leading-relaxed text-gray-400">{risk.message}</div>
           </div>
         </div>
       ))}
@@ -378,8 +378,8 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
           </button>
           <ShieldCheck size={17} className="text-accent" />
           <div className="min-w-0">
-            <h1 className="text-sm font-semibold text-gray-100">AI Coding OS</h1>
-            <p className="truncate text-[10px] text-gray-600">
+            <h1 className="text-body font-semibold text-gray-100">AI Coding OS</h1>
+            <p className="truncate text-caption text-gray-600">
               {snapshot?.cwd ?? "未绑定项目上下文"}
             </p>
           </div>
@@ -387,7 +387,7 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
         <button
           onClick={load}
           disabled={loading}
-          className="inline-flex items-center gap-1.5 rounded border border-border px-2 py-1 text-xs text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 disabled:opacity-50"
+          className="inline-flex items-center gap-1.5 rounded border border-border px-2 py-1 text-label text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 disabled:opacity-50"
         >
           {loading ? <CircleDashed size={13} className="animate-spin" /> : <RefreshCcw size={13} />}
           刷新
@@ -397,18 +397,18 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
       <main className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-6xl px-6 py-5">
           {error && (
-              <div className="mb-4 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-800 dark:text-red-200">
+              <div className="mb-4 rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-label text-red-800 dark:text-red-200">
               {error}
             </div>
           )}
 
           {!snapshot ? (
-            <div className="flex h-64 items-center justify-center text-sm text-gray-600">
+            <div className="flex h-64 items-center justify-center text-body text-gray-600">
               {loading ? "加载控制面…" : "暂无控制面快照"}
             </div>
           ) : (
             <>
-              <div className="mb-4 flex flex-wrap items-center gap-3 text-xs text-gray-500">
+              <div className="mb-4 flex flex-wrap items-center gap-3 text-label text-gray-500">
                 <span className="inline-flex items-center gap-1">
                   <GitBranch size={13} />
                   {gitContextLabel(snapshot.delivery)}

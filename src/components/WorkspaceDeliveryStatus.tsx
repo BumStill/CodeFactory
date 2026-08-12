@@ -238,7 +238,7 @@ export function WorkspaceDeliveryStatus({
           if (onOpenDetails) onOpenDetails();
           else setLocalOpen(true);
         }}
-        className={`inline-flex h-11 max-w-[210px] shrink items-center gap-1.5 overflow-hidden rounded-lg border px-2 text-[12px] transition-colors hover:brightness-95 lg:h-9 ${tone}`}
+        className={`inline-flex h-11 max-w-[210px] shrink items-center gap-1.5 overflow-hidden rounded-lg border px-2 text-label transition-colors hover:brightness-95 lg:h-9 ${tone}`}
         title="查看本会话对应的 PR/MR、CI、合并、发布与线上验证状态"
       >
         <GitPullRequest size={12} className="shrink-0" />
@@ -287,8 +287,8 @@ function DeliveryDetailsView({ snapshot, unavailable, closeButtonRef, onClose, e
       <header className="flex items-start gap-3 border-b border-border px-4 py-3">
         <GitPullRequest size={16} className="mt-0.5 text-accent" />
         <div className="min-w-0 flex-1">
-          <h2 className="text-sm font-semibold text-gray-100">交付详情</h2>
-          <p className="mt-0.5 text-[12px] leading-5 text-gray-600">状态来自会话关联的 PR/MR、CI、正式发布与线上验证；未验证 live 时不会标记为上线。</p>
+          <h2 className="text-body font-semibold text-gray-100">交付详情</h2>
+          <p className="mt-0.5 text-label leading-5 text-gray-600">状态来自会话关联的 PR/MR、CI、正式发布与线上验证；未验证 live 时不会标记为上线。</p>
         </div>
         <button data-auxiliary-initial-focus={embedded ? true : undefined} ref={closeButtonRef} aria-label="关闭交付详情" onClick={onClose} className="flex h-11 w-11 items-center justify-center rounded text-gray-600 hover:bg-surface-3 hover:text-gray-200 lg:h-9 lg:w-9"><X size={14} /></button>
       </header>
@@ -302,8 +302,8 @@ function DeliveryDetailsView({ snapshot, unavailable, closeButtonRef, onClose, e
             <section className="rounded-lg border border-border bg-surface-2 p-3">
               <div className="flex items-start gap-2">
                 <div className="min-w-0 flex-1">
-                  <div className="text-[13px] font-semibold text-gray-200">PR #{pr.number} · {pr.title}</div>
-                  <div className="mt-1 truncate font-mono text-[12px] text-gray-500">{pr.head_branch} → {pr.base_branch}</div>
+                  <div className="text-note font-semibold text-gray-200">PR #{pr.number} · {pr.title}</div>
+                  <div className="mt-1 truncate font-mono text-label text-gray-500">{pr.head_branch} → {pr.base_branch}</div>
                 </div>
                 <a href={pr.url} target="_blank" rel="noreferrer" aria-label={`打开 PR #${pr.number}`} className="rounded p-1 text-gray-600 hover:bg-surface-3 hover:text-gray-200"><ExternalLink size={13} /></a>
               </div>
@@ -321,7 +321,7 @@ function DeliveryDetailsView({ snapshot, unavailable, closeButtonRef, onClose, e
               <DeliveryStep icon={<Rocket size={14} />} label="正式发布" value={snapshot?.release ? `${snapshot.release.tag} 已创建` : "尚未创建包含此合并的正式版本"} tone={snapshot?.release ? "success" : "neutral"} />
               <DeliveryStep icon={<Globe2 size={14} />} label="线上验证" value={snapshot?.release ? "未验证上线" : "等待正式发布"} tone={snapshot?.release ? "warning" : "neutral"} />
             </ol>
-            <p className="text-[12px] leading-5 text-gray-600">CI 绑定上方 PR/MR 的 head SHA；正式发布只表示 release artifact 可见，真实上线还需要 deliver_changes 的部署观察或 live verifier 通过。</p>
+            <p className="text-label leading-5 text-gray-600">CI 绑定上方 PR/MR 的 head SHA；正式发布只表示 release artifact 可见，真实上线还需要 deliver_changes 的部署观察或 live verifier 通过。</p>
           </div>
         )}
       </div>
@@ -370,7 +370,7 @@ function prStateLabel(pr: DeliveryPr): string {
 }
 
 function EmptyState({ title, detail }: { title: string; detail: string }) {
-  return <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center"><CircleDot size={18} className="mx-auto text-gray-600" /><div className="mt-2 text-[13px] font-medium text-gray-400">{title}</div><p className="mx-auto mt-1 max-w-xs text-[12px] leading-5 text-gray-600">{detail}</p></div>;
+  return <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center"><CircleDot size={18} className="mx-auto text-gray-600" /><div className="mt-2 text-note font-medium text-gray-400">{title}</div><p className="mx-auto mt-1 max-w-xs text-label leading-5 text-gray-600">{detail}</p></div>;
 }
 
 type DeliveryStepTone = "neutral" | "progress" | "success" | "warning" | "danger";
@@ -385,5 +385,5 @@ function deliveryStepToneClass(tone: DeliveryStepTone): string {
 
 function DeliveryStep({ icon, label, value, tone, detail }: { icon: React.ReactNode; label: string; value: string; tone: DeliveryStepTone; detail?: string }) {
   const toneClass = deliveryStepToneClass(tone);
-  return <li className="flex min-h-10 items-center gap-2 rounded-lg px-2.5 text-[13px] hover:bg-surface-2"><span className={toneClass}>{icon}</span><span className="w-20 text-gray-500">{label}</span><span className={tone === "neutral" ? "text-gray-500" : "text-gray-200"}>{value}</span>{detail && <span className="ml-auto font-mono text-[11px] text-gray-600">{detail}</span>}</li>;
+  return <li className="flex min-h-10 items-center gap-2 rounded-lg px-2.5 text-note hover:bg-surface-2"><span className={toneClass}>{icon}</span><span className="w-20 text-gray-500">{label}</span><span className={tone === "neutral" ? "text-gray-500" : "text-gray-200"}>{value}</span>{detail && <span className="ml-auto font-mono text-caption text-gray-600">{detail}</span>}</li>;
 }

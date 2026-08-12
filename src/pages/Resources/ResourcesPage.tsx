@@ -37,8 +37,8 @@ export function ResourcesPage({ onBack }: ResourcesPageProps) {
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <Puzzle size={16} className="text-accent" />
           <div>
-            <h1 className="text-sm font-semibold text-gray-200">资源中心</h1>
-            <p className="text-[10px] text-gray-600">统一管理 Agent 自动使用的知识库与技能</p>
+            <h1 className="text-body font-semibold text-gray-200">资源中心</h1>
+            <p className="text-caption text-gray-600">统一管理 Agent 自动使用的知识库与技能</p>
           </div>
         </div>
         <nav className="flex rounded border border-border bg-surface-2 p-0.5" aria-label="资源类型">
@@ -69,7 +69,7 @@ function TabButton({
   return (
     <button
       onClick={onClick}
-      className={`rounded px-3 py-1.5 text-xs transition-colors ${
+      className={`rounded px-3 py-1.5 text-label transition-colors ${
         active ? "bg-accent text-white" : "text-gray-500 hover:bg-surface-3 hover:text-gray-200"
       }`}
     >
@@ -139,18 +139,18 @@ function KnowledgeLibrariesPanel() {
       <div className="mx-auto max-w-5xl space-y-5 px-6 py-6">
         <section className="flex items-start justify-between gap-4">
           <div>
-            <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-200">
+            <h2 className="flex items-center gap-2 text-body font-semibold text-gray-200">
               <BookOpen size={15} className="text-accent" />
               个人知识库
             </h2>
-            <p className="mt-1 text-xs text-gray-600">
+            <p className="mt-1 text-label text-gray-600">
               启用的资料会自动供普通会话和新建自主任务检索；无需在 Session 中重复配置。
             </p>
           </div>
           <button
             onClick={() => void addLibrary()}
             disabled={adding}
-            className="inline-flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
             aria-label="添加知识库"
           >
             {adding ? <Loader2 size={12} className="animate-spin" /> : <FolderPlus size={12} />}
@@ -159,21 +159,21 @@ function KnowledgeLibrariesPanel() {
         </section>
 
         {(actionError || error) && (
-          <div className="rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+          <div className="rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-label text-red-700 dark:text-red-300">
             {actionError || error}
           </div>
         )}
 
         {loading && libraries.length === 0 ? (
-          <div className="py-16 text-center text-xs text-gray-600">加载知识库…</div>
+          <div className="py-16 text-center text-label text-gray-600">加载知识库…</div>
         ) : libraries.length === 0 ? (
           <button
             onClick={() => void addLibrary()}
             className="flex w-full flex-col items-center gap-2 rounded-lg border border-dashed border-border bg-surface-1 py-16 text-gray-600 transition-colors hover:bg-surface-2 hover:text-gray-300"
           >
             <FolderPlus size={24} />
-            <span className="text-sm">添加本地资料文件夹</span>
-            <span className="text-[11px]">支持 DOCX、PPTX 和 PDF</span>
+            <span className="text-body">添加本地资料文件夹</span>
+            <span className="text-caption">支持 DOCX、PPTX 和 PDF</span>
           </button>
         ) : (
           <ul className="grid gap-3 md:grid-cols-2">
@@ -186,8 +186,8 @@ function KnowledgeLibrariesPanel() {
                     <BookOpen size={15} className="mt-0.5 shrink-0 text-accent" />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
-                        <h3 className="truncate text-sm font-medium text-gray-200">{library.name}</h3>
-                        <span className={`rounded px-1.5 py-0.5 text-[10px] ${
+                        <h3 className="truncate text-body font-medium text-gray-200">{library.name}</h3>
+                        <span className={`rounded px-1.5 py-0.5 text-caption ${
                           library.enabled
                             ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
                             : "bg-surface-3 text-gray-600"
@@ -195,16 +195,16 @@ function KnowledgeLibrariesPanel() {
                           {library.enabled ? "已启用" : "已禁用"}
                         </span>
                       </div>
-                      <p className="mt-1 truncate font-mono text-[10px] text-gray-600" title={library.root_path}>
+                      <p className="mt-1 truncate font-mono text-caption text-gray-600" title={library.root_path}>
                         {library.root_path}
                       </p>
-                      <p className="mt-2 text-[11px] text-gray-500">
+                      <p className="mt-2 text-caption text-gray-500">
                         {summary
                           ? `${summary.indexed_documents} 文档 · ${summary.chunks_indexed} 片段 · ${summary.failed_documents} 失败`
                           : scanStatusText(library.scan_status)}
                       </p>
                       {library.last_scan_at && (
-                        <p className="mt-0.5 text-[10px] text-gray-700">
+                        <p className="mt-0.5 text-caption text-gray-700">
                           最近扫描：{new Date(library.last_scan_at).toLocaleString()}
                         </p>
                       )}
@@ -215,7 +215,7 @@ function KnowledgeLibrariesPanel() {
                       onClick={() => void run(() => scanLibrary(library.id))}
                       disabled={isScanning}
                       aria-label={`扫描知识库 ${library.name}`}
-                      className="inline-flex items-center gap-1 rounded bg-surface-3 px-2 py-1 text-[11px] text-gray-400 hover:text-gray-200 disabled:opacity-50"
+                      className="inline-flex items-center gap-1 rounded bg-surface-3 px-2 py-1 text-caption text-gray-400 hover:text-gray-200 disabled:opacity-50"
                     >
                       <RefreshCw size={10} className={isScanning ? "animate-spin" : ""} />
                       {isScanning ? "扫描中" : "重新扫描"}
@@ -223,14 +223,14 @@ function KnowledgeLibrariesPanel() {
                     <button
                       onClick={() => void run(() => setLibraryEnabled(library.id, !library.enabled))}
                       aria-label={`${library.enabled ? "禁用" : "启用"}知识库 ${library.name}`}
-                      className="rounded bg-surface-3 px-2 py-1 text-[11px] text-gray-400 hover:text-gray-200"
+                      className="rounded bg-surface-3 px-2 py-1 text-caption text-gray-400 hover:text-gray-200"
                     >
                       {library.enabled ? "禁用" : "启用"}
                     </button>
                     <button
                       onClick={() => void remove(library)}
                       aria-label={`删除知识库 ${library.name}`}
-                      className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] text-red-700 hover:bg-red-500/10 hover:text-red-500"
+                      className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-caption text-red-700 hover:bg-red-500/10 hover:text-red-500"
                     >
                       <Trash2 size={10} /> 删除
                     </button>

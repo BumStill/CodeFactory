@@ -28,7 +28,7 @@ export function DiffViewer({ output, parsed: parsedResult }: Props) {
   if (parsed.files.length === 0) return null;
 
   return (
-    <div className="space-y-2 font-mono text-[11px]">
+    <div className="space-y-2 font-mono text-caption">
       {parsed.summary && (
         <div className="whitespace-pre-wrap break-words text-gray-400">{parsed.summary}</div>
       )}
