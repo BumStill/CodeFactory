@@ -62,38 +62,38 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
   return (
     <section role="region" aria-label="今日用量与过去 4 周趋势" className="rounded-xl border border-border bg-surface-1 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 className="text-xs font-medium text-gray-300">今日用量</h2>
+        <h2 className="text-body font-medium text-gray-300">今日用量</h2>
         <button
           type="button"
           aria-label="查看用量详情"
           onClick={onOpenUsage}
-          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-accent transition-colors hover:bg-accent/10 focus:outline-none focus:ring-2 focus:ring-accent/60"
+          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption text-accent transition-colors hover:bg-accent/10 focus:outline-none focus:ring-2 focus:ring-accent/60"
         >
           查看详情<ArrowRight size={11} />
         </button>
       </div>
 
       {anonymous ? (
-        <p className="text-xs text-status-warning">匿名会话本次临时用量，不计入今日统计</p>
+        <p className="text-label text-status-warning">匿名会话本次临时用量，不计入今日统计</p>
       ) : dashboard ? (
         <div className="grid gap-4 min-[580px]:grid-cols-[minmax(150px,0.75fr)_minmax(280px,1.5fr)] min-[580px]:items-end min-[580px]:gap-6">
           <div className="min-w-0">
             <div className="flex items-baseline gap-1.5">
-              <span className="font-mono text-2xl font-semibold tracking-tight text-gray-100">{formatUsageTokens(todayTokens)}</span>
-              <span className="text-[11px] uppercase tracking-wide text-gray-400">Tokens</span>
+              <span className="font-mono text-display font-semibold tracking-tight text-gray-100">{formatUsageTokens(todayTokens)}</span>
+              <span className="text-caption text-gray-400">Token</span>
             </div>
-            <div className="mt-1 flex flex-wrap items-center gap-x-2 text-[11px] text-gray-400">
+            <div className="mt-1 flex flex-wrap items-center gap-x-2 text-caption text-gray-400">
               <span>{today?.requests ?? 0} 次请求</span>
               {costLabel && costLabel !== "费用不可用" && <><span aria-hidden>·</span><span>{costLabel}</span></>}
             </div>
             {budgetRatio != null ? (
-              <div className="mt-1 text-[11px] text-gray-400">已使用日预算 {Math.round(budgetRatio * 100)}%</div>
+              <div className="mt-1 text-caption text-gray-400">已使用日预算 {Math.round(budgetRatio * 100)}%</div>
             ) : sevenDayAverage != null ? (
-              <div className="mt-1 text-[11px] text-gray-400">近 7 个完整日均值 {formatUsageTokens(Math.round(sevenDayAverage))}</div>
+              <div className="mt-1 text-caption text-gray-400">近 7 个完整日均值 {formatUsageTokens(Math.round(sevenDayAverage))}</div>
             ) : null}
           </div>
           <div className="min-w-0">
-            <div className="mb-1.5 flex items-center justify-between text-[11px] text-gray-400">
+            <div className="mb-1.5 flex items-center justify-between text-caption text-gray-400">
               <span>过去 4 周</span>
               <span aria-hidden>较低 · 较高</span>
             </div>
@@ -105,9 +105,9 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
           </div>
         </div>
       ) : failed ? (
-        <p className="text-xs text-gray-400">用量统计暂不可用</p>
+        <p className="text-label text-gray-400">用量统计暂不可用</p>
       ) : (
-        <p className="inline-flex items-center gap-1.5 text-xs text-gray-400"><Loader2 size={11} className="animate-spin motion-reduce:animate-none" />正在读取本机用量</p>
+        <p className="inline-flex items-center gap-1.5 text-label text-gray-400"><Loader2 size={11} className="animate-spin motion-reduce:animate-none" />正在读取本机用量</p>
       )}
     </section>
   );

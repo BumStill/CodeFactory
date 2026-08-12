@@ -251,7 +251,7 @@ describe("SettingsPage Hooks and Remotes tabs", () => {
     await user.click(screen.getByRole("tab", { name: "远程仓库" }));
 
     expect(await screen.findByText(/已登录 GitHub CLI/)).toBeInTheDocument();
-    expect(screen.getByText(/无需重复配置 token/)).toBeInTheDocument();
+    expect(screen.getByText(/无需重复配置 Token/)).toBeInTheDocument();
     expect(mocks.invoke).toHaveBeenCalledWith("github_cli_credential_status");
     expect(screen.queryByText("尚未配置远程仓库。")).not.toBeInTheDocument();
   });

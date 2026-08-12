@@ -20,6 +20,13 @@ export const FONT_FAMILY_LABELS: Record<string, string> = {
 
 export const FONT_SIZE_MIN = 12;
 export const FONT_SIZE_MAX = 20;
+/**
+ * The body size the typography scale is authored against.
+ *
+ * `--font-scale` is `font_size / FONT_SIZE_BASE`, so the default setting is
+ * exactly 1 and every token renders at its authored px value.
+ */
+export const FONT_SIZE_BASE = 14;
 
 // ── Theme application ────────────────────────────────────────────────────────
 
@@ -86,7 +93,11 @@ export function applyTheme(settings: Settings) {
   // ── Apply font ──────────────────────────────────────────────────────────
   const fontStack = FONT_FAMILIES[settings.font_family] ?? FONT_FAMILIES.inter;
   html.style.setProperty("--font-family", fontStack);
-  html.style.setProperty("--font-size", `${settings.font_size}px`);
+  // Text size drives a scale factor, never the rem baseline. Writing the user's
+  // size onto `html { font-size }` used to resize spacing, radii and icon boxes
+  // along with the text, because Tailwind expresses all of them in rem — while
+  // hard-coded px sizes stayed put. Only the font-size tokens read this.
+  html.style.setProperty("--font-scale", String(settings.font_size / FONT_SIZE_BASE));
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────

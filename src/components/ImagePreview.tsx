@@ -47,7 +47,7 @@ export function ImagePreview({
           loading="lazy"
           onError={onError}
         />
-        {caption && <span className="mt-1 block text-[10px] text-gray-500">{caption}</span>}
+        {caption && <span className="mt-1 block text-caption text-gray-500">{caption}</span>}
       </button>
 
       {open && createPortal(
@@ -79,7 +79,7 @@ export function ImagePreview({
               alt={alt}
               className="max-h-[85vh] max-w-[92vw] rounded-xl border border-white/20 bg-surface-2 object-contain shadow-2xl"
             />
-            <figcaption className="max-w-[92vw] truncate rounded-full bg-black/50 px-3 py-1 text-xs text-white/80">
+            <figcaption className="max-w-[92vw] truncate rounded-full bg-black/50 px-3 py-1 text-label text-white/80">
               {caption ?? alt}
             </figcaption>
           </figure>

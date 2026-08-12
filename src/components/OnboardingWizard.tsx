@@ -57,7 +57,7 @@ export function OnboardingWizard({
       className="fixed bottom-4 right-4 z-40 w-80 rounded-lg border border-border bg-surface-1 p-3.5 shadow-xl space-y-2.5"
     >
       <div className="flex items-center justify-between">
-        <span className="text-xs font-semibold text-gray-300">快速就绪检查</span>
+        <span className="text-label font-semibold text-gray-300">快速就绪检查</span>
         <button
           type="button"
           onClick={onDone}
@@ -68,7 +68,7 @@ export function OnboardingWizard({
         </button>
       </div>
 
-      <div className="space-y-1.5 text-[12px] leading-5">
+      <div className="space-y-1.5 text-label leading-5">
         <div className="flex items-start gap-1.5">
           {modelReady ? (
             <>
@@ -104,7 +104,7 @@ export function OnboardingWizard({
               <button
                 type="button"
                 onClick={copyGhLogin}
-                className="mx-1 inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-gray-200"
+                className="mx-1 inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-caption text-gray-200"
               >
                 gh auth login
                 {copied ? <Check size={10} className="text-emerald-500" /> : <Copy size={10} />}
@@ -121,7 +121,7 @@ export function OnboardingWizard({
             onChange={(e) =>
               onCeilingChange(e.target.value as NonNullable<Settings["delivery_ceiling"]>)
             }
-            className="rounded border border-border bg-surface-2 px-1.5 py-0.5 text-[11px] text-gray-300"
+            className="rounded border border-border bg-surface-2 px-1.5 py-0.5 text-caption text-gray-300"
           >
             <option value="pr_only">开 PR 为止</option>
             <option value="through_ci_green">等 CI 通过</option>
@@ -135,14 +135,14 @@ export function OnboardingWizard({
         <button
           type="button"
           onClick={onDone}
-          className="rounded border border-border px-2.5 py-1 text-[11px] text-gray-400 hover:text-gray-200"
+          className="rounded border border-border px-2.5 py-1 text-caption text-gray-400 hover:text-gray-200"
         >
           跳过
         </button>
         <button
           type="button"
           onClick={onDone}
-          className="rounded bg-accent px-2.5 py-1 text-[11px] text-white hover:bg-accent-hover"
+          className="rounded bg-accent px-2.5 py-1 text-caption text-white hover:bg-accent-hover"
         >
           完成
         </button>

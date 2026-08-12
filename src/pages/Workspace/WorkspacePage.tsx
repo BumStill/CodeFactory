@@ -583,7 +583,7 @@ export function WorkspacePage({
           <button
             type="button"
             onClick={toggleSidebar}
-            className="flex h-11 shrink-0 items-center gap-1.5 rounded-lg px-2 text-[13px] font-medium text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:h-9"
+            className="flex h-11 shrink-0 items-center gap-1.5 rounded-lg px-2 text-note font-medium text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:h-9"
             title="展开会话侧栏"
             aria-label="展开会话侧栏"
             aria-expanded={false}
@@ -594,7 +594,7 @@ export function WorkspacePage({
           </button>
         )}
         <div className="flex-1 min-w-0">
-          <div className="flex truncate text-[13px] font-semibold text-gray-200 items-center gap-2">
+          <div className="flex truncate text-note font-semibold text-gray-200 items-center gap-2">
             {titleEditing && activeSession ? (
               <input
                 autoFocus
@@ -605,7 +605,7 @@ export function WorkspacePage({
                   if (e.key === "Escape") setTitleEditing(false);
                 }}
                 onBlur={commitTitle}
-                className="min-w-0 flex-1 rounded-md border border-accent/50 bg-surface-2 px-1.5 py-0.5 text-[13px] text-gray-100 outline-none"
+                className="min-w-0 flex-1 rounded-md border border-accent/50 bg-surface-2 px-1.5 py-0.5 text-note text-gray-100 outline-none"
               />
             ) : (
               <span
@@ -623,14 +623,14 @@ export function WorkspacePage({
             )}
             {activeDraft ? (
               <span
-                className="rounded-md bg-status-progress-soft px-1.5 py-0.5 text-[11px] font-normal text-status-progress"
+                className="rounded-md bg-status-progress-soft px-1.5 py-0.5 text-caption font-normal text-status-progress"
                 title="尚未创建记录；发送首条消息后生成"
               >
                 草稿
               </span>
             ) : activeSession?.kind === "quick" ? (
               <span
-                className="rounded-md bg-surface-3 px-1.5 py-0.5 text-[11px] font-normal text-gray-400"
+                className="rounded-md bg-surface-3 px-1.5 py-0.5 text-caption font-normal text-gray-400"
                 title="没有绑定项目的独立任务"
               >
                 独立任务
@@ -638,7 +638,7 @@ export function WorkspacePage({
             ) : null}
             {isAnonymous && (
               <span
-                className="inline-flex items-center gap-1 rounded-md bg-status-warning-soft px-1.5 py-0.5 text-[11px] font-normal text-status-warning"
+                className="inline-flex items-center gap-1 rounded-md bg-status-warning-soft px-1.5 py-0.5 text-caption font-normal text-status-warning"
                 title="匿名会话：不落库、不计费、不进记忆/画像。离开即丢弃。"
               >
                 <EyeOff size={9} />
@@ -646,7 +646,7 @@ export function WorkspacePage({
               </span>
             )}
           </div>
-          <div className="hidden truncate font-mono text-[11px] text-gray-600 lg:block">
+          <div className="hidden truncate font-mono text-caption text-gray-600 lg:block">
             {isAnonymous
               ? "无痕会话 · 不落库 · 不计费 · 不学习"
               : activeDraft
@@ -660,7 +660,7 @@ export function WorkspacePage({
               exitAnonymous();
               onNewConversation(null);
             }}
-            className="flex min-h-11 items-center gap-1 rounded-lg border border-status-warning/30 bg-status-warning-soft px-2 text-[13px] text-status-warning transition-colors hover:brightness-95 lg:min-h-9"
+            className="flex min-h-11 items-center gap-1 rounded-lg border border-status-warning/30 bg-status-warning-soft px-2 text-note text-status-warning transition-colors hover:brightness-95 lg:min-h-9"
             title="退出匿名会话并丢弃其历史"
           >
             <EyeOff size={12} />
@@ -702,7 +702,7 @@ export function WorkspacePage({
             aria-label={`打开任务活动：${taskActivitySummary.label}`}
             aria-expanded={taskActivityOpen}
             aria-controls={taskActivityOpen ? "workspace-auxiliary-pane" : undefined}
-            className={`inline-flex h-11 min-w-11 items-center justify-center gap-1 rounded-lg px-2 text-[13px] font-medium transition-colors lg:h-9 lg:min-w-9 ${
+            className={`inline-flex h-11 min-w-11 items-center justify-center gap-1 rounded-lg px-2 text-note font-medium transition-colors lg:h-9 lg:min-w-9 ${
               taskActivitySummary.tone === "danger"
                 ? "bg-status-danger-soft text-status-danger hover:brightness-95"
                 : taskActivitySummary.tone === "warning"
@@ -1134,18 +1134,18 @@ function WorkspaceAuxiliaryPane({ paneRef, kind, layout, width, maxWidth, sessio
               if (event.key === "ArrowLeft") { event.preventDefault(); selectAdjacentTab(tab.id, -1); }
               if (event.key === "ArrowRight") { event.preventDefault(); selectAdjacentTab(tab.id, 1); }
             }}
-            className={`flex min-h-11 min-w-11 max-w-44 shrink-0 items-center gap-1 rounded px-2 py-1 text-[11px] lg:min-h-9 lg:min-w-9 ${selected === tab.id ? "bg-surface-3 text-gray-200" : "text-gray-500 hover:bg-surface-2 hover:text-gray-300"}`}
+            className={`flex min-h-11 min-w-11 max-w-44 shrink-0 items-center gap-1 rounded px-2 py-1 text-caption lg:min-h-9 lg:min-w-9 ${selected === tab.id ? "bg-surface-3 text-gray-200" : "text-gray-500 hover:bg-surface-2 hover:text-gray-300"}`}
           >
             {tab.kind === "browser" ? <Globe2 size={11} /> : <FileText size={11} />}
             <span className="truncate">{tab.label}</span>
           </button>)}
         </div>
-        <button data-auxiliary-initial-focus type="button" onClick={onCollapse} aria-label="折叠辅助工作区" className="min-h-11 min-w-11 shrink-0 rounded px-2 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:min-h-9 lg:min-w-9">折叠</button>
+        <button data-auxiliary-initial-focus type="button" onClick={onCollapse} aria-label="折叠辅助工作区" className="min-h-11 min-w-11 shrink-0 rounded px-2 text-caption text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:min-h-9 lg:min-w-9">折叠</button>
       </div>}
       {tabbed ? (
         <div id={panelId} role="tabpanel" aria-labelledby={activeTabDomId} className="flex min-h-0 flex-1 flex-col">
           {activeBrowser && loadError && (
-            <div role="alert" className="flex items-center gap-2 border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-[11px] text-red-700 dark:text-red-300">
+            <div role="alert" className="flex items-center gap-2 border-b border-red-500/20 bg-red-500/10 px-3 py-2 text-caption text-red-700 dark:text-red-300">
               <span className="min-w-0 flex-1 break-words">浏览器状态读取失败：{loadError}</span>
               <button type="button" onClick={onRetryBrowserSessions} className="min-h-11 shrink-0 rounded-lg px-2 hover:bg-red-500/10 lg:min-h-9">重试</button>
             </div>
@@ -1174,7 +1174,7 @@ function TaskActivityState({ error, onRetry, onClose }: {
     <section className="flex min-h-0 flex-1 flex-col">
       <header className="flex items-center gap-3 border-b border-border px-4 py-3">
         <PanelRightOpen size={15} className="text-gray-500" aria-hidden="true" />
-        <h2 className="flex-1 text-sm font-semibold text-gray-200">任务活动</h2>
+        <h2 className="flex-1 text-body font-semibold text-gray-200">任务活动</h2>
         <button
           data-auxiliary-initial-focus
           type="button"
@@ -1186,7 +1186,7 @@ function TaskActivityState({ error, onRetry, onClose }: {
         </button>
       </header>
       {error ? (
-        <div role="alert" className="m-4 rounded-lg border border-status-danger/25 bg-status-danger-soft p-4 text-xs text-status-danger">
+        <div role="alert" className="m-4 rounded-lg border border-status-danger/25 bg-status-danger-soft p-4 text-label text-status-danger">
           <p className="break-words">任务活动读取失败：{error}</p>
           <button
             type="button"
@@ -1197,7 +1197,7 @@ function TaskActivityState({ error, onRetry, onClose }: {
           </button>
         </div>
       ) : (
-        <div role="status" className="m-4 flex items-center justify-center gap-2 rounded-lg border border-dashed border-border px-3 py-8 text-center text-xs text-gray-500">
+        <div role="status" className="m-4 flex items-center justify-center gap-2 rounded-lg border border-dashed border-border px-3 py-8 text-center text-label text-gray-500">
           <Loader2 size={14} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
           正在加载任务活动
         </div>
@@ -1302,11 +1302,11 @@ function EmbeddedBrowserPane({ sessions, width, suspended, onCloseSession }: {
       <div className="flex items-center gap-2 border-b border-border px-3 py-2">
         <Globe2 size={14} className="shrink-0 text-accent" aria-hidden="true" />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-xs font-medium text-gray-200">{host}</div>
-          <div className="truncate text-[11px] text-gray-500">{title}</div>
+          <div className="truncate text-label font-medium text-gray-200">{host}</div>
+          <div className="truncate text-caption text-gray-500">{title}</div>
         </div>
-        {sessions.length > 1 && <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-[11px] text-accent">{sessions.length}</span>}
-        <button type="button" onClick={() => onCloseSession(active.session_id)} className="min-h-11 min-w-11 rounded bg-red-500/10 px-2 text-[11px] text-red-700 hover:bg-red-500/20 dark:text-red-300 lg:min-h-9 lg:min-w-9" aria-label="结束浏览器" title="结束当前会话的受管浏览器">结束</button>
+        {sessions.length > 1 && <span className="rounded-full bg-accent/10 px-1.5 py-0.5 text-caption text-accent">{sessions.length}</span>}
+        <button type="button" onClick={() => onCloseSession(active.session_id)} className="min-h-11 min-w-11 rounded bg-red-500/10 px-2 text-caption text-red-700 hover:bg-red-500/20 dark:text-red-300 lg:min-h-9 lg:min-w-9" aria-label="结束浏览器" title="结束当前会话的受管浏览器">结束</button>
       </div>
       <div className="flex min-h-0 flex-1 flex-col bg-surface-0">
         {safeUrl ? (
@@ -1318,7 +1318,7 @@ function EmbeddedBrowserPane({ sessions, width, suspended, onCloseSession }: {
             data-codefactory-browser-session={active.session_id}
           >
             {mountError ? (
-              <div role="alert" className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white p-6 text-center text-xs text-red-700">
+              <div role="alert" className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-white p-6 text-center text-label text-red-700">
                 <div>
                   <p className="font-medium">内置浏览器打开失败</p>
                   <p className="mt-1 max-w-sm break-words text-gray-600">{mountError}</p>
@@ -1331,19 +1331,19 @@ function EmbeddedBrowserPane({ sessions, width, suspended, onCloseSession }: {
                     setMountError(null);
                     void syncNativeWebView();
                   }}
-                  className="min-h-11 rounded-lg border border-red-200 px-3 text-xs text-red-700 hover:bg-red-50 lg:min-h-9"
+                  className="min-h-11 rounded-lg border border-red-200 px-3 text-label text-red-700 hover:bg-red-50 lg:min-h-9"
                 >
                   重试
                 </button>
               </div>
             ) : (
-              <div className="absolute inset-0 flex items-center justify-center bg-white text-xs text-gray-600">
+              <div className="absolute inset-0 flex items-center justify-center bg-white text-label text-gray-600">
                 {suspended ? "权限确认期间已暂停网页交互" : `正在内置浏览器中打开 ${host}`}
               </div>
             )}
           </div>
         ) : (
-          <div className="flex flex-1 items-center justify-center p-6 text-center text-xs text-gray-500">
+          <div className="flex flex-1 items-center justify-center p-6 text-center text-label text-gray-500">
             <div>
               <ExternalLink size={18} className="mx-auto mb-2 text-gray-600" aria-hidden="true" />
               <p className="font-medium text-gray-300">受管浏览器已连接</p>
@@ -1385,19 +1385,19 @@ export function TurnEvidencePane({ evidenceId, messages, onClose }: {
       <header className="flex items-start gap-3 border-b border-border px-4 py-3">
         <CheckCircle2 size={15} className="mt-0.5 text-accent" aria-hidden="true" />
         <div className="min-w-0 flex-1">
-          <h2 className="text-sm font-semibold text-gray-100">回合证据</h2>
-          <p className="mt-0.5 text-[11px] text-gray-600">本回合实际执行的工具、验证与失败边界。</p>
+          <h2 className="text-body font-semibold text-gray-100">回合证据</h2>
+          <p className="mt-0.5 text-caption text-gray-600">本回合实际执行的工具、验证与失败边界。</p>
         </div>
         <button data-auxiliary-initial-focus type="button" onClick={onClose} aria-label="关闭回合证据" className="flex h-11 w-11 items-center justify-center rounded text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:h-9 lg:w-9"><X size={14} /></button>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
         {!message ? (
-          <p className="rounded-lg border border-dashed border-border px-3 py-8 text-center text-xs text-gray-600">该回合的证据仍保留在消息结果卡中。</p>
+          <p className="rounded-lg border border-dashed border-border px-3 py-8 text-center text-label text-gray-600">该回合的证据仍保留在消息结果卡中。</p>
         ) : (
           <div className="space-y-3">
-            {message.failureEvidence && <div className="rounded-lg border border-status-warning/25 bg-status-warning-soft p-3 text-xs leading-5 text-status-warning">{message.failureEvidence}</div>}
+            {message.failureEvidence && <div className="rounded-lg border border-status-warning/25 bg-status-warning-soft p-3 text-label leading-5 text-status-warning">{message.failureEvidence}</div>}
             {totalCallCount > calls.length && (
-              <p role="status" className="rounded-lg border border-status-info/25 bg-status-info-soft px-3 py-2 text-xs text-status-info">
+              <p role="status" className="rounded-lg border border-status-info/25 bg-status-info-soft px-3 py-2 text-label text-status-info">
                 仅显示最近 {calls.length}/{totalCallCount} 项操作
               </p>
             )}
@@ -1405,21 +1405,21 @@ export function TurnEvidencePane({ evidenceId, messages, onClose }: {
               {calls.map((call) => {
                 const input = turnEvidenceArgs(call.args);
                 return (
-                  <li key={call.id} className="flex items-start gap-2 rounded-lg border border-border/60 bg-surface-2 px-3 py-2 text-xs">
+                  <li key={call.id} className="flex items-start gap-2 rounded-lg border border-border/60 bg-surface-2 px-3 py-2 text-label">
                     {call.status === "done" && !call.isError ? <CheckCircle2 size={13} aria-hidden="true" className="mt-0.5 shrink-0 text-status-success" /> : <AlertTriangle size={13} aria-hidden="true" className="mt-0.5 shrink-0 text-status-warning" />}
                     <div className="min-w-0 flex-1 space-y-1.5">
                       <div className="font-mono text-gray-300">{call.name}</div>
-                      {input.summary && <code className="block break-all text-[11px] text-gray-500">{input.summary}</code>}
+                      {input.summary && <code className="block break-all text-caption text-gray-500">{input.summary}</code>}
                       {input.full && (
                         <details>
-                          <summary className="cursor-pointer text-[11px] text-gray-500 hover:text-gray-300">完整输入</summary>
-                          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-0 p-2 text-[11px] text-gray-500">{input.full}</pre>
+                          <summary className="cursor-pointer text-caption text-gray-500 hover:text-gray-300">完整输入</summary>
+                          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-0 p-2 text-caption text-gray-500">{input.full}</pre>
                         </details>
                       )}
                       {call.result && (
                         <details open={Boolean(call.isError)}>
-                          <summary className="cursor-pointer text-[11px] text-gray-500 hover:text-gray-300">完整输出</summary>
-                          <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-0 p-2 text-[11px] text-gray-500">{call.result}</pre>
+                          <summary className="cursor-pointer text-caption text-gray-500 hover:text-gray-300">完整输出</summary>
+                          <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-surface-0 p-2 text-caption text-gray-500">{call.result}</pre>
                         </details>
                       )}
                     </div>
@@ -1427,7 +1427,7 @@ export function TurnEvidencePane({ evidenceId, messages, onClose }: {
                 );
               })}
             </ol>
-            {calls.length === 0 && !message.failureEvidence && <p className="text-xs text-gray-600">本回合没有工具或失败证据。</p>}
+            {calls.length === 0 && !message.failureEvidence && <p className="text-label text-gray-600">本回合没有工具或失败证据。</p>}
           </div>
         )}
       </div>
@@ -1499,15 +1499,15 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onFocusPerm
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-12 shrink-0 items-center justify-between border-b border-border px-4">
         <div className="min-w-0">
-          <h2 className="text-sm font-medium text-gray-200">任务活动</h2>
-          <p className="text-[11px] text-gray-600">后台步骤、验收结果与恢复操作</p>
+          <h2 className="text-body font-medium text-gray-200">任务活动</h2>
+          <p className="text-caption text-gray-600">后台步骤、验收结果与恢复操作</p>
         </div>
         <button data-dialog-initial-focus type="button" onClick={onClose} aria-label="关闭任务活动" className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:h-9 lg:w-9">
           <X size={15} />
         </button>
       </div>
       <div className="flex shrink-0 flex-col gap-2 border-b border-border px-4 py-3">
-        <div className="flex flex-wrap items-center gap-2 text-[12px] text-gray-600">
+        <div className="flex flex-wrap items-center gap-2 text-label text-gray-600">
           <span>已完成 {completedCount}</span><span>等待调度 {pendingCount}</span>
           {runningCount > 0 && <span className="text-status-progress">执行中 {runningCount}</span>}
           {repairableFailedCount > 0 && <span className="text-status-warning">可重试 {repairableFailedCount}</span>}
@@ -1516,7 +1516,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onFocusPerm
           {conversationBlockedTasks.length > 0 && <span className="text-status-danger">需要你 {conversationBlockedTasks.length}</span>}
         </div>
         {!isRunning && pendingCount > 0 && (
-          <p className={`text-[12px] leading-5 ${failedTasks.length > 0 ? "text-status-warning" : "text-gray-500"}`}>
+          <p className={`text-label leading-5 ${failedTasks.length > 0 ? "text-status-warning" : "text-gray-500"}`}>
             {failedTasks.length > 0
               ? `先处理失败项，再继续剩余 ${pendingCount} 项。`
               : `已委派，还有 ${pendingCount} 项等待后台调度。`}
@@ -1524,29 +1524,29 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onFocusPerm
         )}
         <div className="flex flex-wrap items-center gap-1">
           {isRunning ? (
-            <button onClick={() => void handleCancel()} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-status-danger-soft px-2.5 text-[13px] text-status-danger hover:brightness-95 lg:min-h-9"><Square size={11} />停止</button>
+            <button onClick={() => void handleCancel()} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-status-danger-soft px-2.5 text-note text-status-danger hover:brightness-95 lg:min-h-9"><Square size={11} />停止</button>
           ) : pendingCount > 0 && failedTasks.length === 0 ? (
-            <span className="text-[12px] leading-5 text-gray-500">任务已委派，系统会持续调度并自动诊断恢复，无需手动重试。</span>
+            <span className="text-label leading-5 text-gray-500">任务已委派，系统会持续调度并自动诊断恢复，无需手动重试。</span>
           ) : null}
           {!isRunning && repairableFailedCount > 0 && (
-            <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-status-warning-soft px-2.5 text-[13px] text-status-warning disabled:opacity-40 lg:min-h-9" title="重试可自动修复的失败步骤">
+            <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-status-warning-soft px-2.5 text-note text-status-warning disabled:opacity-40 lg:min-h-9" title="重试可自动修复的失败步骤">
               {repairBusy ? <Loader2 size={11} className="animate-spin motion-reduce:animate-none" /> : <RefreshCw size={11} />}重试失败步骤
             </button>
           )}
           {!isRunning && providerBlockedTasks.length > 0 && (
-            <><button onClick={() => onOpenSettings("endpoints")} className="min-h-11 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95 lg:min-h-9">打开模型设置</button>
-            <button aria-label={`已修复，重试 ${providerBlockedTasks.length} 项`} title={`重试：${providerBlockedTasks.map((task) => task.title).join("、")}`} onClick={() => void handleRetryBlocked(providerBlockedTasks)} disabled={blockedRetryBusy} className="flex min-h-11 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-[13px] text-gray-300 disabled:opacity-40 lg:min-h-9"><RefreshCw size={11} />已修复，重试 {providerBlockedTasks.length} 项</button></>
+            <><button onClick={() => onOpenSettings("endpoints")} className="min-h-11 rounded-lg bg-status-progress-soft px-2.5 text-note text-status-progress hover:brightness-95 lg:min-h-9">打开模型设置</button>
+            <button aria-label={`已修复，重试 ${providerBlockedTasks.length} 项`} title={`重试：${providerBlockedTasks.map((task) => task.title).join("、")}`} onClick={() => void handleRetryBlocked(providerBlockedTasks)} disabled={blockedRetryBusy} className="flex min-h-11 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-note text-gray-300 disabled:opacity-40 lg:min-h-9"><RefreshCw size={11} />已修复，重试 {providerBlockedTasks.length} 项</button></>
           )}
           {!isRunning && permissionBlockedTasks.length > 0 && (
-            <><button onClick={onFocusPermission} className="min-h-11 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95 lg:min-h-9">调整会话权限</button>
-            <button onClick={() => void handleRetryBlocked(permissionBlockedTasks)} disabled={blockedRetryBusy} className="min-h-11 rounded-lg border border-border bg-surface-2 px-2.5 text-[13px] text-gray-300 disabled:opacity-40 lg:min-h-9">已授权，重试 {permissionBlockedTasks.length} 项</button></>
+            <><button onClick={onFocusPermission} className="min-h-11 rounded-lg bg-status-progress-soft px-2.5 text-note text-status-progress hover:brightness-95 lg:min-h-9">调整会话权限</button>
+            <button onClick={() => void handleRetryBlocked(permissionBlockedTasks)} disabled={blockedRetryBusy} className="min-h-11 rounded-lg border border-border bg-surface-2 px-2.5 text-note text-gray-300 disabled:opacity-40 lg:min-h-9">已授权，重试 {permissionBlockedTasks.length} 项</button></>
           )}
           {!isRunning && conversationBlockedTasks.length > 0 && (
-            <button onClick={() => onRequestRepair(conversationBlockedTasks[0])} className="min-h-11 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress hover:brightness-95 lg:min-h-9">回到对话处理</button>
+            <button onClick={() => onRequestRepair(conversationBlockedTasks[0])} className="min-h-11 rounded-lg bg-status-progress-soft px-2.5 text-note text-status-progress hover:brightness-95 lg:min-h-9">回到对话处理</button>
           )}
         </div>
       </div>
-      {startError && <div className="border-b border-status-danger/20 bg-status-danger-soft px-4 py-2 text-[12px] text-status-danger">{startError}</div>}
+      {startError && <div className="border-b border-status-danger/20 bg-status-danger-soft px-4 py-2 text-label text-status-danger">{startError}</div>}
       <div className="flex-1 overflow-y-auto p-3"><ul className="space-y-1">{buildTaskTree(sessionTasks).map(({ task, depth }) => <TaskRow key={task.id} task={task} depth={depth} highlighted={task.id === highlightedTaskId} />)}</ul></div>
     </div>
   );
@@ -1593,14 +1593,14 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
         />
         <div className="min-w-0 flex-1">
           <div className="flex items-start gap-1.5">
-            <span className="block flex-1 text-[13px] leading-5 text-gray-300 line-clamp-2">
+            <span className="block flex-1 text-note leading-5 text-gray-300 line-clamp-2">
               {task.title}
             </span>
             {summary && (
               <button
                 onClick={() => setVerifOpen((v) => !v)}
                 title={`验收验证：${summary.passed}/${summary.total} 通过（点击展开逐条）`}
-                className={`mt-0.5 inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] transition-colors hover:bg-surface-2 lg:min-h-9 ${
+                className={`mt-0.5 inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md px-1.5 text-caption transition-colors hover:bg-surface-2 lg:min-h-9 ${
                   summary.allPassed ? "text-status-success" : "text-status-danger"
                 }`}
               >
@@ -1611,7 +1611,7 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
           </div>
           {task.spec_title && (
             <div
-              className="mt-0.5 flex items-center gap-1 text-[11px] text-status-progress"
+              className="mt-0.5 flex items-center gap-1 text-caption text-status-progress"
               title={`来自规范《${task.spec_title}》`}
             >
               <BookOpen size={9} className="shrink-0" />
@@ -1623,7 +1623,7 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
               data-status-tone={
                 task.failure_attribution.repairable === false ? "danger" : "warning"
               }
-              className={`mt-1 flex items-start gap-1.5 rounded-md px-2 py-1 text-[11px] leading-4 ${
+              className={`mt-1 flex items-start gap-1.5 rounded-md px-2 py-1 text-caption leading-4 ${
                 task.failure_attribution.repairable === false
                   ? "bg-status-danger-soft text-status-danger"
                   : "bg-status-warning-soft text-status-warning"
@@ -1638,7 +1638,7 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
             </div>
           )}
           {task.attempts && task.attempts.length > 0 && (
-            <div className="mt-0.5 text-[11px] text-gray-600">
+            <div className="mt-0.5 text-caption text-gray-600">
               {task.attempts.length} 次执行记录
               {task.attempts[task.attempts.length - 1]?.status === "failed" && (
                 <span className="ml-1 text-status-warning">最近一次失败</span>
@@ -1684,11 +1684,11 @@ function VerifCheckRow({ result }: { result: VerificationResult }) {
         ) : (
           <XCircle size={10} className="shrink-0 text-status-danger" />
         )}
-        <span className="flex-1 truncate text-[12px] text-gray-400">{result.check}</span>
-        <span className="text-[11px] text-gray-600">{result.duration_ms}ms</span>
+        <span className="flex-1 truncate text-label text-gray-400">{result.check}</span>
+        <span className="text-caption text-gray-600">{result.duration_ms}ms</span>
       </div>
       {showOutput && hasOutput && (
-        <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap px-1.5 pb-1 font-mono text-[11px] text-gray-500">
+        <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap px-1.5 pb-1 font-mono text-caption text-gray-500">
           {result.output}
         </pre>
       )}

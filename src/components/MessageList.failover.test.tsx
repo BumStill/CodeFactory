@@ -44,7 +44,7 @@ describe("MessageList model route failover", () => {
     );
     expect(line).toHaveAttribute("role", "status");
     expect(line).toHaveAttribute("aria-live", "polite");
-    expect(line).toHaveClass("text-[13px]", "text-gray-500");
+    expect(line).toHaveClass("text-note", "text-gray-500");
     expect(line.className).not.toMatch(/\bborder\b|\bbg-|rounded/);
   });
 
@@ -65,7 +65,7 @@ describe("MessageList model route failover", () => {
 
     const line = screen.getByText(/已自动切换到 DeepSeek/);
     expect(line).toHaveAttribute("role", "status");
-    expect(line).toHaveClass("text-[13px]", "text-gray-500");
+    expect(line).toHaveClass("text-note", "text-gray-500");
     expect(line.className).not.toMatch(/\bborder\b|\bbg-|rounded/);
   });
 
@@ -136,7 +136,7 @@ describe("MessageList model route failover", () => {
     const disclosure = screen.getByText("模型连接不稳定，正在重新连接…").closest("details");
     expect(disclosure).toBeInTheDocument();
     expect(disclosure?.className).not.toMatch(/\bborder\b|\bbg-/);
-    expect(disclosure).toHaveClass("text-[13px]");
+    expect(disclosure).toHaveClass("text-note");
   });
 
   it("shows route exhaustion as actionable guidance with expandable technical evidence", () => {

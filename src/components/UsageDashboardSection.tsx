@@ -100,9 +100,9 @@ export function usageCostLabel(summary: UsageSummary): string {
 function Kpi({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="rounded-lg border border-border bg-surface-1 p-3 min-w-0">
-      <div className="text-[10px] font-medium text-gray-500">{label}</div>
-      <div className="mt-1 truncate font-mono text-base font-semibold text-gray-200" title={value}>{value}</div>
-      {hint && <div className="mt-0.5 truncate text-[10px] text-gray-600" title={hint}>{hint}</div>}
+      <div className="text-caption font-medium text-gray-500">{label}</div>
+      <div className="mt-1 truncate font-mono text-title font-semibold text-gray-200" title={value}>{value}</div>
+      {hint && <div className="mt-0.5 truncate text-caption text-gray-600" title={hint}>{hint}</div>}
     </div>
   );
 }
@@ -239,7 +239,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
     <section role="region" aria-label="用量与预算" className="mx-auto w-full max-w-6xl space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex rounded border border-border p-0.5 text-[10px]" aria-label="摘要范围">
+          <div className="flex rounded border border-border p-0.5 text-caption" aria-label="摘要范围">
             {([1, 7, 30] as const).map((days) => (
               <button
                 type="button"
@@ -252,30 +252,30 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
               </button>
             ))}
           </div>
-          <button type="button" onClick={() => void reload()} className="flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-gray-500 hover:bg-surface-2 hover:text-gray-300">
+          <button type="button" onClick={() => void reload()} className="flex items-center gap-1 rounded border border-border px-2 py-1 text-label text-gray-500 hover:bg-surface-2 hover:text-gray-300">
             <RefreshCw size={11} className={loading ? "animate-spin" : ""} />刷新
           </button>
         </div>
       </div>
 
       {error && (
-        <div role="alert" className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+        <div role="alert" className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-label text-red-700 dark:text-red-300">
           用量统计暂不可用：{error}
         </div>
       )}
       {dashboard?.data_status === "partial" && (
-        <div role="status" className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+        <div role="status" className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-700 dark:text-amber-300">
           部分请求缺少 Provider Usage 或来自历史回填；当前总量可能不完整。
         </div>
       )}
       {budgetStatus?.new_alert && (
-        <div role="alert" className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+        <div role="alert" className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-700 dark:text-amber-300">
           {budgetStatus.new_alert.period_kind === "day" ? "今日" : "本月"} Token 已达到预算的 {Math.round(budgetStatus.new_alert.threshold * 100)}%。本提醒已记录，本周期不会重复出现。
         </div>
       )}
 
       <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-        <Kpi label="总 Tokens" value={summary ? formatUsageTokens(total) : "—"} hint={summary ? `输入 ${formatUsageTokens(summary.input_tokens)} · 输出 ${formatUsageTokens(summary.output_tokens)}` : undefined} />
+        <Kpi label="总 Token" value={summary ? formatUsageTokens(total) : "—"} hint={summary ? `输入 ${formatUsageTokens(summary.input_tokens)} · 输出 ${formatUsageTokens(summary.output_tokens)}` : undefined} />
         <Kpi label="模型请求" value={summary ? `${summary.requests} 次` : "—"} />
         <Kpi label="推理 / 缓存" value={summary ? `${formatUsageTokens(summary.reasoning_tokens)} / ${formatUsageTokens(summary.cached_tokens)}` : "—"} />
         <Kpi label="费用语义" value={summary ? usageCostLabel(summary) : "—"} />
@@ -284,11 +284,11 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
       <div className="rounded-lg border border-border bg-surface-1 p-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <h3 className="text-xs font-medium text-gray-300">Token 预算</h3>
-            <p className="mt-0.5 text-[10px] text-gray-600">预算只提醒，不会停止任务、切换模型或修改权限。</p>
+            <h3 className="text-label font-medium text-gray-300">Token 预算</h3>
+            <p className="mt-0.5 text-caption text-gray-600">预算只提醒，不会停止任务、切换模型或修改权限。</p>
             {dailyBudgetRatio != null && (
               <div className="mt-2">
-                <div className="mb-1 flex justify-between text-[10px] text-gray-500">
+                <div className="mb-1 flex justify-between text-caption text-gray-500">
                   <span>今日 {formatUsageTokens(todayTokens)} / {formatUsageTokens(budget.daily_token_limit)}</span>
                   <span>{Math.round(dailyBudgetRatio * 100)}%</span>
                 </div>
@@ -299,12 +299,12 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
                   />
                 </div>
                 {budget.alerts_enabled && dailyBudgetRatio >= 0.5 && (
-                  <p role="status" className={`mt-1 text-[10px] ${dailyBudgetRatio >= 1 ? "text-red-700 dark:text-red-300" : "text-amber-700 dark:text-amber-300"}`}>
+                  <p role="status" className={`mt-1 text-caption ${dailyBudgetRatio >= 1 ? "text-red-700 dark:text-red-300" : "text-amber-700 dark:text-amber-300"}`}>
                     {dailyBudgetRatio >= 1 ? "今日 Token 已达到预算" : dailyBudgetRatio >= 0.8 ? "今日 Token 已达到预算的 80%" : "今日 Token 已达到预算的 50%"}
                   </p>
                 )}
                 {monthlyBudgetRatio != null && (
-                  <p className="mt-1 text-[10px] text-gray-500">
+                  <p className="mt-1 text-caption text-gray-500">
                     本月 {formatUsageTokens(budgetStatus?.monthly?.usage_tokens ?? 0)} / {formatUsageTokens(budgetStatus?.monthly?.limit_tokens ?? budget.monthly_token_limit)} · {Math.round(monthlyBudgetRatio * 100)}%
                   </p>
                 )}
@@ -312,7 +312,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
             )}
           </div>
           <div className="grid w-full grid-cols-1 gap-2 sm:w-auto sm:grid-cols-2">
-            <label className="text-[10px] text-gray-500">
+            <label className="text-caption text-gray-500">
               每日上限
               <input
                 type="number"
@@ -320,10 +320,10 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
                 step={1000}
                 value={budget.daily_token_limit}
                 onChange={(event) => setBudget({ ...budget, daily_token_limit: Math.max(0, Number(event.target.value) || 0) })}
-                className="mt-1 w-full rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                className="mt-1 w-full rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
               />
             </label>
-            <label className="text-[10px] text-gray-500">
+            <label className="text-caption text-gray-500">
               每月上限
               <input
                 type="number"
@@ -331,14 +331,14 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
                 step={10000}
                 value={budget.monthly_token_limit}
                 onChange={(event) => setBudget({ ...budget, monthly_token_limit: Math.max(0, Number(event.target.value) || 0) })}
-                className="mt-1 w-full rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                className="mt-1 w-full rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
               />
             </label>
-            <label className="flex items-center gap-1.5 text-[10px] text-gray-500 sm:col-span-2">
+            <label className="flex items-center gap-1.5 text-caption text-gray-500 sm:col-span-2">
               <input type="checkbox" checked={budget.alerts_enabled} onChange={(event) => setBudget({ ...budget, alerts_enabled: event.target.checked })} />
               50% / 80% / 100% 阈值提醒
             </label>
-            <button type="button" onClick={() => void saveBudget()} className="flex items-center justify-center gap-1 rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover sm:col-span-2">
+            <button type="button" onClick={() => void saveBudget()} className="flex items-center justify-center gap-1 rounded bg-accent px-3 py-1.5 text-label text-white hover:bg-accent-hover sm:col-span-2">
               {budgetSaved ? <><Check size={11} />已保存</> : "保存预算"}
             </button>
           </div>
@@ -348,11 +348,11 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
       <div className="rounded-lg border border-border bg-surface-1 p-3">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-xs font-medium text-gray-300">Token 消耗地图</h3>
-            <p className="mt-0.5 text-[10px] text-gray-600">每格一天，深浅按对数尺度；悬浮或聚焦查看精确值。</p>
+            <h3 className="text-label font-medium text-gray-300">Token 消耗地图</h3>
+            <p className="mt-0.5 text-caption text-gray-600">每格一天，深浅按对数尺度；悬浮或聚焦查看精确值。</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <div className="flex rounded border border-border p-0.5 text-[10px]" aria-label="地图指标">
+            <div className="flex rounded border border-border p-0.5 text-caption" aria-label="地图指标">
               {(["tokens", "budget", "requests"] as UsageHeatmapMetric[]).map((metric) => (
                 <button
                   type="button"
@@ -361,11 +361,11 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
                   onClick={() => setMapMetric(metric)}
                   className={`rounded px-2 py-1 ${mapMetric === metric ? "bg-surface-3 text-accent" : "text-gray-500 hover:text-gray-300"}`}
                 >
-                  {metric === "tokens" ? "Tokens" : metric === "budget" ? "预算占比" : "请求次数"}
+                  {metric === "tokens" ? "Token" : metric === "budget" ? "预算占比" : "请求次数"}
                 </button>
               ))}
             </div>
-            <div className="flex rounded border border-border p-0.5 text-[10px]">
+            <div className="flex rounded border border-border p-0.5 text-caption">
               {([90, 180, 365] as const).map((days) => (
               <button
                 type="button"
@@ -382,7 +382,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
           </div>
         </div>
         {loading && !dashboard ? (
-          <div className="flex h-24 items-center justify-center gap-2 text-xs text-gray-500"><Loader2 size={13} className="animate-spin" />正在读取本机用量</div>
+          <div className="flex h-24 items-center justify-center gap-2 text-label text-gray-500"><Loader2 size={13} className="animate-spin" />正在读取本机用量</div>
         ) : (
           <TokenUsageHeatmap
             days={dashboard?.heatmap ?? []}
@@ -400,27 +400,27 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
         <section role="region" aria-label={`${selectedDate} 用量明细`} className="rounded-lg border border-border bg-surface-1 p-3">
           <div className="mb-3 flex items-center gap-2">
             <Activity size={12} className="text-accent" />
-            <h3 className="text-xs font-medium text-gray-300">{selectedDate} 用量明细</h3>
+            <h3 className="text-label font-medium text-gray-300">{selectedDate} 用量明细</h3>
             {detailLoading && <Loader2 size={11} className="animate-spin text-gray-500" />}
           </div>
           {selectedDay?.status === "missing" && (
-            <p role="status" className="mb-3 rounded border border-gray-700 bg-surface-2 px-2.5 py-2 text-xs text-gray-400">
+            <p role="status" className="mb-3 rounded border border-gray-700 bg-surface-2 px-2.5 py-2 text-label text-gray-400">
               数据缺失，不等于 0 用量；该日没有可用于下钻的完整计量记录。
             </p>
           )}
           {selectedDay?.status === "partial" && (
-            <p role="status" className="mb-3 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700 dark:text-amber-300">
+            <p role="status" className="mb-3 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-label text-amber-700 dark:text-amber-300">
               历史回填，数据可能不完整；Token 与请求拆分仅代表当前可恢复记录。
             </p>
           )}
           {detail && (
             <div className="grid gap-4 lg:grid-cols-2">
               <div>
-                <div className="mb-2 text-[10px] font-medium text-gray-600">执行入口</div>
+                <div className="mb-2 text-caption font-medium text-gray-600">执行入口</div>
                 <div className="space-y-1">
-                  {detail.breakdowns.length === 0 && <p className="text-xs text-gray-500">当天没有已计量请求</p>}
+                  {detail.breakdowns.length === 0 && <p className="text-label text-gray-500">当天没有已计量请求</p>}
                   {detail.breakdowns.map((item) => (
-                    <div key={item.surface} className="flex items-center justify-between rounded bg-surface-2 px-2.5 py-2 text-xs">
+                    <div key={item.surface} className="flex items-center justify-between rounded bg-surface-2 px-2.5 py-2 text-label">
                       <span className="text-gray-300">{SURFACE_LABELS[item.surface] ?? item.surface}</span>
                       <span className="font-mono text-gray-500">{formatUsageTokens(item.total_tokens)} · {item.requests} 次</span>
                     </div>
@@ -428,15 +428,15 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
                 </div>
               </div>
               <div>
-                <div className="mb-2 text-[10px] font-medium text-gray-600">高消耗会话</div>
+                <div className="mb-2 text-caption font-medium text-gray-600">高消耗会话</div>
                 <div className="space-y-1">
-                  {detail.top_sessions.length === 0 && <p className="text-xs text-gray-500">无会话记录</p>}
+                  {detail.top_sessions.length === 0 && <p className="text-label text-gray-500">无会话记录</p>}
                   {detail.top_sessions.map((session) => (
-                    <div key={session.session_id} className="flex flex-wrap items-center gap-2 rounded bg-surface-2 px-2.5 py-2 text-xs">
+                    <div key={session.session_id} className="flex flex-wrap items-center gap-2 rounded bg-surface-2 px-2.5 py-2 text-label">
                       <span className="min-w-0 flex-1 truncate text-gray-300" title={session.title}>{session.title}</span>
-                      <span className="font-mono text-[10px] text-gray-500">{formatUsageTokens(session.total_tokens)} · {(session.share * 100).toFixed(0)}%</span>
+                      <span className="font-mono text-caption text-gray-500">{formatUsageTokens(session.total_tokens)} · {(session.share * 100).toFixed(0)}%</span>
                       {onOpenSession && (
-                        <button type="button" onClick={() => onOpenSession(session.session_id)} className="text-[10px] text-accent hover:underline">
+                        <button type="button" onClick={() => onOpenSession(session.session_id)} className="text-caption text-accent hover:underline">
                           查看会话
                         </button>
                       )}
@@ -444,7 +444,7 @@ export function UsageDashboardSection({ onOpenSession, onOpenJobLog }: Props) {
                         <button
                           type="button"
                           onClick={() => onOpenJobLog(session.job_session_id!, session.task_id!)}
-                          className="text-[10px] text-accent hover:underline"
+                          className="text-caption text-accent hover:underline"
                         >
                           查看作业日志
                         </button>

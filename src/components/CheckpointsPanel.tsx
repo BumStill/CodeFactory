@@ -118,8 +118,8 @@ export function CheckpointsPanel({ sessionId, embedded = false, narrow = embedde
         aria-label={`恢复 ${changed.length}`}
         title="查看可恢复快照"
         className={embedded
-          ? `inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 ${narrow ? "h-11" : "h-9"}`
-          : "inline-flex h-9 items-center gap-1 rounded border border-border bg-surface-2 px-2 text-[11px] text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"}
+          ? `inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 text-caption text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 ${narrow ? "h-11" : "h-9"}`
+          : "inline-flex h-9 items-center gap-1 rounded border border-border bg-surface-2 px-2 text-caption text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"}
       >
         <History size={11} />
         <span>恢复</span>
@@ -144,8 +144,8 @@ export function CheckpointsPanel({ sessionId, embedded = false, narrow = embedde
             <header className="flex items-start gap-3 border-b border-border px-4 py-3">
               <GitBranch size={15} className="mt-0.5 text-accent" />
               <div className="min-w-0 flex-1">
-                <h2 className="text-sm font-semibold text-gray-100">检查点</h2>
-                <p className="mt-0.5 text-[11px] text-gray-600">
+                <h2 className="text-body font-semibold text-gray-100">检查点</h2>
+                <p className="mt-0.5 text-caption text-gray-600">
                   自动快照不会移动 HEAD；恢复结果会作为普通工作区修改供你审查。
                 </p>
               </div>
@@ -164,18 +164,18 @@ export function CheckpointsPanel({ sessionId, embedded = false, narrow = embedde
 
             <div className="min-h-0 flex-1 overflow-y-auto p-3">
               {checkpoints.length === 0 ? (
-                <p className="rounded border border-dashed border-border px-3 py-8 text-center text-xs text-gray-600">
+                <p className="rounded border border-dashed border-border px-3 py-8 text-center text-label text-gray-600">
                   暂无检查点。Git 项目发送下一条消息前会自动创建。
                 </p>
               ) : (
                 <>
                   <section>
-                    <div className="mb-2 flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wider text-gray-500">
+                    <div className="mb-2 flex items-center gap-2 px-1 text-caption font-semibold text-gray-500">
                       可恢复变更
                       <span className="ml-auto tabular-nums text-gray-600">{changed.length}</span>
                     </div>
                     {changed.length === 0 ? (
-                      <p className="px-2 py-4 text-xs text-gray-600">当前检查点都与工作区一致。</p>
+                      <p className="px-2 py-4 text-label text-gray-600">当前检查点都与工作区一致。</p>
                     ) : (
                       <ul className="space-y-1">
                         {visibleChanged.map((checkpoint) => (
@@ -193,7 +193,7 @@ export function CheckpointsPanel({ sessionId, embedded = false, narrow = embedde
                       <button
                         onClick={() => setShowAllChanged(true)}
                         aria-label={`查看最近 ${changed.length} 个有效检查点`}
-                        className="mt-2 w-full rounded px-2 py-1.5 text-[11px] text-gray-500 hover:bg-surface-2 hover:text-gray-200"
+                        className="mt-2 w-full rounded px-2 py-1.5 text-caption text-gray-500 hover:bg-surface-2 hover:text-gray-200"
                       >
                         查看最近 {changed.length} 个有效检查点
                       </button>
@@ -203,10 +203,9 @@ export function CheckpointsPanel({ sessionId, embedded = false, narrow = embedde
                   {unchanged.length > 0 && (
                     <section className="mt-4 border-t border-border pt-3">
                       <button
-                        onClick={() => setShowUnchanged((value) => !value)}
-                        aria-label={`${showUnchanged ? "收起" : "查看"} ${unchanged.length} 个无差异检查点`}
-                        className="flex w-full items-center gap-2 rounded px-1 py-1 text-[11px] font-semibold uppercase tracking-wider text-gray-600 hover:text-gray-300"
-                      >
+ onClick={() => setShowUnchanged((value) => !value)}
+ aria-label={`${showUnchanged ?"收起":"查看"} ${unchanged.length} 个无差异检查点`}
+ className="flex w-full items-center gap-2 rounded px-1 py-1 text-caption font-semibold text-gray-600 hover:text-gray-300">
                         无文件差异
                         <span className="ml-auto tabular-nums">{unchanged.length}</span>
                       </button>
@@ -275,7 +274,7 @@ function CheckpointRow({
     : checkpoint.label || "(空消息)";
 
   return (
-    <li className="group flex items-center gap-2 rounded border border-transparent px-2 py-2 text-[11px] hover:border-border hover:bg-surface-2">
+    <li className="group flex items-center gap-2 rounded border border-transparent px-2 py-2 text-caption hover:border-border hover:bg-surface-2">
       <span className="w-12 shrink-0 truncate font-mono text-gray-600" title={checkpoint.git_sha}>
         {checkpoint.git_sha.slice(0, 7)}
       </span>
@@ -283,22 +282,22 @@ function CheckpointRow({
         <div className={checkpoint.reverted ? "truncate text-gray-600 line-through" : "truncate text-gray-300"} title={checkpoint.label}>
           {label}
         </div>
-        <div className="mt-0.5 text-[11px] text-gray-600">
+        <div className="mt-0.5 text-caption text-gray-600">
           {fileCount > 0 ? `${fileCount} 个文件变化` : "无文件差异"}
         </div>
       </div>
-      <span className="shrink-0 text-[11px] text-gray-600" title={when.toLocaleString()}>
+      <span className="shrink-0 text-caption text-gray-600" title={when.toLocaleString()}>
         {when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
       </span>
       {checkpoint.reverted ? (
-        <span className="inline-flex shrink-0 items-center gap-0.5 text-[11px] text-status-success">
+        <span className="inline-flex shrink-0 items-center gap-0.5 text-caption text-status-success">
           <Check size={10} /> 已恢复
         </span>
       ) : (
         <button
           onClick={() => onRequestRevert(checkpoint)}
           aria-label={`恢复检查点 ${checkpoint.label}`}
-          className={`inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 text-[11px] text-gray-500 transition-colors hover:bg-status-warning-soft hover:text-status-warning ${narrow ? "h-11" : "h-9"}`}
+          className={`inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 text-caption text-gray-500 transition-colors hover:bg-status-warning-soft hover:text-status-warning ${narrow ? "h-11" : "h-9"}`}
         >
           <RotateCcw size={10} /> 恢复
         </button>
@@ -374,8 +373,8 @@ function RevertConfirmModal({
       >
         <header className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
           <div className="min-w-0">
-            <h2 className="text-sm font-semibold text-gray-100">恢复到检查点</h2>
-            <p className="mt-0.5 truncate text-[11px] text-gray-500" title={checkpoint.label}>
+            <h2 className="text-body font-semibold text-gray-100">恢复到检查点</h2>
+            <p className="mt-0.5 truncate text-caption text-gray-500" title={checkpoint.label}>
               {checkpoint.git_sha.slice(0, 7)} · {checkpoint.label || "(空)"}
             </p>
           </div>
@@ -391,25 +390,25 @@ function RevertConfirmModal({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
           {error ? (
-            <div className="flex items-start gap-2 rounded border border-status-danger/40 bg-status-danger-soft p-2 text-xs text-status-danger">
+            <div className="flex items-start gap-2 rounded border border-status-danger/40 bg-status-danger-soft p-2 text-label text-status-danger">
               <AlertCircle size={12} className="mt-0.5 shrink-0" />
               <span className="flex-1 break-words">{error}</span>
             </div>
           ) : fileChanges === null ? (
-            <div className="text-xs text-gray-500">正在计算差异…</div>
+            <div className="text-label text-gray-500">正在计算差异…</div>
           ) : fileChanges.length === 0 ? (
-            <div className="text-xs italic text-gray-500">工作区已与此检查点一致，不会有任何更改。</div>
+            <div className="text-label italic text-gray-500">工作区已与此检查点一致，不会有任何更改。</div>
           ) : (
             <>
-              <p className="mb-2 text-[11px] text-gray-500">
+              <p className="mb-2 text-caption text-gray-500">
                 以下文件将恢复到快照状态；当前修改会被覆盖：
               </p>
               <ul className="space-y-0.5">
                 {fileChanges.map((file) => (
-                  <li key={file.path} className="flex items-center gap-2 font-mono text-[11px]">
+                  <li key={file.path} className="flex items-center gap-2 font-mono text-caption">
                     <StatusIcon status={file.status} />
                     <span className="min-w-0 flex-1 truncate text-gray-300" title={file.path}>{file.path}</span>
-                    <span className="text-[11px] uppercase tracking-wide text-gray-600">{statusLabel(file.status)}</span>
+                    <span className="text-caption text-gray-600">{statusLabel(file.status)}</span>
                   </li>
                 ))}
               </ul>
@@ -418,14 +417,14 @@ function RevertConfirmModal({
         </div>
 
         <footer className="flex justify-end gap-2 border-t border-border px-4 py-3">
-          <button onClick={onCancel} className={`${narrow ? "h-11" : "h-9"} rounded px-3 text-xs text-gray-400 hover:bg-surface-3 hover:text-gray-200`}>
+          <button onClick={onCancel} className={`${narrow ? "h-11" : "h-9"} rounded px-3 text-label text-gray-400 hover:bg-surface-3 hover:text-gray-200`}>
             取消
           </button>
           <button
             onClick={() => void restore()}
             disabled={busy || fileChanges === null || fileChanges.length === 0}
             aria-label="确认恢复"
-            className={`${narrow ? "h-11" : "h-9"} inline-flex items-center gap-1.5 rounded border border-status-warning/40 bg-status-warning-soft px-3 text-xs text-status-warning transition-colors hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-40`}
+            className={`${narrow ? "h-11" : "h-9"} inline-flex items-center gap-1.5 rounded border border-status-warning/40 bg-status-warning-soft px-3 text-label text-status-warning transition-colors hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-40`}
           >
             <RotateCcw size={11} />
             {busy ? "正在恢复…" : "恢复"}
