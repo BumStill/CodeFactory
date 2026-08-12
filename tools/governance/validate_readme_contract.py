@@ -220,6 +220,8 @@ def _live_pr_body(number: Any) -> str | None:
         ["gh", "pr", "view", str(number), "--json", "body", "--jq", ".body"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         print(

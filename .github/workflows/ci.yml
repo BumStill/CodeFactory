@@ -142,6 +142,21 @@ jobs:
           path: ${{ runner.temp }}/codefactory-resume-headless
           if-no-files-found: error
 
+      - name: Compact composer headless viewport gate
+        id: composer_gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:draft-project-picker:headless
+        env:
+          CODEFACTORY_DRAFT_PROJECT_PICKER_ARTIFACT_DIR: ${{ runner.temp }}/codefactory-compact-composer-headless
+
+      - name: Upload compact composer viewport evidence
+        if: ${{ !cancelled() && steps.composer_gate.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compact-composer-headless-${{ runner.os }}
+          path: ${{ runner.temp }}/codefactory-compact-composer-headless
+          if-no-files-found: error
+
 
       # Run the Rust test suite. New regressions like the v0.3.7
       # "old sessions won't open" bug land here as failing tests so we
