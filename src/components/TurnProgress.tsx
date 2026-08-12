@@ -87,22 +87,22 @@ export function TurnProgress({
           <Loader2 size={14} aria-hidden="true" className="shrink-0 animate-spin text-status-progress motion-reduce:animate-none" />
         )}
         <div className="min-w-0 flex-1">
-          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[13px]">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-note">
             <span className="shrink-0 font-medium text-gray-200">
               已完成 {progress.completed}/{progress.total}
             </span>
             <span className="shrink-0 tabular-nums text-gray-400">
               {progress.percent}%
             </span>
-            <span className="shrink-0 text-[11px] text-gray-600">
+            <span className="shrink-0 text-caption text-gray-600">
               来自 {progress.total} 个计划步骤
             </span>
-            <span className="ml-auto inline-flex shrink-0 items-center gap-1 text-[11px] text-gray-500 tabular-nums">
+            <span className="ml-auto inline-flex shrink-0 items-center gap-1 text-caption text-gray-500 tabular-nums">
               <Clock3 size={11} aria-hidden="true" />
               {formatDuration(elapsedMs)}
             </span>
           </div>
-          <div className="mt-1 grid min-w-0 grid-cols-2 gap-2 text-[12px] text-gray-400">
+          <div className="mt-1 grid min-w-0 grid-cols-2 gap-2 text-label text-gray-400">
             <span className="truncate">
               {progress.current ? `当前 · ${progress.current.title}` : "当前 · 正在整理执行路线"}
             </span>
@@ -113,14 +113,14 @@ export function TurnProgress({
           {(activityLabel || effectiveWaitingReason) && (
             <p
               role="status"
-              className={`mt-1 truncate text-[11px] ${effectiveWaitingReason ? "text-status-warning" : "text-gray-500"}`}
+              className={`mt-1 truncate text-caption ${effectiveWaitingReason ? "text-status-warning" : "text-gray-500"}`}
             >
               {activityLabel ?? effectiveWaitingReason}
               {activityLabel && effectiveWaitingReason ? ` · ${effectiveWaitingReason}` : ""}
             </p>
           )}
           {(estimate || linkedExternalJob) && (
-            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-gray-500">
+            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-caption text-gray-500">
               {estimate && minimumSampleCount != null && (
                 <span>
                   {estimateLabel(estimate.lowMs, estimate.highMs)} · 最少 {minimumSampleCount} 个历史样本
@@ -165,7 +165,7 @@ export function TurnProgress({
       </div>
 
       {expanded && (
-        <div className="space-y-2 border-t border-border/50 px-3 py-2 text-[12px]">
+        <div className="space-y-2 border-t border-border/50 px-3 py-2 text-label">
           <ol className="space-y-1" aria-label="计划步骤">
             {plan.steps.map((step, index) => (
               <li key={step.id} className="flex min-w-0 items-center gap-2">

@@ -117,7 +117,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
     <div className="fixed right-0 top-0 bottom-0 z-40 w-[640px] max-w-[80vw] bg-surface-1 border-l border-border shadow-2xl flex flex-col">
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
-        <span className="text-xs font-semibold text-gray-200 flex-1">任务</span>
+        <span className="text-label font-semibold text-gray-200 flex-1">任务</span>
         <button
           onClick={() => loadTasks(sessionId)}
           disabled={isLoading}
@@ -140,7 +140,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
         <button
           onClick={handleAddDemo}
           disabled={creatingDemo}
-          className="flex items-center gap-1 px-2 py-1 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 transition-colors"
+          className="flex items-center gap-1 px-2 py-1 text-caption rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 transition-colors"
           title="插入一个用于测试的 5 任务示例树"
         >
           <Plus size={11} />
@@ -148,19 +148,19 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
         </button>
         <span className="flex-1" />
         {total > 0 && (
-          <span className="text-[11px] text-gray-500">
+          <span className="text-caption text-gray-500">
             {settled}/{total} 已完成{failed > 0 ? `  · ${failed} 失败` : ""}
           </span>
         )}
         {hasActive && !isRunning && (
-          <span className="text-[11px] text-gray-500">
+          <span className="text-caption text-gray-500">
             已委派，由后台调度器自动执行
           </span>
         )}
         {isRunning && (
           <button
             onClick={() => cancel(sessionId)}
-            className="flex items-center gap-1 px-2 py-1 text-[11px] rounded bg-red-700/70 hover:bg-red-700 text-white transition-colors"
+            className="flex items-center gap-1 px-2 py-1 text-caption rounded bg-red-700/70 hover:bg-red-700 text-white transition-colors"
           >
             <Square size={11} />
             取消
@@ -179,7 +179,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
       )}
 
       {sessionError && (
-        <div className="px-3 py-1.5 text-[11px] text-red-400 border-b border-border bg-red-950/20 shrink-0">
+        <div className="px-3 py-1.5 text-caption text-red-400 border-b border-border bg-red-950/20 shrink-0">
           {sessionError}
         </div>
       )}
@@ -190,7 +190,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
       {/* Body */}
       <div className="flex-1 overflow-y-auto">
         {sessionTasks.length === 0 && !isLoading && (
-          <div className="px-4 py-8 text-center text-[11px] text-gray-700">
+          <div className="px-4 py-8 text-center text-caption text-gray-700">
             暂无任务。点击“添加示例任务树”可插入一个 5 任务示例。
           </div>
         )}
@@ -201,7 +201,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
             if (items.length === 0) return null;
             return (
               <div key={group}>
-                <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0 z-10">
+                <div className="px-2 py-1 text-caption font-semibold text-gray-600 bg-surface-2 sticky top-0 z-10">
                   {STATUS_LABELS[group]} ({items.length})
                 </div>
                 {items.map((t) => {
@@ -313,7 +313,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
         <span className="mt-0.5 shrink-0">{statusIcon(task.status)}</span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5">
-            <span className="text-[12px] text-gray-200 truncate">{task.title}</span>
+            <span className="text-label text-gray-200 truncate">{task.title}</span>
             {restoredKey && <RestoredBadge keyShort={restoredKey} />}
             {verifBadge === "pass" && (
               <span title="全部验证检查通过"><CheckCircle2 size={11} className="text-green-400 shrink-0" /></span>
@@ -322,7 +322,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
               <span title="有验证检查未通过"><XCircle size={11} className="text-red-400 shrink-0" /></span>
             )}
           </div>
-          <div className="flex items-center gap-2 text-[10px] text-gray-600">
+          <div className="flex items-center gap-2 text-caption text-gray-600">
             {dur && <span>{dur}</span>}
             {task.attempt_count > 1 && (
               <span className="text-yellow-500">第 {task.attempt_count} 次尝试</span>
@@ -333,7 +333,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
           </div>
           {task.failure_attribution && (
             <div
-              className="mt-1 flex items-start gap-1 rounded bg-amber-500/10 px-1.5 py-1 text-[10px] text-amber-700 dark:text-amber-300"
+              className="mt-1 flex items-start gap-1 rounded bg-amber-500/10 px-1.5 py-1 text-caption text-amber-700 dark:text-amber-300"
               title={`${task.failure_attribution.summary}\n下一步：${task.failure_attribution.next_action}`}
             >
               <AlertCircle size={11} className="mt-0.5 shrink-0" />
@@ -347,7 +347,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
       </div>
 
       {expanded && (
-        <div className="px-3 pb-2 pt-1 bg-surface-1/50 text-[11px] space-y-2">
+        <div className="px-3 pb-2 pt-1 bg-surface-1/50 text-caption space-y-2">
           <div>
             <span className="text-gray-600">描述：</span>
             <span className="text-gray-300 whitespace-pre-wrap">{task.description}</span>
@@ -369,7 +369,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
                 {task.attempts.map((attempt) => (
                   <div
                     key={attempt.id}
-                    className="rounded bg-surface-2 px-2 py-1 text-[10px] text-gray-400"
+                    className="rounded bg-surface-2 px-2 py-1 text-caption text-gray-400"
                   >
                     <span>第 {attempt.attempt_index} 次</span>
                     <span className="mx-1 text-gray-700">·</span>
@@ -400,7 +400,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
               {result.summary && (
                 <div>
                   <span className="text-gray-600">摘要：</span>
-                  <div className="mt-1 p-2 rounded bg-surface-2 text-gray-300 whitespace-pre-wrap font-mono text-[10px] max-h-48 overflow-y-auto">
+                  <div className="mt-1 p-2 rounded bg-surface-2 text-gray-300 whitespace-pre-wrap font-mono text-caption max-h-48 overflow-y-auto">
                     {result.summary}
                   </div>
                 </div>
@@ -435,7 +435,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
               <button
                 onClick={handleRunVerif}
                 disabled={runningVerif}
-                className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded bg-surface-3 hover:bg-surface-4 text-gray-400 hover:text-gray-200 disabled:opacity-40 transition-colors"
+                className="flex items-center gap-1 px-1.5 py-0.5 text-caption rounded bg-surface-3 hover:bg-surface-4 text-gray-400 hover:text-gray-200 disabled:opacity-40 transition-colors"
                 title="立即运行验证检查"
               >
                 {runningVerif
@@ -466,7 +466,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
                       }
                     </div>
                     {expandedChecks.has(idx) && r.output && (
-                      <pre className="px-2 pb-2 text-[10px] text-gray-400 whitespace-pre-wrap font-mono max-h-40 overflow-y-auto">
+                      <pre className="px-2 pb-2 text-caption text-gray-400 whitespace-pre-wrap font-mono max-h-40 overflow-y-auto">
                         {r.output}
                       </pre>
                     )}
@@ -474,7 +474,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
                 ))}
               </div>
             ) : (
-              <span className="text-gray-700 text-[10px]">尚未运行</span>
+              <span className="text-gray-700 text-caption">尚未运行</span>
             )}
           </div>
         </div>

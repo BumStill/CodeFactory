@@ -96,8 +96,8 @@ export function ReasoningEffortPicker({ embedded = false }: { embedded?: boolean
       onChange={(e) => void setEffort(e.target.value as ReasoningEffort)}
       title="思考强度 (reasoning effort) — 仅作用于当前会话，从下一回合开始生效"
       className={embedded
-        ? "min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
-        : "min-h-[44px] rounded-lg border border-control-border bg-surface-2 px-2 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"}
+        ? "min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-label text-gray-200 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+        : "min-h-[44px] rounded-lg border border-control-border bg-surface-2 px-2 py-1 text-label text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"}
     >
       {efforts.map((v) => (
         <option key={v} value={v}>
@@ -109,7 +109,7 @@ export function ReasoningEffortPicker({ embedded = false }: { embedded?: boolean
   if (!embedded) return select;
   return (
     <div className="space-y-1">
-      <p className="px-0.5 text-[11px] font-medium text-gray-500">思考强度</p>
+      <p className="px-0.5 text-caption font-medium text-gray-500">思考强度</p>
       {select}
     </div>
   );

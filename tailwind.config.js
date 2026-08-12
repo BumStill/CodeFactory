@@ -1,10 +1,45 @@
 /** @type {import('tailwindcss').Config} */
 const themeColor = (name) => `rgb(var(${name}) / <alpha-value>)`;
 
+/**
+ * A step on the type scale, authored in px and scaled by the user's text-size
+ * setting.
+ *
+ * px, not rem, on purpose. Tailwind's stock scale is rem, which ties text to
+ * the rem baseline — and that baseline also drives every spacing, radius and
+ * box size. Sharing one number between "how big is the text" and "how big is
+ * the grid" is what let a 14px root silently render `text-xs` at 10.5px and
+ * `gap-2` at 7px. `--font-scale` moves text alone; the grid stays on rem.
+ */
+const step = (size, lineHeight) => [
+  `calc(${size}px * var(--font-scale, 1))`,
+  { lineHeight: `calc(${lineHeight}px * var(--font-scale, 1))` },
+];
+
 export default {
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
   darkMode: ["selector", '[data-theme="dark"]'],
   theme: {
+    /*
+     * Replaces Tailwind's stock t-shirt scale rather than extending it, so
+     * `text-xs` and friends do not exist. The product had 1039 font-size
+     * declarations across 6 stock steps and 8 arbitrary px values, 83% of them
+     * landing between 10 and 11px, with card titles rendering smaller than
+     * their own body copy. Names that say what the text IS keep that from
+     * coming back; src/styles/typographyScaleAudit.test.ts holds the line.
+     *
+     * See docs/specs/ui-typography-and-spacing.md.
+     */
+    fontSize: {
+      caption: step(11, 16), // timestamps, counts, paths, secondary metadata
+      label:   step(12, 18), // control labels, chips, badges, button text
+      note:    step(13, 20), // secondary reading text; monospace code blocks
+      body:    step(14, 22), // UI body copy, list primaries, form values
+      reading: step(15, 24), // chat message body — the one long-form surface
+      title:   step(16, 24), // card and panel titles
+      heading: step(20, 28), // page titles
+      display: step(24, 32), // welcome headline, headline metrics
+    },
     extend: {
       fontFamily: {
         sans: ["Inter", "system-ui", "sans-serif"],

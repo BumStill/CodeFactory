@@ -50,7 +50,7 @@ const modelReconnectMessage: UIMessage = {
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="min-h-[260px] rounded-lg border border-border bg-surface-1 p-3">
-      <h2 className="mb-3 text-sm font-semibold text-gray-200">{title}</h2>
+      <h2 className="mb-3 text-body font-semibold text-gray-200">{title}</h2>
       <div className="h-[220px] rounded border border-border bg-bg">
         {children}
       </div>
@@ -61,7 +61,7 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
 function AcceptanceApp() {
   return (
     <main className="min-h-screen bg-bg p-6 text-gray-200" aria-label="Reconnect banner acceptance">
-      <h1 className="mb-4 text-lg font-semibold">Reconnect banner attribution acceptance</h1>
+      <h1 className="mb-4 text-heading font-semibold">Reconnect banner attribution acceptance</h1>
       <div className="grid gap-4 md:grid-cols-2">
         <Panel title="Tool command is still running">
           <MessageList messages={[runningToolMessage]} streaming cwd={null} conversationKey="tool-running" />

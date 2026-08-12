@@ -166,13 +166,13 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
                   policy: event.target.value as "fixed" | "prefer" | "auto",
                 });
               }}
-              className="min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+              className="min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-label text-gray-200 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
             >
               <option value="fixed">固定 · 只使用当前模型</option>
               <option value="prefer">首选 · 安全时允许兼容接管</option>
               <option value="auto">自动 · 按能力与状态选择</option>
             </select>
-            <p className="px-0.5 text-xs leading-5 text-gray-500">
+            <p className="px-0.5 text-label leading-5 text-gray-500">
               会话策略更改只从下一轮开始生效；当前运行中的回合不会改路。
             </p>
             <ReasoningEffortPicker embedded />
@@ -214,7 +214,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
                 setLoadingEndpoint(null);
               }
             }}
-            className="min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-xs text-gray-200 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+            className="min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-label text-gray-200 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
           >
             {endpointKeys.map((key) => (
               <option key={key} value={key}>{key}</option>
@@ -228,16 +228,16 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
           onChange={(e) => setQuery(e.target.value)}
           disabled={modelListLoading}
           placeholder="搜索模型…"
-          className="min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 lg:min-h-[36px]"
+          className="min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 lg:min-h-[36px]"
         />
       </div>
       <ul className="max-h-64 overflow-y-auto py-1">
         {modelListLoading ? (
-          <li className="px-3 py-2 text-xs text-gray-600">正在加载模型…</li>
+          <li className="px-3 py-2 text-label text-gray-600">正在加载模型…</li>
         ) : filtered.slice(0, 50).map((m) => (
           <li key={m.id}>
             <button
-              className={`flex min-h-[44px] w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px] ${
+              className={`flex min-h-[44px] w-full items-center gap-1.5 px-3 py-1.5 text-left text-label transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px] ${
                 m.id === activeModel ? "text-accent" : "text-gray-300"
               }`}
               onClick={async () => {
@@ -268,7 +268,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
           </li>
         ))}
         {!modelListLoading && filtered.length === 0 && (
-          <li className="px-3 py-2 text-xs text-gray-600">未找到模型</li>
+          <li className="px-3 py-2 text-label text-gray-600">未找到模型</li>
         )}
       </ul>
     </div>
@@ -295,7 +295,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
         ref={triggerRef}
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className={`flex min-h-[44px] min-w-0 max-w-full items-center gap-1 rounded-lg px-2 py-1 text-xs transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px] ${
+        className={`flex min-h-[44px] min-w-0 max-w-full items-center gap-1 rounded-lg px-2 py-1 text-label transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px] ${
           prominent
             ? "max-w-full border border-accent/30 bg-accent/5 font-medium text-gray-200 hover:border-accent/60 hover:bg-accent/10"
             : "text-gray-400 hover:bg-surface-3 hover:text-gray-200"

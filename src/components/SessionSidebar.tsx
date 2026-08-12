@@ -114,7 +114,7 @@ export function SessionSidebar({
       <div className="shrink-0 border-b border-border/80 px-2 pb-2">
         <div className="flex h-11 items-center justify-between px-1">
           <div className="flex min-w-0 items-center gap-1">
-            <span className="text-[13px] font-semibold text-gray-300">会话</span>
+            <span className="text-note font-semibold text-gray-300">会话</span>
             {onCollapse && (
               <button
                 type="button"
@@ -146,7 +146,7 @@ export function SessionSidebar({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="搜索会话"
-            className="min-w-0 flex-1 bg-transparent text-[13px] text-gray-300 placeholder:text-gray-600 outline-none"
+            className="min-w-0 flex-1 bg-transparent text-note text-gray-300 placeholder:text-gray-600 outline-none"
           />
         </label>
       </div>
@@ -159,18 +159,18 @@ export function SessionSidebar({
             className="relative mb-1 flex min-h-10 w-full items-center gap-2 rounded-lg bg-surface-3 px-2 py-1.5 text-left before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded before:bg-accent"
           >
             <MessageSquare size={12} className="shrink-0 text-accent" />
-            <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-gray-100">
+            <span className="min-w-0 flex-1 truncate text-note font-medium text-gray-100">
               新会话
             </span>
-            <span className="text-[11px] text-accent">{draftSession.anonymous ? "匿名草稿" : "草稿"}</span>
+            <span className="text-caption text-accent">{draftSession.anonymous ? "匿名草稿" : "草稿"}</span>
           </div>
         )}
 
         {rail.length === 0 ? (
-          <p className="px-2 py-8 text-center text-[13px] leading-relaxed text-gray-600">
+          <p className="px-2 py-8 text-center text-note leading-relaxed text-gray-600">
             {query ? "没有匹配的会话" : "还没有会话"}
             <br />
-            <span className="text-[11px] text-gray-600">
+            <span className="text-caption text-gray-600">
               {query ? "试试标题或项目路径" : "点右上角「＋」开始"}
             </span>
           </p>
@@ -256,10 +256,10 @@ function ProjectRow({
           ) : (
             <Folder size={11} className="shrink-0 text-gray-500" />
           )}
-          <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-gray-200">
+          <span className="min-w-0 flex-1 truncate text-note font-medium text-gray-200">
             {name}
           </span>
-          <span className="shrink-0 text-[11px] tabular-nums text-gray-600">{count}</span>
+          <span className="shrink-0 text-caption tabular-nums text-gray-600">{count}</span>
         </button>
         <button
           type="button"
@@ -338,7 +338,7 @@ function SessionRow({
     />
   ) : null;
   const metadata = (
-    <div className="mt-0.5 flex min-w-0 items-center gap-1 pl-[18px] text-[11px] leading-4 text-gray-600">
+    <div className="mt-0.5 flex min-w-0 items-center gap-1 pl-[18px] text-caption leading-4 text-gray-600">
       {!nested && projectName && (
         <>
           <span className="truncate">{projectName}</span>
@@ -374,7 +374,7 @@ function SessionRow({
                   if (e.key === "Escape") setEditing(false);
                 }}
                 onBlur={commitRename}
-                className="min-w-0 flex-1 rounded-md border border-accent/50 bg-surface-3 px-1.5 py-0.5 text-[13px] text-gray-100 outline-none"
+                className="min-w-0 flex-1 rounded-md border border-accent/50 bg-surface-3 px-1.5 py-0.5 text-note text-gray-100 outline-none"
               />
               {statusIndicator}
             </div>
@@ -400,7 +400,7 @@ function SessionRow({
                   e.stopPropagation();
                   startRename();
                 }}
-                className={`flex-1 truncate text-[13px] ${
+                className={`flex-1 truncate text-note ${
                   active ? "font-medium text-gray-100" : "text-gray-300"
                 }`}
               >
@@ -431,7 +431,7 @@ function SessionRow({
                 <button
                   type="button"
                   onClick={startRename}
-                  className="flex min-h-8 w-full items-center gap-1.5 px-2.5 py-1.5 text-[13px] text-gray-300 hover:bg-surface-3"
+                  className="flex min-h-8 w-full items-center gap-1.5 px-2.5 py-1.5 text-note text-gray-300 hover:bg-surface-3"
                 >
                   <Pencil size={11} />
                   重命名
@@ -442,7 +442,7 @@ function SessionRow({
                     setMenuOpen(false);
                     setConfirming(true);
                   }}
-                  className="flex min-h-8 w-full items-center gap-1.5 px-2.5 py-1.5 text-[13px] text-status-danger hover:bg-status-danger-soft"
+                  className="flex min-h-8 w-full items-center gap-1.5 px-2.5 py-1.5 text-note text-status-danger hover:bg-status-danger-soft"
                 >
                   <Trash2 size={11} />
                   删除
@@ -458,7 +458,7 @@ function SessionRow({
               aria-label="确认删除"
               title="确认删除"
               onClick={onDelete}
-              className="inline-flex min-h-7 items-center rounded-md bg-status-danger-soft px-1.5 text-[11px] text-status-danger hover:brightness-95"
+              className="inline-flex min-h-7 items-center rounded-md bg-status-danger-soft px-1.5 text-caption text-status-danger hover:brightness-95"
             >
               删除
             </button>
@@ -467,7 +467,7 @@ function SessionRow({
               aria-label="取消删除"
               title="取消"
               onClick={() => setConfirming(false)}
-              className="inline-flex min-h-7 items-center rounded-md px-1.5 text-[11px] text-gray-500 hover:bg-surface-3"
+              className="inline-flex min-h-7 items-center rounded-md px-1.5 text-caption text-gray-500 hover:bg-surface-3"
             >
               取消
             </button>

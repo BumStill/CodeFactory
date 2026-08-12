@@ -115,12 +115,12 @@ function CustomModelsEditor({
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="flex w-full items-center justify-between text-[11px] text-gray-500 hover:text-gray-300"
+        className="flex w-full items-center justify-between text-caption text-gray-500 hover:text-gray-300"
       >
         <span>
           自定义模型
           {models.length > 0 && (
-            <span className="ml-1.5 text-[10px] text-gray-600">({models.length})</span>
+            <span className="ml-1.5 text-caption text-gray-600">({models.length})</span>
           )}
         </span>
         <ChevronDown
@@ -132,7 +132,7 @@ function CustomModelsEditor({
       {expanded && (
         <div className="space-y-1.5">
           {models.length === 0 && (
-            <div className="text-[11px] text-gray-600 italic">
+            <div className="text-caption text-gray-600 italic">
               暂无自定义模型。适用于不暴露 <code>/models</code> 的 LMStudio / Ollama / 私有网关。
             </div>
           )}
@@ -143,7 +143,7 @@ function CustomModelsEditor({
                 value={m.id}
                 onChange={(e) => updateAt(idx, { id: e.target.value })}
                 placeholder="模型 ID(例如 llama3.1:8b)"
-                className="flex-[2] bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
+                className="flex-[2] bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
               />
               <input
                 value={m.name ?? ""}
@@ -151,7 +151,7 @@ function CustomModelsEditor({
                   updateAt(idx, { name: e.target.value || undefined })
                 }
                 placeholder="显示名称(可选)"
-                className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
+                className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
               />
               <button
                 onClick={() => removeAt(idx)}
@@ -166,7 +166,7 @@ function CustomModelsEditor({
           <button
             type="button"
             onClick={addNew}
-            className="flex items-center gap-1 text-[11px] text-accent hover:text-accent-hover"
+            className="flex items-center gap-1 text-caption text-accent hover:text-accent-hover"
           >
             <Plus size={11} /> 添加模型
           </button>
@@ -221,16 +221,16 @@ function EndpointCard({
       }`}
     >
       <div className="flex items-center justify-between">
-        <span className="text-xs font-medium text-gray-200">{local.key}</span>
+        <span className="text-label font-medium text-gray-200">{local.key}</span>
         <div className="flex items-center gap-2">
           {isDefault ? (
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/20 text-accent">
+            <span className="text-caption px-1.5 py-0.5 rounded bg-accent/20 text-accent">
               默认
             </span>
           ) : (
             <button
               onClick={onSetDefault}
-              className="text-[10px] px-1.5 py-0.5 rounded border border-border text-gray-500 hover:text-gray-300 hover:border-gray-500 transition-colors"
+              className="text-caption px-1.5 py-0.5 rounded border border-border text-gray-500 hover:text-gray-300 hover:border-gray-500 transition-colors"
             >
               设为默认
             </button>
@@ -246,25 +246,25 @@ function EndpointCard({
 
       {/* Base URL */}
       <div className="space-y-1">
-        <label className="text-[11px] text-gray-500">基础 URL</label>
+        <label className="text-caption text-gray-500">基础 URL</label>
         <input
           value={local.base_url}
           onChange={(e) => setLocal({ ...local, base_url: e.target.value })}
           placeholder="https://openrouter.ai/api/v1"
-          className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
+          className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
         />
       </div>
 
       {/* API Key */}
       <div className="space-y-1">
-        <label className="text-[11px] text-gray-500">API 密钥</label>
+        <label className="text-caption text-gray-500">API 密钥</label>
         <div className="flex gap-1">
           <input
             type={showKey ? "text" : "password"}
             value={local.api_key}
             onChange={(e) => setLocal({ ...local, api_key: e.target.value })}
             placeholder={hasSavedKeyRef ? "已保存，输入新密钥以替换" : "sk-…"}
-            className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
+            className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
           />
           <button
             onClick={() => setShowKey((v) => !v)}
@@ -275,7 +275,7 @@ function EndpointCard({
             {showKey ? <EyeOff size={12} /> : <Eye size={12} />}
           </button>
         </div>
-        <p className="text-[11px] leading-4 text-gray-600">
+        <p className="text-caption leading-4 text-gray-600">
           {hasSavedKeyRef
             ? "已保存。macOS 同时保留权限为 0600 的本机可用性副本，避免每次使用都弹出密钥授权；输入新密钥可替换。"
             : "保存时写入系统凭据库；macOS 另存权限为 0600 的本机可用性副本。两者都不进入设置备份。"}
@@ -284,7 +284,7 @@ function EndpointCard({
 
       {/* API Style */}
       <div className="space-y-1">
-        <label className="text-[11px] text-gray-500">API 风格</label>
+        <label className="text-caption text-gray-500">API 风格</label>
         <div className="flex gap-3">
           {(["openai", "anthropic"] as ApiStyle[]).map((style) => (
             <label key={style} className="flex items-center gap-1.5 cursor-pointer">
@@ -294,7 +294,7 @@ function EndpointCard({
                 checked={local.api_style === style}
                 onChange={() => setLocal({ ...local, api_style: style })}
               />
-              <span className="text-xs text-gray-300">
+              <span className="text-label text-gray-300">
                 {style === "openai" ? "OpenAI 兼容" : "Anthropic Messages"}
               </span>
             </label>
@@ -313,7 +313,7 @@ function EndpointCard({
           <button
             onClick={handleSave}
             disabled={saving}
-            className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-xs text-white transition-colors disabled:opacity-50"
+            className="flex items-center gap-1 px-3 py-1 rounded bg-accent hover:bg-accent-hover text-label text-white transition-colors disabled:opacity-50"
           >
             {saved ? <><Check size={11} /> 已保存</> : saving ? "保存中…" : "保存"}
           </button>
@@ -354,36 +354,36 @@ function AddEndpointModal({
         className="w-96 rounded-xl border border-border bg-surface-2 shadow-2xl p-4 space-y-3"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className="text-sm font-semibold text-gray-200">添加端点</h3>
+        <h3 className="text-body font-semibold text-gray-200">添加端点</h3>
 
         <div className="space-y-1">
-          <label className="text-[11px] text-gray-500">名称(slug)</label>
+          <label className="text-caption text-gray-500">名称(slug)</label>
           <input
             autoFocus
             value={key}
             onChange={(e) => { setKey(e.target.value); setErr(""); }}
             placeholder="我的端点"
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
           />
         </div>
 
         <div className="space-y-1">
-          <label className="text-[11px] text-gray-500">基础 URL</label>
+          <label className="text-caption text-gray-500">基础 URL</label>
           <input
             value={url}
             onChange={(e) => { setUrl(e.target.value); setErr(""); }}
             placeholder="https://api.example.com/v1"
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1.5 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40"
           />
         </div>
 
         <div className="space-y-1">
-          <label className="text-[11px] text-gray-500">API 风格</label>
+          <label className="text-caption text-gray-500">API 风格</label>
           <div className="flex gap-3">
             {(["openai", "anthropic"] as ApiStyle[]).map((s) => (
               <label key={s} className="flex items-center gap-1.5 cursor-pointer">
                 <input type="radio" checked={style === s} onChange={() => setStyle(s)} />
-                <span className="text-xs text-gray-300">
+                <span className="text-label text-gray-300">
                   {s === "openai" ? "OpenAI 兼容" : "Anthropic Messages"}
                 </span>
               </label>
@@ -392,16 +392,16 @@ function AddEndpointModal({
         </div>
 
         {err && (
-          <div className="flex items-center gap-1 text-xs text-red-400">
+          <div className="flex items-center gap-1 text-label text-red-400">
             <AlertCircle size={12} /> {err}
           </div>
         )}
 
         <div className="flex justify-end gap-2 pt-1">
-          <button onClick={onClose} className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300">
+          <button onClick={onClose} className="px-3 py-1.5 rounded text-label text-gray-500 hover:text-gray-300">
             取消
           </button>
-          <button onClick={handleAdd} className="px-3 py-1.5 rounded bg-accent hover:bg-accent-hover text-xs text-white transition-colors">
+          <button onClick={handleAdd} className="px-3 py-1.5 rounded bg-accent hover:bg-accent-hover text-label text-white transition-colors">
             添加
           </button>
         </div>
@@ -488,7 +488,7 @@ export function SettingsPage({
 
   if (!settings || !generalDraft) {
     return (
-      <div className="flex h-full items-center justify-center text-xs text-gray-600">
+      <div className="flex h-full items-center justify-center text-label text-gray-600">
         正在加载设置…
       </div>
     );
@@ -642,11 +642,11 @@ export function SettingsPage({
         >
           <ArrowLeft size={14} />
         </button>
-        <span className="text-sm font-semibold">设置</span>
+        <span className="text-body font-semibold">设置</span>
         <button
           type="button"
           onClick={onBack}
-          className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-xs text-gray-400 hover:bg-surface-3 hover:text-gray-200"
+          className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-label text-gray-400 hover:bg-surface-3 hover:text-gray-200"
           aria-label="完成并返回工作区"
         >
           完成
@@ -663,7 +663,7 @@ export function SettingsPage({
         >
           {tabGroups.map((group) => (
             <div key={group.label} className="mb-4">
-              <div className="px-4 pb-1.5 text-[11px] font-semibold text-gray-500">
+              <div className="px-4 pb-1.5 text-caption font-semibold text-gray-500">
                 {group.label}
               </div>
               <div className="flex flex-col gap-0.5">
@@ -677,7 +677,7 @@ export function SettingsPage({
                     id={`settings-tab-${t.id}`}
                     onClick={() => setTab(t.id)}
                     title={t.description}
-                    className={`border-l-2 px-4 py-1.5 text-left text-[13px] transition-colors ${
+                    className={`border-l-2 px-4 py-1.5 text-left text-note transition-colors ${
                       tab === t.id
                         ? "border-accent bg-surface-2 text-gray-100"
                         : "border-transparent text-gray-400 hover:bg-surface-2 hover:text-gray-200"
@@ -699,8 +699,8 @@ export function SettingsPage({
           className="flex-1 overflow-y-auto p-5"
         >
           <div className="mb-5">
-            <h2 id="settings-page-title" className="text-base font-semibold text-gray-100">{activeTab.label}</h2>
-            <p className="mt-1 text-xs leading-5 text-gray-500">{activeTab.description}</p>
+            <h2 id="settings-page-title" className="text-title font-semibold text-gray-100">{activeTab.label}</h2>
+            <p className="mt-1 text-label leading-5 text-gray-500">{activeTab.description}</p>
           </div>
 
         {/* ── Product capabilities moved out of the Workspace toolbar ── */}
@@ -723,14 +723,14 @@ export function SettingsPage({
                 >
                   <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-surface-3 text-gray-300 group-hover:text-accent"><Icon size={16} /></span>
                   <span className="min-w-0 flex-1">
-                    <span className="block text-sm font-medium text-gray-100">{label}</span>
-                    <span className="mt-0.5 block text-[11px] leading-4 text-gray-400">{description}</span>
+                    <span className="block text-body font-medium text-gray-100">{label}</span>
+                    <span className="mt-0.5 block text-caption leading-4 text-gray-400">{description}</span>
                   </span>
                   <ArrowRight size={13} className="shrink-0 text-gray-500 group-hover:text-accent" />
                 </button>
               ))}
             </div>
-            <div className="rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-[11px] leading-5 text-gray-400">
+            <div className="rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-caption leading-5 text-gray-400">
               规范随当前代码库存在；任务计划与拆解由会话内部执行，不再提供独立工作台。
             </div>
           </section>
@@ -749,8 +749,8 @@ export function SettingsPage({
             <div className="rounded-lg border border-border bg-surface-1 p-3">
               <label className="flex items-center justify-between gap-4">
                 <span>
-                  <span className="block text-sm text-gray-200">新会话默认策略</span>
-                  <span className="mt-1 block text-xs leading-5 text-gray-500">
+                  <span className="block text-body text-gray-200">新会话默认策略</span>
+                  <span className="mt-1 block text-label leading-5 text-gray-500">
                     只影响之后创建的会话；已有会话继续使用自己的策略。
                   </span>
                 </span>
@@ -766,7 +766,7 @@ export function SettingsPage({
                         | "auto",
                     });
                   }}
-                  className="shrink-0 rounded border border-border bg-surface-3 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-accent/50"
+                  className="shrink-0 rounded border border-border bg-surface-3 px-2 py-1.5 text-label text-gray-200 outline-none focus:border-accent/50"
                 >
                   <option value="fixed">固定</option>
                   <option value="prefer">首选</option>
@@ -776,12 +776,12 @@ export function SettingsPage({
             </div>
 
             <div className="flex items-center justify-between mb-1">
-              <h2 className="text-xs font-semibold text-gray-400">
+              <h2 className="text-label font-semibold text-gray-400">
                 API 端点
               </h2>
               <button
                 onClick={() => setShowAddEp(true)}
-                className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors border border-border"
+                className="flex items-center gap-1 px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors border border-border"
               >
                 <Plus size={11} /> 添加端点
               </button>
@@ -805,7 +805,7 @@ export function SettingsPage({
               ))}
 
             {endpointDrafts.filter((d) => d.key !== CHATGPT_ENDPOINT_KEY).length === 0 && (
-              <p className="text-xs text-gray-600">尚未配置自定义 API 端点。</p>
+              <p className="text-label text-gray-600">尚未配置自定义 API 端点。</p>
             )}
 
             {showAddEp && (
@@ -825,14 +825,14 @@ export function SettingsPage({
         {tab === "general" && (
           <div className="max-w-2xl space-y-4">
 
-            <div className="rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-[11px] text-gray-500 leading-5">
+            <div className="rounded-lg border border-border bg-surface-1 px-3 py-2.5 text-caption text-gray-500 leading-5">
               <span className="text-gray-300 font-medium">当前模型</span> 现在按端点设置。
               在聊天顶栏的模型下拉菜单中选择——每个端点都会记住各自的选择。
               在 <span className="text-gray-300">端点</span> 标签页中管理端点。
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs text-gray-500">Shell</label>
+              <label className="text-label text-gray-500">Shell</label>
               <div className="flex gap-3">
                 {SHELL_OPTIONS.map((s) => (
                   <label key={s} className="flex items-center gap-1.5 cursor-pointer">
@@ -841,7 +841,7 @@ export function SettingsPage({
                       checked={generalDraft.shell === s}
                       onChange={() => setGeneralDraft({ ...generalDraft, shell: s })}
                     />
-                    <span className="text-xs text-gray-300">{s}</span>
+                    <span className="text-label text-gray-300">{s}</span>
                   </label>
                 ))}
               </div>
@@ -857,8 +857,8 @@ export function SettingsPage({
                 className="mt-0.5"
               />
               <span>
-                <span className="block text-xs font-medium text-gray-200">实现完成后自动创建 PR</span>
-                <span className="block text-xs leading-5 text-gray-500">
+                <span className="block text-label font-medium text-gray-200">实现完成后自动创建 PR</span>
+                <span className="block text-label leading-5 text-gray-500">
                   当规格实现成功完成时自动创建一个拉取请求。
                 </span>
               </span>
@@ -874,16 +874,16 @@ export function SettingsPage({
                 className="mt-0.5"
               />
               <span>
-                <span className="block text-xs font-medium text-gray-200">允许远程会话复盘（发送摘要到模型）</span>
-                <span className="block text-xs leading-5 text-gray-500">
+                <span className="block text-label font-medium text-gray-200">允许远程会话复盘（发送摘要到模型）</span>
+                <span className="block text-label leading-5 text-gray-500">
                   仅控制这一项：会话结束后把有限、脱敏的摘要发送到当前配置的模型以生成候选，默认关闭。本地跨会话挖掘与进化审查是确定性的、不发送任何数据，会话结束后始终自动运行——与此开关无关。
                 </span>
               </span>
             </label>
 
             <div className="space-y-1">
-              <label className="text-xs text-gray-500">默认思考强度</label>
-              <p className="text-[11px] leading-5 text-gray-600">
+              <label className="text-label text-gray-500">默认思考强度</label>
+              <p className="text-caption leading-5 text-gray-600">
                 适用于推理模型(ChatGPT / Codex)。每个会话可在聊天顶栏的模型行中单独覆盖。
               </p>
               <select
@@ -894,7 +894,7 @@ export function SettingsPage({
                     reasoning_effort: e.target.value as Settings["reasoning_effort"],
                   })
                 }
-                className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                className="rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
               >
                 {([
                   ["minimal", "最低"],
@@ -912,8 +912,8 @@ export function SettingsPage({
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs text-gray-500">并行任务上限</label>
-              <p className="text-[11px] leading-5 text-gray-600">
+              <label className="text-label text-gray-500">并行任务上限</label>
+              <p className="text-caption leading-5 text-gray-600">
                 任务分解后同时运行的子代理数量(1–8)。
               </p>
               <input
@@ -927,13 +927,13 @@ export function SettingsPage({
                     max_parallel_tasks: Number(e.target.value),
                   })
                 }
-                className="w-20 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                className="w-20 rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
               />
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs text-gray-500">子代理磁盘隔离</label>
-              <p className="text-[11px] leading-5 text-gray-600">
+              <label className="text-label text-gray-500">子代理磁盘隔离</label>
+              <p className="text-caption leading-5 text-gray-600">
                 worktree 模式下每个并行任务在独立的 git worktree
                 中工作,验证通过后才把改动合并回项目目录;冲突时项目目录保持原样,任务改动保留在分支上。非
                 git 项目自动回退到共享目录。
@@ -947,7 +947,7 @@ export function SettingsPage({
                       .value as NonNullable<Settings["subagent_isolation"]>,
                   })
                 }
-                className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                className="rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
               >
                 <option value="shared">共享目录(默认)</option>
                 <option value="worktree">Git worktree 隔离</option>
@@ -955,8 +955,8 @@ export function SettingsPage({
             </div>
 
             <div className="space-y-1">
-              <label className="text-xs text-gray-500">自动交付上限</label>
-              <p className="text-[11px] leading-5 text-gray-600">
+              <label className="text-label text-gray-500">自动交付上限</label>
+              <p className="text-caption leading-5 text-gray-600">
                 代码改动测试通过后，AI 自动把工作推进到哪一步为止。默认一路合并并创建正式发布；如果你想人工接管，可以把边界降到 PR 或 CI。正式发布只代表 release artifact 已创建，不代表部署或线上验证通过。合并/发布受远端分支保护与凭据权限约束；CodeFactory 会优先使用
                 「远程仓库」令牌，也会自动复用已登录的 GitHub CLI。
               </p>
@@ -969,7 +969,7 @@ export function SettingsPage({
                       .value as NonNullable<Settings["delivery_ceiling"]>,
                   })
                 }
-                className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                className="rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
               >
                 <option value="off">关闭(不自动交付)</option>
                 <option value="pr_only">提交 + 推送 + 开 PR</option>
@@ -982,12 +982,12 @@ export function SettingsPage({
             <section className="space-y-3 rounded-xl border border-border bg-surface-1 p-3" aria-labelledby="settings-im-title">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <h3 id="settings-im-title" className="text-sm font-semibold text-gray-100">手机通知</h3>
-                  <p className="mt-1 text-[11px] leading-5 text-gray-500">
+                  <h3 id="settings-im-title" className="text-body font-semibold text-gray-100">手机通知</h3>
+                  <p className="mt-1 text-caption leading-5 text-gray-500">
                     任务完成、失败或等待你批准时，推送到企业微信或飞书。
                   </p>
                 </div>
-                <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${
+                <span className={`shrink-0 rounded-full px-2 py-0.5 text-caption ${
                   generalDraft.im_webhook_url.trim()
                     ? "bg-green-500/10 text-green-700 dark:text-green-300"
                     : "bg-surface-3 text-gray-500"
@@ -996,7 +996,7 @@ export function SettingsPage({
                 </span>
               </div>
 
-              <div className="rounded-lg border border-border/70 bg-surface-2 px-3 py-2 text-[11px] leading-5 text-gray-500">
+              <div className="rounded-lg border border-border/70 bg-surface-2 px-3 py-2 text-caption leading-5 text-gray-500">
                 新的主路径不是让你手填 URL，而是选择 IM、完成授权/连接、自动发送诊断消息，成功后才保存绑定。
               </div>
 
@@ -1004,14 +1004,14 @@ export function SettingsPage({
                 <button
                   type="button"
                   onClick={() => setShowImBindingDialog(true)}
-                  className="rounded bg-accent px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-hover"
+                  className="rounded bg-accent px-3 py-1.5 text-label font-medium text-white hover:bg-accent-hover"
                 >
                   一键绑定 IM
                 </button>
                 <button
                   type="button"
                   onClick={() => setShowManualImWebhook((value) => !value)}
-                  className="rounded border border-border bg-surface-2 px-3 py-1.5 text-xs text-gray-300 hover:bg-surface-3"
+                  className="rounded border border-border bg-surface-2 px-3 py-1.5 text-label text-gray-300 hover:bg-surface-3"
                 >
                   高级：手动 Webhook
                 </button>
@@ -1019,7 +1019,7 @@ export function SettingsPage({
 
               {showManualImWebhook && (
                 <div className="space-y-2 rounded-lg border border-border/70 bg-surface-0 p-3">
-                  <p className="text-[11px] leading-5 text-gray-500">
+                  <p className="text-caption leading-5 text-gray-500">
                     仅在无法一键绑定时使用。保存前请确认机器人已经在目标群内。
                   </p>
                   <div className="flex items-center gap-2">
@@ -1031,7 +1031,7 @@ export function SettingsPage({
                           im_webhook_format: e.target.value as NonNullable<Settings["im_webhook_format"]>,
                         })
                       }
-                      className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                      className="rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
                     >
                       <option value="wecom">企业微信</option>
                       <option value="feishu">飞书</option>
@@ -1043,7 +1043,7 @@ export function SettingsPage({
                         setGeneralDraft({ ...generalDraft, im_webhook_url: e.target.value })
                       }
                       placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…"
-                      className="min-w-0 flex-1 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                      className="min-w-0 flex-1 rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
                       aria-label="IM Webhook 地址"
                     />
                   </div>
@@ -1060,17 +1060,17 @@ export function SettingsPage({
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div>
-                        <h3 id="im-binding-dialog-title" className="text-sm font-semibold text-gray-100">
+                        <h3 id="im-binding-dialog-title" className="text-body font-semibold text-gray-100">
                           绑定 IM 通知
                         </h3>
-                        <p className="mt-1 text-xs leading-5 text-gray-500">
+                        <p className="mt-1 text-label leading-5 text-gray-500">
                           CodeFactory 会先发送一条诊断消息，成功后才保存绑定。
                         </p>
                       </div>
                       <button
                         type="button"
                         onClick={() => setShowImBindingDialog(false)}
-                        className="rounded px-2 py-1 text-xs text-gray-500 hover:bg-surface-3 hover:text-gray-200"
+                        className="rounded px-2 py-1 text-label text-gray-500 hover:bg-surface-3 hover:text-gray-200"
                       >
                         关闭
                       </button>
@@ -1099,8 +1099,8 @@ export function SettingsPage({
                               : "border-border bg-surface-2"
                           }`}
                         >
-                          <span className="block text-sm font-medium text-gray-100">{provider.name}</span>
-                          <span className="mt-1 block text-[11px] leading-5 text-gray-500">
+                          <span className="block text-body font-medium text-gray-100">{provider.name}</span>
+                          <span className="mt-1 block text-caption leading-5 text-gray-500">
                             {provider.description}
                           </span>
                         </button>
@@ -1109,10 +1109,10 @@ export function SettingsPage({
 
                     {selectedImProvider && (
                       <div className="mt-3 space-y-2 rounded-lg border border-border/70 bg-surface-2 px-3 py-2">
-                        <h4 className="text-xs font-semibold text-gray-200">
+                        <h4 className="text-label font-semibold text-gray-200">
                           {selectedImProvider === "wecom" ? "企业微信绑定步骤" : "飞书绑定步骤"}
                         </h4>
-                        <ol className="space-y-1 text-[11px] leading-5 text-gray-500">
+                        <ol className="space-y-1 text-caption leading-5 text-gray-500">
                           <li>
                             {selectedImProvider === "wecom"
                               ? "1. 在企业微信群里添加群机器人。"
@@ -1131,7 +1131,7 @@ export function SettingsPage({
                               ? "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…"
                               : "https://open.feishu.cn/open-apis/bot/v2/hook/…"
                           }
-                          className="w-full rounded border border-border bg-surface-0 px-2 py-1 text-xs text-gray-300"
+                          className="w-full rounded border border-border bg-surface-0 px-2 py-1 text-label text-gray-300"
                           aria-label={
                             selectedImProvider === "wecom" ? "企业微信 Webhook 地址" : "飞书 Webhook 地址"
                           }
@@ -1139,7 +1139,7 @@ export function SettingsPage({
                       </div>
                     )}
 
-                    <div className="mt-3 rounded-lg border border-border/70 bg-surface-2 px-3 py-2 text-[11px] leading-5 text-gray-500">
+                    <div className="mt-3 rounded-lg border border-border/70 bg-surface-2 px-3 py-2 text-caption leading-5 text-gray-500">
                       下一步会打开对应 IM 的授权/机器人连接流程；如果当前环境不可用，再回退到高级 Webhook。
                     </div>
                   </div>
@@ -1148,8 +1148,8 @@ export function SettingsPage({
             </section>
 
             <div className="space-y-1">
-              <label className="text-xs text-gray-500">命令沙箱</label>
-              <p className="text-[11px] leading-5 text-gray-600">
+              <label className="text-label text-gray-500">命令沙箱</label>
+              <p className="text-caption leading-5 text-gray-600">
                 开启后,AI 执行的每条 shell 命令都在一次性 Docker
                 容器中运行,只挂载当前项目目录——本机其它文件对命令不可见。需要本机已安装并启动
                 Docker;项目目录需位于 Docker 文件共享范围内(默认包含用户目录)。
@@ -1163,7 +1163,7 @@ export function SettingsPage({
                       sandbox_mode: e.target.value as NonNullable<Settings["sandbox_mode"]>,
                     })
                   }
-                  className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                  className="rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
                 >
                   <option value="off">关闭(本机执行,默认)</option>
                   <option value="docker">Docker 容器隔离</option>
@@ -1175,7 +1175,7 @@ export function SettingsPage({
                       setGeneralDraft({ ...generalDraft, sandbox_image: e.target.value })
                     }
                     placeholder="ubuntu:24.04"
-                    className="w-44 rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300"
+                    className="w-44 rounded border border-border bg-surface-2 px-2 py-1 text-label text-gray-300"
                     aria-label="沙箱镜像"
                   />
                 )}
@@ -1185,7 +1185,7 @@ export function SettingsPage({
             <div className="flex justify-end">
               <button
                 onClick={handleSaveGeneral}
-                className="flex items-center gap-1 px-4 py-1.5 rounded bg-accent hover:bg-accent-hover text-xs text-white transition-colors"
+                className="flex items-center gap-1 px-4 py-1.5 rounded bg-accent hover:bg-accent-hover text-label text-white transition-colors"
               >
                 {generalSaved ? <><Check size={11} /> 已保存</> : "保存"}
               </button>
@@ -1256,21 +1256,21 @@ function BrowserSessionsTab() {
       <ChromiumFallbackPanel />
 
       <div className="flex items-start justify-between gap-4">
-        <p className="text-xs leading-5 text-gray-500">
+        <p className="text-label leading-5 text-gray-500">
           这里显示 CodeFactory 创建的自动化浏览器和已连接的用户 Chrome。结束受管会话会关闭自动化浏览器；断开连接只会停止控制，不会关闭你的普通 Chrome 窗口。
         </p>
         <button
           type="button"
           onClick={() => void load()}
           disabled={loading}
-          className="flex items-center gap-1 rounded border border-border bg-surface-1 px-2.5 py-1.5 text-xs text-gray-400 hover:text-gray-200 disabled:opacity-50"
+          className="flex items-center gap-1 rounded border border-border bg-surface-1 px-2.5 py-1.5 text-label text-gray-400 hover:text-gray-200 disabled:opacity-50"
         >
           <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           刷新
         </button>
       </div>
 
-      <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-xs leading-5 text-gray-400">
+      <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-label leading-5 text-gray-400">
         <div className="font-medium text-gray-200">读取普通 Chrome 登录态前的一次性设置</div>
         <div className="mt-1">
           在普通 Chrome 打开{" "}
@@ -1283,13 +1283,13 @@ function BrowserSessionsTab() {
       </div>
 
       {error && (
-        <div role="alert" className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+        <div role="alert" className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-label text-red-700 dark:text-red-300">
           {error}
         </div>
       )}
 
       {!loading && sessions.length === 0 && (
-        <div className="flex items-center gap-3 rounded-xl border border-border bg-surface-1 p-4 text-sm text-gray-400">
+        <div className="flex items-center gap-3 rounded-xl border border-border bg-surface-1 p-4 text-body text-gray-400">
           <PanelTop size={18} className="text-emerald-400" />
           当前没有活动的 CodeFactory 自动化浏览器。
         </div>
@@ -1308,16 +1308,16 @@ function BrowserSessionsTab() {
               }`}
             />
             <div className="min-w-0 flex-1">
-              <div className="truncate text-xs font-medium text-gray-200">
+              <div className="truncate text-label font-medium text-gray-200">
                 {session.task_id ? `任务 ${session.task_id}` : `会话 ${session.owner_session_id ?? "未知"}`}
               </div>
-              <div className="mt-1 text-[10px] text-gray-500">
+              <div className="mt-1 text-caption text-gray-500">
                 {session.kind === "attached_chrome" ? "用户 Chrome（复用现有登录）" : "CodeFactory 受管浏览器"}
               </div>
-              <div className="mt-1 truncate font-mono text-[10px] text-gray-500">
+              <div className="mt-1 truncate font-mono text-caption text-gray-500">
                 {session.session_id}
               </div>
-              <div className="mt-1 text-[10px] text-gray-500">
+              <div className="mt-1 text-caption text-gray-500">
                 最后活动：{new Date(session.updated_at_unix_secs * 1000).toLocaleString()}
               </div>
             </div>
@@ -1326,7 +1326,7 @@ function BrowserSessionsTab() {
               aria-label={`结束浏览器会话 ${session.session_id}`}
               onClick={() => void close(session.session_id)}
               disabled={closing === session.session_id}
-              className="rounded border border-red-500/30 px-2.5 py-1.5 text-xs text-red-700 hover:bg-red-500/10 disabled:opacity-50 dark:text-red-300"
+              className="rounded border border-red-500/30 px-2.5 py-1.5 text-label text-red-700 hover:bg-red-500/10 disabled:opacity-50 dark:text-red-300"
             >
               {closing === session.session_id
                 ? "正在结束…"
@@ -1388,27 +1388,27 @@ function HooksTab() {
   return (
     <div className="max-w-2xl space-y-3">
       <div className="flex items-center justify-between">
-        <h2 className="text-xs font-semibold text-gray-400">钩子</h2>
+        <h2 className="text-label font-semibold text-gray-400">钩子</h2>
         <button
           onClick={() => setAddOpen(true)}
           aria-label="打开添加钩子表单"
-          className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
+          className="flex items-center gap-1 px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
           <Plus size={11} /> 添加钩子
         </button>
       </div>
 
-      {hooks.length === 0 && <p className="text-xs text-gray-600">尚未配置钩子。</p>}
+      {hooks.length === 0 && <p className="text-label text-gray-600">尚未配置钩子。</p>}
 
       {hooks.map((hook) => (
         <div key={hook.id} className="rounded-lg border border-border bg-surface-1 px-3 py-2 space-y-1.5">
           <div className="flex items-center gap-2">
-            <span className="flex-1 text-xs font-medium text-gray-200 truncate">{hook.name}</span>
-            <span className="text-[10px] bg-surface-3 text-gray-500 px-1.5 py-0.5 rounded">{hook.event}</span>
+            <span className="flex-1 text-label font-medium text-gray-200 truncate">{hook.name}</span>
+            <span className="text-caption bg-surface-3 text-gray-500 px-1.5 py-0.5 rounded">{hook.event}</span>
             <button
               onClick={() => handleToggle(hook)}
               aria-label={`${hook.enabled ? "禁用" : "启用"}钩子 ${hook.name}`}
-              className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
+              className={`text-caption px-1.5 py-0.5 rounded transition-colors ${
                 hook.enabled ? "bg-accent/20 text-accent" : "bg-surface-3 text-gray-600"
               }`}
             >
@@ -1417,23 +1417,23 @@ function HooksTab() {
             <button
               onClick={() => handleTest(hook.id)}
               aria-label={`测试钩子 ${hook.name}`}
-              className="text-[10px] text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors"
+              className="text-caption text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors"
             >
               测试
             </button>
             <button
               onClick={() => handleDelete(hook.id)}
               aria-label={`删除钩子 ${hook.name}`}
-              className="text-[10px] text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
+              className="text-caption text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
             >
               <Trash2 size={10} />
             </button>
           </div>
-          <div className="text-[10px] text-gray-600 font-mono truncate">
+          <div className="text-caption text-gray-600 font-mono truncate">
             {hook.action.type}: {hook.action.path ?? hook.action.command ?? hook.action.event_name ?? hook.action.message_template ?? ""}
           </div>
           {testResult?.id === hook.id && (
-            <pre className="text-[10px] text-gray-400 bg-surface-3 rounded p-1.5 whitespace-pre-wrap max-h-20 overflow-y-auto">
+            <pre className="text-caption text-gray-400 bg-surface-3 rounded p-1.5 whitespace-pre-wrap max-h-20 overflow-y-auto">
               {testResult.result}
             </pre>
           )}
@@ -1488,44 +1488,44 @@ function AddHookForm({ onAdded, onCancel }: { onAdded: () => void; onCancel: () 
 
   return (
     <div className="rounded-lg border border-accent/30 bg-surface-1 p-3 space-y-2.5">
-      <p className="text-xs font-medium text-gray-300">新建钩子</p>
+      <p className="text-label font-medium text-gray-300">新建钩子</p>
       <div className="grid grid-cols-2 gap-2">
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">名称</label>
+          <label className="block text-caption text-gray-500 mb-0.5">名称</label>
           <input aria-label="名称" value={name} onChange={(e) => setName(e.target.value)} placeholder="我的钩子"
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">事件</label>
+          <label className="block text-caption text-gray-500 mb-0.5">事件</label>
           <select aria-label="事件" value={event} onChange={(e) => setEvent(e.target.value)}
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 outline-none">
             {HOOK_EVENTS.map((ev) => <option key={ev} value={ev}>{ev}</option>)}
           </select>
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">动作类型</label>
+          <label className="block text-caption text-gray-500 mb-0.5">动作类型</label>
           <select aria-label="动作类型" value={actionType} onChange={(e) => setActionType(e.target.value as HookActionType)}
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 outline-none">
             {HOOK_ACTIONS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
           </select>
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">过滤器(可选)</label>
+          <label className="block text-caption text-gray-500 mb-0.5">过滤器(可选)</label>
           <input aria-label="过滤器(可选)" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="例如 bash"
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div className="col-span-2">
-          <label className="block text-[10px] text-gray-500 mb-0.5">{currentAction?.label ?? "参数"}</label>
+          <label className="block text-caption text-gray-500 mb-0.5">{currentAction?.label ?? "参数"}</label>
           <input aria-label={currentAction?.label ?? "参数"} value={actionParam} onChange={(e) => setActionParam(e.target.value)}
             placeholder={currentAction?.placeholder ?? ""}
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
       </div>
-      {err && <p className="text-xs text-red-400">{err}</p>}
+      {err && <p className="text-label text-red-400">{err}</p>}
       <div className="flex justify-end gap-2">
-        <button onClick={onCancel} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300">取消</button>
+        <button onClick={onCancel} className="px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300">取消</button>
         <button onClick={handleSave} disabled={saving}
-          className="px-2 py-1 rounded bg-accent hover:bg-accent-hover text-xs text-white disabled:opacity-50 transition-colors">
+          className="px-2 py-1 rounded bg-accent hover:bg-accent-hover text-label text-white disabled:opacity-50 transition-colors">
           {saving ? "添加中…" : "添加钩子"}
         </button>
       </div>
@@ -1564,21 +1564,21 @@ function RemotesTab() {
   return (
     <div className="max-w-2xl space-y-3">
       <div className="flex items-center justify-between">
-        <h2 className="text-xs font-semibold text-gray-400">
+        <h2 className="text-label font-semibold text-gray-400">
           Git 远程仓库(GitHub / GitLab)
         </h2>
         <button
           onClick={() => setAddOpen(true)}
           aria-label="打开添加远程仓库表单"
-          className="flex items-center gap-1 px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
+          className="flex items-center gap-1 px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300 hover:bg-surface-3 border border-border transition-colors"
         >
           <Plus size={11} /> 添加远程仓库
         </button>
       </div>
 
-      <div className="rounded-lg border border-border bg-surface-1 px-3 py-2 text-xs">
+      <div className="rounded-lg border border-border bg-surface-1 px-3 py-2 text-label">
         {githubCli?.authenticated ? (
-          <p className="text-green-400">✓ 已登录 GitHub CLI；PR 交付会自动复用该凭据，无需重复配置 token。</p>
+          <p className="text-green-400">✓ 已登录 GitHub CLI；PR 交付会自动复用该凭据，无需重复配置 Token。</p>
         ) : githubCli?.installed ? (
           <p className="text-amber-400">GitHub CLI 尚未登录；运行 gh auth login，或添加远程仓库令牌。</p>
         ) : (
@@ -1587,20 +1587,20 @@ function RemotesTab() {
       </div>
 
       {remotes.length === 0 && githubCli && !githubCli.authenticated && (
-        <p className="text-xs text-gray-600">尚无可用的远程仓库凭据。</p>
+        <p className="text-label text-gray-600">尚无可用的远程仓库凭据。</p>
       )}
 
       {remotes.map((remote: GitRemoteConfig) => (
         <div key={remote.id} className="rounded-lg border border-border bg-surface-1 px-3 py-2 space-y-1.5">
           <div className="flex items-center gap-2">
-            <span className={`text-[9px] px-1.5 py-0.5 rounded font-medium ${
+            <span className={`text-caption px-1.5 py-0.5 rounded font-medium ${
               remote.provider === "github" ? "bg-gray-700 text-gray-200" : "bg-orange-900 text-orange-200"
             }`}>
               {remote.provider}
             </span>
-            <span className="flex-1 text-xs font-medium text-gray-200 truncate">{remote.name}</span>
+            <span className="flex-1 text-label font-medium text-gray-200 truncate">{remote.name}</span>
             {remote.default_repo && (
-              <span className="text-[10px] text-gray-600 font-mono truncate max-w-[120px]">
+              <span className="text-caption text-gray-600 font-mono truncate max-w-[120px]">
                 {remote.default_repo}
               </span>
             )}
@@ -1608,20 +1608,20 @@ function RemotesTab() {
               onClick={() => handleTest(remote.id)}
               disabled={testing === remote.id}
               aria-label={`测试远程仓库 ${remote.name}`}
-              className="text-[10px] text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors disabled:opacity-50"
+              className="text-caption text-gray-600 hover:text-gray-300 px-1.5 py-0.5 rounded hover:bg-surface-3 transition-colors disabled:opacity-50"
             >
               {testing === remote.id ? "…" : "测试"}
             </button>
             <button
               onClick={() => deleteRemote(remote.id)}
               aria-label={`删除远程仓库 ${remote.name}`}
-              className="text-[10px] text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
+              className="text-caption text-red-700 hover:text-red-400 px-1.5 py-0.5 rounded transition-colors"
             >
               <Trash2 size={10} />
             </button>
           </div>
           {testResults[remote.id] && (
-            <div className={`text-[10px] px-1 ${testResults[remote.id].startsWith("✓") ? "text-green-400" : "text-red-400"}`}>
+            <div className={`text-caption px-1 ${testResults[remote.id].startsWith("✓") ? "text-green-400" : "text-red-400"}`}>
               {testResults[remote.id]}
             </div>
           )}
@@ -1684,32 +1684,32 @@ function AddRemoteForm({
 
   return (
     <div className="rounded-lg border border-accent/30 bg-surface-1 p-3 space-y-2.5">
-      <p className="text-xs font-medium text-gray-300">新建远程仓库</p>
+      <p className="text-label font-medium text-gray-300">新建远程仓库</p>
       <div className="grid grid-cols-2 gap-2">
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">名称</label>
+          <label className="block text-caption text-gray-500 mb-0.5">名称</label>
           <input aria-label="名称" value={name} onChange={(e) => setName(e.target.value)} placeholder="我的 GitHub"
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
         <div>
-          <label className="block text-[10px] text-gray-500 mb-0.5">提供商</label>
+          <label className="block text-caption text-gray-500 mb-0.5">提供商</label>
           <select aria-label="提供商" value={provider} onChange={(e) => handleProviderChange(e.target.value as GitProvider)}
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none">
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 outline-none">
             <option value="github">GitHub</option>
             <option value="gitlab">GitLab</option>
           </select>
         </div>
         <div className="col-span-2">
-          <label className="block text-[10px] text-gray-500 mb-0.5">基础 URL</label>
+          <label className="block text-caption text-gray-500 mb-0.5">基础 URL</label>
           <input aria-label="基础 URL" value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 outline-none focus:border-accent/40" />
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 outline-none focus:border-accent/40" />
         </div>
         <div className="col-span-2">
-          <label className="block text-[10px] text-gray-500 mb-0.5">个人访问令牌</label>
+          <label className="block text-caption text-gray-500 mb-0.5">个人访问令牌</label>
           <div className="flex gap-1">
             <input aria-label="个人访问令牌" type={showToken ? "text" : "password"} value={token} onChange={(e) => setToken(e.target.value)}
               placeholder="ghp_…"
-              className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
+              className="flex-1 bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
             <button onClick={() => setShowToken((v) => !v)}
               className="p-1 rounded border border-border text-gray-500 hover:text-gray-300">
               {showToken ? <EyeOff size={12} /> : <Eye size={12} />}
@@ -1717,16 +1717,16 @@ function AddRemoteForm({
           </div>
         </div>
         <div className="col-span-2">
-          <label className="block text-[10px] text-gray-500 mb-0.5">默认仓库(可选)</label>
+          <label className="block text-caption text-gray-500 mb-0.5">默认仓库(可选)</label>
           <input aria-label="默认仓库(可选)" value={defaultRepo} onChange={(e) => setDefaultRepo(e.target.value)} placeholder="owner/repo"
-            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
+            className="w-full bg-surface-3 border border-border rounded px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/40" />
         </div>
       </div>
-      {err && <p className="text-xs text-red-400">{err}</p>}
+      {err && <p className="text-label text-red-400">{err}</p>}
       <div className="flex justify-end gap-2">
-        <button onClick={onCancel} className="px-2 py-1 rounded text-xs text-gray-500 hover:text-gray-300">取消</button>
+        <button onClick={onCancel} className="px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300">取消</button>
         <button onClick={handleSave} disabled={saving}
-          className="px-2 py-1 rounded bg-accent hover:bg-accent-hover text-xs text-white disabled:opacity-50 transition-colors">
+          className="px-2 py-1 rounded bg-accent hover:bg-accent-hover text-label text-white disabled:opacity-50 transition-colors">
           {saving ? "添加中…" : "添加远程仓库"}
         </button>
       </div>
@@ -1760,13 +1760,13 @@ function AppearanceTab() {
 
       {/* Theme */}
       <div>
-        <h2 className="text-xs font-semibold text-gray-400 mb-3">主题</h2>
+        <h2 className="text-label font-semibold text-gray-400 mb-3">主题</h2>
         <div className="flex gap-2">
           {themeOptions.map(({ value, Icon, label }) => (
             <button
               key={value}
               onClick={() => setTheme(value)}
-              className={`flex flex-col items-center gap-1.5 px-4 py-3 rounded-lg border transition-colors text-xs font-medium flex-1 ${
+              className={`flex flex-col items-center gap-1.5 px-4 py-3 rounded-lg border transition-colors text-label font-medium flex-1 ${
                 settings.theme === value
                   ? "border-accent bg-surface-3 text-accent"
                   : "border-border bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-300"
@@ -1781,13 +1781,13 @@ function AppearanceTab() {
 
       {/* Font family */}
       <div>
-        <h2 className="text-xs font-semibold text-gray-400 mb-3">字体</h2>
+        <h2 className="text-label font-semibold text-gray-400 mb-3">字体</h2>
         <div className="flex flex-col gap-2">
           {Object.entries(FONT_FAMILY_LABELS).map(([key, label]) => (
             <button
               key={key}
               onClick={() => setFontFamily(key)}
-              className={`flex items-center justify-between px-3 py-2 rounded-lg border text-xs transition-colors ${
+              className={`flex items-center justify-between px-3 py-2 rounded-lg border text-label transition-colors ${
                 settings.font_family === key
                   ? "border-accent bg-surface-3 text-gray-200"
                   : "border-border bg-surface-2 text-gray-400 hover:border-gray-500 hover:text-gray-300"
@@ -1807,11 +1807,11 @@ function AppearanceTab() {
 
       {/* Font size */}
       <div>
-        <h2 className="text-xs font-semibold text-gray-400 mb-3">
+        <h2 className="text-label font-semibold text-gray-400 mb-3">
           字号 <span className="text-gray-300 font-mono normal-case font-normal ml-1">{settings.font_size}px</span>
         </h2>
         <div className="flex items-center gap-3">
-          <span className="text-xs text-gray-500 w-6 text-right">{FONT_SIZE_MIN}</span>
+          <span className="text-label text-gray-500 w-6 text-right">{FONT_SIZE_MIN}</span>
           <input
             type="range"
             min={FONT_SIZE_MIN}
@@ -1821,9 +1821,9 @@ function AppearanceTab() {
             onChange={(e) => setFontSize(Number(e.target.value))}
             className="flex-1 accent-accent"
           />
-          <span className="text-xs text-gray-500 w-6">{FONT_SIZE_MAX}</span>
+          <span className="text-label text-gray-500 w-6">{FONT_SIZE_MAX}</span>
         </div>
-        <p className="mt-2 text-xs text-gray-500" style={{ fontSize: settings.font_size }}>
+        <p className="mt-2 text-label text-gray-500" style={{ fontSize: settings.font_size }}>
           预览：这是 {settings.font_size}px 的正文文字效果
         </p>
       </div>
@@ -1899,13 +1899,13 @@ function BrowserBridgePanel() {
     <div className="space-y-2.5 rounded-lg border border-border bg-surface-1 p-3">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <p className="text-sm text-gray-200">读取你自己浏览器里已打开的页面</p>
-          <p className="mt-0.5 text-xs leading-5 text-gray-500">
+          <p className="text-body text-gray-200">读取你自己浏览器里已打开的页面</p>
+          <p className="mt-0.5 text-label leading-5 text-gray-500">
             装上 CodeFactory 扩展后,agent 就能读你已经登录的站点——不用在别的浏览器里重新登录一次。
           </p>
         </div>
         <span
-          className={`shrink-0 rounded-full px-2 py-0.5 text-[11px] ${
+          className={`shrink-0 rounded-full px-2 py-0.5 text-caption ${
             state?.connected
               ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
               : "bg-surface-3 text-gray-500"
@@ -1915,28 +1915,28 @@ function BrowserBridgePanel() {
         </span>
       </div>
 
-      {error && <p className="text-xs leading-5 text-rose-500">{error}</p>}
+      {error && <p className="text-label leading-5 text-rose-500">{error}</p>}
 
       {state?.connected ? (
-        <p className="text-xs leading-5 text-gray-500">
+        <p className="text-label leading-5 text-gray-500">
           扩展已连接,配对信息由 CodeFactory 自动维护——重启后会自己恢复,不需要再填端口或配对码。
         </p>
       ) : (
         state && (
           <>
-            <p className="text-xs leading-5 text-gray-500">
+            <p className="text-label leading-5 text-gray-500">
               扩展已准备好(配对信息已经写进去了,不用复制任何东西)。只剩 Chrome 那一步:开启
               「开发者模式」→ 点「加载已解压的扩展程序」→ 选下面这个目录。
             </p>
 
             <div className="flex items-center gap-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
-              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-gray-300">
+              <span className="min-w-0 flex-1 truncate font-mono text-caption text-gray-300">
                 {state.dir}
               </span>
               <button
                 type="button"
                 onClick={() => void copy("dir", state.dir)}
-                className="shrink-0 rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+                className="shrink-0 rounded border border-border px-2 py-0.5 text-caption text-gray-400 hover:text-gray-200"
               >
                 {copied === "dir" ? "已复制" : "复制路径"}
               </button>
@@ -1946,22 +1946,22 @@ function BrowserBridgePanel() {
               <button
                 type="button"
                 onClick={() => void run("browser_open_extensions_page", "打不开 Chrome 扩展页：")}
-                className="rounded bg-accent px-2.5 py-1 text-xs text-white hover:bg-accent-hover"
+                className="rounded bg-accent px-2.5 py-1 text-label text-white hover:bg-accent-hover"
               >
                 打开 Chrome 扩展页
               </button>
               <button
                 type="button"
                 onClick={() => void run("browser_extension_reveal", "打不开文件夹：")}
-                className="rounded border border-border px-2.5 py-1 text-xs text-gray-300 hover:text-gray-100"
+                className="rounded border border-border px-2.5 py-1 text-label text-gray-300 hover:text-gray-100"
               >
                 打开扩展文件夹
               </button>
             </div>
 
-            {notice && <p className="text-xs leading-5 text-amber-500">{notice}</p>}
+            {notice && <p className="text-label leading-5 text-amber-500">{notice}</p>}
 
-            <details className="text-xs text-gray-500">
+            <details className="text-label text-gray-500">
               <summary className="cursor-pointer">手动配对(一般不需要)</summary>
               <div className="mt-2 grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
                 <span className="text-gray-500">端口</span>
@@ -1969,7 +1969,7 @@ function BrowserBridgePanel() {
                 <button
                   type="button"
                   onClick={() => void copy("port", String(state.port))}
-                  className="rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+                  className="rounded border border-border px-2 py-0.5 text-caption text-gray-400 hover:text-gray-200"
                 >
                   {copied === "port" ? "已复制" : "复制"}
                 </button>
@@ -1979,7 +1979,7 @@ function BrowserBridgePanel() {
                 <button
                   type="button"
                   onClick={() => void copy("token", state.token)}
-                  className="rounded border border-border px-2 py-0.5 text-[11px] text-gray-400 hover:text-gray-200"
+                  className="rounded border border-border px-2 py-0.5 text-caption text-gray-400 hover:text-gray-200"
                 >
                   {copied === "token" ? "已复制" : "复制"}
                 </button>
@@ -2049,7 +2049,7 @@ function ChromiumFallbackPanel() {
 
   if (status && !status.supported) {
     return (
-      <div className="rounded-lg border border-border bg-surface-1 p-3 text-xs text-gray-500">
+      <div className="rounded-lg border border-border bg-surface-1 p-3 text-label text-gray-500">
         这个平台没有可用的 Chromium 构建,只能使用扩展方式。
       </div>
     );
@@ -2059,22 +2059,22 @@ function ChromiumFallbackPanel() {
     <div className="space-y-2 rounded-lg border border-border bg-surface-1 p-3">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <p className="text-sm text-gray-200">备用:CodeFactory 自带的浏览器</p>
-          <p className="mt-0.5 text-xs leading-5 text-gray-500">
+          <p className="text-body text-gray-200">备用:CodeFactory 自带的浏览器</p>
+          <p className="mt-0.5 text-label leading-5 text-gray-500">
             没装扩展时用这个。不需要动你的浏览器,代价是要在它里面登录一次。约 150 MB,只下一次。
           </p>
         </div>
         {status?.installed ? (
-          <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[11px] text-emerald-700 dark:text-emerald-400">
+          <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-caption text-emerald-700 dark:text-emerald-400">
             已就绪
           </span>
         ) : null}
       </div>
 
       {status?.installed ? (
-        <p className="text-xs text-gray-600">版本 {status.version}</p>
+        <p className="text-label text-gray-600">版本 {status.version}</p>
       ) : progress ? (
-        <p className="flex items-center gap-1.5 text-xs text-gray-400">
+        <p className="flex items-center gap-1.5 text-label text-gray-400">
           <RefreshCw size={11} className="animate-spin" />
           {progress}
         </p>
@@ -2082,13 +2082,13 @@ function ChromiumFallbackPanel() {
         <button
           type="button"
           onClick={() => void download()}
-          className="rounded bg-accent px-2.5 py-1 text-xs text-white hover:bg-accent-hover"
+          className="rounded bg-accent px-2.5 py-1 text-label text-white hover:bg-accent-hover"
         >
           {status?.needs_repair ? "重新下载(修复)" : "下载浏览器"}
         </button>
       )}
 
-      {error && <p className="text-xs leading-5 text-rose-500">{error}</p>}
+      {error && <p className="text-label leading-5 text-rose-500">{error}</p>}
     </div>
   );
 }
@@ -2231,23 +2231,23 @@ function ChatGptLoginCard() {
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
-              <p className="text-sm text-gray-200">使用 ChatGPT 登录</p>
+              <p className="text-body text-gray-200">使用 ChatGPT 登录</p>
               <span
-                className="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[9px] text-amber-700 dark:text-amber-400"
+                className="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-caption text-amber-700 dark:text-amber-400"
                 title="OpenAI 未提供第三方应用使用 ChatGPT 订阅的官方通道"
               >
                 非官方通道
               </span>
             </div>
             {account === undefined ? (
-              <p className="text-xs text-gray-600">检查登录状态…</p>
+              <p className="text-label text-gray-600">检查登录状态…</p>
             ) : loggedIn ? (
-              <p className="truncate text-xs text-gray-500">
+              <p className="truncate text-label text-gray-500">
                 已登录{account.email ? `：${account.email}` : ""}
                 {account.plan ? ` · ${account.plan}` : ""}
               </p>
             ) : (
-              <p className="text-xs text-gray-600">
+              <p className="text-label text-gray-600">
                 用 ChatGPT Plus/Pro 订阅，免去手动填 API Key
               </p>
             )}
@@ -2258,7 +2258,7 @@ function ChatGptLoginCard() {
           <div className="flex shrink-0 items-center gap-2">
             {isDefault ? (
               <span
-                className="rounded-full bg-accent/15 px-2 py-0.5 text-[11px] text-accent"
+                className="rounded-full bg-accent/15 px-2 py-0.5 text-caption text-accent"
                 title="当前模型请求走 ChatGPT 订阅"
               >
                 默认
@@ -2267,7 +2267,7 @@ function ChatGptLoginCard() {
               <button
                 onClick={handleSetDefault}
                 disabled={busy}
-                className="rounded border border-border px-2.5 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
+                className="rounded border border-border px-2.5 py-1 text-label text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
                 title="把模型请求切到 ChatGPT 订阅"
               >
                 设为默认
@@ -2276,7 +2276,7 @@ function ChatGptLoginCard() {
             <button
               onClick={handleLogout}
               disabled={busy}
-              className="flex items-center gap-1.5 rounded border border-border px-2.5 py-1 text-xs text-gray-400 transition-colors hover:bg-surface-3 disabled:opacity-50"
+              className="flex items-center gap-1.5 rounded border border-border px-2.5 py-1 text-label text-gray-400 transition-colors hover:bg-surface-3 disabled:opacity-50"
             >
               <LogOut size={12} /> 退出登录
             </button>
@@ -2285,7 +2285,7 @@ function ChatGptLoginCard() {
           <button
             onClick={handleLogin}
             disabled={busy}
-            className="flex shrink-0 items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-xs text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
+            className="flex shrink-0 items-center gap-1.5 rounded bg-accent px-2.5 py-1 text-label text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
             {busy ? <RefreshCw size={12} className="animate-spin" /> : <LogIn size={12} />}
             {busy ? "正在准备验证…" : flow?.status === "expired" ? "生成新的验证链接" : "登录"}
@@ -2296,14 +2296,14 @@ function ChatGptLoginCard() {
       {flowActive && !loggedIn && (
         <div role="status" aria-live="polite" className="space-y-2 rounded-md border border-border/70 bg-surface-2 p-2.5">
           <div>
-            <p className="text-xs font-medium text-gray-200">
+            <p className="text-label font-medium text-gray-200">
               {flow.status === "exchanging" ? "正在完成 ChatGPT 验证" : "在浏览器中完成 ChatGPT 验证"}
             </p>
-            <p className="mt-1 text-xs leading-5 text-gray-500">
+            <p className="mt-1 text-label leading-5 text-gray-500">
               若浏览器没有自动打开，可手动打开或复制同一条验证链接。
             </p>
             {flow.browser_open_error && (
-              <p className="mt-1 text-xs leading-5 text-amber-700 dark:text-amber-300">
+              <p className="mt-1 text-label leading-5 text-amber-700 dark:text-amber-300">
                 自动打开失败：{flow.browser_open_error}
               </p>
             )}
@@ -2313,14 +2313,14 @@ function ChatGptLoginCard() {
               type="button"
               onClick={() => void handleOpenLogin()}
               disabled={flow.status === "exchanging"}
-              className="rounded bg-accent px-2.5 py-1.5 text-xs text-white disabled:opacity-50"
+              className="rounded bg-accent px-2.5 py-1.5 text-label text-white disabled:opacity-50"
             >
               打开验证页面
             </button>
             <button
               type="button"
               onClick={() => void handleCopyLogin()}
-              className="rounded border border-border px-2.5 py-1.5 text-xs text-gray-300 hover:bg-surface-3"
+              className="rounded border border-border px-2.5 py-1.5 text-label text-gray-300 hover:bg-surface-3"
             >
               {copied ? "已复制" : "复制链接"}
             </button>
@@ -2328,7 +2328,7 @@ function ChatGptLoginCard() {
               type="button"
               onClick={() => void handleCancelLogin()}
               disabled={busy || flow.status === "exchanging"}
-              className="rounded px-2.5 py-1.5 text-xs text-gray-500 hover:bg-surface-3 hover:text-gray-300 disabled:opacity-50"
+              className="rounded px-2.5 py-1.5 text-label text-gray-500 hover:bg-surface-3 hover:text-gray-300 disabled:opacity-50"
             >
               取消
             </button>
@@ -2336,7 +2336,7 @@ function ChatGptLoginCard() {
         </div>
       )}
       {error && (
-        <p className="flex items-start gap-1.5 text-xs leading-5 text-rose-500">
+        <p className="flex items-start gap-1.5 text-label leading-5 text-rose-500">
           <AlertCircle size={12} className="mt-0.5 shrink-0" /> {error}
         </p>
       )}
@@ -2346,7 +2346,7 @@ function ChatGptLoginCard() {
           path for third-party apps to spend a user's subscription. This login
           works, but it is not a supported channel and can stop working without
           notice — say so where the user decides, not in a changelog. */}
-      <p className="flex items-start gap-1.5 border-t border-border/70 pt-2 text-[11px] leading-5 text-gray-500">
+      <p className="flex items-start gap-1.5 border-t border-border/70 pt-2 text-caption leading-5 text-gray-500">
         <AlertCircle size={11} className="mt-0.5 shrink-0 text-amber-600 dark:text-amber-500" />
         <span>
           这是<span className="text-gray-400">非官方通道</span>：OpenAI 只为自家 Codex
@@ -2375,19 +2375,19 @@ function UpdateStatusLine({
   switch (phase.kind) {
     case "idle":
       return (
-        <p className="text-xs text-gray-500">
+        <p className="text-label text-gray-500">
           点击「检查更新」以查看是否有新版本。
         </p>
       );
     case "checking":
       return (
-        <p className="flex items-center gap-1.5 text-xs text-gray-400">
+        <p className="flex items-center gap-1.5 text-label text-gray-400">
           <RefreshCw size={12} className="animate-spin" /> 正在检查最新版本…
         </p>
       );
     case "up_to_date":
       return (
-        <p className="flex flex-wrap items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
+        <p className="flex flex-wrap items-center gap-1.5 text-label text-emerald-700 dark:text-emerald-400">
           <Check size={12} />
           已是最新版本{currentVersion ? ` (v${currentVersion})` : ""}。
           <span className="text-gray-600">
@@ -2398,29 +2398,29 @@ function UpdateStatusLine({
     case "available":
       return (
         <div className="space-y-2">
-          <p className="flex items-center gap-1.5 text-xs text-accent">
+          <p className="flex items-center gap-1.5 text-label text-accent">
             <Download size={12} /> 发现新版本{" "}
             <span className="font-semibold">v{phase.update.version}</span>
           </p>
           {phase.update.body && (
-            <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap rounded bg-surface-3 p-2 text-[11px] leading-relaxed text-gray-400">
+            <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap rounded bg-surface-3 p-2 text-caption leading-relaxed text-gray-400">
               {phase.update.body}
             </pre>
           )}
           <button
             onClick={onInstall}
-            className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs text-white transition-colors hover:bg-accent-hover"
+            className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label text-white transition-colors hover:bg-accent-hover"
           >
             <Download size={12} /> 下载并安装
           </button>
-          <p className="text-[11px] text-gray-600">安装完成后应用会自动重启。</p>
+          <p className="text-caption text-gray-600">安装完成后应用会自动重启。</p>
         </div>
       );
     case "downloading": {
       const pct = phase.total ? Math.round((phase.received / phase.total) * 100) : 0;
       return (
         <div className="space-y-1.5">
-          <p className="flex items-center gap-1.5 text-xs text-accent">
+          <p className="flex items-center gap-1.5 text-label text-accent">
             <RefreshCw size={12} className="animate-spin" />
             正在下载…{" "}
             {phase.total ? `${pct}%` : `${(phase.received / 1024 / 1024).toFixed(1)} MB`}
@@ -2436,30 +2436,30 @@ function UpdateStatusLine({
     }
     case "installing":
       return (
-        <p className="flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
+        <p className="flex items-center gap-1.5 text-label text-emerald-700 dark:text-emerald-400">
           <RefreshCw size={12} className="animate-spin" /> 正在安装…
         </p>
       );
     case "waiting_for_safe_restart":
       return (
-        <div className="space-y-1.5 text-xs text-amber-700 dark:text-amber-300">
+        <div className="space-y-1.5 text-label text-amber-700 dark:text-amber-300">
           <p className="flex items-center gap-1.5">
             <RefreshCw size={12} /> 更新已下载，等待本地 session 安全结束。
           </p>
-          <p className="text-[11px] text-gray-600">
+          <p className="text-caption text-gray-600">
             当前 {countUpdateBlockers(phase.blockers)} 项工作仍在运行；归零后自动安装并重启，无需再次点击。
           </p>
         </div>
       );
     case "ready":
       return (
-        <p className="flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
+        <p className="flex items-center gap-1.5 text-label text-emerald-700 dark:text-emerald-400">
           <Check size={12} /> 安装完成，即将重启…
         </p>
       );
     case "error":
       return (
-        <p className="flex items-start gap-1.5 text-xs text-rose-500">
+        <p className="flex items-start gap-1.5 text-label text-rose-500">
           <AlertCircle size={12} className="mt-0.5 shrink-0" />
           检查更新失败：{phase.message}
         </p>
@@ -2500,8 +2500,8 @@ function AboutTab() {
           <Package size={22} />
         </div>
         <div>
-          <h2 className="text-base font-semibold text-gray-100">CodeFactory</h2>
-          <p className="font-mono text-xs text-gray-500">
+          <h2 className="text-title font-semibold text-gray-100">CodeFactory</h2>
+          <p className="font-mono text-label text-gray-500">
             {currentVersion ? `v${currentVersion}` : "版本加载中…"}
           </p>
         </div>
@@ -2510,13 +2510,13 @@ function AboutTab() {
       {/* Update card */}
       <div className="space-y-3 rounded-lg border border-border bg-surface-1 p-4">
         <div className="flex items-center justify-between">
-          <span className="text-xs font-semibold text-gray-400">
+          <span className="text-label font-semibold text-gray-400">
             软件更新
           </span>
           <button
             onClick={() => void checkNow()}
             disabled={busy}
-            className="flex items-center gap-1.5 rounded border border-border px-3 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
+            className="flex items-center gap-1.5 rounded border border-border px-3 py-1 text-label text-gray-300 transition-colors hover:bg-surface-3 disabled:opacity-50"
           >
             <RefreshCw size={12} className={phase.kind === "checking" ? "animate-spin" : ""} />
             {phase.kind === "checking" ? "检查中…" : "检查更新"}
@@ -2533,16 +2533,16 @@ function AboutTab() {
       {/* Project link — opens the repo in the system browser (never in-webview) */}
       <button
         onClick={() => void invoke("plugin:shell|open", { path: REPO_URL }).catch(() => {})}
-        className="flex w-full items-center gap-2 rounded-lg border border-border bg-surface-1 px-4 py-2.5 text-xs text-gray-300 transition-colors hover:bg-surface-3"
+        className="flex w-full items-center gap-2 rounded-lg border border-border bg-surface-1 px-4 py-2.5 text-label text-gray-300 transition-colors hover:bg-surface-3"
       >
         <Github size={14} className="text-gray-400" />
         <span className="flex-1 text-left">GitHub 项目主页</span>
-        <span className="font-mono text-[10px] text-gray-500">BumStill/CodeFactory</span>
+        <span className="font-mono text-caption text-gray-500">BumStill/CodeFactory</span>
         <ExternalLink size={11} className="text-gray-500" />
       </button>
 
       {/* Meta */}
-      <p className="text-[11px] leading-relaxed text-gray-600">
+      <p className="text-caption leading-relaxed text-gray-600">
         CodeFactory 是基于 Tauri 的本地 AI 编码工作台。更新通过 GitHub Releases
         分发；点击「检查更新」会与最新发布版本比对，并在确认后下载安装。
       </p>
@@ -2623,15 +2623,15 @@ function DataSection() {
 
   return (
     <div className="pt-4 mt-4 border-t border-border space-y-3">
-      <h2 className="text-xs font-semibold text-gray-400">数据</h2>
+      <h2 className="text-label font-semibold text-gray-400">数据</h2>
 
       <div className="rounded-lg border border-border bg-surface-1 p-3 space-y-2">
-        <div className="text-[11px] text-gray-500">存储位置</div>
-        <div className="flex items-center gap-2 font-mono text-[11px] text-gray-300">
+        <div className="text-caption text-gray-500">存储位置</div>
+        <div className="flex items-center gap-2 font-mono text-caption text-gray-300">
           <FolderOpen size={11} className="text-gray-600 shrink-0" />
           <span className="truncate" title={dataDir}>{dataDir || "加载中…"}</span>
         </div>
-        <p className="text-[11px] text-gray-600 leading-relaxed">
+        <p className="text-caption text-gray-600 leading-relaxed">
           所有会话、消息和设置都保存在这里。卸载并重装后依然保留。
           API Key 不包含在设置备份内。macOS 会同时保存系统凭据与权限为 0600 的本机可用性副本；
           删除端点时两份都会清理。
@@ -2642,7 +2642,7 @@ function DataSection() {
         <button
           onClick={handleExport}
           disabled={busy !== null}
-          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-xs text-gray-200 transition-colors disabled:opacity-50"
+          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-label text-gray-200 transition-colors disabled:opacity-50"
         >
           <DownloadIcon size={12} />
           {busy === "export" ? "导出中…" : "导出备份"}
@@ -2650,7 +2650,7 @@ function DataSection() {
         <button
           onClick={handleImport}
           disabled={busy !== null}
-          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-xs text-gray-200 transition-colors disabled:opacity-50"
+          className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded border border-border bg-surface-1 hover:bg-surface-3 text-label text-gray-200 transition-colors disabled:opacity-50"
         >
           <UploadIcon size={12} />
           {busy === "import" ? "恢复中…" : "从备份恢复"}
@@ -2659,7 +2659,7 @@ function DataSection() {
 
       {msg && (
         <div
-          className={`text-[11px] rounded border px-2.5 py-1.5 ${
+          className={`text-caption rounded border px-2.5 py-1.5 ${
             msg.kind === "ok"
               ? "border-green-500/30 bg-green-500/10 text-green-800 dark:text-green-300"
               : "border-red-500/30 bg-red-500/10 text-red-800 dark:text-red-300"

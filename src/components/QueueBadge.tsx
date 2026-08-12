@@ -26,7 +26,7 @@ export function QueueBadge({ queue, onRemove }: Props) {
         onClick={() => setExpanded((e) => !e)}
         aria-label={`${expanded ? "收起" : "查看"} ${queue.length} 条待发消息`}
         aria-expanded={expanded}
-        className="flex min-h-8 max-w-full items-center gap-2 rounded-lg bg-status-progress-soft px-2.5 text-[13px] text-status-progress transition-colors hover:brightness-95"
+        className="flex min-h-8 max-w-full items-center gap-2 rounded-lg bg-status-progress-soft px-2.5 text-note text-status-progress transition-colors hover:brightness-95"
       >
         <Clock size={13} aria-hidden="true" />
         <span className="truncate">
@@ -41,9 +41,9 @@ export function QueueBadge({ queue, onRemove }: Props) {
           {queue.map((q, i) => (
             <li
               key={q.id}
-              className="group flex items-start gap-2 rounded-lg border border-border/70 bg-surface-1 p-2.5 text-[13px]"
+              className="group flex items-start gap-2 rounded-lg border border-border/70 bg-surface-1 p-2.5 text-note"
             >
-              <span className="mt-0.5 shrink-0 font-mono text-[11px] text-gray-600">#{i + 1}</span>
+              <span className="mt-0.5 shrink-0 font-mono text-caption text-gray-600">#{i + 1}</span>
               <p className="flex-1 text-gray-300 line-clamp-3 leading-snug whitespace-pre-wrap break-words">
                 {q.content}
               </p>

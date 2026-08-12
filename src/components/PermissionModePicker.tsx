@@ -109,7 +109,7 @@ export function PermissionModePicker({
         aria-controls={menuId}
         aria-haspopup="menu"
         title={`会话权限：${current.description}；下一次权限判断生效`}
-        className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-lg px-2 text-xs transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px] lg:min-w-[36px] ${
+        className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-lg px-2 text-label transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px] lg:min-w-[36px] ${
           mode === "trusted"
             ? "bg-status-warning-soft text-status-warning hover:brightness-95"
             : mode === "safe"
@@ -151,7 +151,7 @@ export function PermissionModePicker({
           style={{ left: menuPosition.left, top: menuPosition.top }}
           className="fixed z-[100] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-border bg-surface-2 p-1 shadow-2xl"
         >
-          <p className="px-2 pb-1 pt-1.5 text-[11px] font-medium text-gray-500">下一次权限判断生效</p>
+          <p className="px-2 pb-1 pt-1.5 text-caption font-medium text-gray-500">下一次权限判断生效</p>
           {OPTIONS.map((option) => (
             <button
               key={option.id}
@@ -165,8 +165,8 @@ export function PermissionModePicker({
                 {mode === option.id && <Check size={13} className="text-accent" aria-hidden="true" />}
               </span>
               <span className="min-w-0">
-                <span className="block text-xs text-gray-200">{option.label}</span>
-                <span className="block text-[11px] leading-4 text-gray-500">{option.description}</span>
+                <span className="block text-label text-gray-200">{option.label}</span>
+                <span className="block text-caption text-gray-500">{option.description}</span>
               </span>
             </button>
           ))}

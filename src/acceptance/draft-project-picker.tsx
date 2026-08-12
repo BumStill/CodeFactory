@@ -38,7 +38,7 @@ function DraftProjectPickerAcceptance() {
                   <button
                     type="button"
                     aria-label="选择下一回合模型：gpt-5.6-sol"
-                    className="min-h-[44px] max-w-[132px] truncate rounded-lg px-2 text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+                    className="min-h-[44px] max-w-[132px] truncate rounded-lg px-2 text-label focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
                   >
                     gpt-5.6-sol
                   </button>

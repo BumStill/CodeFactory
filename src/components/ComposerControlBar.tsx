@@ -44,7 +44,7 @@ export function ComposerControlBar({ children, shortcutHint }: ComposerControlBa
       {children}
       <span
         data-testid="composer-shortcut-hint"
-        className="ml-auto hidden shrink-0 text-[11px] text-gray-600 select-none lg:group-focus-within:block"
+        className="ml-auto hidden shrink-0 text-caption text-gray-600 select-none lg:group-focus-within:block"
       >
         {shortcutHint}
       </span>

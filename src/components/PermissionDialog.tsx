@@ -64,11 +64,11 @@ function ToolArgsPreview({ request }: { request: PendingPermission }) {
   if (write) {
     return (
       <div>
-        <div className="mb-1 font-mono text-[11px] text-gray-500">
+        <div className="mb-1 font-mono text-caption text-gray-500">
           写入 <span className="text-gray-300">{write.path}</span>
           {"（若文件已存在将被整份覆盖，以下是新内容，非差异）"}
         </div>
-        <pre className="max-h-80 overflow-auto rounded border border-border bg-surface-1 p-3 text-xs text-gray-300 whitespace-pre-wrap break-all">
+        <pre className="max-h-80 overflow-auto rounded border border-border bg-surface-1 p-3 text-label text-gray-300 whitespace-pre-wrap break-all">
           {write.content.slice(0, 4000)}
           {write.content.length > 4000 && "\n[truncated]"}
         </pre>
@@ -77,7 +77,7 @@ function ToolArgsPreview({ request }: { request: PendingPermission }) {
   }
 
   return (
-    <pre className="rounded border border-border bg-surface-1 p-3 text-xs text-gray-300 whitespace-pre-wrap break-all">
+    <pre className="rounded border border-border bg-surface-1 p-3 text-label text-gray-300 whitespace-pre-wrap break-all">
       {formatToolArgs(request.args)}
     </pre>
   );
@@ -168,23 +168,23 @@ export function PermissionDialog({
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
           <ShieldAlert size={16} className="text-amber-400" />
           <div className="min-w-0">
-            <h2 id="permission-dialog-title" className="text-sm font-semibold text-gray-100">需要权限</h2>
-            <p className="text-xs text-gray-500">
+            <h2 id="permission-dialog-title" className="text-body font-semibold text-gray-100">需要权限</h2>
+            <p className="text-label text-gray-500">
               工具 `{request.toolName}` 想要以项目访问权限运行。
             </p>
           </div>
         </div>
 
         <div className="max-h-[45vh] overflow-auto px-4 py-3">
-          <div className="mb-2 text-xs uppercase tracking-wide text-gray-600">参数</div>
+          <div className="mb-2 text-label text-gray-600">参数</div>
           <ToolArgsPreview request={request} />
           {remainingSeconds != null && (
-            <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+            <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
               请在 {remainingSeconds} 秒内处理；超时只会标记“授权已过期”，不会记成你拒绝。
             </div>
           )}
           {trusted && (
-            <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+            <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
               当前会话已处于信任模式，普通工具会减少确认；高风险命令仍会拦截。
             </div>
           )}
@@ -194,21 +194,21 @@ export function PermissionDialog({
           <button
             ref={denyButtonRef}
             onClick={onDeny}
-            className="inline-flex min-h-11 items-center gap-1.5 rounded border border-border px-3 text-xs text-gray-400 hover:bg-surface-3 hover:text-gray-100 lg:min-h-9"
+            className="inline-flex min-h-11 items-center gap-1.5 rounded border border-border px-3 text-label text-gray-400 hover:bg-surface-3 hover:text-gray-100 lg:min-h-9"
           >
             <X size={13} />
             拒绝
           </button>
           <button
             onClick={onAllow}
-            className="inline-flex min-h-11 items-center gap-1.5 rounded bg-accent px-3 text-xs text-white hover:bg-accent-hover lg:min-h-9"
+            className="inline-flex min-h-11 items-center gap-1.5 rounded bg-accent px-3 text-label text-white hover:bg-accent-hover lg:min-h-9"
           >
             <Check size={13} />
             仅允许一次
           </button>
           <button
             onClick={onAllowFullAccess}
-            className="inline-flex min-h-11 items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 text-xs text-amber-900 dark:text-amber-100 hover:bg-amber-500/20 lg:min-h-9"
+            className="inline-flex min-h-11 items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 text-label text-amber-900 dark:text-amber-100 hover:bg-amber-500/20 lg:min-h-9"
           >
             <Unlock size={13} />
             信任本会话并允许
