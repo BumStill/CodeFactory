@@ -58,6 +58,11 @@ describe("MessageList turn timeline", () => {
     const finals = container.querySelectorAll("[data-segment='final']");
     expect(finals.length).toBe(1);
     expect(finals[0].textContent).toContain("最终总结");
+    // The answer is never smaller than the narration leading up to it. This
+    // branch used to carry no font size and inherited the row's 14px, so a
+    // turn with tool calls rendered its step lines at 15px and its actual
+    // answer at 14px — the most important text on the surface, smallest.
+    expect(finals[0]).toHaveClass("text-reading");
   });
 
   it("preserves Markdown when a live tail becomes an intermediate step", () => {
