@@ -18,10 +18,11 @@
 use base64::Engine;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::config::settings::{
     self as settings_config, ApiStyle, CustomModel, Endpoint, ReasoningEffort, Settings,
@@ -416,6 +417,158 @@ pub fn logout() -> Result<()> {
 
 pub fn current_account() -> Result<Option<CodexAccount>> {
     Ok(load_tokens()?.as_ref().map(CodexAccount::from))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AuthCapabilityObservationResult {
+    pub queued_objectives: usize,
+    pub receipts_recorded: usize,
+}
+
+/// Bind one Keychain observation to every matching opaque Auth Objective.
+/// Ready capability is queued first through the Objective CAS, then receipted
+/// at the resulting revision. A crash between those two writes is repaired by
+/// the startup scan, because `CapabilityRestored` deliberately retains the
+/// stable request key and waiting-system Objectives remain observable.
+pub(crate) async fn observe_chatgpt_auth_capability(
+    pool: &SqlitePool,
+    source: crate::agent::auth_recovery::AuthObservationSource,
+    probe: crate::agent::auth_recovery::AuthCapabilityProbe<'_>,
+) -> Result<AuthCapabilityObservationResult> {
+    use crate::agent::auth_recovery::{
+        AuthCapabilityProbe, AuthObservationSource, AuthRecoveryStore,
+    };
+    use crate::agent::objective::{DecisionRouter, ObjectiveStore, RecoveryDomain, RouteSignal};
+
+    let rows = sqlx::query_as::<_, (String, i64, String, String)>(
+        "SELECT id, revision, status, request_key
+         FROM objectives
+         WHERE domain='auth'
+           AND status IN ('waiting_authorization', 'waiting_system')
+           AND request_key LIKE 'chatgpt-auth:%'
+         ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let objective_store = ObjectiveStore::new(pool.clone());
+    let auth_store = AuthRecoveryStore::new(pool.clone());
+    let mut result = AuthCapabilityObservationResult::default();
+
+    for (objective_id, revision, status, request_key) in rows {
+        let mut current = objective_store
+            .get(&objective_id)
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?
+            .ok_or_else(|| AppError::Other(format!("auth objective {objective_id} disappeared")))?;
+        if current.revision != revision || current.request_key.as_deref() != Some(&request_key) {
+            continue;
+        }
+
+        if matches!(probe, AuthCapabilityProbe::Ready { .. }) && status == "waiting_authorization" {
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::CapabilityRestored {
+                    domain: RecoveryDomain::Auth,
+                    reason: "authorization_restored".into(),
+                    next_observation_at: chrono::Utc::now().timestamp_millis(),
+                    resume_cursor: current.resume_cursor.clone(),
+                },
+            )
+            .map_err(|error| AppError::Other(error.to_string()))?;
+            match objective_store
+                .apply_decision(current.revision, decision)
+                .await
+            {
+                Ok(revised) => {
+                    current = revised;
+                    result.queued_objectives += 1;
+                }
+                Err(error) if error.to_string().contains("revision") => {
+                    current = objective_store
+                        .get(&objective_id)
+                        .await
+                        .map_err(|error| AppError::Other(error.to_string()))?
+                        .ok_or_else(|| {
+                            AppError::Other(format!("auth objective {objective_id} disappeared"))
+                        })?;
+                    if current.status != crate::agent::objective::ObjectiveStatus::WaitingSystem
+                        || current.request_key.as_deref() != Some(&request_key)
+                    {
+                        continue;
+                    }
+                }
+                Err(error) => return Err(AppError::Other(error.to_string())),
+            }
+        }
+
+        auth_store
+            .record_probe(
+                &current.id,
+                current.revision,
+                &request_key,
+                "chatgpt",
+                SECRET_REF,
+                match source {
+                    AuthObservationSource::Callback => AuthObservationSource::Callback,
+                    AuthObservationSource::Startup => AuthObservationSource::Startup,
+                    AuthObservationSource::Adapter => AuthObservationSource::Adapter,
+                },
+                probe,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?;
+        result.receipts_recorded += 1;
+    }
+    Ok(result)
+}
+
+/// Actual startup adapter: read the Keychain once, reduce it to a capability
+/// observation, and never copy token/account material into SQLite.
+pub(crate) async fn observe_chatgpt_auth_on_startup(
+    pool: &SqlitePool,
+) -> Result<AuthCapabilityObservationResult> {
+    use crate::agent::auth_recovery::{AuthCapabilityProbe, AuthObservationSource};
+
+    match load_tokens() {
+        Ok(Some(tokens)) => {
+            let identity_material = if !tokens.access_token.trim().is_empty() {
+                tokens.access_token.as_bytes()
+            } else if !tokens.refresh_token.trim().is_empty() {
+                tokens.refresh_token.as_bytes()
+            } else {
+                return observe_chatgpt_auth_capability(
+                    pool,
+                    AuthObservationSource::Startup,
+                    AuthCapabilityProbe::Expired,
+                )
+                .await;
+            };
+            observe_chatgpt_auth_capability(
+                pool,
+                AuthObservationSource::Startup,
+                AuthCapabilityProbe::Ready { identity_material },
+            )
+            .await
+        }
+        Ok(None) => {
+            observe_chatgpt_auth_capability(
+                pool,
+                AuthObservationSource::Startup,
+                AuthCapabilityProbe::Missing,
+            )
+            .await
+        }
+        Err(error) => {
+            tracing::warn!(%error, "startup could not determine ChatGPT Keychain capability");
+            observe_chatgpt_auth_capability(
+                pool,
+                AuthObservationSource::Startup,
+                AuthCapabilityProbe::Unknown,
+            )
+            .await
+        }
+    }
 }
 
 /// Return a non-expired access token (refreshing if needed) along with the
@@ -884,6 +1037,7 @@ async fn start_login_flow(app: tauri::AppHandle) -> Result<CodexLoginFlow> {
     }
 
     let task_flow_id = flow_id.clone();
+    let recovery_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let expected = state;
         let callback_result = tokio::time::timeout(
@@ -962,6 +1116,29 @@ async fn start_login_flow(app: tauri::AppHandle) -> Result<CodexLoginFlow> {
                             flow.error_message = None;
                         })
                         .await;
+                        let state = recovery_app.state::<AppState>();
+                        let pool = state.db.read().await.clone();
+                        drop(state);
+                        match observe_chatgpt_auth_capability(
+                            &pool,
+                            crate::agent::auth_recovery::AuthObservationSource::Callback,
+                            crate::agent::auth_recovery::AuthCapabilityProbe::Ready {
+                                identity_material: tokens.access_token.as_bytes(),
+                            },
+                        )
+                        .await
+                        {
+                            Ok(result) if result.queued_objectives > 0 => tracing::info!(
+                                count = result.queued_objectives,
+                                receipts = result.receipts_recorded,
+                                "ChatGPT authorization restored; objectives queued for automatic resume"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "failed to queue authorized objectives for resume"
+                            ),
+                        }
                     }
                     Err(error) => {
                         update_login_flow(&task_flow_id, |flow| {
@@ -1149,7 +1326,52 @@ pub async fn apply_codex_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::auth_recovery::{AuthCapabilityProbe, AuthObservationSource};
+    use crate::agent::objective::{
+        CreateObjective, DecisionRouter, ObjectiveKind, ObjectiveStatus, RecoveryDomain,
+        RouteSignal,
+    };
     use crate::config::settings::{DeliveryCeiling, ReasoningEffort};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn waiting_chatgpt_auth_objective(
+        suffix: &str,
+    ) -> (sqlx::SqlitePool, crate::agent::objective::ObjectiveStore) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: format!("objective-auth-{suffix}"),
+                kind: ObjectiveKind::Informational,
+                session_id: Some(format!("session-auth-{suffix}")),
+                root_turn_id: Some(format!("turn-auth-{suffix}")),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::AuthorizationRequired {
+                domain: RecoveryDomain::Auth,
+                request_key: format!("chatgpt-auth:{}", objective.id),
+                action_signature: format!("oauth:chatgpt:resume:{}", objective.id),
+                resume_cursor: objective.root_turn_id.clone(),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        (pool, store)
+    }
 
     fn catalog_model(id: &str) -> CustomModel {
         CustomModel {
@@ -1493,5 +1715,81 @@ mod tests {
         assert!(!is_terminal_refresh_error(&AppError::Other(
             "request timed out".into()
         )));
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_queues_same_objective_only_with_secret_free_receipt() {
+        let (pool, store) = waiting_chatgpt_auth_objective("callback").await;
+        let raw_access_token = b"oauth-access-token-must-never-enter-sqlite";
+
+        let result = observe_chatgpt_auth_capability(
+            &pool,
+            AuthObservationSource::Callback,
+            AuthCapabilityProbe::Ready {
+                identity_material: raw_access_token,
+            },
+        )
+        .await
+        .expect("callback observation");
+
+        assert_eq!(result.queued_objectives, 1);
+        let objective = store.get("objective-auth-callback").await.unwrap().unwrap();
+        assert_eq!(objective.status, ObjectiveStatus::WaitingSystem);
+        assert!(!objective.requires_user_action);
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM auth_capability_receipts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(receipt_count, 1);
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auth_capability_receipts
+             WHERE capability_digest LIKE '%oauth-access-token%'
+                OR request_key LIKE '%oauth-access-token%'
+                OR credential_ref LIKE '%oauth-access-token%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leaked, 0, "OAuth material must never be persisted");
+    }
+
+    #[tokio::test]
+    async fn startup_keychain_ready_observation_repairs_callback_to_queue_crash_window() {
+        let (pool, store) = waiting_chatgpt_auth_objective("startup").await;
+
+        let first = observe_chatgpt_auth_capability(
+            &pool,
+            AuthObservationSource::Startup,
+            AuthCapabilityProbe::Ready {
+                identity_material: b"startup-capability-material",
+            },
+        )
+        .await
+        .expect("startup observation");
+        let second = observe_chatgpt_auth_capability(
+            &pool,
+            AuthObservationSource::Startup,
+            AuthCapabilityProbe::Ready {
+                identity_material: b"startup-capability-material",
+            },
+        )
+        .await
+        .expect("idempotent startup observation");
+
+        assert_eq!(first.queued_objectives, 1);
+        assert_eq!(second.queued_objectives, 0);
+        let objective = store.get("objective-auth-startup").await.unwrap().unwrap();
+        assert_eq!(objective.status, ObjectiveStatus::WaitingSystem);
+        let current_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auth_capability_receipts
+             WHERE objective_id=? AND objective_revision=? AND status='ready'",
+        )
+        .bind(&objective.id)
+        .bind(objective.revision)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(current_receipts, 1);
     }
 }

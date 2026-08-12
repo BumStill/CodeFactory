@@ -37,6 +37,9 @@ export interface QueuedMessage {
   content: string;
   /** Future: attachments. Kept optional so existing call sites need no change. */
   enqueuedAt: number;
+  /** Exact persisted root identity for a materialized draft's first message.
+   * Preserve it if a busy backend makes the frontend restore the message. */
+  rootTurnId?: string;
 }
 
 /** A conversation shell that exists only in frontend memory until the first
@@ -57,6 +60,8 @@ export interface DraftSession {
   modelId: string;
   permissionMode?: PermissionMode;
   text: string;
+  /** Bound on the first send attempt and retained across uncertain retries. */
+  firstMessageId?: string;
 }
 
 export const QUEUE_MAX = 5;
@@ -96,6 +101,7 @@ const EMPTY_RUNTIME: SessionRuntime = {
   pendingPermission: null,
   contextUsage: null,
   compressionToast: null,
+  transportDoneSucceeded: false,
   queue: [],
   persistedMessages: [],
   persistedPlans: [],
@@ -126,6 +132,7 @@ export function freshRuntime(
     pendingPermission: null,
     contextUsage: null,
     compressionToast: null,
+    transportDoneSucceeded: false,
     queue: [],
     persistedMessages: history.persistedMessages ?? [],
     persistedPlans: history.persistedPlans ?? [],
@@ -169,7 +176,7 @@ interface ChatStore {
   renameSession: (id: string, title: string) => Promise<void>;
   /** Send to `sessionId` (default: the active session). Targeting lets the
    *  queue-drain fire the next message into a background session too. */
-  sendMessage: (content: string, sessionId?: string, userMessagePersisted?: boolean) => Promise<void>;
+  sendMessage: (content: string, sessionId?: string, rootTurnId?: string) => Promise<void>;
   /** Send right now if idle, enqueue if streaming, or materialize an active draft. */
   sendOrQueue: (content: string) => Promise<"sent" | "queued" | "full" | "failed">;
   /** Remove a queued message (active session) before it fires. */
@@ -179,7 +186,7 @@ interface ChatStore {
   loadModels: (endpoint: string) => Promise<void>;
   setModel: (modelId: string) => void;
   /** Stop the in-flight turn for `sessionId` (default: the active session). */
-  cancelStream: (sessionId?: string) => void;
+  cancelStream: (sessionId?: string) => Promise<void>;
   respondPermission: (
     allow: boolean,
     opts?: { grantFullAccess?: boolean },
@@ -221,6 +228,10 @@ export function activeRuntime(s: ChatStore): SessionRuntime {
 function findSession(s: ChatStore, id: string): Session | undefined {
   if (s.activeSession?.id === id) return s.activeSession;
   return s.sessions.find((x) => x.id === id);
+}
+
+function isChatRunBusyError(error: unknown): boolean {
+  return String(error).includes("CHAT_RUN_BUSY");
 }
 
 /** Selector: the id of whatever conversation is currently open — a draft or a
@@ -568,7 +579,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }));
   },
 
-  sendMessage: async (content, sessionId, userMessagePersisted = false) => {
+  sendMessage: async (content, sessionId, rootTurnId) => {
     const target = sessionId ? findSession(get(), sessionId) : get().activeSession;
     if (!target) return;
     const id = target.id;
@@ -603,8 +614,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }))
       : [];
 
+    // Persisted turns use the client-generated UUID as the exact durable root
+    // identity. The backend either inserts this id in the admission
+    // transaction or verifies an already-materialized draft row byte-for-byte.
+    // Busy/retry paths preserve the same id, so no user input is duplicated or
+    // orphaned behind a different SQLite root.
+    const exactRootTurnId = rootTurnId ?? crypto.randomUUID();
     const userMsg: UIMessage = {
-      id: crypto.randomUUID(),
+      id: exactRootTurnId,
       role: "user",
       content,
       createdAt: Date.now(),
@@ -627,6 +644,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             ...prev,
             messages: [...prev.messages, userMsg, assistantMsg],
             streaming: true,
+            transportDoneSucceeded: false,
             revision: prev.revision + 1,
           },
         },
@@ -657,10 +675,51 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         await invoke("send_message", {
           sessionId: id,
           content,
-          userMessagePersisted,
+          rootTurnId: exactRootTurnId,
         });
       }
     } catch (e) {
+      if (isChatRunBusyError(e)) {
+        set((s) => {
+          const prev = s.runtime[id];
+          if (!prev) return {};
+          const _streamingMsgId = { ...s._streamingMsgId };
+          if (_streamingMsgId[id] === assistantMsgId) {
+            delete _streamingMsgId[id];
+          }
+          return {
+            runtime: {
+              ...s.runtime,
+              [id]: {
+                ...prev,
+                messages: prev.messages.filter(
+                  (message) => message.id !== userMsg.id && message.id !== assistantMsgId,
+                ),
+                localMessages: prev.localMessages.filter(
+                  (message) => message.id !== userMsg.id && message.id !== assistantMsgId,
+                ),
+                // The optimistic bubbles were rejected, but CHAT_RUN_BUSY is
+                // positive evidence that another run still owns the session.
+                // Its turn_settled event remains the only terminal authority.
+                streaming: true,
+                transportDoneSucceeded: false,
+                queue: [
+                  {
+                    id: userMsg.id,
+                    content,
+                    enqueuedAt: userMsg.createdAt,
+                    rootTurnId: exactRootTurnId,
+                  },
+                  ...prev.queue,
+                ],
+                revision: prev.revision + 1,
+              },
+            },
+            _streamingMsgId,
+          };
+        });
+        return;
+      }
       const errorPresentation = presentChatInvocationError(e);
       set((s) => {
         const prev = s.runtime[id];
@@ -673,7 +732,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               messages: prev.messages.map((m) =>
                 m.id === assistantMsgId ? { ...m, ...errorPresentation } : m,
               ),
-              streaming: false,
+              transportDoneSucceeded: false,
               revision: prev.revision + 1,
             },
           },
@@ -698,11 +757,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         return "sent";
       }
       let materialization = get()._draftMaterialization;
+      const firstMessageId = draft.firstMessageId ?? crypto.randomUUID();
+      if (!draft.firstMessageId) {
+        set((state) => ({
+          draftSession:
+            state.draftSession?.id === draft.id
+              ? { ...state.draftSession, firstMessageId }
+              : state.draftSession,
+        }));
+      }
       if (!materialization) {
         materialization = invoke<Session>("materialize_draft_session", {
           draftId: draft.id,
           cwd: draft.cwd,
           modelId: draft.modelId,
+          firstMessageId,
           firstMessage: text,
         });
         set({ _draftMaterialization: materialization });
@@ -724,7 +793,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           sessions: [session, ...state.sessions.filter((item) => item.id !== session.id)],
         }));
         if (!alreadyMaterialized) {
-          await get().sendMessage(text, session.id, true);
+          await get().sendMessage(text, session.id, firstMessageId);
         }
         return "sent";
       } catch {
@@ -736,7 +805,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const id = active.id;
     const rt = get().runtime[id];
     if (!rt || !rt.streaming) {
-      await get().sendMessage(text);
+      await get().sendMessage(text, id, crypto.randomUUID());
       return "sent";
     }
     if (rt.queue.length >= QUEUE_MAX) return "full";
@@ -749,7 +818,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             ...prev,
             queue: [
               ...prev.queue,
-              { id: crypto.randomUUID(), content: text, enqueuedAt: Date.now() },
+              {
+                id: crypto.randomUUID(),
+                content: text,
+                enqueuedAt: Date.now(),
+                rootTurnId: crypto.randomUUID(),
+              },
             ],
           },
         },
@@ -903,24 +977,53 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
   },
 
-  cancelStream: (sessionId) => {
+  cancelStream: async (sessionId) => {
     const id = sessionId ?? get().activeSession?.id;
     if (!id) return;
-    set((s) => {
-      const prev = s.runtime[id];
-      const runtime = prev
-        ? { ...s.runtime, [id]: { ...prev, pendingPermission: null } }
-        : s.runtime;
-      return { runtime };
-    });
     // Tell the backend to stop the in-flight turn — otherwise the agent keeps
     // looping (burning tokens) after the UI already says "stopped". Cooperative:
     // it stops between rounds, never mid tool-call. Scoped to THIS chat session
     // only; it never affects the task scheduler / long task runs.
-    // Keep the listener and streaming state until the backend emits Done. That
-    // terminal event is the only safe point to drain a queued message; sending
-    // it immediately would race the still-running tool call in the old turn.
-    void invoke("cancel_chat", { sessionId: id });
+    // Keep the listener, permission, and streaming state until the backend
+    // emits turn_settled. Transport-level done/error is not durable settlement.
+    try {
+      await invoke("cancel_chat", { sessionId: id });
+    } catch {
+      const detail =
+        "停止请求未送达；当前运行仍在继续，系统已保留原运行状态。请稍后再次停止。";
+      set((s) => {
+        const prev = s.runtime[id];
+        if (!prev) return {};
+        const currentAssistantId =
+          s._streamingMsgId[id] ??
+          [...prev.messages].reverse().find((message) => message.role === "assistant")?.id;
+        if (!currentAssistantId) return {};
+        return {
+          runtime: {
+            ...s.runtime,
+            [id]: {
+              ...prev,
+              messages: prev.messages.map((message) =>
+                message.id === currentAssistantId
+                  ? {
+                      ...message,
+                      content: message.content
+                        ? `${message.content}\n\n${detail}`
+                        : detail,
+                      runtimeError: {
+                        code: "CHAT_STOP_FAILED",
+                        endpointId: null,
+                        recoverable: true,
+                      },
+                    }
+                  : message,
+              ),
+              revision: prev.revision + 1,
+            },
+          },
+        };
+      });
+    }
   },
 
   respondPermission: async (allow, opts) => {
@@ -939,7 +1042,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         console.error("Failed to persist trusted permission mode for session:", e);
       }
     }
-    await invoke("respond_to_permission", { toolCallId: pending.toolCallId, allow });
+    await invoke("respond_to_permission", { intentId: pending.intentId, allow });
     set((s) => {
       const prev = s.runtime[id];
       if (!prev) return {};
@@ -1194,7 +1297,11 @@ function drainNextQueuedMessage(
     };
   });
   setTimeout(() => {
-    void get().sendMessage(next.content, sessionId);
+    void get().sendMessage(
+      next.content,
+      sessionId,
+      next.rootTurnId,
+    );
   }, 0);
   return true;
 }
@@ -1281,9 +1388,8 @@ function handleStreamEvent(
   });
 
 
-  // Queue drain — fire this session's next queued message as soon as its
-  // stream lands in a terminal state (done OR error). We delay one tick so the
-  // just-completed send's React state settles before we re-enter.
+  // Queue drain is settlement-driven. Transport done/error can be followed by
+  // durable recovery, so neither event is permission to start another run.
   const nowStreaming = get().runtime[sessionId]?.streaming ?? false;
   if (wasStreaming && !nowStreaming) {
     // A steer typed after the loop's last round boundary was never delivered.
@@ -1298,14 +1404,16 @@ function handleStreamEvent(
     }
 
     // Chat-end self-evolution trigger. Mirrors the task path (stores/tasks.ts).
-    // Guards: throttled per session, skip too-short conversations, skip
-    // 'error' terminations, and NEVER for anonymous chats (no-trace = no
-    // learning).
+    // Guards: throttled per session, skip too-short conversations, require a
+    // successful transport-level done before completed settlement, and NEVER
+    // run for anonymous chats (no-trace = no learning).
     const session = findSession(get(), sessionId);
     if (
       session &&
       session.kind !== "anonymous" &&
-      event.type === "done" &&
+      event.type === "turn_settled" &&
+      event.status === "completed" &&
+      get().runtime[sessionId]?.transportDoneSucceeded === true &&
       (get().runtime[sessionId]?.messages.length ?? 0) >= POSTMORTEM_MIN_MESSAGES
     ) {
       const last = _lastPostmortemAt[session.id] ?? 0;
@@ -1556,8 +1664,11 @@ export function dbMessagesToUI(
     const assistant = [...hydrated.slice(rootIndex + 1, nextRootIndex)]
       .reverse()
       .find((message) => message.role === "assistant");
-    if (!assistant) continue;
-    assistant.turnActivity = {
+    // A crash may happen before the first assistant row exists. Bind the
+    // durable objective projection to the root user row instead of silently
+    // dropping it during hydration.
+    const activityTarget = assistant ?? hydrated[rootIndex];
+    activityTarget.turnActivity = {
       rootTurnId: activity.root_turn_id,
       revision: activity.revision,
       phase: activity.phase,
@@ -1567,6 +1678,11 @@ export function dbMessagesToUI(
       waitingReason: activity.waiting_reason ?? null,
       updatedAt: activity.updated_at,
       terminalReason: activity.terminal_reason ?? null,
+      objectiveId: activity.objective_id,
+      objectiveStatus: activity.objective_status,
+      recoveryOwner: activity.recovery_owner ?? null,
+      nextObservationAt: activity.next_observation_at ?? null,
+      lastProgressAt: activity.last_progress_at ?? null,
     };
   }
 

@@ -125,6 +125,44 @@ pub struct CompressionResult {
     pub tokens_freed: u32,
 }
 
+/// Bounded terminal outcomes for one provider round's Context recovery.
+///
+/// These are deliberately stable machine codes rather than provider prose:
+/// the desktop persists `terminal_reason()` and routes the same opaque
+/// Objective to the Context supervisor. Raw capacity errors can include model
+/// or request details and must not become durable control-plane identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextRecoveryOutcome {
+    /// The emergency compactor either did nothing or only claimed it had
+    /// compacted while the exact provider prompt estimate stayed unchanged.
+    CompactionExhausted,
+    /// One measured-smaller emergency payload was sent and the provider still
+    /// rejected it for capacity. A third request in the same run is forbidden.
+    OverflowAfterCompaction,
+    /// This surface cannot safely compact the provider payload in-process.
+    /// The durable Context adapter may re-evaluate the current route/window,
+    /// but the current run never blindly resends the same request.
+    CompressionUnavailable,
+}
+
+impl ContextRecoveryOutcome {
+    pub const fn failure_code(self) -> &'static str {
+        match self {
+            Self::CompactionExhausted => "CONTEXT_COMPACTION_EXHAUSTED",
+            Self::OverflowAfterCompaction => "CONTEXT_OVERFLOW_AFTER_COMPACTION",
+            Self::CompressionUnavailable => "CONTEXT_COMPRESSION_UNAVAILABLE",
+        }
+    }
+
+    pub const fn terminal_reason(self) -> &'static str {
+        match self {
+            Self::CompactionExhausted => "context_compaction_exhausted",
+            Self::OverflowAfterCompaction => "context_overflow_after_compaction",
+            Self::CompressionUnavailable => "context_compression_unavailable",
+        }
+    }
+}
+
 /// Does this provider error mean "the prompt is over the context window"?
 /// Narrow on purpose (capacity wording only) — a false positive would
 /// silently degrade history on unrelated failures.

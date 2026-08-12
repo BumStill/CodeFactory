@@ -7,7 +7,11 @@
 // flow directly — no need to navigate anywhere.
 
 import { Download, RefreshCw, Check, AlertCircle } from "lucide-react";
-import { countUpdateBlockers, useUpdaterStore } from "../stores/updater";
+import {
+  countUpdateBlockers,
+  describeUpdateObjectiveBlockers,
+  useUpdaterStore,
+} from "../stores/updater";
 
 export function UpdateStatusPill() {
   const phase = useUpdaterStore((s) => s.phase);
@@ -40,13 +44,25 @@ export function UpdateStatusPill() {
   }
 
   if (phase.kind === "waiting_for_safe_restart") {
+    const objectiveBlockers = describeUpdateObjectiveBlockers(phase.blockers);
+    const observingUnknownInstall =
+      phase.blockers?.update_install_state === "still_unknown" ||
+      phase.blockers?.update_install_state === "observe_only";
     return (
       <span
         className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/15 text-caption text-amber-800 dark:text-amber-300"
-        title="执行中的本地 session 结束后会自动安装，不会直接重启。"
+        title={[
+          observingUnknownInstall
+            ? "上次安装结果尚未确认；系统只读核对，不会重复安装。"
+            : "执行中的本地 session 结束后会自动安装，不会直接重启。",
+          objectiveBlockers,
+          phase.safetyCheckError,
+        ].filter(Boolean).join(" ")}
       >
         <RefreshCw size={14} />
-        等待安全更新 · {countUpdateBlockers(phase.blockers)}
+        {observingUnknownInstall
+          ? "正在核对更新结果"
+          : `等待安全更新 · ${countUpdateBlockers(phase.blockers)}`}
       </span>
     );
   }
@@ -75,7 +91,7 @@ export function UpdateStatusPill() {
       }`}
       title={
         errored
-          ? `上次检查失败：${phase.message}\n点击重试。`
+          ? `上次检查失败：${phase.message}\n系统会按计划自动再次检查；点击仅用于立即检查。`
           : phase.kind === "up_to_date"
           ? `已是最新版本。\n上次检查于 ${new Date(phase.checkedAt).toLocaleTimeString()}。\n点击再次检查。`
           : phase.kind === "checking"

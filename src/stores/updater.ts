@@ -8,7 +8,6 @@
 
 import { create } from "zustand";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "../lib/tauri";
 
@@ -21,9 +20,39 @@ export interface UpdateSafetyStatus {
   active_chat_turns: number;
   active_task_schedulers: number;
   active_delivery_leases: number;
+  nonterminal_objectives: number;
+  objective_blocker_owners: string[];
   pending_permissions: number;
   managed_browser_sessions: number;
   terminal_sessions: number;
+  update_objective_id?: string | null;
+  update_install_state?:
+    | "observe_only" // legacy read-only projection; never grants install authority
+    | "queued"
+    | "install_permitted"
+    | "definitely_not_applied"
+    | "still_unknown"
+    | "conflict"
+    | "applied"
+    | null;
+  update_receipt_id?: string | null;
+  target_version?: string | null;
+  target_build?: string | null;
+}
+
+export interface UpdateInstallObservation {
+  id: string;
+  objective_id: string | null;
+  target_version: string;
+  target_build: string;
+  state:
+    | "install_permitted"
+    | "definitely_not_applied"
+    | "still_unknown"
+    | "conflict"
+    | "applied";
+  recovery_replay_count: number;
+  observed_at: number;
 }
 
 export function countUpdateBlockers(status: UpdateSafetyStatus | null): number {
@@ -31,9 +60,24 @@ export function countUpdateBlockers(status: UpdateSafetyStatus | null): number {
   return status.active_chat_turns
     + status.active_task_schedulers
     + status.active_delivery_leases
+    + (status.nonterminal_objectives ?? 0)
     + status.pending_permissions
     + status.managed_browser_sessions
     + status.terminal_sessions;
+}
+
+export function describeUpdateObjectiveBlockers(status: UpdateSafetyStatus | null): string | null {
+  const count = status?.nonterminal_objectives ?? 0;
+  if (count === 0) return null;
+  const owners = [...new Set(status?.objective_blocker_owners ?? [])];
+  const ownerText = owners.length > 0 ? owners.join("、") : "系统恢复控制面";
+  return `${count} 个目标仍由 ${ownerText} 持有`;
+}
+
+function targetBuildIdentity(update: Update): string | null {
+  const raw = (update as Update & { rawJson?: Record<string, unknown> }).rawJson ?? {};
+  const value = raw.build_git_sha;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 export type UpdaterPhase =
@@ -81,6 +125,19 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
     } catch (e) {
       console.warn("[updater] getVersion failed:", e);
     }
+    try {
+      const observation = await invoke<UpdateInstallObservation | null>("observe_update_install");
+      if (observation?.state === "applied") {
+        set({
+          currentVersion: observation.target_version,
+          phase: { kind: "up_to_date", checkedAt: Date.now() },
+        });
+      }
+    } catch (e) {
+      // Observation failure is fail-closed by reserve_update_install: an
+      // unresolved receipt still cannot become a second install admission.
+      console.warn("[updater] prior install observation failed:", e);
+    }
 
     // In dev, the unsigned bundle has no updater pubkey — checking would
     // always error. Skip the schedule entirely so DevTools stays quiet.
@@ -124,75 +181,83 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
     const phase = get().phase;
     if (phase.kind !== "available" && phase.kind !== "waiting_for_safe_restart") return;
     const update = phase.update;
-    try {
-      if (phase.kind === "available") {
-        set({ phase: { kind: "downloading", received: 0, total: null } });
-        await update.download((event) => {
-          switch (event.event) {
-            case "Started":
-              set({ phase: { kind: "downloading", received: 0, total: event.data.contentLength ?? null } });
-              break;
-            case "Progress":
-              set((s) =>
-                s.phase.kind === "downloading"
-                  ? { phase: { ...s.phase, received: s.phase.received + event.data.chunkLength } }
-                  : s,
-              );
-              break;
-            case "Finished":
-              break;
-          }
-        });
+    const targetBuild = targetBuildIdentity(update);
+    if (!targetBuild) {
+      set({
+        phase: {
+          kind: "waiting_for_safe_restart",
+          update,
+          blockers: null,
+          safetyCheckError: "更新清单缺少 build_git_sha；系统不会安装或重放该更新。",
+          checkedAt: Date.now(),
+        },
+      });
+      if (get().safeRetryHandle === null) {
+        const handle = window.setTimeout(() => {
+          set({ safeRetryHandle: null });
+          void get().install();
+        }, SAFE_RESTART_RETRY_MS);
+        set({ safeRetryHandle: handle });
       }
-
+      return;
+    }
+    try {
       let safety: UpdateSafetyStatus | null = null;
       let safetyCheckError: string | null = null;
       try {
-        safety = await invoke<UpdateSafetyStatus>("reserve_update_install");
+        safety = await invoke<UpdateSafetyStatus>("reserve_update_install", {
+          targetVersion: update.version,
+          targetBuild,
+        });
       } catch (error) {
         // Unknown safety is unsafe. Keep retrying locally instead of asking the
         // user to click install again or risking an in-flight session.
         safetyCheckError = error instanceof Error ? error.message : String(error);
       }
 
-      if (!safety?.safe_to_restart || !safety.restart_reserved) {
-        set({
-          phase: {
-            kind: "waiting_for_safe_restart",
-            update,
-            blockers: safety,
-            safetyCheckError,
-            checkedAt: Date.now(),
-          },
-        });
-        if (get().safeRetryHandle === null) {
-          const handle = window.setTimeout(() => {
-            set({ safeRetryHandle: null });
-            void get().install();
-          }, SAFE_RESTART_RETRY_MS);
-          set({ safeRetryHandle: handle });
+      if (safety?.update_install_state === "applied") {
+        if (get().safeRetryHandle !== null) {
+          window.clearTimeout(get().safeRetryHandle!);
+          set({ safeRetryHandle: null });
         }
+        set({
+          currentVersion: safety.target_version ?? update.version,
+          phase: { kind: "up_to_date", checkedAt: Date.now() },
+        });
         return;
       }
 
-      if (get().safeRetryHandle !== null) {
-        window.clearTimeout(get().safeRetryHandle!);
-        set({ safeRetryHandle: null });
+      // The renderer only requests durable recovery. It never owns an Update
+      // mutation permit and therefore never downloads, installs, or relaunches
+      // the app. The backend supervisor observes the exact target binding and
+      // may install only with its current owner+epoch permit.
+      set({
+        phase: {
+          kind: "waiting_for_safe_restart",
+          update,
+          blockers: safety,
+          safetyCheckError,
+          checkedAt: Date.now(),
+        },
+      });
+      if (get().safeRetryHandle === null) {
+        const handle = window.setTimeout(() => {
+          set({ safeRetryHandle: null });
+          void get().install();
+        }, SAFE_RESTART_RETRY_MS);
+        set({ safeRetryHandle: handle });
       }
-      set({ phase: { kind: "installing" } });
-      await update.install();
-      set({ phase: { kind: "ready" } });
-      setTimeout(() => {
-        void relaunch().catch(async (error) => {
-          await invoke("release_update_install_reservation").catch(console.error);
-          const message = error instanceof Error ? error.message : String(error);
-          set({ phase: { kind: "error", message, checkedAt: Date.now() } });
-        });
-      }, 800);
     } catch (err) {
-      await invoke("release_update_install_reservation").catch(console.error);
       const msg = err instanceof Error ? err.message : String(err);
-      set({ phase: { kind: "error", message: msg, checkedAt: Date.now() } });
+      set({
+        phase: {
+          kind: "waiting_for_safe_restart",
+          update,
+          blockers: null,
+          safetyCheckError: msg,
+          checkedAt: Date.now(),
+        },
+      });
     }
   },
 

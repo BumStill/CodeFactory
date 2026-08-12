@@ -20,6 +20,7 @@ pub mod learning;
 pub mod mcp;
 pub mod memory;
 pub mod models;
+pub mod objective_health;
 pub mod preferences;
 pub mod session;
 #[cfg(test)]

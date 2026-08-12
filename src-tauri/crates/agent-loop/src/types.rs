@@ -265,6 +265,8 @@ pub enum StreamEvent {
         created_at: i64,
     },
     TurnActivityUpdated {
+        // Objective fields are optional so headless/legacy producers keep the
+        // transport event contract while the desktop projects durable state.
         root_turn_id: String,
         revision: i64,
         phase: String,
@@ -274,6 +276,16 @@ pub enum StreamEvent {
         waiting_reason: Option<String>,
         updated_at: i64,
         terminal_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        objective_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        objective_status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_owner: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_observation_at: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_progress_at: Option<i64>,
     },
     ToolCallStart {
         id: String,
@@ -296,6 +308,10 @@ pub enum StreamEvent {
         metadata: Option<serde_json::Value>,
     },
     PermissionRequest {
+        /// Opaque, single-use durable permission intent. This is the only key
+        /// accepted by the response IPC; provider tool_call_id is correlation
+        /// data for the visible tool card, never authorization authority.
+        intent_id: String,
         tool_call_id: String,
         tool_name: String,
         args: serde_json::Value,
@@ -304,6 +320,18 @@ pub enum StreamEvent {
     Done {
         input_tokens: u32,
         output_tokens: u32,
+    },
+    /// The desktop has durably settled the transport result into the exact
+    /// Objective/run-control identity and released the session's single-runner
+    /// admission lock. `Done`/`Error` only close provider transport; callers
+    /// must wait for this event before starting a queued turn.
+    TurnSettled {
+        run_instance_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        root_turn_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        objective_id: Option<String>,
+        status: String,
     },
     /// Snapshot of how much of the model's context window the last prompt
     /// occupied. Emitted after every assistant turn (whenever we get a

@@ -82,7 +82,7 @@ describe("model route failover stream events", () => {
     );
   });
 
-  it("turns route exhaustion into actionable Chinese guidance while retaining evidence", () => {
+  it("keeps route exhaustion system-owned while retaining evidence", () => {
     const next = reduceChatStreamEvent(
       baseState(),
       {
@@ -93,12 +93,27 @@ describe("model route failover stream events", () => {
       "assistant-1",
     );
 
-    expect(next.streaming).toBe(false);
+    expect(next.streaming).toBe(true);
     expect(next.messages[0].content).toContain("所有已配置且有凭据的模型端点都暂时不可用");
-    expect(next.messages[0].content).toContain("模型设置");
-    expect(next.messages[0].content).toContain("稍后重试");
+    expect(next.messages[0].content).toContain("目标与失败证据已保留");
+    expect(next.messages[0].content).toContain("系统将按退避策略重新观测可用路由");
+    expect(next.messages[0].content).not.toMatch(/重试|继续执行|回到对话/);
     expect(next.messages[0].failureEvidence).toContain("ChatGPT / gpt-5.5");
     expect(next.messages[0].failureEvidence).toContain("DeepSeek / deepseek-v4-pro");
+
+    const settled = reduceChatStreamEvent(
+      next,
+      {
+        type: "turn_settled",
+        run_instance_id: "run-failover-1",
+        root_turn_id: "root-failover-1",
+        objective_id: "objective-failover-1",
+        status: "waiting_system",
+      },
+      "assistant-1",
+    );
+    expect(settled.streaming).toBe(false);
+    expect(settled.messages[0].content).toBe(next.messages[0].content);
   });
 
   it("normalizes a pre-stream invoke rejection into the same actionable state", () => {
@@ -107,6 +122,8 @@ describe("model route failover stream events", () => {
     );
 
     expect(presentation.content).toContain("所有已配置且有凭据的模型端点都暂时不可用");
+    expect(presentation.content).toContain("系统将按退避策略重新观测可用路由");
+    expect(presentation.content).not.toMatch(/重试|继续执行|回到对话/);
     expect(presentation.failureEvidence).toContain("deepseek：凭据读取超时");
     expect(presentation.failureEvidence).not.toMatch(/^Error:/);
   });
@@ -119,6 +136,8 @@ describe("model route failover stream events", () => {
     expect(presentation.content).toContain("DeepSeek / deepseek-v4-pro");
     expect(presentation.content).toContain("尚未配置凭据");
     expect(presentation.content).toContain("模型设置");
+    expect(presentation.content).toContain("保存后系统会从安全检查点恢复");
+    expect(presentation.content).not.toMatch(/重试|继续执行|回到对话/);
   });
 
   it("keeps the same credential guidance when exhaustion arrives as a stream error", () => {
@@ -134,6 +153,9 @@ describe("model route failover stream events", () => {
 
     expect(next.messages[0].content).toContain("DeepSeek / deepseek-v4-pro");
     expect(next.messages[0].content).toContain("无法读取已配置凭据");
+    expect(next.messages[0].content).toContain("需要一次密钥访问授权");
+    expect(next.messages[0].content).toContain("授权完成后系统会从安全检查点恢复");
+    expect(next.messages[0].content).not.toMatch(/重试|继续执行|回到对话/);
     expect(next.messages[0].failureEvidence).toContain("CREDENTIAL_ACCESS_REQUIRED");
   });
 });

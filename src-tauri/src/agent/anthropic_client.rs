@@ -33,7 +33,7 @@ pub struct AnthropicResponse {
     pub cancelled: bool,
 }
 
-pub async fn stream_anthropic(
+pub(super) async fn stream_anthropic(
     http: &Client,
     base_url: &str,
     api_key: &str,
@@ -48,6 +48,8 @@ pub async fn stream_anthropic(
     sanitize_finalization: bool,
     cancel: Option<&Arc<AtomicBool>>,
     events: &dyn crate::agent::events::EventSink,
+    provider_attempt: Option<&super::model_transport::ProviderAttemptRuntime>,
+    http_attempt_budget: usize,
 ) -> Result<AnthropicResponse> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
@@ -75,7 +77,7 @@ pub async fn stream_anthropic(
         }
     }
 
-    let response = crate::http_util::send_with_retry_and_notify_policy(
+    let response = crate::http_util::send_with_attempt_budget_and_notify_policy(
         "Anthropic messages request",
         || {
             http.post(&url)
@@ -86,6 +88,7 @@ pub async fn stream_anthropic(
         },
         |_| {},
         retry_response_body,
+        http_attempt_budget,
     )
     .await?;
     let response = crate::http_util::check_status(response).await?;
@@ -168,6 +171,11 @@ pub async fn stream_anthropic(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        if let Some(attempt) = provider_attempt {
+                            attempt.checkpoint_output_event().await.map_err(|error| {
+                                crate::errors::AppError::Other(error.to_string())
+                            })?;
+                        }
                         tool_map.insert(idx, (id, name, String::new()));
                     }
                 }
@@ -187,6 +195,11 @@ pub async fn stream_anthropic(
                                 .to_string();
                             if !text.is_empty() {
                                 if !finalization_response {
+                                    if let Some(attempt) = provider_attempt {
+                                        attempt.checkpoint_text(&text).await.map_err(|error| {
+                                            crate::errors::AppError::Other(error.to_string())
+                                        })?;
+                                    }
                                     events.emit(StreamEvent::TextDelta {
                                         content: text.clone(),
                                     });
@@ -272,6 +285,14 @@ pub async fn stream_anthropic(
             text_buf = sanitize_completion_summary(&text_buf);
         }
         tool_calls.clear();
+        if !text_buf.is_empty() {
+            if let Some(attempt) = provider_attempt {
+                attempt
+                    .checkpoint_text(&text_buf)
+                    .await
+                    .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+            }
+        }
         events.emit(StreamEvent::TextDelta {
             content: text_buf.clone(),
         });

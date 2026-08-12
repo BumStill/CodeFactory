@@ -728,7 +728,7 @@ describe("Workspace on-demand embedded browser pane", () => {
           ...useChatStore.getState().runtime,
           [projectSession.id]: {
             ...current,
-            pendingPermission: { toolCallId: "tool-permission", toolName: "bash", args: { command: "pnpm test" } },
+            pendingPermission: { intentId: "intent-tool-permission", toolCallId: "tool-permission", toolName: "bash", args: { command: "pnpm test" } },
           },
         },
       });
@@ -775,7 +775,7 @@ describe("Workspace on-demand embedded browser pane", () => {
           ...useChatStore.getState().runtime,
           [projectSession.id]: {
             ...current,
-            pendingPermission: { toolCallId: "tool-native-escape", toolName: "bash", args: {} },
+            pendingPermission: { intentId: "intent-tool-native-escape", toolCallId: "tool-native-escape", toolName: "bash", args: {} },
           },
         },
       });
@@ -855,7 +855,7 @@ describe("Workspace on-demand embedded browser pane", () => {
           ...useChatStore.getState().runtime,
           [projectSession.id]: {
             ...current,
-            pendingPermission: { toolCallId: "tool-hide", toolName: "bash", args: { command: "pnpm test" } },
+            pendingPermission: { intentId: "intent-tool-hide", toolCallId: "tool-hide", toolName: "bash", args: { command: "pnpm test" } },
           },
         },
       });

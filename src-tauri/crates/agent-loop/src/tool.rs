@@ -24,6 +24,23 @@ pub enum ToolExecutionStatus {
     Error,
 }
 
+/// Durable authority for one recovery runner to cross a mutation boundary.
+///
+/// This type intentionally contains no desktop/Tauri handles so the shared
+/// loop and headless surfaces can carry it without learning how SQLite leases
+/// are implemented. The desktop backend validates every field against the
+/// current Objective/remediation rows immediately before it records a started
+/// side-effect receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationPermit {
+    pub objective_id: String,
+    pub remediation_id: String,
+    pub owner: String,
+    pub claim_epoch: i64,
+    pub binding_id: Option<String>,
+    pub resource_generation: Option<i64>,
+}
+
 /// Per-invocation context the loop hands to a backend. No `AppHandle`, no
 /// `SqlitePool` — those live inside the concrete backend, not on the wire
 /// between the loop and the trait.
@@ -33,6 +50,14 @@ pub struct ToolCtx {
     pub session_id: Option<String>,
     pub root_turn_id: Option<String>,
     pub task_id: Option<String>,
+    /// Session whose normalized `tool_calls` row owns this provider call. A
+    /// task subagent audits side effects to its parent session but persists its
+    /// trajectory under the child session, so this is deliberately separate
+    /// from `session_id`.
+    pub trajectory_session_id: Option<String>,
+    /// Present only for a durable recovery runner. Foreground Objectives use
+    /// their active state; waiting-system Objectives must prove this permit.
+    pub mutation_permit: Option<MutationPermit>,
     pub knowledge_library_ids: Option<Vec<String>>,
     /// Budget-clamped per-call timeout. The sidecar puts this on its
     /// `tool_request`; the desktop backend applies it to its `ExecCtx`.

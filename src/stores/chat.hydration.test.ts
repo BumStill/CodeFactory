@@ -510,6 +510,11 @@ describe("persisted chat hydration", () => {
         waiting_reason: null,
         updated_at: 3,
         terminal_reason: "tool_blocked",
+        objective_id: "objective-1",
+        objective_status: "waiting_system",
+        recovery_owner: "objective-supervisor",
+        next_observation_at: 42_000,
+        last_progress_at: 41_000,
       },
     ];
 
@@ -521,6 +526,55 @@ describe("persisted chat hydration", () => {
         revision: 7,
         status: "blocked",
         terminalReason: "tool_blocked",
+        objectiveId: "objective-1",
+        objectiveStatus: "waiting_system",
+        recoveryOwner: "objective-supervisor",
+        nextObservationAt: 42_000,
+        lastProgressAt: 41_000,
+      }),
+    );
+  });
+
+  it("keeps a hydrated system-owned objective when no assistant row exists yet", () => {
+    const rows: Message[] = [
+      {
+        id: "root-before-crash",
+        session_id: "session-1",
+        role: "user",
+        content: "完成并发布",
+        created_at: 1,
+      },
+    ];
+    const states: TurnActivitySnapshot[] = [
+      {
+        root_turn_id: "root-before-crash",
+        revision: 2,
+        phase: "recovering",
+        status: "active",
+        recent_activity_kind: "remediation",
+        recent_activity_label: "正在恢复模型连接",
+        waiting_reason: "等待退避窗口结束",
+        updated_at: 3,
+        terminal_reason: null,
+        objective_id: "objective-before-crash",
+        objective_status: "waiting_system",
+        recovery_owner: "objective-supervisor",
+        next_observation_at: 42_000,
+        last_progress_at: 41_000,
+      },
+    ];
+
+    const hydrated = dbMessagesToUI(rows, [], states);
+
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0].role).toBe("user");
+    expect(hydrated[0].turnActivity).toEqual(
+      expect.objectContaining({
+        objectiveId: "objective-before-crash",
+        objectiveStatus: "waiting_system",
+        recoveryOwner: "objective-supervisor",
+        nextObservationAt: 42_000,
+        lastProgressAt: 41_000,
       }),
     );
   });

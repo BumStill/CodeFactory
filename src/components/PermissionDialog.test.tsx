@@ -8,6 +8,7 @@ import type { PendingPermission } from "../stores/chat";
 
 function baseRequest(overrides: Partial<PendingPermission>): PendingPermission {
   return {
+    intentId: "intent-test",
     toolCallId: "tc-1",
     toolName: "bash",
     args: {},

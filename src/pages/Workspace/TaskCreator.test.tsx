@@ -333,7 +333,9 @@ describe("session-native task delegation", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
     expect(screen.queryByRole("button", { name: /继续执行/ })).not.toBeInTheDocument();
-    expect(screen.getByText("先处理失败项，再继续剩余 1 项。" )).toBeInTheDocument();
+    expect(
+      screen.getByText("系统正在处理失败项，并会自动续接剩余 1 项。"),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "打开模型设置" })).toBeEnabled();
   });
 
@@ -347,7 +349,7 @@ describe("session-native task delegation", () => {
     expect(mocks.cancel).toHaveBeenCalledWith("s1");
   });
 
-  it("retries repairable failures and resumes the same session", async () => {
+  it("keeps repairable technical failures system-owned without a manual retry action", async () => {
     fakeTasksState.tasks = {
       s1: [
         task({
@@ -367,12 +369,16 @@ describe("session-native task delegation", () => {
     renderWorkspace();
 
     await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
-    await userEvent.click(screen.getByRole("button", { name: "重试失败步骤" }));
-    await waitFor(() => expect(mocks.retryFailedTasks).toHaveBeenCalledWith("s1"));
-    expect(mocks.start).toHaveBeenCalledWith("s1");
+    expect(screen.queryByRole("button", { name: "重试失败步骤" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /已修复，重试/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /回到对话处理/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pending-repair-prompt")).not.toBeInTheDocument();
+    expect(mocks.retryFailedTasks).not.toHaveBeenCalled();
+    expect(mocks.retryTasks).not.toHaveBeenCalled();
+    expect(mocks.start).not.toHaveBeenCalled();
   });
 
-  it("turns a provider blocker into model settings plus an explicit retry", async () => {
+  it("uses model settings only for required provider input and resumes without a retry CTA", async () => {
     fakeTasksState.tasks = {
       s1: [
         task({
@@ -405,9 +411,11 @@ describe("session-native task delegation", () => {
     await userEvent.click(screen.getByRole("button", { name: "打开模型设置" }));
     expect(onOpenSettings).toHaveBeenCalledWith("endpoints");
 
-    await userEvent.click(screen.getByRole("button", { name: "已修复，重试 1 项" }));
-    await waitFor(() => expect(mocks.retryTasks).toHaveBeenCalledWith("s1", ["task-1"]));
-    expect(mocks.start).toHaveBeenCalledWith("s1");
+    expect(screen.queryByRole("button", { name: /已修复，重试/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /已授权，重试/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /回到对话处理/ })).not.toBeInTheDocument();
+    expect(mocks.retryTasks).not.toHaveBeenCalled();
+    expect(mocks.start).not.toHaveBeenCalled();
     expect(mocks.retryFailedTasks).not.toHaveBeenCalled();
   });
   it("does not turn cancelled or completed task history into a persistent alert", () => {
@@ -418,16 +426,16 @@ describe("session-native task delegation", () => {
     expect(screen.queryByRole("button", { name: /打开任务活动/ })).not.toBeInTheDocument();
   });
 
-  it("labels a repairable active failure as a failed step, not a generic needs-attention count", () => {
+  it("does not label a system-owned technical failure as user-retryable", () => {
     fakeTasksState.tasks = { s1: [task({ status: "failed", failure_attribution: { repairable: true } })] };
     renderWorkspace();
-    const activity = screen.getByRole("button", { name: "打开任务活动：1 个后台任务失败，可重试" });
+    const activity = screen.getByRole("button", { name: /打开任务活动/ });
     expect(activity).toHaveTextContent("1");
-    expect(activity).not.toHaveTextContent("1 个步骤失败");
+    expect(activity).not.toHaveAccessibleName(/可重试/);
     expect(activity).toHaveClass("text-status-warning");
   });
 
-  it("takes an unknown blocker back to chat with the task evidence prefilled", async () => {
+  it("keeps an unknown technical failure in system recovery without injecting a fake user message", async () => {
     fakeTasksState.tasks = {
       s1: [task({
         status: "failed",
@@ -444,10 +452,12 @@ describe("session-native task delegation", () => {
     };
     renderWorkspace();
     await userEvent.click(screen.getByRole("button", { name: /打开任务活动/ }));
-    await userEvent.click(screen.getByRole("button", { name: "回到对话处理" }));
-    expect(screen.queryByRole("dialog", { name: "任务活动" })).not.toBeInTheDocument();
-    expect(screen.getByTestId("pending-repair-prompt")).toHaveTextContent("实现登录页");
-    expect(screen.getByTestId("pending-repair-prompt")).toHaveTextContent("opaque worker crash 73");
+    expect(screen.queryByRole("button", { name: "回到对话处理" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试失败步骤" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /已修复，重试/ })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pending-repair-prompt")).not.toBeInTheDocument();
+    expect(fakeChatState.sendMessage).not.toHaveBeenCalled();
+    expect(fakeChatState.sendOrQueue).not.toHaveBeenCalled();
   });
 
 });

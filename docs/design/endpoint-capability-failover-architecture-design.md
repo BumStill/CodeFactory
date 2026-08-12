@@ -21,7 +21,7 @@ User turn
               -> FailoverCoordinator selects next eligible route
                   -> rebuild provider transport
                   -> continue same root turn
-              -> exhausted -> actionable terminal failure
+              -> exhausted -> objective waiting_system/remediation
 ```
 
 现有同 route 自愈继续先执行，例如 context compression、vision placeholder、
@@ -125,7 +125,7 @@ Active(route A)
           -> Select(B)
               -> Switched(B) -> Active(B)
               -> Ineligible/Failed(B) -> Select(C)
-          -> Exhausted -> FailedVisible
+          -> Exhausted -> RemediationQueued
   -> Cancelled
 ```
 
@@ -145,7 +145,7 @@ status = active | switched | exhausted | completed | cancelled
 选择前原子写入上一 route 的失败和 `visited_routes`；新 transport 成功接管后再写
 `route_switched`。恢复/重启时从 journal 重建 visited 集合，不重新尝试已访问 route。
 同一 `(endpoint, model, failure_class)` 在一个 episode 最多一次。候选用尽后只能
-进入 `exhausted`，不得重新生成快照形成循环。
+进入 `exhausted` 并提交 DecisionEnvelope 给 objective supervisor，不得重新生成快照形成循环。
 
 ## 6. 上下文与工具连续性
 
@@ -172,7 +172,7 @@ flag。切换 transport 时：
 - `route_retrying`：当前 route 做短退避；默认只更新同一状态行；
 - `route_switching`：包含 source/target display name 和本地化 reason；
 - `route_switched`：目标 transport 已成功接管；
-- `route_exhausted`：包含结构化 exclusions 和 actions；
+- `route_exhausted`：包含结构化 exclusions、typed decision、recovery owner 和下一次观察；
 - `route_recovered`：首选 route 自愈成功，不制造切换记录。
 
 journal 保存脱敏记录：
@@ -189,7 +189,7 @@ usage，不得记为零成本事实，只能记 `usage_unknown`。
 hydration 将 route 事件聚合回所属真实用户回合，最终 effective route 可审计但不创造
 新的用户消息或手动记忆入口。
 
-## 8. 可行动终态
+## 8. 候选耗尽投影
 
 `route_exhausted` 的结构化 payload 至少包含：
 
@@ -203,12 +203,16 @@ type RouteExhausted = {
             "already_failed" | "disabled";
   }>;
   preservedWork: boolean;
-  actions: Array<"retry_primary" | "open_endpoint_settings">;
+  recoveryOwner: string;
+  nextObservationAt?: number;
+  decision: "waiting_system" | "core_input_required";
+  requestKey?: string;
 };
 ```
 
-`retry_primary` 创建新的 episode 并只由用户触发；`open_endpoint_settings` 定位到具体
-故障 endpoint。凭据或登录修改成功后，下一次重试重新读取 Settings 与安全存储。
+`waiting_system` 由 supervisor 在退避/健康证据变化后创建下一 episode；
+`core_input_required` 只有在确认安全替代耗尽时提供唯一输入入口。凭据或登录完成事件到达后，
+系统重新读取 Settings 与安全存储并从 checkpoint 自动续接，不需要人工触发技术重试。
 
 ## 9. 兼容与迁移
 

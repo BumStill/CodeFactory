@@ -16,11 +16,11 @@
 
 Full access 的业务含义保持为「可信项目中的低打扰权限模式」。它只减少配置型 ask，不表示用户授权每个问题都修改代码。回合意图由当前消息和明确的继续/批准动作决定。
 
-### 前台执行必须收敛，但内部预算不是任务终点
+### 前台执行必须收敛，但内部预算不是 objective 终点
 
-Interactive/Execute 回合可以补充验证。单个执行分段内的 completion recovery 保持有界且累计次数不可因普通读取清零；真实证据进展只用于判断是否继续当前策略。分段 guard 或恢复预算耗尽时，系统必须保存检查点并自动续段，或形成带具体 blocker 的可恢复终态，不得发送空 `Done`、把未完成结果伪装成成功，或用“轮次已用完”要求用户重新发起任务。
+Interactive/Execute 回合可以补充验证。单个执行分段内的 completion recovery 保持有界且累计次数不可因普通读取清零；真实证据进展只用于判断是否继续当前策略。分段 guard 或恢复预算耗尽时，系统必须保存检查点并自动续段/换策略；恢复耗尽仍由 durable remediation 持有。不得发送空 `Done`、把未完成结果伪装成成功，或要求用户重新发起技术任务。
 
-用户目标只有在完成、真实阻塞、需要新增授权/决策、用户取消或多策略无材料进展时才结束。详细连续性契约见 `chat-continuity-conversational-evidence-business-design.md`。
+用户目标只有在完成、显式拒绝/取消时结束；不可替代核心输入和无安全默认的不可逆业务决定进入 typed wait，满足后自动续接。多策略无材料进展进入 `failed_internal/platform_incident` remediation，不是用户终点。详细跨域契约见 `objective-recovery-business-design.md`。
 
 ### 隐藏内部文本，不隐藏产品状态
 
@@ -33,6 +33,7 @@ Interactive/Execute 回合可以补充验证。单个执行分段内的 completi
 - 前台回合不会因为 completion recovery、移动中的主分支或观察超时无反馈地占用输入框；内部续段对用户表现为同一目标的连续执行。
 - 长执行中用户能在 5 秒内判断系统正在工作、等待什么、失败在哪里以及如何停止。
 - 取消不会被误解为回滚；已提交、推送或外部变更的边界明确。
+- permission channel timeout 或 App 重启不会把目标回交用户；恢复 owner 与下一次观察始终可见。
 
 ## 非目标
 

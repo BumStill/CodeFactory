@@ -29,6 +29,7 @@ use crate::mcp::McpManager;
 use crate::storage::tasks::TaskConnectorContext;
 use crate::storage::Message;
 use crate::PendingPermissionMap;
+use codefactory_agent_loop::run::{RunOutcome, StopReason};
 
 /// Brief handed to a subagent. The brief MUST be self-contained — the
 /// subagent has no view of the parent's message history.
@@ -69,6 +70,95 @@ pub struct SubagentResult {
     /// Result of the self-verification step (if acceptance_criteria was provided).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acceptance_check: Option<AcceptanceCheck>,
+    /// Exact terminal returned by the shared AgentLoop. Older persisted task
+    /// results do not have this projection, so deserialization keeps it
+    /// optional; every newly executed subagent must populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_outcome: Option<SubagentRunOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentRunOutcome {
+    pub final_text: String,
+    pub completion_evidence: codefactory_agent_core::CompletionEvidence,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub stop_reason: SubagentStopReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStopReason {
+    Finished,
+    Incomplete,
+    FailedInternal,
+    PlatformIncident,
+    Blocked,
+    Cancelled,
+    IterationCeiling,
+    BudgetExhausted,
+}
+
+impl From<StopReason> for SubagentStopReason {
+    fn from(reason: StopReason) -> Self {
+        match reason {
+            StopReason::Finished => Self::Finished,
+            StopReason::Incomplete => Self::Incomplete,
+            StopReason::FailedInternal => Self::FailedInternal,
+            StopReason::PlatformIncident => Self::PlatformIncident,
+            StopReason::Blocked => Self::Blocked,
+            StopReason::Cancelled => Self::Cancelled,
+            StopReason::IterationCeiling => Self::IterationCeiling,
+            StopReason::BudgetExhausted => Self::BudgetExhausted,
+        }
+    }
+}
+
+impl SubagentStopReason {
+    pub(crate) fn failure_code(self) -> &'static str {
+        match self {
+            Self::Finished => "completion_evidence_incomplete",
+            Self::Incomplete => "subagent_incomplete",
+            Self::FailedInternal => "subagent_failed_internal",
+            Self::PlatformIncident => "platform_incident",
+            Self::Blocked => "subagent_blocked",
+            Self::Cancelled => "subagent_cancelled",
+            Self::IterationCeiling => "subagent_iteration_ceiling",
+            Self::BudgetExhausted => "subagent_budget_exhausted",
+        }
+    }
+}
+
+impl From<&RunOutcome> for SubagentRunOutcome {
+    fn from(outcome: &RunOutcome) -> Self {
+        Self {
+            final_text: outcome.final_text.clone(),
+            completion_evidence: outcome.completion_evidence.clone(),
+            input_tokens: outcome.input_tokens,
+            output_tokens: outcome.output_tokens,
+            stop_reason: outcome.stop_reason.into(),
+        }
+    }
+}
+
+impl SubagentResult {
+    /// New results are authoritative only when both projections agree. The
+    /// `None` branch retains compatibility with task results persisted before
+    /// RunOutcome was carried through this boundary.
+    pub(crate) fn is_verified_loop_finish(&self) -> bool {
+        self.completed
+            && self.run_outcome.as_ref().map_or(true, |outcome| {
+                outcome.stop_reason == SubagentStopReason::Finished
+                    && outcome.completion_evidence.completed
+            })
+    }
+
+    pub(crate) fn recovery_failure_code(&self) -> &'static str {
+        self.run_outcome
+            .as_ref()
+            .map(|outcome| outcome.stop_reason.failure_code())
+            .unwrap_or("subagent_incomplete")
+    }
 }
 
 impl Default for SubagentResult {
@@ -80,8 +170,17 @@ impl Default for SubagentResult {
             completed: false,
             sub_session_id: String::new(),
             acceptance_check: None,
+            run_outcome: None,
         }
     }
+}
+
+fn run_outcome_is_completed(outcome: &RunOutcome) -> bool {
+    outcome.stop_reason == StopReason::Finished && outcome.completion_evidence.completed
+}
+
+fn run_outcome_failure_code(outcome: &RunOutcome) -> &'static str {
+    SubagentStopReason::from(outcome.stop_reason).failure_code()
 }
 
 fn resolved_subagent_model(settings: &Settings) -> Result<String> {
@@ -108,6 +207,7 @@ pub async fn run_subagent(
     settings: &Settings,
     app_handle: &AppHandle,
     pending_perms: &PendingPermissionMap,
+    mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
 ) -> std::result::Result<SubagentResult, AppError> {
     let requested_model = resolved_subagent_model(settings)?;
     // Resolve before creating the child session so its stored model reflects
@@ -218,6 +318,8 @@ pub async fn run_subagent(
                 .map(|ctx| ctx.knowledge_library_ids())
                 .unwrap_or_default(),
             usage_surface: crate::agent::UsageSurface::Subagent,
+            mutation_permit,
+            force_context_compression: None,
         }),
         crate::agent::AgentMode::Autonomous,
     )
@@ -226,7 +328,8 @@ pub async fn run_subagent(
     // A subtask stops on its terminal result or explicit cancellation, not an
     // arbitrary wall-clock deadline. Long builds and CI waits are legitimate
     // work; time alone must not turn them into unexplained interruptions.
-    agent.run(history).await?;
+    let run_outcome = agent.run(history).await?;
+    let completed = run_outcome_is_completed(&run_outcome);
 
     // 5. Walk messages to produce a result summary.
     let result = summarize_run(pool, &sub_session_id).await?;
@@ -234,9 +337,9 @@ pub async fn run_subagent(
     // 6. Acceptance check (Phase 3): if criteria were provided, ask the model
     //    to self-verify. We do a lightweight, single-turn call using the same
     //    endpoint so we don't disturb the agent history.
-    let acceptance_check = if let Some(criteria) = &brief.acceptance_criteria {
-        Some(
-            run_acceptance_check(
+    let acceptance_check = if completed {
+        brief.acceptance_criteria.as_ref().map(|criteria| {
+            (
                 criteria,
                 &result.summary,
                 &base_url,
@@ -244,19 +347,25 @@ pub async fn run_subagent(
                 &model,
                 &api_style,
             )
-            .await,
-        )
+        })
     } else {
         None
     };
+    let acceptance_check =
+        if let Some((criteria, summary, base_url, api_key, model, api_style)) = acceptance_check {
+            Some(run_acceptance_check(criteria, summary, base_url, api_key, model, api_style).await)
+        } else {
+            None
+        };
 
     Ok(SubagentResult {
         summary: result.summary,
         files_changed: result.files_changed,
         tool_calls_count: result.tool_calls_count,
-        completed: true,
+        completed,
         sub_session_id,
         acceptance_check,
+        run_outcome: Some(SubagentRunOutcome::from(&run_outcome)),
     })
 }
 
@@ -301,6 +410,54 @@ mod model_routing_tests {
 
         assert!(!result.passed);
         assert!(result.reason.contains("do not support ChatGPT endpoints"));
+    }
+}
+
+#[cfg(test)]
+mod outcome_integrity_tests {
+    use super::*;
+    use codefactory_agent_core::CompletionEvidence;
+    use codefactory_agent_loop::run::{RunOutcome, StopReason};
+
+    fn outcome(stop_reason: StopReason, evidence_completed: bool) -> RunOutcome {
+        RunOutcome {
+            final_text: "terminal summary".into(),
+            completion_evidence: CompletionEvidence {
+                completed: evidence_completed,
+                ..CompletionEvidence::default()
+            },
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason,
+        }
+    }
+
+    #[test]
+    fn only_finished_run_with_sufficient_loop_evidence_is_completed() {
+        assert!(run_outcome_is_completed(&outcome(
+            StopReason::Finished,
+            true
+        )));
+        assert!(!run_outcome_is_completed(&outcome(
+            StopReason::Finished,
+            false
+        )));
+        assert!(!run_outcome_is_completed(&outcome(
+            StopReason::PlatformIncident,
+            true
+        )));
+    }
+
+    #[test]
+    fn platform_and_permission_channel_incidents_keep_a_specific_system_failure_code() {
+        assert_eq!(
+            run_outcome_failure_code(&outcome(StopReason::PlatformIncident, false)),
+            "platform_incident"
+        );
+        assert_eq!(
+            run_outcome_failure_code(&outcome(StopReason::FailedInternal, false)),
+            "subagent_failed_internal"
+        );
     }
 }
 

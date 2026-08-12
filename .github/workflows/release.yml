@@ -343,14 +343,22 @@ jobs:
           CODEFACTORY_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/codefactory-release-evidence
           CODEFACTORY_GUI_PROOF_TIER: released-artifact-gui
           RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_BUILD_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
         run: |
+          set -euo pipefail
           mkdir -p "$CODEFACTORY_RELEASE_EVIDENCE_DIR"
-          DMG_PATH="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -type f -name '*.dmg' -print -quit)"
-          if [ -z "$DMG_PATH" ]; then
-            echo "::error::macOS DMG was not produced"
+          DMG_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg"
+          UPDATER_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle/macos"
+          DMG_COUNT="$(find "$DMG_DIR" -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          UPDATER_COUNT="$(find "$UPDATER_DIR" -type f -name '*.app.tar.gz' | wc -l | tr -d ' ')"
+          if [ "$DMG_COUNT" != "1" ] || [ "$UPDATER_COUNT" != "1" ]; then
+            echo "::error::expected one macOS DMG and one updater archive, found dmg=$DMG_COUNT updater=$UPDATER_COUNT"
             exit 1
           fi
-          scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${RELEASE_TAG#v}"
+          DMG_PATH="$(find "$DMG_DIR" -type f -name '*.dmg' -print -quit)"
+          UPDATER_ARCHIVE="$(find "$UPDATER_DIR" -type f -name '*.app.tar.gz' -print -quit)"
+          scripts/verify-macos-release-artifact.sh \
+            "$DMG_PATH" "${RELEASE_TAG#v}" "$EXPECTED_BUILD_SHA" "$UPDATER_ARCHIVE"
 
       - name: Upload installed release GUI evidence
         if: always()
@@ -367,7 +375,7 @@ jobs:
   # publish point, after every asset is in place.
   finalize:
     runs-on: ubuntu-latest
-    needs: [changelog, build-windows, build-macos]
+    needs: [changelog, prepare-release, build-windows, build-macos]
     permissions:
       contents: write
     steps:
@@ -377,10 +385,15 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
           NOTES: ${{ needs.changelog.outputs.content }}
+          BUILD_GIT_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
           BASE="https://github.com/$REPO/releases/download/$TAG"
+          if [[ ! "$BUILD_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::release build identity must be a full lowercase Git SHA"
+            exit 1
+          fi
 
           # Discover the uploaded binary names on the (still-draft) release.
           gh release view "$TAG" --repo "$REPO" --json assets \
@@ -403,11 +416,12 @@ jobs:
           # NOT the .dmg (which is only the human download).
           jq -n \
             --arg version "$VERSION" \
+            --arg build_git_sha "$BUILD_GIT_SHA" \
             --arg notes "$NOTES" \
             --arg pub_date "$PUB_DATE" \
             --arg winsig "$WIN_SIG" --arg winurl "$BASE/$WIN_EXE" \
             --arg macsig "$MAC_SIG" --arg macurl "$BASE/$MAC_TGZ" \
-            '{version:$version, notes:$notes, pub_date:$pub_date, platforms:{
+            '{version:$version, build_git_sha:$build_git_sha, notes:$notes, pub_date:$pub_date, platforms:{
                "windows-x86_64":      {signature:$winsig, url:$winurl},
                "windows-x86_64-nsis": {signature:$winsig, url:$winurl},
                "darwin-aarch64":      {signature:$macsig, url:$macurl}
@@ -443,14 +457,26 @@ jobs:
           mkdir -p "$RELEASE_DIR"
           VERSION="${TAG#v}"
           DMG_PATH="$RELEASE_DIR/CodeFactory_${VERSION}_aarch64.dmg"
-          PUBLIC_URL="https://github.com/$REPO/releases/download/$TAG/CodeFactory_${VERSION}_aarch64.dmg"
+          UPDATER_ARCHIVE="$RELEASE_DIR/CodeFactory_aarch64.app.tar.gz"
+          LATEST_MANIFEST="$RELEASE_DIR/latest.json"
+          PUBLIC_BASE="https://github.com/$REPO/releases/download/$TAG"
           # Remove any inherited token so this proves the asset is available
           # through the same anonymous URL an end user receives.
           env -u GH_TOKEN curl \
             --fail --location --silent --show-error \
             --retry 4 --retry-all-errors --retry-delay 3 \
             --output "$DMG_PATH" \
-            "$PUBLIC_URL"
+            "$PUBLIC_BASE/CodeFactory_${VERSION}_aarch64.dmg"
+          env -u GH_TOKEN curl \
+            --fail --location --silent --show-error \
+            --retry 4 --retry-all-errors --retry-delay 3 \
+            --output "$UPDATER_ARCHIVE" \
+            "$PUBLIC_BASE/CodeFactory_aarch64.app.tar.gz"
+          env -u GH_TOKEN curl \
+            --fail --location --silent --show-error \
+            --retry 4 --retry-all-errors --retry-delay 3 \
+            --output "$LATEST_MANIFEST" \
+            "$PUBLIC_BASE/latest.json"
 
       - name: Verify published macOS release artifact
         shell: bash
@@ -464,12 +490,22 @@ jobs:
           mkdir -p "$CODEFACTORY_RELEASE_EVIDENCE_DIR"
           {
             DMG_COUNT="$(find "$DMG_DIR" -type f -name '*.dmg' | wc -l | tr -d ' ')"
-            if [ "$DMG_COUNT" != "1" ]; then
-              echo "::error::expected exactly one published arm64 DMG, found $DMG_COUNT"
+            UPDATER_COUNT="$(find "$DMG_DIR" -type f -name '*.app.tar.gz' | wc -l | tr -d ' ')"
+            if [ "$DMG_COUNT" != "1" ] || [ "$UPDATER_COUNT" != "1" ]; then
+              echo "::error::expected one published arm64 DMG and updater archive, found dmg=$DMG_COUNT updater=$UPDATER_COUNT"
               exit 1
             fi
             DMG_PATH="$(find "$DMG_DIR" -type f -name '*.dmg' -print -quit)"
-            scripts/verify-macos-release-artifact.sh "$DMG_PATH" "${RELEASE_TAG#v}"
+            UPDATER_ARCHIVE="$(find "$DMG_DIR" -type f -name '*.app.tar.gz' -print -quit)"
+            LATEST_MANIFEST="$DMG_DIR/latest.json"
+            if [ ! -f "$LATEST_MANIFEST" ]; then
+              echo "::error::published latest.json is missing"
+              exit 1
+            fi
+            EXPECTED_BUILD_SHA="$(git rev-parse HEAD)"
+            scripts/verify-macos-release-artifact.sh \
+              "$DMG_PATH" "${RELEASE_TAG#v}" "$EXPECTED_BUILD_SHA" \
+              "$UPDATER_ARCHIVE" "$LATEST_MANIFEST"
           } 2>&1 | tee "$CODEFACTORY_RELEASE_EVIDENCE_DIR/verification.log"
 
       - name: Upload published release GUI evidence

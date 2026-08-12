@@ -28,6 +28,7 @@ describe("chat tool call stream events", () => {
       baseState(),
       {
         type: "permission_request",
+        intent_id: "intent-1",
         tool_call_id: "tool-1",
         tool_name: "bash",
         args: { command: "pnpm build" },
@@ -50,6 +51,7 @@ describe("chat tool call stream events", () => {
       baseState(),
       {
         type: "permission_request",
+        intent_id: "intent-2",
         tool_call_id: "tool-2",
         tool_name: "write_file",
         args: { path: "README.md", content: "hello" },
@@ -86,7 +88,7 @@ describe("chat tool call stream events", () => {
     expect(done.pendingPermission).toBeNull();
   });
 
-  it("keeps a remote delivery wait active until the terminal done event", () => {
+  it("keeps a remote delivery wait active until durable turn settlement", () => {
     const started = reduceChatStreamEvent(
       baseState(),
       { type: "tool_call_start", id: "delivery-1", name: "deliver_changes", args: {} },
@@ -113,7 +115,20 @@ describe("chat tool call stream events", () => {
       { type: "done", input_tokens: 0, output_tokens: 0 },
       "assistant-1",
     );
-    expect(done.streaming).toBe(false);
+    expect(done.streaming).toBe(true);
+
+    const settled = reduceChatStreamEvent(
+      done,
+      {
+        type: "turn_settled",
+        run_instance_id: "run-delivery-1",
+        root_turn_id: "root-delivery-1",
+        objective_id: "objective-delivery-1",
+        status: "waiting_system",
+      },
+      "assistant-1",
+    );
+    expect(settled.streaming).toBe(false);
   });
 
   it("marks the tool card cancelled and clears pending permission", () => {
@@ -121,6 +136,7 @@ describe("chat tool call stream events", () => {
       baseState(),
       {
         type: "permission_request",
+        intent_id: "intent-3",
         tool_call_id: "tool-cancelled",
         tool_name: "bash",
         args: { command: "sleep 10" },

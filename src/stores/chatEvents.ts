@@ -22,9 +22,15 @@ export interface TurnActivityState {
   waitingReason: string | null;
   updatedAt: number;
   terminalReason: string | null;
+  objectiveId?: string;
+  objectiveStatus?: "active" | "waiting_system" | "waiting_core_input" | "waiting_authorization" | "waiting_business_decision" | "completed" | "cancelled" | "legacy_orphan";
+  recoveryOwner?: string | null;
+  nextObservationAt?: number | null;
+  lastProgressAt?: number | null;
 }
 
 export interface PendingPermission {
+  intentId: string;
   toolCallId: string;
   toolName: string;
   args: unknown;
@@ -48,9 +54,8 @@ export interface UIMessage {
   inputTokens?: number;
   outputTokens?: number;
   createdAt: number;
-  /** Wall-clock the turn took, frozen when the stream reached a terminal
-   *  state (done/error). Absent while still streaming (the UI ticks live off
-   *  `createdAt` instead) and for plain user messages. */
+  /** Wall-clock the turn took, frozen only when the durable run settles.
+   * Transport completion/error can still be followed by recovery work. */
   durationMs?: number;
   /** Internal completion-review provenance from the DB. Drafts and
    *  injected review instructions are excluded from the chat transcript. */
@@ -99,7 +104,7 @@ export interface TransportRetryState {
 
 const MODEL_ROUTE_EXHAUSTED_PREFIX = "所有可用模型端点均不可用：";
 export const MODEL_ROUTE_EXHAUSTED_GUIDANCE =
-  "所有已配置且有凭据的模型端点都暂时不可用。请检查模型设置中的凭据、余额或端点状态，选择其他可用模型后重试；如果服务正在限流，也可以稍后重试。";
+  "所有已配置且有凭据的模型端点都暂时不可用。目标与失败证据已保留；系统将按退避策略重新观测可用路由。";
 
 export function isModelRouteExhaustedError(message: string): boolean {
   return message.startsWith(MODEL_ROUTE_EXHAUSTED_PREFIX);
@@ -110,10 +115,10 @@ function credentialFailureGuidance(message: string): string | null {
   const route = details.split("（", 1)[0]?.trim();
   if (!route) return null;
   if (details.includes("AUTH_MISSING")) {
-    return `${route} 当前不可用：尚未配置凭据。请打开模型设置配置该端点的 API Key 后重试。`;
+    return `${route} 当前不可用：尚未配置凭据。请打开模型设置配置该端点的 API Key；保存后系统会从安全检查点恢复。`;
   }
   if (details.includes("CREDENTIAL_ACCESS_REQUIRED")) {
-    return `${route} 当前不可用：无法读取已配置凭据。请打开模型设置重新保存该端点的 API Key 后重试。`;
+    return `${route} 当前不可用：无法读取已配置凭据，需要一次密钥访问授权。请在模型设置完成授权或重新保存该端点的 API Key；授权完成后系统会从安全检查点恢复。`;
   }
   return null;
 }
@@ -155,6 +160,10 @@ export interface ChatEventState {
   contextUsage: ContextUsage | null;
   /** Set whenever the backend just elided messages; UI shows a toast. */
   compressionToast: CompressionToast | null;
+  /** The current run emitted a successful transport-level `done`. Settlement
+   * may arrive later; only a completed settlement with this evidence may
+   * trigger post-mortem work. Optional for legacy/test state fixtures. */
+  transportDoneSucceeded?: boolean;
 }
 
 function updateMessageById(
@@ -222,6 +231,11 @@ export function reduceChatStreamEvent(
               waitingReason: event.waiting_reason ?? null,
               updatedAt: event.updated_at,
               terminalReason: event.terminal_reason ?? null,
+              objectiveId: event.objective_id,
+              objectiveStatus: event.objective_status,
+              recoveryOwner: event.recovery_owner ?? null,
+              nextObservationAt: event.next_observation_at ?? null,
+              lastProgressAt: event.last_progress_at ?? null,
             },
           };
         }),
@@ -269,6 +283,7 @@ export function reduceChatStreamEvent(
       return {
         ...state,
         pendingPermission: {
+          intentId: event.intent_id,
           toolCallId: event.tool_call_id,
           toolName: event.tool_name,
           args: event.args,
@@ -309,25 +324,19 @@ export function reduceChatStreamEvent(
     }
 
     case "done": {
-      const endedAt = Date.now();
       return {
         ...state,
-        streaming: false,
+        transportDoneSucceeded: true,
         inputTokenTotal: state.inputTokenTotal + event.input_tokens,
         outputTokenTotal: state.outputTokenTotal + event.output_tokens,
-        messages: updateMessageById(state.messages, msgId, (m) =>
-          m.durationMs == null ? { ...m, durationMs: Math.max(0, endedAt - m.createdAt) } : m,
-        ),
       };
     }
 
     case "error": {
-      const endedAt = Date.now();
       const modelRoutesExhausted = isModelRouteExhaustedError(event.message);
       return {
         ...state,
-        streaming: false,
-        pendingPermission: null,
+        transportDoneSucceeded: false,
         messages: updateMessageById(state.messages, msgId, (m) => {
           if (modelRoutesExhausted) {
             const presentation = presentChatInvocationError(event.message);
@@ -335,24 +344,20 @@ export function reduceChatStreamEvent(
               ...m,
               content: presentation.content,
               failureEvidence: presentation.failureEvidence,
-              durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
             };
           }
           return {
             ...m,
             content: m.content + `\n\nError: ${event.message}`,
-            durationMs: m.durationMs ?? Math.max(0, endedAt - m.createdAt),
           };
         }),
       };
     }
 
     case "runtime_error": {
-      const endedAt = Date.now();
       return {
         ...state,
-        streaming: false,
-        pendingPermission: null,
+        transportDoneSucceeded: false,
         messages: updateMessageById(state.messages, msgId, (message) => ({
           ...message,
           content: event.message,
@@ -361,9 +366,21 @@ export function reduceChatStreamEvent(
             endpointId: event.endpoint_id,
             recoverable: event.recoverable,
           },
-          durationMs:
-            message.durationMs ?? Math.max(0, endedAt - message.createdAt),
         })),
+      };
+    }
+
+    case "turn_settled": {
+      const endedAt = Date.now();
+      return {
+        ...state,
+        streaming: false,
+        pendingPermission: null,
+        messages: updateMessageById(state.messages, msgId, (message) =>
+          message.durationMs == null
+            ? { ...message, durationMs: Math.max(0, endedAt - message.createdAt) }
+            : message,
+        ),
       };
     }
 

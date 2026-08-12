@@ -7,9 +7,9 @@
 | running | 正在执行当前步骤 | 否 |
 | waiting | 正在等待远端状态；系统会自动续接 | 否 |
 | recovering | 已接管上次未完成任务，正在核对同一 PR | 否 |
-| needs_business_decision | 需要你选择会改变业务结果的方案，并展示推荐与影响 | 是，业务决策 |
+| needs_business_decision | 需要你选择会改变业务结果的方案，并展示推荐与影响 | 否，objective 等待选择后自动续接 |
 | core_input_required | 缺少无法自动获取的核心外部输入；一次列全，提供后自动续接 | 否，objective 保持运行 |
-| failed_internal | 自动恢复未能解决；这是系统失败 | 是，系统失败 |
+| failed_internal | 当前恢复策略未能解决；系统已进入新的 remediation | 否，系统持有 |
 | platform_incident | 平台正在修复执行环境；无需用户推动 | 否，系统持有 |
 | completed | 已达到请求边界，并附证据 | 是 |
 

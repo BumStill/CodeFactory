@@ -5,24 +5,22 @@
 ```text
 User turn
   -> ActiveSegment
-      -> Completed
-      -> Blocked
-      -> Cancelled
-      -> FailedVisible
+      -> ObjectiveCompleted
+      -> UserCancelled
       -> Checkpointed -> ContinuationQueued -> ActiveSegment
                             | scheduling/panic/restart failure
                             v
-                       InterruptedRecoverable
+                       WaitingSystem -> RemediationSupervisor -> ActiveSegment
 ```
 
-`max_iterations` 从“用户回合终止上限”降级为 `segment_iteration_budget`。一个用户回合可包含多个内部 segment，但只有一个 root goal 和一个最终终态。
+`max_iterations` 从“用户回合终止上限”降级为 `segment_iteration_budget`。一个用户回合可包含多个内部 segment，但只有一个 root goal/objective；turn/stream 可以 settled，只有 CompletionArbiter 或显式用户取消能产生业务终态。
 
 分段边界处理顺序必须为：
 
 1. 确认本轮最后一个工具结果已经持久化；
 2. 写入连续性检查点；
 3. 发出安全的进度事件；
-4. 调度下一 segment；
+4. 由 objective supervisor 调度下一 segment；
 5. 下一 segment 接管成功后把检查点标为 resumed。
 
 任务未完成时不得在第 2 步前后发出成功 `Done`。最终 `Done` 只表示已生成可见最终回复并关闭当前 root turn。
@@ -35,7 +33,7 @@ User turn
 root_turn_id
 session_id
 segment_index
-status              checkpointed | queued | running | interrupted | completed
+status              checkpointed | queued | running | waiting_system | completed | cancelled
 reason              segment_boundary | panic | process_restart | transport | no_progress
 last_message_id
 last_tool_call_id
@@ -46,7 +44,7 @@ updated_at
 
 - 检查点与最后一个工具 outcome 必须按顺序提交，避免工具已执行但游标仍指向工具之前。
 - `goal_digest` 只用于续跑归属和用户提示，不保存新的隐藏用户指令。
-- 启动时把长时间停在 `running`/`queued` 且没有活跃 owner 的记录归为 `interrupted`，再按权限和安全边界自动恢复或提供继续入口。
+- 启动时把长时间停在 `running`/`queued` 且没有活跃 owner 的记录归为 `waiting_system`，身份可证明时由 supervisor 自动 claim；身份不足时只读投影为 `legacy_orphan`，不提供技术恢复入口。
 - 续段重放模型上下文时复用现有 provider replay；不得把 continuity journal 伪装成 `role=user`。
 
 ## 3. 分段续跑与无进展收敛
@@ -59,15 +57,15 @@ updated_at
 - 用户取消状态；
 - 当前任务的 wall-clock 与成本计量。
 
-“可继续”由材料进展决定，而不是无条件无限循环。连续出现相同 blocker 或无新增文件、命令、测试、外部状态证据时，系统应先换策略；达到策略收敛规则后持久化 `Blocked` 并生成具体最终回复。该规则没有“30/80 轮已用完”等用户文案。
+是否保持当前策略由材料进展决定，而不是无条件无限循环。连续出现相同 failure signature 或无新增文件、命令、测试、外部状态证据时，系统应先换策略；达到策略收敛规则后持久化 `failed_internal/platform_incident` remediation 与下一次观察，不能写 user-blocked 最终回复。该规则没有内部轮次耗尽等用户文案。
 
 ## 4. 后台 task 终态监控
 
 聊天命令不得 fire-and-forget 后丢弃 `JoinHandle`。每个 spawned agent future 必须有 owner/watcher：
 
-- 正常返回：由 AgentLoop 产生 Completed/Blocked/Cancelled；
-- `JoinError::is_panic()` 或 unwind：记录 `interrupted(reason=panic)`，发出可见错误事件，释放 running/cancel 状态；
-- task 被 abort：记录 `Cancelled` 或 `InterruptedRecoverable`，不能保持 running；
+- 正常返回：AgentLoop 返回 typed outcome，由 CompletionArbiter/Decision Router 决定 completed、waiting 或 cancelled；
+- `JoinError::is_panic()` 或 unwind：记录 `waiting_system(reason=panic)`，发出可见恢复事件，释放失效 running/cancel owner 并排队 remediation；
+- task 被 abort：只有显式用户 cancel 才记录 `Cancelled`；其它 abort 记录 waiting_system，不能保持 running；
 - watcher 自身无法写库时仍发送前端 error，并写本机诊断日志。
 
 panic 文案只说明“执行意外中断，已保留完成内容”，详细 backtrace 留在诊断日志，不进入聊天正文。
@@ -78,8 +76,9 @@ panic 文案只说明“执行意外中断，已保留完成内容”，详细 b
 
 - `continuity_checkpointed`：内部保存成功，用户可见“继续处理中”；
 - `continuity_resumed`：下一分段接管，更新同一 streaming tail；
-- `turn_interrupted`：包含脱敏原因、是否可自动恢复和继续入口能力；
-- `turn_terminal`：completed/blocked/cancelled/failed 的唯一终态。
+- `turn_interrupted`：包含脱敏原因、objective owner 和下一次观察；不携带技术继续入口；
+- `turn_settled`：只表示当前 stream/turn future 已关闭；
+- `objective_terminal`：只有 completed/cancelled，必须来自 CompletionArbiter 或显式用户动作。
 
 前端 reducer 按 `root_turn_id` 更新同一个回合，而不是为每个 segment 创建新的用户目标。`Done` 或 error 到达后，前端应执行一次有 revision 门禁的尾页重同步；迟到响应不得覆盖已经开始的排队消息。
 
@@ -87,7 +86,7 @@ panic 文案只说明“执行意外中断，已保留完成内容”，详细 b
 
 - assistant narration、tool declaration/replay、continuity 和 completion state 归入同一 turn；
 - 中间 assistant 文本标记为 step，最后一个符合展示条件的正文标记为 final；
-- 悬空工具尾部若没有 completed/blocked/cancelled/failed 终态，合成为 `InterruptedRecoverable`；
+- 悬空工具尾部若没有 objective completed/cancelled，合成为 `WaitingSystem` 或 identity 不足的 `LegacyOrphan`；
 - 旧数据库没有 continuity 字段时，依据持久化 tool outcome 和缺失终态做保守识别，不声称任务仍在运行。
 
 ## 6. 对话式工具证据视图模型
@@ -124,7 +123,7 @@ border: "rgb(var(--border-color) / <alpha-value>)"
 
 最终回复判定仍用于耗时等辅助元信息：
 
-- 所属真实用户回合已有终态；
+- 所属 objective 已由 CompletionArbiter 完成；
 - 该行是回合最终可见 assistant 正文；
 - completion state 不是 step、notice、checkpoint、interrupted 或 rejected candidate；
 - 不是匿名内部恢复文本。

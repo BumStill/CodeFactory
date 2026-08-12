@@ -3,9 +3,10 @@
 ## 背景与目标
 
 CodeFactory 的受控交付必须把一次已授权任务持续推进到用户选择的 ceiling。CI 失败、
-PR 正文缺少治理字段、分支落后或远端暂时失败都不是新的用户意图，也不能被统一压成
-“阻断后总结”。只有无法安全推断的代码冲突、授权撤销、PR head 漂移和高风险歧义才
-需要人工介入。
+PR 正文缺少治理字段、分支落后、代码冲突、PR head 漂移或远端暂时失败都不是新的用户
+意图，也不能被统一压成用户阻断。系统必须修复或只读对账；只有不可替代核心输入、无安全
+默认的不可逆业务选择、显式拒绝或取消才允许进入用户等待。跨域 ownership 以
+`feature-specs/objective-recovery-control-plane.md` 为准。
 
 ## Requirements Traceability
 
@@ -15,7 +16,7 @@ PR 正文缺少治理字段、分支落后或远端暂时失败都不是新的�
 | DR-2 | `deliver_changes` 创建 PR 前必须生成唯一、非占位的 README decision/reason | delivery unit tests + real PR body |
 | DR-3 | 复用已有 PR 时必须保留正文其余内容，并自动收敛缺失、重复、非法或占位的 README 字段 | delivery adapter tests + real PR body |
 | DR-4 | README required check 必须读取当前 PR 正文；正文编辑会触发新 run，rerun 也不能困在旧 event snapshot | workflow contract test + GitHub Actions run |
-| DR-5 | 可恢复的 blocked tool result 必须回到执行循环，执行 `next_action` 后续跑；同一回合最多自动恢复两次 | agent-loop policy/run tests |
+| DR-5 | 可恢复的局部 blocked/waiting tool result 必须回到执行循环，执行 `next_action` 后续跑；同策略最多修复两次，耗尽后进入 durable remediation 而不是用户终态 | agent-loop policy/run + supervisor tests |
 | DR-6 | `BEHIND` 必须自动 update branch、同步本地 head 并重跑 required checks，不能被描述成被动等待 | delivery state-machine tests + real PR merge state |
 | DR-7 | cancelled、timed_out、stale、startup_failure 等基础设施结论允许有界 rerun；普通测试 failure 不盲重跑，必须把失败 check 和最小恢复动作交回实现循环 | CI classification/recovery tests |
 | DR-8 | 任何恢复都不得使用 `--admin`、force push 或 ruleset bypass；合并仍绑定 expected head | merge argv tests + live ruleset |
@@ -37,7 +38,8 @@ pr_open
        -> branch_updated -> gates_pending
        -> infrastructure_rerun -> gates_pending
        -> implementation_required -> agent 修复/commit/push -> gates_pending
-       -> human_required -> blocked
+       -> core_input_required / needs_business_decision -> typed wait -> resume
+       -> failed_internal / platform_incident -> remediation queue
   -> ci_green
   -> merge_queued
        -> branch_updated -> gates_pending
@@ -56,10 +58,10 @@ pr_open
 - README 正文修复、branch update 和 CI rerun 必须幂等。
 - 任何 create/merge/release 前置查询均采用三值语义 `Existing / Absent / Unknown`；
   `Unknown` 永远不能降级为 `Absent`。
-- PR head 与回执绑定 SHA 不一致时旧授权失效，禁止自动合并。
+- PR head 与回执绑定 SHA 不一致时禁止自动合并并先只读对账；objective 授权保持，只有显式撤销才失效。
 - 普通测试失败不允许无条件 rerun；先返回失败 check、结论和可执行诊断入口，由
   agent 修改代码或测试后再 push。
-- 恢复用尽后输出具体失败签名、已尝试动作和下一步，不输出泛化的权限或“本回合”文案。
+- 恢复用尽后记录具体失败签名、已尝试动作、system owner 和下一次观察并进入 remediation；不输出泛化权限文案或人工恢复 CTA。
 
 ## Primary User Path
 

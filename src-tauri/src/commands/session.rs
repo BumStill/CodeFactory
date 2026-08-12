@@ -54,6 +54,7 @@ async fn materialize_session_and_first_message(
     endpoint_id: &str,
     model_id: &str,
     model_policy: &str,
+    first_message_id: &str,
     first_message: &str,
     now: i64,
 ) -> Result<Session, AppError> {
@@ -62,7 +63,26 @@ async fn materialize_session_and_first_message(
         .fetch_optional(pool)
         .await?
     {
-        return Ok(existing);
+        let persisted = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT id, session_id, role, content FROM messages WHERE id = ?",
+        )
+        .bind(first_message_id)
+        .fetch_optional(pool)
+        .await?;
+        if persisted
+            == Some((
+                first_message_id.to_string(),
+                draft_id.to_string(),
+                "user".to_string(),
+                first_message.to_string(),
+            ))
+        {
+            return Ok(existing);
+        }
+        return Err(AppError::Other(
+            "DRAFT_MATERIALIZATION_IDENTITY_MISMATCH: existing session does not contain the exact first user message"
+                .into(),
+        ));
     }
 
     let mut tx = pool.begin().await?;
@@ -87,7 +107,7 @@ async fn materialize_session_and_first_message(
         "INSERT INTO messages (id, session_id, role, content, created_at)
          VALUES (?, ?, 'user', ?, ?)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(first_message_id)
     .bind(draft_id)
     .bind(first_message)
     .bind(now)
@@ -114,12 +134,15 @@ pub async fn materialize_draft_session(
     draft_id: String,
     cwd: Option<String>,
     model_id: String,
+    first_message_id: String,
     first_message: String,
     state: State<'_, AppState>,
 ) -> Result<Session, AppError> {
     if first_message.trim().is_empty() {
         return Err(AppError::Other("First message cannot be empty".into()));
     }
+    Uuid::parse_str(&first_message_id)
+        .map_err(|_| AppError::Other("First message identity must be a valid UUID".into()))?;
 
     let settings = state.settings.read().await.clone();
     let resolved_model = resolve_new_session_model(&settings, &model_id).ok_or_else(|| {
@@ -160,6 +183,7 @@ pub async fn materialize_draft_session(
         &settings.default_endpoint,
         &resolved_model,
         new_session_model_policy(&settings),
+        &first_message_id,
         &first_message,
         Utc::now().timestamp_millis(),
     )
@@ -462,6 +486,11 @@ pub struct TurnActivitySnapshot {
     pub waiting_reason: Option<String>,
     pub updated_at: i64,
     pub terminal_reason: Option<String>,
+    pub objective_id: Option<String>,
+    pub objective_status: Option<String>,
+    pub recovery_owner: Option<String>,
+    pub next_observation_at: Option<i64>,
+    pub last_progress_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -763,21 +792,27 @@ async fn load_turn_activity_states(
     }
 
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT root_turn_id, revision, phase, status,
-                recent_activity_kind, recent_activity_label,
-                waiting_reason, updated_at, terminal_reason
-         FROM chat_turn_state
-         WHERE session_id = ",
+        "SELECT turn.root_turn_id, turn.revision, turn.phase, turn.status,
+                turn.recent_activity_kind, turn.recent_activity_label,
+                turn.waiting_reason, turn.updated_at, turn.terminal_reason,
+                turn.objective_id AS objective_id,
+                objective.status AS objective_status,
+                objective.recovery_owner AS recovery_owner,
+                objective.next_observation_at AS next_observation_at,
+                objective.last_progress_at AS last_progress_at
+         FROM chat_turn_state AS turn
+         LEFT JOIN objectives AS objective ON objective.id = turn.objective_id
+         WHERE turn.session_id = ",
     );
     query.push_bind(session_id);
-    query.push(" AND root_turn_id IN (");
+    query.push(" AND turn.root_turn_id IN (");
     {
         let mut roots_query = query.separated(", ");
         for root in &roots {
             roots_query.push_bind(*root);
         }
     }
-    query.push(") ORDER BY updated_at ASC");
+    query.push(") ORDER BY turn.updated_at ASC");
     match query
         .build_query_as::<TurnActivitySnapshot>()
         .fetch_all(pool)
@@ -790,6 +825,40 @@ async fn load_turn_activity_states(
             // history must remain readable even if a copied database has not
             // run the newest migration yet.
             Ok(Vec::new())
+        }
+        Err(error)
+            if error.to_string().contains("no such table: objectives")
+                || error
+                    .to_string()
+                    .contains("no such column: turn.objective_id") =>
+        {
+            // A copied pre-objective database must remain readable. App startup
+            // installs the additive objective schema before normal commands,
+            // but history import and focused tests can legitimately encounter
+            // the older turn projection alone.
+            let mut legacy = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT root_turn_id, revision, phase, status,
+                        recent_activity_kind, recent_activity_label,
+                        waiting_reason, updated_at, terminal_reason,
+                        NULL AS objective_id, NULL AS objective_status,
+                        NULL AS recovery_owner, NULL AS next_observation_at,
+                        NULL AS last_progress_at
+                 FROM chat_turn_state
+                 WHERE session_id = ",
+            );
+            legacy.push_bind(session_id);
+            legacy.push(" AND root_turn_id IN (");
+            {
+                let mut roots_query = legacy.separated(", ");
+                for root in &roots {
+                    roots_query.push_bind(*root);
+                }
+            }
+            legacy.push(") ORDER BY updated_at ASC");
+            legacy
+                .build_query_as::<TurnActivitySnapshot>()
+                .fetch_all(pool)
+                .await
         }
         Err(error) => Err(error),
     }
@@ -1047,6 +1116,7 @@ mod tests {
             "deepseek",
             "deepseek-v4",
             "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d63",
             "第一条真实消息",
             123,
         )
@@ -1070,6 +1140,11 @@ mod tests {
             .unwrap();
         assert_eq!(session_count, 1);
         assert_eq!(message_count, 1);
+        let persisted_id: String = sqlx::query_scalar("SELECT id FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(persisted_id, "019f9bd3-e868-7c5a-94a8-74d551ea8d63");
     }
 
     #[tokio::test]
@@ -1098,6 +1173,7 @@ mod tests {
             "deepseek",
             "model",
             "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d64",
             "reject",
             123,
         )
@@ -1133,6 +1209,7 @@ mod tests {
                 "deepseek",
                 "model",
                 "prefer",
+                "019f9bd3-e868-7c5a-94a8-74d551ea8d65",
                 "只保存一次",
                 123,
             )
@@ -1146,6 +1223,77 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(message_count, 1);
+    }
+
+    #[tokio::test]
+    async fn materialization_fails_closed_when_existing_session_identity_mismatches() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        create_materialization_schema(&pool).await;
+
+        materialize_session_and_first_message(
+            &pool,
+            "draft-1",
+            "project",
+            "/tmp/project",
+            "deepseek",
+            "model",
+            "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d66",
+            "原始首消息",
+            123,
+        )
+        .await
+        .expect("first materialization");
+
+        let wrong_content = materialize_session_and_first_message(
+            &pool,
+            "draft-1",
+            "project",
+            "/tmp/project",
+            "deepseek",
+            "model",
+            "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d66",
+            "被替换的内容",
+            124,
+        )
+        .await;
+        assert!(wrong_content.is_err(), "content mismatch must fail closed");
+
+        let wrong_id = materialize_session_and_first_message(
+            &pool,
+            "draft-1",
+            "project",
+            "/tmp/project",
+            "deepseek",
+            "model",
+            "prefer",
+            "019f9bd3-e868-7c5a-94a8-74d551ea8d67",
+            "原始首消息",
+            124,
+        )
+        .await;
+        assert!(wrong_id.is_err(), "message id mismatch must fail closed");
+
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT id, session_id, role, content FROM messages WHERE session_id='draft-1'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "019f9bd3-e868-7c5a-94a8-74d551ea8d66".into(),
+                "draft-1".into(),
+                "user".into(),
+                "原始首消息".into(),
+            )]
+        );
     }
 
     async fn create_materialization_schema(pool: &sqlx::SqlitePool) {
@@ -1221,6 +1369,165 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_page_projects_unified_objective_state_into_turn_activity() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        create_materialization_schema(&pool).await;
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                recovery_owner TEXT,
+                next_observation_at INTEGER,
+                last_progress_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+                root_turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                status TEXT NOT NULL,
+                recent_activity_kind TEXT NOT NULL,
+                recent_activity_label TEXT NOT NULL,
+                waiting_reason TEXT,
+                updated_at INTEGER NOT NULL,
+                terminal_reason TEXT,
+                objective_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (
+                id, title, cwd, model_id, created_at, updated_at,
+                total_input_tokens, total_output_tokens, kind
+             ) VALUES ('objective-session', 'objective', '/tmp', 'model', 1, 1, 0, 0, 'project')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('objective-root', 'objective-session', 'user', '完成并发布', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives (
+                id, status, recovery_owner, next_observation_at, last_progress_at
+             ) VALUES ('objective-1', 'waiting_system', 'objective-supervisor', 42000, 41000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state (
+                root_turn_id, session_id, revision, phase, status,
+                recent_activity_kind, recent_activity_label, waiting_reason,
+                updated_at, terminal_reason, objective_id
+             ) VALUES (
+                'objective-root', 'objective-session', 7, 'recovering', 'active',
+                'remediation', '已切换备用 route', '等待退避', 41500, NULL, 'objective-1'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let page = load_message_page(&pool, "objective-session", None, 8)
+            .await
+            .expect("load objective projection");
+        assert_eq!(page.turn_states.len(), 1);
+        let state = &page.turn_states[0];
+        assert_eq!(state.objective_id.as_deref(), Some("objective-1"));
+        assert_eq!(state.objective_status.as_deref(), Some("waiting_system"));
+        assert_eq!(
+            state.recovery_owner.as_deref(),
+            Some("objective-supervisor")
+        );
+        assert_eq!(state.next_observation_at, Some(42000));
+        assert_eq!(state.last_progress_at, Some(41000));
+    }
+
+    #[tokio::test]
+    async fn message_page_preserves_legacy_turn_activity_without_objective_schema() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open db");
+        create_materialization_schema(&pool).await;
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+                root_turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                status TEXT NOT NULL,
+                recent_activity_kind TEXT NOT NULL,
+                recent_activity_label TEXT NOT NULL,
+                waiting_reason TEXT,
+                updated_at INTEGER NOT NULL,
+                terminal_reason TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (
+                id, title, cwd, model_id, created_at, updated_at,
+                total_input_tokens, total_output_tokens, kind
+             ) VALUES ('legacy-session', 'legacy', '/tmp', 'model', 1, 1, 0, 0, 'project')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('legacy-root', 'legacy-session', 'user', '继续', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state (
+                root_turn_id, session_id, revision, phase, status,
+                recent_activity_kind, recent_activity_label, waiting_reason,
+                updated_at, terminal_reason
+             ) VALUES (
+                'legacy-root', 'legacy-session', 3, 'working', 'active',
+                'tool', '执行命令', NULL, 4, NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let page = load_message_page(&pool, "legacy-session", None, 8)
+            .await
+            .expect("legacy activity remains readable");
+        assert_eq!(page.turn_states.len(), 1);
+        let state = &page.turn_states[0];
+        assert_eq!(state.recent_activity_label, "执行命令");
+        assert!(state.objective_id.is_none());
+        assert!(state.objective_status.is_none());
+        assert!(state.recovery_owner.is_none());
+        assert!(state.next_observation_at.is_none());
+        assert!(state.last_progress_at.is_none());
     }
 
     #[tokio::test]
