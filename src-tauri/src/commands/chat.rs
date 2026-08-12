@@ -1110,6 +1110,7 @@ struct ChatRunningSetupGuard {
     session_id: String,
     control: Arc<crate::ChatRunControl>,
     durable_db: Option<sqlx::SqlitePool>,
+    #[cfg(not(test))]
     event_app: Option<AppHandle>,
     armed: bool,
 }
@@ -1248,6 +1249,7 @@ async fn converge_aborted_chat_setup(
     }))
 }
 
+#[cfg(not(test))]
 async fn converge_and_project_aborted_chat_setup(
     pool: &sqlx::SqlitePool,
     chat_cancels: &crate::ChatCancelMap,
@@ -1848,6 +1850,7 @@ impl ChatRunningSetupGuard {
             session_id,
             control,
             durable_db: None,
+            #[cfg(not(test))]
             event_app: None,
             armed: true,
         }
@@ -1857,6 +1860,7 @@ impl ChatRunningSetupGuard {
         self.durable_db = Some(db);
     }
 
+    #[cfg(not(test))]
     fn attach_event_app(&mut self, app: AppHandle) {
         self.event_app = Some(app);
     }
@@ -1874,6 +1878,7 @@ impl ChatRunningSetupGuard {
                 "admitted chat setup has no durable database handle".into(),
             ));
         };
+        #[cfg(not(test))]
         converge_and_project_aborted_chat_setup(
             db,
             &self.chat_cancels,
@@ -1882,6 +1887,12 @@ impl ChatRunningSetupGuard {
             self.event_app.as_ref(),
         )
         .await?;
+        #[cfg(test)]
+        {
+            converge_aborted_chat_setup(db, &self.control, &self.session_id).await?;
+            clear_chat_running_if_current(&self.chat_cancels, &self.session_id, &self.control)
+                .await;
+        }
         self.armed = false;
         Ok(())
     }
@@ -1900,21 +1911,31 @@ impl Drop for ChatRunningSetupGuard {
         let session_id = self.session_id.clone();
         let control = self.control.clone();
         let durable_db = self.durable_db.clone();
+        #[cfg(not(test))]
         let event_app = self.event_app.clone();
         tokio::spawn(async move {
             if control.durable {
                 if let Some(db) = durable_db {
                     let mut retry_attempt = 0_u32;
                     loop {
-                        match converge_and_project_aborted_chat_setup(
+                        #[cfg(not(test))]
+                        let convergence = converge_and_project_aborted_chat_setup(
                             &db,
                             &chat_cancels,
                             &control,
                             &session_id,
                             event_app.as_ref(),
                         )
-                        .await
-                        {
+                        .await;
+                        #[cfg(test)]
+                        let convergence = async {
+                            converge_aborted_chat_setup(&db, &control, &session_id).await?;
+                            clear_chat_running_if_current(&chat_cancels, &session_id, &control)
+                                .await;
+                            Ok::<(), AppError>(())
+                        }
+                        .await;
+                        match convergence {
                             Ok(()) => break,
                             Err(error) => {
                                 retry_attempt = retry_attempt.saturating_add(1);
@@ -1980,6 +2001,7 @@ pub async fn send_message(
     // From this point every early return owns a committed user/root/Objective
     // receipt and therefore must end with one durable recovery/cancel result
     // plus one TurnSettled projection.
+    #[cfg(not(test))]
     running_setup_guard.attach_event_app(app.clone());
     macro_rules! setup_or_recover {
         ($expression:expr) => {
@@ -2507,6 +2529,7 @@ pub(crate) async fn resume_chat_objective(
     );
     let db = state.db.read().await.clone();
     running_guard.attach_durable_db(db.clone());
+    #[cfg(not(test))]
     running_guard.attach_event_app(app.clone());
     let current_binding: Option<String> = sqlx::query_scalar(
         "SELECT objective_id FROM chat_turn_state
