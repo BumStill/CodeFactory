@@ -170,7 +170,7 @@ describe("MessageList model route failover", () => {
     expect(screen.queryByText("需要处理")).not.toBeInTheDocument();
   });
 
-  it("keeps actionable route-exhaustion guidance after a failed turn is reloaded", () => {
+  it("keeps system-owned route-exhaustion recovery after a failed turn is reloaded", () => {
     const { container } = render(
       <MessageList
         messages={[
@@ -186,9 +186,15 @@ describe("MessageList model route failover", () => {
     );
 
     expect(screen.getByText(/所有已配置且有凭据的模型端点都暂时不可用/)).toBeInTheDocument();
-    expect(screen.getByText(/模型设置/)).toBeInTheDocument();
+    expect(screen.getByText(/目标与失败证据已保留/)).toBeInTheDocument();
+    expect(screen.getByText(/系统将按退避策略重新观测可用路由/)).toBeInTheDocument();
     expect(screen.getByText("查看失败详情")).toBeInTheDocument();
-    expect(screen.getByText("需要处理")).toBeInTheDocument();
+    expect(screen.getByText("系统仍在处理")).toBeInTheDocument();
+    expect(screen.queryByText("需要处理")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /重试|模型设置/ })).not.toBeInTheDocument();
+    expect(
+      container.querySelector('[data-testid="failure-resolution-card"]'),
+    ).toHaveAccessibleName("系统仍在处理");
     expect(
       container.querySelector('[data-testid="failure-resolution-card"]'),
     ).toHaveAttribute("data-status-tone", "warning");

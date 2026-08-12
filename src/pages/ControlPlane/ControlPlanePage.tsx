@@ -432,20 +432,20 @@ function ObjectiveHealthMetric({
       }`}
     >
       <div
-        className={`text-[10px] uppercase tracking-wider ${
+        className={`text-caption uppercase tracking-wider ${
           risk ? "text-red-700 dark:text-red-300" : "text-gray-600"
         }`}
       >
         {label}
       </div>
       <div
-        className={`mt-1 text-xl font-semibold ${
+        className={`mt-1 text-display font-semibold ${
           risk ? "text-red-800 dark:text-red-200" : "text-gray-100"
         }`}
       >
         {value}
       </div>
-      {detail && <p className="mt-1 text-[10px] leading-relaxed text-gray-600">{detail}</p>}
+      {detail && <p className="mt-1 text-caption leading-relaxed text-gray-600">{detail}</p>}
     </div>
   );
 }
@@ -454,14 +454,14 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
   if (!health || health.availability === "unavailable" || !health.metrics) {
     return (
       <div className="rounded border border-red-500/40 bg-red-500/10 p-4 text-red-800 dark:text-red-200">
-        <div className="flex items-center gap-2 text-sm font-semibold">
+        <div className="flex items-center gap-2 text-body font-semibold">
           <AlertTriangle size={16} />
           Unavailable
         </div>
-        <p className="mt-2 text-xs leading-relaxed text-gray-400">
+        <p className="mt-2 text-label leading-relaxed text-gray-400">
           {health?.unavailable_reason ?? "Objective health has not produced an observable snapshot."}
         </p>
-        <p className="mt-2 text-[10px] text-red-700 dark:text-red-300">
+        <p className="mt-2 text-caption text-red-700 dark:text-red-300">
           Metrics are intentionally hidden: unavailable is not a healthy zero.
         </p>
       </div>
@@ -533,7 +533,7 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
         }`}
       >
         <div
-          className={`inline-flex items-center gap-2 text-xs font-medium ${
+          className={`inline-flex items-center gap-2 text-label font-medium ${
             releaseGatePassing
               ? "text-emerald-800 dark:text-emerald-300"
               : "text-red-800 dark:text-red-200"
@@ -542,7 +542,7 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
           {releaseGatePassing ? <CircleCheck size={14} /> : <AlertTriangle size={14} />}
           {releaseGatePassing ? "24h non-interruption gate passing" : "24h non-interruption gate blocked"}
         </div>
-        <div className="text-[10px] text-gray-600">
+        <div className="text-caption text-gray-600">
           {health.build_git_sha
             ? `Build ${health.build_git_sha.slice(0, 12)}`
             : "Development build · not production proof"}
@@ -550,7 +550,7 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
         </div>
       </div>
       {health.build_git_sha && health.production_window_covered !== true && (
-        <p className="text-[10px] text-amber-700 dark:text-amber-300">
+        <p className="text-caption text-amber-700 dark:text-amber-300">
           Production observation window incomplete; zero counters are not yet 24h proof.
         </p>
       )}

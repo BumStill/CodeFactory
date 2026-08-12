@@ -657,9 +657,10 @@ const MessageRow = memo(function MessageRow({
     msg.turnActivity?.terminalReason,
   );
 
-  // A persisted turn failure (provider error that killed the turn). Red
-  // notice with the raw error so it survives reloads — the 2026-07-21
-  // interruptions left zero trace because errors were transient events.
+  // A persisted turn failure (provider error that killed the turn). Keep the
+  // raw evidence across reloads without handing system-owned recovery back to
+  // the user — the 2026-07-21 interruptions left zero trace because errors
+  // were transient events.
   if (msg.completionState === "turn_error") {
     const persistedError = msg.content.replace(/^回合中断[::]\s*/, "");
     if (isModelRouteExhaustedError(persistedError)) {
@@ -667,7 +668,7 @@ const MessageRow = memo(function MessageRow({
         <section
           data-testid="failure-resolution-card"
           data-status-tone="warning"
-          aria-label="需要处理"
+          aria-label="系统仍在处理"
           className="max-w-[72ch] space-y-2 rounded-xl border border-status-warning/25 bg-status-warning-soft/55 px-3 py-2.5 text-note leading-5"
         >
           <div className="flex items-center gap-2">
@@ -676,7 +677,7 @@ const MessageRow = memo(function MessageRow({
               aria-hidden="true"
               className="shrink-0 text-status-warning"
             />
-            <span className="font-semibold text-gray-200">需要处理</span>
+            <span className="font-semibold text-gray-200">系统仍在处理</span>
           </div>
           <p className="text-gray-300">
             {MODEL_ROUTE_EXHAUSTED_GUIDANCE}
