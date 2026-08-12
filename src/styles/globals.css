@@ -72,8 +72,14 @@
   --surface-3: 24 33 48;
   --surface-4: 34 45 63;
   --border-color: 46 59 78;
-  /* Interactive control boundary: >=3:1 against surface-2 in both themes. */
-  --control-border-color: 100 116 139;
+  /*
+   * Interactive control boundary (WCAG 1.4.11): >=3:1 against BOTH neighbours —
+   * the control's own fill and the page behind it. Tuned to just clear the bar
+   * rather than to sit far above it: one value was shared by both themes at
+   * 4.76:1 in light, and that surplus read as a heavy dark outline around the
+   * composer instead of a boundary.
+   */
+  --control-border-color: 88 104 125;
   --accent-color: 96 165 250;
   --accent-hover-color: 59 130 246;
 
@@ -118,8 +124,8 @@
   --surface-3: 232 238 246;
   --surface-4: 220 228 239;
   --border-color: 203 213 225;
-  /* Interactive control boundary: >=3:1 against surface-2 in both themes. */
-  --control-border-color: 100 116 139;
+  /* Interactive control boundary (WCAG 1.4.11). See the dark block. */
+  --control-border-color: 124 139 161;
   --accent-color: 37 99 235;
   --accent-hover-color: 29 78 216;
 
