@@ -39,7 +39,7 @@ export function ComposerControlBar({ children, shortcutHint }: ComposerControlBa
       role="toolbar"
       aria-label="输入工具"
       onKeyDown={moveToolbarFocus}
-      className="flex min-h-11 min-w-0 max-w-full flex-wrap items-center gap-1 overflow-x-clip border-t border-border/60 px-2 py-1 lg:min-h-9"
+      className="flex min-h-[44px] min-w-0 max-w-full flex-wrap items-center gap-1 overflow-x-clip border-t border-border/60 px-2 py-1 lg:min-h-[36px]"
     >
       {children}
       <span

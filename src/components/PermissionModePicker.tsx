@@ -109,7 +109,7 @@ export function PermissionModePicker({
         aria-controls={menuId}
         aria-haspopup="menu"
         title={`会话权限：${current.description}；下一次权限判断生效`}
-        className={`flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded-lg px-2 text-xs transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-9 lg:min-w-9 ${
+        className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-lg px-2 text-xs transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px] lg:min-w-[36px] ${
           mode === "trusted"
             ? "bg-status-warning-soft text-status-warning hover:brightness-95"
             : mode === "safe"
@@ -159,7 +159,7 @@ export function PermissionModePicker({
               role="menuitemradio"
               aria-checked={mode === option.id}
               onClick={() => selectMode(option.id)}
-              className="flex min-h-11 w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-9"
+              className="flex min-h-[44px] w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
             >
               <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
                 {mode === option.id && <Check size={13} className="text-accent" aria-hidden="true" />}

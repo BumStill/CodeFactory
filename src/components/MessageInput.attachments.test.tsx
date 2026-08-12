@@ -77,10 +77,10 @@ describe("MessageInput attachments", () => {
     expect(preview).toHaveAttribute("src", "asset://localhost/%2Fproj%2F.codefactory%2Fattachments%2Fx.png");
     expect(screen.getByText("screenshot.png")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "移除 screenshot.png" })).toHaveClass(
-      "h-11",
-      "w-11",
-      "lg:h-9",
-      "lg:w-9",
+      "h-[44px]",
+      "w-[44px]",
+      "lg:h-[36px]",
+      "lg:w-[36px]",
     );
   });
 

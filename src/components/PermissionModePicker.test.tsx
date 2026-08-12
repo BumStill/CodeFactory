@@ -26,7 +26,7 @@ describe("PermissionModePicker", () => {
 
     const standard = screen.getByRole("button", { name: /会话权限.*标准/ });
     expect(standard).not.toHaveTextContent("标准");
-    expect(standard).toHaveClass("min-h-11", "min-w-11", "lg:min-h-9", "lg:min-w-9");
+    expect(standard).toHaveClass("min-h-[44px]", "min-w-[44px]", "lg:min-h-[36px]", "lg:min-w-[36px]");
 
     chatState.activeSession.permission_mode = "trusted";
     rerender(<PermissionModePicker />);
@@ -47,7 +47,7 @@ describe("PermissionModePicker", () => {
       "title",
       "会话权限：普通命令也可自动执行，高风险仍拦截；下一次权限判断生效",
     );
-    expect(picker).toHaveClass("min-h-11", "min-w-11", "lg:min-h-9", "lg:min-w-9");
+    expect(picker).toHaveClass("min-h-[44px]", "min-w-[44px]", "lg:min-h-[36px]", "lg:min-w-[36px]");
 
     await user.tab();
     expect(picker).toHaveFocus();

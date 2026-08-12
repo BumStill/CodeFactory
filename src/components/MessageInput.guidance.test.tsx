@@ -38,7 +38,7 @@ describe("MessageInput guidance mode", () => {
     const attach = screen.getByRole("button", { name: "附加文件" });
     const send = screen.getByRole("button", { name: "引导当前执行" });
     for (const target of [attach, send]) {
-      expect(target).toHaveClass("h-11", "w-11", "lg:h-9", "lg:w-9");
+      expect(target).toHaveClass("h-[44px]", "w-[44px]", "lg:h-[36px]", "lg:w-[36px]");
     }
     expect(onSend).not.toHaveBeenCalled();
   });

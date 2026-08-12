@@ -28,7 +28,7 @@ describe("DraftScopeBar project picker", () => {
 
     const scope = screen.getByRole("button", { name: "选择项目：独立任务" });
     expect(scope).toHaveTextContent("独立任务");
-    expect(scope).toHaveClass("min-h-11", "lg:min-h-9");
+    expect(scope).toHaveClass("min-h-[44px]", "lg:min-h-[36px]");
     expect(screen.getByRole("button", { name: "选择下一回合模型" })).toBeInTheDocument();
     expect(screen.queryByText("新会话")).not.toBeInTheDocument();
     expect(screen.queryByText("没选项目，不会碰任何代码")).not.toBeInTheDocument();
@@ -103,7 +103,7 @@ describe("DraftScopeBar project picker", () => {
     ];
     expect(items[0]).toHaveFocus();
     expect(items[0]).toHaveAttribute("aria-checked", "true");
-    expect(items[0]).toHaveClass("min-h-11", "lg:min-h-9");
+    expect(items[0]).toHaveClass("min-h-[44px]", "lg:min-h-[36px]");
 
     await user.keyboard("{ArrowDown}{Enter}");
     expect(onPickProject).toHaveBeenCalledWith("/Users/leo/Projects/CodeFactory");

@@ -215,7 +215,7 @@ describe("ModelPicker", () => {
       render(<ModelPicker portal />);
 
       const trigger = screen.getByRole("button", { name: /选择下一回合模型.*chatgpt.*gpt-5\.5.*首选/ });
-      expect(trigger).toHaveClass("min-h-11", "lg:min-h-9");
+      expect(trigger).toHaveClass("min-h-[44px]", "lg:min-h-[36px]");
       expect(trigger).toHaveAttribute("aria-expanded", "false");
       expect(trigger).toHaveAttribute("aria-controls");
 
