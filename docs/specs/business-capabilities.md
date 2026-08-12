@@ -48,8 +48,9 @@
 ## C9 任务失败归因与修复闭环
 - Workspace 任务系统必须把 failed/cancelled task 归因为 provider/credential、permission、shell runtime、test failure、verification failure、cancelled 或 unknown。
 - 归因来自通用任务字段，不读取 benchmark 名称或 Terminal-Bench 专用路径。
-- 用户在任务列中能看到失败类型、证据来源和下一步建议，再决定是否点击 `修复失败项` 进入重试。
-- `修复失败项` 只允许自动重置 `repairable=true` 的任务；provider/key、权限、运行环境等需要用户先处理原因的失败必须保持 failed，避免盲目消耗模型调用。
+- 用户在任务列中能看到失败类型、证据来源、recovery owner、最近真实进展和下一次观察；system-owned 技术失败不显示人工继续、重试或回到对话动作。
+- `repairable` 只决定当前 approach 是否可安全重跑。provider、permission timeout、运行环境、测试与验证失败耗尽本地 attempt 后进入 durable remediation 并由同一 objective 自动重派；不得停在 failed 等待用户推动。
+- 只有不可替代核心输入或无安全默认的不可逆业务决定可回交用户；输入或选择满足后，同一 session/objective 从 checkpoint 自动续接。显式拒绝/取消继续作为绑定 action signature 的安全终止边界。
 - 自动修复闭环必须回到同一 project session 的任务执行、验证结果和 evidence pack，而不是只更新 benchmark 分数。
 
 ## C10 有界控制面观察
@@ -70,3 +71,8 @@
 - Interactive/Execute 前台回合的 completion recovery 使用不可重置的累计上限；证据进展不能重新获得完整恢复预算。
 - 内部 recovery prompt、模型草稿和被拒绝候选答复不进入聊天正文，但恢复阶段、次数、安全步骤、最近活动与停止边界必须对用户可见。
 - 取消后续生成不等于回滚；已经执行、提交、推送或产生外部副作用的动作必须明确保留并可审计。
+
+## C13 Objective Recovery Control Plane
+- `objectives` 是跨 chat、task、tool、permission、provider、browser、delivery、release 和进程重启的业务状态真相源；其它局部状态都是 projection。
+- 技术失败、远端不确定、等待和恢复耗尽必须由 durable supervisor 持有；只有必要核心输入、不可代选业务决定、显式拒绝或取消允许中断用户路径。
+- `CompletionArbiter` 根据 requested acceptance 与正式 evidence 独占写入 completed；transport `Done`、局部 task 成功、PR/CI 或 release metadata 均不能单独完成 objective。

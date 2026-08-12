@@ -569,7 +569,20 @@ async fn durable_objective_identity(
     ctx: &ExecCtx,
 ) -> Result<(String, Option<String>)> {
     if let Some(task_id) = ctx.task_id.as_deref().filter(|value| !value.is_empty()) {
-        return Ok((format!("task:{task_id}"), None));
+        let objective_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT objective_id FROM task_runs WHERE id=?",
+        )
+        .bind(task_id)
+        .fetch_optional(db)
+        .await?
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            crate::errors::AppError::Other(format!(
+                "deliver_changes refused task {task_id} without a unified objective identity; legacy reconciliation is required"
+            ))
+        })?;
+        return Ok((objective_id, None));
     }
     let root_turn_id = ctx
         .root_turn_id
@@ -581,31 +594,25 @@ async fn durable_objective_identity(
                     .into(),
             )
         })?;
-    let task_segment_id = sqlx::query_scalar::<_, String>(
-        "SELECT task_segment_id FROM chat_turn_state WHERE root_turn_id=?",
+    let (objective_id, task_segment_id) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT objective_id, task_segment_id FROM chat_turn_state WHERE root_turn_id=?",
     )
     .bind(root_turn_id)
     .fetch_optional(db)
-    .await?;
-    let Some(segment_id) = task_segment_id else {
-        return Ok((format!("chat-turn:{root_turn_id}"), None));
-    };
-    let anchor = sqlx::query_scalar::<_, String>(
-        "WITH RECURSIVE objective_chain(id, previous_segment_id, depth) AS (
-             SELECT id, previous_segment_id, 0 FROM chat_task_segments WHERE id=?
-             UNION ALL
-             SELECT prior.id, prior.previous_segment_id, objective_chain.depth + 1
-             FROM chat_task_segments prior
-             JOIN objective_chain ON prior.id=objective_chain.previous_segment_id
-             WHERE objective_chain.depth < 100
-         )
-         SELECT id FROM objective_chain ORDER BY depth DESC LIMIT 1",
-    )
-    .bind(&segment_id)
-    .fetch_optional(db)
     .await?
-    .unwrap_or_else(|| segment_id.clone());
-    Ok((format!("chat:{anchor}"), Some(segment_id)))
+    .ok_or_else(|| {
+        crate::errors::AppError::Other(format!(
+            "deliver_changes refused unknown root turn {root_turn_id} without a durable objective identity"
+        ))
+    })?;
+    let objective_id = objective_id
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            crate::errors::AppError::Other(format!(
+                "deliver_changes refused root turn {root_turn_id} without a unified objective identity; legacy reconciliation is required"
+            ))
+        })?;
+    Ok((objective_id, task_segment_id))
 }
 
 fn durable_run_id(source_identity: &str, repo_identity: &str) -> String {
@@ -1281,7 +1288,8 @@ mod tests {
         sqlx::query(
             "CREATE TABLE chat_turn_state (
                 root_turn_id TEXT PRIMARY KEY,
-                task_segment_id TEXT
+                task_segment_id TEXT,
+                objective_id TEXT
             )",
         )
         .execute(&pool)
@@ -1295,8 +1303,9 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO chat_turn_state(root_turn_id, task_segment_id) VALUES
-             ('turn-a', 'segment-a'), ('turn-b', 'segment-b')",
+            "INSERT INTO chat_turn_state(root_turn_id, task_segment_id, objective_id) VALUES
+             ('turn-a', 'segment-a', 'objective-opaque-uuid'),
+             ('turn-b', 'segment-b', 'objective-opaque-uuid')",
         )
         .execute(&pool)
         .await
@@ -1311,8 +1320,69 @@ mod tests {
         let continuation_identity = durable_objective_identity(&pool, &continuation)
             .await
             .unwrap();
-        assert_eq!(first_identity.0, "chat:segment-a");
+        assert_eq!(first_identity.0, "objective-opaque-uuid");
         assert_eq!(continuation_identity.0, first_identity.0);
         assert_eq!(continuation_identity.1.as_deref(), Some("segment-b"));
+    }
+
+    #[tokio::test]
+    async fn delivery_refuses_legacy_string_fallback_without_unified_objective_binding() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+                root_turn_id TEXT PRIMARY KEY,
+                task_segment_id TEXT,
+                objective_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, task_segment_id, objective_id)
+             VALUES ('legacy-turn', 'legacy-segment', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut ctx = ExecCtx::new(std::path::PathBuf::from("/tmp"), Some(pool.clone()));
+        ctx.root_turn_id = Some("legacy-turn".into());
+
+        let error = durable_objective_identity(&pool, &ctx).await.unwrap_err();
+        assert!(error.to_string().contains("unified objective identity"));
+    }
+
+    #[tokio::test]
+    async fn task_delivery_uses_the_unified_objective_binding() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY,
+                objective_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO task_runs(id, objective_id)
+             VALUES ('task-run', 'task-objective-opaque-uuid')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut ctx = ExecCtx::new(std::path::PathBuf::from("/tmp"), Some(pool.clone()));
+        ctx.task_id = Some("task-run".into());
+
+        let identity = durable_objective_identity(&pool, &ctx).await.unwrap();
+        assert_eq!(identity, ("task-objective-opaque-uuid".into(), None));
     }
 }

@@ -280,13 +280,17 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             if args.action == "attach" {
                 // No longer a Chrome setting to flip: the extension replaces
                 // remote debugging, so the fix is to install and pair it.
-                return Ok(ToolOutput::blocked(format!(
-                    "还没有连上你的浏览器。请在「设置 → 浏览器会话」里按步骤安装 CodeFactory 扩展并填入配对码,然后重试。\n{error}"
-                )));
+                return Ok(ToolOutput::blocked(attach_blocked_guidance(&error)));
             }
             Ok(ToolOutput::err(error))
         }
     }
+}
+
+fn attach_blocked_guidance(error: &str) -> String {
+    format!(
+        "还没有连上你的浏览器。请在「设置 → 浏览器会话」里按步骤安装 CodeFactory 扩展并填入配对码；这是访问当前浏览器所需的一次性授权，任务状态已保留。\n{error}"
+    )
 }
 
 /// Actions whose output came from a web page, and therefore must be labelled
@@ -749,6 +753,19 @@ async fn reclaim_expired() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_failure_requests_only_the_required_pairing_authorization() {
+        let message = attach_blocked_guidance("extension bridge unavailable");
+
+        assert!(message.contains("安装 CodeFactory 扩展并填入配对码"));
+        assert!(message.contains("访问当前浏览器所需的一次性授权"));
+        assert!(message.contains("任务状态已保留"));
+        assert!(message.contains("extension bridge unavailable"));
+        assert!(!message.contains("重试"));
+        assert!(!message.contains("继续执行"));
+    }
+
     #[test]
     fn session_ids_are_owned_and_unique() {
         let ctx = ExecCtx::new(std::env::temp_dir(), None);

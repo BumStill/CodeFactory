@@ -25,7 +25,7 @@ AgentLoop 保留两个概念：
 - `total_completion_recoveries`：本轮累计 recovery 次数，只增不减，用于硬上限。
 - `consecutive_completion_recoveries`：连续无材料进展次数；材料进展后可以归零，仅用于收敛提示或诊断。
 
-`completion_finalization` 只读取累计次数决定当前 segment 是否还能继续同一种 Recover。Interactive/Execute 达到 3 次后不得发空 `Done` 或把 incomplete 释放为成功：有替代策略或材料进展时先持久化 checkpoint 并续段；没有可行策略时持久化具体 Blocked/Interrupted 终态并生成可见回复。Autonomous 同样不能因 iteration guard 静默终止，继续使用 Blocked/调度器重试语义。
+`completion_finalization` 只读取累计次数决定当前 segment 是否还能继续同一种 Recover。Interactive/Execute 达到上限后不得发空 `Done` 或把 incomplete 释放为成功：必须持久化 checkpoint，由 objective supervisor 续段、换策略或进入 system-owned remediation。只有显式拒绝/取消可终止；必要核心输入/业务决定是可恢复等待。Autonomous 同样不能因 iteration guard 静默终止。
 
 ## 可见恢复摘要
 
@@ -63,7 +63,11 @@ type ReviewProgress = {
 - lastActivityAt = 相关记录最后时间；
 - currentStep = 不从历史完整命令推断，避免泄漏和错误归因。
 
-旧会话没有 recovery 记录但以成功工具结果悬空结束时，必须保守识别为可恢复中断，不能继续显示 running 或假装完成。匿名会话仅依赖 live event，不写 DB。
+旧会话没有 recovery 记录但以成功工具结果悬空结束时，必须保守识别为 `legacy_orphan` 或可恢复 system wait，不能继续显示 running、假装完成或猜测重放。身份可唯一证明时由 startup supervisor claim；匿名会话仅依赖 live event，不写 DB。
+
+## Permission outcome 与 objective 投影
+
+`denied_by_user/timed_out/channel_closed/cancelled/policy_denied` 必须保持独立。timeout/channel close 关闭当前 ask future 后写 `waiting_system` 并保留 objective lease；policy/hard deny 交给 Decision Router 寻找安全替代。只有 `denied_by_user/cancelled` 可以停止绑定 action/objective，任何 adapter 都不得用等价工具绕过。
 
 ## 取消边界
 

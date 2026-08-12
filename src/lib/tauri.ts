@@ -96,6 +96,11 @@ export type StreamEvent =
       waiting_reason?: string | null;
       updated_at: number;
       terminal_reason?: string | null;
+      objective_id?: string;
+      objective_status?: TurnActivitySnapshot["objective_status"];
+      recovery_owner?: string | null;
+      next_observation_at?: number | null;
+      last_progress_at?: number | null;
     }
   | { type: "tool_call_start"; id: string; name: string; args: unknown }
   | { type: "tool_call_args_delta"; index: number; chunk: string }
@@ -206,6 +211,11 @@ export interface TurnActivitySnapshot {
   waiting_reason?: string | null;
   updated_at: number;
   terminal_reason?: string | null;
+  objective_id?: string;
+  objective_status?: "active" | "waiting_system" | "waiting_core_input" | "waiting_authorization" | "waiting_business_decision" | "completed" | "cancelled" | "legacy_orphan";
+  recovery_owner?: string | null;
+  next_observation_at?: number | null;
+  last_progress_at?: number | null;
 }
 
 export interface TurnPlanSnapshot {

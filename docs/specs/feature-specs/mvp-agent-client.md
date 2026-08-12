@@ -60,7 +60,7 @@ P1: 用户打开 CodeFactory，选择项目工作目录和 OpenRouter 模型，�
 | Primary path | 模型提出工具调用，用户允许 | 工具卡片可见，参数、权限状态、结果或错误可展开查看 | UI 截图 + 事件归并测试 + 命令输出 |
 | Primary path | 自主任务运行中从主输入框提交下一步引导 | 页面只有一个引导输入入口；调用 `queue_interjection` 后显示“已加入下一任务”并清空草稿 | 组件交互测试 + Tauri 调用断言 + 真实 App 截图 |
 | Failure path | 用户拒绝写文件 | 工具结果返回拒绝，模型收到拒绝观察，不改文件 | 权限字段断言 + 文件未变 |
-| Failure path | 调度器拒绝或无法保存下一步引导 | 不创建普通聊天消息，不清空输入草稿，错误状态可见且可重试 | 组件失败测试 + 真实 App 失败路径 |
+| Failure path | 调度器拒绝或无法保存下一步引导 | 不创建普通聊天消息，不清空输入草稿；objective 进入 system-owned remediation 并自动重派，错误状态与 owner 可见且无人工技术 CTA | 组件/supervisor 失败测试 + 真实 App 失败路径 |
 | Failure path | 当前回答仍在工具调用时，用户取消并已有排队消息 | `cancel_chat` 后不立即发送排队消息；收到当前回合终止事件后才发送一条，两个 Agent 回合不重叠 | store 时序测试 + IPC 调用顺序断言 |
 | Failure path | 模型一次提出多个工具，第一个等待授权时用户取消 | 整批未完成工具都记录为 `cancelled`，UI 显示已取消，SQLite 不残留 `pending`，随后只发一个终止事件 | Rust 批次终态/重放测试 + frontend reducer 测试 |
 | Failure path | 普通流式回答尚未结束时用户停止，或首个自动允许工具执行完后已经取消 | SSE 读取立即退出；已执行工具保留结果，尚未调度的工具全部取消，只发一个终止事件后再处理排队消息 | Rust pending stream/工具后缀测试 + frontend 时序测试 + 真实 App 验证 |

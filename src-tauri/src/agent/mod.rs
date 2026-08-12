@@ -17,6 +17,8 @@ mod internal_text;
 pub mod journal;
 mod lifecycle_hooks;
 pub mod model_transport;
+pub mod objective;
+pub mod objective_supervisor;
 mod permission_gateway;
 pub mod persistence;
 pub mod scheduler;
@@ -644,12 +646,25 @@ pub struct AgentExecutionContext {
     pub task_id: Option<String>,
     pub knowledge_library_ids: Vec<String>,
     pub usage_surface: UsageSurface,
+    pub mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
 }
 
 fn knowledge_scope_for_tools(
     execution_context: Option<&AgentExecutionContext>,
 ) -> Option<Vec<String>> {
-    execution_context.map(|context| context.knowledge_library_ids.clone())
+    execution_context.and_then(|context| {
+        // A resumed interactive chat carries an execution permit but keeps the
+        // normal dynamic knowledge scope. Autonomous task contexts deliberately
+        // preserve `Some([])` as an explicit deny-all snapshot.
+        if context.usage_surface == UsageSurface::Interactive
+            && context.parent_session_id.is_none()
+            && context.task_id.is_none()
+        {
+            None
+        } else {
+            Some(context.knowledge_library_ids.clone())
+        }
+    })
 }
 
 impl AgentLoop {
@@ -987,7 +1002,10 @@ impl AgentLoop {
         self
     }
 
-    pub async fn run(&mut self, history: Vec<Message>) -> Result<()> {
+    pub async fn run(
+        &mut self,
+        history: Vec<Message>,
+    ) -> Result<codefactory_agent_loop::run::RunOutcome> {
         let root_turn_id = history
             .iter()
             .rev()
@@ -1135,7 +1153,7 @@ impl AgentLoop {
         context_compression: bool,
         overload_backoff: bool,
         expand_context_window: bool,
-    ) -> Result<()> {
+    ) -> Result<codefactory_agent_loop::run::RunOutcome> {
         let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
             None => std::sync::Arc::new(NoOpHooks),
             Some(app) => {
@@ -1154,6 +1172,14 @@ impl AgentLoop {
             db: self.db.clone(),
             mcp_manager: self.mcp_manager.clone(),
             settings: self.settings.clone(),
+            mcp_tool_names: std::sync::Arc::new(std::sync::RwLock::new(
+                self.mcp_manager
+                    .list_all_tools()
+                    .await
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect(),
+            )),
         };
         let effective_instruction = effective_fact_check_instruction(&history);
         let completion_instruction = effective_instruction.clone();
@@ -1172,6 +1198,10 @@ impl AgentLoop {
             fact_check_instruction,
             audit_session_id: self.audit_session_id(),
             root_turn_id,
+            mutation_permit: self
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.mutation_permit.clone()),
             knowledge_library_ids: knowledge_scope_for_tools(self.execution_context.as_ref()),
             cancel: self.cancel.clone(),
         };
@@ -1234,10 +1264,10 @@ impl AgentLoop {
                 None => std::sync::Arc::new(codefactory_agent_loop::services::NoSteering),
             },
         };
-        // The desktop discards the returned RunOutcome (Done already emitted via
-        // the sink); LoopError maps to AppError::Other verbatim (message-identical).
-        codefactory_agent_loop::run::run_agent_loop(inputs, config, svc).await?;
-        Ok(())
+        // `Done` only settles the transport turn. The caller must feed this
+        // typed outcome into the Objective control plane before it may project
+        // a business completion or a durable system-owned continuation.
+        Ok(codefactory_agent_loop::run::run_agent_loop(inputs, config, svc).await?)
     }
 
     /// OpenAI/ChatGPT: compress history, recover transient overloads, expandable window.
@@ -1246,7 +1276,7 @@ impl AgentLoop {
         history: Vec<Message>,
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
-    ) -> Result<()> {
+    ) -> Result<codefactory_agent_loop::run::RunOutcome> {
         self.run_via_agent_loop(history, tool_defs, system_prompt, true, true, true)
             .await
     }
@@ -1260,7 +1290,7 @@ impl AgentLoop {
         history: Vec<Message>,
         tool_defs: &[ToolDefinition],
         system_prompt: &str,
-    ) -> Result<()> {
+    ) -> Result<codefactory_agent_loop::run::RunOutcome> {
         self.run_via_agent_loop(history, tool_defs, system_prompt, false, true, false)
             .await
     }
@@ -1357,6 +1387,7 @@ impl AgentLoop {
             pending_permissions: self.pending_permissions.clone(),
             cancel: self.cancel.clone(),
             browser_read_granted: self.turn_grants.browser_read,
+            browser_act_granted: AtomicBool::new(false),
         }
     }
 
@@ -2543,6 +2574,7 @@ pub(super) fn permission_policy_for_mode(mode: &str) -> PermissionPolicy {
             allow: standard_tools
                 .into_iter()
                 .chain([
+                    "bash".to_string(),
                     "browser_session(open)".to_string(),
                     "browser_session(snapshot)".to_string(),
                     "browser_session(tabs)".to_string(),
@@ -2572,7 +2604,8 @@ fn decide_permission_for_call(
             // Cleanup must never wait for another approval.
             "close" => return PermissionDecision::Allow,
             // Acting in a browser can send, buy, publish, or delete. Trusted
-            // mode does not bypass this per-action confirmation.
+            // mode does not bypass the first explicit confirmation; the
+            // gateway may reuse that successful grant for this AgentLoop run.
             "click" | "fill" | "press" => return PermissionDecision::Ask,
             // This writes a project file; the structural capability gate also
             // rejects it on ReviewOnly turns.
@@ -2648,18 +2681,21 @@ fn decide_permission(
         return PermissionDecision::Allow;
     }
     if tool_name == "bash" {
-        if let Some(command) = cmd {
-            match crate::tools::shell_policy::classify_command(command) {
-                crate::tools::shell_policy::ShellCommandPolicy::Deny { reason } => {
-                    return PermissionDecision::Deny(format!(
-                        "Denied by shell safety policy: {reason}"
-                    ));
-                }
-                crate::tools::shell_policy::ShellCommandPolicy::Ask { .. } => {
-                    return PermissionDecision::Ask;
-                }
-                crate::tools::shell_policy::ShellCommandPolicy::Allow { .. } => {}
+        let Some(command) = cmd else {
+            // A missing command cannot have earned the shell classifier's
+            // Allow verdict, so even standard/trusted mode must fail closed.
+            return PermissionDecision::Ask;
+        };
+        match crate::tools::shell_policy::classify_command(command) {
+            crate::tools::shell_policy::ShellCommandPolicy::Deny { reason } => {
+                return PermissionDecision::Deny(format!(
+                    "Denied by shell safety policy: {reason}"
+                ));
             }
+            crate::tools::shell_policy::ShellCommandPolicy::Ask { .. } => {
+                return PermissionDecision::Ask;
+            }
+            crate::tools::shell_policy::ShellCommandPolicy::Allow { .. } => {}
         }
     }
 
@@ -2860,6 +2896,7 @@ mod tests {
             task_id: Some("task".into()),
             knowledge_library_ids: Vec::new(),
             usage_surface: UsageSurface::Subagent,
+            mutation_permit: None,
         };
 
         assert_eq!(knowledge_scope_for_tools(Some(&context)), Some(Vec::new()));
@@ -3686,6 +3723,11 @@ mod tests {
             decide_permission(&safe, "read_file", None),
             PermissionDecision::Allow
         );
+        assert_eq!(
+            decide_permission(&safe, "bash", Some("pnpm test")),
+            PermissionDecision::Ask,
+            "safe mode keeps prompting even for shell commands classified safe"
+        );
 
         let standard = permission_policy_for_mode("standard");
         assert_eq!(
@@ -3694,7 +3736,17 @@ mod tests {
         );
         assert_eq!(
             decide_permission(&standard, "bash", Some("pnpm test")),
-            PermissionDecision::Ask
+            PermissionDecision::Allow,
+            "standard mode must not interrupt shell commands already classified safe"
+        );
+        assert_eq!(
+            decide_permission(
+                &standard,
+                "bash",
+                Some("Remove-Item -Recurse -Force .\\dist")
+            ),
+            PermissionDecision::Ask,
+            "risk-classified shell mutations still require explicit authorization"
         );
         assert_eq!(
             decide_permission_for_call(

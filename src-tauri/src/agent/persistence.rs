@@ -176,24 +176,21 @@ impl Persistence for SqlitePersistence {
         .execute(&mut *tx)
         .await
         .map_err(perr)?;
-        let objective_id = sqlx::query_scalar::<_, String>(
-            "WITH RECURSIVE objective_chain(id, previous_segment_id, depth) AS (
-                 SELECT segment.id, segment.previous_segment_id, 0
-                 FROM chat_task_segments segment
-                 JOIN chat_turn_state turn ON turn.task_segment_id=segment.id
-                 WHERE turn.root_turn_id=?
-                 UNION ALL
-                 SELECT prior.id, prior.previous_segment_id, objective_chain.depth+1
-                 FROM chat_task_segments prior
-                 JOIN objective_chain ON prior.id=objective_chain.previous_segment_id
-                 WHERE objective_chain.depth < 100
-             )
-             SELECT 'chat:' || id FROM objective_chain ORDER BY depth DESC LIMIT 1",
+        let objective_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT objective_id FROM chat_turn_state WHERE root_turn_id=?",
         )
         .bind(&attempt.root_turn_id)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(perr)?;
+        .map_err(perr)?
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            perr(format!(
+                "recovery attempt refused without unified objective identity for root turn {}",
+                attempt.root_turn_id
+            ))
+        })?;
         sqlx::query(
             "INSERT INTO objective_recovery_attempts
              (id, objective_id, root_turn_id, delivery_run_id, domain, attempt_index,
@@ -257,7 +254,12 @@ impl Persistence for SqlitePersistence {
         .execute(&self.db)
         .await
         .map_err(perr)?;
-        if terminal || update.status == "active" {
+        // `chat_task_segments` is the durable objective projection, not the
+        // transport-turn lifecycle. A Done/failed_internal/platform_incident
+        // settles the current turn above but cannot complete or fail the
+        // business objective. Only reopening work or an explicit user cancel
+        // changes the segment here; CompletionArbiter owns completed.
+        if update.status == "active" || update.status == "cancelled" {
             sqlx::query(
                 "UPDATE chat_task_segments SET status=?, updated_at=?
                  WHERE id=(SELECT task_segment_id FROM chat_turn_state WHERE root_turn_id=?)",
@@ -658,6 +660,7 @@ mod tests {
         sqlx::query(
             "CREATE TABLE chat_turn_state (
                 root_turn_id TEXT PRIMARY KEY, task_segment_id TEXT, revision INTEGER NOT NULL,
+                objective_id TEXT,
                 recovery_attempt INTEGER NOT NULL DEFAULT 0,
                 phase TEXT NOT NULL, status TEXT NOT NULL, recent_activity_kind TEXT,
                 recent_activity_label TEXT, waiting_reason TEXT, updated_at INTEGER NOT NULL,
@@ -968,12 +971,11 @@ mod tests {
         assert_eq!(segment, "active");
     }
 
-    #[tokio::test]
-    async fn failed_internal_is_a_terminal_turn_but_never_completed() {
+    async fn assert_system_owned_failure_does_not_terminalize_objective(status: &str) {
         let db = pool().await;
         sqlx::query(
             "INSERT INTO chat_task_segments (id, status, updated_at) \
-             VALUES ('segment-1','active',1)",
+             VALUES ('segment-1', 'active', 1)",
         )
         .execute(&db)
         .await
@@ -981,7 +983,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO chat_turn_state \
              (root_turn_id, task_segment_id, revision, phase, status, updated_at) \
-             VALUES ('root-1','segment-1',1,'working','active',1)",
+             VALUES ('root-1', 'segment-1', 1, 'working', 'active', 1)",
         )
         .execute(&db)
         .await
@@ -995,11 +997,11 @@ mod tests {
         p.update_turn_activity(&TurnActivityUpdate {
             root_turn_id: "root-1".into(),
             phase: "finalizing".into(),
-            status: "failed_internal".into(),
-            recent_activity_kind: "failed_internal".into(),
-            recent_activity_label: "系统未能完成任务".into(),
-            waiting_reason: None,
-            terminal_reason: Some("completion_recovery_exhausted".into()),
+            status: status.into(),
+            recent_activity_kind: status.into(),
+            recent_activity_label: "系统恢复仍由 CodeFactory 持有".into(),
+            waiting_reason: Some("等待持久恢复器接管".into()),
+            terminal_reason: Some("technical_recovery_exhausted".into()),
         })
         .await
         .unwrap();
@@ -1011,18 +1013,83 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        let segment: String =
+        let objective_status: String =
             sqlx::query_scalar("SELECT status FROM chat_task_segments WHERE id='segment-1'")
                 .fetch_one(&db)
                 .await
                 .unwrap();
-        assert_eq!(turn.0, "failed_internal");
-        assert!(
-            turn.1.is_some(),
-            "terminal system failure needs a stop timestamp"
+        assert_eq!(turn.0, status, "the current transport turn may settle");
+        assert!(turn.1.is_some(), "the settled turn keeps its own timestamp");
+        assert_eq!(turn.2.as_deref(), Some("technical_recovery_exhausted"));
+        assert_eq!(
+            objective_status, "active",
+            "{status} is system-owned recovery, not an objective terminal state"
         );
-        assert_eq!(turn.2.as_deref(), Some("completion_recovery_exhausted"));
-        assert_eq!(segment, "failed_internal");
+    }
+
+    #[tokio::test]
+    async fn failed_internal_does_not_terminalize_the_objective() {
+        assert_system_owned_failure_does_not_terminalize_objective("failed_internal").await;
+    }
+
+    #[tokio::test]
+    async fn platform_incident_does_not_terminalize_the_objective() {
+        assert_system_owned_failure_does_not_terminalize_objective("platform_incident").await;
+    }
+
+    #[tokio::test]
+    async fn completed_transport_turn_does_not_complete_the_objective_without_arbitration() {
+        let db = pool().await;
+        sqlx::query(
+            "INSERT INTO chat_task_segments (id, status, updated_at) \
+             VALUES ('segment-1', 'active', 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state \
+             (root_turn_id, task_segment_id, revision, phase, status, updated_at) \
+             VALUES ('root-1', 'segment-1', 1, 'working', 'active', 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+
+        p.update_turn_activity(&TurnActivityUpdate {
+            root_turn_id: "root-1".into(),
+            phase: "finalizing".into(),
+            status: "completed".into(),
+            recent_activity_kind: "completed".into(),
+            recent_activity_label: "transport Done".into(),
+            waiting_reason: None,
+            terminal_reason: None,
+        })
+        .await
+        .unwrap();
+
+        let turn: (String, Option<i64>) = sqlx::query_as(
+            "SELECT status, completed_at FROM chat_turn_state WHERE root_turn_id='root-1'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let objective_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_task_segments WHERE id='segment-1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(turn.0, "completed");
+        assert!(turn.1.is_some(), "the transport turn itself is settled");
+        assert_eq!(
+            objective_status, "active",
+            "Done/RunOutcome must not bypass the objective completion arbiter"
+        );
     }
 
     #[tokio::test]
@@ -1223,8 +1290,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO chat_turn_state
-             (root_turn_id, task_segment_id, revision, recovery_attempt, phase, status, updated_at)
-             VALUES ('turn', 'objective', 1, 0, 'executing', 'active', 1)",
+             (root_turn_id, task_segment_id, objective_id, revision, recovery_attempt, phase, status, updated_at)
+             VALUES ('turn', 'objective', 'objective-opaque-uuid', 1, 0, 'executing', 'active', 1)",
         )
         .execute(&db)
         .await
@@ -1256,7 +1323,7 @@ mod tests {
         .fetch_one(&db)
         .await
         .unwrap();
-        assert_eq!(row.0, "chat:objective");
+        assert_eq!(row.0, "objective-opaque-uuid");
         assert_eq!(row.1, "PROVIDER_OVERLOADED");
         assert_eq!(row.2, "transient_provider");
         assert_eq!((row.3, row.4), (0, 0));
@@ -1268,5 +1335,42 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_attempt_refuses_to_invent_an_objective_identity() {
+        let db = pool().await;
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, task_segment_id, objective_id, revision, recovery_attempt, phase, status, updated_at)
+             VALUES ('legacy-turn', NULL, NULL, 1, 0, 'executing', 'active', 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let persistence = SqlitePersistence {
+            db: db.clone(),
+            session_id: "session".into(),
+            anonymous: false,
+        };
+        let error = persistence
+            .record_recovery_attempt(&RecoveryAttemptRow {
+                root_turn_id: "legacy-turn".into(),
+                domain: "provider".into(),
+                attempt_index: 1,
+                failure_code: "PROVIDER_OVERLOADED".into(),
+                failure_class: "transient_provider".into(),
+                output_started: false,
+                side_effect_started: false,
+                terminal_decision: "continue".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("objective identity"));
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objective_recovery_attempts")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 0);
     }
 }

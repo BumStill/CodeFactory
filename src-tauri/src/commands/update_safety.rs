@@ -6,14 +6,77 @@
 //! A single backend snapshot keeps all update entry points on the same rule:
 //! no install or relaunch while CodeFactory owns live work.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::sync::atomic::Ordering;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::commands::tasks::SchedulerHandles;
 use crate::commands::terminal::TerminalState;
 use crate::errors::AppError;
 use crate::AppState;
+
+const UPDATE_RECEIPT_STATES: &str = "'install_started','unknown','applied'";
+const UPDATE_TARGET_RESOURCE_KIND: &str = "app_update_target";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateInstallState {
+    InstallPermitted,
+    ObserveOnly,
+    Applied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdateInstallReceiptView {
+    pub id: String,
+    pub objective_id: Option<String>,
+    pub target_version: String,
+    pub target_build: String,
+    pub state: UpdateInstallState,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateInstallAdmission {
+    InstallPermitted(UpdateInstallReceiptView),
+    ObserveOnly(UpdateInstallReceiptView),
+    Applied(UpdateInstallReceiptView),
+}
+
+impl UpdateInstallAdmission {
+    fn view(&self) -> &UpdateInstallReceiptView {
+        match self {
+            Self::InstallPermitted(view) | Self::ObserveOnly(view) | Self::Applied(view) => view,
+        }
+    }
+
+    const fn state(&self) -> UpdateInstallState {
+        match self {
+            Self::InstallPermitted(_) => UpdateInstallState::InstallPermitted,
+            Self::ObserveOnly(_) => UpdateInstallState::ObserveOnly,
+            Self::Applied(_) => UpdateInstallState::Applied,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateClaimPermit {
+    pub objective_id: String,
+    pub remediation_id: String,
+    pub owner: String,
+    pub claim_epoch: i64,
+    pub binding_id: String,
+    pub resource_generation: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ObjectiveBlockers {
+    count: i64,
+    owners: Vec<String>,
+    exempt_objective_id: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct UpdateSafetyStatus {
@@ -22,9 +85,15 @@ pub struct UpdateSafetyStatus {
     pub active_chat_turns: usize,
     pub active_task_schedulers: usize,
     pub active_delivery_leases: i64,
+    pub nonterminal_objectives: i64,
+    pub objective_blocker_owners: Vec<String>,
     pub pending_permissions: usize,
     pub managed_browser_sessions: usize,
     pub terminal_sessions: usize,
+    pub update_objective_id: Option<String>,
+    pub update_install_state: Option<UpdateInstallState>,
+    pub target_version: Option<String>,
+    pub target_build: Option<String>,
 }
 
 impl UpdateSafetyStatus {
@@ -32,11 +101,467 @@ impl UpdateSafetyStatus {
         self.safe_to_restart = self.active_chat_turns == 0
             && self.active_task_schedulers == 0
             && self.active_delivery_leases == 0
+            && self.nonterminal_objectives == 0
             && self.pending_permissions == 0
             && self.managed_browser_sessions == 0
             && self.terminal_sessions == 0;
         self
     }
+}
+
+#[cfg(test)]
+async fn count_nonterminal_objectives(pool: &sqlx::SqlitePool) -> Result<i64, sqlx::Error> {
+    // Keep this aligned with ObjectiveStatus::is_terminal: waiting states are
+    // durable resumable work, not completion, and must survive before restart.
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives
+         WHERE status NOT IN ('completed', 'cancelled')",
+    )
+    .fetch_one(pool)
+    .await
+}
+
+fn objective_owner(row: &sqlx::sqlite::SqliteRow) -> Result<String, sqlx::Error> {
+    let status: String = row.try_get("status")?;
+    let domain: String = row.try_get("domain")?;
+    let recovery_owner: Option<String> = row.try_get("recovery_owner")?;
+    Ok(recovery_owner
+        .filter(|owner| !owner.trim().is_empty())
+        .unwrap_or_else(|| match status.as_str() {
+            "waiting_core_input" => format!("core-input:{domain}"),
+            "waiting_authorization" => format!("authorization:{domain}"),
+            "waiting_business_decision" => format!("business-decision:{domain}"),
+            "legacy_orphan" => "legacy-orphan:system".into(),
+            _ => format!("objective-supervisor:{domain}"),
+        }))
+}
+
+const CURRENT_UPDATE_CLAIM_SQL: &str = "SELECT COUNT(*)
+     FROM objectives objective
+     JOIN objective_remediations remediation
+       ON remediation.id=objective.remediation_id
+      AND remediation.objective_id=objective.id
+     JOIN objective_bindings binding
+       ON binding.id=remediation.binding_id
+      AND binding.objective_id=objective.id
+     WHERE objective.id=? AND objective.domain='update'
+       AND objective.status='waiting_system'
+       AND objective.remediation_id=? AND objective.lease_owner=?
+       AND objective.lease_expires_at>?
+       AND remediation.domain='update'
+       AND remediation.status='claimed' AND remediation.lease_owner=?
+       AND remediation.lease_expires_at>? AND remediation.attempt_index=?
+       AND binding.id=? AND binding.domain='update'
+       AND binding.resource_kind=? AND binding.resource_id=?
+       AND binding.resource_generation=?";
+
+fn update_target_resource_id(target_version: &str, target_build: &str) -> String {
+    format!(
+        "v{}:{}b{}:{}",
+        target_version.len(),
+        target_version,
+        target_build.len(),
+        target_build
+    )
+}
+
+async fn update_claim_matches_target(
+    pool: &sqlx::SqlitePool,
+    now: i64,
+    claim: &UpdateClaimPermit,
+    target_version: &str,
+    target_build: &str,
+) -> Result<bool, sqlx::Error> {
+    let count: i64 = sqlx::query_scalar(CURRENT_UPDATE_CLAIM_SQL)
+        .bind(&claim.objective_id)
+        .bind(&claim.remediation_id)
+        .bind(&claim.owner)
+        .bind(now)
+        .bind(&claim.owner)
+        .bind(now)
+        .bind(claim.claim_epoch)
+        .bind(&claim.binding_id)
+        .bind(UPDATE_TARGET_RESOURCE_KIND)
+        .bind(update_target_resource_id(target_version, target_build))
+        .bind(claim.resource_generation)
+        .fetch_one(pool)
+        .await?;
+    Ok(count == 1)
+}
+
+async fn update_claim_matches_target_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    now: i64,
+    claim: &UpdateClaimPermit,
+    target_version: &str,
+    target_build: &str,
+) -> Result<bool, sqlx::Error> {
+    let count: i64 = sqlx::query_scalar(CURRENT_UPDATE_CLAIM_SQL)
+        .bind(&claim.objective_id)
+        .bind(&claim.remediation_id)
+        .bind(&claim.owner)
+        .bind(now)
+        .bind(&claim.owner)
+        .bind(now)
+        .bind(claim.claim_epoch)
+        .bind(&claim.binding_id)
+        .bind(UPDATE_TARGET_RESOURCE_KIND)
+        .bind(update_target_resource_id(target_version, target_build))
+        .bind(claim.resource_generation)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(count == 1)
+}
+
+/// Count every non-terminal Objective except a caller-held, target-bound,
+/// current Update mutation permit. Merely finding a unique Update claim in
+/// SQLite is never enough to infer that it owns this updater request.
+async fn load_objective_blockers(
+    pool: &sqlx::SqlitePool,
+    now: i64,
+    exact_update_claim: Option<&UpdateClaimPermit>,
+    target_version: &str,
+    target_build: &str,
+) -> Result<ObjectiveBlockers, sqlx::Error> {
+    let exempt_objective_id = if let Some(claim) = exact_update_claim {
+        update_claim_matches_target(pool, now, claim, target_version, target_build)
+            .await?
+            .then_some(claim.objective_id.as_str())
+    } else {
+        None
+    };
+
+    let rows = sqlx::query(
+        "SELECT id, status, domain, recovery_owner
+         FROM objectives
+         WHERE status NOT IN ('completed', 'cancelled')
+           AND (? IS NULL OR id<>?)
+         ORDER BY id",
+    )
+    .bind(exempt_objective_id)
+    .bind(exempt_objective_id)
+    .fetch_all(pool)
+    .await?;
+    let mut owners = rows
+        .iter()
+        .map(objective_owner)
+        .collect::<Result<Vec<_>, _>>()?;
+    owners.sort();
+    owners.dedup();
+    Ok(ObjectiveBlockers {
+        count: rows.len() as i64,
+        owners,
+        exempt_objective_id: exempt_objective_id.map(str::to_string),
+    })
+}
+
+async fn ensure_update_receipt_schema(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS update_install_receipts (
+            id TEXT PRIMARY KEY,
+            objective_id TEXT,
+            target_version TEXT NOT NULL,
+            target_build TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ({UPDATE_RECEIPT_STATES})),
+            created_at INTEGER NOT NULL,
+            observed_at INTEGER NOT NULL,
+            UNIQUE(target_version, target_build)
+        )"
+    );
+    sqlx::query(&ddl).execute(pool).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_update_install_receipts_status
+         ON update_install_receipts(status, observed_at)",
+    )
+    .execute(pool)
+    .await?;
+    // One process-independent unresolved slot fences every target. A second
+    // target must observe/reconcile the first attempt before it can install.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_update_install_receipts_one_unresolved
+         ON update_install_receipts ((1))
+         WHERE status IN ('install_started', 'unknown')",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn update_receipt_view(
+    row: &sqlx::sqlite::SqliteRow,
+    state: UpdateInstallState,
+) -> Result<UpdateInstallReceiptView, sqlx::Error> {
+    Ok(UpdateInstallReceiptView {
+        id: row.try_get("id")?,
+        objective_id: row.try_get("objective_id")?,
+        target_version: row.try_get("target_version")?,
+        target_build: row.try_get("target_build")?,
+        state,
+        observed_at: row.try_get("observed_at")?,
+    })
+}
+
+/// Write-ahead admission for the updater plugin. The partial unique index is a
+/// process-independent CAS: at most one target may be unresolved, and every
+/// later caller must observe/reconcile it instead of starting another install.
+async fn admit_update_install(
+    pool: &sqlx::SqlitePool,
+    claim: Option<&UpdateClaimPermit>,
+    target_version: &str,
+    target_build: &str,
+    current_version: &str,
+    current_build: &str,
+    now: i64,
+) -> Result<UpdateInstallAdmission, sqlx::Error> {
+    ensure_update_receipt_schema(pool).await?;
+    let mut tx = pool.begin().await?;
+
+    if let Some(claim) = claim {
+        if !update_claim_matches_target_in_tx(&mut tx, now, claim, target_version, target_build)
+            .await?
+        {
+            tx.rollback().await?;
+            return Err(sqlx::Error::Protocol(
+                "update mutation permit is stale or bound to another target".into(),
+            ));
+        }
+    }
+
+    // Reconcile the single global unresolved slot before considering the
+    // requested target. A different target cannot leapfrog an uncertain
+    // installer operation.
+    if let Some(unresolved) = sqlx::query(
+        "SELECT id, objective_id, target_version, target_build, status, observed_at
+         FROM update_install_receipts
+         WHERE status IN ('install_started', 'unknown')
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let unresolved_id: String = unresolved.try_get("id")?;
+        let unresolved_version: String = unresolved.try_get("target_version")?;
+        let unresolved_build: String = unresolved.try_get("target_build")?;
+        let unresolved_applied =
+            current_version == unresolved_version && current_build == unresolved_build;
+        if unresolved_applied {
+            sqlx::query(
+                "UPDATE update_install_receipts
+                 SET status='applied', observed_at=? WHERE id=?",
+            )
+            .bind(now)
+            .bind(&unresolved_id)
+            .execute(&mut *tx)
+            .await?;
+            if unresolved_version == target_version && unresolved_build == target_build {
+                let row = sqlx::query(
+                    "SELECT id, objective_id, target_version, target_build, status, observed_at
+                     FROM update_install_receipts WHERE id=?",
+                )
+                .bind(&unresolved_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let view = update_receipt_view(&row, UpdateInstallState::Applied)?;
+                tx.commit().await?;
+                return Ok(UpdateInstallAdmission::Applied(view));
+            }
+        } else {
+            sqlx::query(
+                "UPDATE update_install_receipts
+                 SET status='unknown', observed_at=?
+                 WHERE id=? AND status='install_started'",
+            )
+            .bind(now)
+            .bind(&unresolved_id)
+            .execute(&mut *tx)
+            .await?;
+            let row = sqlx::query(
+                "SELECT id, objective_id, target_version, target_build, status, observed_at
+                 FROM update_install_receipts WHERE id=?",
+            )
+            .bind(&unresolved_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let view = update_receipt_view(&row, UpdateInstallState::ObserveOnly)?;
+            tx.commit().await?;
+            return Ok(UpdateInstallAdmission::ObserveOnly(view));
+        }
+    }
+
+    if let Some(existing) = sqlx::query(
+        "SELECT id, objective_id, target_version, target_build, status, observed_at
+         FROM update_install_receipts
+         WHERE target_version=? AND target_build=?",
+    )
+    .bind(target_version)
+    .bind(target_build)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let existing_id: String = existing.try_get("id")?;
+        let applied = current_version == target_version && current_build == target_build;
+        if applied {
+            sqlx::query(
+                "UPDATE update_install_receipts
+                 SET status='applied', observed_at=? WHERE id=?",
+            )
+            .bind(now)
+            .bind(&existing_id)
+            .execute(&mut *tx)
+            .await?;
+            let row = sqlx::query(
+                "SELECT id, objective_id, target_version, target_build, status, observed_at
+                 FROM update_install_receipts WHERE id=?",
+            )
+            .bind(&existing_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let view = update_receipt_view(&row, UpdateInstallState::Applied)?;
+            tx.commit().await?;
+            return Ok(UpdateInstallAdmission::Applied(view));
+        }
+
+        // Applied history, ownerless legacy rows, and rows owned by a different
+        // Objective are immutable evidence. None may be rebound or replayed.
+        let view = update_receipt_view(&existing, UpdateInstallState::ObserveOnly)?;
+        tx.commit().await?;
+        return Ok(UpdateInstallAdmission::ObserveOnly(view));
+    }
+
+    let receipt_id = uuid::Uuid::new_v4().to_string();
+    let already_applied = current_version == target_version && current_build == target_build;
+    let initial_status = if already_applied {
+        "applied"
+    } else {
+        "install_started"
+    };
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO update_install_receipts
+         (id, objective_id, target_version, target_build, status, created_at, observed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&receipt_id)
+    .bind(claim.map(|claim| claim.objective_id.as_str()))
+    .bind(target_version)
+    .bind(target_build)
+    .bind(initial_status)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+
+    if inserted {
+        let row = sqlx::query(
+            "SELECT id, objective_id, target_version, target_build, status, observed_at
+             FROM update_install_receipts WHERE id=?",
+        )
+        .bind(&receipt_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let initial_state = if already_applied {
+            UpdateInstallState::Applied
+        } else {
+            UpdateInstallState::InstallPermitted
+        };
+        let view = update_receipt_view(&row, initial_state)?;
+        tx.commit().await?;
+        return Ok(if already_applied {
+            UpdateInstallAdmission::Applied(view)
+        } else {
+            UpdateInstallAdmission::InstallPermitted(view)
+        });
+    }
+
+    // A concurrent process won the single unresolved slot. Observe whichever
+    // target it admitted; never convert the loser into another mutation.
+    let row = sqlx::query(
+        "SELECT id, objective_id, target_version, target_build, status, observed_at
+         FROM update_install_receipts
+         WHERE status IN ('install_started', 'unknown')
+            OR (target_version=? AND target_build=?)
+         ORDER BY CASE WHEN status IN ('install_started', 'unknown') THEN 0 ELSE 1 END,
+                  created_at, id
+         LIMIT 1",
+    )
+    .bind(target_version)
+    .bind(target_build)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        sqlx::Error::Protocol("update receipt admission lost without observable winner".into())
+    })?;
+    let view = update_receipt_view(&row, UpdateInstallState::ObserveOnly)?;
+    tx.commit().await?;
+    Ok(UpdateInstallAdmission::ObserveOnly(view))
+}
+
+async fn observe_latest_update_install(
+    pool: &sqlx::SqlitePool,
+    current_version: &str,
+    current_build: &str,
+    now: i64,
+) -> Result<Option<UpdateInstallReceiptView>, sqlx::Error> {
+    ensure_update_receipt_schema(pool).await?;
+    let Some(row) = sqlx::query(
+        "SELECT id, objective_id, target_version, target_build, status, observed_at
+         FROM update_install_receipts
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let id: String = row.try_get("id")?;
+    let target_version: String = row.try_get("target_version")?;
+    let target_build: String = row.try_get("target_build")?;
+    let applied = current_version == target_version && current_build == target_build;
+    let state = if applied {
+        sqlx::query(
+            "UPDATE update_install_receipts
+             SET status='applied', observed_at=? WHERE id=?",
+        )
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await?;
+        UpdateInstallState::Applied
+    } else {
+        sqlx::query(
+            "UPDATE update_install_receipts
+             SET status='unknown', observed_at=?
+             WHERE id=? AND status='install_started'",
+        )
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await?;
+        UpdateInstallState::ObserveOnly
+    };
+    let row = sqlx::query(
+        "SELECT id, objective_id, target_version, target_build, status, observed_at
+         FROM update_install_receipts WHERE id=?",
+    )
+    .bind(&id)
+    .fetch_one(pool)
+    .await?;
+    update_receipt_view(&row, state).map(Some)
+}
+
+fn current_app_identity(app: &AppHandle) -> Result<(String, String), AppError> {
+    let version = app.package_info().version.to_string();
+    let build = option_env!("CODEFACTORY_BUILD_GIT_SHA")
+        .map(str::trim)
+        .filter(|build| !build.is_empty())
+        .ok_or_else(|| {
+            AppError::Other(
+                "current app build_git_sha is unavailable; update remains observe-only".into(),
+            )
+        })?
+        .to_string();
+    Ok((version, build))
 }
 
 async fn count_active_delivery_leases(
@@ -57,10 +582,21 @@ async fn count_active_delivery_leases(
 
 #[tauri::command]
 pub async fn reserve_update_install(
+    target_version: String,
+    target_build: String,
+    claim_permit: Option<UpdateClaimPermit>,
+    app: AppHandle,
     state: State<'_, AppState>,
     schedulers: State<'_, SchedulerHandles>,
     terminals: State<'_, TerminalState>,
 ) -> Result<UpdateSafetyStatus, AppError> {
+    if target_version.trim().is_empty() || target_build.trim().is_empty() {
+        return Err(AppError::Other(
+            "update target version/build identity is required".into(),
+        ));
+    }
+    let target_version = target_version.trim().to_string();
+    let target_build = target_build.trim().to_string();
     // Hold every admission map until the reservation bit is set. Each producer
     // rechecks that bit while holding its own map, closing the check/install
     // race instead of relying on a best-effort snapshot.
@@ -78,7 +614,21 @@ pub async fn reserve_update_install(
     // unexpired durable lease is therefore independent restart-blocking work.
     let now = chrono::Utc::now().timestamp_millis();
     let pool = state.db.read().await;
+    ensure_update_receipt_schema(&pool).await?;
     let active_delivery_leases = count_active_delivery_leases(&pool, now).await?;
+    let objective_blockers = load_objective_blockers(
+        &pool,
+        now,
+        claim_permit.as_ref(),
+        &target_version,
+        &target_build,
+    )
+    .await?;
+    if claim_permit.is_some() && objective_blockers.exempt_objective_id.is_none() {
+        return Err(AppError::Other(
+            "update mutation permit is stale or bound to another target".into(),
+        ));
+    }
 
     let mut status = UpdateSafetyStatus {
         safe_to_restart: false,
@@ -86,19 +636,75 @@ pub async fn reserve_update_install(
         active_chat_turns,
         active_task_schedulers,
         active_delivery_leases,
+        nonterminal_objectives: objective_blockers.count,
+        objective_blocker_owners: objective_blockers.owners,
         pending_permissions,
         managed_browser_sessions,
         terminal_sessions,
+        update_objective_id: objective_blockers.exempt_objective_id.clone(),
+        update_install_state: None,
+        target_version: Some(target_version.clone()),
+        target_build: Some(target_build.clone()),
     }
     .evaluate();
     if status.safe_to_restart {
+        // Resolve both proof dimensions before taking the process reservation;
+        // missing build identity must fail closed without leaving it stuck.
+        let (current_version, current_build) = current_app_identity(&app)?;
         status.restart_reserved = state
             .update_restart_reserved
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
         status.safe_to_restart = status.restart_reserved;
+        if status.restart_reserved {
+            let admission_now = chrono::Utc::now().timestamp_millis();
+            let admission = admit_update_install(
+                &pool,
+                claim_permit.as_ref(),
+                &target_version,
+                &target_build,
+                &current_version,
+                &current_build,
+                admission_now,
+            )
+            .await;
+            match admission {
+                Ok(admission) => {
+                    status.update_objective_id = admission.view().objective_id.clone();
+                    status.update_install_state = Some(admission.state());
+                    if !matches!(admission, UpdateInstallAdmission::InstallPermitted(_)) {
+                        state.update_restart_reserved.store(false, Ordering::SeqCst);
+                        status.restart_reserved = false;
+                        status.safe_to_restart = false;
+                    }
+                }
+                Err(error) => {
+                    state.update_restart_reserved.store(false, Ordering::SeqCst);
+                    return Err(error.into());
+                }
+            }
+        }
     }
     Ok(status)
+}
+
+/// Startup observation for a prior updater write-ahead receipt. A matching
+/// package version *and* build proves the install applied; any other state is
+/// retained as observe-only and never authorizes another install.
+#[tauri::command]
+pub async fn observe_update_install(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<UpdateInstallReceiptView>, AppError> {
+    let (current_version, current_build) = current_app_identity(&app)?;
+    let pool = state.db.read().await;
+    Ok(observe_latest_update_install(
+        &pool,
+        &current_version,
+        &current_build,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?)
 }
 
 #[tauri::command]
@@ -111,7 +717,12 @@ pub async fn release_update_install_reservation(
 
 #[cfg(test)]
 mod tests {
-    use super::{count_active_delivery_leases, UpdateSafetyStatus};
+    use super::{
+        admit_update_install, count_active_delivery_leases, count_nonterminal_objectives,
+        ensure_update_receipt_schema, load_objective_blockers, observe_latest_update_install,
+        update_target_resource_id, UpdateClaimPermit, UpdateInstallAdmission, UpdateInstallState,
+        UpdateSafetyStatus,
+    };
 
     #[test]
     fn restart_is_safe_only_when_every_runtime_owner_is_idle() {
@@ -128,6 +739,10 @@ mod tests {
             },
             UpdateSafetyStatus {
                 active_delivery_leases: 1,
+                ..UpdateSafetyStatus::default()
+            },
+            UpdateSafetyStatus {
+                nonterminal_objectives: 1,
                 ..UpdateSafetyStatus::default()
             },
             UpdateSafetyStatus {
@@ -185,5 +800,376 @@ mod tests {
         }
 
         assert_eq!(count_active_delivery_leases(&pool, 1_000).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_terminal_objectives_allow_restart() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (id, status) in [
+            ("active", "active"),
+            ("waiting-system", "waiting_system"),
+            ("waiting-core-input", "waiting_core_input"),
+            ("waiting-authorization", "waiting_authorization"),
+            ("waiting-business", "waiting_business_decision"),
+            ("legacy-orphan", "legacy_orphan"),
+            ("completed", "completed"),
+            ("cancelled", "cancelled"),
+        ] {
+            sqlx::query("INSERT INTO objectives (id, status) VALUES (?, ?)")
+                .bind(id)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let nonterminal_objectives = count_nonterminal_objectives(&pool).await.unwrap();
+        assert_eq!(nonterminal_objectives, 6);
+        assert!(
+            !UpdateSafetyStatus {
+                nonterminal_objectives,
+                ..UpdateSafetyStatus::default()
+            }
+            .evaluate()
+            .safe_to_restart
+        );
+
+        sqlx::query(
+            "UPDATE objectives SET status = 'completed'
+             WHERE status NOT IN ('completed', 'cancelled')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let nonterminal_objectives = count_nonterminal_objectives(&pool).await.unwrap();
+        assert_eq!(nonterminal_objectives, 0);
+        assert!(
+            UpdateSafetyStatus {
+                nonterminal_objectives,
+                ..UpdateSafetyStatus::default()
+            }
+            .evaluate()
+            .safe_to_restart
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_claimed_update_objective_is_exempt_but_every_other_open_objective_blocks() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                recovery_owner TEXT,
+                remediation_id TEXT,
+                lease_owner TEXT,
+                lease_expires_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE objective_remediations (
+                id TEXT PRIMARY KEY,
+                objective_id TEXT NOT NULL,
+                binding_id TEXT,
+                domain TEXT NOT NULL,
+                status TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at INTEGER,
+                attempt_index INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE objective_bindings (
+                id TEXT PRIMARY KEY,
+                objective_id TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                resource_kind TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                resource_generation INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (id, status, domain, recovery_owner, remediation_id, lease_owner) in [
+            (
+                "update-self",
+                "waiting_system",
+                "update",
+                Some("objective-supervisor:update"),
+                Some("remediation-update"),
+                Some("update-owner"),
+            ),
+            (
+                "chat-active-stream-closed",
+                "active",
+                "chat",
+                Some("objective-supervisor:chat"),
+                None,
+                None,
+            ),
+            (
+                "provider-waiting",
+                "waiting_system",
+                "provider",
+                Some("objective-supervisor:provider"),
+                Some("remediation-provider"),
+                Some("provider-owner"),
+            ),
+            ("core-input", "waiting_core_input", "auth", None, None, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO objectives
+                 (id,status,domain,recovery_owner,remediation_id,lease_owner,lease_expires_at)
+                 VALUES (?,?,?,?,?,?,?)",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(domain)
+            .bind(recovery_owner)
+            .bind(remediation_id)
+            .bind(lease_owner)
+            .bind(lease_owner.map(|_| 2_000_i64))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, objective_id, binding_id, domain, owner, epoch) in [
+            (
+                "remediation-update",
+                "update-self",
+                Some("binding-update"),
+                "update",
+                "update-owner",
+                7_i64,
+            ),
+            (
+                "remediation-provider",
+                "provider-waiting",
+                None,
+                "provider",
+                "provider-owner",
+                2_i64,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO objective_remediations
+                 (id,objective_id,binding_id,domain,status,lease_owner,lease_expires_at,attempt_index)
+                 VALUES (?,?,?,?, 'claimed', ?, 2000, ?)",
+            )
+            .bind(id)
+            .bind(objective_id)
+            .bind(binding_id)
+            .bind(domain)
+            .bind(owner)
+            .bind(epoch)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id,objective_id,domain,resource_kind,resource_id,resource_generation)
+             VALUES ('binding-update','update-self','update','app_update_target',?,3)",
+        )
+        .bind(update_target_resource_id("1.80.0", "build-18000"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let permit = UpdateClaimPermit {
+            objective_id: "update-self".into(),
+            remediation_id: "remediation-update".into(),
+            owner: "update-owner".into(),
+            claim_epoch: 7,
+            binding_id: "binding-update".into(),
+            resource_generation: 3,
+        };
+
+        let mismatched_target =
+            load_objective_blockers(&pool, 1_000, Some(&permit), "1.80.1", "build-18001")
+                .await
+                .unwrap();
+        assert_eq!(
+            mismatched_target.count, 4,
+            "a live Update claim bound to another target cannot be inferred as self"
+        );
+
+        let blockers =
+            load_objective_blockers(&pool, 1_000, Some(&permit), "1.80.0", "build-18000")
+                .await
+                .unwrap();
+
+        assert_eq!(blockers.count, 3);
+        assert_eq!(
+            blockers.owners,
+            vec![
+                "core-input:auth".to_string(),
+                "objective-supervisor:chat".to_string(),
+                "objective-supervisor:provider".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_or_mismatched_update_claim_is_not_exempt() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY, status TEXT NOT NULL, domain TEXT NOT NULL,
+                recovery_owner TEXT, remediation_id TEXT, lease_owner TEXT,
+                lease_expires_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE objective_remediations (
+                id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, binding_id TEXT,
+                domain TEXT NOT NULL,
+                status TEXT NOT NULL,
+                lease_owner TEXT, lease_expires_at INTEGER, attempt_index INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE objective_bindings (
+                id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, domain TEXT NOT NULL,
+                resource_kind TEXT NOT NULL, resource_id TEXT NOT NULL,
+                resource_generation INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives VALUES
+             ('update-self','waiting_system','update','objective-supervisor:update',
+              'remediation-update','update-owner',900)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_remediations VALUES
+             ('remediation-update','update-self','binding-update','update',
+              'claimed','update-owner',900,7)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_bindings VALUES
+             ('binding-update','update-self','update','app_update_target',?,3)",
+        )
+        .bind(update_target_resource_id("1.80.0", "build-18000"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let blockers = load_objective_blockers(
+            &pool,
+            1_000,
+            Some(&UpdateClaimPermit {
+                objective_id: "update-self".into(),
+                remediation_id: "remediation-update".into(),
+                owner: "update-owner".into(),
+                claim_epoch: 7,
+                binding_id: "binding-update".into(),
+                resource_generation: 3,
+            }),
+            "1.80.0",
+            "build-18000",
+        )
+        .await
+        .unwrap();
+        assert_eq!(blockers.count, 1, "an expired claim cannot exempt itself");
+    }
+
+    #[tokio::test]
+    async fn unknown_install_is_observed_not_replayed_and_matching_build_reconciles_after_restart()
+    {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        ensure_update_receipt_schema(&pool).await.unwrap();
+
+        let first = admit_update_install(&pool, None, "1.80.0", "18000", "1.79.0", "17900", 1_000)
+            .await
+            .unwrap();
+        assert!(matches!(
+            &first,
+            UpdateInstallAdmission::InstallPermitted(_)
+        ));
+        assert_eq!(first.view().objective_id, None);
+
+        let takeover =
+            admit_update_install(&pool, None, "1.80.0", "18000", "1.79.0", "17900", 2_000)
+                .await
+                .unwrap();
+        assert!(matches!(takeover, UpdateInstallAdmission::ObserveOnly(_)));
+
+        let different_target =
+            admit_update_install(&pool, None, "1.81.0", "18100", "1.79.0", "17900", 2_500)
+                .await
+                .unwrap();
+        assert!(matches!(
+            &different_target,
+            UpdateInstallAdmission::ObserveOnly(_)
+        ));
+        assert_eq!(different_target.view().target_version, "1.80.0");
+        assert_eq!(different_target.view().target_build, "18000");
+
+        let reconciled = observe_latest_update_install(&pool, "1.80.0", "18000", 3_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reconciled.state, UpdateInstallState::Applied);
+        assert_eq!(reconciled.target_version, "1.80.0");
+        assert_eq!(reconciled.target_build, "18000");
+
+        let already_applied =
+            admit_update_install(&pool, None, "1.81.0", "18100", "1.81.0", "18100", 4_000)
+                .await
+                .unwrap();
+        assert!(matches!(
+            already_applied,
+            UpdateInstallAdmission::Applied(_)
+        ));
     }
 }

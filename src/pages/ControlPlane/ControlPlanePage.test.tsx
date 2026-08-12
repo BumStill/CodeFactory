@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -182,7 +182,7 @@ describe("ControlPlanePage", () => {
     expect(screen.queryByText("加载控制面…")).not.toBeInTheDocument();
   });
 
-  it("reenables refresh after the watchdog and ignores the late stale response", async () => {
+  it("automatically reobserves after the watchdog and ignores the late stale response", async () => {
     vi.useFakeTimers();
     let resolveFirst: ((value: unknown) => void) | undefined;
     const staleSnapshot = {
@@ -235,7 +235,30 @@ describe("ControlPlanePage", () => {
             resolveFirst = resolve;
           }),
       )
-      .mockResolvedValueOnce(recoveredSnapshot);
+      .mockResolvedValueOnce(recoveredSnapshot)
+      .mockResolvedValueOnce({
+        generated_at_ms: 100_000_000,
+        window_start_ms: 13_600_000,
+        availability: "available",
+        unavailable_reason: null,
+        metrics: {
+          open: 0,
+          system_owned: 0,
+          typed_user_attention: 0,
+          technical_user_handoff_violations: 0,
+          overdue_ownerless_remediations: 0,
+          invalid_completions: 0,
+          duplicate_committed_side_effect_receipts: 0,
+          recovery_decisions: 0,
+          recovered_objectives: 0,
+          recovery_latency_p50_ms: null,
+          recovery_latency_p95_ms: null,
+          recovery_decisions_24h: 0,
+          recovered_objectives_24h: 0,
+          recovery_latency_p50_ms_24h: null,
+          recovery_latency_p95_ms_24h: null,
+        },
+      });
 
     render(<ControlPlanePage onBack={vi.fn()} />);
     expect(screen.getByText("加载控制面…")).toBeInTheDocument();
@@ -244,14 +267,23 @@ describe("ControlPlanePage", () => {
       await vi.advanceTimersByTimeAsync(8_000);
     });
 
-    expect(screen.getByText("控制面请求超过 8 秒，请重试。")).toBeInTheDocument();
+    expect(
+      screen.getByText("控制面请求超过 8 秒；观测状态已保留，系统将在 3 秒后自动重新观测。"),
+    ).toBeInTheDocument();
     const refresh = screen.getByRole("button", { name: "刷新" });
     expect(refresh).toBeEnabled();
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(refresh);
     await act(async () => {
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2_999);
     });
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(mocks.invoke).toHaveBeenCalledTimes(3);
+    expect(mocks.invoke).toHaveBeenNthCalledWith(3, "get_objective_health");
     expect(screen.getAllByText("main").length).toBeGreaterThan(0);
     expect(screen.getByText("complete")).toBeInTheDocument();
 
@@ -261,5 +293,123 @@ describe("ControlPlanePage", () => {
     });
     expect(screen.getAllByText("main").length).toBeGreaterThan(0);
     expect(screen.queryByText("git-probe-partial")).not.toBeInTheDocument();
+  });
+
+  it("renders Objective continuity health and marks technical violations as risks", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_objective_health") {
+        return {
+          generated_at_ms: 100_000_000,
+          window_start_ms: 13_600_000,
+          availability: "available",
+          unavailable_reason: null,
+          metrics: {
+            open: 7,
+            system_owned: 5,
+            typed_user_attention: 2,
+            technical_user_handoff_violations: 3,
+            overdue_ownerless_remediations: 1,
+            invalid_completions: 2,
+            duplicate_committed_side_effect_receipts: 1,
+            recovery_decisions: 9,
+            recovered_objectives: 8,
+            recovery_latency_p50_ms: 1200,
+            recovery_latency_p95_ms: 4800,
+            recovery_decisions_24h: 4,
+            recovered_objectives_24h: 3,
+            recovery_latency_p50_ms_24h: 900,
+            recovery_latency_p95_ms_24h: 2400,
+          },
+        };
+      }
+      return {
+        generated_at: "2026-07-10T02:00:00Z",
+        cwd: "/Users/leo/Projects/CodeFactory",
+        authority: [],
+        memory: { pending: 0, accepted: 0, rejected: 0, preference_pending: 0, latest_pending: [] },
+        capabilities: [],
+        delivery: {
+          git_branch: "main",
+          is_dirty: false,
+          dirty_count: 0,
+          sync_gate_present: true,
+          sync_gate_configured: true,
+          release_workflow_present: true,
+          auto_release_present: true,
+          latest_release_tag: "v1.42.6",
+        },
+        risks: [],
+      };
+    });
+
+    render(<ControlPlanePage onBack={vi.fn()} />);
+
+    expect(await screen.findByText("Objective Continuity")).toBeInTheDocument();
+    expect(screen.getByText("Available")).toBeInTheDocument();
+    expect(screen.getByTestId("objective-open")).toHaveTextContent("7");
+    expect(screen.getByTestId("objective-system-owned")).toHaveTextContent("5");
+    expect(screen.getByTestId("objective-typed-attention")).toHaveTextContent("2");
+    expect(screen.getByTestId("objective-technical-handoffs")).toHaveAttribute(
+      "data-severity",
+      "risk",
+    );
+    expect(screen.getByTestId("objective-ownerless-remediations")).toHaveAttribute(
+      "data-severity",
+      "risk",
+    );
+    expect(screen.getByTestId("objective-invalid-completions")).toHaveAttribute(
+      "data-severity",
+      "risk",
+    );
+    expect(screen.getByTestId("objective-duplicate-receipts")).toHaveAttribute(
+      "data-severity",
+      "risk",
+    );
+    expect(screen.getByText("3 / 4")).toBeInTheDocument();
+    expect(screen.getByText("0.9s")).toBeInTheDocument();
+    expect(screen.getByText("2.4s")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry|continue|重试|继续/i })).not.toBeInTheDocument();
+  });
+
+  it("shows Objective health as unavailable without rendering missing metrics as zero", async () => {
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_objective_health") {
+        return {
+          generated_at_ms: 100_000_000,
+          window_start_ms: 13_600_000,
+          availability: "unavailable",
+          unavailable_reason: "objective health unavailable: missing required schema: objectives",
+          metrics: null,
+        };
+      }
+      return {
+        generated_at: "2026-07-10T02:00:00Z",
+        cwd: "/Users/leo/Projects/CodeFactory",
+        authority: [],
+        memory: { pending: 0, accepted: 0, rejected: 0, preference_pending: 0, latest_pending: [] },
+        capabilities: [],
+        delivery: {
+          git_branch: "main",
+          is_dirty: false,
+          dirty_count: 0,
+          sync_gate_present: true,
+          sync_gate_configured: true,
+          release_workflow_present: true,
+          auto_release_present: true,
+          latest_release_tag: null,
+        },
+        risks: [],
+      };
+    });
+
+    render(<ControlPlanePage onBack={vi.fn()} />);
+
+    expect(await screen.findByText("Objective Continuity")).toBeInTheDocument();
+    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText("objective health unavailable: missing required schema: objectives"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("objective-open")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("objective-recovery-24h")).not.toBeInTheDocument();
   });
 });

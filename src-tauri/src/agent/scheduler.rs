@@ -33,19 +33,25 @@
 //! serialized per session so concurrent tasks never interleave `git apply`
 //! on the same checkout. Non-git cwds fall back to today's shared-cwd mode.
 
+use chrono::Utc;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::agent::hooks::{HookEvent, HookRunner};
 use crate::agent::journal;
+use crate::agent::objective::{
+    CompletionArbiter, DecisionRouter, EvidenceKind, ObjectiveEvidence, ObjectiveSnapshot,
+    ObjectiveStatus, ObjectiveStore, RecoveryDomain, RouteSignal,
+};
 use crate::agent::subagent::{self, SubagentBrief, SubagentResult};
 use crate::agent::verification;
 use crate::agent::worktree;
@@ -93,6 +99,11 @@ fn dispatch_inputs(settings: &Settings) -> journal::DispatchInputs {
 
 /// Poll interval when no new tasks can be dispatched but some are still in flight.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const TASK_RECOVERY_BACKOFF_MS: i64 = 5_000;
+const TASK_MUTATION_RUNG_LEASE_MS: i64 = 60_000;
+
+pub type TaskMutationPermits =
+    Arc<RwLock<HashMap<String, codefactory_agent_loop::tool::MutationPermit>>>;
 
 #[derive(Debug)]
 enum VerificationAttemptDecision {
@@ -126,13 +137,213 @@ fn settle_result_after_verification(
     }
 
     let error = failed_verification_message(verif_results);
-    if attempt < max_attempts {
-        return VerificationAttemptDecision::Retry { error };
-    }
+    // The local attempt ceiling limits one approach, not the business
+    // objective. The caller journals this attempt and hands exhaustion to the
+    // durable remediation queue; it must never manufacture terminal `failed`.
+    let _ = (&mut result, attempt, max_attempts);
+    VerificationAttemptDecision::Retry { error }
+}
 
-    result.completed = false;
-    result.summary = format!("Failed after {max_attempts} attempts (verification):\n{error}");
-    VerificationAttemptDecision::Finish(result)
+fn requested_task_acceptance(task: &tasks::TaskRun) -> String {
+    task.acceptance_criteria_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .filter(|criteria| !criteria.is_empty())
+        .map(|criteria| criteria.join("\n"))
+        .unwrap_or_else(|| task.description.clone())
+}
+
+async fn objective_for_task(
+    pool: &SqlitePool,
+    task: &tasks::TaskRun,
+) -> Result<ObjectiveSnapshot, AppError> {
+    let store = ObjectiveStore::new(pool.clone());
+    if let Some(objective_id) = tasks::task_objective_id(pool, &task.id).await? {
+        if let Some(objective) = store
+            .get(&objective_id)
+            .await
+            .map_err(|error| AppError::Other(format!("load task objective: {error:#}")))?
+        {
+            if objective.task_id.as_deref() != Some(task.id.as_str())
+                || objective.session_id.as_deref() != Some(task.session_id.as_str())
+            {
+                return Err(AppError::Other(format!(
+                    "task {} objective binding identity mismatch",
+                    task.id
+                )));
+            }
+            return Ok(objective);
+        }
+    }
+    store
+        .ensure_task_objective(&task.session_id, &task.id, &requested_task_acceptance(task))
+        .await
+        .map_err(|error| AppError::Other(format!("ensure task objective: {error:#}")))
+}
+
+fn task_completion_evidence(
+    objective: &ObjectiveSnapshot,
+    result: &SubagentResult,
+    verification_results: &[verification::VerificationResult],
+) -> Vec<ObjectiveEvidence> {
+    if verification_results.is_empty() || verification_results.iter().any(|item| !item.passed) {
+        return Vec::new();
+    }
+    let now = Utc::now().timestamp_millis();
+    let evidence_ref = format!(
+        "task-scheduler:{}:r{}",
+        objective.id,
+        objective.revision + 1
+    );
+    let digest = |material: &str| format!("sha256:{:x}", Sha256::digest(material.as_bytes()));
+    let mut evidence = Vec::new();
+    if result.files_changed.is_empty() {
+        evidence.push(ObjectiveEvidence {
+            id: Uuid::new_v4().to_string(),
+            kind: EvidenceKind::CurrentStateAcceptance,
+            scope: objective
+                .task_id
+                .clone()
+                .unwrap_or_else(|| objective.id.clone()),
+            digest: digest(&result.summary),
+            evidence_ref: evidence_ref.clone(),
+            observed_at: now,
+            reached_acceptance: objective.requested_acceptance.clone(),
+        });
+    } else {
+        let mut files = result.files_changed.clone();
+        files.sort();
+        evidence.push(ObjectiveEvidence {
+            id: Uuid::new_v4().to_string(),
+            kind: EvidenceKind::ChangeSet,
+            scope: objective
+                .task_id
+                .clone()
+                .unwrap_or_else(|| objective.id.clone()),
+            digest: digest(&files.join("\n")),
+            evidence_ref: evidence_ref.clone(),
+            observed_at: now,
+            reached_acceptance: objective.requested_acceptance.clone(),
+        });
+    }
+    let verification_json = serde_json::to_string(verification_results).unwrap_or_default();
+    evidence.push(ObjectiveEvidence {
+        id: Uuid::new_v4().to_string(),
+        kind: EvidenceKind::PostChangeValidation,
+        scope: objective
+            .task_id
+            .clone()
+            .unwrap_or_else(|| objective.id.clone()),
+        digest: digest(&verification_json),
+        evidence_ref,
+        observed_at: now,
+        reached_acceptance: objective.requested_acceptance.clone(),
+    });
+    evidence
+}
+
+async fn complete_verified_task_objective(
+    pool: &SqlitePool,
+    objective: &ObjectiveSnapshot,
+    result: &SubagentResult,
+    verification_results: &[verification::VerificationResult],
+    mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
+) -> Result<ObjectiveSnapshot, AppError> {
+    let evidence = task_completion_evidence(objective, result, verification_results);
+    let decision = CompletionArbiter::decide(objective, &evidence).map_err(|error| {
+        AppError::Other(format!("task completion evidence rejected: {error:#}"))
+    })?;
+    let store = ObjectiveStore::new(pool.clone());
+    match mutation_permit {
+        Some(permit) => {
+            store
+                .apply_claimed_decision(objective.revision, decision, permit)
+                .await
+        }
+        None => store.apply_decision(objective.revision, decision).await,
+    }
+    .map_err(|error| AppError::Other(format!("complete task objective: {error:#}")))
+}
+
+/// Fence one irreversible scheduler mutation rung behind the exact durable
+/// recovery claim that launched this task future. Foreground work has no
+/// recovery permit and keeps its existing behavior. Recovery work must renew
+/// the still-live owner+epoch lease, then re-observe the full binding identity;
+/// false or an observation error means the caller must perform no mutation.
+async fn authorize_task_mutation_rung(
+    pool: &SqlitePool,
+    mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
+) -> Result<bool, AppError> {
+    let Some(permit) = mutation_permit else {
+        return Ok(true);
+    };
+    let store = ObjectiveStore::new(pool.clone());
+    let renewed = store
+        .renew_claimed_remediation(
+            &permit.objective_id,
+            &permit.remediation_id,
+            &permit.owner,
+            permit.claim_epoch,
+            TASK_MUTATION_RUNG_LEASE_MS,
+        )
+        .await
+        .map_err(|error| AppError::Other(format!("renew task mutation permit: {error:#}")))?;
+    if !renewed {
+        return Ok(false);
+    }
+    store
+        .claim_is_current(permit)
+        .await
+        .map_err(|error| AppError::Other(format!("observe task mutation permit: {error:#}")))
+}
+
+async fn handoff_task_to_system_recovery(
+    pool: &SqlitePool,
+    objective: &ObjectiveSnapshot,
+    task_id: &str,
+    failure_code: &str,
+    error: &str,
+    mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
+) -> Result<ObjectiveSnapshot, AppError> {
+    let next_observation_at = Utc::now().timestamp_millis() + TASK_RECOVERY_BACKOFF_MS;
+    let failure_signature = format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("{task_id}:{failure_code}:{error}").as_bytes())
+    );
+    let decision = DecisionRouter::route(
+        objective,
+        RouteSignal::TechnicalFailure {
+            domain: RecoveryDomain::Task,
+            failure_code: failure_code.to_string(),
+            failure_signature,
+            next_observation_at,
+            resume_cursor: Some(task_id.to_string()),
+        },
+    )
+    .map_err(|route_error| {
+        AppError::Other(format!("route task recovery decision: {route_error:#}"))
+    })?;
+    let store = ObjectiveStore::new(pool.clone());
+    let waiting = match mutation_permit {
+        Some(permit) => {
+            store
+                .apply_claimed_decision(objective.revision, decision, permit)
+                .await
+        }
+        None => store.apply_decision(objective.revision, decision).await,
+    }
+    .map_err(|apply_error| {
+        AppError::Other(format!("persist task recovery decision: {apply_error:#}"))
+    })?;
+    let projected =
+        tasks::mark_task_waiting_system(pool, task_id, &waiting.id, error, next_observation_at)
+            .await?;
+    if !projected {
+        return Err(AppError::Other(format!(
+            "task {task_id} changed before waiting_system projection"
+        )));
+    }
+    Ok(waiting)
 }
 
 /// RAII net under a dispatched task future: on drop without `settled`, the
@@ -162,7 +373,17 @@ impl Drop for DispatchGuard {
                         .ok()
                         .flatten()
                         .is_some();
-                    let _ = journal::reset_to_pending(&pool, &id, has_journal).await;
+                    if tasks::reset_running_task_to_pending(
+                        &pool,
+                        &id,
+                        "resume: re-running after interrupted dispatch",
+                    )
+                    .await
+                    .unwrap_or(false)
+                        && has_journal
+                    {
+                        let _ = journal::journal_mark_stale(&pool, &id).await;
+                    }
                 }
                 running.lock().await.remove(&id);
             });
@@ -176,6 +397,7 @@ pub struct TaskScheduler {
     pub max_parallel: usize,
     pub running: Arc<Mutex<HashSet<String>>>,
     pub cancel_flag: Arc<AtomicBool>,
+    mutation_permits: TaskMutationPermits,
 }
 
 impl TaskScheduler {
@@ -185,7 +407,12 @@ impl TaskScheduler {
             max_parallel: MAX_PARALLEL,
             running: Arc::new(Mutex::new(HashSet::new())),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            mutation_permits: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn mutation_permits(&self) -> TaskMutationPermits {
+        self.mutation_permits.clone()
     }
 
     // Scaffolding: convenience in-process canceller. The live path hands out
@@ -347,10 +574,81 @@ impl TaskScheduler {
 
             // 3. Dispatch as many as the parallelism budget allows.
             let mut dispatched_any = false;
+            let mut admissible_ready = false;
             for task in ready {
                 if self.running.lock().await.contains(&task.id) {
                     continue;
                 }
+                let task_objective = objective_for_task(&self.pool, &task).await?;
+                let candidate_permit = self
+                    .mutation_permits
+                    .read()
+                    .await
+                    .get(&task_objective.id)
+                    .cloned();
+                let task_mutation_permit =
+                    if task_objective.status == ObjectiveStatus::WaitingSystem {
+                        match candidate_permit {
+                            Some(permit)
+                                if ObjectiveStore::new(self.pool.clone())
+                                    .claim_is_current(&permit)
+                                    .await
+                                    .map_err(|error| {
+                                        AppError::Other(format!(
+                                            "validate task mutation permit: {error:#}"
+                                        ))
+                                    })? =>
+                            {
+                                Some(permit)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                match task_objective.status {
+                    ObjectiveStatus::Completed => {
+                        tasks::mark_task_completed(
+                            &self.pool,
+                            &task.id,
+                            r#"{"summary":"reconciled from completed objective evidence"}"#,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    ObjectiveStatus::Cancelled => {
+                        tasks::mark_task_cancelled(&self.pool, &task.id).await?;
+                        continue;
+                    }
+                    ObjectiveStatus::WaitingSystem
+                        if task_objective
+                            .next_observation_at
+                            .is_some_and(|due| due > Utc::now().timestamp_millis()) =>
+                    {
+                        let due = task_objective.next_observation_at.unwrap_or_default();
+                        let reason = task_objective
+                            .failure_code
+                            .as_deref()
+                            .unwrap_or("waiting_system");
+                        tasks::mark_task_waiting_system(
+                            &self.pool,
+                            &task.id,
+                            &task_objective.id,
+                            reason,
+                            due,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    ObjectiveStatus::WaitingSystem if task_mutation_permit.is_none() => {
+                        // A session-level scheduler must not lend one Objective's
+                        // claim to another due task. Its own supervisor will
+                        // dispatch it with its own owner+epoch permit.
+                        continue;
+                    }
+                    _ => {}
+                }
+                admissible_ready = true;
                 let permit = match semaphore.clone().try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => break, // cap reached, try again next tick
@@ -371,6 +669,18 @@ impl TaskScheduler {
                         drop(permit);
                         continue;
                     }
+                }
+                if !tasks::clear_task_recovery_after_claim(&self.pool, &task.id, &task_objective.id)
+                    .await?
+                {
+                    tasks::reset_running_task_to_pending(
+                        &self.pool,
+                        &task.id,
+                        "resume: task objective claim reconciliation",
+                    )
+                    .await?;
+                    drop(permit);
+                    continue;
                 }
                 self.running.lock().await.insert(task.id.clone());
                 emit_task(
@@ -406,6 +716,8 @@ impl TaskScheduler {
                 let task_cwd = task.cwd.clone();
                 let task_title = task.title.clone();
                 let task_description = task.description.clone();
+                let task_objective = task_objective.clone();
+                let task_mutation_permit = task_mutation_permit.clone();
                 // Parse acceptance_criteria_json (stored as JSON array) into a
                 // human-readable bullet block for the subagent brief. The
                 // autonomous prompt instructs the model to verify each one
@@ -507,6 +819,8 @@ impl TaskScheduler {
                     // ── Retry loop ──────────────────────────────────────────
                     let mut prev_error: Option<String> = None;
                     let mut final_outcome: Option<SubagentResult> = None;
+                    let mut final_verification_results = Vec::new();
+                    let mut recovery_failure_code = "task_attempts_exhausted";
 
                     for attempt in 1..=MAX_ATTEMPTS {
                         // Emit retry event on attempts 2+.
@@ -584,13 +898,20 @@ impl TaskScheduler {
                         }
 
                         let attempt_id = Uuid::new_v4().to_string();
-                        if let Err(error) =
-                            tasks::start_task_attempt(&pool, &attempt_id, &task_id, attempt as i32)
-                                .await
+                        let attempt_index = task_row.attempt_count + attempt as i32;
+                        if let Err(error) = tasks::start_task_objective_attempt(
+                            &pool,
+                            &attempt_id,
+                            &task_id,
+                            &task_objective.id,
+                            attempt_index,
+                        )
+                        .await
                         {
                             let message = format!("attempt journal start failed: {error}");
                             tracing::error!("scheduler: task {} {message}", task_id);
                             prev_error = Some(message);
+                            recovery_failure_code = "attempt_journal_error";
                             continue;
                         }
 
@@ -602,6 +923,7 @@ impl TaskScheduler {
                             &settings,
                             &app,
                             &perms,
+                            task_mutation_permit.clone(),
                         )
                         .await;
 
@@ -624,6 +946,7 @@ impl TaskScheduler {
                                     task_id
                                 );
                                 prev_error = Some(msg.clone());
+                                recovery_failure_code = "subagent_error";
                                 emit_task(
                                     &app,
                                     &session_id_for_task,
@@ -669,6 +992,7 @@ impl TaskScheduler {
                                             ac.reason
                                         );
                                         prev_error = Some(msg.clone());
+                                        recovery_failure_code = "acceptance_failed";
                                         emit_task(
                                             &app,
                                             &session_id_for_task,
@@ -746,6 +1070,7 @@ impl TaskScheduler {
                                             task_id
                                         );
                                         prev_error = Some(error);
+                                        recovery_failure_code = "verification_failed";
                                         emit_task(
                                             &app,
                                             &session_id_for_task,
@@ -782,6 +1107,7 @@ impl TaskScheduler {
                                         )
                                         .await
                                         .ok();
+                                        final_verification_results = verif_results;
                                         final_outcome = Some(outcome);
                                         break;
                                     }
@@ -813,6 +1139,38 @@ impl TaskScheduler {
                         let completed_ok = final_outcome.as_ref().map_or(false, |r| r.completed);
                         if completed_ok {
                             let _merge_guard = merge_lock.lock().await;
+                            let mutation_rung_authorized = match authorize_task_mutation_rung(
+                                &pool,
+                                task_mutation_permit.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(authorized) => authorized,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        task_id = %task_id,
+                                        objective_id = %task_objective.id,
+                                        %error,
+                                        "task merge-back fenced because mutation authority could not be observed"
+                                    );
+                                    false
+                                }
+                            };
+                            if !mutation_rung_authorized {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    objective_id = %task_objective.id,
+                                    "task merge-back fenced before merging intent; isolated work preserved"
+                                );
+                                let reclaimed =
+                                    crate::tools::browser_session::close_for_task(&task_id).await;
+                                if reclaimed > 0 {
+                                    tracing::info!(
+                                        "scheduler: reclaimed {reclaimed} browser session(s) for task {task_id}"
+                                    );
+                                }
+                                return;
+                            }
                             // Durable 'merging' intent BEFORE the side effect:
                             // a crash between "diff applied" and "row completed"
                             // is then resolved exactly-once by orphan recovery
@@ -843,6 +1201,38 @@ impl TaskScheduler {
                                     "scheduler: task {} merging intent write failed: {e}",
                                     task_id
                                 );
+                            }
+                            let mutation_rung_authorized = match authorize_task_mutation_rung(
+                                &pool,
+                                task_mutation_permit.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(authorized) => authorized,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        task_id = %task_id,
+                                        objective_id = %task_objective.id,
+                                        %error,
+                                        "task merge-back fenced because mutation authority could not be re-observed"
+                                    );
+                                    false
+                                }
+                            };
+                            if !mutation_rung_authorized {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    objective_id = %task_objective.id,
+                                    "task merge-back fenced after merging intent; isolated work preserved"
+                                );
+                                let reclaimed =
+                                    crate::tools::browser_session::close_for_task(&task_id).await;
+                                if reclaimed > 0 {
+                                    tracing::info!(
+                                        "scheduler: reclaimed {reclaimed} browser session(s) for task {task_id}"
+                                    );
+                                }
+                                return;
                             }
                             match worktree::merge_back(wt) {
                                 Ok(worktree::MergeOutcome::Applied) => {
@@ -903,6 +1293,7 @@ impl TaskScheduler {
                                     );
                                     tracing::warn!("scheduler: task {} {}", task_id, note);
                                     prev_error = Some(note.clone());
+                                    recovery_failure_code = "merge_back_conflict";
                                     if let Some(ref mut r) = final_outcome {
                                         r.completed = false;
                                         r.summary =
@@ -927,6 +1318,7 @@ impl TaskScheduler {
                                     );
                                     tracing::warn!("scheduler: task {} {}", task_id, note);
                                     prev_error = Some(note.clone());
+                                    recovery_failure_code = "merge_back_failed";
                                     if let Some(ref mut r) = final_outcome {
                                         r.completed = false;
                                         r.summary =
@@ -937,172 +1329,174 @@ impl TaskScheduler {
                         }
                     }
 
-                    // ── Settle the task ──────────────────────────────────────
-                    // Capture hook data before match consumes final_outcome.
-                    let hook_completed = final_outcome.as_ref().map_or(false, |r| r.completed);
-                    let hook_summary = final_outcome
+                    // ── Settle the Objective, then its task projection ──────
+                    let mut projection_settled = false;
+                    let mut objective_completed = false;
+                    let mut post_status = "waiting_system";
+                    let mut post_summary = final_outcome
                         .as_ref()
-                        .map(|r| r.summary.clone())
+                        .map(|result| result.summary.clone())
                         .unwrap_or_else(|| prev_error.clone().unwrap_or_default());
 
-                    // One-way IM notification: the moments a human needs to
-                    // come back for. Fire-and-forget; failures only log.
-                    crate::notify::send(
-                        &settings,
-                        if hook_completed {
-                            crate::notify::NotifyEvent::TaskCompleted
-                        } else {
-                            crate::notify::NotifyEvent::TaskFailed
-                        },
-                        format!(
-                            "{task_title}
-{}",
-                            hook_summary.chars().take(200).collect::<String>()
-                        ),
-                    );
-                    match final_outcome {
-                        Some(result) if result.completed => {
-                            let result_json =
-                                serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
-                            // Journal + task_runs completion in one write path:
-                            // records the content address (dispatch key), the
-                            // materialization evidence, and flips the row to
-                            // completed. Falls back to the plain status update
-                            // if the journal write fails — completion must
-                            // never be lost to journaling.
-                            if let Err(e) = journal::record_completion(
-                                &pool,
-                                &task_row,
-                                &journal_inputs,
-                                &journal_dep_keys,
-                                run_checkpoint_id.as_deref(),
-                                &journal_material,
-                                &result_json,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "scheduler: task {} journal completion failed ({e}); \
-                                     falling back to plain status update",
-                                    task_id
-                                );
-                                tasks::mark_task_completed(&pool, &task_id, &result_json)
-                                    .await
-                                    .ok();
-                            }
-                            // Append result to shared brief
-                            let brief_path = format!("{}/_codefactory_brief.md", task_cwd);
-                            if std::path::Path::new(&brief_path).exists() {
-                                let result_entry = format!(
-                                    "\n### \u{2705} {} \u{2014} done\n{}\n",
-                                    task_title,
-                                    result.summary.chars().take(500).collect::<String>()
-                                );
-                                if let Ok(mut existing) = std::fs::read_to_string(&brief_path) {
-                                    existing = existing
-                                        .replace("_(will be updated as tasks complete)_", "");
-                                    existing.push_str(&result_entry);
-                                    let _ = std::fs::write(&brief_path, &existing);
+                    if let Some(result) = final_outcome.as_ref().filter(|result| result.completed) {
+                        match complete_verified_task_objective(
+                            &pool,
+                            &task_objective,
+                            result,
+                            &final_verification_results,
+                            task_mutation_permit.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(completed) if completed.status == ObjectiveStatus::Completed => {
+                                objective_completed = true;
+                                let result_json =
+                                    serde_json::to_string(result).unwrap_or_else(|_| "{}".into());
+                                let task_completed = match journal::record_completion(
+                                    &pool,
+                                    &task_row,
+                                    &journal_inputs,
+                                    &journal_dep_keys,
+                                    run_checkpoint_id.as_deref(),
+                                    &journal_material,
+                                    &result_json,
+                                )
+                                .await
+                                {
+                                    Ok(()) => true,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            "scheduler: task {} journal completion failed ({error}); \
+                                             reconciling the projection from completed Objective",
+                                            task_id
+                                        );
+                                        tasks::mark_task_completed(&pool, &task_id, &result_json)
+                                            .await
+                                            .is_ok()
+                                    }
+                                };
+                                if task_completed {
+                                    projection_settled = true;
+                                    post_status = "completed";
+                                    crate::notify::send(
+                                        &settings,
+                                        crate::notify::NotifyEvent::TaskCompleted,
+                                        format!(
+                                            "{task_title}\n{}",
+                                            result.summary.chars().take(200).collect::<String>()
+                                        ),
+                                    );
+                                    let brief_path = format!("{}/_codefactory_brief.md", task_cwd);
+                                    if std::path::Path::new(&brief_path).exists() {
+                                        let result_entry = format!(
+                                            "\n### \u{2705} {} \u{2014} done\n{}\n",
+                                            task_title,
+                                            result.summary.chars().take(500).collect::<String>()
+                                        );
+                                        if let Ok(mut existing) =
+                                            std::fs::read_to_string(&brief_path)
+                                        {
+                                            existing = existing.replace(
+                                                "_(will be updated as tasks complete)_",
+                                                "",
+                                            );
+                                            existing.push_str(&result_entry);
+                                            let _ = std::fs::write(&brief_path, &existing);
+                                        }
+                                    }
+                                    emit_task(
+                                        &app,
+                                        &session_id_for_task,
+                                        "task_completed",
+                                        &TaskEventPayload {
+                                            task_id: &task_id,
+                                            title: None,
+                                            message: None,
+                                            result: Some(&result_json),
+                                            error: None,
+                                            files_changed: if result.files_changed.is_empty() {
+                                                None
+                                            } else {
+                                                Some(result.files_changed.as_slice())
+                                            },
+                                            cwd: Some(&task_cwd),
+                                        },
+                                    );
                                 }
                             }
-                            emit_task(
-                                &app,
-                                &session_id_for_task,
-                                "task_completed",
-                                &TaskEventPayload {
-                                    task_id: &task_id,
-                                    title: None,
-                                    message: None,
-                                    result: Some(&result_json),
-                                    error: None,
-                                    files_changed: if result.files_changed.is_empty() {
-                                        None
-                                    } else {
-                                        Some(result.files_changed.as_slice())
-                                    },
-                                    cwd: Some(&task_cwd),
-                                },
-                            );
-                        }
-                        Some(result) => {
-                            // Completed=false after retries (e.g. acceptance failure).
-                            let err = prev_error.clone().unwrap_or_else(|| result.summary.clone());
-                            tasks::mark_task_failed(&pool, &task_id, &err).await.ok();
-                            // Append failure to shared brief
-                            let brief_path = format!("{}/_codefactory_brief.md", task_cwd);
-                            if std::path::Path::new(&brief_path).exists() {
-                                let result_entry = format!(
-                                    "\n### \u{274c} {} \u{2014} failed\n{}\n",
-                                    task_title,
-                                    err.chars().take(300).collect::<String>()
-                                );
-                                if let Ok(mut existing) = std::fs::read_to_string(&brief_path) {
-                                    existing = existing
-                                        .replace("_(will be updated as tasks complete)_", "");
-                                    existing.push_str(&result_entry);
-                                    let _ = std::fs::write(&brief_path, &existing);
-                                }
+                            Ok(_) => {
+                                prev_error =
+                                    Some("completion arbiter returned nonterminal state".into());
+                                recovery_failure_code = "completion_evidence_incomplete";
                             }
-                            emit_task(
-                                &app,
-                                &session_id_for_task,
-                                "task_failed",
-                                &TaskEventPayload {
-                                    task_id: &task_id,
-                                    title: None,
-                                    message: None,
-                                    result: None,
-                                    error: Some(&err),
-                                    files_changed: None,
-                                    cwd: None,
-                                },
-                            );
-                        }
-                        None => {
-                            // All attempts returned Err.
-                            let err = prev_error
-                                .clone()
-                                .unwrap_or_else(|| format!("Failed after {MAX_ATTEMPTS} attempts"));
-                            tasks::mark_task_failed(&pool, &task_id, &err).await.ok();
-                            // Append failure to shared brief
-                            let brief_path = format!("{}/_codefactory_brief.md", task_cwd);
-                            if std::path::Path::new(&brief_path).exists() {
-                                let result_entry = format!(
-                                    "\n### \u{274c} {} \u{2014} failed\n{}\n",
-                                    task_title,
-                                    err.chars().take(300).collect::<String>()
-                                );
-                                if let Ok(mut existing) = std::fs::read_to_string(&brief_path) {
-                                    existing = existing
-                                        .replace("_(will be updated as tasks complete)_", "");
-                                    existing.push_str(&result_entry);
-                                    let _ = std::fs::write(&brief_path, &existing);
-                                }
+                            Err(error) => {
+                                prev_error = Some(error.to_string());
+                                recovery_failure_code = "completion_evidence_incomplete";
                             }
-                            emit_task(
-                                &app,
-                                &session_id_for_task,
-                                "task_failed",
-                                &TaskEventPayload {
-                                    task_id: &task_id,
-                                    title: None,
-                                    message: None,
-                                    result: None,
-                                    error: Some(&err),
-                                    files_changed: None,
-                                    cwd: None,
-                                },
-                            );
                         }
                     }
 
+                    if !projection_settled && !objective_completed {
+                        let error = prev_error.clone().unwrap_or_else(|| {
+                            final_outcome
+                                .as_ref()
+                                .map(|result| result.summary.clone())
+                                .unwrap_or_else(|| {
+                                    format!("attempt budget {MAX_ATTEMPTS} exhausted")
+                                })
+                        });
+                        post_summary = error.clone();
+                        match handoff_task_to_system_recovery(
+                            &pool,
+                            &task_objective,
+                            &task_id,
+                            recovery_failure_code,
+                            &error,
+                            task_mutation_permit.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(waiting) => {
+                                projection_settled = true;
+                                emit_task(
+                                    &app,
+                                    &session_id_for_task,
+                                    "task_progress",
+                                    &TaskEventPayload {
+                                        task_id: &task_id,
+                                        title: None,
+                                        message: Some("技术恢复已排队，系统将自动继续"),
+                                        result: None,
+                                        error: None,
+                                        files_changed: None,
+                                        cwd: None,
+                                    },
+                                );
+                                tracing::info!(
+                                    task_id = %task_id,
+                                    objective_id = %waiting.id,
+                                    failure_code = recovery_failure_code,
+                                    "task attempt exhausted into durable system recovery"
+                                );
+                            }
+                            Err(handoff_error) => {
+                                tracing::error!(
+                                    task_id = %task_id,
+                                    objective_id = %task_objective.id,
+                                    %handoff_error,
+                                    "task recovery handoff failed; dispatch guard will restore pending"
+                                );
+                            }
+                        }
+                    }
+                    if objective_completed && !projection_settled {
+                        post_status = "reconciling";
+                        post_summary =
+                            "Objective completed; task projection reconciliation pending"
+                                .to_string();
+                    }
+
                     // ── Post-task hook ───────────────────────────────────────
-                    let post_status = if hook_completed {
-                        "completed"
-                    } else {
-                        "failed"
-                    };
-                    let post_summary = hook_summary;
                     hook_runner
                         .fire(HookEvent::PostTask {
                             task_id: task_id.clone(),
@@ -1117,18 +1511,15 @@ impl TaskScheduler {
                         );
                     }
 
-                    dispatch_guard.settled = true;
+                    dispatch_guard.settled = projection_settled;
                     drop(dispatch_guard); // frees the running slot
                 });
             }
 
             // 4. If nothing is in flight and no new tasks were dispatched and
             //    no pending tasks remain, we're done.
-            let remaining_pending = tasks::list_pending_tasks_for_session(&self.pool, &session_id)
-                .await?
-                .len();
             let in_flight = self.running.lock().await.len();
-            if !dispatched_any && in_flight == 0 && remaining_pending == 0 {
+            if !dispatched_any && in_flight == 0 && !admissible_ready {
                 tracing::info!("scheduler: session {} drained", session_id);
                 break;
             }
@@ -1144,8 +1535,40 @@ impl TaskScheduler {
         session_id: &str,
         app_handle: &AppHandle,
     ) -> Result<(), AppError> {
-        let pending = tasks::list_pending_tasks_for_session(&self.pool, session_id).await?;
+        let pending = tasks::list_all_pending_tasks_for_session(&self.pool, session_id).await?;
         for t in pending {
+            match objective_for_task(&self.pool, &t).await {
+                Ok(objective) if !objective.status.is_terminal() => {
+                    match DecisionRouter::route(
+                        &objective,
+                        RouteSignal::Cancelled {
+                            domain: RecoveryDomain::Task,
+                            provenance: "explicit_cancel".into(),
+                        },
+                    ) {
+                        Ok(decision) => {
+                            if let Err(error) = ObjectiveStore::new(self.pool.clone())
+                                .apply_decision(objective.revision, decision)
+                                .await
+                            {
+                                tracing::warn!(
+                                    task_id = %t.id,
+                                    objective_id = %objective.id,
+                                    %error,
+                                    "failed to project explicit task cancellation to Objective"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(task_id = %t.id, %error, "failed to route task cancellation")
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(task_id = %t.id, %error, "failed to load task Objective during cancellation")
+                }
+            }
             tasks::mark_task_cancelled(&self.pool, &t.id).await.ok();
             emit_task(
                 app_handle,
@@ -1222,8 +1645,87 @@ fn emit_retry(app: &AppHandle, session_id: &str, task_id: &str, attempt: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::objective::ObjectiveKind;
     use crate::agent::subagent::SubagentResult;
     use crate::agent::verification::VerificationResult;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn task_objective_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE task_runs (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT NOT NULL,
+                description TEXT NOT NULL, status TEXT NOT NULL, cwd TEXT NOT NULL,
+                parent_task_id TEXT, sub_session_id TEXT, created_at TEXT NOT NULL,
+                started_at TEXT, completed_at TEXT, result TEXT, error TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0, verification_results TEXT,
+                task_context_json TEXT, acceptance_criteria_json TEXT,
+                spec_req_id TEXT, spec_title TEXT, owner_pid INTEGER,
+                owner_start_token TEXT, objective_id TEXT,
+                recovery_state TEXT, next_observation_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE task_attempts (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt_index INTEGER NOT NULL,
+                sub_session_id TEXT, status TEXT NOT NULL, failure_code TEXT,
+                started_at TEXT NOT NULL, completed_at TEXT, error TEXT, result TEXT,
+                verification_results TEXT, objective_id TEXT,
+                UNIQUE(task_id, attempt_index), UNIQUE(sub_session_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE task_journal (
+                task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                hash_version INTEGER NOT NULL DEFAULT 1, local_digest TEXT NOT NULL,
+                dispatch_key TEXT NOT NULL, dep_keys_json TEXT NOT NULL DEFAULT '[]',
+                resolved_model TEXT NOT NULL, resolved_tools_json TEXT NOT NULL DEFAULT '[]',
+                isolation_mode TEXT NOT NULL, state TEXT NOT NULL,
+                merge_applied INTEGER NOT NULL DEFAULT 0, materialization TEXT NOT NULL,
+                checkpoint_id TEXT, base_sha TEXT, patch_path TEXT, repo_root TEXT,
+                result_json TEXT, completed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        pool
+    }
+
+    fn task_row(id: &str, status: &str) -> tasks::TaskRun {
+        tasks::TaskRun {
+            id: id.into(),
+            session_id: "session-task-objective".into(),
+            title: "Implement durable task recovery".into(),
+            description: "change code and verify it".into(),
+            status: status.into(),
+            cwd: "/tmp/project".into(),
+            parent_task_id: None,
+            sub_session_id: None,
+            created_at: "2026-08-11T00:00:00Z".into(),
+            started_at: None,
+            completed_at: None,
+            result: None,
+            error: None,
+            attempt_count: 0,
+            verification_results: None,
+            task_context_json: None,
+            acceptance_criteria_json: Some(r#"["change is present","focused test passes"]"#.into()),
+            spec_req_id: None,
+            spec_title: None,
+        }
+    }
 
     fn completed_subagent_result() -> SubagentResult {
         SubagentResult {
@@ -1234,8 +1736,323 @@ mod tests {
         }
     }
 
+    fn test_git(cwd: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .expect("spawn git fixture command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialized_task_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let sandbox = tempfile::tempdir().expect("create scheduler git sandbox");
+        let repo = sandbox.path().join("user-checkout");
+        std::fs::create_dir_all(&repo).expect("create user checkout");
+        test_git(&repo, &["init"]);
+        test_git(&repo, &["config", "user.name", "CodeFactory Test"]);
+        test_git(
+            &repo,
+            &["config", "user.email", "codefactory-test@example.invalid"],
+        );
+        std::fs::write(repo.join("state.txt"), "user-tree-base\n")
+            .expect("write initial user tree");
+        test_git(&repo, &["add", "state.txt"]);
+        test_git(&repo, &["commit", "-m", "initial"]);
+        (sandbox, repo)
+    }
+
+    fn mutation_permit_for_claim(
+        claim: &crate::agent::objective::ClaimedRemediation,
+        owner: &str,
+    ) -> codefactory_agent_loop::tool::MutationPermit {
+        codefactory_agent_loop::tool::MutationPermit {
+            objective_id: claim.objective.id.clone(),
+            remediation_id: claim.remediation_id.clone(),
+            owner: owner.to_string(),
+            claim_epoch: claim.claim_epoch,
+            binding_id: claim.binding_id.clone(),
+            resource_generation: claim.resource_generation,
+        }
+    }
+
+    struct TakenOverTaskClaim {
+        task: tasks::TaskRun,
+        objective: ObjectiveSnapshot,
+        stale_permit: codefactory_agent_loop::tool::MutationPermit,
+        current_permit: codefactory_agent_loop::tool::MutationPermit,
+    }
+
+    /// Build the exact ownership transition behind the merge-back race: an old
+    /// scheduler has already started the task, pauses before applying its patch,
+    /// and a replacement supervisor claims a higher epoch after lease expiry.
+    async fn taken_over_task_claim(
+        pool: &SqlitePool,
+        task_id: &str,
+        cwd: &std::path::Path,
+    ) -> TakenOverTaskClaim {
+        let mut task = task_row(task_id, "running");
+        task.cwd = cwd.display().to_string();
+        tasks::insert_task(pool, &task).await.unwrap();
+        let objective = objective_for_task(pool, &task).await.unwrap();
+        let waiting = handoff_task_to_system_recovery(
+            pool,
+            &objective,
+            &task.id,
+            "synthetic_pause_before_merge_back",
+            "old runner paused before merge-back",
+            None,
+        )
+        .await
+        .unwrap();
+        let due = Utc::now().timestamp_millis() - 1;
+        sqlx::query("UPDATE objective_remediations SET next_observation_at=? WHERE objective_id=?")
+            .bind(due)
+            .bind(&waiting.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET next_observation_at=? WHERE id=?")
+            .bind(due)
+            .bind(&waiting.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let store = ObjectiveStore::new(pool.clone());
+        let old_owner = "task-supervisor-old";
+        let old_claim = store
+            .claim_due_remediations(old_owner, 1, 60_000)
+            .await
+            .unwrap()
+            .pop()
+            .expect("old task runner owns the first claim");
+        let stale_permit = mutation_permit_for_claim(&old_claim, old_owner);
+        assert!(store.claim_is_current(&stale_permit).await.unwrap());
+
+        // The task future is still alive even though its Objective lease will
+        // expire. This is the state in which an old future can wake at merge-back.
+        sqlx::query(
+            "UPDATE task_runs SET status='running', recovery_state='resuming', \
+             next_observation_at=NULL WHERE id=?",
+        )
+        .bind(&task.id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let expired = Utc::now().timestamp_millis() - 1;
+        sqlx::query("UPDATE objective_remediations SET lease_expires_at=? WHERE id=?")
+            .bind(expired)
+            .bind(&old_claim.remediation_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
+            .bind(expired)
+            .bind(&old_claim.objective.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let new_owner = "task-supervisor-replacement";
+        let new_claim = store
+            .claim_due_remediations(new_owner, 1, 60_000)
+            .await
+            .unwrap()
+            .pop()
+            .expect("replacement supervisor claims the expired task lease");
+        let current_permit = mutation_permit_for_claim(&new_claim, new_owner);
+        assert!(new_claim.claim_epoch > old_claim.claim_epoch);
+        assert!(!store.claim_is_current(&stale_permit).await.unwrap());
+        assert!(store.claim_is_current(&current_permit).await.unwrap());
+
+        TakenOverTaskClaim {
+            task,
+            objective: old_claim.objective,
+            stale_permit,
+            current_permit,
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_task_runner_cannot_merge_back_after_claim_epoch_takeover() {
+        let pool = task_objective_pool().await;
+        let (sandbox, repo) = initialized_task_repo();
+        let worktree_container = sandbox.path().join("task-worktrees");
+        let task_worktree = worktree::create(&repo, "task-stale-merge-back", &worktree_container)
+            .expect("create isolated task worktree");
+        std::fs::write(
+            task_worktree.effective_cwd.join("state.txt"),
+            "stale-runner-change\n",
+        )
+        .expect("write stale runner change");
+        let user_tree_before = std::fs::read_to_string(repo.join("state.txt"))
+            .expect("read user tree before stale merge");
+
+        // The old task future is paused immediately before the existing
+        // scheduler merge block. Its lease expires and a replacement claims a
+        // higher epoch before the old future is released.
+        let takeover = taken_over_task_claim(&pool, "task-stale-merge-back", &repo).await;
+        let store = ObjectiveStore::new(pool.clone());
+        assert!(!store
+            .claim_is_current(&takeover.stale_permit)
+            .await
+            .unwrap());
+        assert!(store
+            .claim_is_current(&takeover.current_permit)
+            .await
+            .unwrap());
+
+        let journal_inputs = journal::DispatchInputs {
+            resolved_model: "test-model".into(),
+            resolved_tools: Vec::new(),
+            isolation: "worktree".into(),
+        };
+        let merge_intent = journal::Materialization {
+            kind: "applied",
+            merge_applied: false,
+            patch_path: Some(task_worktree.patch_path.display().to_string()),
+            repo_root: Some(task_worktree.repo_root.display().to_string()),
+            base_sha: Some(task_worktree.base_sha.clone()),
+        };
+
+        let mut merge_count = 0;
+        let intent_rung_authorized =
+            authorize_task_mutation_rung(&pool, Some(&takeover.stale_permit))
+                .await
+                .unwrap();
+        if intent_rung_authorized {
+            journal::record_merging_intent(
+                &pool,
+                &takeover.task,
+                &journal_inputs,
+                &[],
+                None,
+                &merge_intent,
+                r#"{"summary":"verified"}"#,
+            )
+            .await
+            .unwrap();
+            if authorize_task_mutation_rung(&pool, Some(&takeover.stale_permit))
+                .await
+                .unwrap()
+            {
+                merge_count += 1;
+                assert!(matches!(
+                    worktree::merge_back(&task_worktree).expect("authorized merge-back path"),
+                    worktree::MergeOutcome::Applied
+                ));
+            }
+        }
+
+        assert!(
+            !intent_rung_authorized,
+            "the production mutation-rung seam must reject the superseded claim epoch"
+        );
+        assert!(
+            journal::journal_get(&pool, &takeover.task.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale permit must be fenced before the merging intent write"
+        );
+        let task_projection: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, completed_at, result FROM task_runs WHERE id=?")
+                .bind(&takeover.task.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(task_projection, ("running".into(), None, None));
+
+        let user_tree_after =
+            std::fs::read_to_string(repo.join("state.txt")).expect("read user tree after release");
+        assert_eq!(
+            (merge_count, user_tree_after),
+            (0, user_tree_before),
+            "a superseded task runner must be fenced before merge-back mutates the user tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_task_runner_cannot_commit_journal_or_task_projection_after_claim_epoch_takeover()
+    {
+        let pool = task_objective_pool().await;
+        let takeover = taken_over_task_claim(
+            &pool,
+            "task-stale-terminal-projection",
+            std::path::Path::new("/tmp/project"),
+        )
+        .await;
+        let result = SubagentResult {
+            completed: true,
+            summary: "stale terminal result".into(),
+            files_changed: vec!["src/lib.rs".into()],
+            ..Default::default()
+        };
+        let verification = vec![VerificationResult {
+            check: "focused test".into(),
+            passed: true,
+            output: "ok".into(),
+            duration_ms: 1,
+        }];
+
+        let stale_settlement = complete_verified_task_objective(
+            &pool,
+            &takeover.objective,
+            &result,
+            &verification,
+            Some(&takeover.stale_permit),
+        )
+        .await;
+        assert!(
+            stale_settlement.is_err(),
+            "a superseded permit must not authorize terminal Objective settlement"
+        );
+
+        let journal_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_journal WHERE task_id=?")
+                .bind(&takeover.task.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            journal_count, 0,
+            "the stale runner must not write a terminal journal row"
+        );
+        let task_projection: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, completed_at, result FROM task_runs WHERE id=?")
+                .bind(&takeover.task.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            task_projection,
+            ("running".into(), None, None),
+            "the stale runner must not project Task completion"
+        );
+
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .get(&takeover.objective.id)
+            .await
+            .unwrap()
+            .expect("task objective remains durable");
+        assert_eq!(objective.status, ObjectiveStatus::WaitingSystem);
+        assert!(store
+            .claim_is_current(&takeover.current_permit)
+            .await
+            .unwrap());
+    }
+
     #[test]
-    fn final_failed_verification_settles_as_failed() {
+    fn final_failed_verification_hands_off_to_system_remediation_instead_of_finishing() {
         let results = vec![VerificationResult {
             check: "npm test".into(),
             passed: false,
@@ -1251,14 +2068,14 @@ mod tests {
         );
 
         match decision {
-            VerificationAttemptDecision::Finish(outcome) => {
-                assert!(!outcome.completed);
-                assert!(outcome.summary.contains("verification"));
-                assert!(outcome.summary.contains("npm test"));
+            VerificationAttemptDecision::Retry { error } => {
+                assert!(error.contains("npm test"));
+                assert!(error.contains("expected red test"));
             }
-            VerificationAttemptDecision::Retry { .. } => {
-                panic!("final attempt must not retry forever")
-            }
+            VerificationAttemptDecision::Finish(outcome) => panic!(
+                "attempt exhaustion is still system-owned work and needs a durable remediation handoff; it must not Finish into terminal failed: {}",
+                outcome.summary
+            ),
         }
     }
 
@@ -1287,5 +2104,146 @@ mod tests {
                 panic!("non-final failed verification should retry")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_and_legacy_resume_bind_one_task_objective_idempotently() {
+        let pool = task_objective_pool().await;
+        let task = task_row("task-idempotent", "pending");
+        tasks::insert_task(&pool, &task).await.unwrap();
+
+        let first = objective_for_task(&pool, &task).await.unwrap();
+        let resumed = objective_for_task(&pool, &task).await.unwrap();
+        assert_eq!(first.id, resumed.id);
+        assert_eq!(first.task_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(
+            tasks::task_objective_id(&pool, &task.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first.id.as_str())
+        );
+        let objective_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objectives WHERE task_id=?")
+                .bind(&task.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(objective_count, 1);
+        let bindings: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT id, objective_id, resource_generation
+             FROM objective_bindings
+             WHERE domain='task' AND resource_kind='task_run' AND resource_id=?",
+        )
+        .bind(&task.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].1, first.id);
+        assert_eq!(bindings[0].2, 1);
+
+        let result = SubagentResult {
+            completed: true,
+            summary: "completed before legacy projection settled".into(),
+            files_changed: vec!["src/lib.rs".into()],
+            ..Default::default()
+        };
+        let verification = vec![VerificationResult {
+            check: "focused test".into(),
+            passed: true,
+            output: "ok".into(),
+            duration_ms: 1,
+        }];
+        let completed =
+            complete_verified_task_objective(&pool, &first, &result, &verification, None)
+                .await
+                .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+        let crash_resumed = objective_for_task(&pool, &task).await.unwrap();
+        assert_eq!(crash_resumed.id, first.id);
+        assert_eq!(crash_resumed.status, ObjectiveStatus::Completed);
+        let objective_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objectives WHERE task_id=?")
+                .bind(&task.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            objective_count, 1,
+            "projection crash recovery must not create a second Objective"
+        );
+    }
+
+    #[test]
+    fn verified_task_completion_requires_arbiter_accepted_evidence() {
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-completion",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Task,
+            "change is present and focused test passes",
+        );
+        objective.task_id = Some("task-completion".into());
+        let result = SubagentResult {
+            completed: true,
+            summary: "implemented and verified".into(),
+            files_changed: vec!["src/lib.rs".into()],
+            ..Default::default()
+        };
+        let verification = vec![VerificationResult {
+            check: "cargo test focused".into(),
+            passed: true,
+            output: "ok".into(),
+            duration_ms: 12,
+        }];
+
+        let evidence = task_completion_evidence(&objective, &result, &verification);
+        assert!(evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::ChangeSet));
+        assert!(evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::PostChangeValidation));
+        let decision = CompletionArbiter::decide(&objective, &evidence).unwrap();
+        assert_eq!(decision.status, ObjectiveStatus::Completed);
+        assert!(CompletionArbiter::decide(
+            &objective,
+            &task_completion_evidence(&objective, &result, &[]),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn exhausted_task_is_durable_system_wait_not_terminal_failure() {
+        let pool = task_objective_pool().await;
+        let task = task_row("task-recoverable", "running");
+        tasks::insert_task(&pool, &task).await.unwrap();
+        let objective = objective_for_task(&pool, &task).await.unwrap();
+
+        let waiting = handoff_task_to_system_recovery(
+            &pool,
+            &objective,
+            &task.id,
+            "verification_failed",
+            "focused test is still red",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(waiting.status, ObjectiveStatus::WaitingSystem);
+        assert!(!waiting.requires_user_action);
+        assert!(waiting.next_observation_at.is_some());
+        let projection: (String, Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT status, recovery_state, next_observation_at, completed_at \
+             FROM task_runs WHERE id=?",
+        )
+        .bind(&task.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(projection.0, "pending");
+        assert_eq!(projection.1.as_deref(), Some("waiting_system"));
+        assert!(projection.2.is_some());
+        assert_eq!(projection.3, None);
     }
 }

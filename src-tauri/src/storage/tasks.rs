@@ -144,6 +144,31 @@ pub async fn start_task_attempt(
     Ok(())
 }
 
+pub async fn start_task_objective_attempt(
+    pool: &SqlitePool,
+    id: &str,
+    task_id: &str,
+    objective_id: &str,
+    attempt_index: i32,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO task_attempts
+         (id, task_id, objective_id, attempt_index, status, started_at)
+         VALUES (?, ?, ?, ?, 'running', ?)
+         ON CONFLICT(task_id, attempt_index) DO UPDATE SET
+            objective_id=excluded.objective_id, status='running', completed_at=NULL,
+            failure_code=NULL, error=NULL",
+    )
+    .bind(id)
+    .bind(task_id)
+    .bind(objective_id)
+    .bind(attempt_index)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn attach_attempt_sub_session(
     pool: &SqlitePool,
     attempt_id: &str,
@@ -302,8 +327,9 @@ pub async fn mark_task_started(pool: &SqlitePool, id: &str) -> Result<()> {
 pub async fn mark_task_completed(pool: &SqlitePool, id: &str, result: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE task_runs SET status = 'completed', completed_at = ?, result = ?, error = NULL \
-         WHERE id = ?",
+        "UPDATE task_runs SET status = 'completed', completed_at = ?, result = ?, error = NULL, \
+         recovery_state = NULL, next_observation_at = NULL, \
+         owner_pid = NULL, owner_start_token = NULL WHERE id = ?",
     )
     .bind(&now)
     .bind(result)
@@ -311,6 +337,98 @@ pub async fn mark_task_completed(pool: &SqlitePool, id: &str, result: &str) -> R
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Project a recoverable technical exhaustion without manufacturing a terminal
+/// task failure. The Objective decision is persisted first; this compare-and-
+/// swap only accepts the matching running/pending task projection and never
+/// revives explicit cancellation or a proven completion.
+pub async fn mark_task_waiting_system(
+    pool: &SqlitePool,
+    id: &str,
+    objective_id: &str,
+    error: &str,
+    next_observation_at: i64,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE task_runs SET status='pending', completed_at=NULL, result=NULL, error=?, \
+         recovery_state='waiting_system', next_observation_at=?, \
+         owner_pid=NULL, owner_start_token=NULL \
+         WHERE id=? AND objective_id=? AND status IN ('running','pending')",
+    )
+    .bind(error)
+    .bind(next_observation_at)
+    .bind(id)
+    .bind(objective_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Make one objective-bound pending task eligible for the scheduler. Duplicate
+/// supervisor deliveries are harmless: the scheduler's pending→running CAS is
+/// still the only operation that owns execution.
+pub async fn make_task_due_for_objective(
+    pool: &SqlitePool,
+    id: &str,
+    objective_id: &str,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE task_runs SET recovery_state='resuming', next_observation_at=NULL \
+         WHERE id=? AND objective_id=? AND status='pending'",
+    )
+    .bind(id)
+    .bind(objective_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn clear_task_recovery_after_claim(
+    pool: &SqlitePool,
+    id: &str,
+    objective_id: &str,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE task_runs SET recovery_state=NULL, next_observation_at=NULL \
+         WHERE id=? AND objective_id=? AND status='running'",
+    )
+    .bind(id)
+    .bind(objective_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Panic/setup recovery may release only the running claim it observed. A
+/// concurrent explicit cancellation or completion is terminal authority and
+/// must never be overwritten back to pending.
+pub async fn reset_running_task_to_pending(
+    pool: &SqlitePool,
+    id: &str,
+    error: &str,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE task_runs SET status='pending', started_at=NULL, completed_at=NULL, \
+         result=NULL, verification_results=NULL, error=?, recovery_state=NULL, \
+         next_observation_at=NULL, owner_pid=NULL, owner_start_token=NULL \
+         WHERE id=? AND status='running'",
+    )
+    .bind(error)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn task_objective_id(pool: &SqlitePool, id: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT objective_id FROM task_runs WHERE id=?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .flatten(),
+    )
 }
 
 pub async fn mark_task_failed(pool: &SqlitePool, id: &str, error: &str) -> Result<()> {
@@ -458,14 +576,46 @@ pub async fn list_pending_tasks_for_session(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Vec<TaskRun>> {
+    let now = Utc::now().timestamp_millis();
     let rows = sqlx::query_as::<_, TaskRun>(
         "SELECT * FROM task_runs WHERE session_id = ? AND status = 'pending' \
+         AND (next_observation_at IS NULL OR next_observation_at <= ?) \
+         ORDER BY created_at ASC",
+    )
+    .bind(session_id)
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Includes future-due recovery tasks. Use for cancellation and drain
+/// accounting, never for dispatch.
+pub async fn list_all_pending_tasks_for_session(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Vec<TaskRun>> {
+    Ok(sqlx::query_as::<_, TaskRun>(
+        "SELECT * FROM task_runs WHERE session_id=? AND status='pending' \
          ORDER BY created_at ASC",
     )
     .bind(session_id)
     .fetch_all(pool)
-    .await?;
-    Ok(rows)
+    .await?)
+}
+
+pub async fn count_all_pending_tasks_for_session(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_runs WHERE session_id=? AND status='pending'",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await?,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -744,7 +894,12 @@ mod tests {
                 task_context_json TEXT,
                 acceptance_criteria_json TEXT,
                 spec_req_id TEXT,
-                spec_title TEXT
+                spec_title TEXT,
+                owner_pid INTEGER,
+                owner_start_token TEXT,
+                objective_id TEXT,
+                recovery_state TEXT,
+                next_observation_at INTEGER
             )",
         )
         .execute(&pool)
@@ -763,6 +918,7 @@ mod tests {
                 error TEXT,
                 result TEXT,
                 verification_results TEXT,
+                objective_id TEXT,
                 UNIQUE(task_id, attempt_index),
                 UNIQUE(sub_session_id)
             )",
@@ -771,6 +927,145 @@ mod tests {
         .await
         .expect("create attempt schema");
         pool
+    }
+
+    #[tokio::test]
+    async fn pending_dispatch_query_waits_until_the_next_observation_is_due() {
+        let pool = test_pool().await;
+        for id in ["ready-null", "ready-past", "deferred-future"] {
+            let mut row = task(id, "pending");
+            row.started_at = None;
+            row.completed_at = None;
+            row.result = None;
+            row.error = None;
+            insert_task(&pool, &row).await.unwrap();
+        }
+        let now = Utc::now().timestamp_millis();
+        sqlx::query("UPDATE task_runs SET next_observation_at=? WHERE id='ready-past'")
+            .bind(now - 60_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task_runs SET next_observation_at=? WHERE id='deferred-future'")
+            .bind(now + 60_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ready = list_pending_tasks_for_session(&pool, "session-1")
+            .await
+            .unwrap();
+        let ready_ids: std::collections::HashSet<_> =
+            ready.into_iter().map(|task| task.id).collect();
+        assert_eq!(
+            ready_ids,
+            std::collections::HashSet::from(["ready-null".into(), "ready-past".into()]),
+            "future system-owned recovery must remain pending without being redispatched early"
+        );
+        assert_eq!(
+            count_all_pending_tasks_for_session(&pool, "session-1")
+                .await
+                .unwrap(),
+            3,
+            "future recovery remains live work for scheduler drain accounting"
+        );
+        assert_eq!(
+            list_all_pending_tasks_for_session(&pool, "session-1")
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "explicit cancellation must still see future recovery work"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_recovery_keeps_task_pending_and_resume_never_revives_terminal_rows() {
+        let pool = test_pool().await;
+        let mut running = task("recoverable", "running");
+        running.completed_at = None;
+        insert_task(&pool, &running).await.unwrap();
+        sqlx::query(
+            "UPDATE task_runs SET objective_id='objective-1', owner_pid=42, \
+             owner_start_token='process-42' WHERE id='recoverable'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let next_observation_at = Utc::now().timestamp_millis() + 30_000;
+        assert!(mark_task_waiting_system(
+            &pool,
+            "recoverable",
+            "objective-1",
+            "verification exhausted",
+            next_observation_at,
+        )
+        .await
+        .unwrap());
+        let projection: (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, recovery_state, next_observation_at, owner_pid, completed_at \
+                 FROM task_runs WHERE id='recoverable'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(projection.0, "pending");
+        assert_eq!(projection.1.as_deref(), Some("waiting_system"));
+        assert_eq!(projection.2, Some(next_observation_at));
+        assert_eq!(projection.3, None);
+        assert_eq!(projection.4, None);
+
+        assert!(
+            make_task_due_for_objective(&pool, "recoverable", "objective-1")
+                .await
+                .unwrap()
+        );
+        let due: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT recovery_state, next_observation_at FROM task_runs WHERE id='recoverable'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(due.0.as_deref(), Some("resuming"));
+        assert_eq!(due.1, None);
+
+        sqlx::query("UPDATE task_runs SET status='cancelled' WHERE id='recoverable'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !mark_task_waiting_system(
+                &pool,
+                "recoverable",
+                "objective-1",
+                "late technical failure",
+                next_observation_at,
+            )
+            .await
+            .unwrap(),
+            "a late worker must not revive explicit cancellation"
+        );
+        assert!(
+            !reset_running_task_to_pending(&pool, "recoverable", "late panic recovery")
+                .await
+                .unwrap(),
+            "dispatch cleanup must not revive explicit cancellation"
+        );
+        assert_eq!(
+            get_task(&pool, "recoverable")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "cancelled"
+        );
     }
 
     fn task(id: &str, status: &str) -> TaskRun {
@@ -889,9 +1184,18 @@ mod tests {
 
         let attempts = list_task_attempts(&pool, "task-1").await.unwrap();
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].sub_session_id.as_deref(), Some("child-session-1"));
-        assert_eq!(attempts[0].failure_code.as_deref(), Some("verification_failed"));
-        assert_eq!(attempts[1].sub_session_id.as_deref(), Some("child-session-2"));
+        assert_eq!(
+            attempts[0].sub_session_id.as_deref(),
+            Some("child-session-1")
+        );
+        assert_eq!(
+            attempts[0].failure_code.as_deref(),
+            Some("verification_failed")
+        );
+        assert_eq!(
+            attempts[1].sub_session_id.as_deref(),
+            Some("child-session-2")
+        );
         assert_eq!(attempts[1].status, "completed");
         assert_eq!(
             get_task(&pool, "task-1")
@@ -903,6 +1207,16 @@ mod tests {
             Some("child-session-2"),
             "task row keeps only the latest convenience pointer while attempts retain history",
         );
+
+        start_task_objective_attempt(&pool, "attempt-4", "task-1", "objective-1", 4)
+            .await
+            .unwrap();
+        let objective_id: Option<String> =
+            sqlx::query_scalar("SELECT objective_id FROM task_attempts WHERE id='attempt-4'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(objective_id.as_deref(), Some("objective-1"));
     }
 
     #[test]

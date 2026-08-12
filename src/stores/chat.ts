@@ -1556,8 +1556,11 @@ export function dbMessagesToUI(
     const assistant = [...hydrated.slice(rootIndex + 1, nextRootIndex)]
       .reverse()
       .find((message) => message.role === "assistant");
-    if (!assistant) continue;
-    assistant.turnActivity = {
+    // A crash may happen before the first assistant row exists. Bind the
+    // durable objective projection to the root user row instead of silently
+    // dropping it during hydration.
+    const activityTarget = assistant ?? hydrated[rootIndex];
+    activityTarget.turnActivity = {
       rootTurnId: activity.root_turn_id,
       revision: activity.revision,
       phase: activity.phase,
@@ -1567,6 +1570,11 @@ export function dbMessagesToUI(
       waitingReason: activity.waiting_reason ?? null,
       updatedAt: activity.updated_at,
       terminalReason: activity.terminal_reason ?? null,
+      objectiveId: activity.objective_id,
+      objectiveStatus: activity.objective_status,
+      recoveryOwner: activity.recovery_owner ?? null,
+      nextObservationAt: activity.next_observation_at ?? null,
+      lastProgressAt: activity.last_progress_at ?? null,
     };
   }
 

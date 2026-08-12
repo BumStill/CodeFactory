@@ -14,7 +14,7 @@
 #   enforcer    artifact that makes/keeps the rule true (must exist)
 #   level       warn | error   (only for enforcement: check)
 
-version: "2026-08-03"
+version: "2026-08-11"
 
 rules:
   - id: release-cadence
@@ -53,6 +53,13 @@ rules:
     doc: AGENTS.md
     enforcement: review
     enforcer: AGENTS.md
+
+  - id: objective-non-interruption-contract
+    statement: "System-owned technical states remain durably owned and must not require a manual continue, retry, resend, or chat handoff; only typed core input, irreversible business decisions, explicit deny, or cancel may interrupt the user path."
+    doc: docs/specs/feature-specs/objective-recovery-control-plane.md
+    enforcement: check
+    enforcer: tools/governance/check_governance_rules.py
+    level: error
 
   - id: evidence-pack-retention
     statement: "One-off timestamped evidence-pack snapshots don't accumulate in docs/evidence-packs/; only *-locked-* baselines are long-lived there."

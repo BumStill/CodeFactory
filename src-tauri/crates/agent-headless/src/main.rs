@@ -179,6 +179,7 @@ where
         fact_check_instruction: config.instruction.clone(),
         audit_session_id: String::new(),
         root_turn_id: None,
+        mutation_permit: None,
         knowledge_library_ids: None,
         cancel: None,
     };

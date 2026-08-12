@@ -106,6 +106,63 @@ describe("MessageList structured progress and result", () => {
     );
   });
 
+  it("keeps a non-terminal system-owned objective visible after the stream closes", () => {
+    const nextObservationAt = Date.now() + 30_000;
+    const activity = {
+      rootTurnId: "user",
+      revision: 5,
+      phase: "recovering",
+      status: "active",
+      kind: "remediation",
+      label: "已切换到备用模型 route",
+      waitingReason: "等待退避窗口结束",
+      updatedAt: Date.now(),
+      terminalReason: null,
+      objectiveId: "objective-1",
+      objectiveStatus: "waiting_system",
+      recoveryOwner: "系统恢复监督器",
+      nextObservationAt,
+      lastProgressAt: Date.now() - 5_000,
+    } as UIMessage["turnActivity"] & {
+      objectiveId: string;
+      objectiveStatus: "waiting_system";
+      recoveryOwner: string;
+      nextObservationAt: number;
+      lastProgressAt: number;
+    };
+
+    render(
+      <MessageList
+        messages={[
+          { id: "user", role: "user", content: "完成并发布", createdAt: 1 },
+          {
+            id: "assistant",
+            role: "assistant",
+            content: "模型连接暂时中断。",
+            createdAt: Date.now() - 10_000,
+            turnActivity: activity,
+          },
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+
+    const progress = screen.getByTestId("turn-activity-progress");
+    expect(progress).toHaveTextContent(/系统仍在处理|恢复中/);
+    expect(progress).toHaveTextContent("系统恢复监督器");
+    expect(progress).toHaveTextContent("已切换到备用模型 route");
+    expect(progress).toHaveTextContent(/下次观察/);
+    for (const forbiddenAction of [
+      /继续执行/,
+      /重试/,
+      /重新发送/,
+      /回到对话/,
+    ]) {
+      expect(screen.queryByRole("button", { name: forbiddenAction })).not.toBeInTheDocument();
+    }
+  });
+
   it("keeps a long-tool waiting reason visible even when a structured plan exists", () => {
     const running = messages(false);
     running[1] = {

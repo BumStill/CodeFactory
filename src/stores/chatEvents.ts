@@ -22,6 +22,11 @@ export interface TurnActivityState {
   waitingReason: string | null;
   updatedAt: number;
   terminalReason: string | null;
+  objectiveId?: string;
+  objectiveStatus?: "active" | "waiting_system" | "waiting_core_input" | "waiting_authorization" | "waiting_business_decision" | "completed" | "cancelled" | "legacy_orphan";
+  recoveryOwner?: string | null;
+  nextObservationAt?: number | null;
+  lastProgressAt?: number | null;
 }
 
 export interface PendingPermission {
@@ -99,7 +104,7 @@ export interface TransportRetryState {
 
 const MODEL_ROUTE_EXHAUSTED_PREFIX = "所有可用模型端点均不可用：";
 export const MODEL_ROUTE_EXHAUSTED_GUIDANCE =
-  "所有已配置且有凭据的模型端点都暂时不可用。请检查模型设置中的凭据、余额或端点状态，选择其他可用模型后重试；如果服务正在限流，也可以稍后重试。";
+  "所有已配置且有凭据的模型端点都暂时不可用。目标与失败证据已保留；系统将按退避策略重新观测可用路由。";
 
 export function isModelRouteExhaustedError(message: string): boolean {
   return message.startsWith(MODEL_ROUTE_EXHAUSTED_PREFIX);
@@ -110,10 +115,10 @@ function credentialFailureGuidance(message: string): string | null {
   const route = details.split("（", 1)[0]?.trim();
   if (!route) return null;
   if (details.includes("AUTH_MISSING")) {
-    return `${route} 当前不可用：尚未配置凭据。请打开模型设置配置该端点的 API Key 后重试。`;
+    return `${route} 当前不可用：尚未配置凭据。请打开模型设置配置该端点的 API Key；保存后系统会从安全检查点恢复。`;
   }
   if (details.includes("CREDENTIAL_ACCESS_REQUIRED")) {
-    return `${route} 当前不可用：无法读取已配置凭据。请打开模型设置重新保存该端点的 API Key 后重试。`;
+    return `${route} 当前不可用：无法读取已配置凭据，需要一次密钥访问授权。请在模型设置完成授权或重新保存该端点的 API Key；授权完成后系统会从安全检查点恢复。`;
   }
   return null;
 }
@@ -222,6 +227,11 @@ export function reduceChatStreamEvent(
               waitingReason: event.waiting_reason ?? null,
               updatedAt: event.updated_at,
               terminalReason: event.terminal_reason ?? null,
+              objectiveId: event.objective_id,
+              objectiveStatus: event.objective_status,
+              recoveryOwner: event.recovery_owner ?? null,
+              nextObservationAt: event.next_observation_at ?? null,
+              lastProgressAt: event.last_progress_at ?? null,
             },
           };
         }),

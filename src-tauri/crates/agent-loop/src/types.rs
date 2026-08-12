@@ -265,6 +265,8 @@ pub enum StreamEvent {
         created_at: i64,
     },
     TurnActivityUpdated {
+        // Objective fields are optional so headless/legacy producers keep the
+        // transport event contract while the desktop projects durable state.
         root_turn_id: String,
         revision: i64,
         phase: String,
@@ -274,6 +276,16 @@ pub enum StreamEvent {
         waiting_reason: Option<String>,
         updated_at: i64,
         terminal_reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        objective_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        objective_status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_owner: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_observation_at: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_progress_at: Option<i64>,
     },
     ToolCallStart {
         id: String,

@@ -454,7 +454,7 @@ impl ActiveRouteState {
             .collect::<Vec<_>>()
             .join("；");
         format!(
-            "所有可用模型端点均不可用：{attempts}。请检查服务状态或额度，或在模型选择器选择其他端点后重试。"
+            "所有可用模型端点均不可用：{attempts}。目标与失败证据已保留；系统将按退避策略重新观测可用路由。"
         )
     }
 }
@@ -618,6 +618,32 @@ mod tests {
         assert_eq!(state.current().endpoint_name, "c");
         assert!(state.advance_after_failure("HTTP 503").is_none());
         assert_eq!(state.current().endpoint_name, "c");
+    }
+
+    #[test]
+    fn exhausted_routes_leave_recovery_owned_by_the_system() {
+        let health = EndpointHealthRegistry::new(Duration::from_secs(120));
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+        let state = ActiveRouteState::from_plan_with_health(plan, health);
+
+        state
+            .advance_after_failure("HTTP 503 Service Unavailable")
+            .expect("fallback exists");
+        let message = state.exhausted_error("HTTP 429 Too Many Requests");
+
+        assert!(message.contains("目标与失败证据已保留"), "got: {message}");
+        assert!(
+            message.contains("系统将按退避策略重新观测可用路由"),
+            "got: {message}"
+        );
+        for forbidden_user_handoff in ["后重试", "点击重试", "回复继续", "回到对话"]
+        {
+            assert!(
+                !message.contains(forbidden_user_handoff),
+                "route exhaustion must not hand technical recovery to the user: {message}"
+            );
+        }
     }
 
     #[test]
