@@ -64,7 +64,7 @@ export function OnboardingWizard({
           aria-label="关闭引导"
           className="p-0.5 rounded text-gray-500 hover:text-gray-300"
         >
-          <X size={12} />
+          <X size={14} />
         </button>
       </div>
 
@@ -72,7 +72,7 @@ export function OnboardingWizard({
         <div className="flex items-start gap-1.5">
           {modelReady ? (
             <>
-              <Check size={13} className="mt-0.5 text-emerald-500 shrink-0" />
+              <Check size={14} className="mt-0.5 text-emerald-500 shrink-0" />
               <span className="text-gray-300">模型已接入,可以直接对话。</span>
             </>
           ) : (
@@ -88,14 +88,14 @@ export function OnboardingWizard({
             <span className="text-gray-500">② 正在检测交付通道…</span>
           ) : channel.gh_cli ? (
             <>
-              <Check size={13} className="mt-0.5 text-emerald-500 shrink-0" />
+              <Check size={14} className="mt-0.5 text-emerald-500 shrink-0" />
               <span className="text-gray-300">
                 GitHub CLI 已就绪——GitHub/GHE 的 PR/CI/合并/发布可零配置使用；其他 Git 平台可用远程令牌或 delivery_provider hook。
               </span>
             </>
           ) : channel.rest_token ? (
             <>
-              <Check size={13} className="mt-0.5 text-emerald-500 shrink-0" />
+              <Check size={14} className="mt-0.5 text-emerald-500 shrink-0" />
               <span className="text-gray-300">已配置远端令牌,交付链可用。</span>
             </>
           ) : (
@@ -107,7 +107,7 @@ export function OnboardingWizard({
                 className="mx-1 inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-caption text-gray-200"
               >
                 gh auth login
-                {copied ? <Check size={10} className="text-emerald-500" /> : <Copy size={10} />}
+                {copied ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
               </button>
               登录一次即可；GitLab/Bitbucket/Azure/Gitea/Forgejo/Gerrit/Zeabur 等请在设置 → 远程仓库配置令牌或 delivery_provider hook。
             </span>

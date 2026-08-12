@@ -120,12 +120,12 @@ export function DraftScopeBar({
         className="flex min-h-8 max-w-[240px] items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-caption text-gray-300 transition-colors hover:border-accent/40 hover:bg-surface-3 hover:text-gray-100"
       >
         {cwd ? (
-          <Folder size={11} className="shrink-0 text-accent" />
+          <Folder size={14} className="shrink-0 text-accent" />
         ) : (
-          <MessageSquare size={11} className="shrink-0 text-gray-500" />
+          <MessageSquare size={14} className="shrink-0 text-gray-500" />
         )}
         <span className="truncate">{label}</span>
-        <ChevronDown size={11} className="shrink-0 text-gray-600" />
+        <ChevronDown size={14} className="shrink-0 text-gray-600" />
       </button>
 
       {modelPicker && (
@@ -148,7 +148,7 @@ export function DraftScopeBar({
             : "border-border bg-surface-2 text-gray-500 hover:bg-surface-3 hover:text-gray-300"
         }`}
       >
-        <EyeOff size={11} />
+        <EyeOff size={14} />
         匿名
       </button>
 
@@ -177,9 +177,9 @@ export function DraftScopeBar({
             }}
             className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
           >
-            <MessageSquare size={11} className="shrink-0 text-gray-500" />
+            <MessageSquare size={14} className="shrink-0 text-gray-500" />
             <span className="flex-1 truncate">独立任务（不使用项目）</span>
-            {cwd === null && <Check size={11} className="shrink-0 text-accent" />}
+            {cwd === null && <Check size={14} className="shrink-0 text-accent" />}
           </button>
           {options.length > 0 && (
             <>
@@ -197,9 +197,9 @@ export function DraftScopeBar({
                   title={project.cwd}
                   className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
                 >
-                  <Folder size={11} className="shrink-0 text-gray-500" />
+                  <Folder size={14} className="shrink-0 text-gray-500" />
                   <span className="flex-1 truncate">{project.name}</span>
-                  {cwd === project.cwd && <Check size={11} className="shrink-0 text-accent" />}
+                  {cwd === project.cwd && <Check size={14} className="shrink-0 text-accent" />}
                 </button>
               ))}
             </>
@@ -209,7 +209,7 @@ export function DraftScopeBar({
             onClick={() => void browse()}
             className="mt-1 flex w-full items-center gap-2 border-t border-border px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
           >
-            <FolderOpen size={11} className="shrink-0 text-gray-500" />
+            <FolderOpen size={14} className="shrink-0 text-gray-500" />
             <span className="flex-1">浏览目录…</span>
           </button>
         </div>,

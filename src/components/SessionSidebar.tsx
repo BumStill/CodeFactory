@@ -138,7 +138,7 @@ export function SessionSidebar({
           </button>
         </div>
         <label className="flex h-8 items-center gap-2 rounded-lg border border-border/70 bg-surface-2 px-2 text-gray-500 transition-colors focus-within:border-accent/50 focus-within:text-gray-400">
-          <Search size={13} aria-hidden="true" className="shrink-0" />
+          <Search size={14} aria-hidden="true" className="shrink-0" />
           <span className="sr-only">搜索会话</span>
           <input
             type="search"
@@ -146,7 +146,9 @@ export function SessionSidebar({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="搜索会话"
-            className="min-w-0 flex-1 bg-transparent text-note text-gray-300 placeholder:text-gray-600 outline-none"
+            // Fills the 32px label rather than sitting as a 20px box inside it,
+            // so the input's own target matches the control the user sees.
+            className="h-full min-w-0 flex-1 bg-transparent text-note text-gray-300 placeholder:text-gray-600 outline-none"
           />
         </label>
       </div>
@@ -158,7 +160,7 @@ export function SessionSidebar({
             data-draft-row
             className="relative mb-1 flex min-h-10 w-full items-center gap-2 rounded-lg bg-surface-3 px-2 py-1.5 text-left before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded before:bg-accent"
           >
-            <MessageSquare size={12} className="shrink-0 text-accent" />
+            <MessageSquare size={14} className="shrink-0 text-accent" />
             <span className="min-w-0 flex-1 truncate text-note font-medium text-gray-100">
               新会话
             </span>
@@ -249,12 +251,12 @@ function ProjectRow({
           aria-expanded={expanded}
           title={cwd}
           onClick={onToggle}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 self-stretch rounded-md text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 self-stretch rounded-lg text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
         >
           {expanded ? (
-            <FolderOpen size={11} className="shrink-0 text-gray-400" />
+            <FolderOpen size={14} className="shrink-0 text-gray-400" />
           ) : (
-            <Folder size={11} className="shrink-0 text-gray-500" />
+            <Folder size={14} className="shrink-0 text-gray-500" />
           )}
           <span className="min-w-0 flex-1 truncate text-note font-medium text-gray-200">
             {name}
@@ -266,9 +268,9 @@ function ProjectRow({
           aria-label={`在 ${name} 里新建会话`}
           title="在此项目里新建会话"
           onClick={onNewConversation}
-          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-gray-600 opacity-0 transition-opacity hover:bg-surface-3 hover:text-gray-200 group-hover:opacity-100 group-focus-within:opacity-100"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-gray-600 opacity-0 transition-opacity hover:bg-surface-3 hover:text-gray-200 group-hover:opacity-100 group-focus-within:opacity-100"
         >
-          <Plus size={12} />
+          <Plus size={14} />
         </button>
       </div>
       {expanded && <ul className="mt-0.5 space-y-0.5 pl-3">{children}</ul>}
@@ -329,10 +331,10 @@ function SessionRow({
   };
   const title = session.title || "未命名会话";
   const statusIndicator = waitingPermission ? (
-    <ShieldQuestion size={12} className="shrink-0 text-status-warning" aria-label="等待批准" />
+    <ShieldQuestion size={14} className="shrink-0 text-status-warning" aria-label="等待批准" />
   ) : streaming ? (
     <Loader2
-      size={11}
+      size={14}
       className="shrink-0 animate-spin text-status-progress motion-reduce:animate-none"
       aria-label="运行中"
     />
@@ -361,7 +363,7 @@ function SessionRow({
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-1.5">
               <MessageSquare
-                size={11}
+                size={14}
                 className={`shrink-0 ${active ? "text-accent" : "text-gray-600"}`}
               />
               <input
@@ -374,7 +376,7 @@ function SessionRow({
                   if (e.key === "Escape") setEditing(false);
                 }}
                 onBlur={commitRename}
-                className="min-w-0 flex-1 rounded-md border border-accent/50 bg-surface-3 px-1.5 py-0.5 text-note text-gray-100 outline-none"
+                className="min-w-0 flex-1 rounded-lg border border-accent/50 bg-surface-3 px-1.5 py-0.5 text-note text-gray-100 outline-none"
               />
               {statusIndicator}
             </div>
@@ -387,11 +389,11 @@ function SessionRow({
             aria-current={active ? "page" : undefined}
             title={`${title} · 双击标题可重命名`}
             onClick={onClick}
-            className="min-w-0 flex-1 cursor-pointer rounded-md text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
+            className="min-w-0 flex-1 cursor-pointer rounded-lg text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
           >
             <div className="flex items-center gap-1.5">
               <MessageSquare
-                size={11}
+                size={14}
                 className={`shrink-0 ${active ? "text-accent" : "text-gray-600"}`}
               />
               <span
@@ -418,22 +420,22 @@ function SessionRow({
               title="更多操作"
               aria-label="更多操作"
               onClick={() => setMenuOpen((v) => !v)}
-              className={`flex items-center rounded p-0.5 transition-opacity hover:bg-surface-3 hover:text-gray-200 ${
+              className={`flex h-6 w-6 items-center justify-center rounded transition-opacity hover:bg-surface-3 hover:text-gray-200 ${
                 menuOpen
                   ? "text-gray-200 opacity-100"
                   : "text-gray-600 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
               }`}
             >
-              <MoreHorizontal size={13} />
+              <MoreHorizontal size={14} />
             </button>
             {menuOpen && (
-              <div className="absolute right-0 top-full z-50 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-surface-2 py-0.5 shadow-xl">
+              <div className="absolute right-0 top-full z-50 mt-1 min-w-[100px] overflow-hidden rounded-lg border border-border bg-surface-2 py-0.5 shadow-xl">
                 <button
                   type="button"
                   onClick={startRename}
                   className="flex min-h-8 w-full items-center gap-1.5 px-2.5 py-1.5 text-note text-gray-300 hover:bg-surface-3"
                 >
-                  <Pencil size={11} />
+                  <Pencil size={14} />
                   重命名
                 </button>
                 <button
@@ -444,7 +446,7 @@ function SessionRow({
                   }}
                   className="flex min-h-8 w-full items-center gap-1.5 px-2.5 py-1.5 text-note text-status-danger hover:bg-status-danger-soft"
                 >
-                  <Trash2 size={11} />
+                  <Trash2 size={14} />
                   删除
                 </button>
               </div>
@@ -458,7 +460,7 @@ function SessionRow({
               aria-label="确认删除"
               title="确认删除"
               onClick={onDelete}
-              className="inline-flex min-h-7 items-center rounded-md bg-status-danger-soft px-1.5 text-caption text-status-danger hover:brightness-95"
+              className="inline-flex min-h-7 items-center rounded-lg bg-status-danger-soft px-1.5 text-caption text-status-danger hover:brightness-95"
             >
               删除
             </button>
@@ -467,7 +469,7 @@ function SessionRow({
               aria-label="取消删除"
               title="取消"
               onClick={() => setConfirming(false)}
-              className="inline-flex min-h-7 items-center rounded-md px-1.5 text-caption text-gray-500 hover:bg-surface-3"
+              className="inline-flex min-h-7 items-center rounded-lg px-1.5 text-caption text-gray-500 hover:bg-surface-3"
             >
               取消
             </button>

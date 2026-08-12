@@ -602,7 +602,7 @@ export function EvolutionWorkbenchPage({ onBack, initialCwd = null }: EvolutionW
             disabled={!cwdIsValid || mining || analysisRunning}
             className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
           >
-            {mining ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            {mining ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
             {mining || analysisRunning ? "分析中" : "运行分析"}
           </button>
         </div>
@@ -802,7 +802,7 @@ function StageCard({
       disabled ? "border-border bg-surface-1 opacity-55" : active ? "border-accent/40 bg-accent/5" : "border-border bg-surface-1"
     }`}>
       <div className="mb-1 flex items-center gap-1.5">
-        <Icon size={12} className={active ? "text-accent" : "text-gray-600"} />
+        <Icon size={14} className={active ? "text-accent" : "text-gray-600"} />
         <span className="text-caption font-medium text-gray-300">{title}</span>
       </div>
       <p className="text-caption text-gray-500">{detail}</p>
@@ -964,7 +964,7 @@ function ReviewPanel({
             >
               <div className="mb-1 flex items-center justify-between gap-2">
                 <span className="text-caption text-accent">{targetLabel(event)}</span>
-                <ChevronRight size={12} className="shrink-0 text-gray-600" />
+                <ChevronRight size={14} className="shrink-0 text-gray-600" />
               </div>
               <p className="break-words text-label font-medium leading-relaxed text-gray-200">{event.observation}</p>
               <p className="mt-1 text-caption text-gray-600">{evidenceSummary(event)}</p>
@@ -976,7 +976,7 @@ function ReviewPanel({
       <article className={`${mobileDetail ? "block" : "hidden lg:block"} min-w-0 rounded-lg border border-border bg-surface-1`}>
         <div className="border-b border-border p-4">
           <button ref={backButtonRef} onClick={onCloseMobileDetail} className="mb-3 flex items-center gap-1 text-caption text-gray-500 hover:text-gray-300 lg:hidden">
-            <ArrowLeft size={11} /> 返回候选队列
+            <ArrowLeft size={14} /> 返回候选队列
           </button>
           <div className="mb-2 flex flex-wrap items-center gap-2 text-caption">
             <span className="rounded bg-accent/10 px-2 py-0.5 text-accent">待人工批准</span>
@@ -1073,7 +1073,7 @@ function ReviewPanel({
                   disabled={busy || (confirmation === "accept" && (currentValueLoading || currentValueError != null))}
                   className={`flex items-center gap-1.5 rounded px-3 py-1.5 text-label text-white disabled:opacity-50 ${confirmation === "accept" ? "bg-accent" : "bg-red-700"}`}
                 >
-                  {busy ? <Loader2 size={12} className="animate-spin" /> : confirmation === "accept" ? <Check size={12} /> : <X size={12} />}
+                  {busy ? <Loader2 size={14} className="animate-spin" /> : confirmation === "accept" ? <Check size={14} /> : <X size={14} />}
                   {confirmation === "accept" ? "确认批准并运行 Evals" : "确认拒绝"}
                 </button>
                 <button onClick={onCancelConfirm} disabled={busy} className="rounded border border-border px-3 py-1.5 text-label text-gray-400 hover:bg-surface-3">取消</button>
@@ -1082,10 +1082,10 @@ function ReviewPanel({
           ) : (
             <div className="fixed inset-x-3 bottom-3 z-20 flex flex-wrap gap-2 rounded-lg border border-border bg-surface-1 p-3 shadow-2xl lg:static lg:inset-auto lg:z-auto lg:rounded-none lg:border-x-0 lg:border-b-0 lg:bg-transparent lg:p-0 lg:pt-4 lg:shadow-none">
               <button ref={acceptTriggerRef} onClick={onAskAccept} disabled={busy || currentValueLoading || currentValueError != null} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label text-white hover:bg-accent-hover disabled:cursor-wait disabled:opacity-50">
-                <Check size={12} /> 批准并运行 Evals
+                <Check size={14} /> 批准并运行 Evals
               </button>
               <button ref={rejectTriggerRef} onClick={onAskReject} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-label text-gray-400 hover:bg-surface-3 disabled:opacity-50">
-                <X size={12} /> 拒绝
+                <X size={14} /> 拒绝
               </button>
             </div>
           )}
@@ -1153,7 +1153,7 @@ function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, 
                 <ul className="mt-3 grid grid-cols-1 gap-1 sm:grid-cols-2">
                   {cases.map((testCase) => (
                     <li key={testCase.id} className="flex min-w-0 items-center gap-1.5 text-caption text-gray-400">
-                      {testCase.status === "passed" ? <CheckCircle2 size={11} className="shrink-0 text-green-500" /> : <XCircle size={11} className="shrink-0 text-red-500" />}
+                      {testCase.status === "passed" ? <CheckCircle2 size={14} className="shrink-0 text-green-500" /> : <XCircle size={14} className="shrink-0 text-red-500" />}
                       <span className="break-words">{testCase.title}</span>
                     </li>
                   ))}
@@ -1186,17 +1186,17 @@ function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, 
             <div className="sticky bottom-3 z-10 mt-3 flex flex-wrap gap-2 rounded-lg border border-border bg-surface-1/95 p-2 shadow-lg backdrop-blur lg:static lg:border-0 lg:bg-transparent lg:p-0 lg:shadow-none">
               {jobIdsByCandidate[candidate.candidate_id] && (
                 <button onClick={() => onOpenJob(jobIdsByCandidate[candidate.candidate_id])} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-3">
-                  <FileCheck2 size={12} /> 查看端到端作业日志
+                  <FileCheck2 size={14} /> 查看端到端作业日志
                 </button>
               )}
               {(candidate.state === "eval_failed" || candidate.state === "eval_error" || candidate.state === "eval_stale") && (
                 <button onClick={() => void onRetry(candidate)} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-3 disabled:opacity-50">
-                  {busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} 重跑 exact revision
+                  {busy ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />} 重跑 exact revision
                 </button>
               )}
               {candidate.state === "pending_activation" && (
                 <button onClick={() => void onActivate(candidate)} disabled={busy} className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label text-white hover:bg-accent-hover disabled:opacity-50">
-                  {busy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} 激活此 revision
+                  {busy ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />} 激活此 revision
                 </button>
               )}
               {candidate.state === "active" && candidate.activation_id && (
@@ -1208,7 +1208,7 @@ function EvaluationActivationPanel({ candidates, casesByRun, jobIdsByCandidate, 
                   </div>
                 ) : (
                   <button onClick={() => setConfirming(candidate.candidate_id)} disabled={busy} className="flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-label text-gray-300 hover:bg-surface-3 disabled:opacity-50">
-                    <RotateCcw size={12} /> 回滚
+                    <RotateCcw size={14} /> 回滚
                   </button>
                 )
               )}
@@ -1261,7 +1261,7 @@ function JobsPanel({ jobs, selectedJob, selectedJobId, onSelectJob, events, load
           <div className="flex items-center gap-2">
             <span className="rounded bg-accent/10 px-2 py-0.5 text-caption text-accent">{statusLabel(job.status)}</span>
             <button onClick={onRefresh} aria-label="刷新作业日志" className="rounded p-1 text-gray-600 hover:bg-surface-3 hover:text-gray-300">
-              <RefreshCw size={11} className={loading ? "animate-spin" : ""} />
+              <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
             </button>
           </div>
         </div>
@@ -1457,7 +1457,7 @@ function EmptyState({ title, detail, loading = false, action }: {
 }) {
   return (
     <div className="rounded-lg border border-dashed border-border bg-surface-1 px-6 py-12 text-center">
-      {loading ? <Loader2 size={22} className="mx-auto mb-3 animate-spin text-accent" /> : <BrainCircuit size={22} className="mx-auto mb-3 text-gray-600" />}
+      {loading ? <Loader2 size={20} className="mx-auto mb-3 animate-spin text-accent" /> : <BrainCircuit size={20} className="mx-auto mb-3 text-gray-600" />}
       <p className="text-body font-medium text-gray-300">{title}</p>
       <p className="mx-auto mt-1 max-w-lg text-label leading-relaxed text-gray-500">{detail}</p>
       {action}

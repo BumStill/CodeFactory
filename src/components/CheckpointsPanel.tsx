@@ -121,7 +121,7 @@ export function CheckpointsPanel({ sessionId, embedded = false, narrow = embedde
           ? `inline-flex items-center gap-1 rounded border border-border bg-surface-2 px-2 text-caption text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 ${narrow ? "h-11" : "h-9"}`
           : "inline-flex h-9 items-center gap-1 rounded border border-border bg-surface-2 px-2 text-caption text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200"}
       >
-        <History size={11} />
+        <History size={14} />
         <span>恢复</span>
         <span className="tabular-nums text-gray-600">{changed.length}</span>
       </button>
@@ -142,7 +142,7 @@ export function CheckpointsPanel({ sessionId, embedded = false, narrow = embedde
             onKeyDown={(event) => trapDialogKeyboard(event, () => setOpen(false))}
           >
             <header className="flex items-start gap-3 border-b border-border px-4 py-3">
-              <GitBranch size={15} className="mt-0.5 text-accent" />
+              <GitBranch size={16} className="mt-0.5 text-accent" />
               <div className="min-w-0 flex-1">
                 <h2 className="text-body font-semibold text-gray-100">检查点</h2>
                 <p className="mt-0.5 text-caption text-gray-600">
@@ -291,7 +291,7 @@ function CheckpointRow({
       </span>
       {checkpoint.reverted ? (
         <span className="inline-flex shrink-0 items-center gap-0.5 text-caption text-status-success">
-          <Check size={10} /> 已恢复
+          <Check size={14} /> 已恢复
         </span>
       ) : (
         <button
@@ -299,7 +299,7 @@ function CheckpointRow({
           aria-label={`恢复检查点 ${checkpoint.label}`}
           className={`inline-flex shrink-0 items-center gap-0.5 rounded px-1.5 text-caption text-gray-500 transition-colors hover:bg-status-warning-soft hover:text-status-warning ${narrow ? "h-11" : "h-9"}`}
         >
-          <RotateCcw size={10} /> 恢复
+          <RotateCcw size={14} /> 恢复
         </button>
       )}
     </li>
@@ -391,7 +391,7 @@ function RevertConfirmModal({
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
           {error ? (
             <div className="flex items-start gap-2 rounded border border-status-danger/40 bg-status-danger-soft p-2 text-label text-status-danger">
-              <AlertCircle size={12} className="mt-0.5 shrink-0" />
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
               <span className="flex-1 break-words">{error}</span>
             </div>
           ) : fileChanges === null ? (
@@ -426,7 +426,7 @@ function RevertConfirmModal({
             aria-label="确认恢复"
             className={`${narrow ? "h-11" : "h-9"} inline-flex items-center gap-1.5 rounded border border-status-warning/40 bg-status-warning-soft px-3 text-label text-status-warning transition-colors hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-40`}
           >
-            <RotateCcw size={11} />
+            <RotateCcw size={14} />
             {busy ? "正在恢复…" : "恢复"}
           </button>
         </footer>
@@ -437,10 +437,10 @@ function RevertConfirmModal({
 
 function StatusIcon({ status }: { status: CheckpointFileChange["status"] }) {
   switch (status) {
-    case "added": return <FilePlus size={11} className="shrink-0 text-status-info" />;
-    case "deleted": return <FileMinus size={11} className="shrink-0 text-gray-500" />;
-    case "modified": return <FileEdit size={11} className="shrink-0 text-accent" />;
-    default: return <FileText size={11} className="shrink-0 text-gray-500" />;
+    case "added": return <FilePlus size={14} className="shrink-0 text-status-info" />;
+    case "deleted": return <FileMinus size={14} className="shrink-0 text-gray-500" />;
+    case "modified": return <FileEdit size={14} className="shrink-0 text-accent" />;
+    default: return <FileText size={14} className="shrink-0 text-gray-500" />;
   }
 }
 

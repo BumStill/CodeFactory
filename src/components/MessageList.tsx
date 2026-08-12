@@ -100,7 +100,7 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   };
 
   return (
-    <div className="my-2 rounded-md overflow-hidden border border-border bg-[#0d1117]">
+    <div className="my-2 rounded-lg overflow-hidden border border-border bg-[#0d1117]">
       <div className="flex items-center justify-between px-3 py-1 bg-surface-3 border-b border-border">
         <span className="text-caption uppercase tracking-wide text-gray-500 font-sans">
           {lang === "text" ? "code" : lang}
@@ -111,7 +111,7 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
           title="复制代码"
           aria-label={copied ? "已复制代码" : "复制代码"}
         >
-          {copied ? <><Check size={11} className="text-status-success" /> 已复制</> : <><Copy size={11} /> 复制</>}
+          {copied ? <><Check size={14} className="text-status-success" /> 已复制</> : <><Copy size={14} /> 复制</>}
         </button>
       </div>
       {html ? (
@@ -439,7 +439,7 @@ export function MessageList({
               disabled={streaming || loadingOlderHistory}
               className="flex items-center gap-1 rounded-full border border-border bg-surface-2 px-2.5 py-1 text-caption text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              <ChevronUp size={12} />
+              <ChevronUp size={14} />
               {loadingOlderHistory ? "正在加载更早记录" : "加载更早记录"}
             </button>
           </div>
@@ -447,7 +447,7 @@ export function MessageList({
         {historyTruncated && (
           <div
             role="status"
-            className="mx-auto max-w-xl rounded-md border border-status-warning/25 bg-status-warning-soft/55 px-3 py-2 text-center text-caption text-status-warning"
+            className="mx-auto max-w-xl rounded-lg border border-status-warning/25 bg-status-warning-soft/55 px-3 py-2 text-center text-caption text-status-warning"
           >
             为保持超长会话可用，部分超大历史内容仅显示预览或分段加载；完整原始记录仍保存在本机。
           </div>
@@ -504,7 +504,7 @@ export function MessageList({
               : "回到最新消息并恢复自动跟随"
           }
         >
-          <ChevronDown size={12} />
+          <ChevronDown size={14} />
           {hasNewContent ? "有新内容" : "回到最新"}
         </button>
       )}
@@ -520,11 +520,11 @@ function SuccessfulToolGroup({ tools }: { tools: NonNullable<UIMessage["toolCall
         type="button"
         aria-label={`${open ? "收起" : "查看"} ${tools.length} 个已完成操作`}
         onClick={() => setOpen((value) => !value)}
-        className="inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-md px-1.5 text-left text-note text-gray-600 transition-colors hover:bg-surface-3/55 hover:text-gray-400"
+        className="inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-lg px-1.5 text-left text-note text-gray-600 transition-colors hover:bg-surface-3/55 hover:text-gray-400"
       >
-        <Check size={12} className="text-status-success/70" />
+        <Check size={14} className="text-status-success/70" />
         <span>已完成 {tools.length} 个操作</span>
-        <ChevronDown size={12} className={`ml-auto transition-transform motion-reduce:transition-none ${open ? "rotate-180" : ""}`} />
+        <ChevronDown size={14} className={`ml-auto transition-transform motion-reduce:transition-none ${open ? "rotate-180" : ""}`} />
       </button>
       {open && <div className="ml-2 border-l border-border/40 pl-2">{tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />)}</div>}
     </div>
@@ -559,7 +559,7 @@ function ActiveTurnProgress({
         }`}
       >
         {waitingReason ? (
-          <AlertTriangle size={12} aria-hidden="true" className="shrink-0" />
+          <AlertTriangle size={14} aria-hidden="true" className="shrink-0" />
         ) : (
           <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-status-progress motion-reduce:animate-none" />
         )}
@@ -644,7 +644,7 @@ const MessageRow = memo(function MessageRow({
         >
           <div className="flex items-center gap-2">
             <AlertTriangle
-              size={15}
+              size={16}
               aria-hidden="true"
               className="shrink-0 text-status-warning"
             />
@@ -673,7 +673,7 @@ const MessageRow = memo(function MessageRow({
       >
         <div className="flex items-center gap-2 font-semibold text-gray-200">
           <AlertTriangle
-            size={15}
+            size={16}
             aria-hidden="true"
             className="shrink-0 text-status-danger"
           />
@@ -856,7 +856,7 @@ const MessageRow = memo(function MessageRow({
       {msg.failureEvidence && (
         <div className="flex items-center gap-2">
           <AlertTriangle
-            size={15}
+            size={16}
             aria-hidden="true"
             className="shrink-0 text-status-warning"
           />
@@ -886,10 +886,10 @@ const MessageRow = memo(function MessageRow({
                   : `展开较早的执行过程，共 ${hiddenSteps} 条`
               }
               onClick={() => setShowAllSteps((v) => !v)}
-              className="inline-flex min-h-7 items-center gap-1 rounded-md px-1.5 text-note leading-5 text-gray-500 transition-colors hover:bg-surface-3/55 hover:text-gray-300"
+              className="inline-flex min-h-7 items-center gap-1 rounded-lg px-1.5 text-note leading-5 text-gray-500 transition-colors hover:bg-surface-3/55 hover:text-gray-300"
             >
               <ChevronDown
-                size={13}
+                size={14}
                 aria-hidden="true"
                 className={`transition-transform motion-reduce:transition-none ${showAllSteps ? "" : "-rotate-90"}`}
               />

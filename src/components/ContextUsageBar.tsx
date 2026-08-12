@@ -326,7 +326,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
       {showToast && toast && (
         <span
           role="status"
-          className="whitespace-nowrap rounded-md bg-status-warning-soft px-1.5 py-0.5 text-caption text-status-warning"
+          className="whitespace-nowrap rounded-lg bg-status-warning-soft px-1.5 py-0.5 text-caption text-status-warning"
           title={`释放约 ${formatContextTokens(toast.tokensFreed)} tokens`}
         >
           已压缩 {toast.elidedCount} 条

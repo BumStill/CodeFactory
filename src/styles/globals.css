@@ -146,6 +146,22 @@
     font-size: calc(14px * var(--font-scale, 1));
   }
 
+  /*
+   * Icon stroke weight, decoupled from icon size.
+   *
+   * lucide draws in a 24-unit viewBox with stroke-width 2, so the rendered
+   * stroke is `size / 24 * 2` — 0.92px at size 11, 1.08px at 13, 1.33px at 16.
+   * Icons sitting in the same row came out visibly different weights, and the
+   * sub-pixel ones antialiased to grey on 1x displays.
+   *
+   * `non-scaling-stroke` measures the stroke in the final coordinate space
+   * instead of viewBox units, so 1.5 is 1.5px at every size.
+   */
+  .lucide {
+    vector-effect: non-scaling-stroke;
+    stroke-width: 1.5;
+  }
+
   /* Custom scrollbar */
   ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }

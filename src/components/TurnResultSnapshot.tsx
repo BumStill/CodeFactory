@@ -194,9 +194,9 @@ export function TurnResultSnapshot({
       className={`mt-3 max-w-[72ch] overflow-hidden rounded-xl border border-border/70 border-l-2 bg-surface-2/70 ${status.borderClass}`}
     >
       <div className="flex flex-wrap items-center gap-2 px-3 py-2.5">
-        <StatusIcon size={15} aria-hidden="true" className={status.iconClass} />
+        <StatusIcon size={16} aria-hidden="true" className={status.iconClass} />
         <span className="text-note font-semibold text-gray-200">{status.label}</span>
-        <span className="rounded-md bg-surface-3 px-1.5 py-0.5 text-caption font-medium tabular-nums text-gray-400">
+        <span className="rounded-lg bg-surface-3 px-1.5 py-0.5 text-caption font-medium tabular-nums text-gray-400">
           {progress.completed}/{progress.total}
         </span>
         <span className="text-caption text-gray-500">
@@ -221,8 +221,8 @@ export function TurnResultSnapshot({
           >
             查看证据
             {onOpenEvidence
-              ? <PanelRightOpen size={12} aria-hidden="true" />
-              : <ChevronDown size={12} aria-hidden="true" className={resultOpen ? "rotate-180" : ""} />}
+              ? <PanelRightOpen size={14} aria-hidden="true" />
+              : <ChevronDown size={14} aria-hidden="true" className={resultOpen ? "rotate-180" : ""} />}
           </button>
           {onToggleProcess && (
             <button
@@ -232,7 +232,7 @@ export function TurnResultSnapshot({
               onClick={onToggleProcess}
               className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-note text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
             >
-              <ListTree size={12} aria-hidden="true" />
+              <ListTree size={14} aria-hidden="true" />
               执行过程
             </button>
           )}
@@ -243,7 +243,7 @@ export function TurnResultSnapshot({
             onClick={() => setSummaryOpen((value) => !value)}
             className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-note text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
           >
-            <RefreshCw size={12} aria-hidden="true" />
+            <RefreshCw size={14} aria-hidden="true" />
             结果摘要
           </button>
         </div>
@@ -259,7 +259,7 @@ export function TurnResultSnapshot({
         <div className="grid gap-3 border-t border-border/50 px-3 py-2.5 text-note sm:grid-cols-2">
           <div>
             <p className="mb-1 flex items-center gap-1 text-gray-400">
-              <FileCode2 size={12} aria-hidden="true" />
+              <FileCode2 size={14} aria-hidden="true" />
               修改文件
             </p>
             {evidence.changedFiles.length > 0 ? (
@@ -270,7 +270,7 @@ export function TurnResultSnapshot({
           </div>
           <div>
             <p className="mb-1 flex items-center gap-1 text-gray-400">
-              <TestTube2 size={12} aria-hidden="true" />
+              <TestTube2 size={14} aria-hidden="true" />
               验证
             </p>
             {evidence.verificationCommands.length > 0 ? (

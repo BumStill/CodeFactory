@@ -21,7 +21,7 @@ export function ResumeBanner({ report }: { report: ResumeReport | undefined }) {
       className="mx-3 mt-2 rounded-lg border border-border bg-surface-2 px-3 py-2 text-label"
     >
       <div className="flex items-center gap-2 text-gray-200">
-        <History size={12} className="shrink-0 text-accent" />
+        <History size={14} className="shrink-0 text-accent" />
         <span>
           已从缓存恢复 <b>{restored.length}</b> 个任务，重新执行{" "}
           <b>{invalidated.length}</b> 个，恢复中断任务 <b>{recovered.length}</b> 个
@@ -31,7 +31,7 @@ export function ResumeBanner({ report }: { report: ResumeReport | undefined }) {
         <ul className="mt-1.5 space-y-0.5 text-gray-500">
           {invalidated.map((t) => (
             <li key={t.task_id} className="flex items-center gap-1.5">
-              <RotateCcw size={10} className="shrink-0" />
+              <RotateCcw size={14} className="shrink-0" />
               <span className="truncate">{t.title}</span>
               <span
                 className="shrink-0 rounded bg-surface-3 px-1 py-px text-caption text-amber-500"
@@ -47,7 +47,7 @@ export function ResumeBanner({ report }: { report: ResumeReport | undefined }) {
         <ul className="mt-1 space-y-0.5 text-gray-500">
           {recovered.map((t) => (
             <li key={t.task_id} className="flex items-center gap-1.5">
-              <Zap size={10} className="shrink-0" />
+              <Zap size={14} className="shrink-0" />
               <span className="truncate">{t.title}</span>
               <span className="shrink-0 rounded bg-surface-3 px-1 py-px text-caption text-sky-500">
                 {t.outcome === "finalized" ? "已确认完成" : "已恢复待执行"}

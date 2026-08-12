@@ -124,7 +124,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
           className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors disabled:opacity-40"
           title="刷新"
         >
-          <RefreshCw size={12} className={isLoading ? "animate-spin" : ""} />
+          <RefreshCw size={14} className={isLoading ? "animate-spin" : ""} />
         </button>
         <button
           onClick={onClose}
@@ -143,7 +143,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
           className="flex items-center gap-1 px-2 py-1 text-caption rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 transition-colors"
           title="插入一个用于测试的 5 任务示例树"
         >
-          <Plus size={11} />
+          <Plus size={14} />
           添加示例任务树
         </button>
         <span className="flex-1" />
@@ -162,7 +162,7 @@ export function TaskDashboard({ sessionId, cwd, onClose }: Props) {
             onClick={() => cancel(sessionId)}
             className="flex items-center gap-1 px-2 py-1 text-caption rounded bg-red-700/70 hover:bg-red-700 text-white transition-colors"
           >
-            <Square size={11} />
+            <Square size={14} />
             取消
           </button>
         )}
@@ -308,7 +308,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
         onClick={onToggle}
       >
         <span className="mt-0.5 shrink-0">
-          {expanded ? <ChevronDown size={12} className="text-gray-500" /> : <ChevronRight size={12} className="text-gray-500" />}
+          {expanded ? <ChevronDown size={14} className="text-gray-500" /> : <ChevronRight size={14} className="text-gray-500" />}
         </span>
         <span className="mt-0.5 shrink-0">{statusIcon(task.status)}</span>
         <div className="flex-1 min-w-0">
@@ -316,10 +316,10 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
             <span className="text-label text-gray-200 truncate">{task.title}</span>
             {restoredKey && <RestoredBadge keyShort={restoredKey} />}
             {verifBadge === "pass" && (
-              <span title="全部验证检查通过"><CheckCircle2 size={11} className="text-green-400 shrink-0" /></span>
+              <span title="全部验证检查通过"><CheckCircle2 size={14} className="text-green-400 shrink-0" /></span>
             )}
             {verifBadge === "fail" && (
-              <span title="有验证检查未通过"><XCircle size={11} className="text-red-400 shrink-0" /></span>
+              <span title="有验证检查未通过"><XCircle size={14} className="text-red-400 shrink-0" /></span>
             )}
           </div>
           <div className="flex items-center gap-2 text-caption text-gray-600">
@@ -336,7 +336,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
               className="mt-1 flex items-start gap-1 rounded bg-amber-500/10 px-1.5 py-1 text-caption text-amber-700 dark:text-amber-300"
               title={`${task.failure_attribution.summary}\n下一步：${task.failure_attribution.next_action}`}
             >
-              <AlertCircle size={11} className="mt-0.5 shrink-0" />
+              <AlertCircle size={14} className="mt-0.5 shrink-0" />
               <span className="shrink-0 font-medium">{task.failure_attribution.label}</span>
               <span className="min-w-0 truncate text-amber-800/80 dark:text-amber-200/80">
                 {task.failure_attribution.next_action}
@@ -429,7 +429,7 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
           <div className="pt-1 border-t border-border/30">
             <div className="flex items-center gap-2 mb-1">
               <span className="text-gray-600 flex items-center gap-1">
-                <ShieldCheck size={11} />
+                <ShieldCheck size={14} />
                 验证
               </span>
               <button
@@ -439,8 +439,8 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
                 title="立即运行验证检查"
               >
                 {runningVerif
-                  ? <Loader2 size={10} className="animate-spin" />
-                  : <RefreshCw size={10} />
+                  ? <Loader2 size={14} className="animate-spin" />
+                  : <RefreshCw size={14} />
                 }
                 运行
               </button>
@@ -455,14 +455,14 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
                       onClick={() => toggleCheck(idx)}
                     >
                       {r.passed
-                        ? <CheckCircle2 size={11} className="text-green-400 shrink-0" />
-                        : <XCircle size={11} className="text-red-400 shrink-0" />
+                        ? <CheckCircle2 size={14} className="text-green-400 shrink-0" />
+                        : <XCircle size={14} className="text-red-400 shrink-0" />
                       }
                       <span className="flex-1 text-gray-300 truncate">{r.check}</span>
                       <span className="text-gray-600">{r.duration_ms}ms</span>
                       {expandedChecks.has(idx)
-                        ? <ChevronDown size={10} className="text-gray-600" />
-                        : <ChevronRight size={10} className="text-gray-600" />
+                        ? <ChevronDown size={14} className="text-gray-600" />
+                        : <ChevronRight size={14} className="text-gray-600" />
                       }
                     </div>
                     {expandedChecks.has(idx) && r.output && (
@@ -486,15 +486,15 @@ function TaskRow({ task, sessionId, expanded, onToggle, onVerificationRun, resto
 function statusIcon(status: TaskStatus) {
   switch (status) {
     case "pending":
-      return <Circle size={12} className="text-gray-500" />;
+      return <Circle size={14} className="text-gray-500" />;
     case "running":
-      return <Loader2 size={12} className="text-blue-400 animate-spin" />;
+      return <Loader2 size={14} className="text-blue-400 animate-spin" />;
     case "completed":
-      return <CheckCircle2 size={12} className="text-green-400" />;
+      return <CheckCircle2 size={14} className="text-green-400" />;
     case "failed":
-      return <XCircle size={12} className="text-red-400" />;
+      return <XCircle size={14} className="text-red-400" />;
     case "cancelled":
-      return <AlertCircle size={12} className="text-yellow-500" />;
+      return <AlertCircle size={14} className="text-yellow-500" />;
   }
 }
 
