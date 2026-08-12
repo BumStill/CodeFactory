@@ -42,9 +42,17 @@ export function ComposerControlBar({ children, shortcutHint }: ComposerControlBa
       className="flex min-h-[44px] min-w-0 max-w-full flex-wrap items-center gap-1 overflow-x-clip border-t border-border/60 px-2 py-1 lg:min-h-[36px]"
     >
       {children}
+      {/*
+        No `ml-auto` here. The row's free space is claimed by exactly one
+        element, and that element is supplied by the caller: the draft bar is
+        `flex-1`, and the session toolbar wraps its usage meter in `ml-auto`.
+        A second auto margin does not win the right edge — it *splits* the free
+        space with the first one, which parked the usage meter (a bare spinner
+        while it loads) in the middle of the bar with nothing either side of it.
+      */}
       <span
         data-testid="composer-shortcut-hint"
-        className="ml-auto hidden shrink-0 text-caption text-gray-600 select-none lg:group-focus-within:block"
+        className="hidden shrink-0 text-caption text-gray-600 select-none lg:group-focus-within:block"
       >
         {shortcutHint}
       </span>
