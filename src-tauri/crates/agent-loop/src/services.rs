@@ -20,6 +20,27 @@ pub trait ContextPolicy: Send + Sync {
     async fn round_reasoning_effort(&self) -> String;
 }
 
+/// Final authorization boundary for context compaction. A recovery run may
+/// wait between resolving the current context window and mutating its prompt;
+/// the desktop implementation therefore re-reads the durable Objective claim
+/// immediately before every normal and emergency compaction. Ordinary
+/// foreground/headless runs use [`AllowAllContextCompaction`].
+#[async_trait::async_trait]
+pub trait ContextCompactionGate: Send + Sync {
+    async fn authorize_compaction(&self) -> Result<(), String>;
+}
+
+/// No durable recovery claim is involved, so compaction follows the surface's
+/// normal policy without an Objective fence.
+pub struct AllowAllContextCompaction;
+
+#[async_trait::async_trait]
+impl ContextCompactionGate for AllowAllContextCompaction {
+    async fn authorize_compaction(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Tool lifecycle callbacks the loop fires around each tool call. Desktop wraps
 /// the user's configured `HookRunner`; headless uses [`NoOpHooks`], which allows
 /// every tool and records nothing. Both default to allow/no-op so a partial impl

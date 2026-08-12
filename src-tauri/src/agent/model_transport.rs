@@ -81,6 +81,7 @@ pub(super) struct RoutedDesktopModelTransport {
     pub(super) db: SqlitePool,
     pub(super) root_turn_id: Option<String>,
     pub(super) mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
+    pub(super) context_authorization: Option<super::context_recovery::ContextRecoveryAuthorization>,
     pub(super) anonymous: bool,
     /// Foreground/recovered chat must never silently fall back to unreceipted
     /// provider I/O. Legacy task/subagent surfaces remain optional until their
@@ -381,10 +382,13 @@ impl RoutedDesktopModelTransport {
                 ));
             };
             let row = sqlx::query(
-                "SELECT o.revision, o.session_id, o.root_turn_id
+                "SELECT o.revision, o.session_id,
+                        COALESCE(NULLIF(o.resume_cursor, ''), o.root_turn_id) AS active_root_turn_id
                  FROM objectives o
                  JOIN objective_bindings b ON b.id=? AND b.objective_id=o.id
-                 WHERE o.id=? AND b.resource_generation=?",
+                 WHERE o.id=? AND b.resource_generation=?
+                   AND b.resource_kind='chat_root_turn'
+                   AND b.resource_id=COALESCE(NULLIF(o.resume_cursor, ''), o.root_turn_id)",
             )
             .bind(binding_id)
             .bind(&permit.objective_id)
@@ -398,7 +402,7 @@ impl RoutedDesktopModelTransport {
                 )
             })?;
             let session_id: Option<String> = row.get("session_id");
-            let objective_root: Option<String> = row.get("root_turn_id");
+            let objective_root: Option<String> = row.get("active_root_turn_id");
             if session_id.as_deref() != Some(self.session_id.as_str())
                 || objective_root.as_deref() != Some(root_turn_id)
             {
@@ -462,6 +466,25 @@ impl RoutedDesktopModelTransport {
         tools: &[ToolDefinition],
         opts: &RoundOptions,
     ) -> std::result::Result<Option<ProviderAttemptRuntime>, TransportError> {
+        if let Some(authorization) = self.context_authorization.as_ref() {
+            let Some(permit) = self.mutation_permit.as_ref() else {
+                return Err(TransportError::Fatal(
+                    "CONTEXT_RECOVERY_FENCED: durable authorization has no mutation permit".into(),
+                ));
+            };
+            let current = super::context_recovery::ContextRecoveryStore::new(self.db.clone())
+                .authorization_is_current(authorization, permit)
+                .await
+                .map_err(|error| {
+                    provider_transport_error("context provider admission failed", error)
+                })?;
+            if !current {
+                return Err(TransportError::Fatal(
+                    "CONTEXT_RECOVERY_FENCED: objective or cursor changed before provider request"
+                        .into(),
+                ));
+            }
+        }
         let Some(permit) = self.resolve_provider_owner().await? else {
             return Ok(None);
         };
@@ -2153,6 +2176,32 @@ mod tests {
         (base_url, hits)
     }
 
+    fn serve_request_probe() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind request probe");
+        listener
+            .set_nonblocking(true)
+            .expect("set request probe nonblocking");
+        let base_url = format!("http://{}", listener.local_addr().expect("probe addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let probe_hits = hits.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        probe_hits.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (base_url, hits)
+    }
+
     async fn durable_foreground_fixture(
         suffix: &str,
     ) -> (SqlitePool, crate::agent::objective::ObjectiveSnapshot) {
@@ -2227,6 +2276,190 @@ mod tests {
         (pool, objective)
     }
 
+    async fn durable_context_transport_fixture() -> (
+        SqlitePool,
+        crate::agent::objective::ObjectiveSnapshot,
+        codefactory_agent_loop::tool::MutationPermit,
+        crate::agent::context_recovery::ContextRecoveryAuthorization,
+    ) {
+        use crate::agent::objective::{
+            CreateObjective, DecisionRouter, ObjectiveKind, ObjectiveStore, RecoveryDomain,
+            RouteSignal,
+        };
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "context-transport-objective".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("context-transport-session".into()),
+                root_turn_id: Some("context-transport-anchor".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "context-transport-test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('context-transport-current', 'context-transport-session', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('context-transport-binding', ?, 'chat', 'chat_root_turn',
+                     'context-transport-current', 2, 'sha256:context-transport',
+                     'context-transport-current', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Context,
+                failure_code: "context_overflow_after_compaction".into(),
+                failure_signature: "sha256:context-transport".into(),
+                next_observation_at: now - 1,
+                resume_cursor: Some("context-transport-current".into()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_recovery_attempts
+             (id, objective_id, root_turn_id, delivery_run_id, domain, attempt_index,
+              failure_code, failure_class, output_started, side_effect_started,
+              queue_wait_ms, runtime_ms, process_instance, resume_owner,
+              terminal_decision, created_at)
+             VALUES ('context-transport-attempt', ?, 'context-transport-current', NULL,
+                     'context', 1, 'CONTEXT_OVERFLOW_AFTER_COMPACTION',
+                     'context_capacity', 0, 0, NULL, NULL, 'prior-process',
+                     'agent_loop', 'waiting_system', ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let claim = store
+            .claim_due_remediations("context-transport-owner", 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let permit = codefactory_agent_loop::tool::MutationPermit {
+            objective_id: claim.objective.id.clone(),
+            remediation_id: claim.remediation_id.clone(),
+            owner: "context-transport-owner".into(),
+            claim_epoch: claim.claim_epoch,
+            binding_id: claim.binding_id.clone(),
+            resource_generation: claim.resource_generation,
+        };
+        let authorization =
+            match crate::agent::context_recovery::ContextRecoveryStore::new(pool.clone())
+                .reserve_claimed_recovery(&claim, &permit)
+                .await
+                .unwrap()
+            {
+                crate::agent::context_recovery::ContextRecoveryReservation::Authorized(value) => {
+                    value
+                }
+                other => panic!("expected Context transport authorization, got {other:?}"),
+            };
+        (pool, claim.objective, permit, authorization)
+    }
+
+    #[tokio::test]
+    async fn stale_context_cursor_is_fenced_before_any_provider_post() {
+        let (pool, objective, permit, authorization) = durable_context_transport_fixture().await;
+        let (base_url, hits) = serve_request_probe();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE objectives SET revision=revision+1, domain='chat', status='active',
+                    decision_type='continue', resume_cursor='context-transport-new',
+                    remediation_id=NULL, lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE id=?",
+        )
+        .bind(now)
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE objective_remediations SET status='superseded', lease_owner=NULL,
+                    lease_expires_at=NULL, updated_at=? WHERE id=?",
+        )
+        .bind(now)
+        .bind(&permit.remediation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "context-transport-session".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                    "must-not-post",
+                    "context-model",
+                    base_url,
+                )),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_output_started: Arc::new(AtomicBool::new(false)),
+            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            db: pool,
+            root_turn_id: Some("context-transport-current".into()),
+            mutation_permit: Some(permit),
+            context_authorization: Some(authorization),
+            anonymous: false,
+            durable_provider_required: true,
+        };
+        let error = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect_err("stale Context authorization must fail before network I/O");
+        assert!(error.to_string().contains("CONTEXT_RECOVERY_FENCED"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn routed_transport_visits_each_candidate_until_the_third_succeeds() {
         const DOWN: (&str, &str, &str) = (
@@ -2263,6 +2496,7 @@ mod tests {
             db: unused_provider_db(),
             root_turn_id: None,
             mutation_permit: None,
+            context_authorization: None,
             anonymous: false,
             durable_provider_required: false,
         };
@@ -2332,6 +2566,7 @@ mod tests {
             db: unused_provider_db(),
             root_turn_id: None,
             mutation_permit: None,
+            context_authorization: None,
             anonymous: false,
             durable_provider_required: false,
         };
@@ -2387,6 +2622,7 @@ mod tests {
             db: pool.clone(),
             root_turn_id: objective.root_turn_id.clone(),
             mutation_permit: None,
+            context_authorization: None,
             anonymous: false,
             durable_provider_required: true,
         };
@@ -2511,6 +2747,7 @@ mod tests {
             db: pool.clone(),
             root_turn_id: Some("durable-partial-root".into()),
             mutation_permit: None,
+            context_authorization: None,
             anonymous: false,
             durable_provider_required: true,
         };
@@ -2588,6 +2825,7 @@ mod tests {
             db: pool,
             root_turn_id: Some("durable-partial-root".into()),
             mutation_permit: Some(mutation_permit),
+            context_authorization: None,
             anonymous: false,
             durable_provider_required: true,
         };
@@ -2642,6 +2880,7 @@ mod tests {
             db: unused_provider_db(),
             root_turn_id: None,
             mutation_permit: None,
+            context_authorization: None,
             anonymous: false,
             durable_provider_required: false,
         };
@@ -2700,6 +2939,7 @@ mod tests {
             db: unused_provider_db(),
             root_turn_id: None,
             mutation_permit: None,
+            context_authorization: None,
             anonymous: false,
             durable_provider_required: false,
         };

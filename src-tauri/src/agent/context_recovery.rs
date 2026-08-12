@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
 
 use super::objective::{ClaimedRemediation, ObjectiveStatus, RecoveryDomain};
 
@@ -26,6 +27,7 @@ pub(crate) enum ContextRecoveryDisposition {
         session_id: String,
         root_turn_id: String,
         resume_cursor: String,
+        source_attempt_id: String,
     },
     ObserveOnlyWrongDomain,
     ObserveOnlyNotWaiting,
@@ -35,6 +37,27 @@ pub(crate) enum ContextRecoveryDisposition {
     ObserveOnlySideEffectStarted,
     ObserveOnlyAttemptUnresolved,
     ObserveOnlyRecoveryBudgetExhausted,
+    ObserveOnlyAuthorizationConsumed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextRecoveryAuthorization {
+    pub(crate) intent_id: String,
+    pub(crate) objective_id: String,
+    pub(crate) objective_revision: i64,
+    pub(crate) source_attempt_id: String,
+    pub(crate) remediation_id: String,
+    pub(crate) binding_id: String,
+    pub(crate) resource_generation: i64,
+    pub(crate) resume_cursor: String,
+    pub(crate) lease_owner: String,
+    pub(crate) claim_epoch: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ContextRecoveryReservation {
+    Authorized(ContextRecoveryAuthorization),
+    ObserveOnly(ContextRecoveryDisposition),
 }
 
 #[derive(Clone)]
@@ -71,7 +94,7 @@ impl ContextRecoveryStore {
 
         let (
             Some(session_id),
-            Some(root_turn_id),
+            Some(_objective_anchor_root_turn_id),
             Some(resume_cursor),
             Some(binding_id),
             Some(resource_generation),
@@ -85,9 +108,10 @@ impl ContextRecoveryStore {
         else {
             return Ok(ContextRecoveryDisposition::ObserveOnlyIdentityIncomplete);
         };
-        if resume_cursor != root_turn_id {
+        if resume_cursor.trim().is_empty() {
             return Ok(ContextRecoveryDisposition::ObserveOnlyIdentityIncomplete);
         }
+        let active_root_turn_id = resume_cursor;
 
         let binding_matches: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objective_bindings
@@ -96,7 +120,7 @@ impl ContextRecoveryStore {
         )
         .bind(binding_id)
         .bind(&claim.objective.id)
-        .bind(root_turn_id)
+        .bind(active_root_turn_id)
         .bind(resource_generation)
         .fetch_one(&self.pool)
         .await?;
@@ -104,7 +128,7 @@ impl ContextRecoveryStore {
             "SELECT objective_id FROM chat_turn_state
              WHERE root_turn_id=? AND session_id=?",
         )
-        .bind(root_turn_id)
+        .bind(active_root_turn_id)
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await?
@@ -116,20 +140,21 @@ impl ContextRecoveryStore {
         }
 
         let last_attempt = sqlx::query(
-            "SELECT failure_code, terminal_decision, output_started, side_effect_started
+            "SELECT id, failure_code, terminal_decision, output_started, side_effect_started
              FROM objective_recovery_attempts
              WHERE objective_id=? AND root_turn_id=? AND domain='context'
              ORDER BY created_at DESC, attempt_index DESC, id DESC
              LIMIT 1",
         )
         .bind(&claim.objective.id)
-        .bind(root_turn_id)
+        .bind(active_root_turn_id)
         .fetch_optional(&self.pool)
         .await?;
         let Some(last_attempt) = last_attempt else {
             return Ok(ContextRecoveryDisposition::ObserveOnlyAttemptUnresolved);
         };
         let failure_code: String = last_attempt.try_get("failure_code")?;
+        let source_attempt_id: String = last_attempt.try_get("id")?;
         let terminal_decision: String = last_attempt.try_get("terminal_decision")?;
         let output_started = last_attempt.try_get::<i64, _>("output_started")? != 0;
         let side_effect_started = last_attempt.try_get::<i64, _>("side_effect_started")? != 0;
@@ -150,7 +175,7 @@ impl ContextRecoveryStore {
                AND terminal_decision='waiting_system'",
         )
         .bind(&claim.objective.id)
-        .bind(root_turn_id)
+        .bind(active_root_turn_id)
         .fetch_one(&self.pool)
         .await?;
         if terminal_attempts != 1 {
@@ -159,9 +184,270 @@ impl ContextRecoveryStore {
 
         Ok(ContextRecoveryDisposition::ReadyToRecompact {
             session_id: session_id.to_string(),
-            root_turn_id: root_turn_id.to_string(),
+            root_turn_id: active_root_turn_id.to_string(),
             resume_cursor: resume_cursor.to_string(),
+            source_attempt_id,
         })
+    }
+
+    /// Atomically consume the one recovery opportunity represented by the
+    /// exact terminal Context attempt. A committed row is permanent fencing:
+    /// after a crash, a replacement owner may observe it but cannot recompact
+    /// or issue another provider request from the same attempt.
+    pub(crate) async fn reserve_claimed_recovery(
+        &self,
+        claim: &ClaimedRemediation,
+        permit: &codefactory_agent_loop::tool::MutationPermit,
+    ) -> Result<ContextRecoveryReservation> {
+        let observation = self.observe_claimed_recovery(claim).await?;
+        let ContextRecoveryDisposition::ReadyToRecompact {
+            resume_cursor,
+            source_attempt_id,
+            ..
+        } = observation
+        else {
+            return Ok(ContextRecoveryReservation::ObserveOnly(observation));
+        };
+        let (Some(binding_id), Some(resource_generation)) =
+            (permit.binding_id.as_deref(), permit.resource_generation)
+        else {
+            return Ok(ContextRecoveryReservation::ObserveOnly(
+                ContextRecoveryDisposition::ObserveOnlyIdentityIncomplete,
+            ));
+        };
+        if permit.objective_id != claim.objective.id
+            || permit.remediation_id != claim.remediation_id
+            || permit.claim_epoch != claim.claim_epoch
+            || permit.binding_id.as_deref() != claim.binding_id.as_deref()
+            || permit.resource_generation != claim.resource_generation
+        {
+            return Ok(ContextRecoveryReservation::ObserveOnly(
+                ContextRecoveryDisposition::ObserveOnlyBindingChanged,
+            ));
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let intent_id = Uuid::new_v4().to_string();
+        let mut tx = self.pool.begin().await?;
+        let current: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM objectives objective
+             JOIN objective_remediations remediation
+               ON remediation.id=objective.remediation_id
+              AND remediation.objective_id=objective.id
+             JOIN objective_bindings binding
+               ON binding.id=remediation.binding_id
+              AND binding.objective_id=objective.id
+             JOIN chat_turn_state turn
+               ON turn.root_turn_id=objective.resume_cursor
+              AND turn.session_id=objective.session_id
+              AND turn.objective_id=objective.id
+             JOIN objective_recovery_attempts attempt
+               ON attempt.id=? AND attempt.objective_id=objective.id
+              AND attempt.root_turn_id=objective.resume_cursor
+              AND attempt.domain='context'
+             WHERE objective.id=? AND objective.revision=?
+               AND objective.status='waiting_system' AND objective.domain='context'
+               AND objective.output_started=0 AND objective.side_effect_started=0
+               AND objective.resume_cursor=?
+               AND objective.lease_owner=? AND objective.lease_expires_at>?
+               AND remediation.id=? AND remediation.status='claimed'
+               AND remediation.domain='context' AND remediation.lease_owner=?
+               AND remediation.attempt_index=? AND remediation.lease_expires_at>?
+               AND binding.id=? AND binding.resource_generation=?
+               AND binding.resource_kind='chat_root_turn' AND binding.resource_id=?
+               AND binding.output_started=0 AND binding.side_effect_started=0
+               AND attempt.terminal_decision='waiting_system'
+               AND attempt.output_started=0 AND attempt.side_effect_started=0
+               AND attempt.failure_code IN (
+                   'CONTEXT_COMPACTION_EXHAUSTED',
+                   'CONTEXT_OVERFLOW_AFTER_COMPACTION',
+                   'CONTEXT_COMPRESSION_UNAVAILABLE'
+               )
+               AND 1=(SELECT COUNT(*) FROM objective_recovery_attempts terminal
+                      WHERE terminal.objective_id=objective.id
+                        AND terminal.root_turn_id=objective.resume_cursor
+                        AND terminal.domain='context'
+                        AND terminal.terminal_decision='waiting_system')",
+        )
+        .bind(&source_attempt_id)
+        .bind(&claim.objective.id)
+        .bind(claim.objective.revision)
+        .bind(&resume_cursor)
+        .bind(&permit.owner)
+        .bind(now)
+        .bind(&permit.remediation_id)
+        .bind(&permit.owner)
+        .bind(permit.claim_epoch)
+        .bind(now)
+        .bind(binding_id)
+        .bind(resource_generation)
+        .bind(&resume_cursor)
+        .fetch_one(&mut *tx)
+        .await?;
+        if current != 1 {
+            tx.rollback().await?;
+            return Ok(ContextRecoveryReservation::ObserveOnly(
+                ContextRecoveryDisposition::ObserveOnlyBindingChanged,
+            ));
+        }
+
+        let inserted = sqlx::query(
+            "INSERT INTO context_recovery_intents
+             (id, objective_id, objective_revision, source_attempt_id,
+              remediation_id, binding_id, resource_generation, resume_cursor,
+              lease_owner, claim_epoch, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&intent_id)
+        .bind(&claim.objective.id)
+        .bind(claim.objective.revision)
+        .bind(&source_attempt_id)
+        .bind(&permit.remediation_id)
+        .bind(binding_id)
+        .bind(resource_generation)
+        .bind(&resume_cursor)
+        .bind(&permit.owner)
+        .bind(permit.claim_epoch)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(ContextRecoveryReservation::ObserveOnly(
+                ContextRecoveryDisposition::ObserveOnlyAuthorizationConsumed,
+            ));
+        }
+        tx.commit().await?;
+        Ok(ContextRecoveryReservation::Authorized(
+            ContextRecoveryAuthorization {
+                intent_id,
+                objective_id: claim.objective.id.clone(),
+                objective_revision: claim.objective.revision,
+                source_attempt_id,
+                remediation_id: permit.remediation_id.clone(),
+                binding_id: binding_id.to_string(),
+                resource_generation,
+                resume_cursor,
+                lease_owner: permit.owner.clone(),
+                claim_epoch: permit.claim_epoch,
+            },
+        ))
+    }
+
+    /// Final pre-provider fence. Provider attempt admission performs its own
+    /// owner/epoch CAS immediately afterward; this check additionally binds
+    /// that request to the single durable Context authorization and cursor.
+    pub(crate) async fn authorization_is_current(
+        &self,
+        authorization: &ContextRecoveryAuthorization,
+        permit: &codefactory_agent_loop::tool::MutationPermit,
+    ) -> Result<bool> {
+        if permit.objective_id != authorization.objective_id
+            || permit.remediation_id != authorization.remediation_id
+            || permit.owner != authorization.lease_owner
+            || permit.claim_epoch != authorization.claim_epoch
+            || permit.binding_id.as_deref() != Some(authorization.binding_id.as_str())
+            || permit.resource_generation != Some(authorization.resource_generation)
+        {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let current: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM context_recovery_intents intent
+             JOIN objectives objective ON objective.id=intent.objective_id
+             JOIN objective_remediations remediation
+               ON remediation.id=intent.remediation_id
+              AND remediation.objective_id=objective.id
+             JOIN objective_bindings binding
+               ON binding.id=intent.binding_id AND binding.objective_id=objective.id
+             JOIN chat_turn_state turn
+               ON turn.root_turn_id=intent.resume_cursor
+              AND turn.session_id=objective.session_id
+              AND turn.objective_id=objective.id
+             WHERE intent.id=? AND intent.status='started'
+               AND intent.objective_id=? AND intent.objective_revision=?
+               AND intent.source_attempt_id=? AND intent.remediation_id=?
+               AND intent.binding_id=? AND intent.resource_generation=?
+               AND intent.resume_cursor=? AND intent.lease_owner=?
+               AND intent.claim_epoch=?
+               AND objective.revision=intent.objective_revision
+               AND objective.status='waiting_system' AND objective.domain='context'
+               AND objective.remediation_id=intent.remediation_id
+               AND objective.resume_cursor=intent.resume_cursor
+               AND objective.output_started=0 AND objective.side_effect_started=0
+               AND objective.lease_owner=intent.lease_owner
+               AND objective.lease_expires_at>?
+               AND remediation.status='claimed' AND remediation.domain='context'
+               AND remediation.binding_id=intent.binding_id
+               AND remediation.lease_owner=intent.lease_owner
+               AND remediation.attempt_index=intent.claim_epoch
+               AND remediation.lease_expires_at>?
+               AND binding.resource_generation=intent.resource_generation
+               AND binding.resource_kind='chat_root_turn'
+               AND binding.resource_id=intent.resume_cursor
+               AND binding.output_started=0 AND binding.side_effect_started=0",
+        )
+        .bind(&authorization.intent_id)
+        .bind(&authorization.objective_id)
+        .bind(authorization.objective_revision)
+        .bind(&authorization.source_attempt_id)
+        .bind(&authorization.remediation_id)
+        .bind(&authorization.binding_id)
+        .bind(authorization.resource_generation)
+        .bind(&authorization.resume_cursor)
+        .bind(&authorization.lease_owner)
+        .bind(authorization.claim_epoch)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(current == 1)
+    }
+}
+
+/// Production implementation of the shared loop's final compaction gate. It
+/// owns the exact durable authorization snapshot but never caches the answer:
+/// every compactor rung re-reads SQLite so steer, cancellation, lease takeover,
+/// binding replacement, or cursor advancement fences the stale runner.
+pub(crate) struct DurableContextCompactionGate {
+    store: ContextRecoveryStore,
+    authorization: ContextRecoveryAuthorization,
+    permit: codefactory_agent_loop::tool::MutationPermit,
+}
+
+impl DurableContextCompactionGate {
+    pub(crate) fn new(
+        pool: SqlitePool,
+        authorization: ContextRecoveryAuthorization,
+        permit: codefactory_agent_loop::tool::MutationPermit,
+    ) -> Self {
+        Self {
+            store: ContextRecoveryStore::new(pool),
+            authorization,
+            permit,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl codefactory_agent_loop::services::ContextCompactionGate for DurableContextCompactionGate {
+    async fn authorize_compaction(&self) -> std::result::Result<(), String> {
+        match self
+            .store
+            .authorization_is_current(&self.authorization, &self.permit)
+            .await
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(
+                "durable objective revision, claim, binding, lease, or resume cursor changed"
+                    .into(),
+            ),
+            Err(error) => Err(format!("durable authorization check failed: {error}")),
+        }
     }
 }
 
@@ -259,6 +545,26 @@ mod tests {
                 session_id: "session-context".into(),
                 root_turn_id: "turn-context".into(),
                 resume_cursor: "turn-context".into(),
+                source_attempt_id: "attempt-context".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn continued_chat_recompacts_the_active_resume_cursor_not_the_objective_anchor() {
+        let (pool, mut claim) = fixture(false, false).await;
+        claim.objective.root_turn_id = Some("turn-anchor".into());
+
+        assert_eq!(
+            ContextRecoveryStore::new(pool)
+                .observe_claimed_recovery(&claim)
+                .await
+                .unwrap(),
+            ContextRecoveryDisposition::ReadyToRecompact {
+                session_id: "session-context".into(),
+                root_turn_id: "turn-context".into(),
+                resume_cursor: "turn-context".into(),
+                source_attempt_id: "attempt-context".into(),
             }
         );
     }

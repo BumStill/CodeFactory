@@ -327,6 +327,10 @@ pub struct LoopServices {
     /// `DefaultCompressor` (token-based elision, today's behaviour); the eval
     /// sidecar supplies its char-budget digest so its scores don't move.
     pub compactor: Arc<dyn crate::services::ContextCompactor>,
+    /// Revalidated immediately before every compactor invocation. Context
+    /// recovery supplies a durable owner/revision/cursor fence; ordinary runs
+    /// and the headless evaluator explicitly allow their own compaction.
+    pub context_compaction_gate: Arc<dyn crate::services::ContextCompactionGate>,
     pub permission: Arc<dyn crate::services::PermissionGateway>,
     pub hooks: Arc<dyn crate::services::LifecycleHooks>,
     pub context_policy: Arc<dyn crate::services::ContextPolicy>,
@@ -644,6 +648,7 @@ pub async fn run_agent_loop(
         events,
         budget,
         compactor,
+        context_compaction_gate,
         permission,
         hooks,
         context_policy,
@@ -847,6 +852,12 @@ pub async fn run_agent_loop(
             // history passes through untouched (no mem::take/repair/event) — we
             // still resolve the window above for the ContextUsage denominator.
             if context_compression {
+                context_compaction_gate
+                    .authorize_compaction()
+                    .await
+                    .map_err(|reason| {
+                        TransportError::Fatal(format!("CONTEXT_RECOVERY_FENCED: {reason}"))
+                    })?;
                 // Delegated to the ContextCompactor seam (slice 4.8c) so each
                 // surface keeps its own budget discipline: desktop = token-based
                 // elision (DefaultCompressor, byte-identical to before),
@@ -910,6 +921,12 @@ pub async fn run_agent_loop(
                         && crate::context::is_context_overflow(&e.to_string()) =>
                 {
                     let emergency_limit = (context_limit / 5).max(1) * 4;
+                    context_compaction_gate
+                        .authorize_compaction()
+                        .await
+                        .map_err(|reason| {
+                            TransportError::Fatal(format!("CONTEXT_RECOVERY_FENCED: {reason}"))
+                        })?;
                     let compression = crate::services::compact_with_measurement(
                         compactor.as_ref(),
                         std::mem::take(&mut messages),
@@ -2672,8 +2689,8 @@ mod tests {
     use crate::events::CollectingEventSink;
     use crate::journal::{NullBudget, PersistResult};
     use crate::services::{
-        AllowAllPermissions, CompactionOutcome, ContextCompactor, NoOpFactChecker, NoOpHooks,
-        PermissionDenial, PermissionDenialReason, PermissionGateway,
+        AllowAllPermissions, CompactionOutcome, ContextCompactionGate, ContextCompactor,
+        NoOpFactChecker, NoOpHooks, PermissionDenial, PermissionDenialReason, PermissionGateway,
     };
     use crate::tool::{ToolBackend, ToolCtx, ToolInvocationResult};
     use crate::transport::{ModelResponse, ModelTransport, RoundOptions};
@@ -3292,6 +3309,52 @@ mod tests {
         }
     }
 
+    struct CountingCompactor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ContextCompactor for CountingCompactor {
+        fn compact(
+            &self,
+            messages: Vec<ChatMessage>,
+            _system_prompt: &str,
+            _context_limit: u32,
+            _tool_definitions: &[ToolDefinition],
+        ) -> CompactionOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            CompactionOutcome {
+                messages,
+                ..Default::default()
+            }
+        }
+    }
+
+    struct ScriptedContextCompactionGate {
+        decisions: Mutex<VecDeque<Result<(), String>>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedContextCompactionGate {
+        fn new(decisions: Vec<Result<(), String>>) -> Self {
+            Self {
+                decisions: Mutex::new(decisions.into()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContextCompactionGate for ScriptedContextCompactionGate {
+        async fn authorize_compaction(&self) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.decisions
+                .lock()
+                .expect("compaction gate decisions")
+                .pop_front()
+                .unwrap_or_else(|| Err("unexpected compaction authorization".into()))
+        }
+    }
+
     fn usage(prompt_tokens: u32, completion_tokens: u32) -> Usage {
         serde_json::from_value(serde_json::json!({
             "prompt_tokens": prompt_tokens,
@@ -3401,12 +3464,91 @@ mod tests {
             events,
             budget: Arc::new(NullBudget),
             compactor: Arc::new(crate::services::DefaultCompressor),
+            context_compaction_gate: Arc::new(crate::services::AllowAllContextCompaction),
             permission: Arc::new(AllowAllPermissions),
             hooks: Arc::new(NoOpHooks),
             context_policy: Arc::new(FixedContext),
             fact_checker: Arc::new(NoOpFactChecker),
             steer: Arc::new(crate::services::NoSteering),
         }
+    }
+
+    #[tokio::test]
+    async fn stale_context_authorization_fences_before_normal_compaction_or_provider() {
+        let transport = Arc::new(ScriptedTransport::new(vec![response(
+            "unsafe provider response",
+            vec![],
+            0,
+        )]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let compactor_calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(ScriptedContextCompactionGate::new(vec![Err(
+            "objective revision or claim changed".into(),
+        )]));
+        let mut svc = services(transport.clone(), persistence.clone(), events.clone());
+        svc.compactor = Arc::new(CountingCompactor {
+            calls: compactor_calls.clone(),
+        });
+        svc.context_compaction_gate = gate.clone();
+
+        let error = run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect_err("stale authorization must stop the old runner");
+
+        assert!(error.to_string().contains("CONTEXT_RECOVERY_FENCED"));
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(compactor_calls.load(Ordering::SeqCst), 0);
+        assert!(transport.requests().is_empty());
+        assert!(persistence
+            .recovery_attempts
+            .lock()
+            .expect("recovery attempts")
+            .is_empty());
+        assert!(persistence.notices.lock().expect("notices").is_empty());
+        assert!(!events
+            .events()
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ContextCompressed { .. })));
+    }
+
+    #[tokio::test]
+    async fn claim_takeover_fences_before_emergency_compaction_or_retry_side_effects() {
+        let transport = Arc::new(ScriptedTransport::from_results(vec![
+            Err(TransportError::Fatal("context window exceeded".into())),
+            Ok(response("unsafe retry", vec![], 0)),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let compactor_calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(ScriptedContextCompactionGate::new(vec![
+            Ok(()),
+            Err("claim epoch changed".into()),
+        ]));
+        let mut svc = services(transport.clone(), persistence.clone(), events.clone());
+        svc.compactor = Arc::new(CountingCompactor {
+            calls: compactor_calls.clone(),
+        });
+        svc.context_compaction_gate = gate.clone();
+
+        let error = run_agent_loop(inputs(), config(), svc)
+            .await
+            .expect_err("replacement owner must fence emergency compaction");
+
+        assert!(error.to_string().contains("CONTEXT_RECOVERY_FENCED"));
+        assert_eq!(gate.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(compactor_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.requests().len(), 1);
+        assert!(persistence
+            .recovery_attempts
+            .lock()
+            .expect("recovery attempts")
+            .is_empty());
+        assert!(persistence.notices.lock().expect("notices").is_empty());
+        assert!(!events
+            .events()
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ContextCompressed { .. })));
     }
 
     #[tokio::test]

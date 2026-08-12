@@ -805,7 +805,14 @@ pub fn decision_for_run_outcome_with_reason(
                 terminal_reason.unwrap_or("none")
             ),
             next_observation_at: Utc::now().timestamp_millis() + 5_000,
-            resume_cursor: objective.root_turn_id.clone().or(objective.task_id.clone()),
+            resume_cursor: if domain == RecoveryDomain::Context {
+                objective
+                    .resume_cursor
+                    .clone()
+                    .or_else(|| objective.root_turn_id.clone())
+            } else {
+                objective.root_turn_id.clone().or(objective.task_id.clone())
+            },
         },
     )
 }
@@ -3324,6 +3331,11 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         .await?;
     sqlx::raw_sql(include_str!(
         "../../migrations/0011_provider_auth_recovery.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0013_context_recovery_intents.sql"
     ))
     .execute(pool)
     .await?;
@@ -6192,12 +6204,14 @@ mod tests {
 
     #[test]
     fn typed_context_transport_outcomes_keep_the_context_recovery_domain() {
-        let objective = ObjectiveSnapshot::new(
+        let mut objective = ObjectiveSnapshot::new(
             "objective-context-interruption",
             ObjectiveKind::Informational,
             RecoveryDomain::Chat,
             "answer",
         );
+        objective.root_turn_id = Some("turn-context-anchor".into());
+        objective.resume_cursor = Some("turn-context-active".into());
         let outcome = RunOutcome {
             final_text: String::new(),
             completion_evidence: CompletionEvidence::default(),
@@ -6217,6 +6231,10 @@ mod tests {
             assert_eq!(decision.decision_type, DecisionType::Waiting);
             assert_eq!(decision.status, ObjectiveStatus::WaitingSystem);
             assert_eq!(decision.failure_code.as_deref(), Some(reason));
+            assert_eq!(
+                decision.resume_cursor.as_deref(),
+                Some("turn-context-active")
+            );
             assert!(!decision.requires_user_action);
         }
     }

@@ -125,6 +125,42 @@ fn episode() -> ProviderEpisodeSpec {
     }
 }
 
+#[tokio::test]
+async fn continued_objective_provider_episode_uses_current_resume_cursor_not_anchor_root() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    sqlx::query("UPDATE objectives SET resume_cursor='turn-current' WHERE id='objective-opaque'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE objective_bindings
+         SET resource_id='turn-current', resume_cursor='turn-current'
+         WHERE id='binding-1'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE objective_remediations SET resume_cursor='turn-current'
+         WHERE id='remediation-1'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut current = episode();
+    current.root_turn_id = "turn-current".into();
+    current.resume_cursor = "turn-current".into();
+
+    assert!(matches!(
+        ProviderRecoveryStore::new(pool)
+            .open_episode(&permit, &current, NOW)
+            .await
+            .unwrap(),
+        ProviderMutation::Applied(_)
+    ));
+}
+
 fn attempt(id: &str, episode_id: &str, endpoint: &str) -> ProviderAttemptSpec {
     ProviderAttemptSpec {
         id: id.into(),

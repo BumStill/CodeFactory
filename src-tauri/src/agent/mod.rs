@@ -648,6 +648,7 @@ impl UsageSurface {
 #[derive(Debug, Clone)]
 pub(crate) struct ContextCompressionAuthorization {
     permit: codefactory_agent_loop::tool::MutationPermit,
+    durable: context_recovery::ContextRecoveryAuthorization,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -666,16 +667,24 @@ pub struct AgentExecutionContext {
 pub(crate) fn claimed_context_compression_authorization(
     objective: &objective::ObjectiveSnapshot,
     permit: &codefactory_agent_loop::tool::MutationPermit,
+    durable: context_recovery::ContextRecoveryAuthorization,
 ) -> Option<ContextCompressionAuthorization> {
     let eligible = objective.domain == objective::RecoveryDomain::Context
         && objective.status == objective::ObjectiveStatus::WaitingSystem
         && !objective.output_started
         && !objective.side_effect_started
         && permit.objective_id == objective.id
-        && permit.binding_id.is_some()
-        && permit.resource_generation.is_some();
+        && permit.binding_id.as_deref() == Some(durable.binding_id.as_str())
+        && permit.resource_generation == Some(durable.resource_generation)
+        && permit.remediation_id == durable.remediation_id
+        && permit.owner == durable.lease_owner
+        && permit.claim_epoch == durable.claim_epoch
+        && durable.objective_id == objective.id
+        && durable.objective_revision == objective.revision
+        && objective.resume_cursor.as_deref() == Some(durable.resume_cursor.as_str());
     eligible.then(|| ContextCompressionAuthorization {
         permit: permit.clone(),
+        durable,
     })
 }
 
@@ -1198,6 +1207,26 @@ impl AgentLoop {
         overload_backoff: bool,
         expand_context_window: bool,
     ) -> Result<codefactory_agent_loop::run::RunOutcome> {
+        if let Some(authorization) = self
+            .execution_context
+            .as_ref()
+            .and_then(|context| context.force_context_compression.as_ref())
+        {
+            let current = context_recovery::ContextRecoveryStore::new(self.db.clone())
+                .authorization_is_current(&authorization.durable, &authorization.permit)
+                .await
+                .map_err(|error| {
+                    crate::errors::AppError::Other(format!(
+                        "CONTEXT_RECOVERY_FENCED: durable authorization check failed: {error}"
+                    ))
+                })?;
+            if !current {
+                return Err(crate::errors::AppError::Other(
+                    "CONTEXT_RECOVERY_FENCED: durable authorization changed before compaction"
+                        .into(),
+                ));
+            }
+        }
         let hooks: std::sync::Arc<dyn LifecycleHooks> = match &self.app {
             None => std::sync::Arc::new(NoOpHooks),
             Some(app) => {
@@ -1293,6 +1322,30 @@ impl AgentLoop {
             is_chatgpt: self.api_style == ApiStyle::Chatgpt,
             cwd: self.cwd.clone(),
         };
+        let context_compaction_gate: std::sync::Arc<
+            dyn codefactory_agent_loop::services::ContextCompactionGate,
+        > = self
+            .execution_context
+            .as_ref()
+            .and_then(|context| context.force_context_compression.as_ref())
+            .map_or_else(
+                || {
+                    std::sync::Arc::new(codefactory_agent_loop::services::AllowAllContextCompaction)
+                        as std::sync::Arc<
+                            dyn codefactory_agent_loop::services::ContextCompactionGate,
+                        >
+                },
+                |authorization| {
+                    std::sync::Arc::new(context_recovery::DurableContextCompactionGate::new(
+                        self.db.clone(),
+                        authorization.durable.clone(),
+                        authorization.permit.clone(),
+                    ))
+                        as std::sync::Arc<
+                            dyn codefactory_agent_loop::services::ContextCompactionGate,
+                        >
+                },
+            );
         let svc = codefactory_agent_loop::run::LoopServices {
             transport: std::sync::Arc::new(
                 self.model_transport(
@@ -1308,6 +1361,7 @@ impl AgentLoop {
             budget: std::sync::Arc::new(codefactory_agent_loop::journal::NullBudget),
             // Today's token-based elision, unchanged (slice 4.8c seam).
             compactor: std::sync::Arc::new(codefactory_agent_loop::services::DefaultCompressor),
+            context_compaction_gate,
             permission: std::sync::Arc::new(self.permission_gateway(root_turn_id)),
             hooks,
             context_policy: std::sync::Arc::new(self.context_policy(expand_context_window)),
@@ -1483,6 +1537,11 @@ impl AgentLoop {
             db: self.db.clone(),
             root_turn_id,
             mutation_permit,
+            context_authorization: self
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.force_context_compression.as_ref())
+                .map(|authorization| authorization.durable.clone()),
             anonymous: self.anonymous,
             durable_provider_required: self
                 .execution_context
@@ -2826,6 +2885,24 @@ fn glob_match(pattern: &str, input: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn durable_context_authorization(
+        objective: &super::objective::ObjectiveSnapshot,
+        permit: &codefactory_agent_loop::tool::MutationPermit,
+    ) -> super::context_recovery::ContextRecoveryAuthorization {
+        super::context_recovery::ContextRecoveryAuthorization {
+            intent_id: "context-intent-test".into(),
+            objective_id: objective.id.clone(),
+            objective_revision: objective.revision,
+            source_attempt_id: "context-attempt-test".into(),
+            remediation_id: permit.remediation_id.clone(),
+            binding_id: permit.binding_id.clone().unwrap(),
+            resource_generation: permit.resource_generation.unwrap(),
+            resume_cursor: objective.resume_cursor.clone().unwrap(),
+            lease_owner: permit.owner.clone(),
+            claim_epoch: permit.claim_epoch,
+        }
+    }
+
     /// Build the `ToolInvocationResult` the loop now feeds the gate with
     /// (slice 4.8c b2), applying the SAME classification the loop used inline
     /// before — so these #135/#136 gate tests pin identical behaviour.
@@ -3017,8 +3094,10 @@ mod tests {
             "answer",
         );
         objective.status = objective::ObjectiveStatus::WaitingSystem;
+        objective.resume_cursor = Some("turn-context".into());
+        let authorization = durable_context_authorization(&objective, &permit);
         context.force_context_compression =
-            claimed_context_compression_authorization(&objective, &permit);
+            claimed_context_compression_authorization(&objective, &permit, authorization);
         assert!(context_compression_for_run(false, Some(&context)));
 
         context.mutation_permit.as_mut().unwrap().claim_epoch += 1;
@@ -3042,16 +3121,35 @@ mod tests {
             "answer",
         );
         objective.status = objective::ObjectiveStatus::WaitingSystem;
-        assert!(claimed_context_compression_authorization(&objective, &permit).is_some());
+        objective.resume_cursor = Some("turn-context".into());
+        let authorization = durable_context_authorization(&objective, &permit);
+        assert!(claimed_context_compression_authorization(
+            &objective,
+            &permit,
+            authorization.clone()
+        )
+        .is_some());
 
         objective.domain = objective::RecoveryDomain::Chat;
-        assert!(claimed_context_compression_authorization(&objective, &permit).is_none());
+        assert!(claimed_context_compression_authorization(
+            &objective,
+            &permit,
+            authorization.clone()
+        )
+        .is_none());
         objective.domain = objective::RecoveryDomain::Context;
         objective.output_started = true;
-        assert!(claimed_context_compression_authorization(&objective, &permit).is_none());
+        assert!(claimed_context_compression_authorization(
+            &objective,
+            &permit,
+            authorization.clone()
+        )
+        .is_none());
         objective.output_started = false;
         objective.side_effect_started = true;
-        assert!(claimed_context_compression_authorization(&objective, &permit).is_none());
+        assert!(
+            claimed_context_compression_authorization(&objective, &permit, authorization).is_none()
+        );
     }
 
     #[tokio::test]
