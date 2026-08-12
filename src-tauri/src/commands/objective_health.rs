@@ -970,12 +970,12 @@ mod tests {
 
         insert_objective(
             &pool,
-            "stalled-permission",
+            "stalled-browser",
             2,
             "waiting_system",
             "platform_incident",
             false,
-            Some("objective-supervisor:permission"),
+            Some("objective-supervisor:browser"),
             Some("remediation-stalled"),
             None,
             None,
@@ -984,8 +984,8 @@ mod tests {
         .await;
         sqlx::query(
             "UPDATE objectives
-             SET domain='permission', last_progress_at=?, created_at=?
-             WHERE id='stalled-permission'",
+             SET domain='browser', last_progress_at=?, created_at=?
+             WHERE id='stalled-browser'",
         )
         .bind(NOW_MS - 300_001)
         .bind(NOW_MS - 300_001)
@@ -1155,6 +1155,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("ALTER TABLE chat_turn_state ADD COLUMN objective_id TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("ALTER TABLE tool_calls ADD COLUMN metadata TEXT")
             .execute(&pool)
             .await
@@ -1163,7 +1167,9 @@ mod tests {
         let snapshot = query_objective_health(&pool, NOW_MS).await;
         assert_eq!(
             snapshot.availability,
-            ObjectiveHealthAvailability::Available
+            ObjectiveHealthAvailability::Available,
+            "unexpected unavailable reason: {:?}",
+            snapshot.unavailable_reason
         );
         assert_eq!(snapshot.metrics.expect("available metrics").open, 0);
     }
