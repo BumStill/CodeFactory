@@ -22,6 +22,7 @@
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,7 +30,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::browser::chromium::ChromiumDriver;
 use crate::browser::extension::ExtensionBridge;
 use crate::browser::profile::{ProfileScope, SessionKind};
-use crate::browser::{as_untrusted_page_data, BrowserDriver, PageContent};
+use crate::browser::{AllowBrowserMutation, BrowserDriver, BrowserMutationAuthorizer, PageContent};
+use crate::errors::AppError;
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
 
@@ -42,6 +44,422 @@ static LOCAL: Lazy<ChromiumDriver> = Lazy::new(ChromiumDriver::new);
 pub static BRIDGE: Lazy<Arc<ExtensionBridge>> = Lazy::new(|| Arc::new(ExtensionBridge::new()));
 
 const LEASE_TTL: Duration = Duration::from_secs(20 * 60);
+
+fn recovery_digest(parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+struct BrowserRuntimeObserver {
+    pool: sqlx::SqlitePool,
+}
+
+#[async_trait::async_trait]
+impl crate::agent::browser_recovery::BrowserObserver for BrowserRuntimeObserver {
+    async fn observe(
+        &self,
+        contract: &crate::agent::browser_recovery::BrowserRecoveryContract,
+    ) -> anyhow::Result<crate::agent::browser_recovery::BrowserObservation> {
+        use crate::agent::browser_recovery::{
+            BrowserAction, BrowserObservation, BrowserObserverKind,
+        };
+
+        let arguments: Option<String> = sqlx::query_scalar(
+            "SELECT arguments FROM tool_calls
+             WHERE id=? AND objective_id=? AND binding_id=?
+               AND action_signature=? AND resource_generation=?",
+        )
+        .bind(&contract.tool_call_id)
+        .bind(&contract.objective_id)
+        .bind(&contract.binding_id)
+        .bind(&contract.action_fingerprint)
+        .bind(contract.resource_generation)
+        .fetch_optional(&self.pool)
+        .await?;
+        let args = arguments
+            .as_deref()
+            .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok());
+        let lease = read_leases()
+            .into_iter()
+            .find(|lease| lease.session_id == contract.session_id);
+        let dispatcher_quiesced = lease
+            .as_ref()
+            .is_none_or(|lease| !browser_process_is_running(lease));
+
+        Ok(match (contract.action, contract.observer_kind) {
+            (BrowserAction::Close, BrowserObserverKind::SessionPresence) => {
+                if lease.is_none()
+                    || (dispatcher_quiesced
+                        && reconnect_managed_browser(lease.as_ref()).await.is_err())
+                {
+                    BrowserObservation::Applied {
+                        observed_digest: contract.expected_postcondition_digest.clone(),
+                    }
+                } else {
+                    BrowserObservation::DefinitelyNotApplied {
+                        observed_digest: contract.precondition_digest.clone(),
+                        dispatcher_quiesced,
+                    }
+                }
+            }
+            (BrowserAction::Attach, BrowserObserverKind::SessionPresence) => {
+                if lease.is_some() && BRIDGE.list_tabs().await.is_ok() {
+                    BrowserObservation::Applied {
+                        observed_digest: contract.expected_postcondition_digest.clone(),
+                    }
+                } else {
+                    BrowserObservation::DefinitelyNotApplied {
+                        observed_digest: None,
+                        dispatcher_quiesced,
+                    }
+                }
+            }
+            (BrowserAction::SelectTab, BrowserObserverKind::TabDigest) => {
+                let expected = args
+                    .as_ref()
+                    .and_then(|args| args.get("target"))
+                    .and_then(Value::as_str)
+                    .map(|target| recovery_digest(&["selected_tab", &contract.session_id, target]));
+                let observed = lease.as_ref().and_then(|lease| {
+                    lease.selected_tab.map(|tab| {
+                        recovery_digest(&["selected_tab", &contract.session_id, &tab.to_string()])
+                    })
+                });
+                if expected.is_some() && observed == expected {
+                    BrowserObservation::Applied {
+                        observed_digest: observed,
+                    }
+                } else {
+                    BrowserObservation::DefinitelyNotApplied {
+                        observed_digest: observed,
+                        dispatcher_quiesced,
+                    }
+                }
+            }
+            (
+                BrowserAction::Open | BrowserAction::Click | BrowserAction::Press,
+                BrowserObserverKind::PageDigest,
+            ) => match reconnect_managed_browser(lease.as_ref()).await {
+                Ok(()) => match LOCAL.read(&contract.session_id).await {
+                    Ok(page) => {
+                        let observed = recovery_digest(&["page_url", &page.url]);
+                        if contract.expected_postcondition_digest.as_deref()
+                            == Some(observed.as_str())
+                        {
+                            BrowserObservation::Applied {
+                                observed_digest: Some(observed),
+                            }
+                        } else {
+                            BrowserObservation::StillUnknown {
+                                observed_digest: Some(observed),
+                            }
+                        }
+                    }
+                    Err(_) => BrowserObservation::StillUnknown {
+                        observed_digest: None,
+                    },
+                },
+                Err(_)
+                    if contract.action == BrowserAction::Open
+                        && dispatcher_quiesced
+                        && lease.as_ref().is_some_and(|lease| {
+                            now_secs().saturating_sub(lease.updated_at_unix_secs) > 90
+                        }) =>
+                {
+                    BrowserObservation::DefinitelyNotApplied {
+                        observed_digest: None,
+                        dispatcher_quiesced: true,
+                    }
+                }
+                Err(_) => BrowserObservation::StillUnknown {
+                    observed_digest: None,
+                },
+            },
+            (BrowserAction::Screenshot, BrowserObserverKind::WorkspaceFileSha256) => {
+                let relative_path = args
+                    .as_ref()
+                    .and_then(|args| args.get("path"))
+                    .and_then(Value::as_str)
+                    .map(std::path::Path::new)
+                    .filter(|path| {
+                        path.is_relative()
+                            && !path.components().any(|component| {
+                                matches!(
+                                    component,
+                                    Component::ParentDir
+                                        | Component::RootDir
+                                        | Component::Prefix(_)
+                                )
+                            })
+                    });
+                let cwd: Option<String> = sqlx::query_scalar(
+                    "SELECT CASE
+                       WHEN binding.resource_kind='task_run' THEN task.cwd
+                       WHEN binding.resource_kind='chat_root_turn' THEN session.cwd
+                       ELSE NULL
+                     END
+                     FROM browser_recovery_contracts AS contract
+                     JOIN objective_bindings AS binding
+                       ON binding.id=contract.binding_id
+                      AND binding.objective_id=contract.objective_id
+                      AND binding.resource_generation=contract.resource_generation
+                     JOIN objectives AS objective ON objective.id=contract.objective_id
+                     LEFT JOIN task_runs AS task
+                       ON binding.resource_kind='task_run'
+                      AND task.id=binding.resource_id
+                      AND task.objective_id=contract.objective_id
+                     LEFT JOIN sessions AS session
+                       ON binding.resource_kind='chat_root_turn'
+                      AND session.id=objective.session_id
+                     WHERE contract.receipt_id=?",
+                )
+                .bind(&contract.receipt_id)
+                .fetch_optional(&self.pool)
+                .await?;
+                let observed = relative_path
+                    .zip(cwd.as_deref())
+                    .and_then(|(path, cwd)| {
+                        std::fs::read(std::path::Path::new(cwd).join(path)).ok()
+                    })
+                    .map(|bytes| {
+                        use sha2::Digest;
+                        format!("{:x}", sha2::Sha256::digest(bytes))
+                    });
+                match (
+                    observed,
+                    contract.precondition_digest.as_deref(),
+                    contract.expected_postcondition_digest.as_deref(),
+                ) {
+                    (Some(observed), _, Some(expected)) if observed == expected => {
+                        BrowserObservation::Applied {
+                            observed_digest: Some(observed),
+                        }
+                    }
+                    (Some(observed), Some(precondition), _) if observed == precondition => {
+                        BrowserObservation::DefinitelyNotApplied {
+                            observed_digest: Some(observed),
+                            dispatcher_quiesced,
+                        }
+                    }
+                    (None, None, _) => BrowserObservation::DefinitelyNotApplied {
+                        observed_digest: None,
+                        dispatcher_quiesced,
+                    },
+                    (observed_digest, _, _) => BrowserObservation::Conflict { observed_digest },
+                }
+            }
+            (BrowserAction::Fill, BrowserObserverKind::ElementDigest) => {
+                let target = args
+                    .as_ref()
+                    .and_then(|args| args.get("target"))
+                    .and_then(Value::as_str);
+                let observed = match (target, reconnect_managed_browser(lease.as_ref()).await) {
+                    (Some(target), Ok(())) => LOCAL
+                        .element_value(&contract.session_id, target)
+                        .await
+                        .ok()
+                        .map(|value| recovery_digest(&["fill_value", target, &value])),
+                    _ => None,
+                };
+                if observed.as_deref() == contract.expected_postcondition_digest.as_deref() {
+                    BrowserObservation::Applied {
+                        observed_digest: observed,
+                    }
+                } else {
+                    BrowserObservation::StillUnknown {
+                        observed_digest: observed,
+                    }
+                }
+            }
+            _ => BrowserObservation::Conflict {
+                observed_digest: None,
+            },
+        })
+    }
+}
+
+pub(crate) async fn observe_browser_receipt(
+    pool: sqlx::SqlitePool,
+    receipt_id: &str,
+) -> anyhow::Result<crate::agent::browser_recovery::BrowserRecoveryDisposition> {
+    crate::agent::browser_recovery::BrowserRecoveryStore::new(pool.clone())
+        .observe(
+            receipt_id,
+            &BrowserRuntimeObserver { pool },
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+}
+
+struct DurableBrowserAuthorizer {
+    store: crate::agent::browser_recovery::BrowserRecoveryStore,
+    execution: crate::agent::browser_recovery::BrowserExecutionPermit,
+    dispatch: tokio::sync::Mutex<Option<crate::agent::browser_recovery::BrowserDispatchPermit>>,
+}
+
+impl DurableBrowserAuthorizer {
+    async fn dispatched(&self) -> bool {
+        self.dispatch.lock().await.is_some()
+    }
+}
+
+#[async_trait::async_trait]
+impl BrowserMutationAuthorizer for DurableBrowserAuthorizer {
+    async fn prepare_precondition(&self, evidence_digest: &str) -> Result<()> {
+        let recorded = self
+            .store
+            .prepare_precondition_digest(
+                &self.execution.operation,
+                evidence_digest,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| {
+                AppError::Other(format!("browser precondition persistence failed: {error}"))
+            })?;
+        if !recorded {
+            return Err(AppError::Other(
+                "browser action was already satisfied or its precondition changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn authorize(&self) -> Result<()> {
+        let mut dispatch = self.dispatch.lock().await;
+        if dispatch.is_some() {
+            return Err(AppError::Other(
+                "browser external event permit was already consumed".into(),
+            ));
+        }
+        let permit = self
+            .store
+            .mark_dispatching(
+                &self.execution.operation,
+                self.execution.recovery.as_ref(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| AppError::Other(format!("browser event admission failed: {error}")))?
+            .ok_or_else(|| {
+                AppError::Other("browser event permit is stale or already consumed".into())
+            })?;
+        *dispatch = Some(permit);
+        Ok(())
+    }
+
+    async fn prepare_postcondition(&self, evidence_digest: &str) -> Result<()> {
+        let dispatch = self.dispatch.lock().await;
+        let permit = dispatch.as_ref().ok_or_else(|| {
+            AppError::Other("browser postcondition lacks a dispatch permit".into())
+        })?;
+        let recorded = self
+            .store
+            .prepare_digest_postcondition(
+                permit,
+                evidence_digest,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| {
+                AppError::Other(format!("browser postcondition persistence failed: {error}"))
+            })?;
+        if !recorded {
+            return Err(AppError::Other(
+                "browser postcondition ownership changed before file mutation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn verify_current(&self) -> Result<()> {
+        let dispatch = self.dispatch.lock().await;
+        let permit = dispatch.as_ref().ok_or_else(|| {
+            AppError::Other("browser event verification lacks a dispatch permit".into())
+        })?;
+        let current = self
+            .store
+            .dispatch_is_current(permit, chrono::Utc::now().timestamp_millis())
+            .await
+            .map_err(|error| AppError::Other(format!("browser event fence failed: {error}")))?;
+        if !current {
+            return Err(AppError::Other(
+                "browser event permit changed before external dispatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn record_connection_endpoint(
+        &self,
+        endpoint: &str,
+        browser_pid: Option<u32>,
+    ) -> Result<()> {
+        let parsed = reqwest::Url::parse(endpoint).map_err(|error| {
+            AppError::Other(format!("invalid browser reconnect endpoint: {error}"))
+        })?;
+        if !matches!(parsed.scheme(), "ws" | "wss" | "http" | "https")
+            || !matches!(
+                parsed.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+            )
+        {
+            return Err(AppError::Other(
+                "browser reconnect endpoint must remain loopback-only".into(),
+            ));
+        }
+        update_lease_connection_endpoint(
+            &self.execution.operation.session_id,
+            endpoint,
+            browser_pid,
+        );
+        Ok(())
+    }
+
+    async fn acknowledge(&self, evidence_digest: Option<&str>) -> Result<()> {
+        let dispatch = self.dispatch.lock().await;
+        let permit = dispatch.as_ref().ok_or_else(|| {
+            AppError::Other("browser event acknowledgement lacks a dispatch permit".into())
+        })?;
+        let recorded = self
+            .store
+            .record_ack(
+                permit,
+                evidence_digest,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .map_err(|error| AppError::Other(format!("browser event ack failed: {error}")))?;
+        if !recorded {
+            return Err(AppError::Other(
+                "browser event ownership changed before acknowledgement".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn unknown(&self) -> Result<()> {
+        let dispatch = self.dispatch.lock().await;
+        let Some(permit) = dispatch.as_ref() else {
+            return Ok(());
+        };
+        let recorded = self
+            .store
+            .record_unknown(permit, chrono::Utc::now().timestamp_millis())
+            .await
+            .map_err(|error| AppError::Other(format!("browser unknown result failed: {error}")))?;
+        if !recorded {
+            return Err(AppError::Other(
+                "browser event ownership changed before unknown settlement".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -58,6 +476,12 @@ struct Args {
     path: Option<String>,
     #[serde(default)]
     query: Option<String>,
+    /// Deterministic, non-secret navigation postcondition for a potentially
+    /// irreversible click/keypress. Query strings, fragments and userinfo are
+    /// rejected by the outer Browser recovery admission and never enter its
+    /// durable contract in plaintext.
+    #[serde(default)]
+    expected_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +505,8 @@ struct Lease {
     #[serde(default)]
     owner_pid: u32,
     #[serde(default)]
+    owner_start_token: Option<String>,
+    #[serde(default)]
     kind: BrowserSessionKind,
     /// Which tab of the user's browser this session works with, if chosen.
     #[serde(default)]
@@ -91,6 +517,10 @@ struct Lease {
     current_host: Option<String>,
     #[serde(default)]
     page_title: Option<String>,
+    #[serde(default)]
+    connection_endpoint: Option<String>,
+    #[serde(default)]
+    browser_pid: Option<u32>,
     #[serde(default = "default_session_status")]
     status: String,
     updated_at_unix_secs: u64,
@@ -130,6 +560,7 @@ pub fn definition() -> ToolDefinition {
                     "text": {"type":"string", "description":"Text for fill"},
                     "path": {"type":"string", "description":"Project-relative screenshot path"},
                     "query": {"type":"string", "description":"Text to search for, for find"}
+                    ,"expected_url": {"type":"string", "description":"Required exact http(s) URL without query/fragment for click or press, used only to reconcile an unknown result safely"}
                 },
                 "required": ["action"]
             }),
@@ -147,10 +578,59 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         }
     };
 
-    reclaim_expired().await;
+    let durable_authorizer = match (ctx.db.as_ref(), ctx.outer_receipt_id.as_deref()) {
+        (Some(pool), Some(receipt_id)) => {
+            let store = crate::agent::browser_recovery::BrowserRecoveryStore::new(pool.clone());
+            let operation = store.operation_permit(receipt_id).await.map_err(|error| {
+                AppError::Other(format!("load browser operation contract: {error}"))
+            })?;
+            Some(DurableBrowserAuthorizer {
+                store,
+                execution: crate::agent::browser_recovery::BrowserExecutionPermit {
+                    operation,
+                    recovery: ctx.mutation_permit.clone(),
+                },
+                dispatch: tokio::sync::Mutex::new(None),
+            })
+        }
+        (None, None) => None,
+        (Some(_), None)
+            if matches!(args.action.as_str(), "tabs" | "read" | "find" | "snapshot") =>
+        {
+            None
+        }
+        _ => {
+            return Ok(ToolOutput::waiting(
+                "浏览器外部操作缺少完整持久化回执；系统已阻止执行并将自动核对。",
+            )
+            .with_metadata(json!({
+                "code": "browser_observation_contract_required",
+                "system_owned": true,
+                "recoverable": true,
+            })))
+        }
+    };
+    let allow = AllowBrowserMutation;
+    let authorizer: &dyn BrowserMutationAuthorizer = durable_authorizer
+        .as_ref()
+        .map_or(&allow, |authorizer| authorizer);
+
+    reclaim_expired(ctx.db.as_ref()).await;
     let (session_id, session_kind) = match args.action.as_str() {
-        "open" => (new_session_id(ctx), BrowserSessionKind::Managed),
-        "attach" => (new_session_id(ctx), BrowserSessionKind::AttachedChrome),
+        "open" => (
+            durable_authorizer
+                .as_ref()
+                .map(|authorizer| authorizer.execution.operation.session_id.clone())
+                .unwrap_or_else(|| new_session_id(ctx)),
+            BrowserSessionKind::Managed,
+        ),
+        "attach" => (
+            durable_authorizer
+                .as_ref()
+                .map(|authorizer| authorizer.execution.operation.session_id.clone())
+                .unwrap_or_else(|| new_session_id(ctx)),
+            BrowserSessionKind::AttachedChrome,
+        ),
         _ => {
             let Some(id) = args
                 .session_id
@@ -179,17 +659,8 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
 
     if args.action == "screenshot" {
-        match screenshot_path(&args, &ctx.cwd) {
-            Ok(path) => {
-                if let Some(parent) = path.parent() {
-                    if let Err(error) = std::fs::create_dir_all(parent) {
-                        return Ok(ToolOutput::err(format!(
-                            "browser_session could not create screenshot directory: {error}"
-                        )));
-                    }
-                }
-            }
-            Err(error) => return Ok(ToolOutput::err(error)),
+        if let Err(error) = screenshot_path(&args, &ctx.cwd) {
+            return Ok(ToolOutput::err(error));
         }
     }
 
@@ -199,20 +670,22 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             task_id: ctx.task_id.clone(),
             owner_session_id: ctx.session_id.clone(),
             owner_pid: std::process::id(),
+            owner_start_token: crate::storage::db::current_process_start_token(),
             kind: session_kind,
             selected_tab: None,
             pane_url: args.url.clone(),
             current_host: args.url.as_deref().and_then(host_of),
             page_title: None,
+            connection_endpoint: None,
+            browser_pid: None,
             status: "active".into(),
             updated_at_unix_secs: now_secs(),
         });
     }
-    let output = dispatch(&args, ctx, &session_id, session_kind).await;
+    let output = dispatch(&args, ctx, &session_id, session_kind, authorizer).await;
     match output {
         Ok(output) => {
             if args.action == "close" {
-                shutdown(&session_id, session_kind).await;
                 remove_lease(&session_id);
                 let label = match session_kind {
                     BrowserSessionKind::Managed => {
@@ -230,18 +703,27 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 let pane_url = if args.action == "open" {
                     args.url.clone()
                 } else {
-                    existing_lease.as_ref().and_then(|lease| lease.pane_url.clone())
+                    existing_lease
+                        .as_ref()
+                        .and_then(|lease| lease.pane_url.clone())
                 };
                 write_lease(&Lease {
                     session_id: session_id.clone(),
                     task_id: ctx.task_id.clone(),
                     owner_session_id: ctx.session_id.clone(),
                     owner_pid: std::process::id(),
+                    owner_start_token: crate::storage::db::current_process_start_token(),
                     kind: session_kind,
                     selected_tab: selected_tab(&session_id),
                     current_host: pane_url.as_deref().and_then(host_of),
                     pane_url,
-                    page_title: existing_lease.and_then(|lease| lease.page_title),
+                    page_title: existing_lease
+                        .as_ref()
+                        .and_then(|lease| lease.page_title.clone()),
+                    connection_endpoint: existing_lease
+                        .as_ref()
+                        .and_then(|lease| lease.connection_endpoint.clone()),
+                    browser_pid: existing_lease.and_then(|lease| lease.browser_pid),
                     status: "active".into(),
                     updated_at_unix_secs: now_secs(),
                 });
@@ -261,17 +743,19 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             }
         }
         Err(error) => {
-            if args.action == "close" {
-                remove_lease(&session_id);
-                let label = match session_kind {
-                    BrowserSessionKind::Managed => format!(
-                        "Closed managed browser session {session_id}; its daemon was already absent or unreachable."
-                    ),
-                    BrowserSessionKind::AttachedChrome => format!(
-                        "Detached CodeFactory from user Chrome session {session_id}; Chrome stayed open and the attachment was already absent or unreachable."
-                    ),
-                };
-                return Ok(ToolOutput::ok(label));
+            let durable_dispatch_started = match durable_authorizer.as_ref() {
+                Some(authorizer) => authorizer.dispatched().await,
+                None => false,
+            };
+            if durable_dispatch_started {
+                return Ok(ToolOutput::waiting(
+                    "浏览器事件可能已经发出；系统已保留会话并将只读核对，绝不盲目重放。",
+                )
+                .with_metadata(json!({
+                    "code": "browser_external_state_uncertain",
+                    "system_owned": true,
+                    "recoverable": true,
+                })));
             }
             // Any surfaced error closes the owned session, so a caller that
             // aborts the turn cannot leak a browser process.
@@ -280,7 +764,14 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             if args.action == "attach" {
                 // No longer a Chrome setting to flip: the extension replaces
                 // remote debugging, so the fix is to install and pair it.
-                return Ok(ToolOutput::blocked(attach_blocked_guidance(&error)));
+                return Ok(
+                    ToolOutput::blocked(attach_blocked_guidance(&error)).with_metadata(json!({
+                        "code": "browser_pairing_required",
+                        "attention_owner": "user",
+                        "request_key": "browser-pairing",
+                        "recoverable": true,
+                    })),
+                );
             }
             Ok(ToolOutput::err(error))
         }
@@ -337,16 +828,24 @@ fn selected_tab(session_id: &str) -> Option<i64> {
 }
 
 fn remember_selected_tab(session_id: &str, tab_id: i64, ctx: &ExecCtx, kind: BrowserSessionKind) {
+    let existing = read_leases()
+        .into_iter()
+        .find(|lease| lease.session_id == session_id);
     write_lease(&Lease {
         session_id: session_id.to_string(),
         task_id: ctx.task_id.clone(),
         owner_session_id: ctx.session_id.clone(),
         owner_pid: std::process::id(),
+        owner_start_token: crate::storage::db::current_process_start_token(),
         kind,
         selected_tab: Some(tab_id),
         pane_url: None,
         current_host: None,
         page_title: None,
+        connection_endpoint: existing
+            .as_ref()
+            .and_then(|lease| lease.connection_endpoint.clone()),
+        browser_pid: existing.and_then(|lease| lease.browser_pid),
         status: "active".into(),
         updated_at_unix_secs: now_secs(),
     });
@@ -368,13 +867,25 @@ async fn dispatch(
     ctx: &ExecCtx,
     session_id: &str,
     kind: BrowserSessionKind,
+    authorizer: &dyn BrowserMutationAuthorizer,
 ) -> std::result::Result<String, String> {
     let to_message = |error: crate::errors::AppError| error.to_string();
 
     match (kind, args.action.as_str()) {
         // ── The user's own browser, through the extension ──────────────────
         (_, "attach") => {
-            let tabs = BRIDGE.list_tabs().await.map_err(to_message)?;
+            if !BRIDGE.connected().await {
+                return Err("browser_pairing_required".into());
+            }
+            authorizer.authorize().await.map_err(to_message)?;
+            let tabs = match BRIDGE.list_tabs().await {
+                Ok(tabs) => tabs,
+                Err(error) => {
+                    let _ = authorizer.unknown().await;
+                    return Err(to_message(error));
+                }
+            };
+            authorizer.acknowledge(None).await.map_err(to_message)?;
             if tabs.is_empty() {
                 return Ok("Connected to the user's browser. No readable tabs are open.".into());
             }
@@ -396,7 +907,9 @@ async fn dispatch(
             let tab_id: i64 = raw
                 .parse()
                 .map_err(|_| format!("'{raw}' is not a tab id from browser_session.tabs"))?;
+            authorizer.authorize().await.map_err(to_message)?;
             remember_selected_tab(session_id, tab_id, ctx, kind);
+            authorizer.acknowledge(None).await.map_err(to_message)?;
             Ok(format!("Working with tab {tab_id}."))
         }
         (BrowserSessionKind::AttachedChrome, "read" | "snapshot") => {
@@ -412,6 +925,11 @@ async fn dispatch(
                 .ok_or("browser_session.find requires a query")?;
             let hits = BRIDGE.find(tab_id, query).await.map_err(to_message)?;
             Ok(format_hits(&hits, query))
+        }
+        (BrowserSessionKind::AttachedChrome, "close") => {
+            authorizer.authorize().await.map_err(to_message)?;
+            authorizer.acknowledge(None).await.map_err(to_message)?;
+            Ok(String::new())
         }
         // Acting as the user in their own browser is deliberately not offered.
         (BrowserSessionKind::AttachedChrome, action) => Err(format!(
@@ -439,7 +957,7 @@ async fn dispatch(
                 return Err(reason);
             }
             let content = LOCAL
-                .open(session_id, url, &scope)
+                .open_authorized(session_id, url, &scope, authorizer)
                 .await
                 .map_err(to_message)?;
             Ok(render_page(&content))
@@ -465,14 +983,17 @@ async fn dispatch(
                 .target
                 .as_deref()
                 .ok_or("browser_session.click requires a target ref")?;
-            LOCAL.click(session_id, target).await.map_err(to_message)
+            LOCAL
+                .click_authorized(session_id, target, authorizer)
+                .await
+                .map_err(to_message)
         }
         (BrowserSessionKind::Managed, "fill") => {
             let (Some(target), Some(text)) = (args.target.as_deref(), args.text.as_deref()) else {
                 return Err("browser_session.fill requires a target ref and text".into());
             };
             LOCAL
-                .fill(session_id, target, text)
+                .fill_authorized(session_id, target, text, authorizer)
                 .await
                 .map_err(to_message)
         }
@@ -482,18 +1003,36 @@ async fn dispatch(
                 .as_deref()
                 .or(args.target.as_deref())
                 .ok_or("browser_session.press requires the key, for example Enter")?;
-            LOCAL.press(session_id, key).await.map_err(to_message)
+            LOCAL
+                .press_authorized(session_id, key, authorizer)
+                .await
+                .map_err(to_message)
         }
         (BrowserSessionKind::Managed, "screenshot") => {
             let path = screenshot_path(args, &ctx.cwd)?;
-            LOCAL.screenshot(session_id, &path).await.map_err(to_message)
+            LOCAL
+                .screenshot_authorized(session_id, &path, authorizer)
+                .await
+                .map_err(to_message)
         }
         (BrowserSessionKind::Managed, "tabs" | "select_tab") => Err(
             "browser_session.tabs only applies to the user's own browser — use \
              browser_session.attach first."
                 .into(),
         ),
-        (_, "close") => Ok(String::new()),
+        (BrowserSessionKind::Managed, "close") => {
+            let lease = read_leases()
+                .into_iter()
+                .find(|lease| lease.session_id == session_id);
+            reconnect_managed_browser(lease.as_ref())
+                .await
+                .map_err(to_message)?;
+            LOCAL
+                .close_authorized(session_id, authorizer)
+                .await
+                .map_err(to_message)?;
+            Ok(String::new())
+        }
         (_, action) => Err(format!("unknown browser_session action '{action}'")),
     }
 }
@@ -582,7 +1121,9 @@ fn output_reports_error(output: &str) -> bool {
 fn host_of(url: &str) -> Option<String> {
     let rest = url.split_once("://")?.1;
     let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let host = authority.split(':').next()?.trim().to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
 }
@@ -624,7 +1165,42 @@ fn write_lease(lease: &Lease) {
     .is_ok()
     {
         let _ = std::fs::rename(temporary_path, path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                lease_path(&lease.session_id),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
     }
+}
+
+fn update_lease_connection_endpoint(session_id: &str, endpoint: &str, browser_pid: Option<u32>) {
+    if let Some(mut lease) = read_leases()
+        .into_iter()
+        .find(|lease| lease.session_id == session_id)
+    {
+        lease.connection_endpoint = Some(endpoint.to_string());
+        lease.browser_pid = browser_pid;
+        lease.updated_at_unix_secs = now_secs();
+        write_lease(&lease);
+    }
+}
+
+async fn reconnect_managed_browser(lease: Option<&Lease>) -> Result<()> {
+    let Some(lease) = lease.filter(|lease| lease.kind == BrowserSessionKind::Managed) else {
+        return Err(AppError::Other(
+            "managed browser lease is unavailable".into(),
+        ));
+    };
+    if LOCAL.read(&lease.session_id).await.is_ok() {
+        return Ok(());
+    }
+    let endpoint = lease.connection_endpoint.as_deref().ok_or_else(|| {
+        AppError::Other("managed browser reconnect endpoint is unavailable".into())
+    })?;
+    LOCAL.reconnect(&lease.session_id, endpoint).await
 }
 fn remove_lease(session_id: &str) {
     let _ = std::fs::remove_file(lease_path(session_id));
@@ -654,16 +1230,17 @@ fn lease_belongs_to_ctx(lease: &Lease, ctx: &ExecCtx) -> bool {
     }
 }
 
-#[cfg(unix)]
-fn owner_process_is_running(owner_pid: u32) -> bool {
-    owner_pid != 0 && unsafe { libc::kill(owner_pid as i32, 0) } == 0
+fn owner_process_is_running(lease: &Lease) -> bool {
+    crate::storage::db::process_identity_is_live(
+        lease.owner_pid,
+        lease.owner_start_token.as_deref(),
+    )
 }
 
-#[cfg(not(unix))]
-fn owner_process_is_running(owner_pid: u32) -> bool {
-    // Windows still reclaims by TTL. Conservatively preserve recent leases
-    // because another CodeFactory instance may be running.
-    owner_pid != 0
+fn browser_process_is_running(lease: &Lease) -> bool {
+    lease
+        .browser_pid
+        .is_some_and(|pid| crate::storage::db::process_identity_is_live(pid, None))
 }
 
 pub fn list_managed_sessions() -> Vec<BrowserSessionView> {
@@ -736,14 +1313,48 @@ pub async fn close_all_for_owner_session(session_id: &str) -> usize {
 /// Recent sessions owned by another live CodeFactory instance are preserved.
 pub async fn reclaim_on_startup() -> usize {
     let at = now_secs();
-    close_matching(|lease| is_expired(lease, at) || !owner_process_is_running(lease.owner_pid))
-        .await
+    close_matching(|lease| is_expired(lease, at) || !owner_process_is_running(lease)).await
 }
 
-async fn reclaim_expired() {
+/// Reclaim dead prior-process sessions only after durable Browser contracts
+/// have been inspected. An unresolved contract is evidence, not garbage: its
+/// lease is required by the read-only observer to decide applied/absent/unknown.
+pub async fn reclaim_on_startup_with_pool(pool: &sqlx::SqlitePool) -> Result<usize> {
+    let protected: std::collections::HashSet<String> =
+        crate::agent::browser_recovery::BrowserRecoveryStore::new(pool.clone())
+            .unresolved_session_ids()
+            .await
+            .map_err(|error| {
+                AppError::Other(format!("load protected browser recovery sessions: {error}"))
+            })?
+            .into_iter()
+            .collect();
+    let at = now_secs();
+    Ok(close_matching(|lease| {
+        !protected.contains(&lease.session_id)
+            && (is_expired(lease, at) || !owner_process_is_running(lease))
+    })
+    .await)
+}
+
+async fn reclaim_expired(pool: Option<&sqlx::SqlitePool>) {
+    let protected: std::collections::HashSet<String> = match pool {
+        Some(pool) => match crate::agent::browser_recovery::BrowserRecoveryStore::new(pool.clone())
+            .unresolved_session_ids()
+            .await
+        {
+            Ok(ids) => ids.into_iter().collect(),
+            // Schema/DB uncertainty must preserve evidence, not delete it.
+            Err(_) => read_leases()
+                .into_iter()
+                .map(|lease| lease.session_id)
+                .collect(),
+        },
+        None => std::collections::HashSet::new(),
+    };
     let at = now_secs();
     for lease in read_leases() {
-        if is_expired(&lease, at) {
+        if is_expired(&lease, at) && !protected.contains(&lease.session_id) {
             shutdown(&lease.session_id, lease.kind).await;
             remove_lease(&lease.session_id);
         }
@@ -782,6 +1393,7 @@ mod tests {
             text: None,
             path: None,
             query: None,
+            expected_url: None,
         }
     }
 
@@ -791,7 +1403,10 @@ mod tests {
         let mut args = args_for("screenshot");
         for bad in ["../outside.png", "/etc/passwd", "a/../../b.png"] {
             args.path = Some(bad.into());
-            assert!(screenshot_path(&args, &cwd).is_err(), "{bad} must be rejected");
+            assert!(
+                screenshot_path(&args, &cwd).is_err(),
+                "{bad} must be rejected"
+            );
         }
         args.path = Some("proof/page.png".into());
         assert_eq!(
@@ -805,12 +1420,14 @@ mod tests {
         // Reading someone's signed-in browser is one thing; acting as them in it
         // is another, and this backend deliberately does not offer the second.
         let ctx = ExecCtx::new(std::env::temp_dir(), None);
+        let authorizer = AllowBrowserMutation;
         for action in ["click", "fill", "press", "screenshot", "open"] {
             let error = dispatch(
                 &args_for(action),
                 &ctx,
                 "codefactory-test",
                 BrowserSessionKind::AttachedChrome,
+                &authorizer,
             )
             .await
             .expect_err("must be refused");
@@ -826,12 +1443,14 @@ mod tests {
         // A managed session drives one page it opened, so a tab list would be
         // meaningless — say so instead of returning something empty.
         let ctx = ExecCtx::new(std::env::temp_dir(), None);
+        let authorizer = AllowBrowserMutation;
         for action in ["tabs", "select_tab"] {
             let error = dispatch(
                 &args_for(action),
                 &ctx,
                 "codefactory-test",
                 BrowserSessionKind::Managed,
+                &authorizer,
             )
             .await
             .expect_err("must be refused");
@@ -845,9 +1464,15 @@ mod tests {
         let ctx = ExecCtx::new(std::env::temp_dir(), None);
         let mut args = args_for("open");
         args.url = Some("file:///etc/passwd".into());
-        let error = dispatch(&args, &ctx, "codefactory-test", BrowserSessionKind::Managed)
-            .await
-            .expect_err("must be refused");
+        let error = dispatch(
+            &args,
+            &ctx,
+            "codefactory-test",
+            BrowserSessionKind::Managed,
+            &AllowBrowserMutation,
+        )
+        .await
+        .expect_err("must be refused");
         assert!(error.contains("http(s)"), "got: {error}");
     }
 
@@ -859,6 +1484,7 @@ mod tests {
             &ctx,
             "codefactory-no-tab",
             BrowserSessionKind::AttachedChrome,
+            &AllowBrowserMutation,
         )
         .await
         .expect_err("no tab selected");
@@ -872,11 +1498,14 @@ mod tests {
             task_id: None,
             owner_session_id: Some("session".into()),
             owner_pid: std::process::id(),
+            owner_start_token: crate::storage::db::current_process_start_token(),
             kind: BrowserSessionKind::Managed,
             selected_tab: None,
             pane_url: Some("https://example.com/path".into()),
             current_host: Some("example.com".into()),
             page_title: None,
+            connection_endpoint: None,
+            browser_pid: None,
             status: "active".into(),
             updated_at_unix_secs: 1_000,
         };
@@ -884,12 +1513,13 @@ mod tests {
         assert!(is_expired(&lease, 1_001 + LEASE_TTL.as_secs()));
     }
 
-
     #[test]
     fn page_derived_output_is_always_labelled_untrusted() {
         // Losing this on one action is how injected page text reaches the model
         // as if it were instructions, so the whole set is pinned.
-        for action in ["open", "attach", "tabs", "read", "find", "snapshot", "click", "fill", "press"] {
+        for action in [
+            "open", "attach", "tabs", "read", "find", "snapshot", "click", "fill", "press",
+        ] {
             assert!(returns_page_data(action), "{action} carries page text");
         }
         // Our own text needs no boundary.
@@ -905,11 +1535,14 @@ mod tests {
             task_id: Some("task-a".into()),
             owner_session_id: Some("session".into()),
             owner_pid: std::process::id(),
+            owner_start_token: crate::storage::db::current_process_start_token(),
             kind: BrowserSessionKind::Managed,
             selected_tab: None,
             pane_url: Some("https://example.com/task".into()),
             current_host: Some("example.com".into()),
             page_title: None,
+            connection_endpoint: None,
+            browser_pid: None,
             status: "active".into(),
             updated_at_unix_secs: now_secs(),
         };
@@ -919,5 +1552,4 @@ mod tests {
         ctx.task_id = Some("task-a".into());
         assert!(lease_belongs_to_ctx(&lease, &ctx));
     }
-
 }

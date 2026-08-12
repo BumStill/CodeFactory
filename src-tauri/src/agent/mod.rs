@@ -3,6 +3,7 @@ use crate::util::no_window::NoWindow;
 pub mod anthropic_client;
 pub mod attachments;
 pub(crate) mod auth_recovery;
+pub(crate) mod browser_recovery;
 pub mod checkpoint;
 pub mod context;
 pub mod context_budget;

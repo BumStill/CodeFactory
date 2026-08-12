@@ -125,16 +125,23 @@ pub async fn close_browser_session(session_id: String) -> Result<(), AppError> {
 /// supported, but the normal path needs neither: `extension_dir` is a folder
 /// CodeFactory has already stamped the pairing into.
 #[tauri::command]
-pub async fn browser_bridge_pairing() -> Result<serde_json::Value, AppError> {
+pub async fn browser_bridge_pairing(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<serde_json::Value, AppError> {
     let bridge = std::sync::Arc::clone(&crate::tools::browser_session::BRIDGE);
     let pairing = bridge
         .start()
         .await
         .map_err(|error| AppError::Other(error.to_string()))?;
+    let connected = bridge.connected().await;
+    if connected {
+        let pool = state.db.read().await.clone();
+        resume_browser_pairing_objectives(&pool).await?;
+    }
     Ok(serde_json::json!({
         "port": pairing.port,
         "token": pairing.token,
-        "connected": bridge.connected().await,
+        "connected": connected,
         "extension_dir": crate::browser::extension_package::existing_dir()
             .map(|dir| dir.display().to_string()),
     }))
@@ -148,7 +155,9 @@ pub async fn browser_bridge_pairing() -> Result<serde_json::Value, AppError> {
 /// administrator rights, so the goal here is that it be the *only* remaining
 /// step: no repository checkout, no build command, and nothing to copy.
 #[tauri::command]
-pub async fn browser_extension_prepare() -> Result<serde_json::Value, AppError> {
+pub async fn browser_extension_prepare(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<serde_json::Value, AppError> {
     let bridge = std::sync::Arc::clone(&crate::tools::browser_session::BRIDGE);
     let pairing = bridge
         .start()
@@ -157,13 +166,31 @@ pub async fn browser_extension_prepare() -> Result<serde_json::Value, AppError> 
     let dir = crate::browser::extension_package::prepare(pairing.port, &pairing.token)
         .map_err(AppError::Other)?;
 
+    let connected = bridge.connected().await;
+    if connected {
+        let pool = state.db.read().await.clone();
+        resume_browser_pairing_objectives(&pool).await?;
+    }
     Ok(serde_json::json!({
         "dir": dir.display().to_string(),
         "port": pairing.port,
         "token": pairing.token,
-        "connected": bridge.connected().await,
+        "connected": connected,
         "chrome_available": crate::browser::chromium::system_chrome().is_some(),
     }))
+}
+
+pub(crate) async fn resume_browser_pairing_objectives(
+    pool: &sqlx::SqlitePool,
+) -> Result<usize, AppError> {
+    crate::agent::objective::ObjectiveStore::new(pool.clone())
+        .resume_waiting_core_inputs(
+            crate::agent::objective::RecoveryDomain::Browser,
+            "browser-pairing:",
+            "browser_pairing_restored",
+        )
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))
 }
 
 /// Show the prepared extension folder in the OS file manager.

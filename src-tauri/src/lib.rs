@@ -210,6 +210,8 @@ pub fn run_browser_session_smoke_cli() -> bool {
                 session_id: Some(owner_session_id.clone()),
                 root_turn_id: None,
                 task_id: None,
+                outer_receipt_id: None,
+                mutation_permit: None,
                 knowledge_library_ids: None,
                 settings: None,
             };
@@ -369,6 +371,8 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             session_id: Some(owner_session_id.clone()),
             root_turn_id: None,
             task_id: None,
+            outer_receipt_id: None,
+            mutation_permit: None,
             knowledge_library_ids: None,
             settings: None,
         };
@@ -617,6 +621,17 @@ pub fn run() {
                     "startup: provider attempts moved to evidence-gated recovery before generic active reconciliation"
                 );
             }
+            let browser_recoveries = tauri::async_runtime::block_on(
+                agent::objective_supervisor::reconcile_browser_recovery_on_startup(
+                    &objective_pool,
+                ),
+            )?;
+            if browser_recoveries > 0 {
+                tracing::info!(
+                    count = browser_recoveries,
+                    "startup: browser operations moved to evidence-gated recovery before generic active reconciliation"
+                );
+            }
             let stale_permission_prompts = tauri::async_runtime::block_on(
                 agent::permission_intent::PermissionIntentStore::new(objective_pool.clone())
                     .reconcile_stale_process_channels(
@@ -660,16 +675,23 @@ pub fn run() {
             );
             agent::objective_supervisor::spawn_objective_recovery_supervisor(
                 app.handle().clone(),
-                objective_pool,
+                objective_pool.clone(),
             );
             app.manage(commands::terminal::TerminalState::new());
 
-            tauri::async_runtime::spawn(async {
-                let reclaimed = tools::browser_session::reclaim_on_startup().await;
-                if reclaimed > 0 {
-                    tracing::info!(
-                        "startup: reclaimed {reclaimed} browser session(s) from the previous run"
-                    );
+            let browser_reclaim_pool = objective_pool.clone();
+            tauri::async_runtime::spawn(async move {
+                match tools::browser_session::reclaim_on_startup_with_pool(&browser_reclaim_pool)
+                    .await
+                {
+                    Ok(reclaimed) if reclaimed > 0 => tracing::info!(
+                        "startup: reclaimed {reclaimed} browser session(s) with no unresolved recovery contract"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "startup: browser session reclamation deferred to preserve recovery evidence"
+                    ),
                 }
             });
 
@@ -679,14 +701,35 @@ pub fn run() {
             // starting here is also what refreshes the pairing file in the
             // extension's folder — so a restart re-pairs itself instead of
             // sending the user back to Settings to copy a new port.
-            tauri::async_runtime::spawn(async {
+            let browser_pairing_pool = objective_pool.clone();
+            tauri::async_runtime::spawn(async move {
                 let bridge = std::sync::Arc::clone(&tools::browser_session::BRIDGE);
                 match bridge.start().await {
                     Ok(pairing) => {
                         tracing::info!(
                             "startup: browser extension bridge listening on {}",
                             pairing.port
-                        )
+                        );
+                        loop {
+                            if bridge.connected().await {
+                                match commands::browser_sessions::resume_browser_pairing_objectives(
+                                    &browser_pairing_pool,
+                                )
+                                .await
+                                {
+                                    Ok(resumed) if resumed > 0 => tracing::info!(
+                                        count = resumed,
+                                        "browser pairing restored; objectives queued for automatic continuation"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(error) => tracing::warn!(
+                                        %error,
+                                        "browser pairing recovery observation deferred"
+                                    ),
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
                     }
                     Err(error) => {
                         // Not fatal: everything except the extension backend works

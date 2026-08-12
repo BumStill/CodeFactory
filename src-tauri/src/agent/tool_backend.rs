@@ -25,9 +25,22 @@ use crate::openrouter::types::{ToolCall, ToolDefinition};
 
 enum MutationAdmission {
     Unbound,
-    Dispatch { receipt_id: Option<String> },
+    Dispatch {
+        receipt_id: Option<String>,
+        browser_execution: Option<super::browser_recovery::BrowserExecutionPermit>,
+    },
     Replay(ToolInvocationResult),
     Waiting(ToolInvocationResult),
+}
+
+#[derive(Debug, Clone)]
+struct BrowserObservationPlan {
+    action: super::browser_recovery::BrowserAction,
+    session_id: String,
+    observer_kind: super::browser_recovery::BrowserObserverKind,
+    safe_locator_json: String,
+    precondition_digest: Option<String>,
+    expected_postcondition_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -403,12 +416,173 @@ fn native_requires_mutation_receipt(
         }
         "browser_session" => !matches!(
             args.get("action").and_then(serde_json::Value::as_str),
-            Some("snapshot" | "tabs")
+            Some("snapshot" | "tabs" | "read" | "find")
         ),
         "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" | "read_pptx"
         | "skill_list" | "skill_search" | "read_xlsx" => false,
         _ => true,
     }
+}
+
+/// `click` and `press` can submit forms, publish content, place orders or
+/// delete data. A DOM ref and a successful CDP send do not make either action
+/// observable after a crash, so require the caller to name a deterministic
+/// URL postcondition before the outer receipt is created. The raw URL remains
+/// in the normalized tool call/ephemeral browser lease; the Browser recovery
+/// contract persists only its digest.
+fn browser_has_observation_contract(args: &serde_json::Value) -> bool {
+    match args.get("action").and_then(serde_json::Value::as_str) {
+        Some("click" | "press") => args
+            .get("expected_url")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|url| {
+                let Ok(url) = reqwest::Url::parse(url) else {
+                    return false;
+                };
+                matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            }),
+        // `fill` is observed by the exact target/value digest; lifecycle and
+        // file actions have deterministic resource/file observers.
+        Some("open" | "attach" | "select_tab" | "close" | "fill" | "screenshot") => true,
+        Some("snapshot" | "tabs") => true,
+        _ => false,
+    }
+}
+
+fn digest_hex(parts: &[&str]) -> String {
+    opaque_digest(parts)
+        .strip_prefix("sha256:")
+        .expect("opaque digest prefix")
+        .to_string()
+}
+
+fn browser_observation_plan(
+    args: &serde_json::Value,
+    receipt_id: &str,
+    resource_id: &str,
+    working_directory: &std::path::Path,
+) -> Option<BrowserObservationPlan> {
+    use super::browser_recovery::{BrowserAction, BrowserObserverKind};
+
+    let action = args.get("action")?.as_str()?;
+    let supplied_session = args.get("session_id").and_then(serde_json::Value::as_str);
+    let session_id = match action {
+        "open" | "attach" => format!(
+            "codefactory-receipt-{}",
+            digest_hex(&["browser_session", receipt_id, resource_id])
+        ),
+        _ => supplied_session?.to_string(),
+    };
+    let session_digest = digest_hex(&["browser_session_id", &session_id]);
+    let mut locator = serde_json::Map::new();
+    locator.insert("session_digest".into(), session_digest.into());
+
+    let (action, observer_kind, precondition, expected) = match action {
+        "click" => {
+            let target = args.get("target")?.as_str()?;
+            let expected_url = args.get("expected_url")?.as_str()?;
+            locator.insert(
+                "target_digest".into(),
+                digest_hex(&["target", target]).into(),
+            );
+            (
+                BrowserAction::Click,
+                BrowserObserverKind::PageDigest,
+                None,
+                Some(digest_hex(&["page_url", expected_url])),
+            )
+        }
+        "fill" => {
+            let target = args.get("target")?.as_str()?;
+            let text = args.get("text")?.as_str()?;
+            locator.insert(
+                "target_digest".into(),
+                digest_hex(&["target", target]).into(),
+            );
+            (
+                BrowserAction::Fill,
+                BrowserObserverKind::ElementDigest,
+                None,
+                Some(digest_hex(&["fill_value", target, text])),
+            )
+        }
+        "press" => {
+            let key = args
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| args.get("target").and_then(serde_json::Value::as_str))?;
+            let expected_url = args.get("expected_url")?.as_str()?;
+            locator.insert(
+                "focus_digest".into(),
+                digest_hex(&["focus_key", key]).into(),
+            );
+            (
+                BrowserAction::Press,
+                BrowserObserverKind::PageDigest,
+                None,
+                Some(digest_hex(&["page_url", expected_url])),
+            )
+        }
+        "open" => {
+            let url = args.get("url")?.as_str()?;
+            (
+                BrowserAction::Open,
+                BrowserObserverKind::PageDigest,
+                None,
+                Some(digest_hex(&["page_url", url])),
+            )
+        }
+        "attach" => (
+            BrowserAction::Attach,
+            BrowserObserverKind::SessionPresence,
+            None,
+            Some(digest_hex(&["session_present", &session_id])),
+        ),
+        "select_tab" => {
+            let target = args.get("target")?.as_str()?;
+            locator.insert("tab_digest".into(), digest_hex(&["tab", target]).into());
+            (
+                BrowserAction::SelectTab,
+                BrowserObserverKind::TabDigest,
+                None,
+                Some(digest_hex(&["selected_tab", &session_id, target])),
+            )
+        }
+        "close" => (
+            BrowserAction::Close,
+            BrowserObserverKind::SessionPresence,
+            Some(digest_hex(&["session_present", &session_id])),
+            Some(digest_hex(&["session_absent", &session_id])),
+        ),
+        "screenshot" => {
+            let path = args.get("path")?.as_str()?;
+            locator.insert("path_digest".into(), digest_hex(&["path", path]).into());
+            let screenshot_path = working_directory.join(path);
+            let precondition = std::fs::read(screenshot_path).ok().map(|bytes| {
+                use sha2::Digest;
+                format!("{:x}", sha2::Sha256::digest(bytes))
+            });
+            (
+                BrowserAction::Screenshot,
+                BrowserObserverKind::WorkspaceFileSha256,
+                precondition,
+                None,
+            )
+        }
+        _ => return None,
+    };
+    Some(BrowserObservationPlan {
+        action,
+        session_id,
+        observer_kind,
+        safe_locator_json: serde_json::Value::Object(locator).to_string(),
+        precondition_digest: precondition,
+        expected_postcondition_digest: expected,
+    })
 }
 
 fn waiting_result(command: &str, kind: ToolKind, code: &str) -> ToolInvocationResult {
@@ -511,6 +685,14 @@ impl DesktopToolBackend {
         .map_err(|error| ToolError {
             message: format!("ensure tool observation schema: {error}"),
         })?;
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0014_browser_recovery_contracts.sql"
+        ))
+        .execute(&self.db)
+        .await
+        .map_err(|error| ToolError {
+            message: format!("ensure browser recovery schema: {error}"),
+        })?;
         Ok(())
     }
 
@@ -524,6 +706,13 @@ impl DesktopToolBackend {
         is_mcp_tool: bool,
     ) -> Result<MutationAdmission, ToolError> {
         self.ensure_observation_schema().await?;
+        if call.function.name == "browser_session" && !browser_has_observation_contract(args) {
+            return Ok(MutationAdmission::Waiting(waiting_result(
+                command,
+                kind,
+                "browser_observation_contract_required",
+            )));
+        }
         let lacks_external_observer = is_mcp_tool
             || (call.function.name == "bash"
                 && args
@@ -791,7 +980,10 @@ impl DesktopToolBackend {
             tx.commit().await.map_err(|error| ToolError {
                 message: format!("commit delivery Objective attribution: {error}"),
             })?;
-            return Ok(MutationAdmission::Dispatch { receipt_id: None });
+            return Ok(MutationAdmission::Dispatch {
+                receipt_id: None,
+                browser_execution: None,
+            });
         }
 
         // Provider call ids change across forced reprompts and process resume.
@@ -834,6 +1026,86 @@ impl DesktopToolBackend {
                 return Ok(MutationAdmission::Replay(replay));
             }
             if matches!(status.as_str(), "started" | "unknown") {
+                let browser_store =
+                    super::browser_recovery::BrowserRecoveryStore::new(self.db.clone());
+                let browser_contract: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM browser_recovery_contracts WHERE receipt_id=?",
+                )
+                .bind(&existing_receipt_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| ToolError {
+                    message: format!("load browser replay contract: {error}"),
+                })?;
+                if browser_contract == 1 {
+                    tx.commit().await.map_err(|error| ToolError {
+                        message: format!("commit browser replay attribution: {error}"),
+                    })?;
+                    let disposition = browser_store
+                        .disposition(&existing_receipt_id)
+                        .await
+                        .map_err(|error| ToolError {
+                            message: format!("inspect browser recovery disposition: {error}"),
+                        })?;
+                    use super::browser_recovery::BrowserRecoveryDisposition as Disposition;
+                    match disposition {
+                        Disposition::AwaitingSettlement | Disposition::ObservedApplied => {
+                            browser_store
+                                .settle(&existing_receipt_id, chrono::Utc::now().timestamp_millis())
+                                .await
+                                .map_err(|error| ToolError {
+                                    message: format!("settle observed browser receipt: {error}"),
+                                })?;
+                            return Ok(MutationAdmission::Replay(replay_result(
+                                command,
+                                kind,
+                                Some(ObservationState::Applied),
+                            )));
+                        }
+                        Disposition::SettledCommitted | Disposition::SettledReconciled => {
+                            return Ok(MutationAdmission::Replay(replay_result(
+                                command,
+                                kind,
+                                Some(ObservationState::Applied),
+                            )));
+                        }
+                        Disposition::Prepared
+                        | Disposition::ReplayableExactGeneration
+                        | Disposition::ReplayableDigestCas
+                            if ctx.mutation_permit.is_some() =>
+                        {
+                            let operation = browser_store
+                                .operation_permit(&existing_receipt_id)
+                                .await
+                                .map_err(|error| ToolError {
+                                    message: format!("load browser retry permit: {error}"),
+                                })?;
+                            return Ok(MutationAdmission::Dispatch {
+                                receipt_id: Some(existing_receipt_id),
+                                browser_execution: Some(
+                                    super::browser_recovery::BrowserExecutionPermit {
+                                        operation,
+                                        recovery: ctx.mutation_permit.clone(),
+                                    },
+                                ),
+                            });
+                        }
+                        Disposition::Conflict => {
+                            return Ok(MutationAdmission::Waiting(waiting_result(
+                                command,
+                                kind,
+                                "browser_observation_conflict",
+                            )));
+                        }
+                        _ => {
+                            return Ok(MutationAdmission::Waiting(waiting_result(
+                                command,
+                                kind,
+                                "browser_external_state_uncertain",
+                            )));
+                        }
+                    }
+                }
                 if let Some(contract) = sqlx::query(
                     "SELECT safe_locator_json, precondition_digest,
                             expected_postcondition_digest, last_dispatch_epoch
@@ -986,6 +1258,7 @@ impl DesktopToolBackend {
                             })?;
                             return Ok(MutationAdmission::Dispatch {
                                 receipt_id: Some(existing_receipt_id),
+                                browser_execution: None,
                             });
                         }
                     }
@@ -1040,6 +1313,43 @@ impl DesktopToolBackend {
         .map_err(|error| ToolError {
             message: format!("persist started mutation receipt: {error}"),
         })?;
+        let browser_execution = if call.function.name == "browser_session" {
+            let plan =
+                browser_observation_plan(args, &receipt_id, resource_id, &ctx.working_directory)
+                    .ok_or_else(|| ToolError {
+                        message: "browser mutation lacks a durable observation plan".into(),
+                    })?;
+            let operation = super::browser_recovery::BrowserRecoveryStore::create_prepared_in_tx(
+                &mut tx,
+                super::browser_recovery::BrowserPreparedOperation {
+                    receipt_id: receipt_id.clone(),
+                    objective_id: objective_id.clone(),
+                    objective_revision: revision,
+                    binding_id: binding_id.clone(),
+                    resource_generation,
+                    action_fingerprint: action_fingerprint.clone(),
+                    tool_call_id: trace_id.clone(),
+                    action: plan.action,
+                    session_id: plan.session_id,
+                    session_generation: 1,
+                    observer_kind: plan.observer_kind,
+                    safe_locator_json: plan.safe_locator_json,
+                    precondition_digest: plan.precondition_digest,
+                    expected_postcondition_digest: plan.expected_postcondition_digest,
+                    now,
+                },
+            )
+            .await
+            .map_err(|error| ToolError {
+                message: format!("persist browser recovery contract: {error}"),
+            })?;
+            Some(super::browser_recovery::BrowserExecutionPermit {
+                operation,
+                recovery: ctx.mutation_permit.clone(),
+            })
+        } else {
+            None
+        };
         if let Some(observation) = file_observation {
             let dispatch_epoch = ctx
                 .mutation_permit
@@ -1076,6 +1386,7 @@ impl DesktopToolBackend {
         })?;
         Ok(MutationAdmission::Dispatch {
             receipt_id: Some(receipt_id),
+            browser_execution,
         })
     }
 
@@ -1085,6 +1396,53 @@ impl DesktopToolBackend {
         result: Option<&ToolInvocationResult>,
         ctx: &ToolCtx,
     ) -> Result<(), ToolError> {
+        let browser_contract: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM browser_recovery_contracts WHERE receipt_id=?",
+        )
+        .bind(receipt_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|error| ToolError {
+            message: format!("load settling browser contract: {error}"),
+        })?;
+        if browser_contract == 1 {
+            let succeeded = result.is_some_and(|result| {
+                result.status == ToolExecutionStatus::Done && !result.is_error
+            });
+            if succeeded {
+                let settlement =
+                    super::browser_recovery::BrowserRecoveryStore::new(self.db.clone())
+                        .settle(receipt_id, chrono::Utc::now().timestamp_millis())
+                        .await
+                        .map_err(|error| ToolError {
+                            message: format!("settle browser recovery contract: {error}"),
+                        })?;
+                if !matches!(
+                    settlement,
+                    super::browser_recovery::BrowserSettlement::Committed
+                        | super::browser_recovery::BrowserSettlement::Reconciled
+                ) {
+                    return Err(ToolError {
+                        message: format!(
+                            "browser action returned success without durable settlement: {settlement:?}"
+                        ),
+                    });
+                }
+                return Ok(());
+            }
+            sqlx::query(
+                "UPDATE side_effect_receipts SET status='unknown', observed_at=?
+                 WHERE id=? AND status IN ('started','unknown')",
+            )
+            .bind(chrono::Utc::now().timestamp_millis())
+            .bind(receipt_id)
+            .execute(&self.db)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("persist browser mutation uncertainty: {error}"),
+            })?;
+            return Ok(());
+        }
         let contract = sqlx::query(
             "SELECT safe_locator_json, precondition_digest, expected_postcondition_digest
              FROM side_effect_observation_contracts WHERE receipt_id=?",
@@ -1204,12 +1562,15 @@ impl ToolBackend for DesktopToolBackend {
         } else {
             MutationAdmission::Unbound
         };
-        let receipt_id = match admission {
+        let (receipt_id, browser_execution) = match admission {
             MutationAdmission::Replay(result) | MutationAdmission::Waiting(result) => {
                 return Ok(result)
             }
-            MutationAdmission::Unbound => None,
-            MutationAdmission::Dispatch { receipt_id } => receipt_id,
+            MutationAdmission::Unbound => (None, None),
+            MutationAdmission::Dispatch {
+                receipt_id,
+                browser_execution,
+            } => (receipt_id, browser_execution),
         };
 
         let exec_ctx = crate::tools::ExecCtx {
@@ -1220,6 +1581,10 @@ impl ToolBackend for DesktopToolBackend {
             session_id: ctx.session_id.clone(),
             root_turn_id: ctx.root_turn_id.clone(),
             task_id: ctx.task_id.clone(),
+            outer_receipt_id: receipt_id.clone(),
+            mutation_permit: browser_execution
+                .as_ref()
+                .and_then(|execution| execution.recovery.clone()),
             knowledge_library_ids: ctx.knowledge_library_ids.clone(),
             settings: Some(self.settings.read().await.clone()),
         };
@@ -1512,6 +1877,7 @@ mod tests {
         {
             MutationAdmission::Dispatch {
                 receipt_id: Some(receipt_id),
+                ..
             } => receipt_id,
             _ => panic!("a fresh observable file mutation must be admitted exactly once"),
         }
@@ -1582,6 +1948,7 @@ mod tests {
         let receipt_id = match admission {
             MutationAdmission::Dispatch {
                 receipt_id: Some(receipt_id),
+                ..
             } => receipt_id,
             _ => panic!("{tool_name} must not dispatch without a generic started receipt"),
         };
@@ -2114,14 +2481,81 @@ mod tests {
 
     #[tokio::test]
     async fn browser_open_close_and_select_tab_require_mutation_receipts() {
-        for action in ["open", "close", "select_tab", "attach"] {
+        for (action, args) in [
+            (
+                "open",
+                serde_json::json!({"action": "open", "url": "https://example.invalid"}),
+            ),
+            (
+                "close",
+                serde_json::json!({"action": "close", "session_id": "codefactory-existing"}),
+            ),
+            (
+                "select_tab",
+                serde_json::json!({
+                    "action": "select_tab",
+                    "session_id": "codefactory-existing",
+                    "target": "tab-1"
+                }),
+            ),
+            ("attach", serde_json::json!({"action": "attach"})),
+        ] {
             assert_objective_bound_call_starts_receipt(
                 "browser_session",
                 &format!("browser-{action}"),
-                &serde_json::json!({"action": action, "url": "https://example.invalid"}),
+                &args,
             )
             .await;
         }
+    }
+
+    #[test]
+    fn browser_read_actions_never_require_a_mutation_receipt() {
+        for action in ["tabs", "read", "find", "snapshot"] {
+            let args = serde_json::json!({"action": action});
+            assert!(!native_requires_mutation_receipt(
+                "browser_session",
+                &args,
+                &ToolKind::ReadOnly,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn unobservable_browser_act_is_fenced_before_native_dispatch() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "action": "click",
+            "session_id": "codefactory-never-dispatch",
+            "target": "ref_1"
+        });
+        let call = call_with_args(
+            "browser-click-without-postcondition",
+            "browser_session",
+            &args,
+        );
+        register_tool_call(&backend, &call, &args).await;
+
+        let output = backend
+            .execute(&call, &args, &objective_ctx(dir.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(output.status, ToolExecutionStatus::Waiting);
+        assert_eq!(
+            output
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("browser_observation_contract_required"),
+        );
+        let receipt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(receipt_count, 0, "no dispatchable receipt may be created");
     }
 
     #[tokio::test]
