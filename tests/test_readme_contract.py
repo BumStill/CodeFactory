@@ -201,6 +201,8 @@ class ReadmeContractTests(unittest.TestCase):
             self.assertEqual(contract._live_pr_body(301), "README-Update: reviewed\n")
             sp.run.assert_called_once()
             self.assertIn("301", sp.run.call_args[0][0])
+            self.assertEqual(sp.run.call_args.kwargs.get("encoding"), "utf-8")
+            self.assertEqual(sp.run.call_args.kwargs.get("errors"), "replace")
 
     def test_live_body_lookup_falls_back_instead_of_hard_failing(self) -> None:
         # No gh, no network, or a PR the token cannot read must not turn the

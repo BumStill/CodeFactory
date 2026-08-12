@@ -56,7 +56,7 @@ describe("ReasoningEffortPicker model capabilities", () => {
     render(<ReasoningEffortPicker />);
 
     const picker = screen.getByRole("combobox", { name: "下一回合思考强度" });
-    expect(picker).toHaveClass("min-h-11", "lg:min-h-9");
+    expect(picker).toHaveClass("min-h-[44px]", "lg:min-h-[36px]");
     expect(picker).toHaveValue("max");
     expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
       "思考·低",

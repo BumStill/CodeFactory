@@ -78,7 +78,7 @@ describe("ContextUsageBar compact ring", () => {
 
     await waitForUsageRefresh("s1");
     const trigger = screen.getByRole("button", { name: /上下文.*详情/ });
-    expect(trigger).toHaveClass("min-h-11", "min-w-11", "lg:min-h-9", "lg:min-w-9");
+    expect(trigger).toHaveClass("min-h-[44px]", "min-w-[44px]", "lg:min-h-[36px]", "lg:min-w-[36px]");
     const meter = within(trigger).getByRole("meter", { name: "上下文占用" });
     expect(meter).toHaveAttribute("aria-valuenow", "58");
     expect(meter).toHaveAttribute("aria-valuetext", expect.stringMatching(/58%/));

@@ -53,7 +53,9 @@ vi.mock("../../components/GitHistoryPanel", () => ({ GitHistoryPanel: () => null
 vi.mock("../../components/RemoteGitPanel", () => ({ RemoteGitPanel: () => null }));
 vi.mock("../../components/WorkspaceDeliveryStatus", () => ({ WorkspaceDeliveryStatus: () => null }));
 vi.mock("../../components/WelcomeUsageCard", () => ({ WelcomeUsageCard: () => null }));
-vi.mock("../../components/MessageInput", () => ({ MessageInput: () => <div>输入框</div> }));
+vi.mock("../../components/MessageInput", () => ({
+  MessageInput: ({ toolbar }: { toolbar?: React.ReactNode }) => <div>输入框{toolbar}</div>,
+}));
 vi.mock("../../components/ContextUsageBar", () => ({ ContextUsageBar: () => null }));
 vi.mock("../../components/PermissionDialog", () => ({ PermissionDialog: () => null }));
 vi.mock("../../components/QueueBadge", () => ({ QueueBadge: () => null }));
@@ -159,7 +161,7 @@ describe("picking a project never opens its history", () => {
       />,
     );
 
-    expect(screen.getByLabelText("会话权限")).toHaveValue("standard");
+    expect(screen.getByRole("button", { name: /会话权限.*标准/ })).toBeInTheDocument();
   });
 
   it("never asks the user to classify the work before starting it", async () => {
@@ -178,7 +180,7 @@ describe("picking a project never opens its history", () => {
   it("keeps the blank draft when a project is picked from the composer scope bar", async () => {
     render(<Shell />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "选择项目" }));
+    fireEvent.click(await screen.findByRole("button", { name: /选择项目/ }));
     const menu = await screen.findByRole("menu", { name: "项目选择" });
     fireEvent.click(within(menu).getByTitle("/code/ledger"));
 

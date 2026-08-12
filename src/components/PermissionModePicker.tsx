@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useId } from "react";
-import { ShieldCheck } from "lucide-react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { Check, ShieldCheck } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import type { PermissionMode } from "../lib/tauri";
 
@@ -18,39 +19,160 @@ export function PermissionModePicker({
   const activeSession = useChatStore((s) => s.activeSession);
   const update = useChatStore((s) => s.updateActiveSessionPermissionMode);
   const descriptionId = `permission-mode-description-${useId().replace(/:/g, "")}`;
+  const menuId = `permission-mode-menu-${useId().replace(/:/g, "")}`;
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [menuPosition, setMenuPosition] = useState({ left: 8, top: 8 });
+
+  const closeAndRestoreFocus = useCallback(() => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }, []);
+
+  const updateMenuPosition = useCallback(() => {
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect || typeof window === "undefined") return;
+    const gutter = 8;
+    const menuWidth = Math.min(288, window.innerWidth - gutter * 2);
+    const menuHeight = 184;
+    setMenuPosition({
+      left: Math.max(gutter, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - gutter)),
+      top: Math.max(gutter, rect.top - menuHeight - 4),
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updateMenuPosition();
+    window.addEventListener("resize", updateMenuPosition);
+    window.addEventListener("scroll", updateMenuPosition, true);
+    return () => {
+      window.removeEventListener("resize", updateMenuPosition);
+      window.removeEventListener("scroll", updateMenuPosition, true);
+    };
+  }, [open, updateMenuPosition]);
+
+  useEffect(() => {
+    if (!open) return;
+    const focusFrame = requestAnimationFrame(() => {
+      menuRef.current
+        ?.querySelector<HTMLElement>('[role="menuitemradio"][aria-checked="true"]')
+        ?.focus();
+    });
+    const onMouseDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeAndRestoreFocus();
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(focusFrame);
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeAndRestoreFocus, open]);
+
   if (!activeSession || activeSession.kind === "anonymous") return null;
   const mode = activeSession.permission_mode ?? "standard";
   const current = OPTIONS.find((option) => option.id === mode) ?? OPTIONS[1];
+  const description = `当前为${current.label}模式：${current.description}。更改将在下一次权限判断生效。`;
+  const visibleRisk = mode !== "standard";
+
+  const selectMode = (next: PermissionMode) => {
+    setOpen(false);
+    if (onChangeForAcceptance) {
+      onChangeForAcceptance(next);
+    } else {
+      void update(next);
+    }
+    requestAnimationFrame(() => triggerRef.current?.focus());
+  };
+
   return (
-    <label
-      className="flex min-h-11 min-w-0 shrink items-center gap-1 rounded-lg px-1 text-label text-gray-400 hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
-      title={`会话权限：${current.description}；下一次权限判断生效`}
-    >
-      <ShieldCheck size={14} aria-hidden="true" />
-      <span className="sr-only">会话权限</span>
-      <span className="hidden lg:inline">会话权限</span>
-      <span id={descriptionId} className="sr-only">
-        当前为{current.label}模式：{current.description}。更改将在下一次权限判断生效。
-      </span>
-      <select
+    <>
+      <span id={descriptionId} className="sr-only">{description}</span>
+      <button
+        ref={triggerRef}
         id="workspace-permission-mode"
-        aria-label="会话权限"
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-label={`会话权限：${current.label}`}
         aria-describedby={descriptionId}
-        value={mode}
-        onChange={(event) => {
-          const next = event.target.value as PermissionMode;
-          if (onChangeForAcceptance) {
-            onChangeForAcceptance(next);
-          } else {
-            void update(next);
-          }
-        }}
-        className="min-h-11 rounded-lg border border-transparent bg-transparent px-1 text-label text-gray-300 outline-none hover:border-border focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
+        aria-expanded={open}
+        aria-controls={menuId}
+        aria-haspopup="menu"
+        title={`会话权限：${current.description}；下一次权限判断生效`}
+        className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-lg px-2 text-label transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px] lg:min-w-[36px] ${
+          mode === "trusted"
+            ? "bg-status-warning-soft text-status-warning hover:brightness-95"
+            : mode === "safe"
+              ? "bg-status-progress-soft text-status-progress hover:brightness-95"
+              : "text-gray-500 hover:bg-surface-3 hover:text-gray-200"
+        }`}
       >
-        {OPTIONS.map((option) => (
-          <option key={option.id} value={option.id}>{option.label}</option>
-        ))}
-      </select>
-    </label>
+        <ShieldCheck size={14} aria-hidden="true" />
+        {visibleRisk && <span>{current.label}</span>}
+      </button>
+      {open && typeof document !== "undefined" && createPortal(
+        <div
+          ref={menuRef}
+          id={menuId}
+          role="menu"
+          aria-label="选择会话权限"
+          onKeyDown={(event) => {
+            if (event.key === "Tab") {
+              event.preventDefault();
+              closeAndRestoreFocus();
+              return;
+            }
+            if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const items = Array.from(
+              menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitemradio"]') ?? [],
+            );
+            if (items.length === 0) return;
+            const currentIndex = items.indexOf(document.activeElement as HTMLElement);
+            const nextIndex = event.key === "Home"
+              ? 0
+              : event.key === "End"
+                ? items.length - 1
+                : event.key === "ArrowDown"
+                  ? (currentIndex + 1 + items.length) % items.length
+                  : (currentIndex - 1 + items.length) % items.length;
+            items[nextIndex]?.focus();
+          }}
+          style={{ left: menuPosition.left, top: menuPosition.top }}
+          className="fixed z-[100] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-border bg-surface-2 p-1 shadow-2xl"
+        >
+          <p className="px-2 pb-1 pt-1.5 text-caption font-medium text-gray-500">下一次权限判断生效</p>
+          {OPTIONS.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              role="menuitemradio"
+              aria-checked={mode === option.id}
+              onClick={() => selectMode(option.id)}
+              className="flex min-h-[44px] w-full items-start gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+            >
+              <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
+                {mode === option.id && <Check size={14} className="text-accent" aria-hidden="true" />}
+              </span>
+              <span className="min-w-0">
+                <span className="block text-label text-gray-200">{option.label}</span>
+                <span className="block text-caption text-gray-500">{option.description}</span>
+              </span>
+            </button>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }
