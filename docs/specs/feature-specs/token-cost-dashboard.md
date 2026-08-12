@@ -1,7 +1,7 @@
 ---
 req_id: CF-010
 title: Token 成本仪表盘
-status: approved
+status: superseded
 tags: [cost, analytics, dashboard]
 acceptance_criteria:
   - 每次 AI 响应完成后，input/output token 数与成本被写入 cost_entries 表
@@ -10,6 +10,8 @@ acceptance_criteria:
   - 支持多 endpoint / model 的成本分开记录
   - 月度成本按 OpenRouter 定价公式估算（$1 = 1M token 作为默认，可被覆盖）
 ---
+
+> 历史规格：本文件的采集目标已由 `token-usage-dashboard.md` 继承；ChatPage 顶部三个常驻指标和旧 `TokenCostBar` 位置已被 CF-USAGE-R13/R14 与 CF-WB-R19/R21 取代。当前权威交互是在 composer 常驻 context 圆环，累计 Token/成本进入点击详情与「用量与预算」页。
 
 # CF-010 Token 成本仪表盘
 
@@ -91,7 +93,7 @@ CREATE TABLE IF NOT EXISTS cost_entries (
 - 发射 `token-usage-recorded` Tauri event
 - 验证：cargo check 通过
 
-### Task 4: 前端 TokenCostBar 组件
+### Task 4: 前端 TokenCostBar 组件（历史实现，已被新信息架构取代）
 依赖：Task 2, Task 3
 - 创建 `src/components/TokenCostBar.tsx`
 - 集成到 ChatPage 顶部工具栏

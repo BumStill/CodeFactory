@@ -23,8 +23,8 @@ const LABELS: Record<ReasoningEffort, string> = {
   ultra: "极致",
 };
 
-function isDeepSeekEndpoint(settings: Settings | null): boolean {
-  const ep = settings?.endpoints?.[settings.default_endpoint];
+function isDeepSeekEndpoint(settings: Settings | null, endpointId?: string): boolean {
+  const ep = settings?.endpoints?.[endpointId ?? settings.default_endpoint];
   if (!ep) return false;
   const base = (ep.base_url ?? "").toLowerCase();
   const models = ep.custom_models ?? [];
@@ -38,17 +38,18 @@ function isDeepSeekEndpoint(settings: Settings | null): boolean {
  *  ChatGPT/Codex endpoint honours reasoning.effort, and DeepSeek models
  *  (deepseek.com direct or deepseek/… via OpenRouter) accept reasoning_effort
  *  low|high|max. Exported for testing. */
-export function reasoningPickerVisible(settings: Settings | null): boolean {
+export function reasoningPickerVisible(settings: Settings | null, endpointId?: string): boolean {
   // Defensive: settings (or endpoints) may be partial while loading.
-  const ep = settings?.endpoints?.[settings.default_endpoint];
-  return ep?.api_style === "chatgpt" || isDeepSeekEndpoint(settings);
+  const ep = settings?.endpoints?.[endpointId ?? settings.default_endpoint];
+  return ep?.api_style === "chatgpt" || isDeepSeekEndpoint(settings, endpointId);
 }
 
 export function reasoningEffortsForModel(
   settings: Settings | null,
   modelId: string,
+  endpointId?: string,
 ): ReasoningEffort[] {
-  const endpoint = settings?.endpoints?.[settings.default_endpoint];
+  const endpoint = settings?.endpoints?.[endpointId ?? settings.default_endpoint];
   const model = endpoint?.custom_models?.find((candidate) => candidate.id === modelId);
   if (model?.supported_reasoning_efforts?.length) {
     return model.supported_reasoning_efforts;
@@ -75,21 +76,26 @@ export function ReasoningEffortPicker() {
   const settings = useSettingsStore((s) => s.settings);
   const activeSession = useChatStore((s) => s.activeSession);
   const setEffort = useChatStore((s) => s.updateActiveSessionReasoningEffort);
-  if (!settings || !reasoningPickerVisible(settings) || !activeSession) return null;
+  if (!settings || !activeSession) return null;
+  // Legacy rows may not yet own an endpoint. Prefer the persisted session
+  // endpoint whenever present; only those unresolved rows inherit the default.
+  const endpointId = activeSession.endpoint_id ?? settings.default_endpoint;
+  if (!reasoningPickerVisible(settings, endpointId)) return null;
   // Per-session override; falls back to the global default for display.
   const globalDefault: ReasoningEffort = settings.reasoning_effort ?? "medium";
   const requested: ReasoningEffort =
     (activeSession.reasoning_effort as ReasoningEffort | null | undefined) ?? globalDefault;
-  const endpoint = settings.endpoints[settings.default_endpoint];
+  const endpoint = settings.endpoints[endpointId];
   const model = endpoint?.custom_models?.find((candidate) => candidate.id === activeSession.model_id);
-  const efforts = reasoningEffortsForModel(settings, activeSession.model_id);
+  const efforts = reasoningEffortsForModel(settings, activeSession.model_id, endpointId);
   const effort = effectiveEffort(requested, efforts, model?.default_reasoning_effort);
   return (
     <select
+      aria-label="下一回合思考强度"
       value={effort}
       onChange={(e) => void setEffort(e.target.value as ReasoningEffort)}
-      title="思考强度 (reasoning effort) — 仅作用于当前会话，立即对后续请求生效"
-      className="rounded border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3"
+      title="思考强度 (reasoning effort) — 仅作用于当前会话，从下一回合开始生效"
+      className="min-h-11 rounded-lg border border-border bg-surface-2 px-2 py-1 text-xs text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
     >
       {efforts.map((v) => (
         <option key={v} value={v}>

@@ -471,6 +471,7 @@ pub struct TurnPlanSnapshot {
     pub steps: Vec<codefactory_agent_loop::types::PlanStepEvent>,
     pub explanation: Option<String>,
     pub waiting_reason: Option<String>,
+    pub next_action_owner: codefactory_agent_loop::types::NextActionOwner,
     pub change_reason: Option<String>,
     pub waiting_history: Vec<String>,
     pub change_history: Vec<String>,
@@ -484,6 +485,7 @@ struct TurnPlanSnapshotRow {
     plan_json: String,
     explanation: Option<String>,
     waiting_reason: Option<String>,
+    next_action_owner: String,
     change_reason: Option<String>,
     created_at: i64,
 }
@@ -821,10 +823,10 @@ async fn load_latest_turn_plans(
     // even after thousands of newer plan events in the same session.
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT root_turn_id, revision, plan_json, explanation,
-                waiting_reason, change_reason, created_at
+                waiting_reason, next_action_owner, change_reason, created_at
          FROM (
              SELECT root_turn_id, revision, plan_json, explanation,
-                    waiting_reason, change_reason, created_at,
+                    waiting_reason, next_action_owner, change_reason, created_at,
                     ROW_NUMBER() OVER (
                         PARTITION BY root_turn_id
                         ORDER BY revision DESC, created_at DESC
@@ -898,6 +900,9 @@ async fn load_latest_turn_plans(
                 steps,
                 explanation: row.explanation,
                 waiting_reason: row.waiting_reason,
+                next_action_owner: codefactory_agent_loop::types::NextActionOwner::from_persisted(
+                    &row.next_action_owner,
+                ),
                 change_reason: row.change_reason,
                 waiting_history: Vec::new(),
                 change_history: Vec::new(),
@@ -1207,6 +1212,7 @@ mod tests {
                 plan_json TEXT NOT NULL,
                 explanation TEXT,
                 waiting_reason TEXT,
+                next_action_owner TEXT NOT NULL DEFAULT 'system',
                 change_reason TEXT,
                 created_at INTEGER NOT NULL,
                 UNIQUE(root_turn_id, revision)
@@ -1389,21 +1395,22 @@ mod tests {
             ])
             .to_string()
         };
-        for (revision, status, waiting_reason) in [
-            (1_i64, "in_progress", None),
-            (2_i64, "in_progress", Some("等待 CI")),
-            (3_i64, "completed", None),
+        for (revision, status, waiting_reason, next_action_owner) in [
+            (1_i64, "in_progress", None, "system"),
+            (2_i64, "in_progress", Some("等待 CI"), "external"),
+            (3_i64, "completed", Some("等待 required checks"), "external"),
         ] {
             sqlx::query(
                 "INSERT INTO chat_plan_events (
                     id, session_id, root_turn_id, revision, plan_json,
-                    waiting_reason, created_at
-                 ) VALUES (?, 'plan-session', 'root-plan', ?, ?, ?, ?)",
+                    waiting_reason, next_action_owner, created_at
+                 ) VALUES (?, 'plan-session', 'root-plan', ?, ?, ?, ?, ?)",
             )
             .bind(format!("event-{revision}"))
             .bind(revision)
             .bind(steps(status))
             .bind(waiting_reason)
+            .bind(next_action_owner)
             .bind(revision)
             .execute(&pool)
             .await
@@ -1415,7 +1422,14 @@ mod tests {
             .expect("load page");
         assert_eq!(page.plans.len(), 1);
         assert_eq!(page.plans[0].revision, 3);
-        assert_eq!(page.plans[0].waiting_history, vec!["等待 CI"]);
+        assert_eq!(
+            page.plans[0].waiting_history,
+            vec!["等待 CI", "等待 required checks"]
+        );
+        assert_eq!(
+            page.plans[0].next_action_owner,
+            codefactory_agent_loop::types::NextActionOwner::External,
+        );
         assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_MESSAGE_PAGE_SERIALIZED_BYTES);
     }
 

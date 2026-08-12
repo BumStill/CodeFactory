@@ -461,6 +461,7 @@ describe("persisted chat hydration", () => {
             status: "completed",
           },
         ],
+        next_action_owner: "external",
         created_at: 3,
       },
     ];
@@ -468,7 +469,11 @@ describe("persisted chat hydration", () => {
     const hydrated = dbMessagesToUI(rows, plans);
     expect(hydrated[1].toolCalls?.map((tool) => tool.name)).toEqual(["bash"]);
     expect(hydrated[2].plan).toEqual(
-      expect.objectContaining({ rootTurnId: "root-turn", revision: 3 }),
+      expect.objectContaining({
+        rootTurnId: "root-turn",
+        revision: 3,
+        nextActionOwner: "external",
+      }),
     );
     expect(hydrated[2].turnToolCalls).toEqual([
       expect.objectContaining({ id: "build-call", status: "done" }),

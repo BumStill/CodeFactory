@@ -112,6 +112,7 @@ describe("Workspace virtual draft", () => {
     const composer = screen.getByTestId("workspace-composer-shell");
     expect(within(composer).getByRole("button", { name: "选择模型" })).toHaveTextContent("模型：model");
     expect(within(workspaceHeader).queryByRole("button", { name: "选择模型" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "选择模型" })).toHaveLength(1);
     expect(screen.getByRole("button", { name: "发送第一条消息" })).toBeEnabled();
     expect(screen.getAllByText("草稿").length).toBeGreaterThan(0);
     expect(screen.queryByText("不应出现检查点")).not.toBeInTheDocument();

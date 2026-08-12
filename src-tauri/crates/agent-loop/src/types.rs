@@ -209,6 +209,35 @@ pub struct ModelsResponse {
 
 // ── Events sent to frontend via Tauri emit ───────────────────────────────────
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NextActionOwner {
+    #[default]
+    System,
+    External,
+    User,
+}
+
+impl NextActionOwner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::External => "external",
+            Self::User => "user",
+        }
+    }
+
+    /// Old or malformed persisted state stays system-owned. Ownership must
+    /// never be inferred from the user-facing waiting reason.
+    pub fn from_persisted(value: &str) -> Self {
+        match value {
+            "external" => Self::External,
+            "user" => Self::User,
+            _ => Self::System,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanStepEvent {
     pub id: String,
@@ -231,6 +260,7 @@ pub enum StreamEvent {
         steps: Vec<PlanStepEvent>,
         explanation: Option<String>,
         waiting_reason: Option<String>,
+        next_action_owner: NextActionOwner,
         change_reason: Option<String>,
         created_at: i64,
     },
@@ -328,4 +358,25 @@ pub enum StreamEvent {
         endpoint_id: Option<String>,
         recoverable: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_action_owner_uses_the_wire_contract_and_fails_safe_when_persisted() {
+        assert_eq!(
+            serde_json::to_value(NextActionOwner::External).unwrap(),
+            serde_json::json!("external"),
+        );
+        assert_eq!(
+            NextActionOwner::from_persisted("unexpected"),
+            NextActionOwner::System,
+        );
+        assert_eq!(
+            NextActionOwner::from_persisted("system"),
+            NextActionOwner::System,
+        );
+    }
 }

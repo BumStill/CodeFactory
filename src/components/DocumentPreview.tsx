@@ -41,6 +41,8 @@ export function DocumentPreview({ tab, cwd, onClose }: Props) {
   }, [cwd, tab.path]);
 
   const isMarkdown = preview?.extension === "md" || preview?.extension === "markdown";
+  const headerActionClass =
+    "inline-flex h-11 w-11 shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:h-9 lg:w-9";
   return (
     <section className="flex min-h-0 flex-1 flex-col bg-surface-0" aria-label={`文档预览：${tab.title}`}>
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
@@ -49,13 +51,13 @@ export function DocumentPreview({ tab, cwd, onClose }: Props) {
           <div className="truncate text-xs font-medium text-gray-200">{tab.title}</div>
           <div className="truncate font-mono text-[11px] text-gray-500">{preview?.relative_path ?? tab.path}</div>
         </div>
-        <button type="button" className="rounded p-1 text-gray-500 hover:bg-surface-3 hover:text-gray-200" onClick={() => void navigator.clipboard?.writeText(preview?.path ?? tab.path)} aria-label={`复制路径 ${tab.title}`}>
+        <button type="button" className={headerActionClass} onClick={() => void navigator.clipboard?.writeText(preview?.path ?? tab.path)} aria-label={`复制路径 ${tab.title}`}>
           <Copy size={12} />
         </button>
-        <button type="button" className="rounded p-1 text-gray-500 hover:bg-surface-3 hover:text-gray-200" onClick={() => void invoke("plugin:shell|open", { path: preview?.path ?? tab.path }).catch(() => {})} aria-label={`系统打开 ${tab.title}`}>
+        <button type="button" className={headerActionClass} onClick={() => void invoke("plugin:shell|open", { path: preview?.path ?? tab.path }).catch(() => {})} aria-label={`系统打开 ${tab.title}`}>
           <ExternalLink size={12} />
         </button>
-        <button type="button" className="rounded p-1 text-gray-500 hover:bg-surface-3 hover:text-gray-200" onClick={onClose} aria-label={`关闭文档 ${tab.title}`}>
+        <button type="button" className={headerActionClass} onClick={onClose} aria-label={`关闭文档 ${tab.title}`}>
           <X size={13} />
         </button>
       </header>

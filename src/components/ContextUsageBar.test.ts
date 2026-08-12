@@ -9,8 +9,10 @@ describe("formatContextTokens", () => {
 
   it("keeps ordinary context usage neutral and only escalates real pressure", () => {
     expect(contextUsagePresentation(58).tone).toBe("progress");
-    expect(contextUsagePresentation(58).label).toBe("上下文充足");
+    expect(contextUsagePresentation(74).tone).toBe("progress");
     expect(contextUsagePresentation(75).tone).toBe("warning");
+    expect(contextUsagePresentation(89).tone).toBe("warning");
     expect(contextUsagePresentation(90).tone).toBe("danger");
+    expect(contextUsagePresentation(90).label).toBe("接近上限");
   });
 });

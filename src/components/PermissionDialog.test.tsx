@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { PermissionDialog } from "./PermissionDialog";
 import type { PendingPermission } from "../stores/chat";
 
@@ -29,6 +31,67 @@ describe("PermissionDialog tool-args preview", () => {
 
     expect(screen.getByRole("dialog", { name: "需要权限" })).toBeInTheDocument();
     expect(screen.getByText(/超时.*不会记成你拒绝/)).toBeInTheDocument();
+  });
+
+  it("focuses the safe refusal action first and traps keyboard focus inside the modal", async () => {
+    render(
+      <PermissionDialog
+        request={baseRequest({ toolName: "bash", args: { command: "pnpm test" } })}
+        trusted={false}
+        {...noop}
+      />,
+    );
+
+    const deny = screen.getByRole("button", { name: "拒绝" });
+    const trust = screen.getByRole("button", { name: "信任本会话并允许" });
+    expect(deny).toHaveClass("min-h-11", "lg:min-h-9");
+    expect(screen.getByRole("button", { name: "仅允许一次" })).toHaveClass("min-h-11", "lg:min-h-9");
+    expect(trust).toHaveClass("min-h-11", "lg:min-h-9");
+    await waitFor(() => expect(deny).toHaveFocus());
+
+    await userEvent.tab({ shift: true });
+    expect(trust).toHaveFocus();
+
+    await userEvent.tab();
+    expect(deny).toHaveFocus();
+  });
+
+  it("treats Escape as an explicit denial and restores focus to the opener", async () => {
+    const onDeny = vi.fn();
+    const onAllow = vi.fn();
+
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <button onClick={() => setOpen(true)}>运行受限工具</button>
+          {open && (
+            <PermissionDialog
+              request={baseRequest({ toolName: "bash", args: { command: "pnpm test" } })}
+              trusted={false}
+              onAllow={onAllow}
+              onDeny={() => {
+                onDeny();
+                setOpen(false);
+              }}
+              onAllowFullAccess={vi.fn()}
+            />
+          )}
+        </>
+      );
+    }
+
+    render(<Harness />);
+    const opener = screen.getByRole("button", { name: "运行受限工具" });
+    await userEvent.click(opener);
+    await waitFor(() => expect(screen.getByRole("button", { name: "拒绝" })).toHaveFocus());
+
+    await userEvent.keyboard("{Escape}");
+
+    expect(onDeny).toHaveBeenCalledTimes(1);
+    expect(onAllow).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "需要权限" })).not.toBeInTheDocument();
+    await waitFor(() => expect(opener).toHaveFocus());
   });
 
   it("renders a real diff for edit_file instead of raw JSON", () => {

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Placement contract for the token/context readout: the usage bar sits
-// directly ABOVE the message input (as a composer header row), not below it
-// at the bottom of the conversation. Regression guard for the UX feedback
-// "token 消耗和 context 放到了最下边，占用了大量空间".
+// Ownership contract for the compact composer controls. Model, reasoning,
+// permission and context all describe the next turn, so they belong to the
+// composer and must never be duplicated in the workspace header.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, within } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn().mockResolvedValue(undefined),
@@ -60,7 +59,23 @@ vi.mock("../../stores/chat", () => ({
   activeRuntime: () => fakeChatRuntime,
 }));
 
-vi.mock("../../components/ModelPicker", () => ({ ModelPicker: () => null }));
+vi.mock("../../components/ModelPicker", () => ({
+  ModelPicker: () => <button aria-label="选择下一回合模型">模型</button>,
+}));
+vi.mock("../../components/ReasoningEffortPicker", () => ({
+  ReasoningEffortPicker: () => (
+    <select aria-label="下一回合思考强度" defaultValue="medium">
+      <option value="medium">思考·中</option>
+    </select>
+  ),
+}));
+vi.mock("../../components/PermissionModePicker", () => ({
+  PermissionModePicker: () => (
+    <select aria-label="会话权限" defaultValue="standard">
+      <option value="standard">标准</option>
+    </select>
+  ),
+}));
 vi.mock("../../components/GitStatusBar", () => ({
   GitStatusBar: () => <button aria-label="Git 状态">Git</button>,
 }));
@@ -72,7 +87,7 @@ vi.mock("../../components/MessageInput", () => ({
 }));
 vi.mock("../../components/PermissionDialog", () => ({ PermissionDialog: () => null }));
 vi.mock("../../components/ContextUsageBar", () => ({
-  ContextUsageBar: () => <div data-testid="context-usage-bar" />,
+  ContextUsageBar: () => <button aria-label="打开上下文与用量详情" data-testid="context-usage-ring" />,
 }));
 vi.mock("../../stores/settings", () => ({
   useSettingsStore: Object.assign(
@@ -127,14 +142,19 @@ vi.mock("../../stores/learning", () => ({
   ),
 }));
 
-describe("usage bar placement above the composer", () => {
+describe("composer runtime control ownership", () => {
   beforeEach(() => {
-    mocks.invoke.mockReset().mockResolvedValue(undefined);
+    mocks.invoke.mockReset().mockImplementation((command: string) => {
+      if (command === "list_browser_sessions" || command === "get_turn_timing_profile") {
+        return new Promise(() => {});
+      }
+      return Promise.resolve(undefined);
+    });
     mocks.loadTasks.mockReset().mockResolvedValue(undefined);
     mocks.subscribe.mockReset().mockResolvedValue(() => {});
   });
 
-  it("renders the usage bar above the message input inside the composer shell", async () => {
+  it("keeps model, reasoning, permission and context in one composer surface, not the header", async () => {
     const { WorkspacePage } = await import("./WorkspacePage");
     const { container } = render(
       <WorkspacePage
@@ -146,14 +166,19 @@ describe("usage bar placement above the composer", () => {
     );
     const shell = container.querySelector('[data-testid="workspace-composer-shell"]');
     expect(shell).not.toBeNull();
-    const usageBar = within(shell as HTMLElement).queryByTestId("context-usage-bar");
-    const input = within(shell as HTMLElement).queryByTestId("message-input");
-    expect(usageBar).not.toBeNull();
-    expect(input).not.toBeNull();
-    // DOM order: usage bar must come BEFORE the input box.
-    expect(
-      (usageBar as HTMLElement).compareDocumentPosition(input as HTMLElement) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    const composer = within(shell as HTMLElement);
+    const header = within(container.querySelector('header[aria-label="会话工具栏"]') as HTMLElement);
+
+    expect(composer.getByRole("button", { name: "选择下一回合模型" })).toBeInTheDocument();
+    expect(composer.getByRole("combobox", { name: "下一回合思考强度" })).toBeInTheDocument();
+    expect(composer.getByRole("combobox", { name: "会话权限" })).toBeInTheDocument();
+    expect(composer.getByRole("button", { name: "打开上下文与用量详情" })).toBeInTheDocument();
+
+    expect(header.queryByRole("button", { name: "选择下一回合模型" })).not.toBeInTheDocument();
+    expect(header.queryByRole("combobox", { name: "下一回合思考强度" })).not.toBeInTheDocument();
+    expect(header.queryByRole("combobox", { name: "会话权限" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "选择下一回合模型" })).toHaveLength(1);
+    expect(screen.getAllByRole("combobox", { name: "下一回合思考强度" })).toHaveLength(1);
+    expect(screen.getAllByRole("combobox", { name: "会话权限" })).toHaveLength(1);
   });
 });

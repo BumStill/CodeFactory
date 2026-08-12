@@ -688,6 +688,13 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         )
         .fetch_one(pool)
         .await?;
+        let source_has_next_action_owner: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('chat_plan_events')
+             WHERE name = 'next_action_owner'",
+        )
+        .fetch_one(pool)
+        .await?
+            > 0;
         let mut migration = pool.begin().await?;
         sqlx::query("DROP TABLE IF EXISTS chat_plan_events_with_session_cascade")
             .execute(&mut *migration)
@@ -701,6 +708,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
                 plan_json      TEXT NOT NULL,
                 explanation    TEXT,
                 waiting_reason TEXT,
+                next_action_owner TEXT NOT NULL DEFAULT 'system',
                 change_reason  TEXT,
                 created_at     INTEGER NOT NULL,
                 UNIQUE(root_turn_id, revision),
@@ -709,12 +717,39 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         )
         .execute(&mut *migration)
         .await?;
-        let copy_sql = if sessions_exist == 0 {
+        let copy_sql = if sessions_exist == 0 && source_has_next_action_owner {
             "INSERT INTO chat_plan_events_with_session_cascade
-             SELECT * FROM chat_plan_events"
+             (id, session_id, root_turn_id, revision, plan_json, explanation,
+              waiting_reason, next_action_owner, change_reason, created_at)
+             SELECT id, session_id, root_turn_id, revision, plan_json, explanation,
+                    waiting_reason, next_action_owner, change_reason, created_at
+             FROM chat_plan_events"
+        } else if sessions_exist == 0 {
+            "INSERT INTO chat_plan_events_with_session_cascade
+             (id, session_id, root_turn_id, revision, plan_json, explanation,
+              waiting_reason, next_action_owner, change_reason, created_at)
+             SELECT id, session_id, root_turn_id, revision, plan_json, explanation,
+                    waiting_reason, 'system', change_reason, created_at
+             FROM chat_plan_events"
+        } else if source_has_next_action_owner {
+            "INSERT INTO chat_plan_events_with_session_cascade
+             (id, session_id, root_turn_id, revision, plan_json, explanation,
+              waiting_reason, next_action_owner, change_reason, created_at)
+             SELECT event.id, event.session_id, event.root_turn_id, event.revision,
+                    event.plan_json, event.explanation, event.waiting_reason,
+                    event.next_action_owner, event.change_reason, event.created_at
+             FROM chat_plan_events event
+             WHERE EXISTS (
+                 SELECT 1 FROM sessions session WHERE session.id = event.session_id
+             )"
         } else {
             "INSERT INTO chat_plan_events_with_session_cascade
-             SELECT event.* FROM chat_plan_events event
+             (id, session_id, root_turn_id, revision, plan_json, explanation,
+              waiting_reason, next_action_owner, change_reason, created_at)
+             SELECT event.id, event.session_id, event.root_turn_id, event.revision,
+                    event.plan_json, event.explanation, event.waiting_reason,
+                    'system', event.change_reason, event.created_at
+             FROM chat_plan_events event
              WHERE EXISTS (
                  SELECT 1 FROM sessions session WHERE session.id = event.session_id
              )"
@@ -731,6 +766,16 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         .await?;
         migration.commit().await?;
     }
+    // Keep this after the legacy no-FK rebuild. The rebuild uses explicit
+    // column lists so it can preserve an intermediate database that already
+    // has the owner column and can default an older database that does not.
+    ensure_column(
+        pool,
+        "chat_plan_events",
+        "next_action_owner",
+        "TEXT NOT NULL DEFAULT 'system'",
+    )
+    .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_chat_plan_events_session_turn
          ON chat_plan_events(session_id, root_turn_id, revision DESC)",
@@ -1732,6 +1777,12 @@ mod tests {
             vec![("sessions".to_string(), "CASCADE".to_string())],
             "chat plan history must be deleted with its owning session"
         );
+        let plan_columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('chat_plan_events')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(plan_columns.contains(&"next_action_owner".to_string()));
 
         // The seeded row's data must survive the ALTER TABLE.
         let role: String = sqlx::query_scalar("SELECT role FROM messages WHERE id='m1'")
@@ -1787,6 +1838,7 @@ mod tests {
                 plan_json TEXT NOT NULL,
                 explanation TEXT,
                 waiting_reason TEXT,
+                next_action_owner TEXT NOT NULL DEFAULT 'system',
                 change_reason TEXT,
                 created_at INTEGER NOT NULL,
                 UNIQUE(root_turn_id, revision)
@@ -1803,18 +1855,20 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        for (id, session_id, root_turn_id) in [
-            ("owned-event", "owned-session", "owned-root"),
-            ("orphan-event", "missing-session", "orphan-root"),
+        for (id, session_id, root_turn_id, next_action_owner) in [
+            ("owned-event", "owned-session", "owned-root", "external"),
+            ("orphan-event", "missing-session", "orphan-root", "user"),
         ] {
             sqlx::query(
                 "INSERT INTO chat_plan_events
-                 (id, session_id, root_turn_id, revision, plan_json, created_at)
-                 VALUES (?, ?, ?, 1, '[]', 1)",
+                 (id, session_id, root_turn_id, revision, plan_json,
+                  next_action_owner, created_at)
+                 VALUES (?, ?, ?, 1, '[]', ?, 1)",
             )
             .bind(id)
             .bind(session_id)
             .bind(root_turn_id)
+            .bind(next_action_owner)
             .execute(&pool)
             .await
             .unwrap();
@@ -1839,6 +1893,82 @@ mod tests {
             plan_foreign_keys,
             vec![("sessions".to_string(), "CASCADE".to_string())]
         );
+        let retained_owner: String = sqlx::query_scalar(
+            "SELECT next_action_owner FROM chat_plan_events WHERE id = 'owned-event'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_owner, "external");
+
+        // The older no-owner shape takes the other rebuild branch and receives
+        // the fail-safe system default without a SELECT * column mismatch.
+        let legacy_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open legacy in-memory db");
+        sqlx::query(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, cwd TEXT NOT NULL,
+                model_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
+                model_id TEXT, input_tokens INTEGER, output_tokens INTEGER,
+                created_at INTEGER
+            )",
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_plan_events (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                root_turn_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                plan_json TEXT NOT NULL, explanation TEXT, waiting_reason TEXT,
+                change_reason TEXT, created_at INTEGER NOT NULL,
+                UNIQUE(root_turn_id, revision)
+            )",
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions
+             (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('legacy-session', 'legacy', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_plan_events
+             (id, session_id, root_turn_id, revision, plan_json, created_at)
+             VALUES ('legacy-event', 'legacy-session', 'legacy-root', 1, '[]', 1)",
+        )
+        .execute(&legacy_pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&legacy_pool)
+            .await
+            .expect("repair no-owner legacy schema");
+        let legacy_owner: String = sqlx::query_scalar(
+            "SELECT next_action_owner FROM chat_plan_events WHERE id = 'legacy-event'",
+        )
+        .fetch_one(&legacy_pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_owner, "system");
     }
 
     /// ensure_schema must be safe to run twice — startup may execute it on

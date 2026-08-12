@@ -1,5 +1,7 @@
 # Workspace 顶栏系统性重构方案
 
+> 2026-08-11 裁决：本计划中“模型/运行安全继续驻留顶栏”和“双层顶栏”已被用户最新决定取代。当前权威设计为 `docs/specs/feature-specs/agent-workbench-experience.md` 与三份 `docs/design/agent-workbench-*`：模型/思考/权限进入 composer，顶栏只保留会话/工程/交付/作业状态，辅助详情统一进入单一 pane。本文保留为历史方案，不再作为实现验收依据。
+
 ## 1. 问题定义
 
 当前 Workspace 顶栏把以下不同性质的信息放在同一条横向 flex 行中：

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { X, FileText, Plus, Check, RefreshCw, GitCommit as GitCommitIcon, History, GitPullRequest } from "lucide-react";
 import { useGitStore } from "../stores/git";
 import type { FileChange } from "../lib/tauri";
@@ -11,6 +12,7 @@ interface Props {
   onOpenHistory: () => void;
   onOpenRemote: () => void;
   sessionId: string | null;
+  embedded?: boolean;
 }
 
 type Group = "staged" | "unstaged" | "untracked";
@@ -21,7 +23,7 @@ interface Row {
   group: Group;
 }
 
-export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionId }: Props) {
+export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionId, embedded = false }: Props) {
   const { status, branches, refreshStatus, refreshBranches, checkout, stageFiles, commit, getFileDiff } = useGitStore();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [activeFile, setActiveFile] = useState<{ path: string; staged: boolean } | null>(null);
@@ -32,6 +34,35 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
   const [committing, setCommitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [switchingBranch, setSwitchingBranch] = useState(false);
+  const [isNarrowEmbedded, setIsNarrowEmbedded] = useState(embedded);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const commitTriggerRef = useRef<HTMLButtonElement>(null);
+  const commitMessageRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (!embedded) {
+      setIsNarrowEmbedded(false);
+      return;
+    }
+    const panel = panelRef.current;
+    if (!panel) return;
+    const update = () => setIsNarrowEmbedded(panel.getBoundingClientRect().width < 640);
+    update();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(update);
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [embedded]);
+
+  useEffect(() => {
+    if (!showCommitModal) return;
+    const returnTarget = commitTriggerRef.current;
+    const frame = window.requestAnimationFrame(() => commitMessageRef.current?.focus());
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (returnTarget?.isConnected && !returnTarget.disabled) returnTarget.focus();
+    };
+  }, [showCommitModal]);
 
   useEffect(() => {
     void Promise.all([refreshStatus(), refreshBranches()]);
@@ -126,39 +157,68 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
   };
 
   return (
-    <div className="fixed right-0 top-0 bottom-0 z-40 w-[640px] max-w-[80vw] bg-surface-1 border-l border-border shadow-2xl flex flex-col">
+    <div
+      ref={panelRef}
+      data-embedded-layout={embedded ? (isNarrowEmbedded ? "stacked" : "split") : undefined}
+      className={embedded
+        ? "relative flex min-h-0 h-full w-full flex-col overflow-hidden bg-surface-1"
+        : "fixed right-0 top-0 bottom-0 z-40 w-[640px] max-w-[80vw] bg-surface-1 border-l border-border shadow-2xl flex flex-col"}
+    >
       {/* Header */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-border shrink-0">
+      <div
+        data-testid="git-changes-header"
+        className={embedded
+          ? `flex items-center gap-2 border-b border-border px-3 py-2 shrink-0 ${isNarrowEmbedded ? "flex-wrap" : "flex-nowrap"}`
+          : "flex items-center gap-2 px-3 py-2 border-b border-border shrink-0"}
+      >
         <FileText size={14} className="text-gray-400" />
         <span className="text-xs font-semibold text-gray-200 flex-1">本地 Git</span>
-        <button onClick={onOpenHistory} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="提交历史"><History size={11} />历史</button>
-        <button onClick={onOpenRemote} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200" title="远程仓库（问题与拉取请求）"><GitPullRequest size={11} />远程</button>
+        <button
+          onClick={onOpenHistory}
+          className={`inline-flex items-center gap-1 rounded px-2 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200 ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
+          title="提交历史"
+        ><History size={11} />历史</button>
+        <button
+          onClick={onOpenRemote}
+          className={`inline-flex items-center gap-1 rounded px-2 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200 ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
+          title="远程仓库（问题与拉取请求）"
+        ><GitPullRequest size={11} />远程</button>
         <button
           onClick={() => refreshStatus()}
-          className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
+          aria-label="刷新本地 Git"
+          className={`inline-flex shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-300 ${embedded && isNarrowEmbedded ? "h-11 w-11" : "h-9 w-9"}`}
           title="刷新"
         >
           <RefreshCw size={12} />
         </button>
         <button
           onClick={onClose}
-          className="p-1 rounded hover:bg-surface-3 text-gray-500 hover:text-gray-300 transition-colors"
-          title="关闭"
+          aria-label={embedded ? "关闭本地 Git" : "关闭"}
+          data-auxiliary-initial-focus={embedded ? true : undefined}
+          className={embedded
+            ? `inline-flex shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-300 ${isNarrowEmbedded ? "h-11 w-11" : "h-9 w-9"}`
+            : "inline-flex h-9 w-9 shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-300"}
+          title={embedded ? "关闭本地 Git" : "关闭"}
         >
           <X size={14} />
         </button>
       </div>
 
       {/* Action bar */}
-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border bg-surface-2 shrink-0">
-        <label className="inline-flex items-center gap-1 text-[11px] text-gray-600">
+      <div
+        data-testid="git-changes-actions"
+        className={embedded
+          ? `flex items-center gap-2 border-b border-border bg-surface-2 px-3 py-1.5 shrink-0 ${isNarrowEmbedded ? "flex-wrap" : "flex-nowrap"}`
+          : "flex items-center gap-2 px-3 py-1.5 border-b border-border bg-surface-2 shrink-0"}
+      >
+        <label className="inline-flex min-w-0 max-w-full items-center gap-1 text-[11px] text-gray-600">
           分支
           <select
             aria-label="切换本地分支"
             value={status?.branch ?? ""}
             disabled={switchingBranch}
             onChange={(event) => void handleBranchChange(event.target.value)}
-            className="max-w-40 rounded border border-border bg-surface-3 px-1.5 py-1 text-[11px] text-gray-300 outline-none focus:border-accent"
+            className={`w-40 max-w-full rounded border border-border bg-surface-3 px-1.5 text-[11px] text-gray-300 outline-none focus:border-accent ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
           >
             {branches.filter((branch) => !branch.is_remote || branch.is_current).map((branch) => (
               <option key={`${branch.is_remote ? "r" : "l"}:${branch.name}`} value={branch.name}>{branch.name}</option>
@@ -168,23 +228,24 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
         <button
           onClick={handleStageAll}
           disabled={rows.length === 0}
-          className="px-2 py-1 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-2 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
         >
           暂存全部
         </button>
         <button
           onClick={handleStageSelected}
           disabled={selected.size === 0}
-          className="px-2 py-1 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-2 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
         >
           暂存选中 ({selected.size})
         </button>
         <span className="flex-1" />
-        <CheckpointsPanel sessionId={sessionId} />
+        <CheckpointsPanel sessionId={sessionId} embedded={embedded} narrow={isNarrowEmbedded} />
         <button
+          ref={commitTriggerRef}
           onClick={() => setShowCommitModal(true)}
           disabled={stagedCount === 0}
-          className="flex items-center gap-1 px-2 py-1 text-[11px] rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} flex items-center gap-1 px-2 text-[11px] rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
         >
           <GitCommitIcon size={11} />
           提交 ({stagedCount})
@@ -198,9 +259,19 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
       )}
 
       {/* Body: list + diff */}
-      <div className="flex-1 flex min-h-0">
+      <div
+        data-testid="git-changes-body"
+        className={embedded
+          ? `flex min-h-0 flex-1 ${isNarrowEmbedded ? "flex-col" : "flex-row"}`
+          : "flex-1 flex min-h-0"}
+      >
         {/* Files list */}
-        <div className="w-[260px] border-r border-border overflow-y-auto shrink-0">
+        <div
+          data-testid="git-changes-file-list"
+          className={embedded
+            ? `shrink-0 overflow-y-auto ${isNarrowEmbedded ? "max-h-[42%] w-full border-b border-border" : "max-h-none w-[260px] border-r border-border"}`
+            : "w-[260px] border-r border-border overflow-y-auto shrink-0"}
+        >
           {rows.length === 0 && (
             <div className="px-3 py-4 text-center text-[11px] text-gray-600">
               无变更
@@ -212,6 +283,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
             group="staged"
             selected={selected}
             activeFile={activeFile}
+            largeTarget={embedded && isNarrowEmbedded}
             onToggle={toggleSelect}
             onSelect={(path, staged) => setActiveFile({ path, staged })}
           />
@@ -221,6 +293,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
             group="unstaged"
             selected={selected}
             activeFile={activeFile}
+            largeTarget={embedded && isNarrowEmbedded}
             onToggle={toggleSelect}
             onSelect={(path, staged) => setActiveFile({ path, staged })}
           />
@@ -237,6 +310,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
                   group="untracked"
                   selected={selected.has(p)}
                   active={activeFile?.path === p && !activeFile.staged}
+                  largeTarget={embedded && isNarrowEmbedded}
                   onToggle={() => toggleSelect(p)}
                   onClick={() => setActiveFile({ path: p, staged: false })}
                 />
@@ -276,17 +350,24 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
       {/* Commit modal */}
       {showCommitModal && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          className={`${embedded ? "absolute" : "fixed"} inset-0 z-50 flex items-center justify-center bg-black/60 p-3`}
           onClick={() => !committing && setShowCommitModal(false)}
         >
           <div
-            className="w-[480px] rounded-xl border border-border bg-surface-2 shadow-2xl p-5 space-y-4"
+            role="dialog"
+            aria-modal={embedded ? "false" : "true"}
+            aria-labelledby="git-commit-dialog-title"
+            className="w-[480px] max-w-full rounded-xl border border-border bg-surface-2 shadow-2xl p-5 space-y-4"
             onClick={(e) => e.stopPropagation()}
+            onKeyDown={(event) => trapDialogKeyboard(event, () => {
+              if (!committing) setShowCommitModal(false);
+            })}
           >
-            <h2 className="text-sm font-semibold text-gray-200 flex items-center gap-2">
+            <h2 id="git-commit-dialog-title" className="text-sm font-semibold text-gray-200 flex items-center gap-2">
               <GitCommitIcon size={14} /> 提交 {stagedCount} 个文件
             </h2>
             <textarea
+              ref={commitMessageRef}
               value={commitMsg}
               onChange={(e) => setCommitMsg(e.target.value)}
               placeholder="提交信息…"
@@ -299,14 +380,14 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
               <button
                 disabled={committing}
                 onClick={() => setShowCommitModal(false)}
-                className="px-3 py-1.5 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors disabled:opacity-40"
+                className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-3 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors disabled:opacity-40`}
               >
                 取消
               </button>
               <button
                 disabled={committing || !commitMsg.trim()}
                 onClick={handleCommit}
-                className="flex items-center gap-1 px-3 py-1.5 rounded text-xs bg-accent hover:bg-accent-hover text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} flex items-center gap-1 px-3 rounded text-xs bg-accent hover:bg-accent-hover text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed`}
               >
                 <Check size={12} />
                 {committing ? "提交中…" : "提交"}
@@ -325,11 +406,12 @@ interface GroupProps {
   group: Group;
   selected: Set<string>;
   activeFile: { path: string; staged: boolean } | null;
+  largeTarget: boolean;
   onToggle: (path: string) => void;
   onSelect: (path: string, staged: boolean) => void;
 }
 
-function FileGroup({ label, files, group, selected, activeFile, onToggle, onSelect }: GroupProps) {
+function FileGroup({ label, files, group, selected, activeFile, largeTarget, onToggle, onSelect }: GroupProps) {
   if (files.length === 0) return null;
   const staged = group === "staged";
   return (
@@ -345,6 +427,7 @@ function FileGroup({ label, files, group, selected, activeFile, onToggle, onSele
           group={group}
           selected={selected.has(f.path)}
           active={activeFile?.path === f.path && activeFile.staged === staged}
+          largeTarget={largeTarget}
           onToggle={() => onToggle(f.path)}
           onClick={() => onSelect(f.path, staged)}
         />
@@ -359,41 +442,76 @@ interface RowProps {
   group: Group;
   selected: boolean;
   active: boolean;
+  largeTarget: boolean;
   onToggle: () => void;
   onClick: () => void;
 }
 
-function FileRow({ path, status, group, selected, active, onToggle, onClick }: RowProps) {
+function FileRow({ path, status, group, selected, active, largeTarget, onToggle, onClick }: RowProps) {
   const statusBadge = badge(status);
   return (
-    <div
-      className={`flex items-center gap-1 px-2 py-1 cursor-pointer transition-colors ${
+    <div className={`flex items-center gap-1 px-2 transition-colors ${
         active ? "bg-surface-3" : "hover:bg-surface-2"
-      }`}
-      onClick={onClick}
-    >
+      }`}>
       {group !== "staged" && (
-        <input
-          type="checkbox"
-          checked={selected}
-          onChange={onToggle}
-          onClick={(e) => e.stopPropagation()}
-          className="shrink-0"
-          title="选择暂存"
-        />
+        <label className={`inline-flex shrink-0 cursor-pointer items-center justify-center ${largeTarget ? "h-11 w-11" : "h-9 w-9"}`}>
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggle}
+            className="shrink-0"
+            title="选择暂存"
+            aria-label={`选择 ${path} 暂存`}
+          />
+        </label>
       )}
-      {group === "staged" && <Plus size={10} className="text-accent shrink-0" />}
-      <span
-        className={`text-[11px] font-mono shrink-0 w-3 text-center ${statusBadge.color}`}
-        title={status}
+      <button
+        type="button"
+        onClick={onClick}
+        aria-label={`查看 ${path} 差异`}
+        aria-current={active ? "true" : undefined}
+        className={`flex min-w-0 flex-1 items-center gap-1 rounded text-left outline-none focus-visible:ring-2 focus-visible:ring-accent/70 ${largeTarget ? "min-h-11" : "min-h-9"}`}
       >
-        {statusBadge.letter}
-      </span>
-      <span className="text-[11px] text-gray-300 truncate flex-1" title={path}>
-        {path}
-      </span>
+        {group === "staged" && <Plus size={10} className="text-accent shrink-0" />}
+        <span
+          className={`text-[11px] font-mono shrink-0 w-3 text-center ${statusBadge.color}`}
+          title={status}
+        >
+          {statusBadge.letter}
+        </span>
+        <span className="text-[11px] text-gray-300 truncate flex-1" title={path}>
+          {path}
+        </span>
+      </button>
     </div>
   );
+}
+
+function trapDialogKeyboard(event: ReactKeyboardEvent<HTMLElement>, onEscape: () => void) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    onEscape();
+    return;
+  }
+  if (event.key !== "Tab") return;
+
+  const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+  )).filter((element) => !element.hasAttribute("hidden"));
+  if (focusable.length === 0) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function badge(status: string): { letter: string; color: string } {

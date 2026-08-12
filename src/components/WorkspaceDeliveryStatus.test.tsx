@@ -49,12 +49,14 @@ describe("WorkspaceDeliveryStatus", () => {
     });
     render(<WorkspaceDeliveryStatus cwd="/repo" currentBranch="main" messages={delivered} />);
 
-    const status = await screen.findByRole("button", { name: "会话交付状态" });
+    const status = await screen.findByRole("button", {
+      name: /会话交付状态.*PR #175.*CI 通过.*已合并.*v1\.63\.0.*未验证上线/,
+    });
     expect(status).toHaveTextContent("PR #175");
-    expect(status).toHaveTextContent("CI 通过");
-    expect(status).toHaveTextContent("已合并");
-    expect(status).toHaveTextContent("v1.63.0");
     expect(status).toHaveTextContent("未验证上线");
+    expect(status).not.toHaveTextContent("CI 通过");
+    expect(status).not.toHaveTextContent("已合并");
+    expect(status).not.toHaveTextContent("v1.63.0");
     expect(status).toHaveAttribute("data-status-tone", "progress");
     expect(status).toHaveAttribute("aria-expanded", "false");
     expect(mocks.invoke).toHaveBeenCalledWith("workspace_delivery_status", {
@@ -92,8 +94,101 @@ describe("WorkspaceDeliveryStatus", () => {
       error: "not authenticated",
     });
     render(<WorkspaceDeliveryStatus cwd="/repo" currentBranch="feat/workspace-ui" messages={[]} />);
-    expect(await screen.findByRole("button", { name: "会话交付状态" })).toHaveTextContent("远程状态不可用");
+    const status = await screen.findByRole("button", {
+      name: /会话交付状态.*远程状态不可用/,
+    });
+    expect(status).toHaveTextContent("远程状态不可用");
+    expect(status).toHaveAttribute("data-status-tone", "warning");
     expect(screen.queryByText("未关联 PR")).not.toBeInTheDocument();
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalled());
+  });
+
+  it("delegates controlled details to the shared auxiliary pane without mounting a legacy drawer", async () => {
+    mocks.invoke.mockResolvedValue({
+      remote_available: true,
+      pr: null,
+      ci_status: "none",
+      release: null,
+      error: null,
+    });
+    const onOpenDetails = vi.fn();
+    render(
+      <WorkspaceDeliveryStatus
+        cwd="/repo"
+        currentBranch="main"
+        messages={[]}
+        detailsOpen
+        detailsId="workspace-auxiliary-pane"
+        onOpenDetails={onOpenDetails}
+      />,
+    );
+
+    const status = await screen.findByRole("button", { name: /会话交付状态/ });
+    expect(status).toHaveAttribute("aria-expanded", "true");
+    expect(status).toHaveAttribute("aria-controls", "workspace-auxiliary-pane");
+    expect(screen.queryByRole("dialog", { name: "交付详情" })).not.toBeInTheDocument();
+    await userEvent.click(status);
+    expect(onOpenDetails).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets an embedded details view reuse the header snapshot instead of polling twice", async () => {
+    mocks.invoke.mockResolvedValue({
+      remote_available: true,
+      pr: null,
+      ci_status: "none",
+      release: null,
+      error: null,
+    });
+    render(
+      <>
+        <WorkspaceDeliveryStatus cwd="/repo" currentBranch="main" messages={[]} />
+        <WorkspaceDeliveryStatus
+          cwd="/repo"
+          currentBranch="main"
+          messages={[]}
+          detailsOnly
+          {...({ deliveryState: { snapshot: null, unavailable: false } } as Record<string, unknown>)}
+        />
+      </>,
+    );
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalled());
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show the previous session PR while the next session is still loading", async () => {
+    let resolveNext!: (value: unknown) => void;
+    mocks.invoke
+      .mockResolvedValueOnce({
+        remote_available: true,
+        pr: {
+          number: 101,
+          title: "Session A",
+          state: "open",
+          draft: false,
+          head_branch: "feat/a",
+          base_branch: "main",
+          head_sha: "a",
+          merge_commit_sha: null,
+          url: "https://example.test/pull/101",
+        },
+        ci_status: "pending",
+        release: null,
+        error: null,
+      })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveNext = resolve; }));
+
+    const { rerender } = render(
+      <WorkspaceDeliveryStatus cwd="/repo-a" sessionId="session-a" currentBranch="feat/a" messages={[]} />,
+    );
+    expect(await screen.findByText("PR #101")).toBeInTheDocument();
+
+    rerender(
+      <WorkspaceDeliveryStatus cwd="/repo-b" sessionId="session-b" currentBranch="feat/b" messages={[]} />,
+    );
+    expect(screen.queryByText("PR #101")).not.toBeInTheDocument();
+
+    resolveNext({ remote_available: true, pr: null, ci_status: "none", release: null, error: null });
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(2));
   });
 });
