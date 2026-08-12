@@ -112,10 +112,47 @@ fn effective_route(route: &RouteCandidate) -> EffectiveRoute {
     }
 }
 
-fn apply_chatgpt_output_ceiling(body: &mut serde_json::Value, ceiling: Option<u32>) {
-    if let Some(ceiling) = ceiling {
+/// The ChatGPT subscription Codex backend rejects `max_output_tokens` on the
+/// Responses route even though the public Responses API accepts that field.
+/// Keep the local metadata marker on the transport, but do not put its output
+/// ceiling on this wire contract. Metadata generation remains bounded by its
+/// deadline, short-title prompt, and strict local output validation.
+fn chatgpt_wire_output_ceiling(_local_ceiling: Option<u32>) -> Option<u32> {
+    None
+}
+
+fn build_chatgpt_responses_body(
+    model_id: &str,
+    instructions: String,
+    input: Vec<serde_json::Value>,
+    tools: Vec<serde_json::Value>,
+    require_tool: bool,
+    reasoning_effort: &str,
+    local_output_ceiling: Option<u32>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model_id,
+        "instructions": instructions,
+        "input": input,
+        "tool_choice": if tools.is_empty() {
+            "none"
+        } else if require_tool {
+            "required"
+        } else {
+            "auto"
+        },
+        "parallel_tool_calls": false,
+        "store": false,
+        "stream": true,
+        "reasoning": { "effort": reasoning_effort, "summary": "auto" },
+    });
+    if let Some(ceiling) = chatgpt_wire_output_ceiling(local_output_ceiling) {
         body["max_output_tokens"] = serde_json::json!(ceiling);
     }
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools);
+    }
+    body
 }
 
 fn classify_transport_error(message: String) -> TransportError {
@@ -303,26 +340,15 @@ impl DesktopModelTransport {
             })
             .collect();
 
-        let mut body = serde_json::json!({
-            "model": self.model_id,
-            "instructions": instructions,
-            "input": input,
-            "tool_choice": if tools.is_empty() {
-                "none"
-            } else if require_tool {
-                "required"
-            } else {
-                "auto"
-            },
-            "parallel_tool_calls": false,
-            "store": false,
-            "stream": true,
-            "reasoning": { "effort": reasoning_effort, "summary": "auto" },
-        });
-        apply_chatgpt_output_ceiling(&mut body, self.max_output_tokens);
-        if !tools.is_empty() {
-            body["tools"] = serde_json::Value::Array(tools);
-        }
+        let body = build_chatgpt_responses_body(
+            &self.model_id,
+            instructions,
+            input,
+            tools,
+            require_tool,
+            reasoning_effort,
+            self.max_output_tokens,
+        );
 
         let mut response = crate::http_util::send_with_retry_and_notify_policy(
             "ChatGPT Responses stream request",
@@ -1482,13 +1508,39 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_metadata_output_cap_uses_responses_field() {
-        let mut body = serde_json::json!({"model": "gpt-test"});
-        apply_chatgpt_output_ceiling(&mut body, Some(64));
-        assert_eq!(body["max_output_tokens"], serde_json::json!(64));
+    fn chatgpt_metadata_request_omits_unsupported_output_cap() {
+        let body = build_chatgpt_responses_body(
+            "gpt-test",
+            "system prompt".into(),
+            vec![serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "name this task"}],
+            })],
+            Vec::new(),
+            false,
+            "low",
+            Some(64),
+        );
+        assert_eq!(body["model"], serde_json::json!("gpt-test"));
+        assert_eq!(body["instructions"], serde_json::json!("system prompt"));
+        assert_eq!(body["input"][0]["type"], serde_json::json!("message"));
+        assert_eq!(body["tool_choice"], serde_json::json!("none"));
+        assert_eq!(body["parallel_tool_calls"], serde_json::json!(false));
+        assert_eq!(body["reasoning"]["effort"], serde_json::json!("low"));
+        assert_eq!(body["store"], serde_json::json!(false));
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert!(body.get("max_output_tokens").is_none());
 
-        let mut interactive = serde_json::json!({"model": "gpt-test"});
-        apply_chatgpt_output_ceiling(&mut interactive, None);
+        let interactive = build_chatgpt_responses_body(
+            "gpt-test",
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            "medium",
+            None,
+        );
         assert!(interactive.get("max_output_tokens").is_none());
     }
 
