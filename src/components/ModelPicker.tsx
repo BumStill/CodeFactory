@@ -262,7 +262,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
               }}
               title={m.id}
             >
-              {m.is_custom && <Sparkles size={10} className="shrink-0 text-amber-400" />}
+              {m.is_custom && <Sparkles size={14} className="shrink-0 text-amber-400" />}
               <span className="truncate">{m.id}</span>
             </button>
           </li>
@@ -309,7 +309,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
         <span className="max-w-[116px] truncate sm:max-w-[190px]">
           {triggerLabel}
         </span>
-        <ChevronDown size={12} />
+        <ChevronDown size={14} />
       </button>
 
       {open && menuContent}

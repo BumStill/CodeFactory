@@ -604,7 +604,7 @@ export function WorkspacePage({
                   if (e.key === "Escape") setTitleEditing(false);
                 }}
                 onBlur={commitTitle}
-                className="min-w-0 flex-1 rounded-md border border-accent/50 bg-surface-2 px-1.5 py-0.5 text-note text-gray-100 outline-none"
+                className="min-w-0 flex-1 rounded-lg border border-accent/50 bg-surface-2 px-1.5 py-0.5 text-note text-gray-100 outline-none"
               />
             ) : (
               <span
@@ -622,14 +622,14 @@ export function WorkspacePage({
             )}
             {activeDraft ? (
               <span
-                className="rounded-md bg-status-progress-soft px-1.5 py-0.5 text-caption font-normal text-status-progress"
+                className="rounded-lg bg-status-progress-soft px-1.5 py-0.5 text-caption font-normal text-status-progress"
                 title="尚未创建记录；发送首条消息后生成"
               >
                 草稿
               </span>
             ) : activeSession?.kind === "quick" ? (
               <span
-                className="rounded-md bg-surface-3 px-1.5 py-0.5 text-caption font-normal text-gray-400"
+                className="rounded-lg bg-surface-3 px-1.5 py-0.5 text-caption font-normal text-gray-400"
                 title="没有绑定项目的独立任务"
               >
                 独立任务
@@ -637,10 +637,10 @@ export function WorkspacePage({
             ) : null}
             {isAnonymous && (
               <span
-                className="inline-flex items-center gap-1 rounded-md bg-status-warning-soft px-1.5 py-0.5 text-caption font-normal text-status-warning"
+                className="inline-flex items-center gap-1 rounded-lg bg-status-warning-soft px-1.5 py-0.5 text-caption font-normal text-status-warning"
                 title="匿名会话：不落库、不计费、不进记忆/画像。离开即丢弃。"
               >
-                <EyeOff size={9} />
+                <EyeOff size={14} />
                 匿名
               </span>
             )}
@@ -662,7 +662,7 @@ export function WorkspacePage({
             className="flex min-h-11 items-center gap-1 rounded-lg border border-status-warning/30 bg-status-warning-soft px-2 text-note text-status-warning transition-colors hover:brightness-95 lg:min-h-9"
             title="退出匿名会话并丢弃其历史"
           >
-            <EyeOff size={12} />
+            <EyeOff size={14} />
             退出匿名
           </button>
         )}
@@ -713,13 +713,13 @@ export function WorkspacePage({
             title={taskActivitySummary.title}
           >
             {taskActivitySummary.kind === "running" ? (
-              <Loader2 size={12} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+              <Loader2 size={14} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
             ) : taskActivitySummary.kind === "pending" ? (
-              <Circle size={11} aria-hidden="true" />
+              <Circle size={14} aria-hidden="true" />
             ) : taskActivitySummary.kind === "failed" ? (
-              <AlertTriangle size={12} aria-hidden="true" />
+              <AlertTriangle size={14} aria-hidden="true" />
             ) : (
-              <XCircle size={12} aria-hidden="true" />
+              <XCircle size={14} aria-hidden="true" />
             )}
             <span>{taskActivitySummary.count}</span>
           </button>
@@ -1127,7 +1127,7 @@ function WorkspaceAuxiliaryPane({ paneRef, kind, layout, width, maxWidth, sessio
             }}
             className={`flex min-h-11 min-w-11 max-w-44 shrink-0 items-center gap-1 rounded px-2 py-1 text-caption lg:min-h-9 lg:min-w-9 ${selected === tab.id ? "bg-surface-3 text-gray-200" : "text-gray-500 hover:bg-surface-2 hover:text-gray-300"}`}
           >
-            {tab.kind === "browser" ? <Globe2 size={11} /> : <FileText size={11} />}
+            {tab.kind === "browser" ? <Globe2 size={14} /> : <FileText size={14} />}
             <span className="truncate">{tab.label}</span>
           </button>)}
         </div>
@@ -1164,7 +1164,7 @@ function TaskActivityState({ error, onRetry, onClose }: {
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <header className="flex items-center gap-3 border-b border-border px-4 py-3">
-        <PanelRightOpen size={15} className="text-gray-500" aria-hidden="true" />
+        <PanelRightOpen size={16} className="text-gray-500" aria-hidden="true" />
         <h2 className="flex-1 text-body font-semibold text-gray-200">任务活动</h2>
         <button
           data-auxiliary-initial-focus
@@ -1336,7 +1336,7 @@ function EmbeddedBrowserPane({ sessions, width, suspended, onCloseSession }: {
         ) : (
           <div className="flex flex-1 items-center justify-center p-6 text-center text-label text-gray-500">
             <div>
-              <ExternalLink size={18} className="mx-auto mb-2 text-gray-600" aria-hidden="true" />
+              <ExternalLink size={20} className="mx-auto mb-2 text-gray-600" aria-hidden="true" />
               <p className="font-medium text-gray-300">受管浏览器已连接</p>
               <p className="mt-1">等待页面地址；Agent 可继续读取和操作该会话。</p>
             </div>
@@ -1374,7 +1374,7 @@ export function TurnEvidencePane({ evidenceId, messages, onClose }: {
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <header className="flex items-start gap-3 border-b border-border px-4 py-3">
-        <CheckCircle2 size={15} className="mt-0.5 text-accent" aria-hidden="true" />
+        <CheckCircle2 size={16} className="mt-0.5 text-accent" aria-hidden="true" />
         <div className="min-w-0 flex-1">
           <h2 className="text-body font-semibold text-gray-100">回合证据</h2>
           <p className="mt-0.5 text-caption text-gray-600">本回合实际执行的工具、验证与失败边界。</p>
@@ -1397,7 +1397,7 @@ export function TurnEvidencePane({ evidenceId, messages, onClose }: {
                 const input = turnEvidenceArgs(call.args);
                 return (
                   <li key={call.id} className="flex items-start gap-2 rounded-lg border border-border/60 bg-surface-2 px-3 py-2 text-label">
-                    {call.status === "done" && !call.isError ? <CheckCircle2 size={13} aria-hidden="true" className="mt-0.5 shrink-0 text-status-success" /> : <AlertTriangle size={13} aria-hidden="true" className="mt-0.5 shrink-0 text-status-warning" />}
+                    {call.status === "done" && !call.isError ? <CheckCircle2 size={14} aria-hidden="true" className="mt-0.5 shrink-0 text-status-success" /> : <AlertTriangle size={14} aria-hidden="true" className="mt-0.5 shrink-0 text-status-warning" />}
                     <div className="min-w-0 flex-1 space-y-1.5">
                       <div className="font-mono text-gray-300">{call.name}</div>
                       {input.summary && <code className="block break-all text-caption text-gray-500">{input.summary}</code>}
@@ -1494,7 +1494,7 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onFocusPerm
           <p className="text-caption text-gray-600">后台步骤、验收结果与恢复操作</p>
         </div>
         <button data-dialog-initial-focus type="button" onClick={onClose} aria-label="关闭任务活动" className="flex h-11 w-11 items-center justify-center rounded-lg text-gray-500 hover:bg-surface-3 hover:text-gray-200 lg:h-9 lg:w-9">
-          <X size={15} />
+          <X size={16} />
         </button>
       </div>
       <div className="flex shrink-0 flex-col gap-2 border-b border-border px-4 py-3">
@@ -1515,18 +1515,18 @@ function TasksColumn({ sessionId, highlightedTaskId, onOpenSettings, onFocusPerm
         )}
         <div className="flex flex-wrap items-center gap-1">
           {isRunning ? (
-            <button onClick={() => void handleCancel()} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-status-danger-soft px-2.5 text-note text-status-danger hover:brightness-95 lg:min-h-9"><Square size={11} />停止</button>
+            <button onClick={() => void handleCancel()} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-status-danger-soft px-2.5 text-note text-status-danger hover:brightness-95 lg:min-h-9"><Square size={14} />停止</button>
           ) : pendingCount > 0 && failedTasks.length === 0 ? (
             <span className="text-label leading-5 text-gray-500">任务已委派，系统会持续调度并自动诊断恢复，无需手动重试。</span>
           ) : null}
           {!isRunning && repairableFailedCount > 0 && (
             <button onClick={() => void handleRepairFailed()} disabled={repairBusy} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-status-warning-soft px-2.5 text-note text-status-warning disabled:opacity-40 lg:min-h-9" title="重试可自动修复的失败步骤">
-              {repairBusy ? <Loader2 size={11} className="animate-spin motion-reduce:animate-none" /> : <RefreshCw size={11} />}重试失败步骤
+              {repairBusy ? <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> : <RefreshCw size={14} />}重试失败步骤
             </button>
           )}
           {!isRunning && providerBlockedTasks.length > 0 && (
             <><button onClick={() => onOpenSettings("endpoints")} className="min-h-11 rounded-lg bg-status-progress-soft px-2.5 text-note text-status-progress hover:brightness-95 lg:min-h-9">打开模型设置</button>
-            <button aria-label={`已修复，重试 ${providerBlockedTasks.length} 项`} title={`重试：${providerBlockedTasks.map((task) => task.title).join("、")}`} onClick={() => void handleRetryBlocked(providerBlockedTasks)} disabled={blockedRetryBusy} className="flex min-h-11 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-note text-gray-300 disabled:opacity-40 lg:min-h-9"><RefreshCw size={11} />已修复，重试 {providerBlockedTasks.length} 项</button></>
+            <button aria-label={`已修复，重试 ${providerBlockedTasks.length} 项`} title={`重试：${providerBlockedTasks.map((task) => task.title).join("、")}`} onClick={() => void handleRetryBlocked(providerBlockedTasks)} disabled={blockedRetryBusy} className="flex min-h-11 items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-note text-gray-300 disabled:opacity-40 lg:min-h-9"><RefreshCw size={14} />已修复，重试 {providerBlockedTasks.length} 项</button></>
           )}
           {!isRunning && permissionBlockedTasks.length > 0 && (
             <><button onClick={onFocusPermission} className="min-h-11 rounded-lg bg-status-progress-soft px-2.5 text-note text-status-progress hover:brightness-95 lg:min-h-9">调整会话权限</button>
@@ -1577,7 +1577,7 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
     >
       <div className="group flex items-start gap-2 px-1.5 py-1">
         <Icon
-          size={13}
+          size={14}
           className={`mt-1 shrink-0 ${statusColor(task.status)} ${
             task.status === "running" ? "animate-spin motion-reduce:animate-none" : ""
           }`}
@@ -1591,11 +1591,11 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
               <button
                 onClick={() => setVerifOpen((v) => !v)}
                 title={`验收验证：${summary.passed}/${summary.total} 通过（点击展开逐条）`}
-                className={`mt-0.5 inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md px-1.5 text-caption transition-colors hover:bg-surface-2 lg:min-h-9 ${
+                className={`mt-0.5 inline-flex min-h-11 shrink-0 items-center gap-1 rounded-lg px-1.5 text-caption transition-colors hover:bg-surface-2 lg:min-h-9 ${
                   summary.allPassed ? "text-status-success" : "text-status-danger"
                 }`}
               >
-                {summary.allPassed ? <CheckCircle2 size={10} /> : <XCircle size={10} />}
+                {summary.allPassed ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
                 {summary.passed}/{summary.total}
               </button>
             )}
@@ -1605,7 +1605,7 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
               className="mt-0.5 flex items-center gap-1 text-caption text-status-progress"
               title={`来自规范《${task.spec_title}》`}
             >
-              <BookOpen size={9} className="shrink-0" />
+              <BookOpen size={14} className="shrink-0" />
               <span className="truncate">规范《{task.spec_title}》</span>
             </div>
           )}
@@ -1614,14 +1614,14 @@ function TaskRow({ task, depth, highlighted = false }: { task: TaskRun; depth: n
               data-status-tone={
                 task.failure_attribution.repairable === false ? "danger" : "warning"
               }
-              className={`mt-1 flex items-start gap-1.5 rounded-md px-2 py-1 text-caption leading-4 ${
+              className={`mt-1 flex items-start gap-1.5 rounded-lg px-2 py-1 text-caption leading-4 ${
                 task.failure_attribution.repairable === false
                   ? "bg-status-danger-soft text-status-danger"
                   : "bg-status-warning-soft text-status-warning"
               }`}
               title={`${task.failure_attribution.summary}\n下一步：${task.failure_attribution.next_action}`}
             >
-              <AlertTriangle size={9} className="mt-0.5 shrink-0" />
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
               <span className="shrink-0 font-medium">{task.failure_attribution.label}</span>
               <span className="min-w-0 truncate opacity-80">
                 {task.failure_attribution.next_action}
@@ -1671,9 +1671,9 @@ function VerifCheckRow({ result }: { result: VerificationResult }) {
         }}
       >
         {result.passed ? (
-          <CheckCircle2 size={10} className="shrink-0 text-status-success" />
+          <CheckCircle2 size={14} className="shrink-0 text-status-success" />
         ) : (
-          <XCircle size={10} className="shrink-0 text-status-danger" />
+          <XCircle size={14} className="shrink-0 text-status-danger" />
         )}
         <span className="flex-1 truncate text-label text-gray-400">{result.check}</span>
         <span className="text-caption text-gray-600">{result.duration_ms}ms</span>

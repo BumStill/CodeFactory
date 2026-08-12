@@ -79,9 +79,17 @@ export function TokenUsageTrend({ days, ariaLabel, dailyBudgetLimit = 0 }: Props
                 moveFocus(nextIndex);
               }
             }}
-            className={`w-full rounded-[2px] border border-transparent transition-colors focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-1 focus:ring-offset-surface-1 ${tone(value, max)}`}
-            style={{ height: `${height}px` }}
-          />
+            // The button is the whole column, not the bar. It used to be the
+            // bar itself, so a zero-usage day was a 4px-tall click target.
+            // The bar is now an inner span; the hit area is the full 40px.
+            className="flex h-full w-full items-end rounded-[2px] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-surface-1"
+          >
+            <span
+              aria-hidden
+              className={`block w-full rounded-[2px] border border-transparent transition-colors ${tone(value, max)}`}
+              style={{ height: `${height}px` }}
+            />
+          </button>
         );
       })}
     </div>

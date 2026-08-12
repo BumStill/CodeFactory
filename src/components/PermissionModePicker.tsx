@@ -159,10 +159,10 @@ export function PermissionModePicker({
               role="menuitemradio"
               aria-checked={mode === option.id}
               onClick={() => selectMode(option.id)}
-              className="flex min-h-[44px] w-full items-start gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+              className="flex min-h-[44px] w-full items-start gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
             >
               <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center">
-                {mode === option.id && <Check size={13} className="text-accent" aria-hidden="true" />}
+                {mode === option.id && <Check size={14} className="text-accent" aria-hidden="true" />}
               </span>
               <span className="min-w-0">
                 <span className="block text-label text-gray-200">{option.label}</span>

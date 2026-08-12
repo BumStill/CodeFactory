@@ -140,7 +140,7 @@ function KnowledgeLibrariesPanel() {
         <section className="flex items-start justify-between gap-4">
           <div>
             <h2 className="flex items-center gap-2 text-body font-semibold text-gray-200">
-              <BookOpen size={15} className="text-accent" />
+              <BookOpen size={16} className="text-accent" />
               个人知识库
             </h2>
             <p className="mt-1 text-label text-gray-600">
@@ -153,7 +153,7 @@ function KnowledgeLibrariesPanel() {
             className="inline-flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-label font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50"
             aria-label="添加知识库"
           >
-            {adding ? <Loader2 size={12} className="animate-spin" /> : <FolderPlus size={12} />}
+            {adding ? <Loader2 size={14} className="animate-spin" /> : <FolderPlus size={14} />}
             添加知识库
           </button>
         </section>
@@ -183,7 +183,7 @@ function KnowledgeLibrariesPanel() {
               return (
                 <li key={library.id} className="rounded-lg border border-border bg-surface-1 p-4">
                   <div className="flex items-start gap-3">
-                    <BookOpen size={15} className="mt-0.5 shrink-0 text-accent" />
+                    <BookOpen size={16} className="mt-0.5 shrink-0 text-accent" />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
                         <h3 className="truncate text-body font-medium text-gray-200">{library.name}</h3>
@@ -217,7 +217,7 @@ function KnowledgeLibrariesPanel() {
                       aria-label={`扫描知识库 ${library.name}`}
                       className="inline-flex items-center gap-1 rounded bg-surface-3 px-2 py-1 text-caption text-gray-400 hover:text-gray-200 disabled:opacity-50"
                     >
-                      <RefreshCw size={10} className={isScanning ? "animate-spin" : ""} />
+                      <RefreshCw size={14} className={isScanning ? "animate-spin" : ""} />
                       {isScanning ? "扫描中" : "重新扫描"}
                     </button>
                     <button
@@ -232,7 +232,7 @@ function KnowledgeLibrariesPanel() {
                       aria-label={`删除知识库 ${library.name}`}
                       className="ml-auto inline-flex items-center gap-1 rounded px-2 py-1 text-caption text-red-700 hover:bg-red-500/10 hover:text-red-500"
                     >
-                      <Trash2 size={10} /> 删除
+                      <Trash2 size={14} /> 删除
                     </button>
                   </div>
                 </li>

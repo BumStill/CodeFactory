@@ -23,7 +23,7 @@ export function UpdateStatusPill() {
         className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/15 border border-accent/40 text-caption text-accent hover:bg-accent/25 transition-colors animate-pulse motion-reduce:animate-none"
         title={`点击下载并安装 v${phase.update.version}`}
       >
-        <Download size={11} />
+        <Download size={14} />
         更新到 v{phase.update.version}
       </button>
     );
@@ -33,7 +33,7 @@ export function UpdateStatusPill() {
     const pct = phase.total ? Math.round((phase.received / phase.total) * 100) : 0;
     return (
       <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-accent/10 text-caption text-accent">
-        <RefreshCw size={11} className="animate-spin motion-reduce:animate-none" />
+        <RefreshCw size={14} className="animate-spin motion-reduce:animate-none" />
         正在下载 {pct}%
       </span>
     );
@@ -45,7 +45,7 @@ export function UpdateStatusPill() {
         className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-amber-500/15 text-caption text-amber-800 dark:text-amber-300"
         title="执行中的本地 session 结束后会自动安装，不会直接重启。"
       >
-        <RefreshCw size={11} />
+        <RefreshCw size={14} />
         等待安全更新 · {countUpdateBlockers(phase.blockers)}
       </span>
     );
@@ -54,7 +54,7 @@ export function UpdateStatusPill() {
   if (phase.kind === "installing" || phase.kind === "ready") {
     return (
       <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/15 text-caption text-emerald-800 dark:text-emerald-300">
-        <Check size={11} />
+        <Check size={14} />
         {phase.kind === "installing" ? "安装中…" : "重启中…"}
       </span>
     );
@@ -83,8 +83,8 @@ export function UpdateStatusPill() {
           : "点击检查更新。"
       }
     >
-      {errored && <AlertCircle size={10} />}
-      {phase.kind === "checking" && <RefreshCw size={10} className="animate-spin motion-reduce:animate-none" />}
+      {errored && <AlertCircle size={14} />}
+      {phase.kind === "checking" && <RefreshCw size={14} className="animate-spin motion-reduce:animate-none" />}
       {versionText}
     </button>
   );

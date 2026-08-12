@@ -398,7 +398,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                   title="移除"
                   aria-label={`移除 ${a.name}`}
                 >
-                  <X size={11} />
+                  <X size={14} />
                 </button>
               </figure>
             ) : (
@@ -407,7 +407,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                 className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-border bg-surface-3 px-2.5 text-note text-gray-300"
                 title={a.path}
               >
-                <Paperclip size={10} className="text-accent" />
+                <Paperclip size={14} className="text-accent" />
                 <span className="max-w-[160px] truncate">{a.name}</span>
                 <span className="text-caption text-gray-600">
                   {(a.sizeBytes / 1024).toFixed(0)}KB
@@ -419,14 +419,14 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
                   title="移除"
                   aria-label={`移除 ${a.name}`}
                 >
-                  <X size={10} />
+                  <X size={14} />
                 </button>
               </span>
             )
           ))}
           {uploading && (
             <span className="inline-flex items-center gap-1 text-note text-gray-500">
-              <Loader2 size={10} className="animate-spin motion-reduce:animate-none" /> 保存中…
+              <Loader2 size={14} className="animate-spin motion-reduce:animate-none" /> 保存中…
             </span>
           )}
           {attachError && (
@@ -540,7 +540,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
         )}
         {guidanceState.kind === "success" && (
           <span aria-live="polite" className="flex items-center gap-1 text-status-success">
-            <Check size={11} /> 已送出
+            <Check size={14} /> 已送出
           </span>
         )}
         {guidanceState.kind === "error" && (

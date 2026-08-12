@@ -172,12 +172,12 @@ export function DraftScopeBar({
         className="flex min-h-[44px] min-w-0 max-w-[132px] shrink items-center gap-1.5 rounded-lg px-2 text-label text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:max-w-[220px] lg:min-h-[36px]"
       >
         {cwd ? (
-          <Folder size={11} className="shrink-0 text-accent" />
+          <Folder size={14} className="shrink-0 text-accent" />
         ) : (
-          <MessageSquare size={11} className="shrink-0 text-gray-500" />
+          <MessageSquare size={14} className="shrink-0 text-gray-500" />
         )}
         <span className="truncate">{label}</span>
-        <ChevronDown size={11} className="shrink-0 text-gray-600" />
+        <ChevronDown size={14} className="shrink-0 text-gray-600" />
       </button>
 
       {modelPicker && (
@@ -197,7 +197,7 @@ export function DraftScopeBar({
           className="flex min-h-[44px] shrink-0 items-center gap-1 rounded-lg bg-status-warning-soft pl-2 text-label font-medium text-status-warning lg:min-h-[36px]"
           title="匿名会话：聊完不留记录"
         >
-          <EyeOff size={13} aria-hidden="true" />
+          <EyeOff size={14} aria-hidden="true" />
           <span>匿名</span>
           <button
             type="button"
@@ -205,7 +205,7 @@ export function DraftScopeBar({
             aria-label="关闭匿名会话"
             className="flex h-[44px] w-[44px] items-center justify-center rounded-lg hover:bg-status-warning/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:h-[36px] lg:w-[36px]"
           >
-            <X size={13} aria-hidden="true" />
+            <X size={14} aria-hidden="true" />
           </button>
         </div>
       ) : (
@@ -220,7 +220,7 @@ export function DraftScopeBar({
           title="更多会话设置"
           className="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:h-[36px] lg:w-[36px]"
         >
-          <MoreHorizontal size={15} aria-hidden="true" />
+          <MoreHorizontal size={16} aria-hidden="true" />
         </button>
       )}
 
@@ -245,9 +245,9 @@ export function DraftScopeBar({
             }}
             className="flex min-h-[44px] w-full items-center gap-2 px-3 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px]"
           >
-            <MessageSquare size={11} className="shrink-0 text-gray-500" />
+            <MessageSquare size={14} className="shrink-0 text-gray-500" />
             <span className="flex-1 truncate">独立任务（不使用项目）</span>
-            {cwd === null && <Check size={11} className="shrink-0 text-accent" />}
+            {cwd === null && <Check size={14} className="shrink-0 text-accent" />}
           </button>
           {options.length > 0 && (
             <>
@@ -267,9 +267,9 @@ export function DraftScopeBar({
                   title={project.cwd}
                   className="flex min-h-[44px] w-full items-center gap-2 px-3 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px]"
                 >
-                  <Folder size={11} className="shrink-0 text-gray-500" />
+                  <Folder size={14} className="shrink-0 text-gray-500" />
                   <span className="flex-1 truncate">{project.name}</span>
-                  {cwd === project.cwd && <Check size={11} className="shrink-0 text-accent" />}
+                  {cwd === project.cwd && <Check size={14} className="shrink-0 text-accent" />}
                 </button>
               ))}
             </>
@@ -280,7 +280,7 @@ export function DraftScopeBar({
             onClick={() => void browse()}
             className="mt-1 flex min-h-[44px] w-full items-center gap-2 border-t border-border px-3 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px]"
           >
-            <FolderOpen size={11} className="shrink-0 text-gray-500" />
+            <FolderOpen size={14} className="shrink-0 text-gray-500" />
             <span className="flex-1">浏览目录…</span>
           </button>
         </div>,
@@ -309,7 +309,7 @@ export function DraftScopeBar({
               closeMenuAndRestoreFocus("more");
               onToggleAnonymous(true);
             }}
-            className="flex min-h-[44px] w-full items-center gap-2 rounded-md px-2 text-left text-label text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+            className="flex min-h-[44px] w-full items-center gap-2 rounded-lg px-2 text-left text-label text-gray-300 transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
           >
             <EyeOff size={14} className="shrink-0 text-gray-500" aria-hidden="true" />
             <span className="flex-1">匿名会话</span>

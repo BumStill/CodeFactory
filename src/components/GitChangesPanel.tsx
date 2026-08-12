@@ -177,19 +177,19 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
           onClick={onOpenHistory}
           className={`inline-flex items-center gap-1 rounded px-2 text-caption text-gray-500 hover:bg-surface-3 hover:text-gray-200 ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
           title="提交历史"
-        ><History size={11} />历史</button>
+        ><History size={14} />历史</button>
         <button
           onClick={onOpenRemote}
           className={`inline-flex items-center gap-1 rounded px-2 text-caption text-gray-500 hover:bg-surface-3 hover:text-gray-200 ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
           title="远程仓库（问题与拉取请求）"
-        ><GitPullRequest size={11} />远程</button>
+        ><GitPullRequest size={14} />远程</button>
         <button
           onClick={() => refreshStatus()}
           aria-label="刷新本地 Git"
           className={`inline-flex shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-surface-3 hover:text-gray-300 ${embedded && isNarrowEmbedded ? "h-11 w-11" : "h-9 w-9"}`}
           title="刷新"
         >
-          <RefreshCw size={12} />
+          <RefreshCw size={14} />
         </button>
         <button
           onClick={onClose}
@@ -247,7 +247,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
           disabled={stagedCount === 0}
           className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} flex items-center gap-1 px-2 text-caption rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
         >
-          <GitCommitIcon size={11} />
+          <GitCommitIcon size={14} />
           提交 ({stagedCount})
         </button>
       </div>
@@ -389,7 +389,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
                 onClick={handleCommit}
                 className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} flex items-center gap-1 px-3 rounded text-label bg-accent hover:bg-accent-hover text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed`}
               >
-                <Check size={12} />
+                <Check size={14} />
                 {committing ? "提交中…" : "提交"}
               </button>
             </div>
@@ -472,7 +472,7 @@ function FileRow({ path, status, group, selected, active, largeTarget, onToggle,
         aria-current={active ? "true" : undefined}
         className={`flex min-w-0 flex-1 items-center gap-1 rounded text-left outline-none focus-visible:ring-2 focus-visible:ring-accent/70 ${largeTarget ? "min-h-11" : "min-h-9"}`}
       >
-        {group === "staged" && <Plus size={10} className="text-accent shrink-0" />}
+        {group === "staged" && <Plus size={14} className="text-accent shrink-0" />}
         <span
           className={`text-caption font-mono shrink-0 w-3 text-center ${statusBadge.color}`}
           title={status}

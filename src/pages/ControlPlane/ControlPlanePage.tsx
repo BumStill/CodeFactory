@@ -374,9 +374,9 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
             className="rounded p-1 text-gray-600 transition-colors hover:bg-surface-3 hover:text-gray-300"
             title="返回"
           >
-            <ChevronLeft size={15} />
+            <ChevronLeft size={16} />
           </button>
-          <ShieldCheck size={17} className="text-accent" />
+          <ShieldCheck size={16} className="text-accent" />
           <div className="min-w-0">
             <h1 className="text-body font-semibold text-gray-100">AI Coding OS</h1>
             <p className="truncate text-caption text-gray-600">
@@ -389,7 +389,7 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
           disabled={loading}
           className="inline-flex items-center gap-1.5 rounded border border-border px-2 py-1 text-label text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 disabled:opacity-50"
         >
-          {loading ? <CircleDashed size={13} className="animate-spin" /> : <RefreshCcw size={13} />}
+          {loading ? <CircleDashed size={14} className="animate-spin" /> : <RefreshCcw size={14} />}
           刷新
         </button>
       </header>
@@ -410,7 +410,7 @@ export function ControlPlanePage({ onBack }: ControlPlanePageProps) {
             <>
               <div className="mb-4 flex flex-wrap items-center gap-3 text-label text-gray-500">
                 <span className="inline-flex items-center gap-1">
-                  <GitBranch size={13} />
+                  <GitBranch size={14} />
                   {gitContextLabel(snapshot.delivery)}
                 </span>
                 <span>{generatedAt}</span>

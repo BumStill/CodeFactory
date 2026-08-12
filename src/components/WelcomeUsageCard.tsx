@@ -67,9 +67,9 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
           type="button"
           aria-label="查看用量详情"
           onClick={onOpenUsage}
-          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-caption text-accent transition-colors hover:bg-accent/10 focus:outline-none focus:ring-2 focus:ring-accent/60"
+          className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-caption text-accent transition-colors hover:bg-accent/10 focus:outline-none focus:ring-2 focus:ring-accent/60"
         >
-          查看详情<ArrowRight size={11} />
+          查看详情<ArrowRight size={14} />
         </button>
       </div>
 
@@ -107,7 +107,7 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
       ) : failed ? (
         <p className="text-label text-gray-400">用量统计暂不可用</p>
       ) : (
-        <p className="inline-flex items-center gap-1.5 text-label text-gray-400"><Loader2 size={11} className="animate-spin motion-reduce:animate-none" />正在读取本机用量</p>
+        <p className="inline-flex items-center gap-1.5 text-label text-gray-400"><Loader2 size={14} className="animate-spin motion-reduce:animate-none" />正在读取本机用量</p>
       )}
     </section>
   );

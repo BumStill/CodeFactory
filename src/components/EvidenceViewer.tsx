@@ -239,7 +239,7 @@ function ToolCallsTab({ toolCalls }: { toolCalls: ToolCallEntry[] }) {
   return (
     <div className="flex flex-col flex-1 min-h-0">
       <div className="flex items-center gap-2 px-4 py-2 border-b border-border shrink-0">
-        <Filter size={12} className="text-gray-500" />
+        <Filter size={14} className="text-gray-500" />
         <select
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
@@ -309,7 +309,7 @@ function FilesChangedTab({ files }: { files: FileChangedEntry[] }) {
             onClick={() => setExpanded(expanded === i ? null : i)}
             className="w-full flex items-center gap-2 px-3 py-2 bg-surface-2 text-left hover:bg-surface-3 transition-colors"
           >
-            <FileText size={12} className="text-gray-500 shrink-0" />
+            <FileText size={14} className="text-gray-500 shrink-0" />
             <span className="flex-1 text-label font-mono text-gray-300 truncate">{f.path}</span>
             <span className="text-gray-600 text-caption">{expanded === i ? "▲" : "▼"}</span>
           </button>
@@ -342,8 +342,8 @@ function VerificationTab({ items }: { items: VerificationEntry[] }) {
         <div key={i} className={`rounded border p-3 ${v.passed ? "border-green-800 bg-green-950/20" : "border-red-800 bg-red-950/20"}`}>
           <div className="flex items-center gap-2 mb-1">
             {v.passed
-              ? <CheckCircle size={12} className="text-green-400 shrink-0" />
-              : <XCircle size={12} className="text-red-400 shrink-0" />}
+              ? <CheckCircle size={14} className="text-green-400 shrink-0" />
+              : <XCircle size={14} className="text-red-400 shrink-0" />}
             <span className="text-label font-medium text-gray-200">{v.check}</span>
             {v.task_title && (
               <span className="text-caption text-gray-500 ml-auto">任务：{v.task_title}</span>
@@ -422,7 +422,7 @@ function AiCollabTab({ data }: { data: AiCollaboration | null }) {
           <ul className="space-y-1">
             {data.assumptions.map((a, i) => (
               <li key={i} className="flex gap-2 text-label text-gray-400">
-                <AlertCircle size={12} className="text-yellow-600 shrink-0 mt-0.5" />
+                <AlertCircle size={14} className="text-yellow-600 shrink-0 mt-0.5" />
                 <span>{a}</span>
               </li>
             ))}
@@ -438,7 +438,7 @@ function AiCollabTab({ data }: { data: AiCollaboration | null }) {
           <ul className="space-y-1">
             {data.review_points.map((r, i) => (
               <li key={i} className="flex gap-2 text-label text-gray-400">
-                <XCircle size={12} className="text-red-600 shrink-0 mt-0.5" />
+                <XCircle size={14} className="text-red-600 shrink-0 mt-0.5" />
                 <span>{r}</span>
               </li>
             ))}
@@ -478,7 +478,7 @@ function SourcesTab({ refs }: { refs: KnowledgeRefEntry[] }) {
             {ref.result_refs.map((source, i) => (
               <div key={`${source.chunk_id ?? source.document_id ?? source.path ?? "source"}-${i}`} className="rounded border border-border/70 bg-surface-1 px-2.5 py-2">
                 <div className="flex items-center gap-2 min-w-0">
-                  <FileText size={12} className="text-gray-500 shrink-0" />
+                  <FileText size={14} className="text-gray-500 shrink-0" />
                   <span className="text-label text-gray-300 font-medium truncate" title={source.path}>
                     {sourceFileName(source.path)}
                   </span>
@@ -531,13 +531,13 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
   };
 
   const tabs: { key: TabKey; label: string; icon: React.ReactNode }[] = [
-    { key: "summary", label: "摘要", icon: <FileText size={12} /> },
-    { key: "tool_calls", label: `工具调用${pack ? ` (${pack.tool_calls.length})` : ""}`, icon: <Terminal size={12} /> },
-    { key: "sources", label: `来源${pack ? ` (${pack.knowledge_refs?.length ?? 0})` : ""}`, icon: <BookOpen size={12} /> },
-    { key: "files", label: `文件${pack ? ` (${pack.files_changed.length})` : ""}`, icon: <FileText size={12} /> },
-    { key: "verification", label: "验证", icon: <CheckCircle size={12} /> },
-    { key: "git", label: `Git${pack ? ` (${pack.git_commits.length})` : ""}`, icon: <GitCommit size={12} /> },
-    { key: "ai", label: "AI", icon: <Bot size={12} /> },
+    { key: "summary", label: "摘要", icon: <FileText size={14} /> },
+    { key: "tool_calls", label: `工具调用${pack ? ` (${pack.tool_calls.length})` : ""}`, icon: <Terminal size={14} /> },
+    { key: "sources", label: `来源${pack ? ` (${pack.knowledge_refs?.length ?? 0})` : ""}`, icon: <BookOpen size={14} /> },
+    { key: "files", label: `文件${pack ? ` (${pack.files_changed.length})` : ""}`, icon: <FileText size={14} /> },
+    { key: "verification", label: "验证", icon: <CheckCircle size={14} /> },
+    { key: "git", label: `Git${pack ? ` (${pack.git_commits.length})` : ""}`, icon: <GitCommit size={14} /> },
+    { key: "ai", label: "AI", icon: <Bot size={14} /> },
   ];
 
   return (
@@ -557,11 +557,11 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
           {pack && (
             <div className="flex items-center gap-3 mt-1 text-caption text-gray-500">
               <span className="flex items-center gap-1">
-                <Clock size={10} />
+                <Clock size={14} />
                 {formatDuration(pack.manifest.duration_minutes)}
               </span>
               <span className="flex items-center gap-1">
-                <Coins size={10} />
+                <Coins size={14} />
                 {formatTokens(pack.manifest.total_tokens)} 个 Token
               </span>
               <span>{pack.manifest.total_tasks} 个任务 · {pack.manifest.total_tool_calls} 次调用 · {pack.manifest.files_changed} 个文件</span>
@@ -573,7 +573,7 @@ export function EvidenceViewer({ packPath, onClose }: EvidenceViewerProps) {
           className="flex items-center gap-1 px-2 py-1 rounded text-label text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors shrink-0"
           title="在文件管理器中打开"
         >
-          <FolderOpen size={12} />
+          <FolderOpen size={14} />
           <span>打开文件夹</span>
         </button>
         <button

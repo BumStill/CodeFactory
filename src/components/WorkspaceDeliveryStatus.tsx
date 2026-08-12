@@ -241,7 +241,7 @@ export function WorkspaceDeliveryStatus({
         className={`inline-flex h-11 max-w-[210px] shrink items-center gap-1.5 overflow-hidden rounded-lg border px-2 text-label transition-colors hover:brightness-95 lg:h-9 ${tone}`}
         title="查看本会话对应的 PR/MR、CI、合并、发布与线上验证状态"
       >
-        <GitPullRequest size={12} className="shrink-0" />
+        <GitPullRequest size={14} className="shrink-0" />
         <span className="truncate" title={summary}>{pr ? <><span className="font-medium">PR #{pr.number}</span>{visibleSummary && <span className="ml-1.5">· {visibleSummary}</span>}</> : visibleSummary}</span>
       </button>
 
@@ -305,7 +305,7 @@ function DeliveryDetailsView({ snapshot, unavailable, closeButtonRef, onClose, e
                   <div className="text-note font-semibold text-gray-200">PR #{pr.number} · {pr.title}</div>
                   <div className="mt-1 truncate font-mono text-label text-gray-500">{pr.head_branch} → {pr.base_branch}</div>
                 </div>
-                <a href={pr.url} target="_blank" rel="noreferrer" aria-label={`打开 PR #${pr.number}`} className="rounded p-1 text-gray-600 hover:bg-surface-3 hover:text-gray-200"><ExternalLink size={13} /></a>
+                <a href={pr.url} target="_blank" rel="noreferrer" aria-label={`打开 PR #${pr.number}`} className="rounded p-1 text-gray-600 hover:bg-surface-3 hover:text-gray-200"><ExternalLink size={14} /></a>
               </div>
             </section>
             <ol aria-label="交付链" className="space-y-1">
@@ -370,7 +370,7 @@ function prStateLabel(pr: DeliveryPr): string {
 }
 
 function EmptyState({ title, detail }: { title: string; detail: string }) {
-  return <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center"><CircleDot size={18} className="mx-auto text-gray-600" /><div className="mt-2 text-note font-medium text-gray-400">{title}</div><p className="mx-auto mt-1 max-w-xs text-label leading-5 text-gray-600">{detail}</p></div>;
+  return <div className="rounded-xl border border-dashed border-border px-4 py-8 text-center"><CircleDot size={20} className="mx-auto text-gray-600" /><div className="mt-2 text-note font-medium text-gray-400">{title}</div><p className="mx-auto mt-1 max-w-xs text-label leading-5 text-gray-600">{detail}</p></div>;
 }
 
 type DeliveryStepTone = "neutral" | "progress" | "success" | "warning" | "danger";
