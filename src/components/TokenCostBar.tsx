@@ -79,7 +79,7 @@ export function TokenCostBar({ sessionId }: Props) {
   if (sessionTok === 0 && todayTok === 0 && monthCost === 0) return null;
 
   return (
-    <div className="flex items-center gap-4 px-4 py-1 border-t border-border text-[11px] text-gray-600 bg-surface-1 shrink-0 select-none">
+    <div className="flex items-center gap-4 px-4 py-1 border-t border-border text-caption text-gray-600 bg-surface-1 shrink-0 select-none">
       {sessionTok > 0 && (
         <span title="当前会话">
           📊 {fmtTokens(sessionTok)} tok

@@ -172,15 +172,15 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
           : "flex items-center gap-2 px-3 py-2 border-b border-border shrink-0"}
       >
         <FileText size={14} className="text-gray-400" />
-        <span className="text-xs font-semibold text-gray-200 flex-1">本地 Git</span>
+        <span className="text-label font-semibold text-gray-200 flex-1">本地 Git</span>
         <button
           onClick={onOpenHistory}
-          className={`inline-flex items-center gap-1 rounded px-2 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200 ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
+          className={`inline-flex items-center gap-1 rounded px-2 text-caption text-gray-500 hover:bg-surface-3 hover:text-gray-200 ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
           title="提交历史"
         ><History size={11} />历史</button>
         <button
           onClick={onOpenRemote}
-          className={`inline-flex items-center gap-1 rounded px-2 text-[11px] text-gray-500 hover:bg-surface-3 hover:text-gray-200 ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
+          className={`inline-flex items-center gap-1 rounded px-2 text-caption text-gray-500 hover:bg-surface-3 hover:text-gray-200 ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
           title="远程仓库（问题与拉取请求）"
         ><GitPullRequest size={11} />远程</button>
         <button
@@ -211,14 +211,14 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
           ? `flex items-center gap-2 border-b border-border bg-surface-2 px-3 py-1.5 shrink-0 ${isNarrowEmbedded ? "flex-wrap" : "flex-nowrap"}`
           : "flex items-center gap-2 px-3 py-1.5 border-b border-border bg-surface-2 shrink-0"}
       >
-        <label className="inline-flex min-w-0 max-w-full items-center gap-1 text-[11px] text-gray-600">
+        <label className="inline-flex min-w-0 max-w-full items-center gap-1 text-caption text-gray-600">
           分支
           <select
             aria-label="切换本地分支"
             value={status?.branch ?? ""}
             disabled={switchingBranch}
             onChange={(event) => void handleBranchChange(event.target.value)}
-            className={`w-40 max-w-full rounded border border-border bg-surface-3 px-1.5 text-[11px] text-gray-300 outline-none focus:border-accent ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
+            className={`w-40 max-w-full rounded border border-border bg-surface-3 px-1.5 text-caption text-gray-300 outline-none focus:border-accent ${embedded && isNarrowEmbedded ? "h-11" : "h-9"}`}
           >
             {branches.filter((branch) => !branch.is_remote || branch.is_current).map((branch) => (
               <option key={`${branch.is_remote ? "r" : "l"}:${branch.name}`} value={branch.name}>{branch.name}</option>
@@ -228,14 +228,14 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
         <button
           onClick={handleStageAll}
           disabled={rows.length === 0}
-          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-2 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
+          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-2 text-caption rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
         >
           暂存全部
         </button>
         <button
           onClick={handleStageSelected}
           disabled={selected.size === 0}
-          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-2 text-[11px] rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
+          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-2 text-caption rounded bg-surface-3 hover:bg-surface-4 text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
         >
           暂存选中 ({selected.size})
         </button>
@@ -245,7 +245,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
           ref={commitTriggerRef}
           onClick={() => setShowCommitModal(true)}
           disabled={stagedCount === 0}
-          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} flex items-center gap-1 px-2 text-[11px] rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
+          className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} flex items-center gap-1 px-2 text-caption rounded bg-accent hover:bg-accent-hover text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors`}
         >
           <GitCommitIcon size={11} />
           提交 ({stagedCount})
@@ -253,7 +253,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
       </div>
 
       {error && (
-        <div className="px-3 py-1.5 text-[11px] text-status-danger border-b border-border bg-status-danger-soft shrink-0">
+        <div className="px-3 py-1.5 text-caption text-status-danger border-b border-border bg-status-danger-soft shrink-0">
           {error}
         </div>
       )}
@@ -273,7 +273,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
             : "w-[260px] border-r border-border overflow-y-auto shrink-0"}
         >
           {rows.length === 0 && (
-            <div className="px-3 py-4 text-center text-[11px] text-gray-600">
+            <div className="px-3 py-4 text-center text-caption text-gray-600">
               无变更
             </div>
           )}
@@ -299,7 +299,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
           />
           {status && status.untracked.length > 0 && (
             <div>
-              <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0">
+              <div className="px-2 py-1 text-caption font-semibold text-gray-600 bg-surface-2 sticky top-0">
                 未跟踪 ({status.untracked.length})
               </div>
               {status.untracked.map((p) => (
@@ -322,21 +322,21 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
         {/* Diff view */}
         <div className="flex-1 overflow-y-auto p-2 min-w-0">
           {!activeFile && (
-            <div className="pt-8 text-center text-[11px] text-gray-600">
+            <div className="pt-8 text-center text-caption text-gray-600">
               选择文件以查看差异
             </div>
           )}
           {activeFile && diffLoading && (
-            <div className="text-[11px] text-gray-600 text-center pt-8">加载中…</div>
+            <div className="text-caption text-gray-600 text-center pt-8">加载中…</div>
           )}
           {activeFile && !diffLoading && (
             <>
-              <div className="text-[11px] text-gray-500 mb-2 truncate">
+              <div className="text-caption text-gray-500 mb-2 truncate">
                 {activeFile.path}{" "}
                 <span className="text-gray-600">({activeFile.staged ? "已暂存" : "未暂存"})</span>
               </div>
               {diff.trim().length === 0 ? (
-                <div className="text-[11px] text-gray-600">
+                <div className="text-caption text-gray-600">
                   无可用差异（文件可能为二进制或完全新增）。
                 </div>
               ) : (
@@ -363,7 +363,7 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
               if (!committing) setShowCommitModal(false);
             })}
           >
-            <h2 id="git-commit-dialog-title" className="text-sm font-semibold text-gray-200 flex items-center gap-2">
+            <h2 id="git-commit-dialog-title" className="text-body font-semibold text-gray-200 flex items-center gap-2">
               <GitCommitIcon size={14} /> 提交 {stagedCount} 个文件
             </h2>
             <textarea
@@ -372,22 +372,22 @@ export function GitChangesPanel({ onClose, onOpenHistory, onOpenRemote, sessionI
               onChange={(e) => setCommitMsg(e.target.value)}
               placeholder="提交信息…"
               rows={5}
-              className="w-full bg-surface-3 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none font-mono"
+              className="w-full bg-surface-3 border border-border rounded px-3 py-2 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50 resize-none font-mono"
               autoFocus
             />
-            {error && <div className="text-[11px] text-status-danger">{error}</div>}
+            {error && <div className="text-caption text-status-danger">{error}</div>}
             <div className="flex justify-end gap-2">
               <button
                 disabled={committing}
                 onClick={() => setShowCommitModal(false)}
-                className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-3 rounded text-xs text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors disabled:opacity-40`}
+                className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} px-3 rounded text-label text-gray-500 hover:text-gray-300 hover:bg-surface-3 transition-colors disabled:opacity-40`}
               >
                 取消
               </button>
               <button
                 disabled={committing || !commitMsg.trim()}
                 onClick={handleCommit}
-                className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} flex items-center gap-1 px-3 rounded text-xs bg-accent hover:bg-accent-hover text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed`}
+                className={`${embedded && isNarrowEmbedded ? "h-11" : "h-9"} flex items-center gap-1 px-3 rounded text-label bg-accent hover:bg-accent-hover text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed`}
               >
                 <Check size={12} />
                 {committing ? "提交中…" : "提交"}
@@ -416,7 +416,7 @@ function FileGroup({ label, files, group, selected, activeFile, largeTarget, onT
   const staged = group === "staged";
   return (
     <div>
-      <div className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wider text-gray-600 bg-surface-2 sticky top-0">
+      <div className="px-2 py-1 text-caption font-semibold text-gray-600 bg-surface-2 sticky top-0">
         {label} ({files.length})
       </div>
       {files.map((f) => (
@@ -474,12 +474,12 @@ function FileRow({ path, status, group, selected, active, largeTarget, onToggle,
       >
         {group === "staged" && <Plus size={10} className="text-accent shrink-0" />}
         <span
-          className={`text-[11px] font-mono shrink-0 w-3 text-center ${statusBadge.color}`}
+          className={`text-caption font-mono shrink-0 w-3 text-center ${statusBadge.color}`}
           title={status}
         >
           {statusBadge.letter}
         </span>
-        <span className="text-[11px] text-gray-300 truncate flex-1" title={path}>
+        <span className="text-caption text-gray-300 truncate flex-1" title={path}>
           {path}
         </span>
       </button>

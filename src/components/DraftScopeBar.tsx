@@ -107,7 +107,7 @@ export function DraftScopeBar({
       className="relative flex flex-wrap items-center gap-1.5 border-b border-border/60 bg-surface-1/30 px-3 py-2"
       ref={rootRef}
     >
-      <span className="mr-0.5 shrink-0 text-[11px] font-medium uppercase tracking-[0.08em] text-gray-600">
+      <span className="mr-0.5 shrink-0 text-caption font-medium text-gray-600">
         新会话
       </span>
       <button
@@ -117,7 +117,7 @@ export function DraftScopeBar({
         aria-label="选择项目"
         aria-expanded={menuOpen}
         title={cwd ?? "不使用项目，只做一个独立任务"}
-        className="flex min-h-8 max-w-[240px] items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-[11px] text-gray-300 transition-colors hover:border-accent/40 hover:bg-surface-3 hover:text-gray-100"
+        className="flex min-h-8 max-w-[240px] items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2.5 text-caption text-gray-300 transition-colors hover:border-accent/40 hover:bg-surface-3 hover:text-gray-100"
       >
         {cwd ? (
           <Folder size={11} className="shrink-0 text-accent" />
@@ -142,7 +142,7 @@ export function DraftScopeBar({
         onClick={() => onToggleAnonymous(!anonymous)}
         aria-pressed={anonymous}
         title="匿名：这次对话不留任何记录"
-        className={`flex min-h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] transition-colors ${
+        className={`flex min-h-8 items-center gap-1.5 rounded-lg border px-2.5 text-caption transition-colors ${
           anonymous
             ? "border-accent/50 bg-accent/10 text-accent"
             : "border-border bg-surface-2 text-gray-500 hover:bg-surface-3 hover:text-gray-300"
@@ -152,7 +152,7 @@ export function DraftScopeBar({
         匿名
       </button>
 
-      <span className="min-w-[160px] flex-1 truncate px-1 text-[11px] text-gray-600">
+      <span className="min-w-[160px] flex-1 truncate px-1 text-caption text-gray-600">
         {anonymous
           ? "聊完不留记录"
           : cwd
@@ -168,14 +168,14 @@ export function DraftScopeBar({
           style={menuPosition ? { left: menuPosition.left, top: menuPosition.top } : undefined}
           className="fixed z-[100] w-64 overflow-hidden rounded-lg border border-border bg-surface-2 py-1 shadow-2xl"
         >
-          <p className="px-3 py-1 text-[11px] font-medium tracking-wide text-gray-600">在哪里干活</p>
+          <p className="px-3 py-1 text-caption font-medium text-gray-600">在哪里干活</p>
           <button
             type="button"
             onClick={() => {
               onPickProject(null);
               setMenuOpen(false);
             }}
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-gray-300 transition-colors hover:bg-surface-3"
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
           >
             <MessageSquare size={11} className="shrink-0 text-gray-500" />
             <span className="flex-1 truncate">独立任务（不使用项目）</span>
@@ -183,7 +183,7 @@ export function DraftScopeBar({
           </button>
           {options.length > 0 && (
             <>
-              <p className="mt-1 border-t border-border px-3 pb-0.5 pt-1.5 text-[11px] font-medium tracking-wide text-gray-600">
+              <p className="mt-1 border-t border-border px-3 pb-0.5 pt-1.5 text-caption font-medium text-gray-600">
                 最近项目
               </p>
               {options.map((project) => (
@@ -195,7 +195,7 @@ export function DraftScopeBar({
                     setMenuOpen(false);
                   }}
                   title={project.cwd}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-gray-300 transition-colors hover:bg-surface-3"
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
                 >
                   <Folder size={11} className="shrink-0 text-gray-500" />
                   <span className="flex-1 truncate">{project.name}</span>
@@ -207,7 +207,7 @@ export function DraftScopeBar({
           <button
             type="button"
             onClick={() => void browse()}
-            className="mt-1 flex w-full items-center gap-2 border-t border-border px-3 py-1.5 text-left text-[11px] text-gray-300 transition-colors hover:bg-surface-3"
+            className="mt-1 flex w-full items-center gap-2 border-t border-border px-3 py-1.5 text-left text-caption text-gray-300 transition-colors hover:bg-surface-3"
           >
             <FolderOpen size={11} className="shrink-0 text-gray-500" />
             <span className="flex-1">浏览目录…</span>

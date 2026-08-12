@@ -53,8 +53,8 @@ describe("MessageList turn timeline", () => {
     const steps = container.querySelectorAll("[data-segment='step']");
     expect(steps.length).toBe(1);
     expect(steps[0].textContent).toContain("两类红灯都稳定复现了");
-    expect(steps[0]).toHaveClass("text-[15px]", "leading-6");
-    expect(steps[0]).not.toHaveClass("text-[13px]", "border-l");
+    expect(steps[0]).toHaveClass("text-reading", "leading-6");
+    expect(steps[0]).not.toHaveClass("text-note", "border-l");
     const finals = container.querySelectorAll("[data-segment='final']");
     expect(finals.length).toBe(1);
     expect(finals[0].textContent).toContain("最终总结");

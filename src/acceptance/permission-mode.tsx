@@ -79,9 +79,9 @@ function PermissionModeAcceptanceApp() {
 
   return (
     <main className="min-h-screen bg-bg p-6 text-gray-200" aria-label="Permission mode acceptance">
-      <h1 className="mb-4 text-lg font-semibold">Session permission mode acceptance</h1>
+      <h1 className="mb-4 text-heading font-semibold">Session permission mode acceptance</h1>
       <section aria-label="Workspace toolbar" className="mb-4 rounded-lg border border-border bg-surface-1 p-3">
-        <h2 className="mb-2 text-sm font-medium">Workspace toolbar</h2>
+        <h2 className="mb-2 text-body font-medium">Workspace toolbar</h2>
         <PermissionModePicker onChangeForAcceptance={(mode) => {
           const current = useChatStore.getState().activeSession;
           if (!current) return;
@@ -91,12 +91,12 @@ function PermissionModeAcceptanceApp() {
             sessions: state.sessions.map((item) => item.id === updated.id ? updated : item),
           }));
         }} />
-        <div data-testid="current-permission-mode" className="mt-2 text-xs text-gray-400">mode:{currentMode}</div>
+        <div data-testid="current-permission-mode" className="mt-2 text-label text-gray-400">mode:{currentMode}</div>
       </section>
       <section aria-label="Settings tabs" className="rounded-lg border border-border bg-surface-1 p-3">
         <button
           type="button"
-          className="rounded bg-accent px-3 py-1.5 text-xs text-white"
+          className="rounded bg-accent px-3 py-1.5 text-label text-white"
           onClick={() => setSettingsOpen((open) => !open)}
         >
           {settingsOpen ? "关闭设置" : "打开设置"}

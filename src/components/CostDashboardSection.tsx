@@ -112,11 +112,11 @@ export function CostDashboardSection() {
   return (
     <section>
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+        <h2 className="text-label font-semibold text-gray-400 flex items-center gap-1.5">
           <DollarSign size={12} className="text-accent" />
           成本透视
         </h2>
-        <div className="flex items-center rounded border border-border overflow-hidden text-[10px]">
+        <div className="flex items-center rounded border border-border overflow-hidden text-caption">
           {(["today", "month", "all"] as Scope[]).map((s) => (
             <button
               key={s}
@@ -133,25 +133,25 @@ export function CostDashboardSection() {
         </div>
       </div>
 
-      {error && <p className="text-xs text-red-700 dark:text-red-300 mb-2">{error}</p>}
+      {error && <p className="text-label text-red-700 dark:text-red-300 mb-2">{error}</p>}
 
       {/* Headline row */}
       <div className="grid grid-cols-3 gap-3 mb-4">
         <div className="rounded-lg border border-border bg-surface-1 p-3">
-          <div className="text-[10px] text-gray-500 uppercase mb-0.5">花费</div>
-          <div className="text-base font-semibold text-gray-200 font-mono">
+          <div className="text-caption text-gray-500 mb-0.5">花费</div>
+          <div className="text-title font-semibold text-gray-200 font-mono">
             {summary ? fmtUsd(summary.cost_usd) : <Loader2 size={12} className="animate-spin inline" />}
           </div>
         </div>
         <div className="rounded-lg border border-border bg-surface-1 p-3">
-          <div className="text-[10px] text-gray-500 uppercase mb-0.5">输入 token</div>
-          <div className="text-base font-semibold text-gray-200 font-mono">
+          <div className="text-caption text-gray-500 mb-0.5">输入 Token</div>
+          <div className="text-title font-semibold text-gray-200 font-mono">
             {summary ? fmtTokens(summary.input_tokens) : "—"}
           </div>
         </div>
         <div className="rounded-lg border border-border bg-surface-1 p-3">
-          <div className="text-[10px] text-gray-500 uppercase mb-0.5">输出 token</div>
-          <div className="text-base font-semibold text-gray-200 font-mono">
+          <div className="text-caption text-gray-500 mb-0.5">输出 Token</div>
+          <div className="text-title font-semibold text-gray-200 font-mono">
             {summary ? fmtTokens(summary.output_tokens) : "—"}
           </div>
         </div>
@@ -159,13 +159,13 @@ export function CostDashboardSection() {
 
       {/* By model */}
       <div className="mb-4">
-        <h3 className="text-[11px] font-medium text-gray-400 mb-1.5">按模型</h3>
+        <h3 className="text-caption font-medium text-gray-400 mb-1.5">按模型</h3>
         {loading && byModel.length === 0 ? (
-          <p className="text-xs text-gray-500 text-center py-4 flex items-center justify-center gap-2">
+          <p className="text-label text-gray-500 text-center py-4 flex items-center justify-center gap-2">
             <Loader2 size={11} className="animate-spin" /> 加载中
           </p>
         ) : byModel.length === 0 ? (
-          <p className="text-xs text-gray-500 text-center py-4">
+          <p className="text-label text-gray-500 text-center py-4">
             {scope === "today" ? "今天" : scope === "month" ? "本月" : ""}还没有消费记录
           </p>
         ) : (
@@ -177,12 +177,12 @@ export function CostDashboardSection() {
               return (
                 <div key={m.model} className="px-3 py-2">
                   <div className="flex items-center gap-2 mb-1">
-                    <span className="text-xs text-gray-300 font-mono truncate flex-1" title={m.model}>
+                    <span className="text-label text-gray-300 font-mono truncate flex-1" title={m.model}>
                       {m.model}
                     </span>
-                    <span className="text-xs text-gray-200 font-mono">{fmtUsd(m.cost_usd)}</span>
+                    <span className="text-label text-gray-200 font-mono">{fmtUsd(m.cost_usd)}</span>
                   </div>
-                  <div className="flex items-center gap-2 text-[10px] text-gray-500">
+                  <div className="flex items-center gap-2 text-caption text-gray-500">
                     <div className="flex-1 h-1 rounded bg-surface-3 overflow-hidden">
                       <div className="h-full bg-accent" style={{ width: `${pct}%` }} />
                     </div>
@@ -199,23 +199,23 @@ export function CostDashboardSection() {
 
       {/* Recent activity */}
       <div>
-        <h3 className="text-[11px] font-medium text-gray-400 mb-1.5 flex items-center gap-1">
+        <h3 className="text-caption font-medium text-gray-400 mb-1.5 flex items-center gap-1">
           <Activity size={10} /> 最近活动
           {totalCallsAllScopes > 0 && (
             <span className="text-gray-600 font-normal">· 共 {totalCallsAllScopes} 次调用</span>
           )}
         </h3>
         {recent.length === 0 ? (
-          <p className="text-xs text-gray-500 text-center py-3">无</p>
+          <p className="text-label text-gray-500 text-center py-3">无</p>
         ) : (
           <details className="rounded-lg border border-border bg-surface-1">
-            <summary className="px-3 py-2 text-[11px] text-gray-500 cursor-pointer hover:text-gray-300 select-none">
+            <summary className="px-3 py-2 text-caption text-gray-500 cursor-pointer hover:text-gray-300 select-none">
               展开最近 {recent.length} 条
             </summary>
             <ul className="border-t border-border divide-y divide-border max-h-60 overflow-y-auto">
               {recent.map((r) => (
-                <li key={r.id} className="px-3 py-1.5 flex items-center gap-2 text-[11px]">
-                  <span className="text-[10px] text-gray-600 font-mono shrink-0">
+                <li key={r.id} className="px-3 py-1.5 flex items-center gap-2 text-caption">
+                  <span className="text-caption text-gray-600 font-mono shrink-0">
                     {r.created_at.slice(5, 16).replace("T", " ")}
                   </span>
                   <span className="text-gray-300 font-mono truncate flex-1" title={r.model}>
@@ -234,7 +234,7 @@ export function CostDashboardSection() {
         )}
       </div>
 
-      <p className="mt-2 text-[10px] text-gray-600">
+      <p className="mt-2 text-caption text-gray-600">
         定价基于默认估算（input $1/M · output $3/M）。后续支持按模型自定义定价。
       </p>
     </section>

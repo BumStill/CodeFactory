@@ -4,6 +4,15 @@
 
 /* ── Theme variables ────────────────────────────────────────────────────────── */
 
+/*
+ * `:root` carries the dark palette as the pre-hydration fallback.
+ *
+ * `data-theme` is written by stores/settings.ts only after the `get_settings`
+ * IPC resolves. Without a `:root` copy, every cold start painted one frame with
+ * `--surface-0` undefined — `rgb(var(--surface-0))` is an invalid declaration,
+ * so the dark app flashed white before the first real frame.
+ */
+:root,
 [data-theme="dark"] {
   /* RGB channels let Tailwind's `/opacity` modifiers remain theme-aware. */
   --surface-0: 8 12 19;
@@ -117,8 +126,24 @@
     background-color: rgb(var(--surface-0));
     color: rgb(var(--gray-200));
     font-family: var(--font-family, Inter, system-ui, sans-serif);
-    font-size: var(--font-size, 14px);
     -webkit-font-smoothing: antialiased;
+  }
+
+  /*
+   * The root font size is the rem baseline, and Tailwind expresses EVERY
+   * spacing, radius, width and height in rem. Pinning it to the user's text
+   * size (it used to be `font-size: var(--font-size, 14px)`) silently scaled
+   * the whole design system by 14/16: `gap-2` rendered at 7px, `rounded` at
+   * 3.5px, and the 4px grid stopped existing. It also meant the "font size"
+   * slider resized the layout — while every hard-coded `text-[11px]` and
+   * `size={12}` stayed put, so the UI came apart as the slider moved.
+   *
+   * The baseline now stays at the platform default. User text size rides on
+   * `--font-scale`, which only the font-size tokens consume, so it moves text
+   * and nothing else.
+   */
+  body {
+    font-size: calc(14px * var(--font-scale, 1));
   }
 
   /* Custom scrollbar */

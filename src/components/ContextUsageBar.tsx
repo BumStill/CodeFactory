@@ -257,7 +257,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
         ref={triggerRef}
         type="button"
         data-testid="context-usage-ring"
-        className={`inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-lg px-2 text-xs transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9 lg:min-w-9 ${
+        className={`inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-lg px-2 text-label transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9 lg:min-w-9 ${
           percent == null ? "text-gray-500" : presentation.textClass
         }`}
         aria-label={`打开上下文与用量详情，${meterText}`}
@@ -326,7 +326,7 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
       {showToast && toast && (
         <span
           role="status"
-          className="whitespace-nowrap rounded-md bg-status-warning-soft px-1.5 py-0.5 text-[11px] text-status-warning"
+          className="whitespace-nowrap rounded-md bg-status-warning-soft px-1.5 py-0.5 text-caption text-status-warning"
           title={`释放约 ${formatContextTokens(toast.tokensFreed)} tokens`}
         >
           已压缩 {toast.elidedCount} 条
@@ -341,11 +341,11 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
           role="dialog"
           aria-label="上下文与用量详情"
           tabIndex={-1}
-          className="fixed z-[110] overflow-y-auto rounded-xl border border-border bg-surface-2 p-3 text-left text-xs text-gray-300 shadow-2xl outline-none"
+          className="fixed z-[110] overflow-y-auto rounded-xl border border-border bg-surface-2 p-3 text-left text-label text-gray-300 shadow-2xl outline-none"
           style={detailPosition}
         >
           <div className="mb-2 flex items-center justify-between gap-3">
-            <h3 className="text-sm font-semibold text-gray-200">上下文与用量详情</h3>
+            <h3 className="text-body font-semibold text-gray-200">上下文与用量详情</h3>
             <button
               type="button"
               aria-label="关闭上下文与用量详情"

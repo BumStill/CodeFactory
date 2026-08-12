@@ -18,7 +18,7 @@ export function ResumeBanner({ report }: { report: ResumeReport | undefined }) {
   return (
     <div
       data-testid="resume-banner"
-      className="mx-3 mt-2 rounded-lg border border-border bg-surface-2 px-3 py-2 text-xs"
+      className="mx-3 mt-2 rounded-lg border border-border bg-surface-2 px-3 py-2 text-label"
     >
       <div className="flex items-center gap-2 text-gray-200">
         <History size={12} className="shrink-0 text-accent" />
@@ -34,7 +34,7 @@ export function ResumeBanner({ report }: { report: ResumeReport | undefined }) {
               <RotateCcw size={10} className="shrink-0" />
               <span className="truncate">{t.title}</span>
               <span
-                className="shrink-0 rounded bg-surface-3 px-1 py-px text-[10px] text-amber-500"
+                className="shrink-0 rounded bg-surface-3 px-1 py-px text-caption text-amber-500"
                 title={`该任务因「${RESUME_REASON_LABELS[t.reason]}」需要重新执行`}
               >
                 {RESUME_REASON_LABELS[t.reason]}
@@ -49,7 +49,7 @@ export function ResumeBanner({ report }: { report: ResumeReport | undefined }) {
             <li key={t.task_id} className="flex items-center gap-1.5">
               <Zap size={10} className="shrink-0" />
               <span className="truncate">{t.title}</span>
-              <span className="shrink-0 rounded bg-surface-3 px-1 py-px text-[10px] text-sky-500">
+              <span className="shrink-0 rounded bg-surface-3 px-1 py-px text-caption text-sky-500">
                 {t.outcome === "finalized" ? "已确认完成" : "已恢复待执行"}
               </span>
             </li>
@@ -64,7 +64,7 @@ export function ResumeBanner({ report }: { report: ResumeReport | undefined }) {
 export function RestoredBadge({ keyShort }: { keyShort: string }) {
   return (
     <span
-      className="ml-1.5 shrink-0 rounded bg-surface-3 px-1 py-px text-[10px] text-emerald-500"
+      className="ml-1.5 shrink-0 rounded bg-surface-3 px-1 py-px text-caption text-emerald-500"
       title={`已从缓存恢复(内容指纹 ${keyShort}) — 输入未变化,未重新执行`}
     >
       已缓存

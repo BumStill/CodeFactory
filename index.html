@@ -1,5 +1,12 @@
 <!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+<!--
+  `data-theme` must be on the element before the first paint. It used to say
+  class="dark", which does nothing — tailwind.config.js resolves dark mode from
+  the [data-theme="dark"] attribute, and the theme variables only existed under
+  that attribute, so the first frame had no palette at all and flashed white.
+  stores/settings.ts corrects this to the user's real theme once settings load.
+-->
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />

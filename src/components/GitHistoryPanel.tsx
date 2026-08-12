@@ -64,7 +64,7 @@ export function GitHistoryPanel({ onClose, embedded = false }: Props) {
       {/* Header */}
       <div className={`flex items-center gap-2 px-3 py-2 border-b border-border shrink-0 ${embedded && isNarrowEmbedded ? "flex-wrap" : "flex-nowrap"}`}>
         <History size={14} className="text-gray-400" />
-        <span className="text-xs font-semibold text-gray-200 flex-1">历史记录</span>
+        <span className="text-label font-semibold text-gray-200 flex-1">历史记录</span>
         <button
           onClick={handleRefresh}
           aria-label="刷新提交历史"
@@ -88,10 +88,10 @@ export function GitHistoryPanel({ onClose, embedded = false }: Props) {
 
       <div className="flex-1 overflow-y-auto">
         {commits.length === 0 && !loading && (
-          <div className="pt-8 text-center text-[11px] text-gray-600">无提交</div>
+          <div className="pt-8 text-center text-caption text-gray-600">无提交</div>
         )}
         {loading && commits.length === 0 && (
-          <div className="text-[11px] text-gray-600 text-center pt-8">加载中…</div>
+          <div className="text-caption text-gray-600 text-center pt-8">加载中…</div>
         )}
         {commits.map((c) => {
           const isExpanded = expanded.has(c.hash);
@@ -113,11 +113,11 @@ export function GitHistoryPanel({ onClose, embedded = false }: Props) {
                   <ChevronRight size={12} className="text-gray-600 shrink-0 mt-0.5" />
                 )}
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 text-[11px]">
+                  <div className="flex items-center gap-2 text-caption">
                     <span className="shrink-0 font-mono text-accent">{c.short_hash}</span>
                     <span className="text-gray-200 truncate flex-1">{c.message}</span>
                   </div>
-                  <div className="flex items-center gap-2 text-[11px] text-gray-600 mt-0.5">
+                  <div className="flex items-center gap-2 text-caption text-gray-600 mt-0.5">
                     <span className="truncate">{c.author}</span>
                     <span className="text-gray-600">·</span>
                     <span>{formatRelative(c.timestamp)}</span>
@@ -131,10 +131,10 @@ export function GitHistoryPanel({ onClose, embedded = false }: Props) {
                 hidden={!isExpanded}
                 className="px-3 pb-2 pt-0 ml-5"
               >
-                <pre className="text-[11px] text-gray-400 whitespace-pre-wrap break-words font-mono bg-surface-2 rounded p-2 border border-border">
+                <pre className="text-caption text-gray-400 whitespace-pre-wrap break-words font-mono bg-surface-2 rounded p-2 border border-border">
                   {c.message_body || c.message}
                 </pre>
-                <div className="mt-1.5 text-[11px] text-gray-600">
+                <div className="mt-1.5 text-caption text-gray-600">
                   <span className="font-mono">{c.hash}</span>
                   <span className="mx-1">·</span>
                   <span>{c.email}</span>

@@ -71,7 +71,7 @@ describe("ToolCallCard — open generated file", () => {
     const row = screen.getByRole("button", { name: /命令.*npm test/ });
     expect(row).toHaveAttribute("data-density", "compact");
     expect(row).toHaveClass("min-h-7");
-    expect(container.firstElementChild).toHaveClass("text-[13px]");
+    expect(container.firstElementChild).toHaveClass("text-note");
     expect(row).not.toHaveClass("w-full");
     expect(container.firstElementChild).not.toHaveClass("border");
     expect(container.firstElementChild).not.toHaveClass("bg-surface-1/30");
@@ -109,7 +109,7 @@ describe("ToolCallCard — open generated file", () => {
       />,
     );
     const detail = screen.getByText(/\[shell-audit]/);
-    expect(detail).toHaveClass("max-w-[56ch]", "text-[13px]");
+    expect(detail).toHaveClass("max-w-[56ch]", "text-note");
     expect(detail).not.toHaveClass("border-t");
   });
 

@@ -193,7 +193,7 @@ export function TokenUsageHeatmap({
                 key={month}
                 type="button"
                 onClick={() => onSelectDate?.(monthDays[monthDays.length - 1]?.local_date ?? null)}
-                className="flex w-full items-center justify-between rounded border border-border bg-surface-2 px-2.5 py-2 text-xs"
+                className="flex w-full items-center justify-between rounded border border-border bg-surface-2 px-2.5 py-2 text-label"
               >
                 <span className="text-gray-300">{month}</span>
                 <span className="font-mono text-gray-500">{formatUsageTokens(total)}{missing > 0 ? ` · ${missing} 天缺失` : ""}</span>
@@ -208,7 +208,7 @@ export function TokenUsageHeatmap({
 
 export function UsageHeatmapLegend() {
   return (
-    <div className="flex flex-wrap items-center gap-3 text-[10px] text-gray-500" aria-label="地图图例">
+    <div className="flex flex-wrap items-center gap-3 text-caption text-gray-500" aria-label="地图图例">
       <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-[2px] border border-gray-600">×</span>数据缺失</span>
       <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-[2px] bg-surface-3 text-center leading-[10px]">·</span>0 用量</span>
       <span className="inline-flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-[2px] bg-accent/20" />低</span>

@@ -40,11 +40,11 @@ export function UpdaterBanner() {
           <div className="flex items-start gap-2 p-3">
             <Download size={14} className="text-accent shrink-0 mt-0.5" />
             <div className="flex-1 min-w-0">
-              <div className="text-xs font-medium text-gray-200">
+              <div className="text-label font-medium text-gray-200">
                 有可用更新：v{phase.update.version}
               </div>
               {phase.update.body && (
-                <div className="mt-1 text-[11px] text-gray-500 line-clamp-3 whitespace-pre-wrap">
+                <div className="mt-1 text-caption text-gray-500 line-clamp-3 whitespace-pre-wrap">
                   {phase.update.body}
                 </div>
               )}
@@ -60,13 +60,13 @@ export function UpdaterBanner() {
           <div className="flex border-t border-border">
             <button
               onClick={dismiss}
-              className="flex-1 py-1.5 text-[11px] text-gray-500 hover:bg-surface-3 transition-colors"
+              className="flex-1 py-1.5 text-caption text-gray-500 hover:bg-surface-3 transition-colors"
             >
               稍后
             </button>
             <button
               onClick={() => void install()}
-              className="flex-1 py-1.5 text-[11px] text-accent font-medium hover:bg-accent/10 transition-colors border-l border-border"
+              className="flex-1 py-1.5 text-caption text-accent font-medium hover:bg-accent/10 transition-colors border-l border-border"
             >
               立即安装
             </button>
@@ -76,7 +76,7 @@ export function UpdaterBanner() {
 
       {phase.kind === "downloading" && (
         <div className="p-3 space-y-2">
-          <div className="flex items-center gap-2 text-xs text-gray-300">
+          <div className="flex items-center gap-2 text-label text-gray-300">
             <RefreshCw size={12} className="text-accent animate-spin motion-reduce:animate-none" />
             <span>正在下载更新…</span>
           </div>
@@ -90,7 +90,7 @@ export function UpdaterBanner() {
               }}
             />
           </div>
-          <div className="text-[11px] text-gray-600 text-right tabular-nums">
+          <div className="text-caption text-gray-600 text-right tabular-nums">
             {(phase.received / 1024 / 1024).toFixed(1)} MB
             {phase.total && ` / ${(phase.total / 1024 / 1024).toFixed(1)} MB`}
           </div>
@@ -98,14 +98,14 @@ export function UpdaterBanner() {
       )}
 
       {phase.kind === "installing" && (
-        <div className="flex items-center gap-2 p-3 text-xs text-gray-300">
+        <div className="flex items-center gap-2 p-3 text-label text-gray-300">
           <RefreshCw size={12} className="text-accent animate-spin motion-reduce:animate-none" />
           <span>安装中…</span>
         </div>
       )}
 
       {phase.kind === "waiting_for_safe_restart" && (
-        <div className="p-3 space-y-1 text-xs text-amber-700 dark:text-amber-300">
+        <div className="p-3 space-y-1 text-label text-amber-700 dark:text-amber-300">
           <div className="flex items-center gap-2">
             <RefreshCw size={12} />
             <span>
@@ -115,27 +115,27 @@ export function UpdaterBanner() {
             </span>
           </div>
           {phase.blockers?.update_install_state === "observe_only" ? (
-            <p className="text-[11px] text-gray-500">
+            <p className="text-caption text-gray-500">
               当前仅观察目标版本与 build_git_sha，不会重复安装未知结果。
             </p>
           ) : (
-            <p className="text-[11px] text-gray-500">
+            <p className="text-caption text-gray-500">
               当前 {countUpdateBlockers(phase.blockers)} 项本地工作仍在运行；归零后会自动安装，无需再次操作。
             </p>
           )}
           {describeUpdateObjectiveBlockers(phase.blockers) && (
-            <p className="text-[11px] text-gray-500">
+            <p className="text-caption text-gray-500">
               {describeUpdateObjectiveBlockers(phase.blockers)}。
             </p>
           )}
           {phase.safetyCheckError && (
-            <p className="text-[11px] text-gray-500">{phase.safetyCheckError}</p>
+            <p className="text-caption text-gray-500">{phase.safetyCheckError}</p>
           )}
         </div>
       )}
 
       {phase.kind === "ready" && (
-        <div className="flex items-center gap-2 p-3 text-xs text-green-400">
+        <div className="flex items-center gap-2 p-3 text-label text-green-400">
           <CheckCircle size={12} />
           <span>已安装，正在重启…</span>
         </div>
@@ -145,7 +145,7 @@ export function UpdaterBanner() {
           sits in the header pill so transient network errors don't yank
           attention with a giant popup. */}
       {false && phase.kind === "error" && (
-        <div className="p-3 flex items-start gap-2 text-xs text-red-400">
+        <div className="p-3 flex items-start gap-2 text-label text-red-400">
           <AlertCircle size={12} className="shrink-0 mt-0.5" />
           <span className="flex-1 break-words">更新失败</span>
         </div>

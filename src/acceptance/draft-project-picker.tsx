@@ -26,11 +26,11 @@ function DraftProjectPickerAcceptance() {
             cwd={cwd}
             anonymous={false}
             projects={projects}
-            modelPicker={<span className="text-[11px] text-gray-300">模型</span>}
+            modelPicker={<span className="text-caption text-gray-300">模型</span>}
             onPickProject={setCwd}
             onToggleAnonymous={() => {}}
           />
-          <div className="px-4 pb-4 text-xs text-gray-600">模拟聊天输入框外壳：overflow-hidden</div>
+          <div className="px-4 pb-4 text-label text-gray-600">模拟聊天输入框外壳：overflow-hidden</div>
         </div>
       </div>
       <div aria-label="Draft project picker probe" data-selected-cwd={cwd ?? ""} />

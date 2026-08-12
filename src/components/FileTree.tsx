@@ -55,7 +55,7 @@ function FileNodeItem({ node, root, onSelectFile, depth }: FileNodeItemProps) {
     <li>
       <button
         onClick={handleClick}
-        className="w-full flex items-center gap-1 px-2 py-0.5 text-left text-xs text-gray-400 hover:text-gray-200 hover:bg-surface-2 transition-colors rounded truncate"
+        className="w-full flex items-center gap-1 px-2 py-0.5 text-left text-label text-gray-400 hover:text-gray-200 hover:bg-surface-2 transition-colors rounded truncate"
         style={{ paddingLeft: `${8 + depth * 10}px` }}
         title={node.path}
       >
@@ -102,7 +102,7 @@ export function FileTree({ cwd, onSelectFile }: FileTreeProps) {
     <div className="border-t border-border">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center gap-1 px-3 py-2 text-xs font-semibold text-gray-400 uppercase tracking-wider hover:text-gray-300 transition-colors"
+        className="w-full flex items-center gap-1 px-3 py-2 text-label font-semibold text-gray-400 uppercase tracking-wider hover:text-gray-300 transition-colors"
       >
         <span className="flex-1 text-left">Files</span>
         <span className="text-gray-600">{open ? "▾" : "▸"}</span>
@@ -119,7 +119,7 @@ export function FileTree({ cwd, onSelectFile }: FileTreeProps) {
             />
           ))}
           {nodes.length === 0 && (
-            <li className="px-3 py-1 text-xs text-gray-700">Empty</li>
+            <li className="px-3 py-1 text-label text-gray-700">Empty</li>
           )}
         </ul>
       )}

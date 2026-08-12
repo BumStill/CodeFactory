@@ -23,7 +23,7 @@ export function PermissionModePicker({
   const current = OPTIONS.find((option) => option.id === mode) ?? OPTIONS[1];
   return (
     <label
-      className="flex min-h-11 min-w-0 shrink items-center gap-1 rounded-lg px-1 text-xs text-gray-400 hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
+      className="flex min-h-11 min-w-0 shrink items-center gap-1 rounded-lg px-1 text-label text-gray-400 hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
       title={`会话权限：${current.description}；下一次权限判断生效`}
     >
       <ShieldCheck size={14} aria-hidden="true" />
@@ -45,7 +45,7 @@ export function PermissionModePicker({
             void update(next);
           }
         }}
-        className="min-h-11 rounded-lg border border-transparent bg-transparent px-1 text-xs text-gray-300 outline-none hover:border-border focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
+        className="min-h-11 rounded-lg border border-transparent bg-transparent px-1 text-label text-gray-300 outline-none hover:border-border focus:border-accent/50 focus-visible:ring-2 focus-visible:ring-accent/60 lg:min-h-9"
       >
         {OPTIONS.map((option) => (
           <option key={option.id} value={option.id}>{option.label}</option>

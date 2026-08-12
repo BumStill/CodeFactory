@@ -272,34 +272,34 @@ function sourceLocator(source: KnowledgeSource): string | null {
 function KnowledgeSourcesList({ sources }: { sources: KnowledgeSource[] }) {
   return (
     <div className="space-y-2 font-sans">
-      <div className="text-gray-500 text-[11px] font-medium">sources {sources.length}</div>
+      <div className="text-gray-500 text-caption font-medium">sources {sources.length}</div>
       <div className="space-y-1.5">
         {sources.map((source, i) => (
           <div key={`${source.chunk_id ?? source.document_id ?? source.path ?? "source"}-${i}`} className="rounded border border-border bg-surface-1 px-2.5 py-2">
             <div className="flex items-center gap-2 min-w-0">
               <BookOpen size={12} className="text-status-info shrink-0" />
-              <span className="text-xs text-gray-200 font-medium truncate" title={source.path}>
+              <span className="text-label text-gray-200 font-medium truncate" title={source.path}>
                 {sourceDisplayName(source)}
               </span>
               {source.kind && (
-                <span className="text-[11px] uppercase text-gray-600 shrink-0">{source.kind}</span>
+                <span className="text-caption uppercase text-gray-600 shrink-0">{source.kind}</span>
               )}
             </div>
-            <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-gray-500 font-mono">
+            <div className="mt-1 flex flex-wrap items-center gap-1.5 text-caption text-gray-500 font-mono">
               {sourceLocator(source) && <span>{sourceLocator(source)}</span>}
               {source.chunk_id && <span>{source.chunk_id}</span>}
               {source.score != null && <span>score {source.score}</span>}
             </div>
             {(source.heading || source.title) && (
-              <div className="mt-1 text-[11px] text-gray-400 truncate">{source.heading || source.title}</div>
+              <div className="mt-1 text-caption text-gray-400 truncate">{source.heading || source.title}</div>
             )}
             {source.snippet && (
-              <div className="mt-1 text-[11px] text-gray-400 leading-relaxed whitespace-pre-wrap break-words">
+              <div className="mt-1 text-caption text-gray-400 leading-relaxed whitespace-pre-wrap break-words">
                 {source.snippet}
               </div>
             )}
             {source.path && (
-              <div className="mt-1 text-[11px] text-gray-600 font-mono truncate" title={source.path}>
+              <div className="mt-1 text-caption text-gray-600 font-mono truncate" title={source.path}>
                 {source.path}
               </div>
             )}
@@ -359,7 +359,7 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
     : "rounded-md";
 
   return (
-    <div className={`my-0.5 w-fit max-w-full text-[13px] leading-5 ${shellClass}`} data-tool-status={tc.status}>
+    <div className={`my-0.5 w-fit max-w-full text-note leading-5 ${shellClass}`} data-tool-status={tc.status}>
       <button
         data-density={needsAttention ? "attention" : "compact"}
         aria-label={`${toolLabel(tc.name)}${summary ? ` · ${summary}` : ""}`}
@@ -372,12 +372,12 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
         <Icon size={12} className={`${needsAttention ? iconClass : "text-gray-600"} shrink-0`} />
         <span className={`shrink-0 ${needsAttention ? "text-gray-300" : "text-gray-500"}`}>{toolLabel(tc.name)}</span>
         {isTestMod && (
-          <span className="shrink-0 rounded bg-surface-3 px-1 py-0.5 text-[11px] font-medium text-gray-500">
+          <span className="shrink-0 rounded bg-surface-3 px-1 py-0.5 text-caption font-medium text-gray-500">
             test
           </span>
         )}
         {summary && (
-          <span className="min-w-0 truncate font-mono text-[13px] text-gray-600">· {summary}</span>
+          <span className="min-w-0 truncate font-mono text-note text-gray-600">· {summary}</span>
         )}
         <span className="ml-auto shrink-0">{statusIcon}</span>
       </button>
@@ -386,12 +386,12 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
           first line of the error on the collapsed card. Full output stays
           behind the expand toggle. */}
       {!open && (tc.isError || tc.status === "error") && tc.result && (
-        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] font-mono leading-5 text-status-danger">
+        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-note font-mono leading-5 text-status-danger">
           {firstNonEmptyLine(tc.result)}
         </div>
       )}
       {!open && tc.status === "blocked" && tc.result && (
-        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-[13px] leading-5 text-status-warning">
+        <div className="ml-7 max-w-[56ch] truncate px-1.5 pb-1 text-note leading-5 text-status-warning">
           {firstNonEmptyLine(tc.result)}
         </div>
       )}
@@ -404,11 +404,11 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
             }).catch(() => {})
           }
           title={`打开 ${filePath}`}
-          className="ml-7 flex max-w-[calc(100%-1.75rem)] items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-[12px] text-accent transition-colors hover:bg-surface-3"
+          className="ml-7 flex max-w-[calc(100%-1.75rem)] items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-label text-accent transition-colors hover:bg-surface-3"
         >
           <ExternalLink size={11} className="shrink-0" />
           <span className="truncate font-mono">{basename(filePath)}</span>
-          <span className="ml-auto shrink-0 text-[11px] text-gray-500">打开文件</span>
+          <span className="ml-auto shrink-0 text-caption text-gray-500">打开文件</span>
         </button>
       )}
 
