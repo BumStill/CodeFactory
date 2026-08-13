@@ -43,6 +43,19 @@
 | CF-ORC-R32 | 本原则/规格进入 Feature Specs 索引和可执行治理规则；CI 拒绝未标 superseded 的技术 retry/continue/resend 契约以及缺 Req→test 映射 | governance validator negative fixtures |
 | CF-ORC-R33 | 每个 fence 资源必须有明确的释放责任人和释放时机，不得只靠"下一次准入顺手关闭"。回合结束时必须释放该回合证据已确定的 provider episode（无未结副作用且所有 attempt 已终态）；`prepared`/`in_flight`/`streaming`/`unknown` 或存在未结副作用时保持关闭，交由 supervisor 观察 | 回合结算释放测试 + 不确定证据保持 fenced 的负例 |
 | CF-ORC-R34 | 只读 bash 探查（含 `&&`/`;`/管道/丢弃型重定向的复合命令）不得被判定为需要观察契约的外部变更；判定按 segment 逐段进行，任一段不在只读白名单、含真实重定向、含命令替换或后台 `&` 则整条命令继续 fenced | 复合只读命令与逐段 fence 的双向单测 |
+| CF-ORC-R35 | system-owned 恢复必须有界。持久 remediation 历史按 `(objective, failure_signature)` 终身累计计数，并对单个 objective 设总量兜底；任一上限达成后不得再排下一次 observation，必须以 `technical_recovery_exhausted` 进入 typed core input 等待并结算 transport turn。计数不因 failure code 变化而重置，用户驱动的 remediation（`apply_recommended` 与 `resume_authorized_action`）不计入预算 | 上限/签名抖动/证据门禁/权限豁免单测 + 真实 app 复现 |
+
+## 恢复有界性（CF-ORC-R35）
+
+本规格的顶层原则要求"持续持有所有**可恢复**的技术状态"，CF-ORC-R24 要求"局部预算耗尽只能扩大退避或换策略"。2026-08-13 的现场证据表明这条补救路径在实现中从未发生：`objective_remediations.approach_index` 恒为 0（从不换策略）、退避恒为 ~13s（从不扩大），而每一轮都真实调用模型并产生费用。
+
+因此本条明确边界：**不能恢复的状态不属于"可恢复"，持续持有它不是持有目标，而是空转**。
+
+- 判定"无进展"的依据是 failure signature 重复，而不是 failure code。计数为终身累计而非连续 streak——否则中间插入一个不同的 failure code 就能把计数清零，同一条坏路径可以无限续命。
+- `completion_evidence_incomplete` 明确计入：完成证据门禁驳回后重跑同一 prompt 得到同一答案，是无进展的典型形态。
+- 达到上限后的出口是 `core_input_required`（CF-ORC-R3 允许的两种回交之一），不是 `completed`／`cancelled`，因此不违反 CF-ORC-R22 的双终态约束；objective 仍然存活，用户的下一条消息以 `core_input_response` 续接同一 objective。
+- 上限只约束**系统自发**的重试。用户恢复能力（`CapabilityRestored`）与用户授权权限（`resume_authorized_action`）不消耗预算。
+- 上限达成时 transport turn 必须结算并写入 `terminal_reason='technical_recovery_exhausted'`，否则界面会继续呈现"仍在恢复"而实际已无任何 observation 排队。
 
 ## Decision Envelope
 
@@ -122,7 +135,7 @@ App 在 provider、permission、task、browser 或 delivery 等待中退出或�
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-ORC-R1..R32 与所有 superseded 规格反向追踪。
+- Spec Harness：CF-ORC-R1..R35 与所有 superseded 规格反向追踪。
 - Compatibility Harness：旧 SQLite、旧 turn/task/delivery 状态、旧 auth 错误、旧设置和历史会话 hydration。
 - Observation Harness：typed decisions、lease、owner、真实 progress、attempt、receipt 和 KPI。
 - Release Harness：PR/CI/merge、正式 artifact、安装版和 rollback。
@@ -146,6 +159,7 @@ App 在 provider、permission、task、browser 或 delivery 等待中退出或�
 | Completion | transport Done/noop without evidence | stream closes but objective not completed | arbiter + reducer + SQLite truth |
 | Compatibility | pre-0006 DB with open records | identity-complete rows migrate; ambiguous rows become legacy_orphan without mutation | migration fixture |
 | UX | system-owned technical state | no retry/continue CTA; owner/progress/next attempt visible | component + 3 viewport screenshots |
+| Safety | same failure signature repeats with no progress | recovery stops at the ceiling, turn settles as technical_recovery_exhausted, nothing left queued | objective/chat/scheduler ceiling tests + real app |
 | Metrics | injected avoidable reprompt/false complete | aggregate detects non-zero and release gate fails | analytics + governance tests |
 | Release | formal installed build | all above smoke receipts match version/commit/artifact; 24h KPI meets thresholds | release evidence pack |
 
@@ -159,7 +173,7 @@ App 在 provider、permission、task、browser 或 delivery 等待中退出或�
 
 ## Evidence Pack Requirements
 
-- Req R1..R32 的实现文件、测试文件、命令与结果追踪表。
+- Req R1..R35 的实现文件、测试文件、命令与结果追踪表。
 - SQLite migration/constraint/legacy fixture 和 objective transition journal。
 - permission/provider/task/auth/browser/delivery/release 的成功、边界与跨重启 fault receipts。
 - CodeFactoryDev 真实主路径截图/录屏，包含 system-owned、core input、business decision、completed 四态。

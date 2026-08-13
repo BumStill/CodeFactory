@@ -419,50 +419,36 @@ pub async fn cancel_chat(
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
     let control = state.chat_cancels.lock().await.get(&session_id).cloned();
-    let Some(control) = control else {
-        // No run in this process owns the session, which is exactly when a user
-        // most needs to stop: the turn is being driven by system-owned recovery,
-        // or this process restarted and inherited a non-terminal Objective from
-        // the database. The cancel map lives only in memory, so returning `Ok`
-        // here reported success while doing nothing — that is why the
-        // 2026-08-13 sessions could not be stopped and resumed on every
-        // restart. Fall through to the durable cancel instead.
-        let pool = state.db.read().await.clone();
-        let stopped = cancel_system_owned_chat(&app, &pool, &session_id).await?;
-        tracing::info!(
-            "cancel_chat: durably stopped {stopped} system-owned objective(s) for session {session_id}"
-        );
-        return Ok(());
-    };
-    if !control.durable {
-        control.cancel.store(true, Ordering::SeqCst);
+    if control.as_ref().is_some_and(|control| !control.durable) {
+        control
+            .expect("ephemeral control checked above")
+            .cancel
+            .store(true, Ordering::SeqCst);
         tracing::info!("cancel_chat: requested ephemeral stop for session {session_id}");
         return Ok(());
     }
     let pool = state.db.read().await.clone();
-    let identity = request_chat_run_cancel(&pool, &control.run_instance_id, &session_id).await?;
-    control.cancel.store(true, Ordering::SeqCst);
-    if let Some(identity) = identity {
-        tracing::debug!(
-            objective_id = %identity.objective_id,
-            objective_revision = identity.objective_revision,
-            "settling exact durable chat cancellation"
-        );
-        let cancelled = consume_requested_chat_cancel(&pool, &control.run_instance_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::Other("chat cancellation identity disappeared before settlement".into())
-            })?;
-        project_chat_objective(
-            &pool,
-            &app,
-            &format!("stream:{session_id}"),
-            &identity.root_turn_id,
-            &cancelled,
-        )
-        .await?;
+    let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+    // Fence the complete session first. A process-local run may finish while
+    // the stop is being handled, but it cannot persist another non-cancel
+    // decision after this durable row exists.
+    store
+        .request_chat_session_cancel(&session_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    if let Some(control) = control.as_ref() {
+        if control.durable {
+            request_chat_run_cancel(&pool, &control.run_instance_id, &session_id).await?;
+        }
+        control.cancel.store(true, Ordering::SeqCst);
     }
-    tracing::info!("cancel_chat: durably requested stop for session {session_id}");
+    let stopped = cancel_system_owned_chat(&app, &pool, &session_id).await?;
+    if let Some(control) = control.as_ref() {
+        clear_chat_running_if_current(&state.chat_cancels, &session_id, control).await;
+    }
+    tracing::info!(
+        "cancel_chat: durably stopped {stopped} objective(s) for session {session_id}"
+    );
     Ok(())
 }
 
@@ -471,6 +457,7 @@ pub async fn cancel_chat(
 /// the user's stop must reach. Kept free of `AppHandle` so it stays directly
 /// testable: constructing handle-owning values inside the unit-test binary is
 /// what previously broke the Windows loader.
+#[cfg(test)]
 async fn live_chat_objectives(
     pool: &sqlx::SqlitePool,
     session_id: &str,
@@ -505,39 +492,34 @@ async fn cancel_system_owned_chat(
     pool: &sqlx::SqlitePool,
     session_id: &str,
 ) -> Result<usize, AppError> {
-    let live = live_chat_objectives(pool, session_id).await?;
-
-    let mut stopped = 0;
-    let mut first_error = None;
-    for (objective_id, root_turn_id) in live {
-        match cancel_chat_objective_exact(pool, session_id, &root_turn_id, &objective_id).await {
-            Ok(cancelled) => {
-                project_chat_objective(
-                    pool,
-                    app,
-                    &format!("stream:{session_id}"),
-                    &root_turn_id,
-                    &cancelled,
-                )
-                .await?;
-                stopped += 1;
-            }
-            // One unstoppable Objective must not strand the others; report the
-            // failure only when nothing could be stopped at all.
-            Err(error) => {
-                tracing::warn!(
-                    objective_id = %objective_id,
-                    %error,
-                    "cancel_chat: durable stop failed for one objective"
-                );
-                first_error.get_or_insert(error);
-            }
+    let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+    let cancelled = store
+        .consume_chat_session_cancel(session_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    // Projection is deliberately after durable settlement. A UI event failure
+    // must never leave later Objectives alive; hydration/query is the fallback.
+    for (objective_id, root_turn_id, snapshot) in &cancelled {
+        let Some(root_turn_id) = root_turn_id.as_deref() else {
+            continue;
+        };
+        if let Err(error) = project_chat_objective(
+            pool,
+            app,
+            &format!("stream:{session_id}"),
+            root_turn_id,
+            snapshot,
+        )
+        .await
+        {
+            tracing::warn!(
+                %objective_id,
+                %error,
+                "cancel_chat: durable stop settled but turn projection failed"
+            );
         }
     }
-    match first_error {
-        Some(error) if stopped == 0 => Err(error),
-        _ => Ok(stopped),
-    }
+    Ok(cancelled.len())
 }
 
 async fn cancel_chat_objective_exact(
@@ -867,7 +849,19 @@ pub async fn is_chat_running(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<bool, AppError> {
-    Ok(state.chat_cancels.lock().await.contains_key(&session_id))
+    if state.chat_cancels.lock().await.contains_key(&session_id) {
+        return Ok(true);
+    }
+    let pool = state.db.read().await.clone();
+    let system_owned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives objective
+         WHERE objective.session_id=? AND objective.root_turn_id IS NOT NULL
+           AND objective.status IN ('active','waiting_system')",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await?;
+    Ok(system_owned > 0)
 }
 
 async fn clear_chat_running_if_current(
@@ -985,19 +979,35 @@ fn requested_acceptance(kind: crate::agent::objective::ObjectiveKind) -> &'stati
     }
 }
 
-async fn project_chat_objective(
-    db: &sqlx::SqlitePool,
-    app: &AppHandle,
-    event_name: &str,
-    root_turn_id: &str,
+/// How one durable Objective presents itself on the transport turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatTurnProjection {
+    phase: &'static str,
+    activity_kind: &'static str,
+    activity_label: &'static str,
+    /// `Some` once the turn has stopped moving on its own — either a terminal
+    /// objective, or system-owned recovery that ran out of budget.
+    terminal_reason: Option<&'static str>,
+}
+
+fn chat_turn_projection(
     objective: &crate::agent::objective::ObjectiveSnapshot,
-) -> Result<(), AppError> {
-    use crate::agent::objective::ObjectiveStatus;
-    let now = Utc::now().timestamp_millis();
+) -> ChatTurnProjection {
+    use crate::agent::objective::{ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED};
+    // Recovery that ran out of budget is a settled turn, not a live one. The
+    // objective stays non-terminal (the work was never finished), but the
+    // transport turn must stop presenting itself as still recovering.
+    let recovery_exhausted = objective.status == ObjectiveStatus::WaitingCoreInput
+        && objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED);
     let (phase, activity_kind, activity_label) = match objective.status {
         ObjectiveStatus::Completed => ("finalizing", "objective_completed", "目标证据已满足"),
         ObjectiveStatus::Cancelled => ("finalizing", "objective_cancelled", "已按用户要求停止"),
         ObjectiveStatus::WaitingSystem => ("recovering", "system_recovery", "系统正在恢复并续接"),
+        ObjectiveStatus::WaitingCoreInput if recovery_exhausted => (
+            "waiting",
+            TECHNICAL_RECOVERY_EXHAUSTED,
+            "系统多轮自动恢复没有进展，已停止并把当前结论交还给你",
+        ),
         ObjectiveStatus::WaitingCoreInput => ("waiting", "core_input_required", "需要补充核心输入"),
         ObjectiveStatus::WaitingAuthorization => {
             ("waiting", "authorization_required", "等待必要授权")
@@ -1012,12 +1022,40 @@ async fn project_chat_objective(
             "系统正在核对历史工作",
         ),
     };
+    ChatTurnProjection {
+        phase,
+        activity_kind,
+        activity_label,
+        terminal_reason: if recovery_exhausted {
+            Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        } else if objective.status.is_terminal() {
+            Some(objective.decision_type.as_str())
+        } else {
+            None
+        },
+    }
+}
+
+async fn project_chat_objective(
+    db: &sqlx::SqlitePool,
+    app: &AppHandle,
+    event_name: &str,
+    root_turn_id: &str,
+    objective: &crate::agent::objective::ObjectiveSnapshot,
+) -> Result<(), AppError> {
+    let now = Utc::now().timestamp_millis();
+    let ChatTurnProjection {
+        phase,
+        activity_kind,
+        activity_label,
+        terminal_reason,
+    } = chat_turn_projection(objective);
     let waiting_reason = objective
         .failure_code
         .as_deref()
         .or(objective.request_key.as_deref())
         .or(objective.decision_key.as_deref());
-    let completed_at = objective.status.is_terminal().then_some(now);
+    let completed_at = terminal_reason.is_some().then_some(now);
     let revision: i64 = sqlx::query_scalar(
         "UPDATE chat_turn_state SET revision=revision+1, phase=?, status=?,
            recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
@@ -1031,11 +1069,7 @@ async fn project_chat_objective(
     .bind(waiting_reason)
     .bind(now)
     .bind(completed_at)
-    .bind(if objective.status.is_terminal() {
-        Some(objective.decision_type.as_str())
-    } else {
-        None
-    })
+    .bind(terminal_reason)
     .bind(root_turn_id)
     .fetch_one(db)
     .await?;
@@ -1050,11 +1084,7 @@ async fn project_chat_objective(
             recent_activity_label: activity_label.into(),
             waiting_reason: waiting_reason.map(str::to_string),
             updated_at: now,
-            terminal_reason: if objective.status.is_terminal() {
-                Some(objective.decision_type.as_str().into())
-            } else {
-                None
-            },
+            terminal_reason: terminal_reason.map(str::to_string),
             objective_id: Some(objective.id.clone()),
             objective_status: Some(objective.status.as_str().into()),
             recovery_owner: objective.recovery_owner.clone(),
@@ -3131,12 +3161,93 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::time::Duration;
 
+    fn projection_objective(
+        status: crate::agent::objective::ObjectiveStatus,
+        decision_type: crate::agent::objective::DecisionType,
+        failure_code: Option<&str>,
+    ) -> crate::agent::objective::ObjectiveSnapshot {
+        use crate::agent::objective::{ObjectiveKind, ObjectiveSnapshot, RecoveryDomain};
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-projection",
+            ObjectiveKind::Informational,
+            RecoveryDomain::Chat,
+            "informational_answer",
+        );
+        objective.status = status;
+        objective.decision_type = decision_type;
+        objective.failure_code = failure_code.map(str::to_string);
+        objective
+    }
+
+    /// A bounded-out recovery must settle the transport turn. Leaving it
+    /// `recovering` with no terminal reason is exactly what showed the user an
+    /// endless "系统仍在恢复" spinner while nothing was left to observe.
+    #[test]
+    fn exhausted_recovery_settles_the_turn_instead_of_spinning() {
+        use crate::agent::objective::{
+            DecisionType, ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED,
+        };
+        let projection = chat_turn_projection(&projection_objective(
+            ObjectiveStatus::WaitingCoreInput,
+            DecisionType::CoreInputRequired,
+            Some(TECHNICAL_RECOVERY_EXHAUSTED),
+        ));
+        assert_eq!(projection.phase, "waiting");
+        assert_eq!(projection.activity_kind, TECHNICAL_RECOVERY_EXHAUSTED);
+        assert_eq!(
+            projection.terminal_reason,
+            Some(TECHNICAL_RECOVERY_EXHAUSTED),
+            "the settled turn must name why the system stopped"
+        );
+        assert!(
+            projection.activity_label.contains("交还"),
+            "the user must be told the work is theirs now, not still running"
+        );
+    }
+
+    /// Recovery that still has budget stays system-owned and unsettled: the
+    /// ceiling must not turn ordinary retries into handbacks.
+    #[test]
+    fn recovery_with_budget_left_stays_system_owned() {
+        use crate::agent::objective::{DecisionType, ObjectiveStatus};
+        let projection = chat_turn_projection(&projection_objective(
+            ObjectiveStatus::WaitingSystem,
+            DecisionType::Waiting,
+            Some("completion_evidence_incomplete"),
+        ));
+        assert_eq!(projection.phase, "recovering");
+        assert_eq!(projection.terminal_reason, None);
+    }
+
+    /// An ordinary core-input handoff is a different thing and keeps its own
+    /// live presentation.
+    #[test]
+    fn ordinary_core_input_is_not_reported_as_exhausted_recovery() {
+        use crate::agent::objective::{DecisionType, ObjectiveStatus};
+        let projection = chat_turn_projection(&projection_objective(
+            ObjectiveStatus::WaitingCoreInput,
+            DecisionType::CoreInputRequired,
+            Some("browser_pairing_required"),
+        ));
+        assert_eq!(projection.activity_kind, "core_input_required");
+        assert_eq!(projection.terminal_reason, None);
+    }
+
     async fn reprompt_test_pool() -> sqlx::SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (
+               id TEXT PRIMARY KEY
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         sqlx::query(
             "CREATE TABLE chat_task_segments (
                 id TEXT PRIMARY KEY,
@@ -3791,6 +3902,10 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
         crate::agent::delivery_run::ensure_schema(&pool)
             .await
             .unwrap();
@@ -3805,6 +3920,11 @@ mod tests {
         .await
         .unwrap();
         crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id) VALUES (?)")
+            .bind(format!("session-{test_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
         let store = ObjectiveStore::new(pool.clone());
         let objective = store
             .create(CreateObjective {
@@ -3887,6 +4007,22 @@ mod tests {
         .await
         .unwrap();
 
+        // A crash may persist the Objective before its chat_turn_state
+        // projection. The session fence must still find this row by durable
+        // ownership instead of relying on the presentation table.
+        let unprojected = ObjectiveStore::new(pool.clone())
+            .create(CreateObjective {
+                id: "objective-user-stop-unprojected".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some(session_id.clone()),
+                root_turn_id: Some("turn-user-stop-unprojected".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+
         let live = live_chat_objectives(&pool, &session_id).await.unwrap();
         assert_eq!(
             live.len(),
@@ -3894,11 +4030,17 @@ mod tests {
             "a stop must reach every live objective, not only the newest: {live:?}"
         );
 
-        for (objective_id, root_turn_id) in live {
-            let cancelled =
-                cancel_chat_objective_exact(&pool, &session_id, &root_turn_id, &objective_id)
-                    .await
-                    .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        store
+            .request_chat_session_cancel(&session_id)
+            .await
+            .unwrap();
+        let cancelled = store
+            .consume_chat_session_cancel(&session_id)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.len(), 3);
+        for (_, _, cancelled) in cancelled {
             assert_eq!(cancelled.status, ObjectiveStatus::Cancelled);
             assert_eq!(
                 cancelled.cancellation_provenance.as_deref(),
@@ -3914,6 +4056,53 @@ mod tests {
                 .is_empty(),
             "a stopped session must leave the supervisor nothing to resume"
         );
+        let intent_status: String = sqlx::query_scalar(
+            "SELECT status FROM chat_session_cancel_intents WHERE session_id=?",
+        )
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(intent_status, "settled");
+        assert_eq!(
+            store.get(&unprojected.id).await.unwrap().unwrap().status,
+            ObjectiveStatus::Cancelled,
+            "an Objective must remain stoppable before turn projection exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_left_session_stop_fences_claim_and_is_consumed_on_restart() {
+        use crate::agent::objective::{ObjectiveStatus, ObjectiveStore};
+
+        let (pool, waiting) = durable_cancel_test_objective("session-fence-restart").await;
+        let store = ObjectiveStore::new(pool.clone());
+        let session_id = waiting.session_id.as_deref().unwrap();
+        store.request_chat_session_cancel(session_id).await.unwrap();
+
+        assert!(store
+            .claim_due_remediations("stale-supervisor", 8, 60_000)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .consume_pending_chat_session_cancellations()
+                .await
+                .unwrap(),
+            1
+        );
+        let stopped = store.get(&waiting.id).await.unwrap().unwrap();
+        assert_eq!(stopped.status, ObjectiveStatus::Cancelled);
+        assert_eq!(
+            stopped.cancellation_provenance.as_deref(),
+            Some("explicit_cancel")
+        );
+        assert!(store
+            .claim_due_remediations("replacement-supervisor", 8, 60_000)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
