@@ -94,6 +94,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python -m unittest tests.test_release_workflow
 
+      - name: Historical long-task scenario contract
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:unattended-contract
+
       - name: README contract
         if: ${{ !cancelled() }}
         env:
@@ -188,6 +192,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
 
+      # The command classifier and shared execution contracts live in their
+      # own workspace member. If this package is omitted, a production command
+      # such as `npm test` can silently change from verification to mutation
+      # while the root and loop test jobs remain green.
+      - name: Cargo test (agent-core crate)
+        if: ${{ !cancelled() }}
+        run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-core --quiet
+
       # The root `cargo test` covers only the `codefactory` package. The shared
       # tauri-free loop crate (keystone slice 4) is a separate workspace member,
       # so test it explicitly — future slices move real loop logic here.
@@ -234,6 +246,37 @@ jobs:
           if ($smoke.app_handle -ne "none") { throw "Headless smoke ran with an AppHandle" }
           if ($smoke.tool_count -lt 1) { throw "Headless tool surface was empty" }
           if ($smoke.events_recorded -ne 1) { throw "Headless event sink did not record" }
+
+      # Historical-session contract HLT-001. This is deliberately a formal
+      # executable smoke instead of a reducer/unit test: it starts a real
+      # AgentLoop process, commits one native file mutation, hard-kills that
+      # process, opens the same SQLite from a replacement process, replays the
+      # exact receipt, runs a real project test, and settles the same Objective
+      # without manufacturing a second user turn.
+      - name: Unattended long-task cross-process smoke
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "unattended-long-task-smoke.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --unattended-long-task-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Unattended long-task smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if (-not $smoke.ok) { throw "Unattended long-task smoke did not report ok" }
+          if ($smoke.scenario_id -ne "HLT-001") { throw "Unattended long-task smoke ran the wrong scenario" }
+          if (-not $smoke.process_restart_observed) { throw "Replacement process was not observed" }
+          if (-not $smoke.phase_one_was_hard_killed) { throw "The fault injection did not hard-kill phase one" }
+          if (-not $smoke.same_objective) { throw "Recovery created a different Objective" }
+          if ($smoke.user_message_count -ne 1) { throw "Recovery manufactured a user message" }
+          if ($smoke.human_prompt_count -ne 0) { throw "Recoverable work requested human input" }
+          if ($smoke.side_effect_receipt_count -ne 1) { throw "Mutation receipt was duplicated" }
+          if ($smoke.replay_call_link_count -ne 2) { throw "Both provider Tool calls did not resolve to one receipt" }
+          if ($smoke.objective_status -ne "completed") { throw "Recovered Objective did not complete" }
+          if ($smoke.live_owner_count -ne 0) { throw "A live owner survived settlement" }
+          if ($smoke.claimable_remediation_count -ne 0) { throw "A remediation remained claimable" }
+          if ($smoke.provider_request_count -lt 5) { throw "The deterministic provider trajectory was incomplete" }
+          if (-not $smoke.artifact_verified) { throw "The recovered workspace was not verified" }
+          if (-not $smoke.cleanup_ok) { throw "The unattended smoke leaked isolated state" }
+          Get-Content $receipt
 
       # The browser CLI may report an action error with exit code 0. Exercise
       # the real binary and prove the native manager detects that output and

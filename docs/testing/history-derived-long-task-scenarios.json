@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "source_policy": "aggregate-shapes-only",
+  "privacy": {
+    "allowed": [
+      "aggregate counts",
+      "typed state transitions",
+      "synthetic prompts",
+      "synthetic paths"
+    ],
+    "forbidden": [
+      "session ids",
+      "verbatim conversation content",
+      "local user paths",
+      "credentials"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "HLT-001",
+      "name": "一次授权后跨进程自动完成",
+      "source_shape": "长期任务包含大量工具调用和故障，用户期望进程重启后无需再次发言",
+      "synthetic_given": "一个用户消息授权写入、验证并完成本地任务",
+      "fault": "首次写入完成后强制终止正式子进程",
+      "required_outcome": [
+        "同一 session、root turn 和 objective",
+        "user message 总数为 1",
+        "human prompt 总数为 0",
+        "副作用 receipt 总数为 1",
+        "重启后 objective 自动 completed",
+        "无 live owner"
+      ],
+      "automated_by": [
+        "formal-binary:--unattended-long-task-smoke",
+        "ci:Unattended long-task cross-process smoke",
+        "release:Verify Windows release executable unattended long task"
+      ],
+      "gate": ["pull_request", "nightly", "release_artifact"]
+    },
+    {
+      "id": "HLT-002",
+      "name": "恢复预算按实际 claim 收敛",
+      "source_shape": "历史中同一 provider remediation 曾被重领数百次",
+      "synthetic_given": "相同 failure signature 的可恢复 provider 故障",
+      "fault": "同一 remediation 行被反复 claim 和 defer",
+      "required_outcome": [
+        "signature claim 到达 5 次后停止自动恢复",
+        "objective 总 claim 到达 20 次后停止自动恢复",
+        "进入 waiting_core_input technical_recovery_exhausted",
+        "claimable remediation 为 0",
+        "重启不重置预算"
+      ],
+      "automated_by": [
+        "rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling",
+        "rust:repeated_failure_signature_exhausts_system_recovery_and_returns_to_user"
+      ],
+      "gate": ["pull_request", "nightly"]
+    },
+    {
+      "id": "CXD-001",
+      "name": "增量约束仍属于同一长任务",
+      "source_shape": "用户先给目标，再连续补充约束、纠错，并用继续或可以推进",
+      "synthetic_given": "一个开放 objective 和三条增量 steer：补验收边界、纠正实现方向、确认继续",
+      "fault": "任一 steer 到达时 provider、工具或 CI 正处于等待或恢复",
+      "required_outcome": [
+        "增量约束按顺序生效",
+        "不新建无关 objective",
+        "不丢失已完成工作和 receipt",
+        "不重复请求已有授权",
+        "继续不是恢复所必需的技术按钮"
+      ],
+      "automated_by": [
+        "rust:historical_incremental_constraints_land_in_order_on_the_same_long_task",
+        "rust:contextual_root_continues_the_single_open_objective_and_elevates_its_ceiling",
+        "rust:startup_recovers_a_v1819_exhausted_reprompt_exactly_once"
+      ],
+      "gate": ["pull_request", "nightly"]
+    },
+    {
+      "id": "CXD-002",
+      "name": "交付证据链决定完成",
+      "source_shape": "用户把本地修改、PR、CI、合并、发布和正式产物区分为不同完成阶段",
+      "synthetic_given": "任务要求修复并发布，过程中所有本地测试先后通过",
+      "fault": "在 PR、required CI、merge、release artifact 任一阶段注入等待或失败",
+      "required_outcome": [
+        "未达到约定边界前不得标记 completed",
+        "同一 delivery run 和 canonical PR/head 继续推进",
+        "可恢复失败不要求用户回复继续",
+        "最终证据包含 artifact identity 和真实主路径结果"
+      ],
+      "automated_by": [
+        "rust:receipt_backed_delivery_completion_atomically_completes_run_and_objective",
+        "release:Verify Windows release executable unattended long task"
+      ],
+      "gate": ["nightly", "release_artifact"]
+    },
+    {
+      "id": "HLT-003",
+      "name": "历史 session 中简短继续精确续接",
+      "source_shape": "多个长期 session 在较长间隔后收到简短继续或可以",
+      "synthetic_given": "一个唯一开放 objective 和一条简短上下文确认",
+      "fault": "应用曾退出，当前没有内存 run control",
+      "required_outcome": [
+        "只续接唯一开放 objective",
+        "ambiguous 时 fail closed",
+        "同一输入重试只 admission 一次",
+        "不存在开放 objective 时作为普通新消息处理"
+      ],
+      "automated_by": [
+        "rust:arbitrary_real_user_message_links_the_unique_open_objective",
+        "rust:user_message_without_an_open_objective_is_not_attributed",
+        "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident",
+        "rust:startup_recovers_a_v1819_exhausted_reprompt_exactly_once",
+        "rust:contextual_root_fails_closed_when_two_open_objectives_are_present"
+      ],
+      "gate": ["pull_request", "nightly"]
+    },
+    {
+      "id": "HLT-004",
+      "name": "显式停止跨重启保持终止",
+      "source_shape": "历史进程卡住并在重启程序或电脑后被重新认领",
+      "synthetic_given": "一个 session 拥有多个非终态 objective",
+      "fault": "停止请求与 supervisor claim 并发，随后重启",
+      "required_outcome": [
+        "session 全部 live objective 持久 cancelled",
+        "任一取消失败则 fail closed",
+        "claimable remediation 为 0",
+        "重启后不会复活"
+      ],
+      "automated_by": [
+        "rust:a_user_stop_reaches_every_live_objective_the_session_still_owns",
+        "rust:crash_left_session_stop_fences_claim_and_is_consumed_on_restart",
+        "rust:durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled"
+      ],
+      "gate": ["pull_request", "nightly", "release_artifact"]
+    }
+  ]
+}

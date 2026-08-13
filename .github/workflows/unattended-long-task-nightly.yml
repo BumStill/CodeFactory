@@ -1,0 +1,77 @@
+name: Unattended Long Task Nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unattended-long-task-nightly
+  cancel-in-progress: false
+
+jobs:
+  historical-scenario-matrix:
+    name: Historical scenario matrix (HLT-001 HLT-002 HLT-003 HLT-004 CXD-001 CXD-002)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Validate synthetic historical scenario catalog
+        run: node --test scripts/unattended-long-task-contract.test.mjs
+
+      # Full workspace coverage is intentional here. Required PR CI splits
+      # workspace members for readable verdicts; nightly proves the aggregate
+      # dependency graph and every Rust target referenced by the catalog.
+      - name: Run historical scenario unit and integration matrix
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --quiet
+
+      - name: Run formal cross-process hard-kill scenario
+        id: unattended_smoke
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "unattended-long-task-nightly.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --unattended-long-task-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Unattended nightly smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if (-not $smoke.ok) { throw "Unattended nightly smoke did not report ok" }
+          if ($smoke.scenario_id -ne "HLT-001") { throw "Nightly ran the wrong formal scenario" }
+          if (-not $smoke.phase_one_was_hard_killed) { throw "Nightly did not inject a hard kill" }
+          if (-not $smoke.process_restart_observed) { throw "Nightly did not observe replacement process" }
+          if (-not $smoke.same_objective) { throw "Nightly recovery changed Objective identity" }
+          if ($smoke.user_message_count -ne 1) { throw "Nightly manufactured a user message" }
+          if ($smoke.human_prompt_count -ne 0) { throw "Nightly requested human participation" }
+          if ($smoke.side_effect_receipt_count -ne 1) { throw "Nightly duplicated a side effect" }
+          if ($smoke.replay_call_link_count -ne 2) { throw "Nightly replay did not converge" }
+          if ($smoke.objective_status -ne "completed") { throw "Nightly Objective did not complete" }
+          if ($smoke.live_owner_count -ne 0) { throw "Nightly left a live owner" }
+          if ($smoke.claimable_remediation_count -ne 0) { throw "Nightly left claimable remediation" }
+          if (-not $smoke.artifact_verified) { throw "Nightly did not verify the workspace" }
+          if (-not $smoke.cleanup_ok) { throw "Nightly leaked isolated state" }
+          Get-Content $receipt
+
+      - name: Upload unattended receipt
+        if: ${{ !cancelled() && steps.unattended_smoke.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unattended-long-task-nightly-${{ github.run_id }}
+          path: ${{ runner.temp }}/unattended-long-task-nightly.json
+          if-no-files-found: error

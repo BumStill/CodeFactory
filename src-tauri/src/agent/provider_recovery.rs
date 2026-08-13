@@ -333,7 +333,15 @@ impl ProviderRecoveryStore {
                        AS attempt_output_started,
                     COALESCE((SELECT a.side_effect_started FROM provider_route_attempts a
                      WHERE a.episode_id=e.id ORDER BY a.attempt_order DESC LIMIT 1), 0)
-                       AS attempt_side_effect_started
+                       AS attempt_side_effect_started,
+                    (SELECT COUNT(*) FROM side_effect_receipts receipt
+                     WHERE receipt.objective_id=e.objective_id
+                       AND receipt.status IN ('started', 'unknown'))
+                       AS unresolved_receipt_count,
+                    (SELECT COUNT(*) FROM side_effect_receipts receipt
+                     WHERE receipt.objective_id=e.objective_id
+                       AND receipt.status IN ('committed', 'reconciled', 'cancelled'))
+                       AS settled_receipt_count
              FROM provider_route_episodes e
              JOIN objective_bindings b ON b.id=e.binding_id AND b.objective_id=e.objective_id
              JOIN objectives o ON o.id=e.objective_id
@@ -349,12 +357,17 @@ impl ProviderRecoveryStore {
         {
             let prior_id: String = prior.get("id");
             let attempt_status: Option<String> = prior.try_get("attempt_status")?;
-            let replay_safe = prior.get::<i64, _>("output_started") == 0
-                && prior.get::<i64, _>("side_effect_started") == 0
-                && prior.get::<i64, _>("binding_output_started") == 0
-                && prior.get::<i64, _>("binding_side_effect_started") == 0
-                && prior.get::<i64, _>("objective_output_started") == 0
-                && prior.get::<i64, _>("objective_side_effect_started") == 0
+            let historical_side_effect = prior.get::<i64, _>("binding_side_effect_started") != 0
+                || prior.get::<i64, _>("objective_side_effect_started") != 0;
+            let settled_receipts_prove_history = !historical_side_effect
+                || prior.get::<i64, _>("settled_receipt_count") > 0;
+            // Episode/binding/objective output latches are intentionally
+            // monotonic across model rounds. Recovery safety is therefore
+            // decided by the latest request plus exact side-effect receipts,
+            // not by historical output that is already in chat history.
+            let replay_safe = prior.get::<i64, _>("side_effect_started") == 0
+                && prior.get::<i64, _>("unresolved_receipt_count") == 0
+                && settled_receipts_prove_history
                 && prior.get::<i64, _>("attempt_output_started") == 0
                 && prior.get::<i64, _>("attempt_side_effect_started") == 0
                 && matches!(
@@ -1310,7 +1323,15 @@ impl ProviderRecoveryStore {
             "SELECT e.id, e.status, e.next_observation_at,
                     e.side_effect_started,
                     b.side_effect_started AS binding_side_effect_started,
-                    o.side_effect_started AS objective_side_effect_started
+                    o.side_effect_started AS objective_side_effect_started,
+                    (SELECT COUNT(*) FROM side_effect_receipts receipt
+                     WHERE receipt.objective_id=e.objective_id
+                       AND receipt.status IN ('started', 'unknown'))
+                       AS unresolved_receipt_count,
+                    (SELECT COUNT(*) FROM side_effect_receipts receipt
+                     WHERE receipt.objective_id=e.objective_id
+                       AND receipt.status IN ('committed', 'reconciled', 'cancelled'))
+                       AS settled_receipt_count
              FROM provider_route_episodes e
              JOIN objective_bindings b ON b.id=e.binding_id AND b.objective_id=e.objective_id
              JOIN objectives o ON o.id=e.objective_id
@@ -1348,10 +1369,12 @@ impl ProviderRecoveryStore {
         };
         let attempt_id: String = attempt.get("id");
         let status: String = attempt.get("status");
+        let historical_side_effect = episode.get::<i64, _>("binding_side_effect_started") != 0
+            || episode.get::<i64, _>("objective_side_effect_started") != 0;
         let side_effect_started = attempt.get::<i64, _>("side_effect_started") != 0
             || episode.get::<i64, _>("side_effect_started") != 0
-            || episode.get::<i64, _>("binding_side_effect_started") != 0
-            || episode.get::<i64, _>("objective_side_effect_started") != 0;
+            || episode.get::<i64, _>("unresolved_receipt_count") != 0
+            || (historical_side_effect && episode.get::<i64, _>("settled_receipt_count") == 0);
         if side_effect_started {
             return Ok(ProviderRecoveryDisposition::ObserveOnlySideEffect {
                 episode_id,
@@ -1406,6 +1429,15 @@ impl ProviderRecoveryStore {
                     e.root_turn_id, e.status AS episode_status,
                     e.next_observation_at, e.side_effect_started AS episode_side_effect,
                     b.side_effect_started AS binding_side_effect,
+                    o.side_effect_started AS objective_side_effect,
+                    (SELECT COUNT(*) FROM side_effect_receipts receipt
+                     WHERE receipt.objective_id=o.id
+                       AND receipt.status IN ('started', 'unknown'))
+                       AS unresolved_receipt_count,
+                    (SELECT COUNT(*) FROM side_effect_receipts receipt
+                     WHERE receipt.objective_id=o.id
+                       AND receipt.status IN ('committed', 'reconciled', 'cancelled'))
+                       AS settled_receipt_count,
                     a.status AS attempt_status, a.output_started AS attempt_output,
                     a.side_effect_started AS attempt_side_effect
              FROM objectives o
@@ -1434,8 +1466,12 @@ impl ProviderRecoveryStore {
             .map(|row| {
                 let episode_status: String = row.get("episode_status");
                 let attempt_status: Option<String> = row.try_get("attempt_status")?;
+                let historical_side_effect = row.get::<i64, _>("binding_side_effect") != 0
+                    || row.get::<i64, _>("objective_side_effect") != 0;
                 let has_side_effect = row.get::<i64, _>("episode_side_effect") != 0
-                    || row.get::<i64, _>("binding_side_effect") != 0
+                    || row.get::<i64, _>("unresolved_receipt_count") != 0
+                    || (historical_side_effect
+                        && row.get::<i64, _>("settled_receipt_count") == 0)
                     || row
                         .try_get::<Option<i64>, _>("attempt_side_effect")?
                         .unwrap_or_default()
@@ -1472,6 +1508,63 @@ impl ProviderRecoveryStore {
                 })
             })
             .collect()
+    }
+
+    /// A provider POST has no external mutation semantics of its own. After
+    /// its chat-run owner is durably retired, a latest in-flight attempt with
+    /// no observed bytes, no tool intent, and no unresolved tool receipt may
+    /// be replayed at least once. Any partial output or uncertain receipt keeps
+    /// the attempt fenced and observation-only.
+    pub async fn reconcile_stale_effect_free_in_flight(&self, now: i64) -> Result<u64> {
+        let updated = sqlx::query(
+            "UPDATE provider_route_attempts
+             SET status='failed_replayable',
+                 failure_class='process_restart',
+                 failure_code='provider_process_restarted_before_output',
+                 observed_at=?, completed_at=?
+             WHERE id IN (
+                 SELECT attempt.id
+                 FROM provider_route_attempts attempt
+                 JOIN provider_route_episodes episode ON episode.id=attempt.episode_id
+                 JOIN objectives objective ON objective.id=attempt.objective_id
+                 JOIN objective_bindings binding
+                   ON binding.id=attempt.binding_id
+                  AND binding.objective_id=attempt.objective_id
+                 WHERE attempt.status='in_flight'
+                   AND attempt.output_started=0
+                   AND attempt.side_effect_started=0
+                   AND attempt.side_effect_receipt_id IS NULL
+                   AND objective.status='active'
+                   AND attempt.id=(
+                       SELECT latest.id FROM provider_route_attempts latest
+                       WHERE latest.episode_id=attempt.episode_id
+                       ORDER BY latest.attempt_order DESC LIMIT 1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM provider_output_checkpoints checkpoint
+                       WHERE checkpoint.attempt_id=attempt.id)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM chat_run_controls control
+                       WHERE control.objective_id=objective.id
+                         AND control.objective_revision=objective.revision
+                         AND control.status IN ('active', 'cancel_requested'))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM side_effect_receipts receipt
+                       WHERE receipt.objective_id=objective.id
+                         AND receipt.status IN ('started', 'unknown'))
+                   AND (
+                       (objective.side_effect_started=0
+                        AND binding.side_effect_started=0)
+                       OR EXISTS (
+                           SELECT 1 FROM side_effect_receipts receipt
+                           WHERE receipt.objective_id=objective.id
+                             AND receipt.status IN
+                                 ('committed', 'reconciled', 'cancelled'))))",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected())
     }
 
     async fn transition_attempt(

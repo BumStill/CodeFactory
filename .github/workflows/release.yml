@@ -250,6 +250,34 @@ jobs:
           if (-not $smoke.cleanup) { throw "Evolution smoke did not clean isolated state" }
           Get-Content $receipt
 
+      - name: Verify Windows release executable unattended long task
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "src-tauri/target/release" -Filter "codefactory.exe" -File | Select-Object -First 1
+          if (-not $exe) { throw "Windows release executable was not produced" }
+          $receipt = Join-Path $env:RUNNER_TEMP "unattended-long-task-release-smoke.json"
+          $process = Start-Process -FilePath $exe.FullName `
+            -ArgumentList @("--unattended-long-task-smoke", $receipt) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Unattended release smoke exited $($process.ExitCode)" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if (-not $smoke.ok) { throw "Unattended release smoke did not report ok" }
+          if ($smoke.scenario_id -ne "HLT-001") { throw "Unattended release smoke ran the wrong scenario" }
+          if ($smoke.build_git_sha -ne "${{ needs.prepare-release.outputs.tag_sha }}") { throw "Unattended smoke was not built from the release commit" }
+          if (-not $smoke.process_restart_observed) { throw "Replacement process was not observed" }
+          if (-not $smoke.phase_one_was_hard_killed) { throw "The release smoke did not inject a hard kill" }
+          if (-not $smoke.same_objective) { throw "Release recovery created a different Objective" }
+          if ($smoke.user_message_count -ne 1) { throw "Release recovery manufactured a user message" }
+          if ($smoke.human_prompt_count -ne 0) { throw "Release recovery requested human input" }
+          if ($smoke.side_effect_receipt_count -ne 1) { throw "Release recovery duplicated a mutation receipt" }
+          if ($smoke.replay_call_link_count -ne 2) { throw "Release Tool calls did not converge on one receipt" }
+          if ($smoke.objective_status -ne "completed") { throw "Release Objective did not complete" }
+          if ($smoke.live_owner_count -ne 0) { throw "Release smoke left a live owner" }
+          if ($smoke.claimable_remediation_count -ne 0) { throw "Release smoke left claimable remediation" }
+          if ($smoke.provider_request_count -lt 5) { throw "Release provider trajectory was incomplete" }
+          if (-not $smoke.artifact_verified) { throw "Release smoke did not verify the workspace" }
+          if (-not $smoke.cleanup_ok) { throw "Release smoke leaked isolated state" }
+          Get-Content $receipt
+
   # ── Step 3: build the macOS (Apple Silicon) app + dmg ─────────────────────
   # Runs in parallel with Windows after prepare-release creates the draft;
   # tauri-action uploads the .app.tar.gz (+ .sig) and the .dmg. The updater

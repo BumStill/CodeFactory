@@ -659,6 +659,7 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
                 "cargo test",
                 "npm run build",
                 "npm run lint",
+                "npm test",
                 "pnpm build",
                 "pnpm lint",
                 "pnpm test",
@@ -5409,6 +5410,7 @@ mod tests {
         // vitest / jest / tsc are the standard verification commands in a
         // TypeScript repo; the gate must accept them, not only `pnpm test`.
         for command in [
+            "npm test",
             "pnpm exec vitest run src/pages/Workspace/TaskCreator.test.tsx",
             "npx vitest run",
             "pnpm exec jest src/foo.test.ts",

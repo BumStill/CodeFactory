@@ -4250,6 +4250,117 @@ mod tests {
         }
     }
 
+    struct OrderedSteers {
+        schedule: Vec<(u32, String)>,
+        drains: Mutex<u32>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::SteerInbox for OrderedSteers {
+        async fn drain(&self) -> Vec<String> {
+            let mut drains = self.drains.lock().expect("drains");
+            *drains += 1;
+            self.schedule
+                .iter()
+                .filter(|(at, _)| *at == *drains)
+                .map(|(_, message)| message.clone())
+                .collect()
+        }
+
+        fn capability_override(&self, _content: &str) -> Option<TurnCapability> {
+            None
+        }
+    }
+
+    /// Historical user workflow contract: the user authorizes one long task,
+    /// then adds an acceptance constraint, corrects the direction, and finally
+    /// says a terse "继续". All three notes must reach the same running loop in
+    /// order before the next provider request; none is a technical prerequisite
+    /// for recovery or a reason to discard already-recorded tool evidence.
+    #[tokio::test]
+    async fn historical_incremental_constraints_land_in_order_on_the_same_long_task() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "先执行第一步",
+                vec![call("t1", "scripted", serde_json::json!({}))],
+                0,
+            ),
+            response(
+                "已纳入验收边界",
+                vec![call("t2", "scripted", serde_json::json!({}))],
+                1,
+            ),
+            response(
+                "已按纠正方向处理",
+                vec![call(
+                    "t3",
+                    "bash",
+                    serde_json::json!({"command": "pnpm test"}),
+                )],
+                2,
+            ),
+            response("任务已按全部约束完成", vec![], 3),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let notes = vec![
+            "补充：验收必须证明重启后仍是同一任务".to_string(),
+            "纠正：不要新建第二个任务".to_string(),
+            "继续".to_string(),
+        ];
+        let steer = Arc::new(OrderedSteers {
+            schedule: notes
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, message)| (index as u32 + 2, message))
+                .collect(),
+            drains: Mutex::new(0),
+        });
+        let mut cfg = config();
+        cfg.max_iterations = 4;
+        let mut svc = services(transport.clone(), persistence.clone(), events.clone());
+        svc.steer = steer;
+
+        let outcome = run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
+        assert_eq!(outcome.stop_reason, StopReason::Finished);
+
+        let persisted_notes = persistence
+            .messages
+            .lock()
+            .expect("messages")
+            .iter()
+            .filter(|(role, content, _)| role == "user" && notes.contains(content))
+            .map(|(_, content, _)| content.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_notes, notes);
+
+        let applied = events
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                StreamEvent::SteerApplied { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(applied, notes);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 4);
+        for (request_index, expected_count) in [(1, 1), (2, 2), (3, 3)] {
+            let visible_notes = requests[request_index]
+                .iter()
+                .filter_map(|message| match (&message.role[..], &message.content) {
+                    ("user", MessageContent::Text(content)) if notes.contains(content) => {
+                        Some(content.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(visible_notes, notes[..expected_count]);
+        }
+    }
+
     #[tokio::test]
     async fn an_explicit_steer_updates_action_intent_before_the_next_tool_batch() {
         let transport = Arc::new(ScriptedTransport::new(vec![

@@ -32,6 +32,8 @@ pub mod subagent;
 mod tool_backend;
 pub(crate) mod tool_recovery;
 pub(crate) mod update_recovery;
+#[cfg(not(test))]
+pub(crate) mod unattended_smoke;
 pub mod user_context;
 pub mod verification;
 pub mod worktree;
