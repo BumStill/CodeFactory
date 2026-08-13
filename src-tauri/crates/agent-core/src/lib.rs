@@ -6242,10 +6242,24 @@ mod tests {
         let mut js_chained = outcome(1, ToolKind::Verification, 1);
         js_chained.command = "cd web && pnpm test && cd ../other".to_owned();
         js_chained.working_directory = Some("/workspace".to_owned());
+        let normalized_scope =
+            verification_scope(&js_chained.command, js_chained.working_directory.as_deref());
         assert_eq!(
-            verification_scope(&js_chained.command, js_chained.working_directory.as_deref())
-                .working_directory,
-            "/workspace/web"
+            PathBuf::from(&normalized_scope.working_directory),
+            normalize_lexical_path(&PathBuf::from("/workspace").join("web")),
+            "verification cwd uses the target platform's native separators"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            PathBuf::from(
+                verification_scope(
+                    "cd web && pnpm test",
+                    Some(r"C:\workspace\CaseSensitive"),
+                )
+                .working_directory
+            ),
+            PathBuf::from(r"C:\workspace\CaseSensitive\web"),
+            "Windows drive and backslash input must preserve case while resolving cd"
         );
         js_trailing_cd.record(&js_chained);
         let mut js_direct = outcome(2, ToolKind::Verification, 0);
