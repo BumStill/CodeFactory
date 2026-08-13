@@ -72,6 +72,26 @@ string_enum!(ObjectiveStatus {
     LegacyOrphan => "legacy_orphan",
 });
 
+/// Reason recorded when system-owned recovery gave up. Reused verbatim on the
+/// transport turn (`chat_turn_state.terminal_reason`) so a settled turn and the
+/// objective that produced it name the same thing.
+pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
+
+/// How many durable remediations one failure signature may buy before the
+/// system admits it is not making progress. Counted as a lifetime tally per
+/// `(objective, failure_signature)` rather than a consecutive streak: an
+/// intervening different failure code must not hand the same broken route a
+/// fresh budget.
+pub const MAX_SIGNATURE_RECOVERY_ATTEMPTS: i64 = 5;
+
+/// Backstop for signatures that never repeat. Some routes embed varying error
+/// text in the signature (task recovery hashes the message), which would
+/// otherwise leave every per-signature tally at 1 forever. This bounds one
+/// objective's total system-owned recovery regardless of how the signature
+/// churns; it is deliberately far above the per-signature ceiling so ordinary
+/// multi-stage recovery never trips it.
+pub const MAX_OBJECTIVE_RECOVERY_ATTEMPTS: i64 = 20;
+
 impl ObjectiveStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled)
@@ -2407,6 +2427,89 @@ impl ObjectiveStore {
         .await
     }
 
+    /// Bound system-owned recovery so it can never spin forever.
+    ///
+    /// Every recovery route inserts a *brand new* remediation row per attempt,
+    /// which is why the per-row `attempt_index` resets to 0 each round and can
+    /// never reach any ceiling on its own. The only counter that survives a
+    /// re-route is the durable remediation history, so bound against that.
+    ///
+    /// Two bounds, both keyed on durable history rather than a live streak:
+    ///
+    /// * per `(objective, failure_signature)` — the same signature recurring is
+    ///   the definition of no progress. It is a lifetime tally, not a
+    ///   consecutive run, so an intervening *different* failure code cannot
+    ///   hand the same broken route a fresh budget.
+    /// * per objective — a backstop for routes whose signature embeds varying
+    ///   text, where every per-signature tally would otherwise stay at 1.
+    ///
+    /// User-driven remediations are excluded from both counts — a restored
+    /// capability or an authorized permission is the user changing the world,
+    /// not the system retrying itself, and must never spend the recovery
+    /// budget. They are recognised two ways because they are written two ways:
+    /// a `CapabilityRestored` route lands an `apply_recommended` decision, and
+    /// permission authorization inserts its remediation directly with the
+    /// `resume_authorized_action` strategy and no decision row at all.
+    async fn bound_system_recovery(
+        &self,
+        mut decision: DecisionEnvelope,
+    ) -> anyhow::Result<DecisionEnvelope> {
+        if decision.status != ObjectiveStatus::WaitingSystem
+            || !matches!(
+                decision.decision_type,
+                DecisionType::Waiting | DecisionType::PlatformIncident | DecisionType::FailedInternal
+            )
+        {
+            return Ok(decision);
+        }
+        let signature = decision.failure_signature.clone().unwrap_or_default();
+        let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
+            "SELECT
+               COALESCE(SUM(CASE WHEN remediation.failure_signature=? THEN 1 ELSE 0 END), 0),
+               COUNT(*)
+             FROM objective_remediations remediation
+             LEFT JOIN objective_decisions decision
+               ON decision.remediation_id=remediation.id
+              AND decision.objective_id=remediation.objective_id
+             WHERE remediation.objective_id=?
+               AND remediation.strategy='reconcile_then_resume'
+               AND COALESCE(decision.decision_type, 'waiting')<>'apply_recommended'",
+        )
+        .bind(&signature)
+        .bind(&decision.objective_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if signature_attempts < MAX_SIGNATURE_RECOVERY_ATTEMPTS
+            && objective_attempts < MAX_OBJECTIVE_RECOVERY_ATTEMPTS
+        {
+            return Ok(decision);
+        }
+
+        tracing::warn!(
+            objective_id = %decision.objective_id,
+            failure_code = decision.failure_code.as_deref().unwrap_or("unknown"),
+            domain = decision.domain.as_str(),
+            signature_attempts,
+            objective_attempts,
+            "system recovery made no progress; returning the objective to the user"
+        );
+        decision.decision_type = DecisionType::CoreInputRequired;
+        decision.status = ObjectiveStatus::WaitingCoreInput;
+        decision.request_key = Some(format!(
+            "{TECHNICAL_RECOVERY_EXHAUSTED}:{}",
+            decision.objective_id
+        ));
+        // Keep the exhausted signature for forensics; the failure code becomes
+        // the typed reason so the transport turn and the objective agree.
+        decision.failure_code = Some(TECHNICAL_RECOVERY_EXHAUSTED.into());
+        decision.recovery_owner = None;
+        decision.remediation_id = None;
+        decision.next_observation_at = None;
+        decision.next_action_authorized = false;
+        decision.requires_user_action = true;
+        Ok(decision)
+    }
+
     async fn apply_decision_inner(
         &self,
         expected_revision: i64,
@@ -2424,6 +2527,11 @@ impl ObjectiveStore {
                 current.revision
             );
         }
+        decision.validate(&current)?;
+        // Runs before the transaction opens: a deterministic pool may allow a
+        // single connection, and asking for a second one mid-transaction
+        // deadlocks recovery into a timeout.
+        let decision = self.bound_system_recovery(decision).await?;
         decision.validate(&current)?;
         let now = Utc::now().timestamp_millis();
         let process_instance = current_process_instance();
@@ -6626,6 +6734,337 @@ mod tests {
         assert_eq!(
             store.get(&cancelled.id).await.unwrap().unwrap().status,
             ObjectiveStatus::Cancelled
+        );
+    }
+
+    async fn recovery_ceiling_objective(pool: &SqlitePool, id: &str) -> ObjectiveSnapshot {
+        ObjectiveStore::new(pool.clone())
+            .create(CreateObjective {
+                id: id.into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some(format!("session-{id}")),
+                root_turn_id: Some(format!("turn-{id}")),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "informational_answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn claimable_remediations(pool: &SqlitePool, objective_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=? AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(objective_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// How many durable recovery attempts the system actually bought. Each one
+    /// is a real re-run of the model, so this is the number the ceiling exists
+    /// to bound.
+    async fn total_remediations(pool: &SqlitePool, objective_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations WHERE objective_id=?")
+            .bind(objective_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Drive one system-owned technical failure round and return the durable
+    /// objective it settled into.
+    async fn route_technical_failure(
+        store: &ObjectiveStore,
+        current: &ObjectiveSnapshot,
+        failure_code: &str,
+        failure_signature: &str,
+    ) -> ObjectiveSnapshot {
+        let decision = DecisionRouter::route(
+            current,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: failure_code.into(),
+                failure_signature: failure_signature.into(),
+                next_observation_at: Utc::now().timestamp_millis() + 5_000,
+                resume_cursor: current.root_turn_id.clone(),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(current.revision, decision)
+            .await
+            .unwrap()
+    }
+
+    fn assert_returned_to_user(objective: &ObjectiveSnapshot) {
+        assert_eq!(
+            objective.status,
+            ObjectiveStatus::WaitingCoreInput,
+            "exhausted recovery must leave the system-owned loop"
+        );
+        assert_eq!(objective.decision_type, DecisionType::CoreInputRequired);
+        assert!(
+            objective.requires_user_action,
+            "an exhausted objective is the user's call, not another observation"
+        );
+        assert_eq!(
+            objective.failure_code.as_deref(),
+            Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        );
+        assert_eq!(
+            objective.request_key.as_deref(),
+            Some(format!("{TECHNICAL_RECOVERY_EXHAUSTED}:{}", objective.id).as_str()),
+            "the handback needs a stable request key the user can answer against"
+        );
+        assert!(
+            objective.recovery_owner.is_none() && objective.remediation_id.is_none(),
+            "no owner may keep observing an exhausted objective"
+        );
+        assert!(
+            objective.next_observation_at.is_none(),
+            "an exhausted objective must not schedule another observation"
+        );
+    }
+
+    /// The 2026-08-13 incident: a completion-evidence rejection re-queued a
+    /// durable remediation every ~13s forever, each round paying for a real
+    /// model call that returned the very same answer.
+    #[tokio::test]
+    async fn repeated_failure_signature_exhausts_system_recovery_and_returns_to_user() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-recovery-ceiling").await;
+        let signature = format!("{}:Finished:none", current.id);
+
+        let mut queued_rounds = 0_i64;
+        for _ in 0..(MAX_SIGNATURE_RECOVERY_ATTEMPTS + 4) {
+            if current.requires_user_action {
+                break;
+            }
+            current = route_technical_failure(
+                &store,
+                &current,
+                "completion_evidence_incomplete",
+                &signature,
+            )
+            .await;
+            if current.status == ObjectiveStatus::WaitingSystem {
+                queued_rounds += 1;
+            }
+        }
+
+        assert_eq!(
+            queued_rounds, MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+            "system recovery must stop re-queueing at the global ceiling"
+        );
+        assert_returned_to_user(&current);
+        assert_eq!(
+            claimable_remediations(&pool, &current.id).await,
+            0,
+            "the supervisor must have nothing left to claim"
+        );
+    }
+
+    /// A changed failure code must not buy another full budget: the tally is a
+    /// lifetime per-signature count, not a consecutive streak that churn resets.
+    #[tokio::test]
+    async fn alternating_failure_codes_cannot_reset_the_recovery_ceiling() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-recovery-churn").await;
+        let signatures = [
+            format!("{}:Finished:none", current.id),
+            format!("{}:FailedInternal:none", current.id),
+        ];
+
+        let mut rounds = 0_usize;
+        while !current.requires_user_action && rounds < 64 {
+            let index = rounds % signatures.len();
+            current = route_technical_failure(
+                &store,
+                &current,
+                if index == 0 {
+                    "completion_evidence_incomplete"
+                } else {
+                    "failed_internal"
+                },
+                &signatures[index],
+            )
+            .await;
+            rounds += 1;
+        }
+
+        assert_returned_to_user(&current);
+        assert!(
+            (rounds as i64) <= MAX_SIGNATURE_RECOVERY_ATTEMPTS * signatures.len() as i64 + 1,
+            "alternating two signatures bought {rounds} rounds; the per-signature \
+             tally must survive an intervening different failure code"
+        );
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 0);
+    }
+
+    /// Signature churn (a failure signature that embeds varying error text)
+    /// must still terminate — otherwise the ceiling is trivially bypassed.
+    #[tokio::test]
+    async fn churning_failure_signatures_still_reach_the_objective_recovery_ceiling() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-recovery-unique").await;
+
+        let mut rounds = 0_i64;
+        while !current.requires_user_action && rounds < MAX_OBJECTIVE_RECOVERY_ATTEMPTS * 4 {
+            current = route_technical_failure(
+                &store,
+                &current,
+                "agent_loop_error",
+                &format!("sha256:unique-{rounds}"),
+            )
+            .await;
+            rounds += 1;
+        }
+
+        assert_returned_to_user(&current);
+        assert_eq!(
+            total_remediations(&pool, &current.id).await,
+            MAX_OBJECTIVE_RECOVERY_ATTEMPTS,
+            "a never-repeating signature must still hit the per-objective backstop"
+        );
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 0);
+    }
+
+    /// Requirement 3 verified against the real routing path, not a hand-built
+    /// envelope: a `Finished` run whose evidence never satisfies the objective
+    /// kind produces the identical signature every round, so re-running the
+    /// same prompt for the same answer is no progress and must count.
+    #[tokio::test]
+    async fn completion_evidence_gate_rejection_counts_as_no_progress() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = store
+            .create(CreateObjective {
+                id: "objective-evidence-gate-loop".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-evidence-gate-loop".into()),
+                root_turn_id: Some("turn-evidence-gate-loop".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        // The model answers every round; the gate rejects every round because
+        // no ChangeSet/PostChangeValidation evidence ever appears.
+        let rerun = || RunOutcome {
+            final_text: "同一段答案".into(),
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 12,
+            output_tokens: 34,
+            stop_reason: StopReason::Finished,
+        };
+
+        let mut signatures = std::collections::HashSet::new();
+        let mut rounds = 0_i64;
+        while !current.requires_user_action && rounds < MAX_SIGNATURE_RECOVERY_ATTEMPTS * 4 {
+            let decision = decision_for_run_outcome(&current, &rerun()).unwrap();
+            assert_eq!(
+                decision.failure_code.as_deref(),
+                Some("completion_evidence_incomplete")
+            );
+            signatures.insert(decision.failure_signature.clone().unwrap());
+            current = store
+                .apply_decision(current.revision, decision)
+                .await
+                .unwrap();
+            rounds += 1;
+        }
+
+        assert_eq!(
+            signatures.len(),
+            1,
+            "re-running the same prompt for the same answer must keep one signature"
+        );
+        assert_eq!(
+            total_remediations(&pool, &current.id).await,
+            MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+            "the evidence gate may only buy the bounded number of model re-runs"
+        );
+        assert_returned_to_user(&current);
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 0);
+    }
+
+    /// The ceiling must never swallow a real capability restoration: that is
+    /// the user changing the world, not the system spinning on itself.
+    #[tokio::test]
+    async fn restored_capability_is_never_terminalized_by_the_recovery_ceiling() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-recovery-restored").await;
+
+        for _ in 0..(MAX_OBJECTIVE_RECOVERY_ATTEMPTS + 8) {
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::CapabilityRestored {
+                    domain: RecoveryDomain::Auth,
+                    reason: "authorization_restored".into(),
+                    next_observation_at: Utc::now().timestamp_millis(),
+                    resume_cursor: current.root_turn_id.clone(),
+                },
+            )
+            .unwrap();
+            current = store
+                .apply_decision(current.revision, decision)
+                .await
+                .unwrap();
+            assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+            assert!(!current.requires_user_action);
+        }
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 1);
+    }
+
+    /// Permission authorization writes its remediation directly, with no
+    /// decision row to join against. A user clicking Allow is progress and must
+    /// not quietly spend the system's recovery budget.
+    #[tokio::test]
+    async fn authorized_permission_remediations_do_not_spend_the_recovery_budget() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-recovery-permission").await;
+        let now = Utc::now().timestamp_millis();
+        for index in 0..(MAX_OBJECTIVE_RECOVERY_ATTEMPTS + 4) {
+            sqlx::query(
+                "INSERT INTO objective_remediations
+                 (id, objective_id, domain, status, failure_code, failure_signature,
+                  strategy, approach_index, attempt_index, next_observation_at,
+                  created_at, updated_at)
+                 VALUES (?, ?, 'permission', 'superseded', 'authorization_restored', ?,
+                         'resume_authorized_action', 0, 0, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&current.id)
+            .bind(format!("permission:intent-{index}:authorized"))
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let queued = route_technical_failure(
+            &store,
+            &current,
+            "completion_evidence_incomplete",
+            &format!("{}:Finished:none", current.id),
+        )
+        .await;
+        assert_eq!(
+            queued.status,
+            ObjectiveStatus::WaitingSystem,
+            "user-authorized permissions must not exhaust system recovery"
         );
     }
 }

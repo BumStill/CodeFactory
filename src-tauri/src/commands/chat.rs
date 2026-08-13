@@ -898,19 +898,35 @@ fn requested_acceptance(kind: crate::agent::objective::ObjectiveKind) -> &'stati
     }
 }
 
-async fn project_chat_objective(
-    db: &sqlx::SqlitePool,
-    app: &AppHandle,
-    event_name: &str,
-    root_turn_id: &str,
+/// How one durable Objective presents itself on the transport turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatTurnProjection {
+    phase: &'static str,
+    activity_kind: &'static str,
+    activity_label: &'static str,
+    /// `Some` once the turn has stopped moving on its own — either a terminal
+    /// objective, or system-owned recovery that ran out of budget.
+    terminal_reason: Option<&'static str>,
+}
+
+fn chat_turn_projection(
     objective: &crate::agent::objective::ObjectiveSnapshot,
-) -> Result<(), AppError> {
-    use crate::agent::objective::ObjectiveStatus;
-    let now = Utc::now().timestamp_millis();
+) -> ChatTurnProjection {
+    use crate::agent::objective::{ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED};
+    // Recovery that ran out of budget is a settled turn, not a live one. The
+    // objective stays non-terminal (the work was never finished), but the
+    // transport turn must stop presenting itself as still recovering.
+    let recovery_exhausted = objective.status == ObjectiveStatus::WaitingCoreInput
+        && objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED);
     let (phase, activity_kind, activity_label) = match objective.status {
         ObjectiveStatus::Completed => ("finalizing", "objective_completed", "目标证据已满足"),
         ObjectiveStatus::Cancelled => ("finalizing", "objective_cancelled", "已按用户要求停止"),
         ObjectiveStatus::WaitingSystem => ("recovering", "system_recovery", "系统正在恢复并续接"),
+        ObjectiveStatus::WaitingCoreInput if recovery_exhausted => (
+            "waiting",
+            TECHNICAL_RECOVERY_EXHAUSTED,
+            "系统多轮自动恢复没有进展，已停止并把当前结论交还给你",
+        ),
         ObjectiveStatus::WaitingCoreInput => ("waiting", "core_input_required", "需要补充核心输入"),
         ObjectiveStatus::WaitingAuthorization => {
             ("waiting", "authorization_required", "等待必要授权")
@@ -925,12 +941,40 @@ async fn project_chat_objective(
             "系统正在核对历史工作",
         ),
     };
+    ChatTurnProjection {
+        phase,
+        activity_kind,
+        activity_label,
+        terminal_reason: if recovery_exhausted {
+            Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        } else if objective.status.is_terminal() {
+            Some(objective.decision_type.as_str())
+        } else {
+            None
+        },
+    }
+}
+
+async fn project_chat_objective(
+    db: &sqlx::SqlitePool,
+    app: &AppHandle,
+    event_name: &str,
+    root_turn_id: &str,
+    objective: &crate::agent::objective::ObjectiveSnapshot,
+) -> Result<(), AppError> {
+    let now = Utc::now().timestamp_millis();
+    let ChatTurnProjection {
+        phase,
+        activity_kind,
+        activity_label,
+        terminal_reason,
+    } = chat_turn_projection(objective);
     let waiting_reason = objective
         .failure_code
         .as_deref()
         .or(objective.request_key.as_deref())
         .or(objective.decision_key.as_deref());
-    let completed_at = objective.status.is_terminal().then_some(now);
+    let completed_at = terminal_reason.is_some().then_some(now);
     let revision: i64 = sqlx::query_scalar(
         "UPDATE chat_turn_state SET revision=revision+1, phase=?, status=?,
            recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
@@ -944,11 +988,7 @@ async fn project_chat_objective(
     .bind(waiting_reason)
     .bind(now)
     .bind(completed_at)
-    .bind(if objective.status.is_terminal() {
-        Some(objective.decision_type.as_str())
-    } else {
-        None
-    })
+    .bind(terminal_reason)
     .bind(root_turn_id)
     .fetch_one(db)
     .await?;
@@ -963,11 +1003,7 @@ async fn project_chat_objective(
             recent_activity_label: activity_label.into(),
             waiting_reason: waiting_reason.map(str::to_string),
             updated_at: now,
-            terminal_reason: if objective.status.is_terminal() {
-                Some(objective.decision_type.as_str().into())
-            } else {
-                None
-            },
+            terminal_reason: terminal_reason.map(str::to_string),
             objective_id: Some(objective.id.clone()),
             objective_status: Some(objective.status.as_str().into()),
             recovery_owner: objective.recovery_owner.clone(),
@@ -3043,6 +3079,78 @@ mod tests {
     use crate::config::settings::{ApiStyle, Endpoint};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::time::Duration;
+
+    fn projection_objective(
+        status: crate::agent::objective::ObjectiveStatus,
+        decision_type: crate::agent::objective::DecisionType,
+        failure_code: Option<&str>,
+    ) -> crate::agent::objective::ObjectiveSnapshot {
+        use crate::agent::objective::{ObjectiveKind, ObjectiveSnapshot, RecoveryDomain};
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-projection",
+            ObjectiveKind::Informational,
+            RecoveryDomain::Chat,
+            "informational_answer",
+        );
+        objective.status = status;
+        objective.decision_type = decision_type;
+        objective.failure_code = failure_code.map(str::to_string);
+        objective
+    }
+
+    /// A bounded-out recovery must settle the transport turn. Leaving it
+    /// `recovering` with no terminal reason is exactly what showed the user an
+    /// endless "系统仍在恢复" spinner while nothing was left to observe.
+    #[test]
+    fn exhausted_recovery_settles_the_turn_instead_of_spinning() {
+        use crate::agent::objective::{
+            DecisionType, ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED,
+        };
+        let projection = chat_turn_projection(&projection_objective(
+            ObjectiveStatus::WaitingCoreInput,
+            DecisionType::CoreInputRequired,
+            Some(TECHNICAL_RECOVERY_EXHAUSTED),
+        ));
+        assert_eq!(projection.phase, "waiting");
+        assert_eq!(projection.activity_kind, TECHNICAL_RECOVERY_EXHAUSTED);
+        assert_eq!(
+            projection.terminal_reason,
+            Some(TECHNICAL_RECOVERY_EXHAUSTED),
+            "the settled turn must name why the system stopped"
+        );
+        assert!(
+            projection.activity_label.contains("交还"),
+            "the user must be told the work is theirs now, not still running"
+        );
+    }
+
+    /// Recovery that still has budget stays system-owned and unsettled: the
+    /// ceiling must not turn ordinary retries into handbacks.
+    #[test]
+    fn recovery_with_budget_left_stays_system_owned() {
+        use crate::agent::objective::{DecisionType, ObjectiveStatus};
+        let projection = chat_turn_projection(&projection_objective(
+            ObjectiveStatus::WaitingSystem,
+            DecisionType::Waiting,
+            Some("completion_evidence_incomplete"),
+        ));
+        assert_eq!(projection.phase, "recovering");
+        assert_eq!(projection.terminal_reason, None);
+    }
+
+    /// An ordinary core-input handoff is a different thing and keeps its own
+    /// live presentation.
+    #[test]
+    fn ordinary_core_input_is_not_reported_as_exhausted_recovery() {
+        use crate::agent::objective::{DecisionType, ObjectiveStatus};
+        let projection = chat_turn_projection(&projection_objective(
+            ObjectiveStatus::WaitingCoreInput,
+            DecisionType::CoreInputRequired,
+            Some("browser_pairing_required"),
+        ));
+        assert_eq!(projection.activity_kind, "core_input_required");
+        assert_eq!(projection.terminal_reason, None);
+    }
 
     async fn reprompt_test_pool() -> sqlx::SqlitePool {
         let pool = SqlitePoolOptions::new()

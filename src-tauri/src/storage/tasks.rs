@@ -431,10 +431,14 @@ pub async fn task_objective_id(pool: &SqlitePool, id: &str) -> Result<Option<Str
     )
 }
 
+/// Settle a task as failed. Like completion, this clears the recovery pointer:
+/// a settled task carrying `recovery_state='waiting_system'` and a future
+/// observation time reads as "still being recovered" to every later sweep.
 pub async fn mark_task_failed(pool: &SqlitePool, id: &str, error: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "UPDATE task_runs SET status = 'failed', completed_at = ?, error = ?, \
+         recovery_state = NULL, next_observation_at = NULL, \
          owner_pid = NULL, owner_start_token = NULL WHERE id = ?",
     )
     .bind(&now)
