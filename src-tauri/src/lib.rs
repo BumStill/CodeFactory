@@ -592,6 +592,15 @@ pub fn run() {
                 Arc::new(Mutex::new(HashMap::new()));
             app.manage(scheduler_handles);
             let objective_store = agent::objective::ObjectiveStore::new(objective_pool.clone());
+            let cancelled_sessions = tauri::async_runtime::block_on(
+                objective_store.consume_pending_chat_session_cancellations(),
+            )?;
+            if cancelled_sessions > 0 {
+                tracing::info!(
+                    count = cancelled_sessions,
+                    "startup: persisted session stops settled before recovery admission"
+                );
+            }
             let cancelled_objectives = tauri::async_runtime::block_on(
                 objective_store.consume_pending_chat_cancellations(),
             )?;

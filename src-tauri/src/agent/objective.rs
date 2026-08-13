@@ -72,6 +72,26 @@ string_enum!(ObjectiveStatus {
     LegacyOrphan => "legacy_orphan",
 });
 
+/// Reason recorded when system-owned recovery gave up. Reused verbatim on the
+/// transport turn (`chat_turn_state.terminal_reason`) so a settled turn and the
+/// objective that produced it name the same thing.
+pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
+
+/// How many durable remediations one failure signature may buy before the
+/// system admits it is not making progress. Counted as a lifetime tally per
+/// `(objective, failure_signature)` rather than a consecutive streak: an
+/// intervening different failure code must not hand the same broken route a
+/// fresh budget.
+pub const MAX_SIGNATURE_RECOVERY_ATTEMPTS: i64 = 5;
+
+/// Backstop for signatures that never repeat. Some routes embed varying error
+/// text in the signature (task recovery hashes the message), which would
+/// otherwise leave every per-signature tally at 1 forever. This bounds one
+/// objective's total system-owned recovery regardless of how the signature
+/// churns; it is deliberately far above the per-signature ceiling so ordinary
+/// multi-stage recovery never trips it.
+pub const MAX_OBJECTIVE_RECOVERY_ATTEMPTS: i64 = 20;
+
 impl ObjectiveStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled)
@@ -1078,6 +1098,17 @@ impl ObjectiveStore {
         let process_instance = current_process_instance();
         let mut legacy_root_to_reconcile = None;
 
+        let stop_requested: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_session_cancel_intents
+             WHERE session_id=? AND status='requested'",
+        )
+        .bind(session_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if stop_requested > 0 {
+            bail!("chat admission fenced by durable session cancellation");
+        }
+
         let current_binding = sqlx::query_scalar::<_, Option<String>>(
             "SELECT objective_id FROM chat_turn_state WHERE root_turn_id=? AND session_id=?",
         )
@@ -1503,6 +1534,14 @@ impl ObjectiveStore {
         if binding_count != 1 {
             bail!("chat cancellation identity mismatch");
         }
+        self.cancel_session_owned_exact(session_id, objective_id).await
+    }
+
+    async fn cancel_session_owned_exact(
+        &self,
+        session_id: &str,
+        objective_id: &str,
+    ) -> anyhow::Result<ObjectiveSnapshot> {
         for _ in 0..4 {
             let current = self
                 .get(objective_id)
@@ -1531,6 +1570,130 @@ impl ObjectiveStore {
             }
         }
         bail!("chat cancellation could not win a stable Objective revision")
+    }
+
+    /// Persist a session-wide stop fence before touching any individual
+    /// Objective. Re-requesting a settled stop starts a new intent; no later
+    /// chat admission may pass while this row remains `requested`.
+    pub async fn request_chat_session_cancel(&self, session_id: &str) -> anyhow::Result<()> {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO chat_session_cancel_intents
+             (session_id, status, requested_at, settled_at, updated_at)
+             VALUES (?, 'requested', ?, NULL, ?)
+             ON CONFLICT(session_id) DO UPDATE SET
+               status='requested', requested_at=excluded.requested_at,
+               settled_at=NULL, updated_at=excluded.updated_at",
+        )
+        .bind(session_id)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Consume one durable session stop. The intent remains requested on any
+    /// error, keeping recovery fenced. Success rechecks the complete live set
+    /// in the transaction that settles the fence.
+    pub async fn consume_chat_session_cancel(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<(String, Option<String>, ObjectiveSnapshot)>> {
+        let mut cancelled = Vec::new();
+        loop {
+            let live = sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT objective.id, objective.root_turn_id
+                 FROM objectives objective
+                 WHERE objective.session_id=?
+                   AND objective.root_turn_id IS NOT NULL
+                   AND objective.status NOT IN ('completed','cancelled','legacy_orphan')
+                 ORDER BY objective.updated_at DESC",
+            )
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?;
+            if live.is_empty() {
+                break;
+            }
+            for (objective_id, root_turn_id) in live {
+                let snapshot = self
+                    .cancel_session_owned_exact(session_id, &objective_id)
+                    .await?;
+                if !matches!(
+                    snapshot.status,
+                    ObjectiveStatus::Cancelled | ObjectiveStatus::Completed
+                ) {
+                    bail!("session cancellation left a nonterminal Objective");
+                }
+                cancelled.push((objective_id, root_turn_id, snapshot));
+            }
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objectives objective
+             WHERE objective.session_id=?
+               AND objective.root_turn_id IS NOT NULL
+               AND objective.status NOT IN ('completed','cancelled','legacy_orphan')",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if remaining != 0 {
+            bail!("session cancellation raced a new live Objective");
+        }
+        let settled = sqlx::query(
+            "UPDATE chat_session_cancel_intents
+             SET status='settled', settled_at=?, updated_at=?
+             WHERE session_id=? AND status='requested'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        if settled.rows_affected() != 1 {
+            let status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM chat_session_cancel_intents WHERE session_id=?",
+            )
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if status.as_deref() != Some("settled") {
+                bail!("session cancellation intent disappeared before settlement");
+            }
+        }
+        sqlx::query(
+            "UPDATE chat_run_controls
+             SET status='cancelled',
+                 cancel_requested_at=COALESCE(cancel_requested_at, ?),
+                 settled_at=COALESCE(settled_at, ?), updated_at=?
+             WHERE session_id=? AND status IN ('active','cancel_requested')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
+    /// Finish crash-left session stops before any recovery admission.
+    pub async fn consume_pending_chat_session_cancellations(&self) -> anyhow::Result<usize> {
+        let sessions = sqlx::query_scalar::<_, String>(
+            "SELECT session_id FROM chat_session_cancel_intents
+             WHERE status='requested' ORDER BY requested_at, session_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for session_id in &sessions {
+            self.consume_chat_session_cancel(session_id).await?;
+        }
+        Ok(sessions.len())
     }
 
     /// Consume exact crash-left chat stop intents before any startup recovery
@@ -1667,7 +1830,9 @@ impl ObjectiveStore {
         let now = Utc::now().timestamp_millis();
         let rows = sqlx::query(
             "SELECT remediation.id AS remediation_id,
-                    remediation.objective_id, remediation.domain
+                    remediation.objective_id, remediation.domain,
+                    remediation.failure_code, remediation.failure_signature,
+                    remediation.strategy
              FROM objective_remediations remediation
              JOIN objectives objective ON objective.id=remediation.objective_id
              WHERE objective.status='waiting_system'
@@ -1675,6 +1840,10 @@ impl ObjectiveStore {
                AND remediation.status IN ('queued','waiting','claimed')
                AND remediation.next_observation_at<=?
                AND (remediation.lease_expires_at IS NULL OR remediation.lease_expires_at<=?)
+               AND NOT EXISTS (
+                 SELECT 1 FROM chat_session_cancel_intents stop
+                 WHERE stop.session_id=objective.session_id AND stop.status='requested'
+               )
              ORDER BY remediation.next_observation_at, remediation.created_at
              LIMIT ?",
         )
@@ -1688,8 +1857,57 @@ impl ObjectiveStore {
             let remediation_id: String = row.try_get("remediation_id")?;
             let objective_id: String = row.try_get("objective_id")?;
             let domain = RecoveryDomain::parse(row.try_get::<String, _>("domain")?.as_str())?;
+            let failure_code: String = row.try_get("failure_code")?;
+            let failure_signature: String = row.try_get("failure_signature")?;
+            let strategy: String = row.try_get("strategy")?;
             let lease_expires_at = now + lease_ms.max(1);
             let mut tx = self.pool.begin().await?;
+            if strategy == "reconcile_then_resume" {
+                let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
+                    "SELECT
+                       COALESCE(SUM(CASE WHEN remediation.failure_signature=?
+                                         THEN remediation.attempt_index ELSE 0 END), 0),
+                       COALESCE(SUM(remediation.attempt_index), 0)
+                     FROM objective_remediations remediation
+                     LEFT JOIN objective_decisions decision
+                       ON decision.remediation_id=remediation.id
+                      AND decision.objective_id=remediation.objective_id
+                     WHERE remediation.objective_id=?
+                       AND remediation.strategy='reconcile_then_resume'
+                       AND COALESCE(decision.decision_type, 'waiting')<>'apply_recommended'",
+                )
+                .bind(&failure_signature)
+                .bind(&objective_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if signature_attempts >= MAX_SIGNATURE_RECOVERY_ATTEMPTS
+                    || objective_attempts >= MAX_OBJECTIVE_RECOVERY_ATTEMPTS
+                {
+                    tx.rollback().await?;
+                    let current = match self.get(&objective_id).await? {
+                        Some(current) if current.status == ObjectiveStatus::WaitingSystem => {
+                            current
+                        }
+                        _ => continue,
+                    };
+                    let decision = DecisionRouter::route(
+                        &current,
+                        RouteSignal::TechnicalFailure {
+                            domain,
+                            failure_code: failure_code.clone(),
+                            failure_signature: failure_signature.clone(),
+                            next_observation_at: now,
+                            resume_cursor: current.resume_cursor.clone(),
+                        },
+                    )?;
+                    match self.apply_decision(current.revision, decision).await {
+                        Ok(_) => {}
+                        Err(error) if error.to_string().contains("revision") => {}
+                        Err(error) => return Err(error),
+                    }
+                    continue;
+                }
+            }
             let updated = sqlx::query(
                 "UPDATE objective_remediations
                  SET status='claimed', attempt_index=attempt_index+1,
@@ -2407,6 +2625,91 @@ impl ObjectiveStore {
         .await
     }
 
+    /// Bound system-owned recovery so it can never spin forever.
+    ///
+    /// Recovery may insert a new remediation or defer and reclaim the same row
+    /// after an adapter failure. `attempt_index` records real claims, so its
+    /// sum across durable history bounds both shapes of retry.
+    ///
+    /// Two bounds, both keyed on durable history rather than a live streak:
+    ///
+    /// * per `(objective, failure_signature)` — the same signature recurring is
+    ///   the definition of no progress. It is a lifetime tally, not a
+    ///   consecutive run, so an intervening *different* failure code cannot
+    ///   hand the same broken route a fresh budget.
+    /// * per objective — a backstop for routes whose signature embeds varying
+    ///   text, where every per-signature tally would otherwise stay at 1.
+    ///
+    /// User-driven remediations are excluded from both counts — a restored
+    /// capability or an authorized permission is the user changing the world,
+    /// not the system retrying itself, and must never spend the recovery
+    /// budget. They are recognised two ways because they are written two ways:
+    /// a `CapabilityRestored` route lands an `apply_recommended` decision, and
+    /// permission authorization inserts its remediation directly with the
+    /// `resume_authorized_action` strategy and no decision row at all.
+    async fn bound_system_recovery(
+        &self,
+        mut decision: DecisionEnvelope,
+    ) -> anyhow::Result<DecisionEnvelope> {
+        if decision.status != ObjectiveStatus::WaitingSystem
+            || !matches!(
+                decision.decision_type,
+                DecisionType::Waiting
+                    | DecisionType::PlatformIncident
+                    | DecisionType::FailedInternal
+            )
+        {
+            return Ok(decision);
+        }
+        let signature = decision.failure_signature.clone().unwrap_or_default();
+        let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
+            "SELECT
+               COALESCE(SUM(CASE WHEN remediation.failure_signature=?
+                                 THEN remediation.attempt_index ELSE 0 END), 0),
+               COALESCE(SUM(remediation.attempt_index), 0)
+             FROM objective_remediations remediation
+             LEFT JOIN objective_decisions decision
+               ON decision.remediation_id=remediation.id
+              AND decision.objective_id=remediation.objective_id
+             WHERE remediation.objective_id=?
+               AND remediation.strategy='reconcile_then_resume'
+               AND COALESCE(decision.decision_type, 'waiting')<>'apply_recommended'",
+        )
+        .bind(&signature)
+        .bind(&decision.objective_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if signature_attempts < MAX_SIGNATURE_RECOVERY_ATTEMPTS
+            && objective_attempts < MAX_OBJECTIVE_RECOVERY_ATTEMPTS
+        {
+            return Ok(decision);
+        }
+
+        tracing::warn!(
+            objective_id = %decision.objective_id,
+            failure_code = decision.failure_code.as_deref().unwrap_or("unknown"),
+            domain = decision.domain.as_str(),
+            signature_attempts,
+            objective_attempts,
+            "system recovery made no progress; returning the objective to the user"
+        );
+        decision.decision_type = DecisionType::CoreInputRequired;
+        decision.status = ObjectiveStatus::WaitingCoreInput;
+        decision.request_key = Some(format!(
+            "{TECHNICAL_RECOVERY_EXHAUSTED}:{}",
+            decision.objective_id
+        ));
+        // Keep the exhausted signature for forensics; the failure code becomes
+        // the typed reason so the transport turn and the objective agree.
+        decision.failure_code = Some(TECHNICAL_RECOVERY_EXHAUSTED.into());
+        decision.recovery_owner = None;
+        decision.remediation_id = None;
+        decision.next_observation_at = None;
+        decision.next_action_authorized = false;
+        decision.requires_user_action = true;
+        Ok(decision)
+    }
+
     async fn apply_decision_inner(
         &self,
         expected_revision: i64,
@@ -2424,6 +2727,11 @@ impl ObjectiveStore {
                 current.revision
             );
         }
+        decision.validate(&current)?;
+        // Runs before the transaction opens: a deterministic pool may allow a
+        // single connection, and asking for a second one mid-transaction
+        // deadlocks recovery into a timeout.
+        let decision = self.bound_system_recovery(decision).await?;
         decision.validate(&current)?;
         let now = Utc::now().timestamp_millis();
         let process_instance = current_process_instance();
@@ -2446,6 +2754,17 @@ impl ObjectiveStore {
         .await?;
         let has_chat_cancel_projection = has_chat_cancel_projection == 2;
         if decision.decision_type != DecisionType::Cancelled && has_chat_cancel_projection {
+            let pending_session_cancellations: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM chat_session_cancel_intents stop
+                 JOIN objectives objective ON objective.session_id=stop.session_id
+                 WHERE stop.status='requested' AND objective.id=?",
+            )
+            .bind(&decision.objective_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if pending_session_cancellations > 0 {
+                bail!("objective decision fenced by durable session cancellation");
+            }
             let pending_chat_cancellations: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*)
                  FROM chat_run_controls control
@@ -3077,6 +3396,88 @@ impl ObjectiveStore {
         }
 
         if decision.status == ObjectiveStatus::Cancelled {
+            let turn_projection_columns: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('chat_turn_state')
+                 WHERE name IN ('revision','phase','status','recent_activity_kind',
+                                'recent_activity_label','waiting_reason','updated_at',
+                                'completed_at','terminal_reason','objective_id')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if turn_projection_columns == 10 {
+                sqlx::query(
+                    "UPDATE chat_turn_state
+                     SET revision=revision+1, phase='cancelled', status='cancelled',
+                         recent_activity_kind='cancelled', recent_activity_label='已停止',
+                         waiting_reason=NULL, updated_at=?, completed_at=?,
+                         terminal_reason='cancelled'
+                     WHERE objective_id=?",
+                )
+                .bind(now)
+                .bind(now)
+                .bind(&decision.objective_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        if decision.status == ObjectiveStatus::WaitingCoreInput
+            && decision.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        {
+            // Exhaustion is one state transition, not an Objective write
+            // followed by best-effort projections. Otherwise a crash can leave
+            // a chat turn recovering forever or a pending task redispatchable.
+            let turn_projection_columns: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('chat_turn_state')
+                 WHERE name IN ('revision','phase','status','recent_activity_kind',
+                                'recent_activity_label','waiting_reason','updated_at',
+                                'completed_at','terminal_reason','objective_id')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if turn_projection_columns == 10 {
+                sqlx::query(
+                    "UPDATE chat_turn_state
+                     SET revision=revision+1, phase='waiting', status='waiting_core_input',
+                         recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
+                         updated_at=?, completed_at=?, terminal_reason=?
+                     WHERE objective_id=?",
+                )
+                .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+                .bind("系统多轮自动恢复没有进展，已停止并把当前结论交还给你")
+                .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+                .bind(now)
+                .bind(now)
+                .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+                .bind(&decision.objective_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let has_task_runs: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='task_runs'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_task_runs == 1 {
+                let completed_at = Utc::now().to_rfc3339();
+                sqlx::query(
+                    "UPDATE task_runs
+                     SET status='failed', completed_at=?, error=?,
+                         recovery_state=NULL, next_observation_at=NULL,
+                         owner_pid=NULL, owner_start_token=NULL
+                     WHERE objective_id=? AND status IN ('pending','running')",
+                )
+                .bind(completed_at)
+                .bind("系统多轮自动恢复没有进展（technical_recovery_exhausted），已停止自动恢复。")
+                .bind(&decision.objective_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        if decision.status == ObjectiveStatus::Cancelled {
             let cancelled_run = sqlx::query(
                 "UPDATE delivery_runs
                  SET status='cancelled', next_action=NULL, next_action_authorized=0,
@@ -3429,6 +3830,11 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .await?;
     sqlx::raw_sql(include_str!(
         "../../migrations/0015_tool_recovery_contracts.sql"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0016_chat_session_cancel_intents.sql"
     ))
     .execute(pool)
     .await?;
@@ -6626,6 +7032,434 @@ mod tests {
         assert_eq!(
             store.get(&cancelled.id).await.unwrap().unwrap().status,
             ObjectiveStatus::Cancelled
+        );
+    }
+
+    async fn recovery_ceiling_objective(pool: &SqlitePool, id: &str) -> ObjectiveSnapshot {
+        ObjectiveStore::new(pool.clone())
+            .create(CreateObjective {
+                id: id.into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some(format!("session-{id}")),
+                root_turn_id: Some(format!("turn-{id}")),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "informational_answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn claimable_remediations(pool: &SqlitePool, objective_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=? AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(objective_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// How many durable recovery attempts the system actually bought. Each one
+    /// is a real re-run of the model, so this is the number the ceiling exists
+    /// to bound.
+    async fn total_remediations(pool: &SqlitePool, objective_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations WHERE objective_id=?")
+            .bind(objective_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Drive one system-owned technical failure round and return the durable
+    /// objective it settled into.
+    async fn route_technical_failure(
+        store: &ObjectiveStore,
+        current: &ObjectiveSnapshot,
+        failure_code: &str,
+        failure_signature: &str,
+    ) -> ObjectiveSnapshot {
+        let decision = DecisionRouter::route(
+            current,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: failure_code.into(),
+                failure_signature: failure_signature.into(),
+                next_observation_at: Utc::now().timestamp_millis() - 1,
+                resume_cursor: current.root_turn_id.clone(),
+            },
+        )
+        .unwrap();
+        let waiting = store
+            .apply_decision(current.revision, decision)
+            .await
+            .unwrap();
+        if waiting.status == ObjectiveStatus::WaitingSystem {
+            let claims = store
+                .claim_due_remediations("recovery-ceiling-test", 1, 30_000)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1, "one queued recovery round must be claimed");
+        }
+        store.get(&waiting.id).await.unwrap().unwrap()
+    }
+
+    fn assert_returned_to_user(objective: &ObjectiveSnapshot) {
+        assert_eq!(
+            objective.status,
+            ObjectiveStatus::WaitingCoreInput,
+            "exhausted recovery must leave the system-owned loop"
+        );
+        assert_eq!(objective.decision_type, DecisionType::CoreInputRequired);
+        assert!(
+            objective.requires_user_action,
+            "an exhausted objective is the user's call, not another observation"
+        );
+        assert_eq!(
+            objective.failure_code.as_deref(),
+            Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        );
+        assert_eq!(
+            objective.request_key.as_deref(),
+            Some(format!("{TECHNICAL_RECOVERY_EXHAUSTED}:{}", objective.id).as_str()),
+            "the handback needs a stable request key the user can answer against"
+        );
+        assert!(
+            objective.recovery_owner.is_none() && objective.remediation_id.is_none(),
+            "no owner may keep observing an exhausted objective"
+        );
+        assert!(
+            objective.next_observation_at.is_none(),
+            "an exhausted objective must not schedule another observation"
+        );
+    }
+
+    /// The 2026-08-13 incident: a completion-evidence rejection re-queued a
+    /// durable remediation every ~13s forever, each round paying for a real
+    /// model call that returned the very same answer.
+    #[tokio::test]
+    async fn repeated_failure_signature_exhausts_system_recovery_and_returns_to_user() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-recovery-ceiling").await;
+        let signature = format!("{}:Finished:none", current.id);
+
+        let mut queued_rounds = 0_i64;
+        for _ in 0..(MAX_SIGNATURE_RECOVERY_ATTEMPTS + 4) {
+            if current.requires_user_action {
+                break;
+            }
+            current = route_technical_failure(
+                &store,
+                &current,
+                "completion_evidence_incomplete",
+                &signature,
+            )
+            .await;
+            if current.status == ObjectiveStatus::WaitingSystem {
+                queued_rounds += 1;
+            }
+        }
+
+        assert_eq!(
+            queued_rounds, MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+            "system recovery must stop re-queueing at the global ceiling"
+        );
+        assert_returned_to_user(&current);
+        assert_eq!(
+            claimable_remediations(&pool, &current.id).await,
+            0,
+            "the supervisor must have nothing left to claim"
+        );
+    }
+
+    /// Adapter failures defer the same row instead of creating a new one. The
+    /// ceiling must count those real claims or a single remediation can loop
+    /// forever across process restarts.
+    #[tokio::test]
+    async fn same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-same-row-reclaim").await;
+        let waiting = route_technical_failure(
+            &store,
+            &current,
+            "adapter_error",
+            "sha256:same-row-reclaim",
+        )
+        .await;
+        let remediation_id = waiting.remediation_id.clone().unwrap();
+
+        // route_technical_failure bought claim #1. Repeated adapter failures
+        // keep deferring exactly that row.
+        for expected_claim in 1..MAX_SIGNATURE_RECOVERY_ATTEMPTS {
+            store
+                .defer_claimed_remediation(
+                    &waiting.id,
+                    &remediation_id,
+                    "recovery-ceiling-test",
+                    expected_claim,
+                    1_000,
+                )
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE objective_remediations SET next_observation_at=? WHERE id=?",
+            )
+            .bind(Utc::now().timestamp_millis() - 1)
+            .bind(&remediation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let claim = store
+                .claim_due_remediations("recovery-ceiling-test", 1, 30_000)
+                .await
+                .unwrap();
+            assert_eq!(claim.len(), 1);
+            assert_eq!(claim[0].claim_epoch, expected_claim + 1);
+        }
+
+        store
+            .defer_claimed_remediation(
+                &waiting.id,
+                &remediation_id,
+                "recovery-ceiling-test",
+                MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+                1_000,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objective_remediations SET next_observation_at=? WHERE id=?")
+            .bind(Utc::now().timestamp_millis() - 1)
+            .bind(&remediation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(store
+            .claim_due_remediations("replacement-process", 1, 30_000)
+            .await
+            .unwrap()
+            .is_empty());
+        let exhausted = store.get(&waiting.id).await.unwrap().unwrap();
+        assert_returned_to_user(&exhausted);
+        assert_eq!(claimable_remediations(&pool, &waiting.id).await, 0);
+    }
+
+    /// A changed failure code must not buy another full budget: the tally is a
+    /// lifetime per-signature count, not a consecutive streak that churn resets.
+    #[tokio::test]
+    async fn alternating_failure_codes_cannot_reset_the_recovery_ceiling() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-recovery-churn").await;
+        let signatures = [
+            format!("{}:Finished:none", current.id),
+            format!("{}:FailedInternal:none", current.id),
+        ];
+
+        let mut rounds = 0_usize;
+        while !current.requires_user_action && rounds < 64 {
+            let index = rounds % signatures.len();
+            current = route_technical_failure(
+                &store,
+                &current,
+                if index == 0 {
+                    "completion_evidence_incomplete"
+                } else {
+                    "failed_internal"
+                },
+                &signatures[index],
+            )
+            .await;
+            rounds += 1;
+        }
+
+        assert_returned_to_user(&current);
+        assert!(
+            (rounds as i64) <= MAX_SIGNATURE_RECOVERY_ATTEMPTS * signatures.len() as i64 + 1,
+            "alternating two signatures bought {rounds} rounds; the per-signature \
+             tally must survive an intervening different failure code"
+        );
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 0);
+    }
+
+    /// Signature churn (a failure signature that embeds varying error text)
+    /// must still terminate — otherwise the ceiling is trivially bypassed.
+    #[tokio::test]
+    async fn churning_failure_signatures_still_reach_the_objective_recovery_ceiling() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-recovery-unique").await;
+
+        let mut rounds = 0_i64;
+        while !current.requires_user_action && rounds < MAX_OBJECTIVE_RECOVERY_ATTEMPTS * 4 {
+            current = route_technical_failure(
+                &store,
+                &current,
+                "agent_loop_error",
+                &format!("sha256:unique-{rounds}"),
+            )
+            .await;
+            rounds += 1;
+        }
+
+        assert_returned_to_user(&current);
+        assert_eq!(
+            total_remediations(&pool, &current.id).await,
+            MAX_OBJECTIVE_RECOVERY_ATTEMPTS,
+            "a never-repeating signature must still hit the per-objective backstop"
+        );
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 0);
+    }
+
+    /// Requirement 3 verified against the real routing path, not a hand-built
+    /// envelope: a `Finished` run whose evidence never satisfies the objective
+    /// kind produces the identical signature every round, so re-running the
+    /// same prompt for the same answer is no progress and must count.
+    #[tokio::test]
+    async fn completion_evidence_gate_rejection_counts_as_no_progress() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = store
+            .create(CreateObjective {
+                id: "objective-evidence-gate-loop".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-evidence-gate-loop".into()),
+                root_turn_id: Some("turn-evidence-gate-loop".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        // The model answers every round; the gate rejects every round because
+        // no ChangeSet/PostChangeValidation evidence ever appears.
+        let rerun = || RunOutcome {
+            final_text: "同一段答案".into(),
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 12,
+            output_tokens: 34,
+            stop_reason: StopReason::Finished,
+        };
+
+        let mut signatures = std::collections::HashSet::new();
+        let mut rounds = 0_i64;
+        while !current.requires_user_action && rounds < MAX_SIGNATURE_RECOVERY_ATTEMPTS * 4 {
+            let decision = decision_for_run_outcome(&current, &rerun()).unwrap();
+            assert_eq!(
+                decision.failure_code.as_deref(),
+                Some("completion_evidence_incomplete")
+            );
+            signatures.insert(decision.failure_signature.clone().unwrap());
+            current = store
+                .apply_decision(current.revision, decision)
+                .await
+                .unwrap();
+            if current.status == ObjectiveStatus::WaitingSystem {
+                sqlx::query(
+                    "UPDATE objective_remediations SET next_observation_at=? WHERE id=?",
+                )
+                .bind(Utc::now().timestamp_millis() - 1)
+                .bind(current.remediation_id.as_deref().unwrap())
+                .execute(&pool)
+                .await
+                .unwrap();
+                let claims = store
+                    .claim_due_remediations("evidence-gate-test", 1, 30_000)
+                    .await
+                    .unwrap();
+                assert_eq!(claims.len(), 1);
+                current = store.get(&current.id).await.unwrap().unwrap();
+            }
+            rounds += 1;
+        }
+
+        assert_eq!(
+            signatures.len(),
+            1,
+            "re-running the same prompt for the same answer must keep one signature"
+        );
+        assert_eq!(
+            total_remediations(&pool, &current.id).await,
+            MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+            "the evidence gate may only buy the bounded number of model re-runs"
+        );
+        assert_returned_to_user(&current);
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 0);
+    }
+
+    /// The ceiling must never swallow a real capability restoration: that is
+    /// the user changing the world, not the system spinning on itself.
+    #[tokio::test]
+    async fn restored_capability_is_never_terminalized_by_the_recovery_ceiling() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-recovery-restored").await;
+
+        for _ in 0..(MAX_OBJECTIVE_RECOVERY_ATTEMPTS + 8) {
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::CapabilityRestored {
+                    domain: RecoveryDomain::Auth,
+                    reason: "authorization_restored".into(),
+                    next_observation_at: Utc::now().timestamp_millis(),
+                    resume_cursor: current.root_turn_id.clone(),
+                },
+            )
+            .unwrap();
+            current = store
+                .apply_decision(current.revision, decision)
+                .await
+                .unwrap();
+            assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+            assert!(!current.requires_user_action);
+        }
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 1);
+    }
+
+    /// Permission authorization writes its remediation directly, with no
+    /// decision row to join against. A user clicking Allow is progress and must
+    /// not quietly spend the system's recovery budget.
+    #[tokio::test]
+    async fn authorized_permission_remediations_do_not_spend_the_recovery_budget() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-recovery-permission").await;
+        let now = Utc::now().timestamp_millis();
+        for index in 0..(MAX_OBJECTIVE_RECOVERY_ATTEMPTS + 4) {
+            sqlx::query(
+                "INSERT INTO objective_remediations
+                 (id, objective_id, domain, status, failure_code, failure_signature,
+                  strategy, approach_index, attempt_index, next_observation_at,
+                  created_at, updated_at)
+                 VALUES (?, ?, 'permission', 'superseded', 'authorization_restored', ?,
+                         'resume_authorized_action', 0, 0, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&current.id)
+            .bind(format!("permission:intent-{index}:authorized"))
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let queued = route_technical_failure(
+            &store,
+            &current,
+            "completion_evidence_incomplete",
+            &format!("{}:Finished:none", current.id),
+        )
+        .await;
+        assert_eq!(
+            queued.status,
+            ObjectiveStatus::WaitingSystem,
+            "user-authorized permissions must not exhaust system recovery"
         );
     }
 }

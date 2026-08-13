@@ -147,6 +147,26 @@ export function WorkspacePage({
   } = useChatStore(activeRuntime);
   const isAnonymous = activeSession?.kind === "anonymous";
   const persistedRunActive = useTasksStore((state) => state.running[sessionId] ?? false);
+  const [durableTurnActive, setDurableTurnActive] = useState(false);
+  useEffect(() => {
+    setDurableTurnActive(false);
+    if (activeDraft) {
+      return;
+    }
+    if (streaming) return;
+    let current = true;
+    void (async () => {
+      try {
+        const running = await invoke<boolean>("is_chat_running", { sessionId });
+        if (current) setDurableTurnActive(running);
+      } catch {
+        // Hydrated turn activity remains the conservative fallback.
+      }
+    })();
+    return () => {
+      current = false;
+    };
+  }, [activeDraft, sessionId, streaming]);
   const [pendingInsert, setPendingInsert] = useState<string | undefined>(undefined);
   const [deliveryState, setDeliveryState] = useState<WorkspaceDeliveryState>({
     snapshot: null,
@@ -207,12 +227,14 @@ export function WorkspacePage({
       messages.some((message) => {
         const status = message.turnActivity?.objectiveStatus;
         return Boolean(
-          status && !["completed", "cancelled", "legacy_orphan"].includes(status),
+          status && !["waiting_core_input", "completed", "cancelled", "legacy_orphan"].includes(status),
         );
       }),
     [messages],
   );
-  const turnInFlight = activeDraft ? false : streaming || systemHoldsTurn;
+  const turnInFlight = activeDraft
+    ? false
+    : streaming || durableTurnActive || systemHoldsTurn;
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
     if (!trimmed || activeDraft) return;
@@ -857,7 +879,11 @@ export function WorkspacePage({
                 initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
                 onSend={(t) => void sendOrQueue(t)}
                 onGuide={guideNextStep}
-                onCancel={() => cancelStream()}
+                onCancel={async () => {
+                  if (await cancelStream(sessionId)) {
+                    setDurableTurnActive(false);
+                  }
+                }}
                 streaming={turnInFlight}
                 guidanceActive={steerActive}
                 disabled={!activeSession && !activeDraft}

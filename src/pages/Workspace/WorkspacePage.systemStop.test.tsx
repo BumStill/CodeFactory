@@ -4,7 +4,8 @@
 // to "发送" and the only visible affordance started ANOTHER turn — so the
 // 2026-08-13 sessions could not be ended at all, and resumed on every restart.
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 type TurnActivity = { objectiveStatus?: string };
 type RuntimeMessage = { id: string; role: string; content: string; createdAt: number; turnActivity?: TurnActivity };
@@ -55,6 +56,7 @@ const chatState = {
   deleteSession: vi.fn(),
   loadSessions: vi.fn(),
 };
+const invokeMock = vi.hoisted(() => vi.fn(async () => false));
 
 vi.mock("../../stores/chat", () => ({
   useChatStore: Object.assign(
@@ -103,8 +105,10 @@ vi.mock("../../components/ExecutionStream", () => ({ ExecutionStream: () => null
 vi.mock("../../components/MessageList", () => ({ MessageList: () => <div>会话</div> }));
 vi.mock("../../components/MessageInput", () => ({
   // Surface the prop that decides whether the composer offers stop or send.
-  MessageInput: ({ streaming }: { streaming: boolean }) => (
-    <div data-testid="composer-mode">{streaming ? "停止后续生成" : "发送"}</div>
+  MessageInput: ({ streaming, onCancel }: { streaming: boolean; onCancel: () => void }) => (
+    <button data-testid="composer-mode" onClick={onCancel}>
+      {streaming ? "停止后续生成" : "发送"}
+    </button>
   ),
 }));
 vi.mock("../../components/ContextUsageBar", () => ({ ContextUsageBar: () => null }));
@@ -112,7 +116,7 @@ vi.mock("../../components/PermissionDialog", () => ({ PermissionDialog: () => nu
 vi.mock("../../components/WorkspaceDeliveryStatus", () => ({ WorkspaceDeliveryStatus: () => null }));
 vi.mock("../../lib/tauri", async (orig) => ({
   ...((await orig()) as object),
-  invoke: vi.fn(async () => null),
+  invoke: invokeMock,
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
@@ -170,5 +174,29 @@ describe("system-owned turns stay stoppable", () => {
     renderWorkspace();
 
     expect(screen.getByTestId("composer-mode")).toHaveTextContent("发送");
+  });
+
+  it("uses the backend session summary when the live objective is outside the loaded page", async () => {
+    runtime.streaming = false;
+    runtime.messages = [assistantMessage(undefined)];
+    invokeMock.mockResolvedValueOnce(true);
+
+    renderWorkspace();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("composer-mode")).toHaveTextContent("停止后续生成"),
+    );
+  });
+
+  it("targets the rendered session explicitly when stop is clicked", async () => {
+    const user = userEvent.setup();
+    runtime.streaming = false;
+    runtime.messages = [assistantMessage("waiting_system")];
+    chatState.cancelStream.mockResolvedValueOnce(true);
+
+    renderWorkspace();
+    await user.click(screen.getByTestId("composer-mode"));
+
+    expect(chatState.cancelStream).toHaveBeenCalledWith("session-1");
   });
 });

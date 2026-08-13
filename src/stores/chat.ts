@@ -186,7 +186,8 @@ interface ChatStore {
   loadModels: (endpoint: string) => Promise<void>;
   setModel: (modelId: string) => void;
   /** Stop the in-flight turn for `sessionId` (default: the active session). */
-  cancelStream: (sessionId?: string) => Promise<void>;
+  /** Returns true only after the backend durably settled the whole session. */
+  cancelStream: (sessionId?: string) => Promise<boolean>;
   respondPermission: (
     allow: boolean,
     opts?: { grantFullAccess?: boolean },
@@ -979,7 +980,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   cancelStream: async (sessionId) => {
     const id = sessionId ?? get().activeSession?.id;
-    if (!id) return;
+    if (!id) return false;
     // Tell the backend to stop the in-flight turn — otherwise the agent keeps
     // looping (burning tokens) after the UI already says "stopped". Cooperative:
     // it stops between rounds, never mid tool-call. Scoped to THIS chat session
@@ -988,6 +989,44 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // emits turn_settled. Transport-level done/error is not durable settlement.
     try {
       await invoke("cancel_chat", { sessionId: id });
+      set((s) => {
+        const prev = s.runtime[id];
+        if (!prev) return {};
+        return {
+          runtime: {
+            ...s.runtime,
+            [id]: {
+              ...prev,
+              // A queued user message is released only by the authoritative
+              // turn_settled event. Historical recovered turns have no live
+              // stream/queue, so they return to Send immediately here.
+              streaming: prev.streaming && prev.queue.length > 0,
+              pendingPermission: null,
+              messages: prev.messages.map((message) => {
+                const activity = message.turnActivity;
+                const status = activity?.objectiveStatus;
+                if (
+                  !activity ||
+                  !status ||
+                  ["completed", "cancelled", "legacy_orphan"].includes(status)
+                ) {
+                  return message;
+                }
+                return {
+                  ...message,
+                  turnActivity: {
+                    ...activity,
+                    objectiveStatus: "cancelled",
+                    terminalReason: "explicit_cancel",
+                  },
+                };
+              }),
+              revision: prev.revision + 1,
+            },
+          },
+        };
+      });
+      return true;
     } catch {
       const detail =
         "停止请求未送达；当前运行仍在继续，系统已保留原运行状态。请稍后再次停止。";
@@ -1023,6 +1062,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           },
         };
       });
+      return false;
     }
   },
 

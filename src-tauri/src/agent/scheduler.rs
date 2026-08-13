@@ -339,6 +339,14 @@ async fn handoff_task_to_system_recovery(
     .map_err(|apply_error| {
         AppError::Other(format!("persist task recovery decision: {apply_error:#}"))
     })?;
+    // The store bounds system-owned recovery. Once it hands the objective back
+    // to the user, projecting the task as `waiting_system` would re-arm the
+    // scheduler and rebuild the very loop the ceiling just broke.
+    if waiting.requires_user_action {
+        // ObjectiveStore settles the task projection in the same transaction
+        // as exhaustion. A second write here would reopen a crash window.
+        return Ok(waiting);
+    }
     let projected =
         tasks::mark_task_waiting_system(pool, task_id, &waiting.id, error, next_observation_at)
             .await?;
@@ -1833,6 +1841,101 @@ mod tests {
         test_git(&repo, &["add", "state.txt"]);
         test_git(&repo, &["commit", "-m", "initial"]);
         (sandbox, repo)
+    }
+
+    /// The task-domain twin of the chat recovery loop: a task that keeps
+    /// failing the same way must stop being re-armed as `waiting_system` and
+    /// settle where the user can see it. Re-arming the scheduler after the
+    /// store has already handed the objective back rebuilds the same spin.
+    #[tokio::test]
+    async fn exhausted_task_recovery_settles_the_task_instead_of_rearming_the_scheduler() {
+        use crate::agent::objective::MAX_SIGNATURE_RECOVERY_ATTEMPTS;
+
+        let pool = task_objective_pool().await;
+        let task = task_row("task-recovery-ceiling", "running");
+        tasks::insert_task(&pool, &task).await.unwrap();
+        let mut objective = objective_for_task(&pool, &task).await.unwrap();
+
+        let mut handoffs = 0_i64;
+        while !objective.requires_user_action && handoffs < MAX_SIGNATURE_RECOVERY_ATTEMPTS * 4 {
+            objective = handoff_task_to_system_recovery(
+                &pool,
+                &objective,
+                &task.id,
+                "completion_evidence_incomplete",
+                "completion arbiter returned nonterminal state",
+                None,
+            )
+            .await
+            .unwrap();
+            handoffs += 1;
+            if objective.requires_user_action {
+                break;
+            }
+            sqlx::query(
+                "UPDATE objective_remediations SET next_observation_at=?
+                 WHERE id=?",
+            )
+            .bind(Utc::now().timestamp_millis() - 1)
+            .bind(objective.remediation_id.as_deref().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+            let claims = ObjectiveStore::new(pool.clone())
+                .claim_due_remediations("task-ceiling-test", 1, 30_000)
+                .await
+                .unwrap();
+            assert_eq!(claims.len(), 1, "each handoff must buy one real task retry");
+            ObjectiveStore::new(pool.clone())
+                .defer_claimed_remediation(
+                    &objective.id,
+                    &claims[0].remediation_id,
+                    "task-ceiling-test",
+                    claims[0].claim_epoch,
+                    1_000,
+                )
+                .await
+                .unwrap();
+            // Re-arm the row the way the scheduler would before the next
+            // attempt, so only the ceiling can end this loop.
+            sqlx::query("UPDATE task_runs SET status='running' WHERE id=?")
+                .bind(&task.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            objective.requires_user_action,
+            "task recovery must reach the ceiling and hand back to the user"
+        );
+        let remediations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations WHERE objective_id=?")
+                .bind(&objective.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remediations, MAX_SIGNATURE_RECOVERY_ATTEMPTS);
+
+        let (status, recovery_state, error): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, recovery_state, error FROM task_runs WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "failed",
+            "an exhausted task must settle, not sit pending for another dispatch"
+        );
+        assert_ne!(
+            recovery_state.as_deref(),
+            Some("waiting_system"),
+            "re-arming waiting_system would restart the very loop the ceiling broke"
+        );
+        assert!(
+            error.unwrap_or_default().contains("已停止自动恢复"),
+            "the settled task must say why the system gave up"
+        );
     }
 
     fn mutation_permit_for_claim(
