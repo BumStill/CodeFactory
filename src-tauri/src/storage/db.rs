@@ -1585,7 +1585,9 @@ pub async fn close_and_release_files(pool: SqlitePool) {
 
     let deadline = std::time::Instant::now() + BUDGET;
     let mut backoff = FIRST_BACKOFF;
-    let mut last_error: Option<String> = None;
+    // Assigned by every branch that reaches the deadline warning below; the
+    // early returns leave the loop before it is ever read.
+    let mut last_error: Option<String>;
 
     loop {
         // A database the caller already deleted, or one whose sidecars are
