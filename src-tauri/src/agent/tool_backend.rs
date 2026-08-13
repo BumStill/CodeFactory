@@ -310,46 +310,151 @@ fn bash_has_explicit_external_mutation(command: &str) -> bool {
         || command.contains(" -T "))
 }
 
-fn bash_is_explicit_read_only(command: &str) -> bool {
-    let lower = command.trim_start().to_ascii_lowercase();
-    if lower.contains(['\n', ';', '&', '>']) || lower.contains("| tee ") {
+const READ_ONLY_BASH_VERBS: &[&str] = &[
+    "cd",
+    "echo",
+    "pwd",
+    "ls",
+    "rg",
+    "grep",
+    "find",
+    "cat",
+    "head",
+    "tail",
+    "sed -n",
+    "stat",
+    "wc",
+    "du",
+    "df",
+    "which",
+    "command -v",
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git rev-parse",
+    "git ls-files",
+    "git branch --show-current",
+    "kubectl get",
+    "kubectl describe",
+    "kubectl logs",
+    "kubectl version",
+];
+
+/// Redirects that discard output cannot mutate the workspace, and `2>&1` only
+/// merges two streams. Strip them before segmentation so they neither read as
+/// a write nor split a pipeline at their `&`. Longer patterns come first: a
+/// leading `>/dev/null` rewrite would otherwise strand the `2` of `2>/dev/null`.
+fn strip_discarded_redirects(command: &str) -> String {
+    let mut stripped = command.to_string();
+    for pattern in [
+        "2>&1",
+        "&>/dev/null",
+        "&> /dev/null",
+        "2>/dev/null",
+        "2> /dev/null",
+        "1>/dev/null",
+        "1> /dev/null",
+        ">/dev/null",
+        "> /dev/null",
+    ] {
+        stripped = stripped.replace(pattern, " ");
+    }
+    stripped
+}
+
+/// A trailing `&` backgrounds the command, so its completion is unobservable
+/// no matter how read-only the verb looks. `&&` is a sequencer, not a fork.
+fn has_background_operator(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'&' {
+            if bytes.get(index + 1) == Some(&b'&') {
+                index += 2;
+                continue;
+            }
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn split_shell_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\n' | ';' => segments.push(std::mem::take(&mut current)),
+            '&' | '|' => {
+                if characters.peek() == Some(&character) {
+                    characters.next();
+                }
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.push(character),
+        }
+    }
+    segments.push(current);
+    segments.retain(|segment| !segment.trim().is_empty());
+    segments
+}
+
+/// Some whitelisted verbs carry flags that turn them into writers. `find` can
+/// delete or exec, and `sed -n` still edits in place under `-i`. Keep these
+/// per-verb: a blanket `-i` denylist would fence the very common `grep -i`.
+fn read_only_verb_flags_are_safe(segment: &str) -> bool {
+    if segment.starts_with("find") {
+        return ![
+            "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint",
+        ]
+        .iter()
+        .any(|flag| segment.contains(flag));
+    }
+    if segment.starts_with("sed") {
+        return !segment.contains("-i");
+    }
+    true
+}
+
+fn bash_segment_is_read_only(segment: &str) -> bool {
+    // A redirect that survived stripping writes somewhere real.
+    if segment.contains('>') || segment.contains('&') {
         return false;
     }
-    [
-        "pwd",
-        "ls",
-        "rg",
-        "grep",
-        "find",
-        "cat",
-        "head",
-        "tail",
-        "sed -n",
-        "stat",
-        "wc",
-        "du",
-        "df",
-        "which",
-        "command -v",
-        "git status",
-        "git diff",
-        "git log",
-        "git show",
-        "git rev-parse",
-        "git ls-files",
-        "git branch --show-current",
-        "kubectl get",
-        "kubectl describe",
-        "kubectl logs",
-        "kubectl version",
-    ]
-    .iter()
-    .any(|command_name| {
-        lower == *command_name
+    let lower = segment.trim().to_ascii_lowercase();
+    READ_ONLY_BASH_VERBS.iter().any(|verb| {
+        (lower == *verb
             || lower
-                .strip_prefix(command_name)
-                .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+                .strip_prefix(verb)
+                .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace)))
+            && read_only_verb_flags_are_safe(&lower)
     })
+}
+
+/// Agents routinely probe a repository with compound read-only pipelines such
+/// as `cd repo && ls src 2>/dev/null | head -50`. Rejecting every command that
+/// merely contains `&`, `>` or `;` pushed those probes into the mutation
+/// branch, where bash can never supply the observation contract the receipt
+/// gate demands, so the tool call settled as `Waiting` and stranded the turn.
+/// Segment the command instead and keep it read-only only when *every* segment
+/// is an explicitly read-only verb; anything unrecognized still fences it.
+fn bash_is_explicit_read_only(command: &str) -> bool {
+    // Command substitution can hide any verb inside a read-only looking shell.
+    if command.contains('`') || command.contains("$(") {
+        return false;
+    }
+    let normalized = strip_discarded_redirects(command);
+    if has_background_operator(&normalized) {
+        return false;
+    }
+    let segments = split_shell_segments(&normalized);
+    !segments.is_empty()
+        && segments
+            .iter()
+            .all(|segment| bash_segment_is_read_only(segment))
 }
 
 /// Completion evidence and durable side-effect admission answer different
@@ -2306,6 +2411,58 @@ mod tests {
                 .1,
             ToolKind::Mutation
         );
+    }
+
+    /// The 2026-08-13 freeze started with `cd repo && ls src 2>/dev/null |
+    /// head -50` — a wholly read-only probe. The old whitelist rejected any
+    /// command containing `&`, `>` or `;`, so the probe fell through to the
+    /// mutation branch, demanded an observation contract bash cannot supply,
+    /// and settled `Waiting` with the rest of the batch cancelled.
+    #[test]
+    fn compound_read_only_pipelines_never_demand_an_observation_contract() {
+        for command in [
+            "cd /repo && ls src",
+            "cd /repo && ls src && echo \"---\" && ls src/components 2>/dev/null | head -50",
+            "ls src 2>/dev/null | head -50",
+            "git status; git diff",
+            "rg pattern src | head -20",
+            "cat notes.txt 2>&1 | wc -l",
+            "grep -i needle haystack.txt",
+        ] {
+            assert!(
+                bash_is_explicit_read_only(command),
+                "{command} only reads and must not be fenced behind a receipt"
+            );
+        }
+    }
+
+    /// Widening the whitelist to pipelines must not widen it to writers: one
+    /// non-read-only segment fences the whole command. `find -exec` and
+    /// `sed -i` matter most — segmentation on `;` would otherwise hand
+    /// `find . -exec rm {} \;` a read-only verdict the old check refused.
+    #[test]
+    fn one_mutating_segment_fences_the_whole_command() {
+        for command in [
+            "ls src > out.txt",
+            "ls src >> out.txt",
+            "cd /repo && rm -rf build",
+            "ls | tee out.txt",
+            "ls | xargs rm",
+            "echo hi > file",
+            "find . -name '*.tmp' -delete",
+            "find . -type f -exec rm {} \\;",
+            "sed -n -i.bak 's/a/b/' file",
+            "ls $(rm -rf /tmp/x)",
+            "ls `whoami`",
+            "ls &",
+            "npm run build",
+            "curl -X POST https://example.com",
+        ] {
+            assert!(
+                !bash_is_explicit_read_only(command),
+                "{command} can mutate external state and must stay fenced"
+            );
+        }
     }
 
     #[tokio::test]

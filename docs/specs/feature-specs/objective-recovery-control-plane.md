@@ -41,6 +41,8 @@
 | CF-ORC-R30 | fault injection 覆盖 permission、auth、429/503、tool timeout/panic、task exhaustion、context、process restart、remote unknown、CI failure、browser/terminal 与 update wait | cross-domain E2E matrix |
 | CF-ORC-R31 | 只有精确正式安装包重走成功与边界路径，DB/side-effect 证据与 PR/CI/merge/release/live 一致，且 24 小时 KPI 达标，才允许结论为“满足” | packaged App evidence pack + production gate |
 | CF-ORC-R32 | 本原则/规格进入 Feature Specs 索引和可执行治理规则；CI 拒绝未标 superseded 的技术 retry/continue/resend 契约以及缺 Req→test 映射 | governance validator negative fixtures |
+| CF-ORC-R33 | 每个 fence 资源必须有明确的释放责任人和释放时机，不得只靠"下一次准入顺手关闭"。回合结束时必须释放该回合证据已确定的 provider episode（无未结副作用且所有 attempt 已终态）；`prepared`/`in_flight`/`streaming`/`unknown` 或存在未结副作用时保持关闭，交由 supervisor 观察 | 回合结算释放测试 + 不确定证据保持 fenced 的负例 |
+| CF-ORC-R34 | 只读 bash 探查（含 `&&`/`;`/管道/丢弃型重定向的复合命令）不得被判定为需要观察契约的外部变更；判定按 segment 逐段进行，任一段不在只读白名单、含真实重定向、含命令替换或后台 `&` 则整条命令继续 fenced | 复合只读命令与逐段 fence 的双向单测 |
 
 ## Decision Envelope
 
