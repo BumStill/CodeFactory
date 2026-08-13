@@ -344,6 +344,129 @@ async fn partial_and_unknown_attempts_are_observe_only() {
     );
 }
 
+/// The 2026-08-13 freeze. A turn committed its provider response and then
+/// ended with its tool batch cancelled. `commit_response` keeps the episode
+/// live on purpose so the same fenced owner can run another model round, but
+/// nothing closed it when the turn itself ended. Every later admission — each
+/// carrying a fresh Objective revision minted by system recovery — then found a
+/// live prior episode that `replay_safe` can never supersede once
+/// `output_started` is 1, so recovery retried that identical refusal every 10s
+/// until the app quit.
+#[tokio::test]
+async fn a_finished_turn_releases_its_episode_so_the_next_revision_is_admitted() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(
+            &permit,
+            &attempt("attempt-committed", "episode-1", "a"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "attempt-committed", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .commit_response(
+            &permit,
+            "attempt-committed",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "answer",
+            false,
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .settle_finished_turn_episodes("session-1", "turn-1", NOW + 4)
+            .await
+            .unwrap(),
+        1,
+        "a turn that committed its response must release its provider episode"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM provider_route_episodes WHERE id='episode-1'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "completed"
+    );
+
+    // System recovery mints a new Objective revision, which derives a new
+    // episode id. Before the release this admission bailed forever.
+    sqlx::query("UPDATE objectives SET revision=5 WHERE id='objective-opaque'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let resumed = ProviderOwnerPermit::remediation(
+        "objective-opaque",
+        5,
+        "binding-1",
+        3,
+        "remediation-1",
+        "provider-owner",
+        7,
+    );
+    let mut next = episode();
+    next.id = "episode-2".into();
+    assert!(
+        matches!(
+            store.open_episode(&resumed, &next, NOW + 5).await.unwrap(),
+            ProviderMutation::Applied(_)
+        ),
+        "recovery must be admitted once the finished turn released its episode"
+    );
+}
+
+/// Releasing a finished turn must not release uncertain evidence. An attempt
+/// still in flight may have reached the provider, so the fence stays shut and
+/// the supervisor keeps its observation duty.
+#[tokio::test]
+async fn an_in_flight_attempt_keeps_its_episode_fenced_after_the_turn_settles() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(
+            &permit,
+            &attempt("attempt-in-flight", "episode-1", "a"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "attempt-in-flight", NOW + 2)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .settle_finished_turn_episodes("session-1", "turn-1", NOW + 3)
+            .await
+            .unwrap(),
+        0,
+        "an unresolved provider request must keep the binding fenced"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM provider_route_episodes WHERE id='episode-1'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "active"
+    );
+}
+
 #[tokio::test]
 async fn stale_epoch_cannot_post_emit_or_commit() {
     let pool = pool().await;

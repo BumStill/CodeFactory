@@ -744,7 +744,35 @@ async fn settle_chat_run_control(
     .bind(run_instance_id)
     .execute(pool)
     .await?;
+    settle_finished_turn_provider_episodes(pool, run_instance_id, now).await?;
     Ok(None)
+}
+
+/// A run instance spans every model round of one turn, so its settlement is the
+/// exact point where the turn's provider episodes stop being needed. Leaving
+/// them live outlived their owner and permanently fenced the binding against
+/// any later admission, which is how the 2026-08-13 session spun in system
+/// recovery forever. Episodes whose evidence is still uncertain stay open for
+/// the supervisor to observe.
+async fn settle_finished_turn_provider_episodes(
+    pool: &sqlx::SqlitePool,
+    run_instance_id: &str,
+    now: i64,
+) -> Result<(), AppError> {
+    let Some((session_id, root_turn_id)) = sqlx::query_as::<_, (String, String)>(
+        "SELECT session_id, root_turn_id FROM chat_run_controls WHERE run_instance_id=?",
+    )
+    .bind(run_instance_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(());
+    };
+    crate::agent::provider_recovery::ProviderRecoveryStore::new(pool.clone())
+        .settle_finished_turn_episodes(&session_id, &root_turn_id, now)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    Ok(())
 }
 
 #[tauri::command]

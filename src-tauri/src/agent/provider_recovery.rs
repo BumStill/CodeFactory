@@ -1248,6 +1248,51 @@ impl ProviderRecoveryStore {
         Ok(ProviderMutation::Applied(updated))
     }
 
+    /// Close the episodes belonging to a finished turn.
+    ///
+    /// `commit_response` deliberately keeps an episode live so the same fenced
+    /// owner can issue the next model round after tool results, but nothing
+    /// closed it once the turn itself ended: the only other `completed` write
+    /// lives inside `open_episode`, which supersedes a prior episode only when
+    /// `replay_safe` proves it never produced output. A turn that ended after
+    /// committing a response therefore left an `active` episode that no later
+    /// admission could ever supersede — every retry raised the Objective
+    /// revision, re-derived a new episode id, hit the same live prior episode
+    /// and bailed, so system recovery spun every 10s until the app quit
+    /// (2026-08-13 freeze).
+    ///
+    /// Close only what is certain: no side effect outstanding and every attempt
+    /// already terminal. `prepared`, `in_flight`, `streaming` and `unknown`
+    /// still need the supervisor to observe them, so they keep the fence shut
+    /// on purpose.
+    pub async fn settle_finished_turn_episodes(
+        &self,
+        session_id: &str,
+        root_turn_id: &str,
+        now: i64,
+    ) -> Result<u64> {
+        let settled = sqlx::query(
+            "UPDATE provider_route_episodes
+                SET status='completed', completed_at=?, updated_at=?
+              WHERE session_id=? AND root_turn_id=?
+                AND status IN ('active', 'waiting')
+                AND side_effect_started=0
+                AND NOT EXISTS (
+                      SELECT 1 FROM provider_route_attempts attempt
+                       WHERE attempt.episode_id=provider_route_episodes.id
+                         AND (attempt.side_effect_started<>0
+                              OR attempt.status IN
+                                 ('prepared', 'in_flight', 'streaming', 'unknown')))",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(session_id)
+        .bind(root_turn_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(settled.rows_affected())
+    }
+
     pub async fn observe(&self, objective_id: &str) -> Result<ProviderRecoveryDisposition> {
         self.observe_at(objective_id, chrono::Utc::now().timestamp_millis())
             .await
