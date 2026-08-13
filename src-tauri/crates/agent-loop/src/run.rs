@@ -3032,8 +3032,8 @@ mod tests {
         }
     }
 
-    struct SlowErrorTools {
-        delay: std::time::Duration,
+    struct HeartbeatGatedErrorTools {
+        events: Arc<CollectingEventSink>,
     }
 
     #[derive(Default)]
@@ -3077,7 +3077,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ToolBackend for SlowErrorTools {
+    impl ToolBackend for HeartbeatGatedErrorTools {
         async fn list_schemas(&self) -> Vec<ToolDefinition> {
             vec![tool_definition()]
         }
@@ -3088,7 +3088,21 @@ mod tests {
             _args: &serde_json::Value,
             _ctx: &ToolCtx,
         ) -> Result<ToolInvocationResult, ToolError> {
-            tokio::time::sleep(self.delay).await;
+            // Do not use a wall-clock delay to prove the long-tool path. On
+            // Windows the timer granularity can let the tool finish at the
+            // same instant as the heartbeat timeout. Hold the tool open until
+            // the loop has actually emitted its first heartbeat instead.
+            while !self.events.events().iter().any(|event| {
+                matches!(
+                    event,
+                    StreamEvent::TurnActivityUpdated {
+                        recent_activity_kind,
+                        ..
+                    } if recent_activity_kind == "tool_wait"
+                )
+            }) {
+                tokio::task::yield_now().await;
+            }
             Ok(ToolInvocationResult {
                 content: "command failed and can be repaired".into(),
                 is_error: true,
@@ -3101,7 +3115,7 @@ mod tests {
                 error: Some("failed".into()),
                 metadata: None,
                 next_working_directory: None,
-                duration_ms: self.delay.as_millis() as u64,
+                duration_ms: 1,
             })
         }
     }
@@ -4032,8 +4046,8 @@ mod tests {
         let mut cfg = config();
         cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(10));
         let mut svc = services(transport, persistence, events.clone());
-        svc.tools = Arc::new(SlowErrorTools {
-            delay: std::time::Duration::from_millis(25),
+        svc.tools = Arc::new(HeartbeatGatedErrorTools {
+            events: events.clone(),
         });
 
         run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
