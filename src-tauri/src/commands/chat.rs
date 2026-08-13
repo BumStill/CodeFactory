@@ -1346,9 +1346,9 @@ async fn converge_aborted_chat_setup(
         .await
         .map_err(|error| AppError::Other(error.to_string()))?
         .ok_or_else(|| AppError::Other(format!("objective {objective_id} missing")))?;
-    if objective.session_id.as_deref() != Some(session_id)
-        || objective.root_turn_id.as_deref() != Some(root_turn_id.as_str())
-    {
+    let root_matches_objective = objective.root_turn_id.as_deref() == Some(root_turn_id.as_str())
+        || objective.resume_cursor.as_deref() == Some(root_turn_id.as_str());
+    if objective.session_id.as_deref() != Some(session_id) || !root_matches_objective {
         return Err(AppError::Other(
             "aborted chat setup durable identity mismatch".into(),
         ));
@@ -3787,6 +3787,113 @@ mod tests {
         assert_eq!(projected.objective.status, ObjectiveStatus::Active);
         assert_eq!(projected.objective.revision, newer.revision + 1);
         assert!(projected.objective.failure_code.is_none());
+    }
+
+    #[tokio::test]
+    async fn aborted_continuation_setup_accepts_the_durable_resume_cursor() {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-continuation-setup".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-continuation-setup".into()),
+                root_turn_id: Some("turn-original-root".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE objectives
+             SET status='waiting_system', decision_type='waiting',
+                 resume_cursor='turn-continuation-root', revision=revision+1
+             WHERE id=?",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-continuation-root', 'session-continuation-setup', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let continued = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(continued.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(continued.root_turn_id.as_deref(), Some("turn-original-root"));
+        assert_eq!(
+            continued.resume_cursor.as_deref(),
+            Some("turn-continuation-root")
+        );
+
+        let control = crate::ChatRunControl::pending();
+        register_chat_run_control(&pool, &control, "session-continuation-setup")
+            .await
+            .unwrap();
+        bind_chat_run_root(
+            &pool,
+            &control.run_instance_id,
+            "session-continuation-setup",
+            "turn-continuation-root",
+        )
+        .await
+        .unwrap();
+        bind_chat_run_objective(
+            &pool,
+            &control.run_instance_id,
+            "session-continuation-setup",
+            "turn-continuation-root",
+            &continued.id,
+            continued.revision,
+        )
+        .await
+        .unwrap();
+
+        let settled = converge_aborted_chat_setup(
+            &pool,
+            &control,
+            "session-continuation-setup",
+        )
+        .await
+        .expect("the durable continuation identity should converge")
+        .expect("the continuation keeps its Objective receipt");
+        assert_eq!(settled.root_turn_id, "turn-continuation-root");
+        assert_eq!(settled.objective.id, objective.id);
+        assert_eq!(settled.objective.status, ObjectiveStatus::WaitingSystem);
+        let control_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id=?")
+                .bind(&control.run_instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(control_status, "completed");
     }
 
     #[tokio::test]

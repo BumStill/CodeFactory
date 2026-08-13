@@ -619,6 +619,15 @@ pub fn run() {
                     "startup: retired prior-process chat transports before objective recovery"
                 );
             }
+            let recovered_exhausted_reprompts = tauri::async_runtime::block_on(
+                objective_store.reconcile_unconsumed_exhausted_chat_reprompts(),
+            )?;
+            if recovered_exhausted_reprompts > 0 {
+                tracing::info!(
+                    count = recovered_exhausted_reprompts,
+                    "startup: resumed user messages swallowed by the exhausted recovery ceiling"
+                );
+            }
             let provider_recoveries = tauri::async_runtime::block_on(
                 agent::objective_supervisor::reconcile_provider_recovery_on_startup(
                     &objective_pool,
