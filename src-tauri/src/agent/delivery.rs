@@ -3465,7 +3465,10 @@ async fn wait_for_http_live(live: &LiveHttpAssertion, sha: &str) -> Result<(), S
         ))
         .build()
         .map_err(|e| format!("创建 live verifier HTTP client 失败: {e}"))?;
-    let mut last_error = String::new();
+    // Every loop path either returns or records why this poll failed, so the
+    // deadline branch below always reads a real observation rather than an
+    // empty placeholder.
+    let mut last_error;
     loop {
         match client.get(&live.url).send().await {
             Ok(resp) => {
@@ -10401,7 +10404,7 @@ Release-Urgency: hold"
 
     #[test]
     fn worktree_feature_branch_is_discovered_and_delivered_from_main() {
-        let (root, wt) = repo_with_worktree_feature("wt-discover");
+        let (root, _wt) = repo_with_worktree_feature("wt-discover");
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,

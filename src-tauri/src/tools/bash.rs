@@ -233,7 +233,9 @@ async fn execute_inner(
         .as_ref()
         .map(|s| s.sandbox_mode)
         .unwrap_or_default();
-    let mut launched_program = String::new();
+    // Set by whichever sandbox branch actually builds the command; the branches
+    // that bail out return before anything reads it.
+    let launched_program;
     let sandboxed = matches!(sandbox_mode, crate::config::settings::SandboxMode::Docker);
     let cmd = match sandbox_mode {
         crate::config::settings::SandboxMode::Docker => {

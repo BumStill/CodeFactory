@@ -1492,8 +1492,6 @@ mod tests {
         assert!(joined.contains(".claude/skills"));
     }
 
-    use super::*;
-
     #[test]
     fn builtin_registry_parses_into_unique_usable_skills() {
         let skills: Vec<MarketplaceSkill> = serde_json::from_str(BUILTIN_REGISTRY)
