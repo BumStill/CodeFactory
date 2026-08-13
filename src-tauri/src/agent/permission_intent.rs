@@ -1134,16 +1134,19 @@ impl PermissionIntentStore {
                     "INSERT INTO objective_remediations
                      (id, objective_id, binding_id, domain, status, failure_code,
                       failure_signature, strategy, approach_index, attempt_index,
-                      action_fingerprint, resume_cursor, next_observation_at,
+                      recovery_generation, action_fingerprint, resume_cursor, next_observation_at,
                       created_at, updated_at)
                      VALUES (?, ?, ?, 'permission', 'queued',
                              'authorization_restored', ?, 'resume_authorized_action',
-                             0, 0, ?, ?, ?, ?, ?)",
+                             0, 0,
+                             (SELECT recovery_generation FROM objectives WHERE id=?),
+                             ?, ?, ?, ?, ?)",
                 )
                 .bind(&remediation_id)
                 .bind(&intent.scope.objective_id)
                 .bind(&intent.scope.binding_id)
                 .bind(&failure_signature)
+                .bind(&intent.scope.objective_id)
                 .bind(&intent.action_signature)
                 .bind(&resume_cursor)
                 .bind(now)

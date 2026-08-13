@@ -78,10 +78,11 @@ string_enum!(ObjectiveStatus {
 pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
 
 /// How many durable remediations one failure signature may buy before the
-/// system admits it is not making progress. Counted as a lifetime tally per
-/// `(objective, failure_signature)` rather than a consecutive streak: an
-/// intervening different failure code must not hand the same broken route a
-/// fresh budget.
+/// system admits it is not making progress. Counted as a cumulative tally per
+/// `(objective, recovery_generation, failure_signature)` rather than a
+/// consecutive streak: an intervening different failure code must not hand the
+/// same broken route a fresh budget. Only an explicit user reprompt after
+/// exhaustion starts another independently bounded generation.
 pub const MAX_SIGNATURE_RECOVERY_ATTEMPTS: i64 = 5;
 
 /// Backstop for signatures that never repeat. Some routes embed varying error
@@ -193,6 +194,8 @@ pub struct ObjectiveSnapshot {
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_at: Option<i64>,
+    #[serde(default)]
+    pub recovery_generation: i64,
 }
 
 impl ObjectiveSnapshot {
@@ -236,6 +239,7 @@ impl ObjectiveSnapshot {
             created_at: now,
             updated_at: now,
             completed_at: None,
+            recovery_generation: 0,
         }
     }
 
@@ -301,6 +305,11 @@ impl ObjectiveSnapshot {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             completed_at: row.try_get("completed_at")?,
+            // Minimal legacy/adapter schemas may be observed before the
+            // startup compatibility pass has added the column. Generation
+            // zero is the exact historical meaning; ensure_schema persists it
+            // before any new recovery can be admitted.
+            recovery_generation: row.try_get("recovery_generation").unwrap_or(0),
         })
     }
 }
@@ -1203,6 +1212,13 @@ impl ObjectiveStore {
                 objective.requested_acceptance.as_str()
             };
             let next_revision = objective.revision + 1;
+            let next_recovery_generation = if objective.status == ObjectiveStatus::WaitingCoreInput
+                && objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
+            {
+                objective.recovery_generation + 1
+            } else {
+                objective.recovery_generation
+            };
             let updated = sqlx::query(
                 "UPDATE objectives SET revision=?, kind=?, requested_acceptance=?,
                    status='active', decision_type='continue', domain='chat',
@@ -1211,6 +1227,7 @@ impl ObjectiveStore {
                    recovery_owner='chat-foreground', remediation_id=NULL,
                    resume_cursor=?, next_observation_at=NULL,
                    lease_owner=NULL, lease_expires_at=NULL,
+                   recovery_generation=?,
                    last_observed_process_instance=?,
                    last_progress_at=?, updated_at=?, completed_at=NULL
                  WHERE id=? AND revision=?
@@ -1220,6 +1237,7 @@ impl ObjectiveStore {
             .bind(target_kind.as_str())
             .bind(target_acceptance)
             .bind(root_turn_id)
+            .bind(next_recovery_generation)
             .bind(&process_instance)
             .bind(now)
             .bind(now)
@@ -1309,6 +1327,7 @@ impl ObjectiveStore {
                 serde_json::json!({
                     "root_turn_id": root_turn_id,
                     "legacy_root_turn_id": legacy_root_to_reconcile,
+                    "recovery_generation": next_recovery_generation,
                 })
                 .to_string(),
             )
@@ -1818,6 +1837,145 @@ impl ObjectiveStore {
         Ok(updated.rows_affected() as usize)
     }
 
+    /// Repair the v1.81.9 admission regression without asking the user to send
+    /// the same message again. That build persisted and bound a real
+    /// `core_input_response`, then immediately re-applied the exhausted budget
+    /// from generation zero. The exact latest root remains in `resume_cursor`.
+    ///
+    /// Generation zero is part of the compatibility fence: after this repair,
+    /// normal admission increments every later exhausted reprompt before it can
+    /// run, so startup can never buy another budget merely by restarting.
+    pub async fn reconcile_unconsumed_exhausted_chat_reprompts(
+        &self,
+    ) -> anyhow::Result<usize> {
+        let candidates = sqlx::query_as::<_, (String, i64, String, String)>(
+            "SELECT objective.id, objective.revision, objective.session_id,
+                    objective.resume_cursor
+             FROM objectives objective
+             JOIN chat_turn_state turn
+               ON turn.objective_id=objective.id
+              AND turn.session_id=objective.session_id
+              AND turn.root_turn_id=objective.resume_cursor
+             JOIN messages message
+               ON message.id=turn.root_turn_id
+              AND message.session_id=turn.session_id
+              AND message.role='user'
+             WHERE objective.status='waiting_core_input'
+               AND objective.failure_code=?
+               AND objective.recovery_generation=0
+               AND turn.status='waiting_core_input'
+               AND turn.user_reprompt_driver='core_input_response'
+             ORDER BY objective.updated_at, objective.id",
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut reconciled = 0;
+        for (objective_id, revision, session_id, root_turn_id) in candidates {
+            let now = Utc::now().timestamp_millis();
+            let remediation_id = Uuid::new_v4().to_string();
+            let failure_code = "exhausted_user_reprompt_unconsumed";
+            let failure_signature = format!("{objective_id}:{root_turn_id}:{failure_code}");
+            let mut tx = self.pool.begin().await?;
+            let updated = sqlx::query(
+                "UPDATE objectives SET revision=revision+1,
+                   recovery_generation=1, status='waiting_system',
+                   decision_type='waiting', domain='chat',
+                   requires_user_action=0, request_key=NULL, decision_key=NULL,
+                   failure_code=?, failure_signature=?,
+                   recovery_owner='objective-supervisor:chat', remediation_id=?,
+                   next_observation_at=?, lease_owner=NULL, lease_expires_at=NULL,
+                   completed_at=NULL, last_progress_at=?, updated_at=?
+                 WHERE id=? AND revision=? AND session_id=? AND resume_cursor=?
+                   AND status='waiting_core_input' AND failure_code=?
+                   AND recovery_generation=0",
+            )
+            .bind(failure_code)
+            .bind(&failure_signature)
+            .bind(&remediation_id)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .bind(&objective_id)
+            .bind(revision)
+            .bind(&session_id)
+            .bind(&root_turn_id)
+            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO objective_remediations
+                 (id, objective_id, domain, status, failure_code,
+                  failure_signature, strategy, approach_index, attempt_index,
+                  recovery_generation, resume_cursor, next_observation_at,
+                  created_at, updated_at)
+                 VALUES (?, ?, 'chat', 'queued', ?, ?,
+                         'reconcile_then_resume', 0, 0, 1, ?, ?, ?, ?)",
+            )
+            .bind(&remediation_id)
+            .bind(&objective_id)
+            .bind(failure_code)
+            .bind(&failure_signature)
+            .bind(&root_turn_id)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            let projected = sqlx::query(
+                "UPDATE chat_turn_state SET revision=revision+1,
+                   phase='recovering', status='waiting_system',
+                   recent_activity_kind='system_recovery',
+                   recent_activity_label='正在续接你已发送的消息',
+                   waiting_reason='exhausted_user_reprompt_unconsumed',
+                   updated_at=?, completed_at=NULL, terminal_reason=NULL
+                 WHERE root_turn_id=? AND session_id=? AND objective_id=?
+                   AND status='waiting_core_input'
+                   AND user_reprompt_driver='core_input_response'",
+            )
+            .bind(now)
+            .bind(&root_turn_id)
+            .bind(&session_id)
+            .bind(&objective_id)
+            .execute(&mut *tx)
+            .await?;
+            if projected.rows_affected() != 1 {
+                tx.rollback().await?;
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO objective_events
+                 (id, objective_id, revision, event_type, status, decision_type,
+                  domain, failure_code, recovery_owner, detail_json, created_at)
+                 VALUES (?, ?, ?, 'exhausted_user_reprompt_recovered',
+                         'waiting_system', 'waiting', 'chat', ?,
+                         'objective-supervisor:chat', ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&objective_id)
+            .bind(revision + 1)
+            .bind(failure_code)
+            .bind(
+                serde_json::json!({
+                    "root_turn_id": root_turn_id,
+                    "recovery_generation": 1,
+                    "compatibility_repair": "v1.81.9",
+                })
+                .to_string(),
+            )
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
     /// Lease due recovery work with compare-and-swap semantics. A stale
     /// process can observe candidates but cannot claim a row after another
     /// supervisor has advanced its lease or status.
@@ -1874,9 +2032,13 @@ impl ObjectiveStore {
                       AND decision.objective_id=remediation.objective_id
                      WHERE remediation.objective_id=?
                        AND remediation.strategy='reconcile_then_resume'
+                       AND remediation.recovery_generation=(
+                         SELECT recovery_generation FROM objectives WHERE id=?
+                       )
                        AND COALESCE(decision.decision_type, 'waiting')<>'apply_recommended'",
                 )
                 .bind(&failure_signature)
+                .bind(&objective_id)
                 .bind(&objective_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -2629,16 +2791,20 @@ impl ObjectiveStore {
     ///
     /// Recovery may insert a new remediation or defer and reclaim the same row
     /// after an adapter failure. `attempt_index` records real claims, so its
-    /// sum across durable history bounds both shapes of retry.
+    /// sum across the current durable recovery generation bounds both shapes
+    /// of retry while older generations stay queryable as audit history.
     ///
-    /// Two bounds, both keyed on durable history rather than a live streak:
+    /// Two bounds, both keyed on the current generation's durable history
+    /// rather than a live streak:
     ///
-    /// * per `(objective, failure_signature)` — the same signature recurring is
-    ///   the definition of no progress. It is a lifetime tally, not a
-    ///   consecutive run, so an intervening *different* failure code cannot
-    ///   hand the same broken route a fresh budget.
-    /// * per objective — a backstop for routes whose signature embeds varying
-    ///   text, where every per-signature tally would otherwise stay at 1.
+    /// * per `(objective, recovery_generation, failure_signature)` — the same
+    ///   signature recurring is the definition of no progress. It is a
+    ///   generation-lifetime tally, not a consecutive run, so an intervening
+    ///   *different* failure code cannot hand the same broken route a fresh
+    ///   budget.
+    /// * per `(objective, recovery_generation)` — a backstop for routes whose
+    ///   signature embeds varying text, where every per-signature tally would
+    ///   otherwise stay at 1.
     ///
     /// User-driven remediations are excluded from both counts — a restored
     /// capability or an authorized permission is the user changing the world,
@@ -2673,9 +2839,13 @@ impl ObjectiveStore {
               AND decision.objective_id=remediation.objective_id
              WHERE remediation.objective_id=?
                AND remediation.strategy='reconcile_then_resume'
+               AND remediation.recovery_generation=(
+                 SELECT recovery_generation FROM objectives WHERE id=?
+               )
                AND COALESCE(decision.decision_type, 'waiting')<>'apply_recommended'",
         )
         .bind(&signature)
+        .bind(&decision.objective_id)
         .bind(&decision.objective_id)
         .fetch_one(&self.pool)
         .await?;
@@ -3710,9 +3880,10 @@ impl ObjectiveStore {
             sqlx::query(
                 "INSERT INTO objective_remediations
                  (id, objective_id, binding_id, domain, status, failure_code, failure_signature,
-                  strategy, approach_index, attempt_index, resume_cursor,
+                  strategy, approach_index, attempt_index, recovery_generation, resume_cursor,
                   next_observation_at, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, 'queued', ?, ?, 'reconcile_then_resume', 0, 0, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, 'queued', ?, ?, 'reconcile_then_resume', 0, 0,
+                         (SELECT recovery_generation FROM objectives WHERE id=?), ?, ?, ?, ?)",
             )
             .bind(
                 decision
@@ -3735,6 +3906,7 @@ impl ObjectiveStore {
                     .as_deref()
                     .ok_or_else(|| anyhow!("waiting_system failure signature missing"))?,
             )
+            .bind(&decision.objective_id)
             .bind(&decision.resume_cursor)
             .bind(
                 decision
@@ -3836,6 +4008,26 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     sqlx::raw_sql(include_str!(
         "../../migrations/0016_chat_session_cancel_intents.sql"
     ))
+    .execute(pool)
+    .await?;
+    ensure_column(
+        pool,
+        "objectives",
+        "recovery_generation",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(recovery_generation >= 0)",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "objective_remediations",
+        "recovery_generation",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(recovery_generation >= 0)",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_objective_remediations_generation
+         ON objective_remediations(objective_id, recovery_generation, failure_signature)",
+    )
     .execute(pool)
     .await?;
 
@@ -7172,6 +7364,259 @@ mod tests {
             0,
             "the supervisor must have nothing left to claim"
         );
+    }
+
+    /// A recovery ceiling bounds system-owned retries; it must not permanently
+    /// poison the same Objective after the user explicitly supplies a new turn.
+    /// The opaque Objective identity and audit history stay intact, while the
+    /// new user-driven generation receives its own bounded recovery budget.
+    #[tokio::test]
+    async fn user_reprompt_after_exhaustion_starts_a_new_bounded_recovery_generation() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-user-reprompt").await;
+        let signature = "sha256:user-reprompt-same-failure";
+
+        while !current.requires_user_action {
+            current = route_technical_failure(
+                &store,
+                &current,
+                "completion_evidence_incomplete",
+                signature,
+            )
+            .await;
+        }
+        assert_returned_to_user(&current);
+
+        let original_root_turn_id = current.root_turn_id.clone().unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, status, objective_id)
+             VALUES (?, ?, 'waiting_core_input', ?),
+                    ('turn-user-reprompt', ?, 'active', NULL)",
+        )
+        .bind(&original_root_turn_id)
+        .bind(current.session_id.as_deref().unwrap())
+        .bind(&current.id)
+        .bind(current.session_id.as_deref().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reopened = store
+            .ensure_or_continue_chat_objective(
+                current.session_id.as_deref().unwrap(),
+                "turn-user-reprompt",
+                Some(&original_root_turn_id),
+                current.kind,
+                &current.requested_acceptance,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.id, current.id, "the business Objective stays stable");
+        assert_eq!(reopened.status, ObjectiveStatus::Active);
+
+        let first_new_failure = route_technical_failure(
+            &store,
+            &reopened,
+            "completion_evidence_incomplete",
+            signature,
+        )
+        .await;
+        assert_eq!(
+            first_new_failure.status,
+            ObjectiveStatus::WaitingSystem,
+            "old exhausted attempts must not consume the user-driven generation's budget"
+        );
+        assert_eq!(first_new_failure.recovery_generation, 1);
+        assert_eq!(claimable_remediations(&pool, &reopened.id).await, 1);
+
+        let mut current_generation = first_new_failure;
+        while !current_generation.requires_user_action {
+            current_generation = route_technical_failure(
+                &store,
+                &current_generation,
+                "completion_evidence_incomplete",
+                signature,
+            )
+            .await;
+        }
+        assert_returned_to_user(&current_generation);
+        assert_eq!(current_generation.recovery_generation, 1);
+        assert_eq!(claimable_remediations(&pool, &reopened.id).await, 0);
+        let attempts_by_generation: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT recovery_generation, SUM(attempt_index)
+             FROM objective_remediations WHERE objective_id=?
+             GROUP BY recovery_generation ORDER BY recovery_generation",
+        )
+        .bind(&reopened.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attempts_by_generation,
+            vec![(0, MAX_SIGNATURE_RECOVERY_ATTEMPTS), (1, MAX_SIGNATURE_RECOVERY_ATTEMPTS)],
+            "each user-authorized generation stays independently bounded"
+        );
+    }
+
+    async fn exhausted_reprompt_compatibility_fixture(
+        user_reprompt_driver: Option<&str>,
+    ) -> (SqlitePool, ObjectiveStore, String) {
+        let pool = pool().await;
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE messages (
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               role TEXT NOT NULL, content TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               revision INTEGER NOT NULL DEFAULT 1, phase TEXT NOT NULL,
+               status TEXT NOT NULL, recent_activity_kind TEXT,
+               recent_activity_label TEXT, waiting_reason TEXT,
+               updated_at INTEGER NOT NULL, completed_at INTEGER,
+               terminal_reason TEXT, objective_id TEXT,
+               user_reprompt_driver TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let session_id = "session-exhausted-reprompt-compat";
+        let root_turn_id = "turn-exhausted-reprompt-compat";
+        sqlx::query("INSERT INTO sessions(id) VALUES (?)")
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-exhausted-reprompt-compat".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some(session_id.into()),
+                root_turn_id: Some("turn-original".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE objectives SET revision=7, status='waiting_core_input',
+               decision_type='core_input_required', requires_user_action=1,
+               request_key=?, failure_code=?, failure_signature='sha256:old',
+               recovery_owner=NULL, remediation_id=NULL, resume_cursor=?,
+               recovery_generation=0, completed_at=? WHERE id=?",
+        )
+        .bind(format!("{TECHNICAL_RECOVERY_EXHAUSTED}:{}", objective.id))
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(root_turn_id)
+        .bind(Utc::now().timestamp_millis())
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, role, content)
+             VALUES (?, ?, 'user', '继续')",
+        )
+        .bind(root_turn_id)
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, phase, status, recent_activity_kind,
+              recent_activity_label, waiting_reason, updated_at, completed_at,
+              terminal_reason, objective_id, user_reprompt_driver)
+             VALUES (?, ?, 'waiting', 'waiting_core_input', ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(root_turn_id)
+        .bind(session_id)
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind("系统多轮自动恢复没有进展")
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(Utc::now().timestamp_millis())
+        .bind(Utc::now().timestamp_millis())
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(&objective.id)
+        .bind(user_reprompt_driver)
+        .execute(&pool)
+        .await
+        .unwrap();
+        (pool, store, objective.id)
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_a_v1819_exhausted_reprompt_exactly_once() {
+        let (pool, store, objective_id) =
+            exhausted_reprompt_compatibility_fixture(Some("core_input_response")).await;
+
+        assert_eq!(
+            store
+                .reconcile_unconsumed_exhausted_chat_reprompts()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .reconcile_unconsumed_exhausted_chat_reprompts()
+                .await
+                .unwrap(),
+            0,
+            "a restart must not buy the compatibility generation twice"
+        );
+        let recovered = store.get(&objective_id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(recovered.recovery_generation, 1);
+        assert_eq!(recovered.resume_cursor.as_deref(), Some("turn-exhausted-reprompt-compat"));
+        assert_eq!(claimable_remediations(&pool, &objective_id).await, 1);
+        let turn: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT status, phase, terminal_reason FROM chat_turn_state
+             WHERE root_turn_id='turn-exhausted-reprompt-compat'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(turn, ("waiting_system".into(), "recovering".into(), None));
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_reopen_exhaustion_without_an_unconsumed_user_reprompt() {
+        let (_, store, objective_id) = exhausted_reprompt_compatibility_fixture(None).await;
+
+        assert_eq!(
+            store
+                .reconcile_unconsumed_exhausted_chat_reprompts()
+                .await
+                .unwrap(),
+            0
+        );
+        let untouched = store.get(&objective_id).await.unwrap().unwrap();
+        assert_returned_to_user(&untouched);
+        assert_eq!(untouched.recovery_generation, 0);
     }
 
     /// Adapter failures defer the same row instead of creating a new one. The
