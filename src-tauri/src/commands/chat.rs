@@ -418,7 +418,20 @@ pub async fn cancel_chat(
     session_id: String,
     state: State<'_, AppState>,
 ) -> Result<(), AppError> {
-    let Some(control) = state.chat_cancels.lock().await.get(&session_id).cloned() else {
+    let control = state.chat_cancels.lock().await.get(&session_id).cloned();
+    let Some(control) = control else {
+        // No run in this process owns the session, which is exactly when a user
+        // most needs to stop: the turn is being driven by system-owned recovery,
+        // or this process restarted and inherited a non-terminal Objective from
+        // the database. The cancel map lives only in memory, so returning `Ok`
+        // here reported success while doing nothing — that is why the
+        // 2026-08-13 sessions could not be stopped and resumed on every
+        // restart. Fall through to the durable cancel instead.
+        let pool = state.db.read().await.clone();
+        let stopped = cancel_system_owned_chat(&app, &pool, &session_id).await?;
+        tracing::info!(
+            "cancel_chat: durably stopped {stopped} system-owned objective(s) for session {session_id}"
+        );
         return Ok(());
     };
     if !control.durable {
@@ -451,6 +464,80 @@ pub async fn cancel_chat(
     }
     tracing::info!("cancel_chat: durably requested stop for session {session_id}");
     Ok(())
+}
+
+/// Every Objective a session still owns, newest turn first. Terminal states are
+/// excluded; every non-terminal one — `active`, any `waiting_*` — is something
+/// the user's stop must reach. Kept free of `AppHandle` so it stays directly
+/// testable: constructing handle-owning values inside the unit-test binary is
+/// what previously broke the Windows loader.
+async fn live_chat_objectives(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> Result<Vec<(String, String)>, AppError> {
+    Ok(sqlx::query_as::<_, (String, String)>(
+        "SELECT turn.objective_id, turn.root_turn_id
+         FROM chat_turn_state turn
+         JOIN objectives objective ON objective.id=turn.objective_id
+         WHERE turn.session_id=?
+           AND turn.objective_id IS NOT NULL
+           AND objective.status NOT IN ('completed', 'cancelled')
+         ORDER BY objective.updated_at DESC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Stop every Objective a session still owns when no run in this process holds
+/// it. System-owned recovery and post-restart adoption live only in the
+/// database, so the in-memory cancel map cannot reach them, yet those are the
+/// states a user cannot otherwise escape.
+///
+/// Every live Objective is cancelled, not just the newest: the 2026-08-13
+/// session grew a second Objective behind the one that had been stopped, so
+/// cancelling one at a time left the turn unfinished and the user's queued
+/// message stuck behind it. An explicit user stop is also the only authority
+/// that may abandon an Objective whose external side effect stayed uncertain —
+/// `explicit_cancel` provenance is exactly what the durable store requires.
+async fn cancel_system_owned_chat(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> Result<usize, AppError> {
+    let live = live_chat_objectives(pool, session_id).await?;
+
+    let mut stopped = 0;
+    let mut first_error = None;
+    for (objective_id, root_turn_id) in live {
+        match cancel_chat_objective_exact(pool, session_id, &root_turn_id, &objective_id).await {
+            Ok(cancelled) => {
+                project_chat_objective(
+                    pool,
+                    app,
+                    &format!("stream:{session_id}"),
+                    &root_turn_id,
+                    &cancelled,
+                )
+                .await?;
+                stopped += 1;
+            }
+            // One unstoppable Objective must not strand the others; report the
+            // failure only when nothing could be stopped at all.
+            Err(error) => {
+                tracing::warn!(
+                    objective_id = %objective_id,
+                    %error,
+                    "cancel_chat: durable stop failed for one objective"
+                );
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) if stopped == 0 => Err(error),
+        _ => Ok(stopped),
+    }
 }
 
 async fn cancel_chat_objective_exact(
@@ -3757,6 +3844,76 @@ mod tests {
             .await
             .unwrap();
         (pool, waiting)
+    }
+
+    /// A user pressing stop must reach a turn that no run in this process owns.
+    /// The in-memory cancel map is empty after a restart and never holds
+    /// system-owned recovery, so `cancel_chat` returned `Ok` without doing
+    /// anything and the turn resumed on every launch. Selection therefore has
+    /// to come from durable state, and it has to find *every* live Objective:
+    /// the 2026-08-13 session grew a second Objective behind the one that had
+    /// already been cancelled, which kept the turn unfinished and the user's
+    /// queued message stuck behind it.
+    #[tokio::test]
+    async fn a_user_stop_reaches_every_live_objective_the_session_still_owns() {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain,
+        };
+
+        let (pool, waiting) = durable_cancel_test_objective("user-stop").await;
+        let session_id = waiting.session_id.clone().unwrap();
+
+        // A second Objective appears while the first is still being recovered.
+        let second = ObjectiveStore::new(pool.clone())
+            .create(CreateObjective {
+                id: "objective-user-stop-2".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some(session_id.clone()),
+                root_turn_id: Some("turn-user-stop-2".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind("turn-user-stop-2")
+        .bind(&session_id)
+        .bind(&second.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let live = live_chat_objectives(&pool, &session_id).await.unwrap();
+        assert_eq!(
+            live.len(),
+            2,
+            "a stop must reach every live objective, not only the newest: {live:?}"
+        );
+
+        for (objective_id, root_turn_id) in live {
+            let cancelled =
+                cancel_chat_objective_exact(&pool, &session_id, &root_turn_id, &objective_id)
+                    .await
+                    .unwrap();
+            assert_eq!(cancelled.status, ObjectiveStatus::Cancelled);
+            assert_eq!(
+                cancelled.cancellation_provenance.as_deref(),
+                Some("explicit_cancel"),
+                "only an explicit user stop may abandon system-owned work"
+            );
+        }
+
+        assert!(
+            live_chat_objectives(&pool, &session_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a stopped session must leave the supervisor nothing to resume"
+        );
     }
 
     #[tokio::test]

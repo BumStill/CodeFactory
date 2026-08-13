@@ -198,6 +198,21 @@ export function WorkspacePage({
   // autonomous task run. Same keystroke, same meaning, same queue — which of
   // the two happens to be running is the framework's business, not the user's.
   const steerActive = activeDraft ? false : streaming || persistedRunActive;
+  // A turn the system still owns is exactly the state a user could not escape:
+  // once streaming stopped the composer went back to "发送", so system-owned
+  // recovery kept the turn alive with no way to end it — across restarts too.
+  // Same predicate the progress banner uses to decide it is still working.
+  const systemHoldsTurn = useMemo(
+    () =>
+      messages.some((message) => {
+        const status = message.turnActivity?.objectiveStatus;
+        return Boolean(
+          status && !["completed", "cancelled", "legacy_orphan"].includes(status),
+        );
+      }),
+    [messages],
+  );
+  const turnInFlight = activeDraft ? false : streaming || systemHoldsTurn;
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
     if (!trimmed || activeDraft) return;
@@ -843,7 +858,7 @@ export function WorkspacePage({
                 onSend={(t) => void sendOrQueue(t)}
                 onGuide={guideNextStep}
                 onCancel={() => cancelStream()}
-                streaming={streaming}
+                streaming={turnInFlight}
                 guidanceActive={steerActive}
                 disabled={!activeSession && !activeDraft}
                 pendingInsert={pendingInsert}
