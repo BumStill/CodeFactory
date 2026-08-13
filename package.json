@@ -14,6 +14,7 @@
     "worktrees:closeout": "node scripts/worktree-closeout.mjs",
     "worktree:start": "node scripts/worktree-start.mjs",
     "test:worktree-start": "node --test scripts/worktree-start.test.mjs",
+    "test:unattended-contract": "node --test scripts/unattended-long-task-contract.test.mjs",
     "test": "vitest run",
     "test:rust:fast": "node scripts/cargo-shared.mjs test --manifest-path src-tauri/Cargo.toml",
     "test:evolution:headless": "node scripts/verify-evolution-workbench-headless.mjs",

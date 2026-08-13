@@ -1106,6 +1106,27 @@ async fn settle_chat_objective_from_outcome(
     outcome: &codefactory_agent_loop::run::RunOutcome,
     mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
 ) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
+    let revised = apply_chat_objective_outcome(
+        db,
+        objective_id,
+        expected_revision,
+        root_turn_id,
+        outcome,
+        mutation_permit,
+    )
+    .await?;
+    project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
+    Ok(revised)
+}
+
+async fn apply_chat_objective_outcome(
+    db: &sqlx::SqlitePool,
+    objective_id: &str,
+    expected_revision: i64,
+    root_turn_id: &str,
+    outcome: &codefactory_agent_loop::run::RunOutcome,
+    mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
+) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
     let store = crate::agent::objective::ObjectiveStore::new(db.clone());
     let current = store
         .get(objective_id)
@@ -1113,7 +1134,6 @@ async fn settle_chat_objective_from_outcome(
         .map_err(|error| AppError::Other(error.to_string()))?
         .ok_or_else(|| AppError::Other(format!("objective {objective_id} missing")))?;
     if current.status.is_terminal() {
-        project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
         return Ok(current);
     }
     if current.revision != expected_revision {
@@ -1134,7 +1154,7 @@ async fn settle_chat_objective_from_outcome(
         terminal_reason.as_deref(),
     )
     .map_err(|error| AppError::Other(error.to_string()))?;
-    let revised = match mutation_permit {
+    match mutation_permit {
         Some(permit) => {
             store
                 .apply_claimed_decision(current.revision, decision, permit)
@@ -1142,9 +1162,30 @@ async fn settle_chat_objective_from_outcome(
         }
         None => store.apply_decision(current.revision, decision).await,
     }
-    .map_err(|error| AppError::Other(error.to_string()))?;
-    project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
-    Ok(revised)
+    .map_err(|error| AppError::Other(error.to_string()))
+}
+
+/// Settle the production Objective decision path without a Tauri window.
+/// Formal executable recovery smokes use this after the real AgentLoop exits;
+/// the typed decision and claimed-remediation CAS are unchanged.
+#[cfg(not(test))]
+pub(crate) async fn settle_headless_chat_objective_from_outcome(
+    db: &sqlx::SqlitePool,
+    objective_id: &str,
+    expected_revision: i64,
+    root_turn_id: &str,
+    outcome: &codefactory_agent_loop::run::RunOutcome,
+    mutation_permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
+) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
+    apply_chat_objective_outcome(
+        db,
+        objective_id,
+        expected_revision,
+        root_turn_id,
+        outcome,
+        mutation_permit,
+    )
+    .await
 }
 
 async fn settle_chat_objective_from_error(
@@ -1458,6 +1499,29 @@ struct ChatAdmissionReceipt {
     cancel_requested: bool,
     continuation_driver: Option<String>,
     already_settled: bool,
+}
+
+/// AppHandle-free admission receipt used by formal executable system smokes.
+/// It delegates to the desktop's atomic admission transaction rather than
+/// maintaining a second test-only chat schema.
+#[cfg(not(test))]
+pub(crate) struct HeadlessChatAdmission {
+    pub root_turn_id: String,
+    pub objective: crate::agent::objective::ObjectiveSnapshot,
+}
+
+#[cfg(not(test))]
+pub(crate) async fn admit_headless_chat_turn(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    content: &str,
+) -> Result<HeadlessChatAdmission, AppError> {
+    let control = crate::ChatRunControl::pending();
+    let admission = admit_persisted_chat_turn(pool, &control, session_id, None, content).await?;
+    Ok(HeadlessChatAdmission {
+        root_turn_id: admission.root_turn_id,
+        objective: admission.objective,
+    })
 }
 
 async fn resolve_open_chat_objective_continuation_in_tx(

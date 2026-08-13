@@ -322,9 +322,11 @@ pub(crate) async fn reconcile_provider_recovery_on_startup(
     use super::objective::{DecisionRouter, ObjectiveStatus, RouteSignal};
 
     let now = chrono::Utc::now().timestamp_millis();
-    let candidates = super::provider_recovery::ProviderRecoveryStore::new(pool.clone())
-        .startup_recovery_candidates(now)
+    let provider = super::provider_recovery::ProviderRecoveryStore::new(pool.clone());
+    provider
+        .reconcile_stale_effect_free_in_flight(now)
         .await?;
+    let candidates = provider.startup_recovery_candidates(now).await?;
     let store = ObjectiveStore::new(pool.clone());
     let mut reconciled = 0;
     for candidate in candidates {
@@ -884,7 +886,7 @@ async fn resume_browser_objective(
 /// unresolved provider side effect/output can be replayed reaches the Chat
 /// executor. Auth additionally requires a current-revision capability receipt;
 /// neither path treats an identity-shaped Objective as sufficient proof.
-async fn require_provider_resume_evidence(
+pub(crate) async fn require_provider_resume_evidence(
     pool: &SqlitePool,
     objective_id: &str,
     require_auth_receipt: bool,
@@ -2576,6 +2578,227 @@ mod tests {
                 .to_string()
                 .contains("ObserveOnlyPartial")
         );
+    }
+
+    /// Production-shaped restart boundary for an unattended coding turn:
+    /// round one produced a tool call whose exact side-effect receipt is
+    /// committed, then the process died after POSTing round two but before any
+    /// bytes or tool intent were observed. Historical turn latches must not
+    /// make that latest effect-free request permanently unrecoverable.
+    #[tokio::test]
+    async fn startup_effect_free_provider_request_after_committed_tool_is_retry_safe() {
+        use crate::agent::provider_recovery::{
+            ProviderAttemptSpec, ProviderEpisodeSpec, ProviderOwnerPermit,
+            ProviderRecoveryDisposition, ProviderRecoveryStore,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-provider-restart-safe".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-provider-restart-safe".into()),
+                root_turn_id: Some("turn-provider-restart-safe".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('binding-provider-restart-safe', ?, 'chat', 'chat_root_turn', ?,
+                     1, 'sha256:provider-restart-safe', ?, ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance, created_at, updated_at)
+             VALUES ('run-provider-restart-safe', ?, ?, ?, 1, 'active',
+                     'dead-process', ?, ?)",
+        )
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let permit = ProviderOwnerPermit::chat_run(
+            &objective.id,
+            1,
+            "binding-provider-restart-safe",
+            1,
+            "run-provider-restart-safe",
+            1,
+        );
+        let provider = ProviderRecoveryStore::new(pool.clone());
+        provider
+            .open_episode(
+                &permit,
+                &ProviderEpisodeSpec {
+                    id: "episode-provider-restart-safe".into(),
+                    session_id: objective.session_id.clone().unwrap(),
+                    root_turn_id: objective.root_turn_id.clone().unwrap(),
+                    policy: "fixed".into(),
+                    candidate_snapshot_digest:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .into(),
+                    candidate_snapshot_json:
+                        r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
+                    resume_cursor: objective.root_turn_id.clone().unwrap(),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        provider
+            .begin_attempt(
+                &permit,
+                &ProviderAttemptSpec {
+                    id: "attempt-provider-tool-call".into(),
+                    episode_id: "episode-provider-restart-safe".into(),
+                    endpoint: "test".into(),
+                    model: "test-model".into(),
+                    request_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .into(),
+                    resume_cursor: objective.root_turn_id.clone().unwrap(),
+                },
+                now + 1,
+            )
+            .await
+            .unwrap();
+        provider
+            .mark_in_flight(&permit, "attempt-provider-tool-call", now + 2)
+            .await
+            .unwrap();
+        provider
+            .commit_response(
+                &permit,
+                "attempt-provider-tool-call",
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "tool call",
+                false,
+                now + 3,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, binding_id, revision, action_fingerprint,
+              idempotency_key, status, created_at, observed_at)
+             VALUES ('receipt-provider-restart-safe', ?, 'binding-provider-restart-safe', 1,
+                     'tool:write_file', 'write-once', 'started', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now + 4)
+        .bind(now + 4)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE objectives SET side_effect_started=1 WHERE id=?;
+             UPDATE objective_bindings SET side_effect_started=1
+              WHERE id='binding-provider-restart-safe'",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        provider
+            .begin_attempt(
+                &permit,
+                &ProviderAttemptSpec {
+                    id: "attempt-provider-crash-left".into(),
+                    episode_id: "episode-provider-restart-safe".into(),
+                    endpoint: "test".into(),
+                    model: "test-model".into(),
+                    request_digest:
+                        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                            .into(),
+                    resume_cursor: objective.root_turn_id.clone().unwrap(),
+                },
+                now + 5,
+            )
+            .await
+            .unwrap();
+        provider
+            .mark_in_flight(&permit, "attempt-provider-crash-left", now + 6)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE chat_run_controls SET status='completed', settled_at=?, updated_at=?
+             WHERE run_instance_id='run-provider-restart-safe'",
+        )
+        .bind(now + 7)
+        .bind(now + 7)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A receipt that was only started is still uncertain. The startup
+        // reconciler must leave the provider request fenced until that exact
+        // side effect has a terminal observation.
+        assert_eq!(
+            provider
+                .reconcile_stale_effect_free_in_flight(now + 8)
+                .await
+                .unwrap(),
+            0
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM provider_route_attempts
+             WHERE id='attempt-provider-crash-left'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "in_flight");
+        sqlx::query(
+            "UPDATE side_effect_receipts
+             SET status='committed', observed_at=?
+             WHERE id='receipt-provider-restart-safe'",
+        )
+        .bind(now + 9)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reconcile_provider_recovery_on_startup(&pool).await.unwrap(),
+            1
+        );
+        let current = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(current.domain, RecoveryDomain::Provider);
+        assert_eq!(
+            current.failure_code.as_deref(),
+            Some("provider_retry_safe_after_restart")
+        );
+        assert!(matches!(
+            provider.observe(&objective.id).await.unwrap(),
+            ProviderRecoveryDisposition::RetrySafe { attempt_id, .. }
+                if attempt_id == "attempt-provider-crash-left"
+        ));
     }
 
     #[tokio::test]
