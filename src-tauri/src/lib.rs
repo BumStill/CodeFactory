@@ -63,6 +63,75 @@ impl ChatRunControl {
 /// cancellation handles — stopping a chat turn never cancels delegated tasks.
 pub type ChatCancelMap = Arc<Mutex<HashMap<String, Arc<ChatRunControl>>>>;
 
+/// Execute historical-session continuation and durable-stop restart oracles
+/// before Tauri initializes. Parent and workers are the exact same executable.
+#[cfg(not(test))]
+pub fn run_history_session_smoke_cli() -> bool {
+    let args = std::env::args().collect::<Vec<_>>();
+    let Some(flag) = args.get(1).map(String::as_str) else {
+        return false;
+    };
+    if !matches!(flag, "--history-session-smoke" | "--history-session-worker") {
+        return false;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Historical session smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    match flag {
+        "--history-session-smoke" => {
+            if args.len() != 3 {
+                eprintln!("usage: CodeFactory --history-session-smoke <receipt.json>");
+                std::process::exit(2);
+            }
+            let output = std::path::PathBuf::from(&args[2]);
+            match runtime.block_on(agent::history_session_smoke::run_parent()) {
+                Ok(receipt) => {
+                    let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+                    if let Err(error) = std::fs::write(&output, rendered.as_bytes()) {
+                        eprintln!(
+                            "Historical session smoke could not write {}: {error}",
+                            output.display()
+                        );
+                        std::process::exit(1);
+                    }
+                    println!("{rendered}");
+                    true
+                }
+                Err(error) => {
+                    let receipt = serde_json::json!({
+                        "ok": false,
+                        "scenario_ids": ["E2E-002", "E2E-003"],
+                        "error": error.to_string(),
+                    });
+                    let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+                    let _ = std::fs::write(&output, rendered.as_bytes());
+                    eprintln!("Historical session smoke failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "--history-session-worker" => {
+            if args.len() != 4 {
+                eprintln!("usage: CodeFactory --history-session-worker <state-dir> <phase>");
+                std::process::exit(2);
+            }
+            let state_dir = std::path::PathBuf::from(&args[2]);
+            if let Err(error) = runtime.block_on(agent::history_session_smoke::run_worker(
+                &state_dir, &args[3],
+            )) {
+                eprintln!("Historical session worker failed: {error}");
+                std::process::exit(1);
+            }
+            true
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Execute the network-hermetic, cross-process long-task contract before
 /// Tauri initializes. Both the parent and its internal workers are copies of
 /// this exact formal executable, so release CI never substitutes a test EXE.

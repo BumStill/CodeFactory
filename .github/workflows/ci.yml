@@ -98,6 +98,10 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:unattended-contract
 
+      - name: Historical session restart scenario contract
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:history-session-contract
+
       - name: README contract
         if: ${{ !cancelled() }}
         env:
@@ -291,6 +295,34 @@ jobs:
           if ($smoke.provider_request_count -lt 5) { throw "The deterministic provider trajectory was incomplete" }
           if (-not $smoke.artifact_verified) { throw "The recovered workspace was not verified" }
           if (-not $smoke.cleanup_ok) { throw "The unattended smoke leaked isolated state" }
+          Get-Content $receipt
+
+      # E2E-002/E2E-003: use production SQLite admission and cancellation
+      # through six copies of this exact executable. This catches restart-only
+      # failures that reducer and WebView-mock tests cannot observe.
+      - name: Historical session continue/stop cross-process smoke
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "history-session-smoke.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --history-session-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Historical session smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if (-not $smoke.ok) { throw "Historical session smoke did not report ok" }
+          if (@($smoke.scenario_ids) -notcontains "E2E-002") { throw "Historical continue scenario was not exercised" }
+          if (@($smoke.scenario_ids) -notcontains "E2E-003") { throw "Historical stop scenario was not exercised" }
+          if ($smoke.process_restart_count -lt 5) { throw "The smoke did not cross enough process restarts" }
+          if (-not $smoke.stop_request_was_hard_killed) { throw "The durable stop fence was not followed by a hard kill" }
+          if (-not $smoke.same_objective) { throw "Historical continue created a different Objective" }
+          if ($smoke.continuation_objective_count -ne 1) { throw "Historical continue duplicated its Objective" }
+          if ($smoke.continuation_user_message_count -ne 2) { throw "Historical continue lost or duplicated user input" }
+          if ($smoke.continuation_bound_turn_count -ne 2) { throw "Historical continue did not bind both turns" }
+          if (-not $smoke.history_outside_recent_page) { throw "The fixture did not exceed the recent message page" }
+          if (-not $smoke.all_live_objectives_cancelled) { throw "Session stop left a live Objective" }
+          if ($smoke.explicit_cancel_count -ne 3) { throw "Session stop did not cancel every owned Objective" }
+          if ($smoke.claimable_remediation_count -ne 0) { throw "A cancelled remediation remained claimable" }
+          if (-not $smoke.second_restart_stayed_cancelled) { throw "A cancelled Objective revived after the second restart" }
+          if (-not $smoke.cleanup_ok) { throw "Historical session smoke leaked isolated state" }
           Get-Content $receipt
 
       # The browser CLI may report an action error with exit code 0. Exercise

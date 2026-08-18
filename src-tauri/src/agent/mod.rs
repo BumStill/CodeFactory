@@ -15,6 +15,8 @@ pub mod dispatch;
 pub mod events;
 mod fact_checker;
 pub mod failover;
+#[cfg(not(test))]
+pub(crate) mod history_session_smoke;
 pub mod hooks;
 mod internal_text;
 pub mod journal;

@@ -186,12 +186,13 @@ Scenario-Test: HLT-003, HLT-004
 
 ## 实施顺序
 
-1. 本变更：统一 18 个场景，加入 validator、PR 声明门和 6 个复杂 E2E 设计；
-2. 优先自动化 E2E-003、E2E-002，因为它们直接覆盖最近的停止/继续回归；
+1. 已完成：统一 18 个场景，加入 validator、PR 声明门和 6 个复杂 E2E 设计；
+2. 已完成第一阶段：E2E-003、E2E-002 使用同一正式二进制和真实 SQLite，在 required Windows CI、nightly、release exact executable 覆盖分页历史、无内存控制、hard kill、session 全量取消和两次重启；当前状态为 `partially_implemented`；
 3. 把现有 unattended smoke 和 browser smoke 扩展成 E2E-001/E2E-005 完整 oracle；
 4. 建立 fake-forge，自动化 E2E-004；
 5. 在 Windows release runner 建前一版本升级 fixture，自动化 E2E-006；
-6. 当 6 个 case 均达到声明层级后，将 P0 release gate 从设计状态提升为硬阻断。
+6. 补齐 E2E-002/E2E-003 的真实 WebView L3、旧 schema 迁移矩阵和部分投影失败并发，再提升为 `implemented`；
+7. 当 6 个 case 均达到声明层级后，将 P0 release gate 从设计状态提升为硬阻断。
 
 ## 验收标准
 
@@ -201,7 +202,7 @@ Scenario-Test: HLT-003, HLT-004
 - 原历史场景目录不再维护第二份场景数据，只保留 canonical registry 指针；
 - 18 个现有场景和 6 个复杂 E2E 设计可由机器读取；
 - E2E-001 明确保证无人参与执行；
-- 未完成自动化的 case 明确标注 `designed`，不得报告为已覆盖。
+- 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`，不得报告为全覆盖。
 
 ## 风险与边界
 
