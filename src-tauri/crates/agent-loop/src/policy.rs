@@ -272,16 +272,33 @@ pub fn completion_finalization(
 
 /// User-facing system-owned failure notice when a chat turn exhausts completion
 /// recovery without complete verification. Chinese, plain language, no gate
-/// terminology; the raw blocker list goes to the log only. It deliberately has
-/// no "reply continue" escape hatch: technical recovery is the platform's job.
+/// terminology. It deliberately has no "reply continue" escape hatch: technical
+/// recovery is the platform's job.
+///
+/// The sentence follows the evidence instead of asserting one fixed story. A
+/// turn that changed nothing used to be told its "modifications" lacked
+/// verification, which is how pure-analysis turns ended up hunting for evidence
+/// of work they never did. The unmet checks ship with the warning rather than
+/// going to the log alone, because a user staring at a stopped turn otherwise
+/// has no way to tell what the gate wanted.
 pub fn unverified_release_warning(evidence: &CompletionEvidence) -> String {
     tracing::info!(
         "releasing chat turn with unverified blockers: {}",
         evidence.blockers.join("; ")
     );
-    "⚠ 本轮任务未完成：修改后仍有检查未复验，或失败检查尚未修复并重跑。\
-系统已将本轮记录为内部失败；以上内容仅为阶段性结果，不代表任务完成。"
-        .to_string()
+    let cause = if evidence.last_mutation_sequence.is_some() {
+        "修改后仍有检查未复验，或失败检查尚未修复并重跑"
+    } else {
+        "本轮未修改任何文件，但要求的检查没有跑通"
+    };
+    let mut warning = format!(
+        "⚠ 本轮任务未完成：{cause}。系统已将本轮记录为内部失败；以上内容仅为阶段性结果，不代表任务完成。"
+    );
+    if !evidence.blockers.is_empty() {
+        warning.push_str("\n未满足的检查：");
+        warning.push_str(&evidence.blockers.join("；"));
+    }
+    warning
 }
 
 pub fn completion_blocked_message(evidence: &CompletionEvidence) -> String {
@@ -904,6 +921,31 @@ pub fn autonomous_budget_denial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unverified_release_warning_never_invents_modifications_and_names_the_blockers() {
+        // A read-only turn that exhausts recovery must not be told a story about
+        // unverified modifications it never made: that fixed sentence is what sent
+        // pure-analysis turns chasing verification evidence for work that does not
+        // exist. The real blockers stop being log-only so the user can see why.
+        let mut read_only = CompletionGate::new(true).evidence();
+        read_only.last_mutation_sequence = None;
+        read_only.blockers = vec!["at least one successful verification is required".to_owned()];
+        let warning = unverified_release_warning(&read_only);
+        assert!(!warning.contains("修改后"), "read-only turn claimed modifications: {warning}");
+        assert!(warning.contains("未修改"), "read-only turn must say so: {warning}");
+        assert!(
+            warning.contains("successful verification"),
+            "the real blocker must reach the user: {warning}"
+        );
+
+        // A turn that did mutate keeps the modification-shaped wording.
+        let mut mutated = CompletionGate::new(true).evidence();
+        mutated.last_mutation_sequence = Some(7);
+        mutated.blockers = vec!["at least one successful verification is required".to_owned()];
+        let warning = unverified_release_warning(&mutated);
+        assert!(warning.contains("修改"), "mutation turn lost its wording: {warning}");
+    }
 
     #[test]
     fn inspection_budget_denies_only_exhausted_read_only_calls() {

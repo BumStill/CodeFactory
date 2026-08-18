@@ -163,6 +163,51 @@ describe("MessageList structured progress and result", () => {
     }
   });
 
+  it("retires the progress banner once the objective hands the turn back to the user", () => {
+    // technical_recovery_exhausted settles the objective into waiting_core_input:
+    // the system is done and the user must type. The banner must not keep
+    // advertising a next step, a live timer and an ETA for a turn nobody is running.
+    const activity = {
+      rootTurnId: "user",
+      revision: 52,
+      phase: "waiting",
+      status: "waiting_core_input",
+      kind: "technical_recovery_exhausted",
+      label: "系统多轮自动恢复没有进展，已停止并把当前结论交还给你",
+      waitingReason: "technical_recovery_exhausted",
+      updatedAt: Date.now(),
+      terminalReason: "technical_recovery_exhausted",
+      objectiveId: "objective-1",
+      objectiveStatus: "waiting_core_input",
+    } as UIMessage["turnActivity"] & {
+      objectiveId: string;
+      objectiveStatus: "waiting_core_input";
+    };
+
+    render(
+      <MessageList
+        messages={[
+          { id: "user", role: "user", content: "只读分析", createdAt: 1 },
+          {
+            id: "assistant",
+            role: "assistant",
+            content: "分析结论如上，当前未修改代码。",
+            createdAt: Date.now() - 10_000,
+            plan,
+            turnActivity: activity,
+          },
+        ]}
+        streaming={false}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.queryByTestId("turn-progress")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("turn-activity-progress")).not.toBeInTheDocument();
+    expect(screen.queryByText(/下一步 · /)).not.toBeInTheDocument();
+    expect(screen.queryByText(/预计还需/)).not.toBeInTheDocument();
+  });
+
   it("keeps a long-tool waiting reason visible even when a structured plan exists", () => {
     const running = messages(false);
     running[1] = {

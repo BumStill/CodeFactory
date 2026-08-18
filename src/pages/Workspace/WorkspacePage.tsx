@@ -40,6 +40,7 @@ import { useTasksStore } from "../../stores/tasks";
 import type { BrowserSession, TaskRun, VerificationResult } from "../../lib/tauri";
 import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
+import { systemOwnsObjective } from "../../lib/turnOwnership";
 
 type WorkspaceBrowserSession = BrowserSession & {
   status?: string | null;
@@ -224,12 +225,9 @@ export function WorkspacePage({
   // Same predicate the progress banner uses to decide it is still working.
   const systemHoldsTurn = useMemo(
     () =>
-      messages.some((message) => {
-        const status = message.turnActivity?.objectiveStatus;
-        return Boolean(
-          status && !["waiting_core_input", "completed", "cancelled", "legacy_orphan"].includes(status),
-        );
-      }),
+      messages.some((message) =>
+        systemOwnsObjective(message.turnActivity?.objectiveStatus),
+      ),
     [messages],
   );
   const turnInFlight = activeDraft
