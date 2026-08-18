@@ -44,6 +44,8 @@
 | CF-ORC-R33 | 每个 fence 资源必须有明确的释放责任人和释放时机，不得只靠"下一次准入顺手关闭"。回合结束时必须释放该回合证据已确定的 provider episode（无未结副作用且所有 attempt 已终态）；`prepared`/`in_flight`/`streaming`/`unknown` 或存在未结副作用时保持关闭，交由 supervisor 观察 | 回合结算释放测试 + 不确定证据保持 fenced 的负例 |
 | CF-ORC-R34 | 只读 bash 探查（含 `&&`/`;`/管道/丢弃型重定向的复合命令）不得被判定为需要观察契约的外部变更；判定按 segment 逐段进行，任一段不在只读白名单、含真实重定向、含命令替换或后台 `&` 则整条命令继续 fenced | 复合只读命令与逐段 fence 的双向单测 |
 | CF-ORC-R35 | system-owned 恢复必须有界。持久 remediation 历史按 `(objective, recovery_generation, failure_signature)` 在一次用户授权代际内累计计数，并对该代际设总量兜底；任一上限达成后不得再排下一次 observation，必须以 `technical_recovery_exhausted` 进入 typed core input 等待并结算 transport turn。计数不因 failure code 变化而重置；用户明确新输入续接 exhausted Objective 时保留同一 Objective 与全部历史、递增 `recovery_generation` 并获得一份新的有界预算；用户驱动的 remediation（`apply_recommended` 与 `resume_authorized_action`）不计入预算 | 上限/同代签名抖动/跨代续接/再次耗尽/证据门禁/权限豁免单测 + 真实 app 复现 |
+| CF-ORC-R36 | `update_plan` 等只修改 CodeFactory 事务型控制面的工具保持 Mutation capability，但不得创建外部副作用 receipt；校验拒绝必须确定为未应用，plan revision、Objective side-effect latch 和后续工具准入均不得被污染 | 真实 ToolBackend + SQLite plan revision/receipt sequence |
+| CF-ORC-R37 | `technical_recovery_exhausted` 必须在同一 SQLite 事务结算 `chat_turn_state.turn_settled_at/stream_closed_at`、精确 run-control 与非终态 tool projection；Objective 保持 `waiting_core_input`，unknown receipt 保持审计真相但不得继续呈现为运行中 | ObjectiveStore fault injection + cross-process restart smoke + browser integration |
 
 ## 恢复有界性（CF-ORC-R35）
 

@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Real-browser acceptance entry for turn handback. It mounts the production
-// MessageList with bounded fixtures so browser layout decides whether the
-// progress banner is actually gone — jsdom renders no CSS, so a banner that
-// merely moved or collapsed would still read as "absent" there.
+// production reducer, MessageList, ToolCallCard and MessageInput with bounded
+// fixtures so browser layout decides whether every in-flight surface actually
+// converges after durable handback.
 
 import React from "react";
 import { createRoot } from "react-dom/client";
 
 import "../styles/globals.css";
 import { MessageList } from "../components/MessageList";
+import { MessageInput } from "../components/MessageInput";
 import type { TurnPlan } from "../lib/chatPlan";
-import type { UIMessage } from "../stores/chatEvents";
+import {
+  reduceChatStreamEvent,
+  type ChatEventState,
+  type UIMessage,
+} from "../stores/chatEvents";
 
 const plan: TurnPlan = {
   rootTurnId: "user",
@@ -28,7 +33,14 @@ const plan: TurnPlan = {
 
 // The turn this whole change came from: recovery exhausted, objective settled
 // into waiting_core_input, nothing running, the user must type.
-const handedBack: UIMessage[] = [
+const beforeHandback: ChatEventState = {
+  streaming: true,
+  inputTokenTotal: 0,
+  outputTokenTotal: 0,
+  pendingPermission: null,
+  contextUsage: null,
+  compressionToast: null,
+  messages: [
   { id: "user", role: "user", content: "只读分析输入框与弹层问题", createdAt: Date.now() - 9 * 60 * 1000 },
   {
     id: "assistant",
@@ -37,21 +49,49 @@ const handedBack: UIMessage[] = [
     createdAt: Date.now() - 10_000,
     durationMs: 6 * 60 * 1000,
     plan,
+    toolCalls: [{
+      id: "audit-tool",
+      name: "bash",
+      args: "set -euo pipefail; git diff --check; git status --short",
+      result: "external_state_uncertain",
+      status: "waiting",
+    }],
+    segments: [{ kind: "tool", toolCallId: "audit-tool" }],
     turnActivity: {
       rootTurnId: "user",
-      revision: 52,
-      phase: "waiting",
-      status: "waiting_core_input",
-      kind: "technical_recovery_exhausted",
-      label: "系统多轮自动恢复没有进展，已停止并把当前结论交还给你",
-      waitingReason: "technical_recovery_exhausted",
-      updatedAt: Date.now(),
-      terminalReason: "technical_recovery_exhausted",
+      revision: 51,
+      phase: "recovering",
+      status: "active",
+      kind: "tool",
+      label: "正在恢复工具状态",
+      waitingReason: "工具状态待确认",
+      updatedAt: Date.now() - 1,
+      terminalReason: null,
       objectiveId: "objective-handback",
-      objectiveStatus: "waiting_core_input",
+      objectiveStatus: "waiting_system",
     } as UIMessage["turnActivity"],
   },
-];
+  ],
+};
+
+const handedBack = reduceChatStreamEvent(
+  beforeHandback,
+  {
+    type: "turn_activity_updated",
+    root_turn_id: "user",
+    revision: 52,
+    phase: "waiting",
+    status: "waiting_core_input",
+    recent_activity_kind: "technical_recovery_exhausted",
+    recent_activity_label: "系统多轮自动恢复没有进展，已停止并把当前结论交还给你",
+    waiting_reason: "technical_recovery_exhausted",
+    updated_at: Date.now(),
+    terminal_reason: "technical_recovery_exhausted",
+    objective_id: "objective-handback",
+    objective_status: "waiting_core_input",
+  },
+  "assistant",
+);
 
 // The guard against over-suppression: a turn that really is running keeps its
 // banner, its next step and its estimate.
@@ -88,14 +128,30 @@ function Panel({ title, children }: { title: string; children: React.ReactNode }
   );
 }
 
+function Composer({ streaming }: { streaming: boolean }) {
+  return (
+    <div className="shrink-0 px-3 pb-3">
+      <MessageInput
+        onSend={() => {}}
+        onCancel={() => {}}
+        streaming={streaming}
+        disabled={false}
+        cwd={null}
+      />
+    </div>
+  );
+}
+
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <main aria-label="Turn handback acceptance" className="flex flex-col gap-4 bg-surface-0">
       <Panel title="Handed back to the user">
-        <MessageList messages={handedBack} streaming={false} cwd={null} />
+        <MessageList messages={handedBack.messages} streaming={handedBack.streaming} cwd={null} />
+        <Composer streaming={handedBack.streaming} />
       </Panel>
       <Panel title="Still running">
         <MessageList messages={running} streaming cwd={null} />
+        <Composer streaming />
       </Panel>
     </main>
   </React.StrictMode>,

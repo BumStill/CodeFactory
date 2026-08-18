@@ -91,6 +91,7 @@ jobs:
           if (-not $smoke.all_live_objectives_cancelled) { throw "Nightly session stop left a live Objective" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "Nightly left claimable cancellation recovery" }
           if (-not $smoke.second_restart_stayed_cancelled) { throw "Nightly cancellation revived after the second restart" }
+          if (-not $smoke.handback_survived_two_restarts) { throw "Nightly handback revived after restart" }
           if (-not $smoke.cleanup_ok) { throw "Nightly historical session smoke leaked isolated state" }
           Get-Content $receipt
 

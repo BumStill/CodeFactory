@@ -297,10 +297,9 @@ jobs:
           if (-not $smoke.cleanup_ok) { throw "The unattended smoke leaked isolated state" }
           Get-Content $receipt
 
-      # E2E-002/E2E-003: use production SQLite admission and cancellation
-      # through six copies of this exact executable. This catches restart-only
-      # failures that reducer and WebView-mock tests cannot observe.
-      - name: Historical session continue/stop cross-process smoke
+      # E2E-002/E2E-003/E2E-007: use production SQLite admission, cancellation
+      # and recovery exhaustion through distinct copies of this exact executable.
+      - name: Historical session continue/stop/handback cross-process smoke
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
@@ -311,6 +310,7 @@ jobs:
           if (-not $smoke.ok) { throw "Historical session smoke did not report ok" }
           if (@($smoke.scenario_ids) -notcontains "E2E-002") { throw "Historical continue scenario was not exercised" }
           if (@($smoke.scenario_ids) -notcontains "E2E-003") { throw "Historical stop scenario was not exercised" }
+          if (@($smoke.scenario_ids) -notcontains "E2E-007") { throw "Recovery handback scenario was not exercised" }
           if ($smoke.process_restart_count -lt 5) { throw "The smoke did not cross enough process restarts" }
           if (-not $smoke.stop_request_was_hard_killed) { throw "The durable stop fence was not followed by a hard kill" }
           if (-not $smoke.same_objective) { throw "Historical continue created a different Objective" }
@@ -322,6 +322,7 @@ jobs:
           if ($smoke.explicit_cancel_count -ne 3) { throw "Session stop did not cancel every owned Objective" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "A cancelled remediation remained claimable" }
           if (-not $smoke.second_restart_stayed_cancelled) { throw "A cancelled Objective revived after the second restart" }
+          if (-not $smoke.handback_survived_two_restarts) { throw "A handed-back turn revived after restart" }
           if (-not $smoke.cleanup_ok) { throw "Historical session smoke leaked isolated state" }
           Get-Content $receipt
 

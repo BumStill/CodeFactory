@@ -20,18 +20,20 @@ test("the formal binary exposes the historical session restart smoke", async () 
   assert.ok(lib.includes("history_session_smoke::run_parent"));
 });
 
-test("required Windows CI runs the cross-process continue and stop oracle", async () => {
+test("required Windows CI runs the cross-process continue, stop and handback oracle", async () => {
   const ci = await source(".github/workflows/ci.yml");
   for (const marker of [
-    "Historical session continue/stop cross-process smoke",
+    "Historical session continue/stop/handback cross-process smoke",
     "--history-session-smoke",
     "E2E-002",
     "E2E-003",
+    "E2E-007",
     "same_objective",
     "stop_request_was_hard_killed",
     "all_live_objectives_cancelled",
     "second_restart_stayed_cancelled",
     "claimable_remediation_count",
+    "handback_survived_two_restarts",
   ]) {
     assert.ok(ci.includes(marker), `required CI is missing ${marker}`);
   }
@@ -44,6 +46,7 @@ test("nightly repeats the historical session restart fault path", async () => {
     "--history-session-smoke",
     "stop_request_was_hard_killed",
     "second_restart_stayed_cancelled",
+    "handback_survived_two_restarts",
     "Upload historical session receipt",
   ]) {
     assert.ok(nightly.includes(marker), `nightly is missing ${marker}`);
@@ -58,14 +61,16 @@ test("the exact Windows release executable runs the same smoke", async () => {
     "build_git_sha",
     "stop_request_was_hard_killed",
     "second_restart_stayed_cancelled",
+    "E2E-007",
+    "handback_survived_two_restarts",
   ]) {
     assert.ok(release.includes(marker), `release is missing ${marker}`);
   }
 });
 
-test("the registry maps both E2E cases to the executable without overstating L3", async () => {
+test("the registry maps all historical E2E cases to the executable without overstating L3", async () => {
   const registry = JSON.parse(await source("docs/testing/scenario-registry.json"));
-  for (const id of ["E2E-002", "E2E-003"]) {
+  for (const id of ["E2E-002", "E2E-003", "E2E-007"]) {
     const scenario = registry.complex_e2e_cases.find((item) => item.id === id);
     assert.ok(scenario, `${id} is missing`);
     assert.equal(scenario.automation_status, "partially_implemented");
