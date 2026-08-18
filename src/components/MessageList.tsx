@@ -427,7 +427,9 @@ export function MessageList({
         .find((message) => message.role === "assistant")
     : undefined;
   const projectedActiveTurnMessage =
-    activeTurnMessage?.turnActivity?.rootTurnId || activeTurnMessage?.plan?.rootTurnId
+    activeTurnMessage?.rootTurnId ||
+    activeTurnMessage?.turnActivity?.rootTurnId ||
+    activeTurnMessage?.plan?.rootTurnId
       ? activeTurnMessage
       : [...visible]
           .reverse()
@@ -438,6 +440,7 @@ export function MessageList({
               systemOwnsObjective(message.turnActivity?.objectiveStatus),
           );
   const activeRootTurnId =
+    projectedActiveTurnMessage?.rootTurnId ??
     projectedActiveTurnMessage?.turnActivity?.rootTurnId ??
     projectedActiveTurnMessage?.plan?.rootTurnId;
   const activeRootMessage = activeRootTurnId

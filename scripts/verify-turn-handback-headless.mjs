@@ -159,6 +159,12 @@ async function main() {
         && !(await running.textContent() ?? "").includes("运行中 ·"),
       "the body must not keep either legacy running indicator",
     );
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    assert(
+      await inlineStatus.locator("svg").evaluate((icon) => getComputedStyle(icon).animationName) === "none",
+      "the inline activity icon must stop animating when reduced motion is requested",
+    );
+    await page.emulateMedia({ reducedMotion: "no-preference" });
 
     await page.screenshot({ path: path.join(artifactDir, "turn-handback-wide.png"), fullPage: true });
     await page.setViewportSize({ width: 430, height: 780 });
@@ -180,6 +186,7 @@ async function main() {
         runningTurnKeepsItsBanner: true,
         runningTurnKeepsOneInlineReceipt: true,
         inlineReceiptFitsNarrowViewport: true,
+        reducedMotionStopsInlineIcon: true,
       },
     }, null, 2));
   } finally {

@@ -632,6 +632,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       id: assistantMsgId,
       role: "assistant",
       content: "",
+      rootTurnId: exactRootTurnId,
       toolCalls: [],
       createdAt: Date.now(),
     };
@@ -1389,6 +1390,10 @@ function splitAssistantTurnAfterSteer(
       id: crypto.randomUUID(),
       role: "assistant",
       content: "",
+      rootTurnId:
+        settled.rootTurnId ??
+        settled.turnActivity?.rootTurnId ??
+        settled.plan?.rootTurnId,
       createdAt: now,
     };
     messages.push(resumed);

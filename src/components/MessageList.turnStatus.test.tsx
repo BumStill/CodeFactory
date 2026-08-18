@@ -212,7 +212,6 @@ describe("inline active-turn status", () => {
               waitingReason: null,
               updatedAt: NOW,
               terminalReason: null,
-              objectiveStatus: "active",
             },
           }),
           {
@@ -221,7 +220,11 @@ describe("inline active-turn status", () => {
             content: "换个方向",
             createdAt: NOW - 10_000,
           },
-          assistant({ id: "assistant-after-steer", createdAt: NOW - 9_000 }),
+          assistant({
+            id: "assistant-after-steer",
+            createdAt: NOW - 9_000,
+            rootTurnId: "root-user",
+          }),
         ]}
         streaming
         turnActive
