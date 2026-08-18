@@ -23,6 +23,7 @@
     "test:usage:headless": "node scripts/verify-token-usage-headless.mjs",
     "test:attachments:asset-scope": "node scripts/verify-attachment-asset-scope.mjs",
     "test:reconnect-banner:headless": "node scripts/verify-reconnect-banner-headless.mjs",
+    "test:turn-handback:headless": "node scripts/verify-turn-handback-headless.mjs",
     "test:streaming-markdown:headless": "node scripts/verify-streaming-markdown-headless.mjs",
     "test:permission-mode:headless": "node scripts/verify-permission-mode-headless.mjs",
     "test:startup-session:headless": "node scripts/verify-startup-session-headless.mjs",
