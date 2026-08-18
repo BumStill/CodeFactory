@@ -1,0 +1,383 @@
+{
+  "schema_version": 1,
+  "source_policy": "aggregate-shapes-only",
+  "privacy": {
+    "allowed": [
+      "aggregate counts",
+      "typed state transitions",
+      "synthetic prompts",
+      "synthetic repositories and paths",
+      "redacted failure signatures"
+    ],
+    "forbidden": [
+      "session ids",
+      "verbatim conversation content",
+      "local user paths",
+      "credentials",
+      "raw tool arguments from production"
+    ]
+  },
+  "categories": [
+    {"id": "long_task_continuity", "name": "长任务连续性与恢复"},
+    {"id": "conversation_delivery", "name": "对话协作与交付"},
+    {"id": "workspace_session", "name": "工作区与会话体验"},
+    {"id": "content_rendering", "name": "内容输入与呈现"},
+    {"id": "permission_safety", "name": "权限与安全"},
+    {"id": "capability_usage", "name": "能力演进与用量"},
+    {"id": "runtime_lifecycle", "name": "运行时资源生命周期"}
+  ],
+  "evidence_levels": [
+    {"id": "L0", "name": "契约与纯逻辑", "oracle": "字段、状态机和分类规则"},
+    {"id": "L1", "name": "集成", "oracle": "真实 SQLite、provider adapter 和工具边界"},
+    {"id": "L2", "name": "真实进程", "oracle": "独立进程、hard kill、重启和资源回收"},
+    {"id": "L3", "name": "真实桌面主路径", "oracle": "真实 WebView、用户操作和持久化投影"},
+    {"id": "L4", "name": "正式产物", "oracle": "exact release binary、安装、更新和 build identity"}
+  ],
+  "scenarios": [
+    {
+      "id": "HLT-001",
+      "name": "一次授权后跨进程自动完成",
+      "category": "long_task_continuity",
+      "priority": "P0",
+      "source_kind": "anonymized_history_shape",
+      "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/crates/agent-loop/src/*.rs"],
+      "automated_by": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"],
+      "required_evidence": ["L1", "L2", "L4"],
+      "gates": ["pull_request", "nightly", "release_artifact"]
+    },
+    {
+      "id": "HLT-002",
+      "name": "恢复预算按实际 claim 收敛",
+      "category": "long_task_continuity",
+      "priority": "P0",
+      "source_kind": "anonymized_history_shape",
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs"],
+      "automated_by": ["rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling", "rust:repeated_failure_signature_exhausts_system_recovery_and_returns_to_user"],
+      "required_evidence": ["L0", "L1", "L2"],
+      "gates": ["pull_request", "nightly"]
+    },
+    {
+      "id": "HLT-003",
+      "name": "历史 session 中简短继续精确续接",
+      "category": "long_task_continuity",
+      "priority": "P0",
+      "source_kind": "anonymized_history_shape",
+      "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
+      "automated_by": ["rust:arbitrary_real_user_message_links_the_unique_open_objective", "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident"],
+      "required_evidence": ["L1", "L2", "L3"],
+      "gates": ["pull_request", "nightly"]
+    },
+    {
+      "id": "HLT-004",
+      "name": "显式停止跨重启保持终止",
+      "category": "long_task_continuity",
+      "priority": "P0",
+      "source_kind": "anonymized_history_shape",
+      "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
+      "automated_by": ["rust:a_user_stop_reaches_every_live_objective_the_session_still_owns", "rust:crash_left_session_stop_fences_claim_and_is_consumed_on_restart", "rust:durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled"],
+      "required_evidence": ["L1", "L2", "L3"],
+      "gates": ["pull_request", "nightly"]
+    },
+    {
+      "id": "CXD-001",
+      "name": "增量约束仍属于同一长任务",
+      "category": "conversation_delivery",
+      "priority": "P1",
+      "source_kind": "anonymized_history_shape",
+      "change_patterns": ["src-tauri/src/commands/chat.rs", "src-tauri/src/agent/objective.rs", "src/stores/chat.ts"],
+      "automated_by": ["rust:historical_incremental_constraints_land_in_order_on_the_same_long_task", "rust:contextual_root_continues_the_single_open_objective_and_elevates_its_ceiling"],
+      "required_evidence": ["L0", "L1", "L3"],
+      "gates": ["pull_request", "nightly"]
+    },
+    {
+      "id": "CXD-002",
+      "name": "交付证据链决定完成",
+      "category": "conversation_delivery",
+      "priority": "P0",
+      "source_kind": "anonymized_history_shape",
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/delivery*.rs", ".github/workflows/release.yml"],
+      "automated_by": ["rust:receipt_backed_delivery_completion_atomically_completes_run_and_objective", "workflow:Verify Windows release executable unattended long task"],
+      "required_evidence": ["L1", "L2", "L4"],
+      "gates": ["nightly", "release_artifact"]
+    },
+    {
+      "id": "UI-001",
+      "name": "草稿项目选择与 compact composer",
+      "category": "workspace_session",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/components/MessageInput.tsx", "src/pages/Workspace/WorkspacePage.tsx"],
+      "automated_by": ["pnpm:test:draft-project-picker:headless", "path:src/acceptance/draft-project-picker.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["pull_request"]
+    },
+    {
+      "id": "UI-002",
+      "name": "仓库意图展示与操作",
+      "category": "workspace_session",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/pages/Workspace/*.tsx"],
+      "automated_by": ["pnpm:test:repository-intent:headless", "path:src/acceptance/repository-intent.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["manual_canary"]
+    },
+    {
+      "id": "UI-003",
+      "name": "恢复日志与续接状态",
+      "category": "workspace_session",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/pages/Workspace/*.tsx", "src/stores/chat.ts"],
+      "automated_by": ["pnpm:test:resume:headless", "path:src/acceptance/resume-journal.tsx"],
+      "required_evidence": ["L1", "L3"],
+      "gates": ["pull_request"]
+    },
+    {
+      "id": "UI-004",
+      "name": "断线提示与恢复",
+      "category": "workspace_session",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/pages/Workspace/*.tsx", "src/stores/chat.ts"],
+      "automated_by": ["pnpm:test:reconnect-banner:headless", "path:src/acceptance/reconnect-banner.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["manual_canary"]
+    },
+    {
+      "id": "UI-005",
+      "name": "启动后恢复历史会话",
+      "category": "workspace_session",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/App.tsx", "src/stores/chat.ts", "src/pages/Workspace/*.tsx"],
+      "automated_by": ["pnpm:test:startup-session:headless", "path:src/acceptance/startup-session.tsx"],
+      "required_evidence": ["L1", "L3", "L4"],
+      "gates": ["manual_canary"]
+    },
+    {
+      "id": "UI-006",
+      "name": "侧栏展开与长会话导航",
+      "category": "workspace_session",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/components/Sidebar*.tsx", "src/pages/Workspace/*.tsx"],
+      "automated_by": ["pnpm:test:sidebar-expansion:headless", "path:src/acceptance/sidebar-expansion.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["manual_canary"]
+    },
+    {
+      "id": "UI-007",
+      "name": "图片预览与附件边界",
+      "category": "content_rendering",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/components/*Image*.tsx", "src/components/*Attachment*.tsx"],
+      "automated_by": ["pnpm:test:image-preview:headless", "path:src/acceptance/image-preview.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["manual_canary"]
+    },
+    {
+      "id": "UI-008",
+      "name": "流式 Markdown 持续呈现",
+      "category": "content_rendering",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/components/Message*.tsx", "src/components/*Markdown*.tsx", "src/stores/chat.ts"],
+      "automated_by": ["pnpm:test:streaming-markdown:headless", "path:src/acceptance/streaming-markdown.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["manual_canary"]
+    },
+    {
+      "id": "UI-009",
+      "name": "权限模式切换与可见状态",
+      "category": "permission_safety",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs"],
+      "automated_by": ["pnpm:test:permission-mode:headless", "path:src/acceptance/permission-mode.tsx"],
+      "required_evidence": ["L1", "L3"],
+      "gates": ["manual_canary"]
+    },
+    {
+      "id": "UI-010",
+      "name": "Evolution 审核、激活与回滚",
+      "category": "capability_usage",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/pages/Evolution*.tsx", "src-tauri/src/evolution*.rs"],
+      "automated_by": ["pnpm:test:evolution:headless", "binary:--evolution-smoke"],
+      "required_evidence": ["L1", "L2", "L4"],
+      "gates": ["pull_request", "release_artifact"]
+    },
+    {
+      "id": "UI-011",
+      "name": "Token 用量与成本反馈",
+      "category": "capability_usage",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/components/*Usage*.tsx", "src/pages/*Usage*.tsx", "src/stores/usage*.ts"],
+      "automated_by": ["pnpm:test:usage:headless", "path:src/acceptance/usage.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["manual_canary"]
+    },
+    {
+      "id": "RTE-001",
+      "name": "受管浏览器失败后回收会话和租约",
+      "category": "runtime_lifecycle",
+      "priority": "P0",
+      "source_kind": "incident_shape",
+      "change_patterns": ["src-tauri/src/browser/*.rs", "src-tauri/src/tools/browser*.rs"],
+      "automated_by": ["binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke"],
+      "required_evidence": ["L1", "L2", "L4"],
+      "gates": ["pull_request"]
+    }
+  ],
+  "complex_e2e_cases": [
+    {
+      "id": "E2E-001",
+      "name": "用户离开后长任务跨进程自动完成",
+      "priority": "P0",
+      "covers": ["HLT-001", "HLT-002", "CXD-002"],
+      "must_remain_unattended": true,
+      "fixture": {"synthetic": true, "shape": "多文件仓库、失败测试、一次幂等写入、确定性 provider 轨迹"},
+      "steps": [
+        "用户只发送一次包含修改、测试和交付边界的任务",
+        "模型读取、修改并取得一次副作用 receipt",
+        "在 provider/tool 恢复阶段 hard kill 正式进程",
+        "启动替代进程并从同一 SQLite 恢复同一 objective",
+        "自动完成剩余验证并按约定证据边界结算"
+      ],
+      "fault_injection": ["process hard kill", "transient provider failure", "same remediation reclaim", "restart before UI hydration"],
+      "oracles": {
+        "ui": ["状态从 waiting_system 自动推进到 completed，不能显示要求用户继续的技术 CTA"],
+        "durable_state": ["同一 session、root turn、objective 和 receipt", "user message 总数为 1", "human prompt 总数为 0"],
+        "process": ["观察到不同 PID 的替代进程", "终态无 live owner 和 claimable remediation"],
+        "side_effects": ["副作用 receipt 总数为 1", "重复 tool call 只能链接同一 receipt"],
+        "delivery": ["完成前必须具备最新机器验证和约定的 canonical delivery evidence"]
+      },
+      "execution": {"pull_request": "deterministic Windows process smoke", "nightly": "fault matrix", "release_artifact": "exact Windows executable"},
+      "automation_status": "partially_implemented"
+    },
+    {
+      "id": "E2E-002",
+      "name": "历史 session 简短继续精确续接",
+      "priority": "P0",
+      "covers": ["HLT-003", "CXD-001", "UI-003", "UI-005"],
+      "fixture": {"synthetic": true, "shape": "旧版本 SQLite、分页历史消息、唯一开放 objective、无内存 run control"},
+      "steps": [
+        "由旧 schema fixture 启动真实 App",
+        "选择历史 session 并加载第一页消息",
+        "用户发送简短继续",
+        "后端只 admission 唯一开放 objective 并恢复 stream projection",
+        "重启后再次确认没有重复 turn 或 objective"
+      ],
+      "fault_injection": ["missing in-memory cancel/run map", "live objective outside recent message page", "stream listener absent during hydration"],
+      "oracles": {
+        "ui": ["历史 session 可交互，继续后立即出现真实进度"],
+        "durable_state": ["同一 objective/root turn", "ambiguous 多 objective 时 fail closed"],
+        "process": ["App 重启前后均可续接且不依赖旧 PID"],
+        "side_effects": ["同一输入重试只 admission 一次"],
+        "delivery": ["该场景的桌面证据与数据库断言绑定同一 run receipt"]
+      },
+      "execution": {"pull_request": "SQLite plus native UI integration", "nightly": "old-schema matrix", "release_artifact": "installed historical-session canary"},
+      "automation_status": "designed"
+    },
+    {
+      "id": "E2E-003",
+      "name": "显式停止清除整个 session 并跨重启保持",
+      "priority": "P0",
+      "covers": ["HLT-004", "UI-003", "UI-005"],
+      "fixture": {"synthetic": true, "shape": "一个 session 拥有多个不同页上的非终态 objectives"},
+      "steps": [
+        "启动真实 App 并打开历史 session",
+        "在非 streaming 的 active/waiting_system 状态点击停止",
+        "让取消与 supervisor claim、UI projection 并发",
+        "停止完成后 hard kill 并重启 App",
+        "再次重启验证没有 objective 被重新认领"
+      ],
+      "fault_injection": ["partial projection failure", "cancel/claim race", "multiple live objectives", "message pagination hides owner turn"],
+      "oracles": {
+        "ui": ["停止失败时保持停止态并显示错误，成功只由持久 cancelled projection 解锁"],
+        "durable_state": ["session 所有 live objectives 均为 cancelled 和 explicit_cancel"],
+        "process": ["两次重启后 live owner 与 claimable remediation 均为 0"],
+        "side_effects": ["取消操作幂等，重复点击不产生新 objective"],
+        "delivery": ["Windows exact executable 必须生成包含取消后重启断言的 receipt"]
+      },
+      "execution": {"pull_request": "race-focused integration", "nightly": "real App restart", "release_artifact": "Windows installed/manual canary until automated"},
+      "automation_status": "designed"
+    },
+    {
+      "id": "E2E-004",
+      "name": "长任务中追加约束并完成完整交付链",
+      "priority": "P1",
+      "covers": ["CXD-001", "CXD-002", "HLT-001"],
+      "fixture": {"synthetic": true, "shape": "有预存用户改动的 Git 仓库、失败测试、可控 CI 和 artifact receipt"},
+      "steps": [
+        "用户授权实现并发布一个多文件改动",
+        "运行中追加验收约束和一次方向纠正",
+        "首次验证失败后自动诊断、最小修复并复验",
+        "创建 canonical PR 并等待可控 CI 从失败恢复为成功",
+        "合并并生成与 commit SHA 绑定的 synthetic artifact receipt"
+      ],
+      "fault_injection": ["provider reconnect", "test failure after mutation", "CI transient failure", "pre-existing dirty file"],
+      "oracles": {
+        "ui": ["增量约束按顺序可见且同一任务持续推进"],
+        "durable_state": ["同一 objective、delivery run、change set 和 PR identity"],
+        "process": ["等待 CI 时释放本地执行 owner，恢复后继续同一 run"],
+        "side_effects": ["不覆盖预存改动，不创建重复 PR 或重复发布"],
+        "delivery": ["测试、PR、required CI、merge、artifact identity 缺一不可 completed"]
+      },
+      "execution": {"nightly": "local fake-forge end-to-end", "manual_canary": "real governed delivery without external mutation by default"},
+      "automation_status": "designed"
+    },
+    {
+      "id": "E2E-005",
+      "name": "浏览器逻辑失败后回收并可继续任务",
+      "priority": "P0",
+      "covers": ["RTE-001", "HLT-001"],
+      "fixture": {"synthetic": true, "shape": "受管浏览器任务、故意返回逻辑失败的 CLI、后续非浏览器验证步骤"},
+      "steps": [
+        "长任务租用唯一受管浏览器 session",
+        "浏览器成功启动并保存 snapshot",
+        "注入退出码为零但动作结果失败的 CLI 响应",
+        "运行时识别失败、关闭进程树并回收租约",
+        "objective 使用后续安全路径继续并结算"
+      ],
+      "fault_injection": ["logical failure with exit code zero", "browser child process survives parent response", "retry after lease reclaim"],
+      "oracles": {
+        "ui": ["显示真实失败和恢复状态，不把 CLI 零退出当成功"],
+        "durable_state": ["浏览器 lease 终态已回收且 objective 状态可继续"],
+        "process": ["无遗留 browser daemon、CPU 占用进程或过期租约"],
+        "side_effects": ["每次重试分配新 session，旧 session 不可复用"],
+        "delivery": ["receipt 同时记录 snapshot、failure detection 和 cleanup"]
+      },
+      "execution": {"pull_request": "real process lifecycle smoke", "nightly": "failure/retry matrix", "release_artifact": "exact binary smoke"},
+      "automation_status": "partially_implemented"
+    },
+    {
+      "id": "E2E-006",
+      "name": "历史卡住任务存在时仍可完成应用更新",
+      "priority": "P0",
+      "covers": ["HLT-001", "HLT-004", "UI-005"],
+      "fixture": {"synthetic": true, "shape": "旧版本安装、持久 waiting_system objective、可控 updater manifest 和新版本安装包"},
+      "steps": [
+        "旧版本创建可恢复但尚未完成的历史 objective",
+        "关闭旧 App 并由 updater 启动版本切换",
+        "新版本首次启动先消费 durable stop/recovery fence",
+        "确认更新完成且旧进程、旧 owner 不阻塞安装和启动",
+        "再次重启验证版本、数据库和 session 均稳定"
+      ],
+      "fault_injection": ["stale process metadata", "updater restart boundary", "crash between install and first reconciliation", "old schema WAL state"],
+      "oracles": {
+        "ui": ["显示新版本 build identity，历史 session 可打开且状态真实"],
+        "durable_state": ["迁移后 objective 只能恢复或持久终止，不能形成幽灵 owner"],
+        "process": ["旧 executable 无残留锁，新 executable 可启动并完成第二次重启"],
+        "side_effects": ["安装和 schema migration 均幂等，不重复创建 session/objective"],
+        "delivery": ["manifest、安装包、运行中 build SHA 与目标 tag 完全一致"]
+      },
+      "execution": {"nightly": "Windows install-upgrade fixture", "release_artifact": "exact previous-to-current upgrade gate"},
+      "automation_status": "designed"
+    }
+  ]
+}

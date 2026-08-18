@@ -59,6 +59,15 @@
 - 未运行验证命令时，不得声称完成，只能说明已修改并待验证。
 - 本仓库治理基线验证命令：`python tools/governance/validate_repo_governance_baseline.py`。
 
+### 场景测试统一治理（硬规则）
+
+- `docs/testing/scenario-registry.json` 是业务场景、UI acceptance、运行时 smoke、复杂 E2E、证据等级和 gate 的唯一机器权威源；PR/nightly/release 对同一逻辑场景的执行不得重复计数。
+- 修改产品代码的 `feat` / `fix` PR 必须在 PR body 声明 `Scenario-Test: <IDs>`；命中 P0 `change_patterns` 时必须覆盖全部受影响 P0 ID，CI 通过 `tools/governance/validate_scenario_test_governance.py --ci` 阻断漏报。
+- 复杂真实 E2E 必须使用 synthetic fixture，并同时断言 UI、持久状态、真实进程、幂等副作用和交付证据；jsdom、mock AppHandle、窗口打开或 HTTP 200 不能替代完整主路径。
+- 历史 session 只能提取匿名聚合形状，不得写入原始消息、真实 session/objective ID、本机路径、凭据或生产工具参数。
+- 长任务无人参与基线是 `E2E-001`：用户消息总数为 1、human prompt 总数为 0，进程/应用重启后必须自动完成或进入真实不可恢复终态，不能等待用户发送“继续”。
+- 完整规格：`docs/specs/feature-specs/scenario-test-governance.md`。
+
 ### 会话静默禁止规则（硬规则）
 
 **适用范围：** 任何耗时 >30 秒且不产生实时输出的 bash 调用（CI 轮询、cargo build、

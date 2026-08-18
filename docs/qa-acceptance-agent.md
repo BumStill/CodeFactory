@@ -14,11 +14,14 @@
 - Viewport Harness 是否覆盖目标窗口尺寸和关键操作区。
 - Payload Harness 是否覆盖文件、命令输出、SSE chunk、会话导出或网关限制。
 - Compatibility Harness 是否覆盖旧配置、旧会话、旧权限和 provider 差异。
+- PR 声明的 Scenario ID 是否完整，自动化入口与 `docs/testing/scenario-registry.json` 一致。
+- 复杂 E2E 是否把 UI、SQLite/持久状态、PID/进程、幂等副作用和交付结果绑定到同一 run receipt。
 
 ## 拒绝条件
 - 只看到 UI 出现，没有主路径结果。
 - 只看到 HTTP 200，没有字段级断言。
 - 只看到 mock 成功，没有真实或代表性样本。
+- 只看到 jsdom、mock AppHandle 或窗口打开，却声明跨重启、历史 session 或正式版本场景完成。
 - 只看到 deploy 成功，没有 build metadata 和 live verification。
 - 权限、命令、文件写入或凭据路径没有实际 route evidence。
 
