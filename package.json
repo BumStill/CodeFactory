@@ -8,6 +8,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "cargo:shared": "node scripts/cargo-shared.mjs",
+    "test:cargo-shared": "node --test scripts/cargo-shared.test.mjs",
     "test:worktree-lifecycle": "node --test scripts/worktree-cargo-target.test.mjs",
     "worktrees": "node scripts/worktree-janitor.mjs",
     "worktrees:clean": "node scripts/worktree-janitor.mjs --apply --stale-days 7",

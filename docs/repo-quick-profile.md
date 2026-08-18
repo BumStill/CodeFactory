@@ -44,6 +44,7 @@
   - 设计入口：`docs/design/github-main-gates-business-design.md`、`github-main-gates-architecture-design.md`、`github-main-gates-ux-design.md`
 - 跨 worktree 共享 Cargo 缓存：`pnpm cargo:shared -- <cargo arguments>`
   - **裸 `cargo build` / `cargo test` 不走共享缓存**，会在当前 worktree 另起一份数 GB 的 `target/`。长会话优先用上面这条。
+  - 可从仓库根目录或任意子目录运行：wrapper 会剥掉 pnpm 转发的前导 `--`，并在 cargo 自己找不到清单时回退到当前 worktree 的 `src-tauri/` 工作区。在 `src-tauri/` 内、单个 crate 内或显式传 `--manifest-path` 时保持原有作用域。
 - 清理已完结的 worktree：`pnpm worktrees`（只报告）/ `pnpm worktrees:clean`（删已合并且干净的，并清 7 天未动的构建产物）
   - 本仓库一律 squash 合并，`git merge-base --is-ancestor` 会把已合并分支判成未合并；脚本靠「是否存在已合并 PR」来判定，不要用裸 merge-base 自己写清理。
 - PR 合并后清理自己的目录：从其他 checkout 运行 `pnpm worktrees:closeout -- --path <绝对路径> --apply`；该命令只接受 GitHub 已合并 PR，兼容 squash merge。
