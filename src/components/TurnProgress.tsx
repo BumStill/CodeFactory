@@ -10,6 +10,7 @@ import type {
 import { planProgress } from "../lib/chatPlan";
 import { estimateTurnRemaining } from "../lib/turnEstimate";
 import { formatDuration } from "../lib/duration";
+import { humanWaitingReason, isTerminalWaitingReason } from "../lib/waitingReason";
 
 interface Props {
   plan: TurnPlan;
@@ -68,8 +69,12 @@ export function TurnProgress({
     progress.current?.kind === "external_job" && progress.current.externalJobId
       ? externalJobs.find((job) => job.id === progress.current?.externalJobId)
       : null;
-  const effectiveWaitingReason = activityWaitingReason || plan.waitingReason;
+  const rawWaitingReason = activityWaitingReason || plan.waitingReason;
+  const effectiveWaitingReason = humanWaitingReason(rawWaitingReason);
   const waiting = Boolean(effectiveWaitingReason);
+  // A stopped turn has no remaining time to quote. Only a wait that will end
+  // by itself (a build, a long command) keeps its estimate.
+  const stopped = isTerminalWaitingReason(rawWaitingReason);
 
   return (
     <section
@@ -119,9 +124,9 @@ export function TurnProgress({
               {activityLabel && effectiveWaitingReason ? ` · ${effectiveWaitingReason}` : ""}
             </p>
           )}
-          {(estimate || linkedExternalJob) && (
+          {((estimate && !stopped) || linkedExternalJob) && (
             <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-caption text-gray-500">
-              {estimate && minimumSampleCount != null && (
+              {estimate && !stopped && minimumSampleCount != null && (
                 <span>
                   {estimateLabel(estimate.lowMs, estimate.highMs)} · 最少 {minimumSampleCount} 个历史样本
                 </span>
@@ -187,7 +192,7 @@ export function TurnProgress({
           </ol>
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-gray-500">
             {progress.next && <span>下一步 · {progress.next.title}</span>}
-            {estimate && (
+            {estimate && !stopped && (
               <span>
                 时间样本 ·{" "}
                 {estimate.sources

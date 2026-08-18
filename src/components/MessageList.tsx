@@ -15,6 +15,8 @@ import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
 import { formatDuration, useNowTick } from "../lib/duration";
 import { TurnProgress } from "./TurnProgress";
+import { systemOwnsObjective } from "../lib/turnOwnership";
+import { humanWaitingReason } from "../lib/waitingReason";
 import {
   summarizeTurnEvidence,
   TurnResultSnapshot,
@@ -399,11 +401,7 @@ export function MessageList({
       if (streaming) {
         return message.role === "assistant" && Boolean(message.plan || message.turnActivity);
       }
-      const objectiveStatus = message.turnActivity?.objectiveStatus;
-      return Boolean(
-        objectiveStatus &&
-        !["completed", "cancelled", "legacy_orphan"].includes(objectiveStatus),
-      );
+      return systemOwnsObjective(message.turnActivity?.objectiveStatus);
     });
   const lastAssistantIdsByUserTurn = new Set<string>();
   let pendingLastAssistantId: string | null = null;
@@ -553,7 +551,7 @@ function ActiveTurnProgress({
 }) {
   const nowMs = useNowTick(true);
   if (!plan) {
-    const waitingReason = activity?.waitingReason;
+    const waitingReason = humanWaitingReason(activity?.waitingReason);
     const systemOwned = activity?.objectiveStatus === "active" || activity?.objectiveStatus === "waiting_system";
     const nextObservation = activity?.nextObservationAt
       ? Math.max(0, activity.nextObservationAt - nowMs)

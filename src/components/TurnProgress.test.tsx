@@ -47,6 +47,27 @@ describe("TurnProgress", () => {
     expect(screen.getByText(/发现发布前需要补一轮安装 smoke/)).toBeInTheDocument();
   });
 
+  it("renders a waiting reason as human text and never as the raw internal code", () => {
+    const stopped: TurnPlan = { ...plan, waitingReason: "technical_recovery_exhausted" };
+    render(
+      <TurnProgress plan={stopped} timingProfile={timing} externalJobs={[]} elapsedMs={90_000} />,
+    );
+
+    const banner = screen.getByTestId("turn-progress");
+    expect(banner).not.toHaveTextContent("technical_recovery_exhausted");
+    expect(banner).toHaveTextContent(/自动恢复/);
+  });
+
+  it("stops quoting a remaining time once the turn is no longer running", () => {
+    const stopped: TurnPlan = { ...plan, waitingReason: "technical_recovery_exhausted" };
+    render(
+      <TurnProgress plan={stopped} timingProfile={timing} externalJobs={[]} elapsedMs={90_000} />,
+    );
+
+    expect(screen.queryByText(/预计还需/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/个历史样本/)).not.toBeInTheDocument();
+  });
+
   it("omits the time estimate when the sample profile is unavailable", () => {
     render(<TurnProgress plan={plan} timingProfile={null} externalJobs={[]} elapsedMs={90_000} />);
     expect(screen.queryByText(/预计还需/)).not.toBeInTheDocument();

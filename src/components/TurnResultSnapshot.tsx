@@ -16,6 +16,7 @@ import type { TurnPlan } from "../lib/chatPlan";
 import { planProgress } from "../lib/chatPlan";
 import { formatDuration } from "../lib/duration";
 import type { ToolCallState } from "../stores/chatEvents";
+import { humanWaitingReason } from "../lib/waitingReason";
 
 const MAX_EVIDENCE_ITEMS = 20;
 
@@ -176,7 +177,7 @@ export function TurnResultSnapshot({
                 borderClass: "border-l-border",
               };
   const StatusIcon = status.icon;
-  const attentionDetail = plan.waitingReason
+  const attentionDetail = humanWaitingReason(plan.waitingReason)
     ?? (turnBoundaryFailure
       ? "回合存在失败或中断证据"
       : effectiveFailureCount > 0

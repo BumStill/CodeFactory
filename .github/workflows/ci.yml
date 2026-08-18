@@ -146,6 +146,21 @@ jobs:
           path: ${{ runner.temp }}/codefactory-resume-headless
           if-no-files-found: error
 
+      - name: Turn handback headless gate
+        id: handback_gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:turn-handback:headless
+        env:
+          CODEFACTORY_TURN_HANDBACK_ARTIFACT_DIR: ${{ runner.temp }}/codefactory-turn-handback-headless
+
+      - name: Upload turn handback evidence
+        if: ${{ !cancelled() && steps.handback_gate.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: turn-handback-headless-${{ runner.os }}
+          path: ${{ runner.temp }}/codefactory-turn-handback-headless
+          if-no-files-found: error
+
       - name: Compact composer headless viewport gate
         id: composer_gate
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
