@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, it, expect } from "vitest";
-import { formatDuration } from "./duration";
+import { formatDuration, formatElapsedClock } from "./duration";
 
 describe("formatDuration", () => {
   it("renders sub-second values in milliseconds", () => {
@@ -32,5 +32,18 @@ describe("formatDuration", () => {
     expect(formatDuration(-5)).toBe("0ms");
     expect(formatDuration(NaN)).toBe("0ms");
     expect(formatDuration(Infinity)).toBe("0ms");
+  });
+});
+
+describe("formatElapsedClock", () => {
+  it("keeps a stable session-style clock while the turn runs", () => {
+    expect(formatElapsedClock(0)).toBe("00:00");
+    expect(formatElapsedClock(84_000)).toBe("01:24");
+    expect(formatElapsedClock(3_723_000)).toBe("1:02:03");
+  });
+
+  it("clamps invalid values", () => {
+    expect(formatElapsedClock(-1)).toBe("00:00");
+    expect(formatElapsedClock(Number.NaN)).toBe("00:00");
   });
 });

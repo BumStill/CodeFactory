@@ -41,6 +41,10 @@ export interface UIMessage {
   id: string;
   role: "user" | "assistant" | "tool" | "system";
   content: string;
+  /** Frontend root-turn identity retained across live assistant segments.
+   * Unlike plan/activity projection, it exists before the first stream event
+   * and survives the brief gap created when a steer splits the bubble. */
+  rootTurnId?: string;
   toolCalls?: ToolCallState[];
   transportRetries?: TransportRetryState[];
   /** Technical route failures retained behind an expandable disclosure when

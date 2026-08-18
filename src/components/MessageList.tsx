@@ -6,14 +6,24 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
-import { AlertTriangle, Check, Copy, ChevronDown, ChevronUp } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  Clock3,
+  Copy,
+  ChevronDown,
+  ChevronUp,
+  LoaderCircle,
+  Sparkles,
+  SquareTerminal,
+} from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { ImagePreview } from "./ImagePreview";
 import { FileArtifactCard, isDocumentPath } from "./FileArtifactCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
-import { formatDuration, useNowTick } from "../lib/duration";
+import { formatDuration, formatElapsedClock, useNowTick } from "../lib/duration";
 import { TurnProgress } from "./TurnProgress";
 import { systemOwnsObjective } from "../lib/turnOwnership";
 import { humanWaitingReason } from "../lib/waitingReason";
@@ -35,6 +45,10 @@ import {
 interface Props {
   messages: UIMessage[];
   streaming: boolean;
+  /** The session still owns the current turn, including durable recovery
+   * between provider stream segments. Defaults to `streaming` for standalone
+   * acceptance fixtures and older call sites. */
+  turnActive?: boolean;
   /** Working directory of the active session. */
   cwd?: string | null;
   /** Called when the user picks an example prompt from the welcome screen. */
@@ -288,25 +302,12 @@ const markdownComponents: Components = {
   em: ({ children }) => <em className="italic text-gray-200">{children}</em>,
 };
 
-// ── Typing dots — replaces the block cursor ──────────────────────────────────
-function TypingDots() {
-  return (
-    <span className="inline-flex items-center gap-1 ml-1 align-middle">
-      <span className="h-1 w-1 animate-typing-dot rounded-full bg-status-progress motion-reduce:animate-none" style={{ animationDelay: "0ms" }} />
-      <span className="h-1 w-1 animate-typing-dot rounded-full bg-status-progress motion-reduce:animate-none" style={{ animationDelay: "150ms" }} />
-      <span className="h-1 w-1 animate-typing-dot rounded-full bg-status-progress motion-reduce:animate-none" style={{ animationDelay: "300ms" }} />
-    </span>
-  );
-}
-
 const TimelineMarkdownSegment = memo(function TimelineMarkdownSegment({
   text,
   isFinal,
-  showTypingDots,
 }: {
   text: string;
   isFinal: boolean;
-  showTypingDots: boolean;
 }) {
   return (
     <div
@@ -322,7 +323,6 @@ const TimelineMarkdownSegment = memo(function TimelineMarkdownSegment({
       }
     >
       <MarkdownContent content={text} />
-      {showTypingDots && <TypingDots />}
     </div>
   );
 });
@@ -331,6 +331,7 @@ const TimelineMarkdownSegment = memo(function TimelineMarkdownSegment({
 export function MessageList({
   messages,
   streaming,
+  turnActive = streaming,
   onUsePrompt,
   onOpenUsage,
   onOpenSession,
@@ -350,7 +351,7 @@ export function MessageList({
   const resolvedConversationKey = conversationKey ?? messages[0]?.id ?? null;
   const contentSignal = messages.length === 0
     ? null
-    : `${messages.length}:${messages[messages.length - 1]?.id ?? ""}`;
+    : `${messages.length}:${messages[messages.length - 1]?.id ?? ""}:${turnActive ? "active" : "idle"}`;
   const {
     scrollerRef,
     pinned,
@@ -378,12 +379,23 @@ export function MessageList({
 
   if (messages.length === 0) {
     return (
-      <WelcomeScreen
-        onUsePrompt={onUsePrompt}
-        onOpenUsage={onOpenUsage}
-        onOpenSession={onOpenSession}
-        onPickProject={onPickProject}
-      />
+      <div className="relative flex-1 min-h-0">
+        <WelcomeScreen
+          onUsePrompt={onUsePrompt}
+          onOpenUsage={onOpenUsage}
+          onOpenSession={onOpenSession}
+          onPickProject={onPickProject}
+        />
+        {turnActive && (
+          <div className="absolute bottom-3 left-1/2 w-[calc(100%-2rem)] max-w-[var(--reading-column)] -translate-x-1/2">
+            <InlineTurnStatus
+              message={undefined}
+              streaming={streaming}
+              startedAt={Date.now()}
+            />
+          </div>
+        )}
+      </div>
     );
   }
 
@@ -409,6 +421,35 @@ export function MessageList({
       }
       return systemOwnsObjective(message.turnActivity?.objectiveStatus);
     });
+  const activeTurnMessage = turnActive
+    ? [...visible]
+        .reverse()
+        .find((message) => message.role === "assistant")
+    : undefined;
+  const projectedActiveTurnMessage =
+    activeTurnMessage?.rootTurnId ||
+    activeTurnMessage?.turnActivity?.rootTurnId ||
+    activeTurnMessage?.plan?.rootTurnId
+      ? activeTurnMessage
+      : [...visible]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === "assistant" &&
+              Boolean(message.turnActivity?.rootTurnId) &&
+              systemOwnsObjective(message.turnActivity?.objectiveStatus),
+          );
+  const activeRootTurnId =
+    projectedActiveTurnMessage?.rootTurnId ??
+    projectedActiveTurnMessage?.turnActivity?.rootTurnId ??
+    projectedActiveTurnMessage?.plan?.rootTurnId;
+  const activeRootMessage = activeRootTurnId
+    ? visible.find(
+        (message) => message.role === "user" && message.id === activeRootTurnId,
+      )
+    : [...visible].reverse().find((message) => message.role === "user");
+  const activeTurnStartedAt =
+    activeRootMessage?.createdAt ?? activeTurnMessage?.createdAt ?? Date.now();
   const lastAssistantIdsByUserTurn = new Set<string>();
   let pendingLastAssistantId: string | null = null;
   for (const message of visible) {
@@ -498,6 +539,13 @@ export function MessageList({
           </div>
           );
         })}
+        {turnActive && (
+          <InlineTurnStatus
+            message={activeTurnMessage}
+            streaming={streaming}
+            startedAt={activeTurnStartedAt}
+          />
+        )}
         </div>
       </div>
 
@@ -519,6 +567,75 @@ export function MessageList({
           {hasNewContent ? "有新内容" : "回到最新"}
         </button>
       )}
+    </div>
+  );
+}
+
+type InlineTurnPhase = "thinking" | "executing" | "waiting" | "finalizing";
+
+function inlineTurnPhase(
+  message: UIMessage | undefined,
+  streaming: boolean,
+): InlineTurnPhase {
+  const phase = message?.turnActivity?.phase;
+  const kind = message?.turnActivity?.kind;
+  if (phase === "finalizing" || kind === "finalizing") return "finalizing";
+
+  const toolStatuses = (message?.toolCalls ?? []).map((tool) => tool.status);
+  if (
+    toolStatuses.some((status) => status === "waiting" || status === "waiting_permission")
+  ) {
+    return "waiting";
+  }
+  if (toolStatuses.includes("running")) return "executing";
+  if (
+    message?.turnActivity?.objectiveStatus === "waiting_system" ||
+    !streaming
+  ) {
+    return "waiting";
+  }
+  return "thinking";
+}
+
+const INLINE_TURN_PHASE = {
+  thinking: { label: "Thinking", Icon: LoaderCircle },
+  executing: { label: "执行中", Icon: SquareTerminal },
+  waiting: { label: "等待中", Icon: Clock3 },
+  finalizing: { label: "整理结果", Icon: Sparkles },
+} satisfies Record<InlineTurnPhase, { label: string; Icon: typeof LoaderCircle }>;
+
+function InlineTurnStatus({
+  message,
+  streaming,
+  startedAt,
+}: {
+  message: UIMessage | undefined;
+  streaming: boolean;
+  startedAt: number;
+}) {
+  const nowMs = useNowTick(true);
+  const phase = inlineTurnPhase(message, streaming);
+  const { label, Icon } = INLINE_TURN_PHASE[phase];
+  const animated = phase === "thinking" || phase === "finalizing";
+
+  return (
+    <div
+      data-testid="inline-turn-status"
+      role="status"
+      aria-live="polite"
+      className="mt-1.5 inline-flex items-center gap-1.5 text-caption text-gray-500"
+    >
+      <Icon
+        size={14}
+        aria-hidden="true"
+        className={`shrink-0 text-status-progress ${
+          animated ? "animate-spin motion-reduce:animate-none" : ""
+        }`}
+      />
+      <span>{label}</span>
+      <span aria-hidden="true" className="tabular-nums text-gray-600 select-none">
+        {" · "}{formatElapsedClock(Math.max(0, nowMs - startedAt))}
+      </span>
     </div>
   );
 }
@@ -650,10 +767,6 @@ const MessageRow = memo(function MessageRow({
   evidenceOpen: boolean;
 }) {
   const isUser = msg.role === "user";
-  // Must run unconditionally (before the early return) to satisfy the rules
-  // of hooks. Only the live streaming tail arms the 1s ticker; for every
-  // other row `active` is false, so this is inert.
-  const nowMs = useNowTick(isStreamingTail);
   const [showAllSteps, setShowAllSteps] = useState(false);
   const turnBoundaryFailure = Boolean(
     msg.failureEvidence ||
@@ -805,12 +918,6 @@ const MessageRow = memo(function MessageRow({
     );
   }
 
-  const showThinkingHint =
-    isStreamingTail &&
-    !msg.content &&
-    (!msg.toolCalls || msg.toolCalls.length === 0) &&
-    (!msg.transportRetries || msg.transportRetries.length === 0) &&
-    (!msg.gateActions || msg.gateActions.length === 0);
   // Turn timeline: when segments exist (live-streamed turns), render
   // narration and tool cards in ARRIVAL order — mid-turn narration as light
   // step lines, only the final segment as full prose. Without segments
@@ -838,9 +945,7 @@ const MessageRow = memo(function MessageRow({
       tool.status === "waiting_permission",
   );
   const isWaitingOnModelTransport = isStreamingTail && !hasActiveTool;
-  const durationLabel = isStreamingTail
-    ? formatDuration(Math.max(0, nowMs - msg.createdAt))
-    : isSettledAnswer && msg.durationMs != null
+  const durationLabel = isSettledAnswer && msg.durationMs != null
       ? formatDuration(msg.durationMs)
       : null;
   // Keep the active turn as one continuous reading flow. Once the turn
@@ -947,7 +1052,6 @@ const MessageRow = memo(function MessageRow({
                 key={`seg-${index}`}
                 text={segment.text}
                 isFinal={isFinal}
-                showTypingDots={isFinal && isStreamingTail}
               />
             );
           })}
@@ -1011,7 +1115,6 @@ const MessageRow = memo(function MessageRow({
       {!timeline && msg.content ? (
         <div className="prose dark:prose-invert prose-sm max-w-none text-reading leading-6 [&_pre]:!p-0 [&_pre]:!bg-transparent [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
           <MarkdownContent content={msg.content} />
-          {isStreamingTail && <TypingDots />}
         </div>
       ) : null}
       {msg.failureEvidence && (
@@ -1024,14 +1127,9 @@ const MessageRow = memo(function MessageRow({
           </div>
         </details>
       )}
-      {showThinkingHint && (
-        <div role="status" className="inline-flex items-center text-note text-gray-500">
-          正在处理 <TypingDots />
-        </div>
-      )}
       {durationLabel && (
         <div className="text-caption text-gray-600 tabular-nums select-none">
-          {isStreamingTail ? `运行中 · ${durationLabel}` : `用时 ${durationLabel}`}
+          用时 {durationLabel}
         </div>
       )}
       {isSettledAnswer && msg.plan && (() => {
