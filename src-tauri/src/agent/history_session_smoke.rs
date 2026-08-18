@@ -21,7 +21,7 @@ use uuid::Uuid;
 const CONTINUE_SESSION: &str = "history-continue-session";
 const STOP_SESSION: &str = "history-stop-session";
 const ORIGINAL_INSTRUCTION: &str =
-    "实现一个长任务并验证结果；遇到可恢复故障或应用重启时继续执行，不要等待人工参与。";
+    "实现一个长任务并验证结果；遇到可恢复故障或应用重启时由系统自动恢复，不要等待人工参与。";
 const HISTORY_PADDING: i64 = 12;
 const STOP_OBJECTIVE_COUNT: i64 = 3;
 
