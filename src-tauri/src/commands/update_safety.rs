@@ -98,7 +98,7 @@ pub struct UpdateSafetyStatus {
     pub active_chat_turns: usize,
     pub active_task_schedulers: usize,
     pub active_delivery_leases: i64,
-    pub nonterminal_objectives: i64,
+    pub active_objective_leases: i64,
     pub objective_blocker_owners: Vec<String>,
     pub pending_permissions: usize,
     pub managed_browser_sessions: usize,
@@ -115,7 +115,7 @@ impl UpdateSafetyStatus {
         self.safe_to_restart = self.active_chat_turns == 0
             && self.active_task_schedulers == 0
             && self.active_delivery_leases == 0
-            && self.nonterminal_objectives == 0
+            && self.active_objective_leases == 0
             && self.pending_permissions == 0
             && self.managed_browser_sessions == 0
             && self.terminal_sessions == 0;
@@ -266,9 +266,11 @@ async fn update_claim_matches_target_in_tx(
     Ok(count == 1)
 }
 
-/// Count every non-terminal Objective except a caller-held, target-bound,
-/// current Update mutation permit. Merely finding a unique Update claim in
-/// SQLite is never enough to infer that it owns this updater request.
+/// Count only currently leased Objective work except a caller-held,
+/// target-bound Update mutation permit. Durable user waits and unleased
+/// recovery state survive restart, but they do not represent executing work.
+/// Merely finding a unique Update claim in SQLite is never enough to infer
+/// that it owns this updater request.
 async fn load_objective_blockers(
     pool: &sqlx::SqlitePool,
     now: i64,
@@ -287,10 +289,13 @@ async fn load_objective_blockers(
     let rows = sqlx::query(
         "SELECT id, status, domain, recovery_owner
          FROM objectives
-         WHERE status NOT IN ('completed', 'cancelled')
+         WHERE status IN ('active','waiting_system')
+           AND lease_owner IS NOT NULL
+           AND lease_expires_at>?
            AND (? IS NULL OR id<>?)
          ORDER BY id",
     )
+    .bind(now)
     .bind(exempt_objective_id)
     .bind(exempt_objective_id)
     .fetch_all(pool)
@@ -806,6 +811,33 @@ pub(crate) async fn ensure_update_objective(
     .fetch_optional(pool)
     .await?
     {
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .get(&objective_id)
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?
+            .ok_or_else(|| AppError::Other("bound update objective disappeared".into()))?;
+        if objective.status == ObjectiveStatus::WaitingCoreInput
+            && objective.failure_code.as_deref()
+                == Some(crate::agent::objective::TECHNICAL_RECOVERY_EXHAUSTED)
+        {
+            let mut decision = DecisionRouter::route(
+                &objective,
+                RouteSignal::CapabilityRestored {
+                    domain: RecoveryDomain::Update,
+                    reason: "update_objective_rearmed".into(),
+                    next_observation_at: chrono::Utc::now().timestamp_millis(),
+                    resume_cursor: Some(resource_id.clone()),
+                },
+            )
+            .map_err(|error| AppError::Other(error.to_string()))?;
+            decision.request_key = None;
+            match store.apply_decision(objective.revision, decision).await {
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("revision") => {}
+                Err(error) => return Err(AppError::Other(error.to_string())),
+            }
+        }
         return Ok(objective_id);
     }
 
@@ -822,9 +854,47 @@ pub(crate) async fn ensure_update_objective(
     .fetch_optional(pool)
     .await?
     {
-        return Err(AppError::Other(format!(
-            "update target {resource_id} cannot replace the system-owned target {existing_resource} on objective {objective_id}"
-        )));
+        let store = ObjectiveStore::new(pool.clone());
+        let existing = store
+            .get(&objective_id)
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?
+            .ok_or_else(|| AppError::Other("conflicting update objective disappeared".into()))?;
+        if existing.status == ObjectiveStatus::WaitingCoreInput
+            && existing.failure_code.as_deref()
+                == Some(crate::agent::objective::TECHNICAL_RECOVERY_EXHAUSTED)
+        {
+            let mut decision = existing.as_decision();
+            decision.decision_type = crate::agent::objective::DecisionType::FailedInternal;
+            decision.status = ObjectiveStatus::LegacyOrphan;
+            decision.failure_code = Some("update_target_superseded".into());
+            decision.failure_signature = Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    format!("{}\0{}\0{}", objective_id, existing_resource, resource_id).as_bytes()
+                )
+            ));
+            decision.recovery_owner = None;
+            decision.remediation_id = None;
+            decision.next_observation_at = None;
+            decision.next_action_authorized = false;
+            decision.requires_user_action = false;
+            decision.request_key = None;
+            decision.decision_key = None;
+            match store.apply_decision(existing.revision, decision).await {
+                Ok(_) => {}
+                Err(error) if error.to_string().contains("revision") => {
+                    return Err(AppError::Other(
+                        "update target changed while reconciling the exhausted target".into(),
+                    ));
+                }
+                Err(error) => return Err(AppError::Other(error.to_string())),
+            }
+        } else {
+            return Err(AppError::Other(format!(
+                "update target {resource_id} cannot replace the system-owned target {existing_resource} on objective {objective_id}"
+            )));
+        }
     }
 
     let objective_id = uuid::Uuid::new_v4().to_string();
@@ -921,6 +991,60 @@ pub(crate) async fn ensure_update_objective(
     Ok(objective_id)
 }
 
+/// Observe whether a claimed Update remediation has reached a restart-safe
+/// point without reserving the process or writing an install receipt. The
+/// mutating admission path repeats the same checks under the same runtime
+/// locks, so a later race still fails closed.
+pub(crate) async fn observe_update_restart_safety_inner(
+    target_version: &str,
+    target_build: &str,
+    claim_permit: &UpdateClaimPermit,
+    state: &AppState,
+    schedulers: &SchedulerHandles,
+    terminals: &TerminalState,
+) -> Result<UpdateSafetyStatus, AppError> {
+    validate_update_identity(target_version.trim(), target_build.trim())?;
+    let target_version = target_version.trim();
+    let target_build = target_build.trim();
+    let chat_turns = state.chat_cancels.lock().await;
+    let task_schedulers = schedulers.lock().await;
+    let permissions = state.pending_permissions.lock().await;
+    let terminal_map = terminals.0.lock().await;
+    let now = chrono::Utc::now().timestamp_millis();
+    let pool = state.db.read().await;
+    let objective_blockers =
+        load_objective_blockers(&pool, now, Some(claim_permit), target_version, target_build)
+            .await?;
+    if objective_blockers.exempt_objective_id.is_none() {
+        return Err(AppError::Other(
+            "update mutation permit is stale or bound to another target".into(),
+        ));
+    }
+    let restart_reserved = state.update_restart_reserved.load(Ordering::SeqCst);
+    let mut status = UpdateSafetyStatus {
+        safe_to_restart: false,
+        restart_reserved,
+        active_chat_turns: chat_turns.len(),
+        active_task_schedulers: task_schedulers.len(),
+        active_delivery_leases: count_active_delivery_leases(&pool, now).await?,
+        active_objective_leases: objective_blockers.count,
+        objective_blocker_owners: objective_blockers.owners,
+        pending_permissions: permissions.len(),
+        managed_browser_sessions: crate::tools::browser_session::list_managed_sessions().len(),
+        terminal_sessions: terminal_map.len(),
+        update_objective_id: objective_blockers.exempt_objective_id,
+        update_install_state: None,
+        update_receipt_id: None,
+        target_version: Some(target_version.to_string()),
+        target_build: Some(target_build.to_string()),
+    }
+    .evaluate();
+    if restart_reserved {
+        status.safe_to_restart = false;
+    }
+    Ok(status)
+}
+
 pub(crate) async fn reserve_update_install_inner(
     target_version: String,
     target_build: String,
@@ -978,7 +1102,7 @@ pub(crate) async fn reserve_update_install_inner(
         active_chat_turns,
         active_task_schedulers,
         active_delivery_leases,
-        nonterminal_objectives: objective_blockers.count,
+        active_objective_leases: objective_blockers.count,
         objective_blocker_owners: objective_blockers.owners,
         pending_permissions,
         managed_browser_sessions,
@@ -1098,9 +1222,11 @@ pub(crate) fn release_update_install_reservation_inner(state: &AppState) {
 mod tests {
     use super::{
         admit_update_install, count_active_delivery_leases, count_nonterminal_objectives,
-        load_objective_blockers, observe_latest_update_install, update_target_resource_id,
-        UpdateClaimPermit, UpdateInstallAdmission, UpdateInstallState, UpdateSafetyStatus,
+        ensure_update_objective, load_objective_blockers, observe_latest_update_install,
+        update_target_resource_id, UpdateClaimPermit, UpdateInstallAdmission, UpdateInstallState,
+        UpdateSafetyStatus,
     };
+    use crate::agent::objective::{ObjectiveStatus, ObjectiveStore, TECHNICAL_RECOVERY_EXHAUSTED};
 
     const CURRENT_VERSION: &str = "1.79.0";
     const CURRENT_BUILD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1200,7 +1326,7 @@ mod tests {
                 ..UpdateSafetyStatus::default()
             },
             UpdateSafetyStatus {
-                nonterminal_objectives: 1,
+                active_objective_leases: 1,
                 ..UpdateSafetyStatus::default()
             },
             UpdateSafetyStatus {
@@ -1261,7 +1387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_terminal_objectives_allow_restart() {
+    async fn durable_unleased_waits_do_not_block_restart() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1270,7 +1396,30 @@ mod tests {
         sqlx::query(
             "CREATE TABLE objectives (
                 id TEXT PRIMARY KEY,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                recovery_owner TEXT,
+                remediation_id TEXT,
+                lease_owner TEXT,
+                lease_expires_at INTEGER
+            );
+            CREATE TABLE objective_remediations (
+                id TEXT PRIMARY KEY,
+                objective_id TEXT NOT NULL,
+                binding_id TEXT,
+                domain TEXT NOT NULL,
+                status TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_expires_at INTEGER,
+                attempt_index INTEGER NOT NULL
+            );
+            CREATE TABLE objective_bindings (
+                id TEXT PRIMARY KEY,
+                objective_id TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                resource_kind TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                resource_generation INTEGER NOT NULL
             )",
         )
         .execute(&pool)
@@ -1278,8 +1427,8 @@ mod tests {
         .unwrap();
 
         for (id, status) in [
-            ("active", "active"),
-            ("waiting-system", "waiting_system"),
+            ("active-without-runtime-owner", "active"),
+            ("expired-system-lease", "waiting_system"),
             ("waiting-core-input", "waiting_core_input"),
             ("waiting-authorization", "waiting_authorization"),
             ("waiting-business", "waiting_business_decision"),
@@ -1287,37 +1436,36 @@ mod tests {
             ("completed", "completed"),
             ("cancelled", "cancelled"),
         ] {
-            sqlx::query("INSERT INTO objectives (id, status) VALUES (?, ?)")
-                .bind(id)
-                .bind(status)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO objectives
+                 (id,status,domain,recovery_owner,remediation_id,lease_owner,lease_expires_at)
+                 VALUES (?,?,'tool',NULL,NULL,NULL,NULL)",
+            )
+            .bind(id)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
-
-        let nonterminal_objectives = count_nonterminal_objectives(&pool).await.unwrap();
-        assert_eq!(nonterminal_objectives, 6);
-        assert!(
-            !UpdateSafetyStatus {
-                nonterminal_objectives,
-                ..UpdateSafetyStatus::default()
-            }
-            .evaluate()
-            .safe_to_restart
-        );
-
         sqlx::query(
-            "UPDATE objectives SET status = 'completed'
-             WHERE status NOT IN ('completed', 'cancelled')",
+            "UPDATE objectives
+             SET recovery_owner='objective-supervisor:tool', lease_owner='expired-owner',
+                 lease_expires_at=999
+             WHERE id='expired-system-lease'",
         )
         .execute(&pool)
         .await
         .unwrap();
-        let nonterminal_objectives = count_nonterminal_objectives(&pool).await.unwrap();
-        assert_eq!(nonterminal_objectives, 0);
+
+        assert_eq!(count_nonterminal_objectives(&pool).await.unwrap(), 6);
+        let blockers = load_objective_blockers(&pool, 1_000, None, TARGET_VERSION, TARGET_BUILD)
+            .await
+            .unwrap();
+        assert_eq!(blockers.count, 0);
+        assert!(blockers.owners.is_empty());
         assert!(
             UpdateSafetyStatus {
-                nonterminal_objectives,
+                active_objective_leases: blockers.count,
                 ..UpdateSafetyStatus::default()
             }
             .evaluate()
@@ -1326,7 +1474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_claimed_update_objective_is_exempt_but_every_other_open_objective_blocks() {
+    async fn exact_claimed_update_is_exempt_but_other_live_objective_leases_block() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1391,6 +1539,14 @@ mod tests {
                 Some("objective-supervisor:chat"),
                 None,
                 None,
+            ),
+            (
+                "chat-active-with-lease",
+                "active",
+                "chat",
+                Some("objective-supervisor:chat"),
+                None,
+                Some("chat-owner"),
             ),
             (
                 "provider-waiting",
@@ -1475,8 +1631,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            mismatched_target.count, 4,
-            "a live Update claim bound to another target cannot be inferred as self"
+            mismatched_target.count, 3,
+            "all three unexpired Objective leases are live restart blockers"
         );
 
         let blockers =
@@ -1484,19 +1640,99 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(blockers.count, 3);
+        assert_eq!(blockers.count, 2);
         assert_eq!(
             blockers.owners,
             vec![
-                "core-input:auth".to_string(),
                 "objective-supervisor:chat".to_string(),
                 "objective-supervisor:provider".to_string(),
             ]
         );
     }
 
+    async fn force_exhausted_update(pool: &sqlx::SqlitePool, objective_id: &str) {
+        sqlx::query(
+            "UPDATE objective_remediations
+             SET status='superseded', lease_owner=NULL, lease_expires_at=NULL
+             WHERE objective_id=?",
+        )
+        .bind(objective_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE objectives
+             SET status='waiting_core_input', decision_type='core_input_required',
+                 requires_user_action=1, request_key=?, failure_code=?,
+                 recovery_owner=NULL, remediation_id=NULL,
+                 next_observation_at=NULL, lease_owner=NULL, lease_expires_at=NULL
+             WHERE id=?",
+        )
+        .bind(format!("{TECHNICAL_RECOVERY_EXHAUSTED}:{objective_id}"))
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(objective_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
-    async fn stale_or_mismatched_update_claim_is_not_exempt() {
+    async fn exact_exhausted_update_is_rearmed_in_a_fresh_recovery_generation() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let objective_id = ensure_update_objective(&pool, TARGET_VERSION, TARGET_BUILD)
+            .await
+            .unwrap();
+        force_exhausted_update(&pool, &objective_id).await;
+
+        let recovered_id = ensure_update_objective(&pool, TARGET_VERSION, TARGET_BUILD)
+            .await
+            .unwrap();
+        assert_eq!(recovered_id, objective_id);
+        let recovered = ObjectiveStore::new(pool.clone())
+            .get(&objective_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(recovered.recovery_generation, 1);
+        assert!(recovered.remediation_id.is_some());
+        assert!(!recovered.requires_user_action);
+    }
+
+    #[tokio::test]
+    async fn exhausted_old_update_target_is_audibly_superseded_by_the_new_target() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let old_id = ensure_update_objective(&pool, TARGET_VERSION, TARGET_BUILD)
+            .await
+            .unwrap();
+        force_exhausted_update(&pool, &old_id).await;
+
+        let next_build = "cccccccccccccccccccccccccccccccccccccccc";
+        let next_id = ensure_update_objective(&pool, "1.81.0", next_build)
+            .await
+            .unwrap();
+        assert_ne!(next_id, old_id);
+        let store = ObjectiveStore::new(pool.clone());
+        assert_eq!(
+            store.get(&old_id).await.unwrap().unwrap().status,
+            ObjectiveStatus::LegacyOrphan
+        );
+        assert_eq!(
+            store.get(&next_id).await.unwrap().unwrap().status,
+            ObjectiveStatus::WaitingSystem
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_update_claim_is_neither_exempt_nor_a_live_blocker() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1574,7 +1810,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(blockers.count, 1, "an expired claim cannot exempt itself");
+        assert_eq!(blockers.exempt_objective_id, None);
+        assert_eq!(
+            blockers.count, 0,
+            "an expired claim cannot exempt itself or impersonate live work"
+        );
     }
 
     #[tokio::test]

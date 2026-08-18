@@ -13,21 +13,23 @@ use tauri_plugin_updater::UpdaterExt;
 use uuid::Uuid;
 
 use super::objective::{
-    CompletionArbiter, EvidenceKind, ObjectiveEvidence, ObjectiveSnapshot, ObjectiveStatus,
-    ObjectiveStore, RecoveryDomain,
+    CompletionArbiter, DecisionRouter, EvidenceKind, ObjectiveEvidence, ObjectiveSnapshot,
+    ObjectiveStatus, ObjectiveStore, RecoveryDomain, RouteSignal, UPDATE_SAFE_POINT_PENDING,
 };
 use crate::commands::tasks::SchedulerHandles;
 use crate::commands::terminal::TerminalState;
 use crate::commands::update_safety::{
     admit_update_install, current_app_identity, mark_update_install_unknown,
-    parse_update_target_resource_id, release_update_install_reservation_inner,
-    reserve_update_install_inner, validate_update_identity, UpdateClaimPermit,
-    UpdateInstallAdmission, UpdateInstallReceiptView, UpdateInstallState,
+    observe_update_restart_safety_inner, parse_update_target_resource_id,
+    release_update_install_reservation_inner, reserve_update_install_inner,
+    validate_update_identity, UpdateClaimPermit, UpdateInstallAdmission, UpdateInstallReceiptView,
+    UpdateInstallState,
 };
 use crate::errors::AppError;
 use crate::AppState;
 
 const UPDATE_TARGET_RESOURCE_KIND: &str = "app_update_target";
+const SAFE_POINT_REOBSERVE_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaimedUpdateTarget {
@@ -231,6 +233,47 @@ pub(crate) async fn resume_update_objective(
         };
     }
 
+    let store = ObjectiveStore::new(pool.clone());
+    if objective.failure_code.as_deref() == Some(UPDATE_SAFE_POINT_PENDING) {
+        let safety = observe_update_restart_safety_inner(
+            &target.version,
+            &target.build,
+            &exact_claim,
+            state.inner(),
+            schedulers.inner(),
+            terminals.inner(),
+        )
+        .await?;
+        if !safety.safe_to_restart {
+            store
+                .defer_claimed_remediation(
+                    &objective.id,
+                    &permit.remediation_id,
+                    &permit.owner,
+                    permit.claim_epoch,
+                    SAFE_POINT_REOBSERVE_MS,
+                )
+                .await
+                .map_err(|error| app_error("defer Update safe-point observation", error))?;
+            return Ok(());
+        }
+        let decision = DecisionRouter::route(
+            &objective,
+            RouteSignal::CapabilityRestored {
+                domain: RecoveryDomain::Update,
+                reason: "update_safe_point_reached".into(),
+                next_observation_at: chrono::Utc::now().timestamp_millis(),
+                resume_cursor: objective.resume_cursor.clone(),
+            },
+        )
+        .map_err(|error| app_error("route Update safe-point observation", error))?;
+        store
+            .apply_claimed_decision(objective.revision, decision, &permit)
+            .await
+            .map_err(|error| app_error("settle Update safe-point observation", error))?;
+        return Ok(());
+    }
+
     let update = app
         .updater()
         .map_err(|error| app_error("initialize updater", error))?
@@ -257,6 +300,31 @@ pub(crate) async fn resume_update_objective(
         terminals.inner(),
     )
     .await?;
+    if !safety.safe_to_restart && safety.update_install_state.is_none() {
+        let failure_signature = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                format!("{}\0{}\0restart-safe-point", target.version, target.build).as_bytes()
+            )
+        );
+        let decision = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Update,
+                failure_code: UPDATE_SAFE_POINT_PENDING.into(),
+                failure_signature,
+                next_observation_at: chrono::Utc::now().timestamp_millis()
+                    + SAFE_POINT_REOBSERVE_MS,
+                resume_cursor: objective.resume_cursor.clone(),
+            },
+        )
+        .map_err(|error| app_error("route Update safe-point wait", error))?;
+        store
+            .apply_claimed_decision(objective.revision, decision, &permit)
+            .await
+            .map_err(|error| app_error("persist Update safe-point wait", error))?;
+        return Ok(());
+    }
     let receipt_id = safety.update_receipt_id.ok_or_else(|| {
         release_update_install_reservation_inner(state.inner());
         AppError::Other("update admission produced no durable receipt".into())
@@ -289,7 +357,7 @@ pub(crate) async fn resume_update_objective(
                     return Err(app_error("download exact update package", error));
                 }
             };
-            let claim_is_current = ObjectiveStore::new(pool.clone())
+            let claim_is_current = store
                 .claim_is_current(&permit)
                 .await
                 .map_err(|error| app_error("recheck update mutation permit", error))?;

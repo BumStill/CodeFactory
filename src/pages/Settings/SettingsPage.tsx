@@ -2475,17 +2475,26 @@ function UpdateStatusLine({
           <RefreshCw size={14} className="animate-spin" /> 正在安装…
         </p>
       );
-    case "waiting_for_safe_restart":
+    case "waiting_for_safe_restart": {
+      const observingUnknownInstall =
+        phase.blockers?.update_install_state === "still_unknown" ||
+        phase.blockers?.update_install_state === "observe_only";
       return (
         <div className="space-y-1.5 text-label text-amber-700 dark:text-amber-300">
           <p className="flex items-center gap-1.5">
-            <RefreshCw size={14} /> 更新已下载，等待本地 session 安全结束。
+            <RefreshCw size={14} />{" "}
+            {observingUnknownInstall
+              ? "正在核对上次安装结果…"
+              : "更新已排队，等待本地执行结束。"}
           </p>
           <p className="text-caption text-gray-600">
-            当前 {countUpdateBlockers(phase.blockers)} 项工作仍在运行；归零后自动安装并重启，无需再次点击。
+            {observingUnknownInstall
+              ? "当前仅观察目标版本与 build_git_sha，不会重复安装未知结果。"
+              : `当前 ${countUpdateBlockers(phase.blockers)} 项工作仍在运行；结束后自动下载、安装并重启，无需再次点击。`}
           </p>
         </div>
       );
+    }
     case "ready":
       return (
         <p className="flex items-center gap-1.5 text-label text-emerald-700 dark:text-emerald-400">

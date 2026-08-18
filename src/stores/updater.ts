@@ -20,7 +20,7 @@ export interface UpdateSafetyStatus {
   active_chat_turns: number;
   active_task_schedulers: number;
   active_delivery_leases: number;
-  nonterminal_objectives: number;
+  active_objective_leases: number;
   objective_blocker_owners: string[];
   pending_permissions: number;
   managed_browser_sessions: number;
@@ -60,14 +60,14 @@ export function countUpdateBlockers(status: UpdateSafetyStatus | null): number {
   return status.active_chat_turns
     + status.active_task_schedulers
     + status.active_delivery_leases
-    + (status.nonterminal_objectives ?? 0)
+    + (status.active_objective_leases ?? 0)
     + status.pending_permissions
     + status.managed_browser_sessions
     + status.terminal_sessions;
 }
 
 export function describeUpdateObjectiveBlockers(status: UpdateSafetyStatus | null): string | null {
-  const count = status?.nonterminal_objectives ?? 0;
+  const count = status?.active_objective_leases ?? 0;
   if (count === 0) return null;
   const owners = [...new Set(status?.objective_blocker_owners ?? [])];
   const ownerText = owners.length > 0 ? owners.join("、") : "系统恢复控制面";
