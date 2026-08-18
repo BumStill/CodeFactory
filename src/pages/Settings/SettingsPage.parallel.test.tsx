@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { SettingsPage } from "./SettingsPage";
+import type { UpdaterPhase } from "../../stores/updater";
 
 const mocks = vi.hoisted(() => ({
   load: vi.fn(),
@@ -77,7 +78,7 @@ const gitRemoteState = vi.hoisted(() => ({
 }));
 
 const updaterState = vi.hoisted(() => ({
-  phase: { kind: "idle" as const },
+  phase: { kind: "idle" } as UpdaterPhase,
   currentVersion: "dev",
   initialize: mocks.updaterInitialize,
   checkNow: mocks.updaterCheckNow,
@@ -106,6 +107,7 @@ vi.mock("../../stores/gitRemote", () => ({
 
 vi.mock("../../stores/updater", () => ({
   useUpdaterStore: <T,>(selector: (state: typeof updaterState) => T) => selector(updaterState),
+  countUpdateBlockers: () => 1,
 }));
 
 vi.mock("../../lib/tauri", () => ({
@@ -150,6 +152,40 @@ describe("SettingsPage parallel-task controls", () => {
     mocks.closeBrowserSession.mockResolvedValue(undefined);
     // DataSection on the 通用 tab fetches the data dir on mount.
     mocks.invoke.mockResolvedValue("");
+    updaterState.phase = { kind: "idle" };
+  });
+
+  it("describes queued and observe-only updater states without claiming a download", () => {
+    updaterState.phase = {
+      kind: "waiting_for_safe_restart",
+      update: { version: "1.81.13" },
+      blockers: {
+        update_install_state: "queued",
+      },
+      safetyCheckError: null,
+      checkedAt: 1,
+    } as UpdaterPhase;
+    const { unmount } = render(<SettingsPage onBack={() => {}} initialTab="about" />);
+
+    expect(screen.getByText("更新已排队，等待本地执行结束。")).toBeInTheDocument();
+    expect(screen.getByText(/结束后自动下载、安装并重启/)).toBeInTheDocument();
+    expect(screen.queryByText(/更新已下载/)).toBeNull();
+    unmount();
+
+    updaterState.phase = {
+      kind: "waiting_for_safe_restart",
+      update: { version: "1.81.13" },
+      blockers: {
+        update_install_state: "observe_only",
+      },
+      safetyCheckError: null,
+      checkedAt: 1,
+    } as UpdaterPhase;
+    render(<SettingsPage onBack={() => {}} initialTab="about" />);
+
+    expect(screen.getByText("正在核对上次安装结果…")).toBeInTheDocument();
+    expect(screen.getByText(/不会重复安装未知结果/)).toBeInTheDocument();
+    expect(screen.queryByText(/自动下载、安装并重启/)).toBeNull();
   });
 
   it("makes moved workspace capabilities readable and reachable from settings", async () => {
