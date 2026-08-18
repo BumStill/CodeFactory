@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 const CONTINUE_SESSION: &str = "history-continue-session";
 const STOP_SESSION: &str = "history-stop-session";
+const HANDBACK_SESSION: &str = "history-handback-session";
 const ORIGINAL_INSTRUCTION: &str =
     "实现一个长任务并验证结果；遇到可恢复故障或应用重启时由系统自动恢复，不要等待人工参与。";
 const HISTORY_PADDING: i64 = 12;
@@ -180,9 +181,126 @@ async fn seed_stop_session(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn seed_handback_session(pool: &SqlitePool) -> anyhow::Result<()> {
+    ensure_session(pool, HANDBACK_SESSION, "Recovery handback smoke").await?;
+    let admission = crate::commands::chat::admit_headless_chat_turn(
+        pool,
+        HANDBACK_SESSION,
+        "执行只读仓库审计并在恢复耗尽时明确交还控制权",
+    )
+    .await
+    .map_err(|error| anyhow!(error.to_string()))?;
+    let now = Utc::now().timestamp_millis();
+    let assistant_id = "history-handback-assistant";
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at)
+         VALUES (?, ?, 'assistant', '当前结论已保留。', ?)",
+    )
+    .bind(assistant_id)
+    .bind(HANDBACK_SESSION)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO tool_calls
+         (id, message_id, tool_name, arguments, result, status, created_at,
+          objective_id)
+         VALUES ('history-handback-tool', ?, 'bash', ?,
+                 'external_state_uncertain', 'waiting', ?, ?)",
+    )
+    .bind(assistant_id)
+    .bind(r#"{"command":"set -euo pipefail; git diff --check; git status --short"}"#)
+    .bind(now)
+    .bind(&admission.objective.id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO side_effect_receipts
+         (id, objective_id, revision, action_fingerprint, idempotency_key,
+          status, created_at, observed_at)
+         VALUES ('history-handback-unknown-receipt', ?, ?,
+                 'sha256:historical-unknown', 'sha256:historical-unknown-key',
+                 'unknown', ?, ?)",
+    )
+    .bind(&admission.objective.id)
+    .bind(admission.objective.revision)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    let store = ObjectiveStore::new(pool.clone());
+    let mut current = admission.objective;
+    for _ in 0..32 {
+        if current.requires_user_action {
+            break;
+        }
+        current = route_waiting(&store, &current, "external_state_uncertain").await?;
+        if current.status.as_str() == "waiting_system" {
+            let claims = store
+                .claim_due_remediations("history-handback-worker", 1, 30_000)
+                .await?;
+            if claims.len() != 1 {
+                bail!("handback recovery round did not claim exactly once");
+            }
+            current = store.get(&current.id).await?.context("reload handback objective")?;
+        }
+    }
+    if !current.requires_user_action
+        || current.status.as_str() != "waiting_core_input"
+        || current.failure_code.as_deref() != Some("technical_recovery_exhausted")
+    {
+        bail!("production recovery ceiling did not hand the synthetic turn back");
+    }
+    Ok(())
+}
+
 async fn seed(pool: &SqlitePool) -> anyhow::Result<()> {
     seed_continue_session(pool).await?;
-    seed_stop_session(pool).await
+    seed_stop_session(pool).await?;
+    seed_handback_session(pool).await
+}
+
+async fn verify_handback_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
+    let row: (String, String, Option<i64>, Option<i64>, String, Option<i64>, String, String) =
+        sqlx::query_as(
+            "SELECT objective.status, turn.status, turn.turn_settled_at,
+                    turn.stream_closed_at, control.status, control.settled_at,
+                    tool.status, receipt.status
+             FROM objectives objective
+             JOIN chat_turn_state turn ON turn.objective_id=objective.id
+             JOIN chat_run_controls control ON control.objective_id=objective.id
+             JOIN tool_calls tool ON tool.objective_id=objective.id
+             JOIN side_effect_receipts receipt ON receipt.objective_id=objective.id
+             WHERE objective.session_id=?",
+        )
+        .bind(HANDBACK_SESSION)
+        .fetch_one(pool)
+        .await?;
+    if row.0 != "waiting_core_input"
+        || row.1 != "waiting_core_input"
+        || row.2.is_none()
+        || row.3.is_none()
+        || row.4 != "completed"
+        || row.5.is_none()
+        || row.6 != "blocked"
+        || row.7 != "unknown"
+    {
+        bail!("restarted handback oracle rejected durable state: {row:?}");
+    }
+    let claimable: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objective_remediations remediation
+         JOIN objectives objective ON objective.id=remediation.objective_id
+         WHERE objective.session_id=?
+           AND remediation.status IN ('queued','waiting','claimed')",
+    )
+    .bind(HANDBACK_SESSION)
+    .fetch_one(pool)
+    .await?;
+    if claimable != 0 {
+        bail!("handed-back objective became claimable after restart");
+    }
+    Ok(())
 }
 
 async fn continue_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -324,6 +442,7 @@ pub(crate) async fn run_worker(state_dir: &Path, phase: &str) -> anyhow::Result<
     let pool = crate::storage::db::connect(&db_url).await?;
     let result = match phase {
         "seed" => seed(&pool).await,
+        "verify-handback" | "verify-handback-again" => verify_handback_after_restart(&pool).await,
         "continue" => continue_after_restart(&pool).await,
         "verify-continue" => verify_continue_after_second_restart(&pool).await,
         "stop-request" => request_stop_then_crash(&pool, state_dir).await,
@@ -401,18 +520,18 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
     ));
     std::fs::create_dir_all(&root)?;
     let result = async {
-        let phases = ["seed", "continue", "verify-continue"];
+        let phases = ["seed", "verify-handback", "continue", "verify-continue"];
         let mut pids = Vec::new();
         for phase in phases {
             pids.push(run_phase(&root, phase).await?);
         }
         pids.push(run_stop_request_fault(&root).await?);
-        for phase in ["verify-stop", "verify-stop-again"] {
+        for phase in ["verify-stop", "verify-stop-again", "verify-handback-again"] {
             pids.push(run_phase(&root, phase).await?);
         }
         pids.sort_unstable();
         pids.dedup();
-        if pids.len() != 6 {
+        if pids.len() != 8 {
             bail!("history-session smoke did not observe distinct worker processes");
         }
 
@@ -482,9 +601,9 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         }
         Ok(serde_json::json!({
             "ok": true,
-            "scenario_ids": ["E2E-002", "E2E-003"],
+            "scenario_ids": ["E2E-002", "E2E-003", "E2E-007"],
             "build_git_sha": option_env!("CODEFACTORY_BUILD_GIT_SHA").unwrap_or("unknown"),
-            "process_restart_count": 5,
+            "process_restart_count": 7,
             "stop_request_was_hard_killed": true,
             "same_objective": same_objective,
             "continuation_objective_count": continuation_objective_count,
@@ -496,6 +615,7 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             "claimable_remediation_count": claimable_remediation_count,
             "cancel_intent_status": cancel_intent_status,
             "second_restart_stayed_cancelled": true,
+            "handback_survived_two_restarts": true,
             "ui_oracle_status": "remaining_L3_real_desktop_gap",
             "cleanup_ok": false
         }))

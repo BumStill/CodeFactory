@@ -115,6 +115,16 @@ async function main() {
       !(await handedBack.textContent() ?? "").includes("technical_recovery_exhausted"),
       "the internal reason code must never reach the screen",
     );
+    assert(
+      (await handedBack.getByRole("button", { name: "发送" }).count()) === 1
+        && (await handedBack.getByRole("button", { name: "停止后续生成" }).count()) === 0,
+      "handback must restore the real composer to Send instead of Stop",
+    );
+    assert(
+      (await handedBack.getByLabel("已阻断").count()) === 1
+        && !(await handedBack.textContent() ?? "").includes("等待远端"),
+      "the waiting tool must remain visible as blocked without a live clock",
+    );
 
     const runningBanner = running.getByTestId("turn-progress");
     await runningBanner.waitFor({ timeout: 10_000 });
@@ -130,6 +140,10 @@ async function main() {
       (await runningBanner.textContent() ?? "").includes("命令已连续运行约 3 分钟"),
       "a running turn must keep its human waiting reason",
     );
+    assert(
+      await running.getByRole("button", { name: "停止后续生成" }).isVisible(),
+      "the running control panel must keep the real Stop control",
+    );
 
     await page.screenshot({ path: path.join(artifactDir, "turn-handback.png"), fullPage: true });
     console.log(JSON.stringify({
@@ -139,6 +153,8 @@ async function main() {
         handedBackTurnRetiresTheBanner: true,
         handedBackTurnQuotesNoRemainingTime: true,
         internalReasonCodeNeverRendered: true,
+        composerReturnsToSend: true,
+        waitingToolBecomesBlocked: true,
         runningTurnKeepsItsBanner: true,
       },
     }, null, 2));

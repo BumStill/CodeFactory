@@ -398,6 +398,12 @@ export function MessageList({
   const activeProgressMessage = [...visible]
     .reverse()
     .find((message) => {
+      if (
+        message.turnActivity?.objectiveStatus &&
+        !systemOwnsObjective(message.turnActivity.objectiveStatus)
+      ) {
+        return false;
+      }
       if (streaming) {
         return message.role === "assistant" && Boolean(message.plan || message.turnActivity);
       }

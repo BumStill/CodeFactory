@@ -292,11 +292,13 @@ jobs:
           if ($smoke.build_git_sha -ne "${{ needs.prepare-release.outputs.tag_sha }}") { throw "Historical session smoke was not built from the release commit" }
           if (@($smoke.scenario_ids) -notcontains "E2E-002") { throw "Release omitted the historical continue scenario" }
           if (@($smoke.scenario_ids) -notcontains "E2E-003") { throw "Release omitted the historical stop scenario" }
+          if (@($smoke.scenario_ids) -notcontains "E2E-007") { throw "Release omitted the recovery handback scenario" }
           if (-not $smoke.stop_request_was_hard_killed) { throw "Release did not hard-kill the durable stop owner" }
           if (-not $smoke.same_objective) { throw "Release historical continue changed Objective identity" }
           if (-not $smoke.all_live_objectives_cancelled) { throw "Release session stop left a live Objective" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "Release left claimable cancellation recovery" }
           if (-not $smoke.second_restart_stayed_cancelled) { throw "Release cancellation revived after the second restart" }
+          if (-not $smoke.handback_survived_two_restarts) { throw "Release handback revived after restart" }
           if (-not $smoke.cleanup_ok) { throw "Release historical session smoke leaked isolated state" }
           Get-Content $receipt
 

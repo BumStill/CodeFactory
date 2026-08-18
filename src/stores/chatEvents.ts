@@ -182,6 +182,29 @@ function updateMessageById(
   return next;
 }
 
+const TRANSIENT_TOOL_STATUSES = new Set<ToolCallState["status"]>([
+  "waiting_permission",
+  "running",
+  "waiting",
+]);
+
+function terminalizeTransientTools(message: UIMessage): UIMessage {
+  const terminalize = (tool: ToolCallState): ToolCallState =>
+    TRANSIENT_TOOL_STATUSES.has(tool.status)
+      ? {
+          ...tool,
+          status: "blocked",
+          result: "系统已停止自动恢复，当前步骤未继续执行。",
+          isError: false,
+        }
+      : tool;
+  return {
+    ...message,
+    toolCalls: message.toolCalls?.map(terminalize),
+    turnToolCalls: message.turnToolCalls?.map(terminalize),
+  };
+}
+
 export function reduceChatStreamEvent(
   state: ChatEventState,
   event: StreamEvent,
@@ -209,9 +232,11 @@ export function reduceChatStreamEvent(
         }),
       };
 
-    case "turn_activity_updated":
+    case "turn_activity_updated": {
+      const releasedToUser = event.objective_status === "waiting_core_input";
       return {
         ...state,
+        ...(releasedToUser ? { streaming: false, pendingPermission: null } : {}),
         messages: updateMessageById(state.messages, msgId, (message) => {
           if (
             message.turnActivity &&
@@ -219,7 +244,7 @@ export function reduceChatStreamEvent(
           ) {
             return message;
           }
-          return {
+          const projected = {
             ...message,
             turnActivity: {
               rootTurnId: event.root_turn_id,
@@ -238,8 +263,10 @@ export function reduceChatStreamEvent(
               lastProgressAt: event.last_progress_at ?? null,
             },
           };
+          return releasedToUser ? terminalizeTransientTools(projected) : projected;
         }),
       };
+    }
 
     case "text_delta":
       return {
@@ -372,15 +399,17 @@ export function reduceChatStreamEvent(
 
     case "turn_settled": {
       const endedAt = Date.now();
+      const terminalForTurn = event.status !== "waiting_system";
       return {
         ...state,
         streaming: false,
         pendingPermission: null,
-        messages: updateMessageById(state.messages, msgId, (message) =>
-          message.durationMs == null
+        messages: updateMessageById(state.messages, msgId, (message) => {
+          const settled = message.durationMs == null
             ? { ...message, durationMs: Math.max(0, endedAt - message.createdAt) }
-            : message,
-        ),
+            : message;
+          return terminalForTurn ? terminalizeTransientTools(settled) : settled;
+        }),
       };
     }
 

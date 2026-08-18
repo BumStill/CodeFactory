@@ -167,6 +167,15 @@ describe("system-owned turns stay stoppable", () => {
     }
   });
 
+  it("returns to send when recovery hands back even if a stale stream flag remains true", () => {
+    runtime.streaming = true;
+    runtime.messages = [assistantMessage("waiting_core_input")];
+
+    renderWorkspace();
+
+    expect(screen.getByTestId("composer-mode")).toHaveTextContent("发送");
+  });
+
   it("returns to send for a turn that never carried objective activity", () => {
     runtime.streaming = false;
     runtime.messages = [assistantMessage(undefined)];

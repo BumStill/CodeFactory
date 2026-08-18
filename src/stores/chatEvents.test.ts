@@ -131,6 +131,50 @@ describe("chat tool call stream events", () => {
     expect(settled.streaming).toBe(false);
   });
 
+  it("terminalizes transient tools when durable recovery hands the turn back", () => {
+    const waiting: ChatEventState = {
+      ...baseState(),
+      messages: [{
+        ...baseState().messages[0],
+        toolCalls: [{
+          id: "tool-handback",
+          name: "bash",
+          args: "git status --short",
+          result: "external_state_uncertain",
+          status: "waiting",
+        }],
+      }],
+    };
+
+    const handedBack = reduceChatStreamEvent(
+      waiting,
+      {
+        type: "turn_activity_updated",
+        root_turn_id: "root-handback",
+        revision: 9,
+        phase: "waiting",
+        status: "waiting_core_input",
+        recent_activity_kind: "technical_recovery_exhausted",
+        recent_activity_label: "系统已停止并把当前结论交还给你",
+        waiting_reason: "technical_recovery_exhausted",
+        updated_at: 9,
+        terminal_reason: "technical_recovery_exhausted",
+        objective_id: "objective-handback",
+        objective_status: "waiting_core_input",
+      },
+      "assistant-1",
+    );
+
+    expect(handedBack.streaming).toBe(false);
+    expect(handedBack.messages[0].toolCalls?.[0]).toMatchObject({
+      status: "blocked",
+      isError: false,
+    });
+    expect(handedBack.messages[0].toolCalls?.[0]?.result).not.toContain(
+      "external_state_uncertain",
+    );
+  });
+
   it("marks the tool card cancelled and clears pending permission", () => {
     const waiting = reduceChatStreamEvent(
       baseState(),

@@ -3626,19 +3626,79 @@ impl ObjectiveStore {
             .fetch_one(&mut *tx)
             .await?;
             if turn_projection_columns == 10 {
-                sqlx::query(
+                let durable_settlement_columns: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM pragma_table_info('chat_turn_state')
+                     WHERE name IN ('turn_settled_at','stream_closed_at')",
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                let statement = if durable_settlement_columns == 2 {
+                    "UPDATE chat_turn_state
+                     SET revision=revision+1, phase='waiting', status='waiting_core_input',
+                         recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
+                         updated_at=?, completed_at=?, terminal_reason=?,
+                         turn_settled_at=COALESCE(turn_settled_at, ?),
+                         stream_closed_at=COALESCE(stream_closed_at, ?)
+                     WHERE objective_id=?"
+                } else {
                     "UPDATE chat_turn_state
                      SET revision=revision+1, phase='waiting', status='waiting_core_input',
                          recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
                          updated_at=?, completed_at=?, terminal_reason=?
-                     WHERE objective_id=?",
-                )
+                     WHERE objective_id=?"
+                };
+                let mut query = sqlx::query(statement)
                 .bind(TECHNICAL_RECOVERY_EXHAUSTED)
                 .bind("系统多轮自动恢复没有进展，已停止并把当前结论交还给你")
                 .bind(TECHNICAL_RECOVERY_EXHAUSTED)
                 .bind(now)
                 .bind(now)
-                .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+                .bind(TECHNICAL_RECOVERY_EXHAUSTED);
+                if durable_settlement_columns == 2 {
+                    query = query.bind(now).bind(now);
+                }
+                query
+                    .bind(&decision.objective_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            let terminalizable_tool_columns: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('tool_calls')
+                 WHERE name IN ('objective_id','status','result')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if terminalizable_tool_columns == 3 {
+                sqlx::query(
+                    "UPDATE tool_calls
+                     SET status='blocked', result=?
+                     WHERE objective_id=?
+                       AND status IN ('pending','running','waiting','waiting_permission')",
+                )
+                .bind("系统已停止自动恢复，当前步骤未继续执行。")
+                .bind(&decision.objective_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let has_chat_run_controls: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='chat_run_controls'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_chat_run_controls == 1 {
+                sqlx::query(
+                    "UPDATE chat_run_controls
+                     SET status='completed', objective_revision=?,
+                         settled_at=COALESCE(settled_at, ?), updated_at=?
+                     WHERE objective_id=?
+                       AND status IN ('active','cancel_requested')",
+                )
+                .bind(decision.revision)
+                .bind(now)
+                .bind(now)
                 .bind(&decision.objective_id)
                 .execute(&mut *tx)
                 .await?;
@@ -7363,6 +7423,81 @@ mod tests {
         let pool = pool().await;
         let store = ObjectiveStore::new(pool.clone());
         let mut current = recovery_ceiling_objective(&pool, "objective-recovery-ceiling").await;
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               revision INTEGER NOT NULL DEFAULT 1, phase TEXT NOT NULL,
+               status TEXT NOT NULL, recent_activity_kind TEXT,
+               recent_activity_label TEXT, waiting_reason TEXT,
+               updated_at INTEGER NOT NULL, completed_at INTEGER,
+               terminal_reason TEXT, objective_id TEXT,
+               turn_settled_at INTEGER, stream_closed_at INTEGER
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, phase, status, updated_at, objective_id)
+             VALUES (?, ?, 'recovering', 'active', ?, ?)",
+        )
+        .bind(current.root_turn_id.as_deref().unwrap())
+        .bind(current.session_id.as_deref().unwrap())
+        .bind(Utc::now().timestamp_millis())
+        .bind(&current.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance,
+              created_at, updated_at)
+             VALUES ('run-recovery-ceiling', ?, ?, ?, ?, 'active',
+                     'process-recovery-ceiling', ?, ?)",
+        )
+        .bind(current.session_id.as_deref().unwrap())
+        .bind(current.root_turn_id.as_deref().unwrap())
+        .bind(&current.id)
+        .bind(current.revision)
+        .bind(Utc::now().timestamp_millis())
+        .bind(Utc::now().timestamp_millis())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE tool_calls (
+               id TEXT PRIMARY KEY, objective_id TEXT,
+               status TEXT NOT NULL, result TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls(id, objective_id, status, result)
+             VALUES ('waiting-read-only-command', ?, 'waiting', 'external_state_uncertain')",
+        )
+        .bind(&current.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, revision, action_fingerprint, idempotency_key,
+              status, created_at, observed_at)
+             VALUES ('recovery-ceiling-unknown-receipt', ?, ?,
+                     'sha256:unknown', 'sha256:unknown-key', 'unknown', ?, ?)",
+        )
+        .bind(&current.id)
+        .bind(current.revision)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
         let signature = format!("{}:Finished:none", current.id);
 
         let mut queued_rounds = 0_i64;
@@ -7391,6 +7526,52 @@ mod tests {
             claimable_remediations(&pool, &current.id).await,
             0,
             "the supervisor must have nothing left to claim"
+        );
+        let projection: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT status, turn_settled_at, stream_closed_at
+             FROM chat_turn_state WHERE objective_id=?",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(projection.0, "waiting_core_input");
+        assert!(
+            projection.1.is_some() && projection.2.is_some(),
+            "handback must durably settle the turn and close its stream"
+        );
+        let run_control: (String, Option<i64>) = sqlx::query_as(
+            "SELECT status, settled_at FROM chat_run_controls
+             WHERE objective_id=?",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_control.0, "completed");
+        assert!(run_control.1.is_some(), "handback must release the run lock");
+        let tool: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, result FROM tool_calls WHERE objective_id=?",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tool.0, "blocked", "no tool may keep a live clock after handback");
+        assert!(
+            !tool.1.unwrap_or_default().contains("external_state_uncertain"),
+            "the terminal tool projection must not expose an internal recovery code"
+        );
+        let receipt_status: String = sqlx::query_scalar(
+            "SELECT status FROM side_effect_receipts
+             WHERE id='recovery-ceiling-unknown-receipt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt_status, "unknown",
+            "handback must not rewrite unresolved external-state audit truth"
         );
     }
 

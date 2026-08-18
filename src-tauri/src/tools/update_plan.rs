@@ -6,7 +6,6 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 #[cfg(not(test))]
 use tauri::Emitter;
-#[cfg(not(test))]
 use uuid::Uuid;
 
 use super::{ExecCtx, ToolOutput};
@@ -164,7 +163,6 @@ fn sanitize(args: &mut UpdatePlanArgs) {
         .map(|value| crate::trajectory::redact_text(value.trim(), 500));
 }
 
-#[cfg(not(test))]
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let mut args: UpdatePlanArgs = serde_json::from_value(args)?;
     if let Err(message) = validate(&args) {
@@ -181,10 +179,9 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             "update_plan requires a real user root turn",
         ));
     };
+    #[cfg(not(test))]
     let Some(app) = ctx.app.clone() else {
-        return Ok(ToolOutput::err(
-            "update_plan is unavailable in this runtime",
-        ));
+        return Ok(ToolOutput::err("update_plan is unavailable in this runtime"));
     };
 
     sanitize(&mut args);
@@ -233,7 +230,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     .await?;
     tx.commit().await?;
 
-    let steps = args
+    let steps: Vec<codefactory_agent_loop::types::PlanStepEvent> = args
         .steps
         .iter()
         .map(|step| codefactory_agent_loop::types::PlanStepEvent {
@@ -244,32 +241,28 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             external_job_id: step.external_job_id.clone(),
         })
         .collect();
-    let event_name = format!("stream:{session_id}");
-    app.emit(
-        &event_name,
-        codefactory_agent_loop::types::StreamEvent::PlanUpdated {
-            root_turn_id: root_turn_id.to_string(),
-            revision,
-            steps,
-            explanation: args.explanation,
-            waiting_reason: args.waiting_reason,
-            next_action_owner: args.next_action_owner,
-            change_reason: args.change_reason,
-            created_at,
-        },
-    )
-    .ok();
+    #[cfg(not(test))]
+    {
+        let event_name = format!("stream:{session_id}");
+        app.emit(
+            &event_name,
+            codefactory_agent_loop::types::StreamEvent::PlanUpdated {
+                root_turn_id: root_turn_id.to_string(),
+                revision,
+                steps,
+                explanation: args.explanation,
+                waiting_reason: args.waiting_reason,
+                next_action_owner: args.next_action_owner,
+                change_reason: args.change_reason,
+                created_at,
+            },
+        )
+        .ok();
+    }
+    #[cfg(test)]
+    let _ = steps;
 
     Ok(ToolOutput::ok(format!("Plan revision {revision} saved.")))
-}
-
-#[cfg(test)]
-pub async fn execute(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
-    let args: UpdatePlanArgs = serde_json::from_value(args)?;
-    Ok(match validate(&args) {
-        Ok(()) => ToolOutput::ok("Plan validated."),
-        Err(message) => ToolOutput::err(message),
-    })
 }
 
 #[cfg(test)]
