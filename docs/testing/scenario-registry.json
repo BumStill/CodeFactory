@@ -63,9 +63,9 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
-      "automated_by": ["rust:arbitrary_real_user_message_links_the_unique_open_objective", "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident"],
-      "required_evidence": ["L1", "L2", "L3"],
-      "gates": ["pull_request", "nightly"]
+      "automated_by": ["rust:arbitrary_real_user_message_links_the_unique_open_objective", "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident", "binary:--history-session-smoke"],
+      "required_evidence": ["L1", "L2", "L3", "L4"],
+      "gates": ["pull_request", "nightly", "release_artifact"]
     },
     {
       "id": "HLT-004",
@@ -74,9 +74,9 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
-      "automated_by": ["rust:a_user_stop_reaches_every_live_objective_the_session_still_owns", "rust:crash_left_session_stop_fences_claim_and_is_consumed_on_restart", "rust:durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled"],
-      "required_evidence": ["L1", "L2", "L3"],
-      "gates": ["pull_request", "nightly"]
+      "automated_by": ["rust:a_user_stop_reaches_every_live_objective_the_session_still_owns", "rust:crash_left_session_stop_fences_claim_and_is_consumed_on_restart", "rust:durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled", "binary:--history-session-smoke"],
+      "required_evidence": ["L1", "L2", "L3", "L4"],
+      "gates": ["pull_request", "nightly", "release_artifact"]
     },
     {
       "id": "CXD-001",
@@ -281,7 +281,9 @@
         "delivery": ["该场景的桌面证据与数据库断言绑定同一 run receipt"]
       },
       "execution": {"pull_request": "SQLite plus native UI integration", "nightly": "old-schema matrix", "release_artifact": "installed historical-session canary"},
-      "automation_status": "designed"
+      "automation_status": "partially_implemented",
+      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
+      "remaining_gaps": ["L3 真实桌面 WebView 中选择历史 session、发送继续并观察即时 stream projection", "旧 schema fixture 迁移矩阵仍需扩展"]
     },
     {
       "id": "E2E-003",
@@ -305,7 +307,9 @@
         "delivery": ["Windows exact executable 必须生成包含取消后重启断言的 receipt"]
       },
       "execution": {"pull_request": "race-focused integration", "nightly": "real App restart", "release_artifact": "Windows installed/manual canary until automated"},
-      "automation_status": "designed"
+      "automation_status": "partially_implemented",
+      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
+      "remaining_gaps": ["L3 真实桌面 WebView 中点击停止、失败态和 persisted cancelled projection", "partial projection failure 与真实 UI listener 并发仍需桌面自动化"]
     },
     {
       "id": "E2E-004",

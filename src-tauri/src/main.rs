@@ -2,6 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    if codefactory_lib::run_history_session_smoke_cli() {
+        return;
+    }
     if codefactory_lib::run_unattended_long_task_smoke_cli() {
         return;
     }
