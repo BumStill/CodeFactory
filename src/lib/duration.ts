@@ -31,6 +31,30 @@ export function formatDuration(ms: number): string {
 }
 
 /**
+ * Fixed-width elapsed clock for a live turn status line.
+ *
+ *   < 1hr  -> "MM:SS"
+ *   >= 1hr -> "H:MM:SS"
+ *
+ * This deliberately stays separate from `formatDuration`: settled metadata
+ * remains compact prose (`1m07s`), while the live clock should be easy to scan
+ * as it ticks in place.
+ */
+export function formatElapsedClock(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  const totalSeconds = Math.floor(ms / 1000);
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+  return `${String(totalMinutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+/**
  * Re-render on a ~1s cadence while `active`, so an elapsed-time label keeps
  * ticking even when nothing else changes — e.g. during a long tool call that
  * emits no text deltas. Returns the current `Date.now()` sample.

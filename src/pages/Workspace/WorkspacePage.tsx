@@ -845,6 +845,7 @@ export function WorkspacePage({
           <MessageList
             messages={messages}
             streaming={streaming}
+            turnActive={turnInFlight}
             cwd={activeCwd}
             conversationKey={activeSession?.id ?? activeDraft?.id ?? sessionId}
             hasOlderHistory={hasOlderHistory}
