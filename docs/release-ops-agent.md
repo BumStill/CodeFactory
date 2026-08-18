@@ -8,6 +8,7 @@
 - 版本号、commit SHA、build metadata 和构建时间可追踪。
 - 配置、环境变量、签名证书、更新通道和回滚包边界清楚。
 - Evidence pack 已包含主路径证据、字段级断言和失败路径。
+- 所有带 `release_artifact` gate 的 Scenario 已在 exact artifact 达到注册表要求的 L4 证据，且 build identity 与 tag SHA 一致。
 
 ## CodeFactory 发布 surface
 - Windows 安装包：MSI/NSIS，签名状态必须记录。
@@ -25,3 +26,4 @@
 - 不能停在构建成功。
 - 不能停在 deploy 命令成功。
 - 只有 live 主路径验证完成，或有明确 blocker 和下一步动作，才能收口。
+- PR/nightly 的同名场景通过不能替代 release artifact 层；场景计数不增加，但证据层必须升级。

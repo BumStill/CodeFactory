@@ -35,6 +35,7 @@
 - `agent-workbench-experience.md`: Workspace 现代视觉层级、语义状态、会话阅读、composer、后台作业与真实交付链体验规格。
 - `on-demand-embedded-browser-pane.md`: 当前会话按需创建的内置右侧浏览器分屏、控制权、安全隔离与自动回收规格。
 - `browser-access-zero-touch-provisioning.md`: 浏览器扩展零手工配对、受管浏览器下载在 Windows 权限受限时的自愈与回退规格。
+- `scenario-test-governance.md`: 统一场景注册表、PR 影响声明、证据等级，以及基于匿名历史形状的复杂真实端到端测试治理规格。
 
 ## 模板
 - `requirements-traceability-template.md`

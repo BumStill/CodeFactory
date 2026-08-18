@@ -18,6 +18,11 @@ jobs:
           python-version: "3.11"
       - run: pip install pyyaml
       - run: python tools/governance/validate_repo_governance_baseline.py
+      - name: Validate scenario test governance
+        env:
+          SCENARIO_TEST_EVENT_PATH: ${{ github.event_path }}
+          SCENARIO_TEST_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python tools/governance/validate_scenario_test_governance.py --ci
       - name: Enforce governance rules manifest (docs/governance/rules.yml)
         env:
           GOVERNANCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

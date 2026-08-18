@@ -19,6 +19,9 @@
     "docs/specs/feature-specs/payload-harness-template.md",
     "docs/specs/feature-specs/viewport-harness-template.md",
     "docs/specs/feature-specs/evidence-pack-template.md",
+    "docs/specs/feature-specs/scenario-test-governance.md",
+    "docs/testing/README.md",
+    "docs/testing/scenario-registry.json",
     "docs/evidence-packs/README.md",
     "docs/long-tasks/README.md",
     "docs/long-tasks/task-record-template.md",
@@ -28,7 +31,8 @@
     "tools/governance/validate_repo_governance_baseline.py",
     "tools/governance/check_repo_governance.ps1",
     "tools/governance/diagnose_release_latency.py",
-    "tools/governance/validate_long_task_record.py"
+    "tools/governance/validate_long_task_record.py",
+    "tools/governance/validate_scenario_test_governance.py"
   ],
   "required_markers": {
     "AGENTS.md": [
@@ -45,6 +49,8 @@
       "Compatibility Harness",
       "Release Harness",
       "Observation Harness",
+      "scenario-registry.json",
+      "Scenario-Test:",
       "long tasks",
       "governed CI/CD"
     ],
@@ -58,22 +64,26 @@
       "Requirements Traceability",
       "Primary User Path",
       "Applicable Harnesses",
+      "Scenario Traceability",
       "Payload Harness",
       "Viewport Harness"
     ],
     "docs/development-agent.md": [
       "Req ID",
+      "Scenario-Test:",
       "structure guards",
       "behavior validation",
       "Long Task"
     ],
     "docs/qa-acceptance-agent.md": [
       "Primary User Path",
+      "scenario-registry.json",
       "Viewport Harness",
       "Evidence Pack"
     ],
     "docs/release-ops-agent.md": [
       "evidence pack",
+      "release_artifact",
       "/health",
       "/build_info",
       "deployment latency",
@@ -81,8 +91,16 @@
     ],
     ".github/workflows/governance-baseline.yml": [
       "validate_repo_governance_baseline.py",
+      "validate_scenario_test_governance.py",
       "pull_request",
       "push"
+    ],
+    "docs/specs/feature-specs/scenario-test-governance.md": [
+      "Requirements Traceability",
+      "Primary User Path",
+      "Scenario-Test:",
+      "E2E-001",
+      "Applicable Harnesses"
     ],
     ".github/workflows/governed-delivery.yml": [
       "validate_repo_governance_baseline.py",
@@ -95,6 +113,11 @@
       "Applicable Harnesses",
       "Evidence Pack Requirements",
       "CF-MVP-R1"
+    ],
+    "docs/specs/feature-specs/testing-matrix-template.md": [
+      "Scenario ID",
+      "Complex E2E",
+      "evidence level"
     ]
   },
   "repo_profile_markers": [

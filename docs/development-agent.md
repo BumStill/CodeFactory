@@ -7,12 +7,14 @@
 - 开始前确认对应规格、Requirements Traceability 和 Primary User Path 已存在。
 - 行为或代码修改前先写失败测试或可执行验收。
 - 每个实现变更都标注影响的 Req ID、surface 和兼容性影响。
+- 每个产品 `feat` / `fix` 都从统一注册表确认受影响 Scenario ID；PR body 使用 `Scenario-Test: <IDs>`，命中 P0 路径时不得漏报。
 - 优先复用项目现有模式和依赖；未明确要求不引入新依赖、不做无关重构。
 
 ## 验证要求
 - 区分 structure guards 和 behavior validation。
 - structure guards 只能证明文件、类型、字段或接口存在；不能替代真实业务行为。
 - behavior validation 必须覆盖主路径结果、失败路径和关键业务字段。
+- 复杂 E2E 按注册表同时提供 UI、durable state、process、side effect 和 delivery oracle；局部单测不能替代声明的 L2-L4 证据。
 - OpenRouter、工具执行、权限策略和存储路径必须证明实际 route selection。
 
 ## CodeFactory 开发注意

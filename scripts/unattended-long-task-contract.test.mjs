@@ -76,8 +76,9 @@ test("the exact Windows release executable repeats the same contract", async () 
   );
 });
 
-test("history-derived scenarios are synthetic and versioned", async () => {
-  const [catalog, objective, chat, loop, ci, nightly, release] = await Promise.all([
+test("history-derived scenarios use the unified synthetic registry", async () => {
+  const [catalog, redirect, objective, chat, loop, ci, nightly, release] = await Promise.all([
+    source("docs/testing/scenario-registry.json"),
     source("docs/testing/history-derived-long-task-scenarios.json"),
     source("src-tauri/src/agent/objective.rs"),
     source("src-tauri/src/commands/chat.rs"),
@@ -87,15 +88,21 @@ test("history-derived scenarios are synthetic and versioned", async () => {
     source(".github/workflows/release.yml"),
   ]);
   const parsed = JSON.parse(catalog);
+  const legacy = JSON.parse(redirect);
   assert.equal(parsed.schema_version, 1);
   assert.equal(parsed.source_policy, "aggregate-shapes-only");
+  assert.equal(legacy.status, "redirect");
+  assert.equal(legacy.canonical_registry, "scenario-registry.json");
   assert.ok(parsed.scenarios.some((item) => item.id === "HLT-001"));
   assert.ok(parsed.scenarios.some((item) => item.id === "HLT-002"));
   assert.ok(parsed.scenarios.some((item) => item.id === "CXD-001"));
   assert.ok(parsed.scenarios.some((item) => item.id === "CXD-002"));
   assert.ok(
     parsed.scenarios.every(
-      (item) => !Object.hasOwn(item, "session_id") && !Object.hasOwn(item, "content"),
+      (item) =>
+        !Object.hasOwn(item, "session_id") &&
+        !Object.hasOwn(item, "content") &&
+        !Object.hasOwn(item, "local_user_path"),
     ),
   );
   assert.ok(
@@ -105,7 +112,7 @@ test("history-derived scenarios are synthetic and versioned", async () => {
     "every scenario must name an executable automation target",
   );
   const implementation = `${objective}\n${chat}\n${loop}\n${ci}\n${nightly}\n${release}`;
-  for (const scenario of parsed.scenarios) {
+  for (const scenario of parsed.scenarios.filter((item) => legacy.scenario_ids.includes(item.id))) {
     for (const automation of scenario.automated_by) {
       const target = automation.slice(automation.indexOf(":") + 1);
       assert.ok(

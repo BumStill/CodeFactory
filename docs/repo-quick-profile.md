@@ -49,6 +49,8 @@
 - PR 合并后清理自己的目录：从其他 checkout 运行 `pnpm worktrees:closeout -- --path <绝对路径> --apply`；该命令只接受 GitHub 已合并 PR，兼容 squash merge。
 - Rust 快速回归：`pnpm test:rust:fast -- <test filter>`
 - 治理基线：`python tools/governance/validate_repo_governance_baseline.py`
+- 场景测试治理：`python tools/governance/validate_scenario_test_governance.py`
+- 场景权威源：`docs/testing/scenario-registry.json`；产品 `feat/fix` PR 必须声明 `Scenario-Test: <IDs>`。
 - PowerShell 包装：`powershell -ExecutionPolicy Bypass -File tools/governance/check_repo_governance.ps1`
 - 长任务记录：`python tools/governance/validate_long_task_record.py --task-record-path <path>`
 
