@@ -108,6 +108,7 @@ impl ExtensionBridge {
             .map_err(|error| AppError::Other(format!("Could not read the bridge port: {error}")))?
             .port();
         *self.port.lock().await = Some(port);
+        let holds_stable_port = port == PREFERRED_PORT;
 
         let bridge = Arc::clone(self);
         tokio::spawn(async move {
@@ -127,7 +128,15 @@ impl ExtensionBridge {
         // developer's real home; the publishing itself is covered by
         // `extension_package`'s own tests.
         #[cfg(not(test))]
-        publish(&pairing);
+        if may_publish(holds_stable_port).await {
+            publish(&pairing);
+        } else {
+            tracing::info!(
+                "bridge: listening on {port}; leaving the published pairing pointed at {PREFERRED_PORT}"
+            );
+        }
+        #[cfg(test)]
+        let _ = holds_stable_port;
         Ok(pairing)
     }
 
@@ -340,6 +349,79 @@ fn read_token(path: PathBuf) -> Option<String> {
     looks_like_a_token.then_some(token)
 }
 
+/// Whether this instance may repoint the extension at itself.
+///
+/// The pairing file and the extension's stamped copy are shared by every
+/// CodeFactory on the machine, and the last writer won. When a second instance
+/// starts — a dev build beside the installed app is the ordinary case — it finds
+/// [`PREFERRED_PORT`] taken, falls back to an ephemeral port, and published
+/// that. From then on the extension dialled a socket owned by the short-lived
+/// process; when that process exited, the pairing pointed at nothing. An
+/// extension paired weeks earlier stopped being recognised with no visible
+/// cause, and the installed app sitting on the stable port was never found
+/// again.
+///
+/// So the instance holding the stable port owns the pairing. A fallback
+/// instance publishes only when nothing is actually serving — which is what
+/// bootstraps the very first launch, and what recovers the file if the stable
+/// port is squatted by something that never accepts a connection.
+#[cfg_attr(test, allow(dead_code))]
+async fn may_publish(holds_stable_port: bool) -> bool {
+    if holds_stable_port {
+        return publish_decision(true, true, None);
+    }
+    let stable_port_live = port_is_listening(PREFERRED_PORT).await;
+    let published_alive = match pairing_path().and_then(read_published_port) {
+        Some(port) => Some(port_is_listening(port).await),
+        None => None,
+    };
+    publish_decision(false, stable_port_live, published_alive)
+}
+
+/// The rule itself, separated from the probes so it can be stated as a table.
+///
+/// `published_alive` is `None` when no pairing has ever been written — the
+/// first launch, which must bootstrap the file even from a fallback port.
+fn publish_decision(
+    holds_stable_port: bool,
+    stable_port_live: bool,
+    published_alive: Option<bool>,
+) -> bool {
+    if holds_stable_port {
+        return true;
+    }
+    if stable_port_live {
+        return false;
+    }
+    !published_alive.unwrap_or(false)
+}
+
+/// The port the published pairing currently names.
+#[cfg_attr(test, allow(dead_code))]
+fn read_published_port(path: PathBuf) -> Option<u16> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let stored: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    u16::try_from(stored.get("port")?.as_u64()?)
+        .ok()
+        .filter(|port| *port > 0)
+}
+
+/// Whether anything on loopback accepts a connection there.
+///
+/// Bounded, because "port taken but nobody accepting" is exactly the state this
+/// has to distinguish, and a blocking connect against it would hold up startup.
+#[cfg_attr(test, allow(dead_code))]
+async fn port_is_listening(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 /// Make the live pairing available to both the Settings page and the extension.
 ///
 /// Best effort on purpose: the bridge is perfectly usable with a hand-pasted
@@ -405,6 +487,59 @@ mod tests {
             bridge.pending.lock().await.is_empty(),
             "a command that was never sent must not stay pending"
         );
+    }
+
+    /// The failure this fixes, as a table. A dev build started beside the
+    /// installed app takes an ephemeral port; publishing it repointed the
+    /// extension at a process that was about to exit, and the app on the stable
+    /// port was never found again — "I installed it before and now it isn't
+    /// recognised". The stable-port holder owns the pairing; a fallback
+    /// instance writes only when nothing at all is serving.
+    #[test]
+    fn only_the_stable_port_holder_owns_the_published_pairing() {
+        assert!(
+            publish_decision(true, true, Some(true)),
+            "the instance on the stable port always publishes its own pairing"
+        );
+        assert!(
+            !publish_decision(false, true, Some(true)),
+            "a fallback instance must not repoint a live pairing at itself"
+        );
+        assert!(
+            !publish_decision(false, true, None),
+            "the stable-port holder will publish; a fallback must not race it"
+        );
+        assert!(
+            publish_decision(false, false, None),
+            "first launch bootstraps the pairing file even from a fallback port"
+        );
+        assert!(
+            publish_decision(false, false, Some(false)),
+            "a recorded pairing nobody answers on is repaired, not preserved"
+        );
+        assert!(
+            !publish_decision(false, false, Some(true)),
+            "something is serving the recorded pairing; leave it alone"
+        );
+    }
+
+    #[test]
+    fn a_published_port_is_read_back_and_a_damaged_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.json");
+        std::fs::write(&good, serde_json::json!({"port": 47615}).to_string()).unwrap();
+        assert_eq!(read_published_port(good), Some(47615));
+
+        for (name, body) in [
+            ("missing-port.json", r#"{"token":"x"}"#),
+            ("zero.json", r#"{"port": 0}"#),
+            ("out-of-range.json", r#"{"port": 70000}"#),
+            ("garbage.json", "not json"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(read_published_port(path), None, "{name} must be rejected");
+        }
     }
 
     #[test]

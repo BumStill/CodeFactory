@@ -278,36 +278,65 @@ fn desktop_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (Strin
     (command, kind)
 }
 
-fn bash_has_explicit_external_mutation(command: &str) -> bool {
+pub(super) fn bash_has_explicit_external_mutation(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
-    let curl = lower
-        .split(|character: char| character.is_whitespace() || matches!(character, ';' | '|' | '&'))
-        .any(|word| word == "curl");
-    curl && ([
-        " -x post",
-        " -xpost",
-        " --request post",
-        " -x put",
-        " -xput",
-        " --request put",
-        " -x patch",
-        " -xpatch",
-        " --request patch",
-        " -x delete",
-        " -xdelete",
-        " --request delete",
-        " --data",
-        " --json",
-        " --form",
-        " --upload-file",
-        " -d ",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-        // curl short options are case-sensitive: `-F` uploads a form while
-        // `-f` is the read-only fail-on-HTTP-error flag; likewise `-T` uploads.
-        || command.contains(" -F ")
-        || command.contains(" -T "))
+    let words = || {
+        lower.split(|character: char| {
+            character.is_whitespace() || matches!(character, ';' | '|' | '&' | '(' | ')')
+        })
+    };
+    let curl = words().any(|word| word == "curl");
+    let web_cmdlet = words().any(|word| {
+        matches!(
+            word,
+            "invoke-webrequest" | "invoke-restmethod" | "iwr" | "irm"
+        )
+    });
+    if curl
+        && ([
+            " -x post",
+            " -xpost",
+            " --request post",
+            " -x put",
+            " -xput",
+            " --request put",
+            " -x patch",
+            " -xpatch",
+            " --request patch",
+            " -x delete",
+            " -xdelete",
+            " --request delete",
+            " --data",
+            " --json",
+            " --form",
+            " --upload-file",
+            " -d ",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+            // curl short options are case-sensitive: `-F` uploads a form while
+            // `-f` is the read-only fail-on-HTTP-error flag; likewise `-T` uploads.
+            || command.contains(" -F ")
+            || command.contains(" -T "))
+    {
+        return true;
+    }
+    // The PowerShell half of the same rule. Reading it as always-mutating is
+    // what made `Invoke-WebRequest` unusable for a download on Windows: the
+    // fetch is a GET until a method or a body says otherwise, exactly as with
+    // `curl`. `-OutFile` names a local destination and is not a body.
+    web_cmdlet
+        && [
+            "-method post",
+            "-method put",
+            "-method patch",
+            "-method delete",
+            "-body",
+            "-infile",
+            "-form",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 const READ_ONLY_BASH_VERBS: &[&str] = &[
@@ -675,8 +704,15 @@ fn browser_observation_plan(
 
 fn waiting_result(command: &str, kind: ToolKind, code: &str) -> ToolInvocationResult {
     let (content, next_action) = match code {
+        // Naming the family matters: the old wording described the gate rather
+        // than the way out, so an agent that hit it re-issued the same command
+        // and burned the Objective's recovery budget on a verdict that could
+        // never change. What remains fenced here writes somewhere this machine
+        // cannot read back — a remote branch, a registry, a cluster, another
+        // host, an HTTP request carrying a body — or forks into the background.
         "tool_observation_contract_missing" => (
-            "该外部操作缺少可验证的观察契约，系统未执行；将改用可观察的专用工具或当前状态重新规划。",
+            "该操作的效果落在本机之外或脱离前台（远端推送、发布、集群写入、带请求体的网络写入、后台进程），没有可验证的观察契约，系统未执行；\
+可行方向是改用带持久回执的专用工具（如 deliver_changes），或改成先写入工作区文件再核对的形式。",
             "replan_observable_tool",
         ),
         "mutation_permit_lost" => (
@@ -2677,11 +2713,11 @@ mod tests {
             ),
             (
                 "powershell-compound-external",
-                "Add-Content -Path effect.log -Value once; Invoke-WebRequest https://example.invalid/hook",
+                "Add-Content -Path effect.log -Value once; Invoke-WebRequest https://example.invalid/hook -Method POST -Body once",
             ),
             (
                 "powershell-nested-external",
-                "Add-Content -Path effect.log -Value (Invoke-WebRequest https://example.invalid/hook)",
+                "Add-Content -Path effect.log -Value (Invoke-RestMethod https://example.invalid/hook -Method PUT -Body once)",
             ),
             (
                 "shell-compound-external",
@@ -2716,6 +2752,48 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(receipts, 0, "{call_id} must fail before dispatch");
+        }
+    }
+
+    /// The same compound shapes with a *read* on the far side. They must not
+    /// win the exact append contract — the append is no longer the whole
+    /// command — but they are ordinary local work and get the workspace digest
+    /// instead of a permanent refusal. `Invoke-WebRequest` earned this the hard
+    /// way: read as always-mutating, it made every Windows download impossible.
+    #[tokio::test]
+    async fn a_compound_command_with_a_plain_fetch_falls_back_to_the_workspace_digest() {
+        for (call_id, command) in [
+            (
+                "powershell-compound-fetch",
+                "Add-Content -Path effect.log -Value once; Invoke-WebRequest https://example.invalid/status",
+            ),
+            (
+                "shell-compound-fetch",
+                "printf 'once\\n' >> effect.log && curl -fsSL https://example.invalid/status",
+            ),
+        ] {
+            let backend = objective_backend(false).await;
+            let dir = tempfile::tempdir().unwrap();
+            let args = serde_json::json!({"command": command});
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let (classified, kind) = backend.classify(&call, &args);
+            let admission = backend
+                .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
+                .await
+                .unwrap();
+            assert!(
+                matches!(admission, MutationAdmission::Dispatch { .. }),
+                "{call_id} must reach dispatch"
+            );
+            let (resource_kind, replay_policy): (String, String) = sqlx::query_as(
+                "SELECT resource_kind, replay_policy FROM tool_recovery_contracts LIMIT 1",
+            )
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+            assert_eq!(resource_kind, "workspace_git", "{call_id}");
+            assert_eq!(replay_policy, "never_after_dispatch", "{call_id}");
         }
     }
 
@@ -3117,22 +3195,143 @@ mod tests {
         }
     }
 
+    /// A verb that merely looks like a read-only one is still not read-only:
+    /// `lsmalware` must never be admitted through the `ls` prefix. What it does
+    /// earn is an observer — the workspace digest — because an unfamiliar local
+    /// binary is exactly as observable as `rm`, and refusing it outright left no
+    /// reachable outcome at all. Which binary may run is the permission mode's
+    /// decision, not the receipt gate's.
     #[tokio::test]
-    async fn unknown_executable_mutation_fails_closed_without_a_named_observer() {
+    async fn an_unfamiliar_local_executable_is_observed_rather_than_admitted_as_read_only() {
         let backend = objective_backend(false).await;
-        let args = serde_json::json!({"command": "lsmalware --perform-side-effect"});
+        let command = "lsmalware --perform-side-effect";
+        assert!(
+            !bash_is_explicit_read_only(command),
+            "a read-only prefix look-alike must never pass as read-only"
+        );
+        assert!(
+            native_requires_mutation_receipt(
+                "bash",
+                &serde_json::json!({"command": command}),
+                &ToolKind::ReadOnly
+            ),
+            "an unfamiliar executable still dispatches only behind a durable receipt"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({"command": command});
         let call = call_with_args("bash-read-prefix-lookalike", "bash", &args);
         register_tool_call(&backend, &call, &args).await;
-        let outcome = backend
-            .execute(&call, &args, &objective_ctx(std::path::Path::new(".")))
+        let (classified, kind) = backend.classify(&call, &args);
+        let admission = backend
+            .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
             .await
             .unwrap();
-        assert_eq!(outcome.status, ToolExecutionStatus::Waiting);
+        assert!(
+            matches!(admission, MutationAdmission::Dispatch { .. }),
+            "a local effect the workspace digest can observe must have a way through"
+        );
+        let policy: String = sqlx::query_scalar(
+            "SELECT replay_policy FROM tool_recovery_contracts LIMIT 1",
+        )
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            policy, "never_after_dispatch",
+            "an imprecise observer must never authorise a replay"
+        );
+    }
+
+    /// The report that opened this fix: a plain GET for an installer, refused
+    /// as `curl` and again as `Invoke-WebRequest`, with "replan with an
+    /// observable tool" as the only advice — and no such tool exists for HTTP.
+    /// The file it writes is the observation contract.
+    #[tokio::test]
+    async fn a_download_dispatches_against_the_file_it_writes() {
+        for (call_id, command, expected) in [
+            (
+                "bash-curl-download",
+                "curl -fsSL https://example.invalid/install/agentcenter/download -o agentcenter-install.sh",
+                "agentcenter-install.sh",
+            ),
+            (
+                "bash-curl-redirect-download",
+                "curl -fsSL https://example.invalid/install.sh > install.sh",
+                "install.sh",
+            ),
+        ] {
+            let backend = objective_backend(false).await;
+            let dir = tempfile::tempdir().unwrap();
+            let args = serde_json::json!({"command": command});
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let (classified, kind) = backend.classify(&call, &args);
+            let admission = backend
+                .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
+                .await
+                .unwrap();
+            assert!(
+                matches!(admission, MutationAdmission::Dispatch { .. }),
+                "{call_id} must reach dispatch"
+            );
+            let (resource_kind, locator): (String, String) = sqlx::query_as(
+                "SELECT resource_kind, safe_locator_json FROM tool_recovery_contracts LIMIT 1",
+            )
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+            assert_eq!(resource_kind, "workspace_file", "{call_id}");
+            assert!(
+                locator.contains(expected),
+                "{call_id} must be observed by {expected}, got {locator}"
+            );
+        }
+    }
+
+    /// `npm install` was indistinguishable from an unobservable remote write:
+    /// neither had an entry on the local allowlist, so both settled `Waiting`
+    /// no matter which permission mode the user had chosen.
+    #[tokio::test]
+    async fn dependency_installs_are_admitted_while_remote_writes_stay_fenced() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({"command": "npm install"});
+        let call = call_with_args("bash-npm-install", "bash", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (classified, kind) = backend.classify(&call, &args);
+        assert!(matches!(
+            backend
+                .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
+                .await
+                .unwrap(),
+            MutationAdmission::Dispatch { .. }
+        ));
+
+        let backend = objective_backend(false).await;
+        let args = serde_json::json!({"command": "npm publish"});
+        let call = call_with_args("bash-npm-publish", "bash", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (classified, kind) = backend.classify(&call, &args);
+        let admission = backend
+            .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
+            .await
+            .unwrap();
+        let MutationAdmission::Waiting(outcome) = admission else {
+            panic!("publishing to a registry has no local observer");
+        };
         assert_eq!(
             outcome
                 .metadata
-                .and_then(|value| value.get("code").cloned()),
-            Some(serde_json::json!("tool_observation_contract_missing"))
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some("tool_observation_contract_missing")
+        );
+        assert!(
+            outcome.content.contains("deliver_changes"),
+            "a fenced effect must name a reachable alternative, got: {}",
+            outcome.content
         );
     }
 

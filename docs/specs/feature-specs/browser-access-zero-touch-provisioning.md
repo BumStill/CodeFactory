@@ -13,6 +13,7 @@ CodeFactory 有两条读取网页的路径：**用户自己的浏览器**（扩�
 | --- | --- |
 | Windows 上浏览器下载「最后因为权限失败」 | 安装只有一个固定根目录、下载前不验证可写；最终把解压目录 rename 到位这一步在 Windows 上会被杀软句柄、Controlled Folder Access、重定向的 AppData 直接拒绝（`os error 5`），且旧目录删除失败被静默忽略 |
 | 扩展让用户操作太多 | 需要仓库 checkout 跑 `pnpm ext:build`、手动 load unpacked、再把端口和配对码抄进扩展；而 token 每次进程启动重新生成、端口是随机端口、bridge 只在打开设置页时才启动——等于每次重启都要重新配对一次 |
+| 已配对好的扩展「装过但 App 不再认识」 | 配对文件是全机唯一、后写覆盖先写。第二个实例（开发构建与安装版并存是常态）发现固定端口被占用后回退随机端口，并把这个端口写进 `bridge.json` 与扩展目录；该进程退出后配对指向无人监听的端口，而扩展只会拨这一个地址，于是固定端口上的安装版再也不会被找到 |
 
 ## Requirements Traceability
 
@@ -30,7 +31,8 @@ CodeFactory 有两条读取网页的路径：**用户自己的浏览器**（扩�
 | CF-BP-R10 | 扩展落盘目录按用户固定（不随版本变化），使 Chrome 推导出的 unpacked extension ID 跨重启、跨升级稳定 | `browser::extension_package` | unit |
 | CF-BP-R11 | 配对信息由 App 写入扩展自身目录的 `pairing.json`，扩展自行读取；正常路径下用户不需要复制端口或配对码 | `extension/background.js` + `browser::extension_package` | unit + 真实浏览器 e2e |
 | CF-BP-R12 | 配对 token 跨重启持久化；损坏或被手改的配对文件必须重新生成 token，不得把空/短值当成期望 token | `browser::extension` | unit |
-| CF-BP-R13 | bridge 优先绑定固定端口，被占用时回退随机端口；端口变化时 `pairing.json` 必须被刷新 | `browser::extension` | unit + e2e |
+| CF-BP-R13 | bridge 优先绑定固定端口，被占用时回退随机端口；持有固定端口的实例是已发布配对的唯一所有者，回退到随机端口的实例只有在固定端口与已发布端口都无人应答时才写 `bridge.json` 与 `pairing.json` | `browser::extension` | unit + e2e |
+| CF-BP-R18 | 扩展对同一份配对至少尝试两个地址：记录端口优先、固定端口兜底，失败后交替。单一记录端口失效不得成为「必须重新配对」的终点 | `extension/background.js` | unit |
 | CF-BP-R14 | bridge 在 App 启动时就监听，不依赖用户打开设置页 | `lib.rs` setup | 代码结构 |
 | CF-BP-R15 | 扩展 service worker 每次连接都重读 `pairing.json`（`cache: no-store`），不使用缓存值；文件不可用时回退到手工填写的值，手工值不得覆盖 App 写入的实时值 | `extension/background.js` | unit |
 | CF-BP-R16 | 设置页一键完成「准备扩展」，并提供打开 Chrome 扩展页、打开扩展目录、复制目录路径；已连接后不再展示安装步骤 | `SettingsPage` | component |

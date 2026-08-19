@@ -30,8 +30,17 @@ const PAIRING_FILE = "pairing.json";
 const KEEPALIVE_ALARM = "codefactory-bridge-keepalive";
 const RECONNECT_CEILING_MS = 30_000;
 
+// The port CodeFactory asks for before falling back to an ephemeral one. Kept
+// here as a second address to try, because a pairing file can outlive the
+// process that wrote it: a second CodeFactory that took an ephemeral port used
+// to stamp that port in here, and once it exited the extension was left dialling
+// a socket nobody owned — while the app the user actually runs sat on this port
+// the whole time. Trying both makes that self-correcting instead of a re-pair.
+const STABLE_PORT = 47615;
+
 let socket = null;
 let reconnectDelayMs = 1000;
+let addressAttempt = 0;
 
 /**
  * Pairing written into this extension's folder by the running app.
@@ -79,22 +88,36 @@ async function setStatus(status, extra = {}) {
   await chrome.storage.local.set({ status, statusAt: Date.now(), ...extra });
 }
 
+/**
+ * Addresses to try for one pairing, best first.
+ *
+ * The recorded port leads; the stable port is the fallback for a recording that
+ * has gone stale. The token is the same either way — it is persisted by the app
+ * and shared across its instances — so the second address needs nothing typed.
+ */
+function addressesFor(paired) {
+  return paired.port === STABLE_PORT ? [paired.port] : [paired.port, STABLE_PORT];
+}
+
 function connect() {
   pairing().then((paired) => {
     if (!paired) {
       setStatus("not_paired");
       return;
     }
-    // Recorded so the options page can say "paired automatically" instead of
-    // showing an empty form that looks like nothing has been set up.
-    setStatus("connecting", { pairingSource: paired.source, activePort: paired.port });
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
+    const addresses = addressesFor(paired);
+    const port = addresses[addressAttempt % addresses.length];
+    // Recorded so the options page can say "paired automatically" instead of
+    // showing an empty form that looks like nothing has been set up.
+    setStatus("connecting", { pairingSource: paired.source, activePort: port });
+
     // Loopback only. The app refuses any origin that is not this extension, so
     // a page cannot stand in for us even though it could open the same socket.
-    socket = new WebSocket(`ws://127.0.0.1:${paired.port}`);
+    socket = new WebSocket(`ws://127.0.0.1:${port}`);
 
     socket.addEventListener("open", () => {
       reconnectDelayMs = 1000;
@@ -131,6 +154,10 @@ function connect() {
     socket.addEventListener("close", () => {
       socket = null;
       setStatus("disconnected");
+      // Next attempt tries the other address. Without this the extension would
+      // keep dialling one stale port forever, which is precisely how a working
+      // pairing turned into "the app no longer sees my browser".
+      addressAttempt += 1;
       // Backoff: CodeFactory being closed is the normal case, not an error, so
       // retries must not spin.
       reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_CEILING_MS);

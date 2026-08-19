@@ -46,8 +46,19 @@
 | CF-ORC-R35 | system-owned 恢复必须有界。持久 remediation 历史按 `(objective, recovery_generation, failure_signature)` 在一次用户授权代际内累计计数，并对该代际设总量兜底；任一上限达成后不得再排下一次 observation，必须以 `technical_recovery_exhausted` 进入 typed core input 等待并结算 transport turn。计数不因 failure code 变化而重置；用户明确新输入续接 exhausted Objective 时保留同一 Objective 与全部历史、递增 `recovery_generation` 并获得一份新的有界预算；用户驱动的 remediation（`apply_recommended` 与 `resume_authorized_action`）不计入预算 | 上限/同代签名抖动/跨代续接/再次耗尽/证据门禁/权限豁免单测 + 真实 app 复现 |
 | CF-ORC-R36 | `update_plan` 等只修改 CodeFactory 事务型控制面的工具保持 Mutation capability，但不得创建外部副作用 receipt；校验拒绝必须确定为未应用，plan revision、Objective side-effect latch 和后续工具准入均不得被污染 | 真实 ToolBackend + SQLite plan revision/receipt sequence |
 | CF-ORC-R37 | `technical_recovery_exhausted` 必须在同一 SQLite 事务结算 `chat_turn_state.turn_settled_at/stream_closed_at`、精确 run-control 与非终态 tool projection；Objective 保持 `waiting_core_input`，unknown receipt 保持审计真相但不得继续呈现为运行中 | ObjectiveStore fault injection + cross-process restart smoke + browser integration |
+| CF-ORC-R38 | bash 的观察契约按**效果范围**判定，不按命令是否出现在白名单里。落在本机的效果必须获得可用观察者并放行：下载到指定文件由该文件的 sha256 观察，其余本机命令由 workspace digest 观察且 replay policy 为 `never_after_dispatch`。只有效果落在本机之外（远端推送/发布/集群/其他主机/带 method 或 body 的网络写入）、目标在工作区之外的文件破坏性操作、以及后台化命令才继续 fenced；fenced 文案必须指出可达替代路径，不得只描述门禁本身 | 下载文件观察者、依赖安装放行、工作区外破坏性操作与远端写入 fenced 的双向单测 |
+| CF-ORC-R39 | 单次 root turn 内已建立的 browser session 归属已由 task/chat 唯一确定时，后续 browser 动作省略 `session_id` 必须自动续用该 session；只有零个或多个归属会话时才要求显式命名 | 单会话续用 + 跨会话不可达 + 多会话必须命名的单测 |
 
-## 恢复有界性（CF-ORC-R35）
+## 效果范围决定观察契约（CF-ORC-R38）
+
+CF-ORC-R34 已经把"只读探查不是外部变更"写进规格。R38 把同一条推理补完到写操作一侧。
+
+2026-08-19 的现场证据：一个安装 CLI 的任务先后用 `curl` 与 `Invoke-WebRequest` 拉取安装脚本，两次都得到"缺少可验证的观察契约，系统未执行"。这不是慢路径而是**不可达路径**——`curl` 在实现里位于 deny list，任何 replan 都无法为它生成观察者，而文案建议的"可观察的专用工具"对 HTTP 并不存在。同一条路径同时挡住了 `npm install` 与项目自带脚本：它们只是没有出现在那份十来个动词的白名单里。
+
+- 白名单选择的是**信任**，而信任是权限模式（只读/默认/信任）已经在回答的问题；观察者选择的是**这次效果能不能被读回来**。把前者当成后者，就会出现"用户已授予信任、系统仍然拒绝执行且用户无法裁决"的状态，违反本规格顶层原则（只有不可安全推导的核心输入才允许回交）。
+- 下载的目的地就是它的观察契约。写入指定本地文件的 GET 与 `write_file` 同构，用同一个 `workspace_file` 观察者即可。
+- 对不熟悉的本机命令，workspace digest 是诚实且足够的观察者：它回答"工作区是否改变"，配合 `never_after_dispatch` 永不授权重放，因此不精确的观察者不会带来重复副作用，只会退化为 `ObserveOnly`。
+- 仍然 fenced 的两类是真正读不回来的：效果落在别的系统上，或进程 fork 后脱离本次观察。这两类的文案必须给出可达出口（如 `deliver_changes`），否则等价于让模型在同一裁决上耗尽恢复预算。
 
 本规格的顶层原则要求"持续持有所有**可恢复**的技术状态"，CF-ORC-R24 要求"局部预算耗尽只能扩大退避或换策略"。2026-08-13 的现场证据表明这条补救路径在实现中从未发生：`objective_remediations.approach_index` 恒为 0（从不换策略）、退避恒为 ~13s（从不扩大），而每一轮都真实调用模型并产生费用。
 

@@ -131,13 +131,14 @@ describe("service worker command dispatch", () => {
       "chrome",
       "WebSocket",
       "fetch",
-      `${source}\nreturn { handle, listTabs, pairing, packagedPairing };`,
+      `${source}\nreturn { handle, listTabs, pairing, packagedPairing, addressesFor };`,
     );
     const api = module(chromeStub, SocketStub, fetchStub) as {
       handle: (request: Record<string, unknown>) => Promise<Record<string, unknown>>;
       listTabs: () => Promise<Record<string, unknown>[]>;
       pairing: () => Promise<Record<string, unknown> | null>;
       packagedPairing: () => Promise<Record<string, unknown> | null>;
+      addressesFor: (paired: { port: number }) => number[];
     };
     return { api, storage, executeScript, sockets, fetchStub, chromeStub };
   }
@@ -192,6 +193,20 @@ describe("service worker command dispatch", () => {
     });
 
     expect(await api.pairing()).toMatchObject({ port: 47615, source: "packaged" });
+  });
+
+  it("keeps the stable port as a second address so a stale pairing self-heals", async () => {
+    // How a working pairing broke: a second CodeFactory took an ephemeral port,
+    // stamped it in here, and exited. The extension then dialled a dead socket
+    // forever while the app the user runs sat on the stable port. One recorded
+    // port must not be the only address it will ever try.
+    const { api } = await loadWorker([], {
+      packaged: { port: 64530, token: "0123456789abcdef0123456789abcdef" },
+    });
+
+    expect(api.addressesFor({ port: 64530 })).toEqual([64530, 47615]);
+    // Already on the stable port: no point dialling it twice.
+    expect(api.addressesFor({ port: 47615 })).toEqual([47615]);
   });
 
   it("ignores a pairing file that is not usable rather than dialling a bad port", async () => {

@@ -118,17 +118,26 @@ impl ToolRecoveryStore {
                     .get("command")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                if let Some(relative) = exact_local_append_target(command) {
+                let named_file =
+                    exact_local_append_target(command).or_else(|| fetch_output_target(command));
+                if let Some(relative) = named_file {
                     file_plan(cwd, Some(&relative)).await?
-                } else if known_local_workspace_command(command) {
+                } else if escapes_workspace_observation(command) {
+                    None
+                } else {
+                    // The workspace digest answers the only question recovery
+                    // asks — did anything change? — for `git commit` and for a
+                    // build script alike. Which binary runs is a permission
+                    // decision the user already made; it is not what makes an
+                    // effect observable, and treating an allowlist as if it
+                    // were left `npm install`, `pip install` and every project
+                    // script with no observer that could ever be built.
                     Some(ToolRecoveryPlan {
                         resource_kind: "workspace_git",
                         replay_policy: "never_after_dispatch",
                         safe_locator_json: "{}".into(),
                         precondition_digest: workspace_git_digest(cwd).await?,
                     })
-                } else {
-                    None
                 }
             }
             // Every future native mutation fails closed until it names a
@@ -798,90 +807,213 @@ fn exact_local_append_target(command: &str) -> Option<String> {
     safe_relative(Path::new(&candidate)).then_some(candidate)
 }
 
-fn known_local_workspace_command(command: &str) -> bool {
-    let lower = command.trim_start().to_ascii_lowercase();
-    if lower.is_empty()
-        || lower.contains("nohup ")
-        || lower.contains("start-process ")
-        || lower.contains("start-job ")
-        || lower.trim_end().ends_with('&')
-        || [
-            "curl ",
-            "wget ",
-            "invoke-webrequest ",
-            "invoke-restmethod ",
-            "kubectl ",
-            "helm ",
-            "ssh ",
-            "scp ",
-            "rsync ",
-            "git push",
-            "git tag",
-            "gh pr create",
-            "gh pr merge",
-            "gh workflow run",
-            "gh release ",
-            "npm publish",
-            "pnpm publish",
-            "cargo publish",
-            "docker push",
-            "podman push",
-            "vercel ",
-            "netlify ",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
+/// A file mutator aimed outside the workspace.
+///
+/// `rm /tmp/keep` and `Add-Content -Path C:\Temp\effect.log` do land on this
+/// machine, but nowhere the workspace digest reads — admitting them would
+/// attach an observer that could never see the effect, and an unobservable
+/// delete is precisely what the receipt gate exists to hold.
+///
+/// Scoped to verbs whose arguments *are* paths. A build script that happens to
+/// mention `/usr/lib` in a flag is not this, and widening the check to every
+/// command containing a slash is what made the old allowlist reject most of the
+/// shell.
+fn file_mutator_leaves_the_workspace(lower: &str) -> bool {
+    let first = lower.split_whitespace().next().unwrap_or_default();
+    if !matches!(
+        first,
+        "rm" | "rmdir"
+            | "mv"
+            | "cp"
+            | "touch"
+            | "mkdir"
+            | "ln"
+            | "add-content"
+            | "set-content"
+            | "out-file"
+            | "remove-item"
+            | "move-item"
+            | "copy-item"
+            | "new-item"
+    ) {
         return false;
     }
-    if lower.contains(['\n', '\r', ';', '|', '&', '>', '<', '`'])
-        || lower.contains("$(")
-        || lower.contains("${")
-    {
-        return false;
-    }
-    if lower.contains("../")
+    lower.contains("../")
         || lower.contains("..\\")
-        || lower.contains(" $")
         || lower.contains("%userprofile%")
         || lower.contains("%temp%")
-        || lower.contains("\\\\")
         || lower.split_whitespace().any(|word| {
             let word = word.trim_matches(['\'', '"']);
             (word.starts_with('/') && !word.starts_with("--"))
                 || word.starts_with("~/")
                 || word.starts_with("~\\")
+                || word.starts_with("\\\\")
                 || word
                     .as_bytes()
                     .get(1)
                     .is_some_and(|separator| *separator == b':')
         })
+}
+
+/// Effects the workspace digest cannot speak for.
+///
+/// Two families, and only two. A backgrounded command outlives the observation
+/// entirely, so its completion is unknowable no matter what it does. Everything
+/// else here writes somewhere this machine cannot read back: a remote branch, a
+/// registry, a cluster, another host, or an HTTP request carrying a body.
+///
+/// The list used to be the inverse — an allowlist of a dozen local verbs, with
+/// everything unrecognized fenced. That is the wrong polarity for a shell: the
+/// long tail of legitimate local work (`npm install`, `pip install`, a project's
+/// own build script) is unbounded, and each one settled `Waiting` on an
+/// observation contract that no amount of replanning could produce. Fencing an
+/// effect is only honest when the effect is genuinely unobservable, not when the
+/// verb is merely unfamiliar — which binary may run is what the permission mode
+/// decides.
+fn escapes_workspace_observation(command: &str) -> bool {
+    let trimmed = command.trim_end();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.trim().is_empty() {
+        return true;
+    }
+    // `&&` sequences; a lone trailing `&` forks.
+    if lower.ends_with('&') && !lower.ends_with("&&") {
+        return true;
+    }
+    if ["nohup ", "start-process ", "start-job "]
+        .iter()
+        .any(|marker| lower.contains(marker))
     {
-        return false;
+        return true;
     }
-    let first = lower.split_whitespace().next().unwrap_or_default();
-    match first {
-        "apply_patch" | "touch" | "mkdir" | "rm" | "mv" | "cp" | "install" | "rustfmt"
-        | "prettier" | "eslint" | "biome" => true,
-        "sed" => lower.split_whitespace().any(|arg| arg == "-i"),
-        "perl" => lower.split_whitespace().any(|arg| arg == "-pi"),
-        "cargo" => lower.split_whitespace().nth(1) == Some("fmt"),
-        "git" => matches!(
-            lower.split_whitespace().nth(1),
-            Some(
-                "add"
-                    | "commit"
-                    | "apply"
-                    | "branch"
-                    | "switch"
-                    | "checkout"
-                    | "fetch"
-                    | "pull"
-                    | "stash"
-            )
-        ),
-        _ => false,
+    // A request with a method or a body changes state on the far side, which no
+    // local file can attest to. A plain fetch is a read and stays admissible.
+    if super::tool_backend::bash_has_explicit_external_mutation(command) {
+        return true;
     }
+    if file_mutator_leaves_the_workspace(&lower) {
+        return true;
+    }
+    [
+        "kubectl ",
+        "helm ",
+        "ssh ",
+        "scp ",
+        "rsync ",
+        "git push",
+        "git tag",
+        "gh pr create",
+        "gh pr merge",
+        "gh workflow run",
+        "gh release ",
+        "npm publish",
+        "pnpm publish",
+        "cargo publish",
+        "docker push",
+        "podman push",
+        "vercel ",
+        "netlify ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Whether a shell metacharacter appears outside quotes.
+///
+/// `curl "https://host/path?a=1&b=2" -o out` is one foreground command; a bare
+/// `&` in the same position forks it. Only the unquoted one changes what runs,
+/// and a query string is far too common to read as backgrounding.
+fn contains_unquoted(command: &str, needle: char) -> bool {
+    let mut quote: Option<char> = None;
+    for character in command.chars() {
+        match (quote, character) {
+            (Some(open), current) if current == open => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(character),
+            (None, current) if current == needle => return true,
+            (None, _) => {}
+        }
+    }
+    false
+}
+
+/// The local file a download names, when it names exactly one.
+///
+/// A download reads like an unobservable network call, but its entire purpose is
+/// a file on disk — and that file is observable by the same `workspace_file`
+/// contract `write_file` uses. Without this, `curl` sat on a deny list, no
+/// observer could ever be built for it, and "fetch the installer" was not a slow
+/// path but an impossible one: every attempt settled `Waiting` and the only
+/// suggested alternative — a dedicated observable tool — does not exist for HTTP.
+///
+/// Deliberately strict about shape. One segment, no substitution, no
+/// backgrounding, and a workspace-relative destination; anything more elaborate
+/// falls through to the workspace digest rather than claiming a precision it
+/// does not have.
+fn fetch_output_target(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(['\n', '\r', ';', '|', '`'])
+        || contains_unquoted(trimmed, '&')
+        || trimmed.contains("$(")
+        || trimmed.contains("${")
+    {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let client = lower.split_whitespace().next().unwrap_or_default().to_owned();
+    if !matches!(client.as_str(), "curl" | "wget" | "invoke-webrequest" | "iwr") {
+        return None;
+    }
+    if escapes_workspace_observation(trimmed) {
+        return None;
+    }
+
+    let candidate = if let Some((before, after)) = trimmed.split_once('>') {
+        // `curl URL > out`. A second redirect or an input redirect means the
+        // destination is no longer a single obvious file.
+        if after.contains('>') || before.contains('<') || after.trim().is_empty() {
+            return None;
+        }
+        after.trim().trim_matches(['\'', '"']).to_owned()
+    } else {
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut found: Option<String> = None;
+        for (index, word) in words.iter().enumerate() {
+            if let Some((name, value)) = word.split_once('=') {
+                if matches!(
+                    name.trim_start_matches('-').to_ascii_lowercase().as_str(),
+                    "output" | "output-document" | "outfile"
+                ) && !value.is_empty()
+                {
+                    found = Some(value.trim_matches(['\'', '"']).to_owned());
+                    break;
+                }
+            }
+            // `-O` means "keep the remote name" to curl and "write this path"
+            // to wget. Reading it as a path for curl would invent a file the
+            // command never writes.
+            let takes_path = match client.as_str() {
+                "curl" => *word == "-o" || word.eq_ignore_ascii_case("--output"),
+                "wget" => {
+                    *word == "-O" || word.eq_ignore_ascii_case("--output-document")
+                }
+                _ => word.eq_ignore_ascii_case("-outfile"),
+            };
+            if takes_path {
+                found = words
+                    .get(index + 1)
+                    .map(|path| path.trim_matches(['\'', '"']).to_owned());
+                break;
+            }
+        }
+        found?
+    };
+
+    if candidate.is_empty() {
+        return None;
+    }
+    safe_relative(Path::new(&candidate)).then_some(candidate)
 }
 
 async fn workspace_git_digest(cwd: &Path) -> Result<String> {
@@ -1118,4 +1250,118 @@ async fn terminalize_linked_calls(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A download's destination is the whole point of the command, and a file
+    /// digest observes it exactly. Before this, `curl` was on a deny list with
+    /// no observer of any kind, so "fetch the installer" could not be attempted
+    /// at all — the report that started this fix showed both `curl` and
+    /// `Invoke-WebRequest` refused for a plain GET.
+    #[test]
+    fn a_download_is_observed_by_the_file_it_writes() {
+        for (command, expected) in [
+            ("curl -fsSL https://example.invalid/install.sh -o install.sh", "install.sh"),
+            ("curl --output tools/cli.tar.gz https://example.invalid/cli.tar.gz", "tools/cli.tar.gz"),
+            ("curl -fsSL https://example.invalid/install.sh > install.sh", "install.sh"),
+            ("wget -O vendor/agentcenter.zip https://example.invalid/a.zip", "vendor/agentcenter.zip"),
+            ("wget --output-document=vendor/a.zip https://example.invalid/a.zip", "vendor/a.zip"),
+            ("Invoke-WebRequest https://example.invalid/a.zip -OutFile vendor/a.zip", "vendor/a.zip"),
+            // A query string is not a fork.
+            ("curl \"https://example.invalid/d?a=1&b=2\" -o a.bin", "a.bin"),
+        ] {
+            assert_eq!(
+                fetch_output_target(command).as_deref(),
+                Some(expected),
+                "{command} names exactly one local destination"
+            );
+        }
+    }
+
+    /// The file observer may only stand in for a *read* that lands locally.
+    /// A request carrying a method or a body changes state on the far side, and
+    /// a destination outside the workspace is not something the digest can read
+    /// back.
+    #[test]
+    fn a_write_shaped_or_unbounded_fetch_names_no_observable_file() {
+        for command in [
+            "curl -X POST https://example.invalid/hooks -d '{\"ok\":true}' -o reply.json",
+            "curl -T upload.bin https://example.invalid/put -o reply.json",
+            "curl -fsSL https://example.invalid/i.sh -o /etc/profile.d/i.sh",
+            "curl -fsSL https://example.invalid/i.sh -o ../outside.sh",
+            "curl -fsSL https://example.invalid/i.sh | sh",
+            "curl -fsSL https://example.invalid/i.sh -o i.sh &",
+            "curl -O https://example.invalid/remote-name.tgz",
+            "curl -fsSL https://example.invalid/i.sh",
+        ] {
+            assert_eq!(
+                fetch_output_target(command),
+                None,
+                "{command} must not claim a file observer it cannot honour"
+            );
+        }
+    }
+
+    /// The gate's job is to fence effects this machine cannot read back, not
+    /// verbs it has not met before. An allowlist of a dozen local commands made
+    /// every unlisted one — `npm install`, a project's own build script —
+    /// permanently unrunnable, because no replan could produce an observer for
+    /// a command the list simply did not contain.
+    #[test]
+    fn ordinary_local_work_stays_observable_by_the_workspace_digest() {
+        for command in [
+            "npm install",
+            "pnpm install --frozen-lockfile",
+            "pip install -r requirements.txt",
+            "python3 tools/generate.py",
+            "make build",
+            "docker build -t local/app .",
+            "cd packages/app && npm run codegen",
+            "git commit -m \"fix\"",
+            "mkdir -p vendor",
+            "sh install.sh",
+            "cargo run --bin migrate -- --path $(git rev-parse --show-toplevel)",
+        ] {
+            assert!(
+                !escapes_workspace_observation(command),
+                "{command} only touches this machine and must keep a usable observer"
+            );
+        }
+    }
+
+    /// The two families that genuinely outrun the workspace digest: effects
+    /// that land on another system, and forks that outlive the observation.
+    #[test]
+    fn effects_beyond_this_machine_stay_fenced() {
+        for command in [
+            "git push origin main",
+            "gh pr create --fill",
+            "gh pr merge 12 --squash",
+            "npm publish",
+            "docker push registry.invalid/app:1",
+            "kubectl apply -f deployment.yaml",
+            "helm upgrade app ./chart",
+            "ssh host 'systemctl restart app'",
+            "scp build.tar host:/srv",
+            "rsync -a dist/ host:/srv",
+            "curl -X POST https://example.invalid/hooks -d '{\"ok\":true}'",
+            "nohup sh -c 'touch launched' >/dev/null 2>&1 &",
+            "Start-Process powershell -ArgumentList '-Command whoami'",
+        ] {
+            assert!(
+                escapes_workspace_observation(command),
+                "{command} writes where this machine cannot read back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_ampersand_is_not_a_fork() {
+        assert!(contains_unquoted("sleep 1 & echo done", '&'));
+        assert!(!contains_unquoted("curl \"https://h/d?a=1&b=2\" -o a.bin", '&'));
+        assert!(!contains_unquoted("curl 'https://h/d?a=1&b=2' -o a.bin", '&'));
+    }
 }
