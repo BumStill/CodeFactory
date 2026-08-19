@@ -1,6 +1,6 @@
 {
   "name": "codefactory",
-  "version": "1.81.15",
+  "version": "1.81.16",
   "type": "module",
   "scripts": {
     "dev": "vite",
