@@ -535,6 +535,27 @@ describe("persisted chat hydration", () => {
     );
   });
 
+  it("restores whole-turn duration from a terminal activity without a plan", () => {
+    const rows: Message[] = [
+      { id: "root", session_id: "session-1", role: "user", content: "开始", created_at: 1_000 },
+      { id: "answer", session_id: "session-1", role: "assistant", content: "结束", created_at: 2_000 },
+    ];
+    const states: TurnActivitySnapshot[] = [{
+      root_turn_id: "root",
+      revision: 8,
+      phase: "terminal",
+      status: "blocked",
+      recent_activity_kind: "handback",
+      recent_activity_label: "任务已结束",
+      waiting_reason: null,
+      updated_at: 85_000,
+      terminal_reason: "waiting_core_input",
+      objective_status: "waiting_core_input",
+    }];
+
+    expect(dbMessagesToUI(rows, [], states)[1].durationMs).toBe(84_000);
+  });
+
   it("keeps a hydrated system-owned objective when no assistant row exists yet", () => {
     const rows: Message[] = [
       {

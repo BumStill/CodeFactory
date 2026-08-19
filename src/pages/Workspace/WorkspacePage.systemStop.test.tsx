@@ -103,8 +103,19 @@ vi.mock("../../components/GitStatusBar", () => ({ GitStatusBar: () => null }));
 vi.mock("../../components/CheckpointsPanel", () => ({ CheckpointsPanel: () => null }));
 vi.mock("../../components/ExecutionStream", () => ({ ExecutionStream: () => null }));
 vi.mock("../../components/MessageList", () => ({
-  MessageList: ({ turnActive }: { turnActive?: boolean }) => (
-    <div data-testid="body-turn-state">{turnActive ? "正文运行中" : "正文空闲"}</div>
+  MessageList: ({
+    turnActive,
+    turnExecutionActive,
+  }: {
+    turnActive?: boolean;
+    turnExecutionActive?: boolean;
+  }) => (
+    <div>
+      <div data-testid="body-turn-state">{turnActive ? "正文运行中" : "正文空闲"}</div>
+      <div data-testid="body-turn-execution">
+        {turnExecutionActive ? "正文执行中" : "正文未执行"}
+      </div>
+    </div>
   ),
 }));
 vi.mock("../../components/MessageInput", () => ({
@@ -200,6 +211,7 @@ describe("system-owned turns stay stoppable", () => {
       expect(screen.getByTestId("composer-mode")).toHaveTextContent("停止后续生成"),
     );
     expect(screen.getByTestId("body-turn-state")).toHaveTextContent("正文运行中");
+    expect(screen.getByTestId("body-turn-execution")).toHaveTextContent("正文执行中");
   });
 
   it("targets the rendered session explicitly when stop is clicked", async () => {
