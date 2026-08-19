@@ -89,6 +89,14 @@ export function useStickyAutoScroll(
   // should NOT light up the "new content" badge. See the bug-reproducer
   // test in useStickyAutoScroll.test.tsx for the exact scenario.
   const newContentBaseline = useRef(0);
+  // Layout can grow because the user expanded evidence that was already in
+  // the conversation. That is not new streamed content. When the caller can
+  // provide a semantic content signal, require it to change after pin loss
+  // before lighting the badge; callers without a signal retain the legacy
+  // height-only behavior.
+  const contentSignalRef = useRef(contentSignal);
+  contentSignalRef.current = contentSignal;
+  const pinLossContentSignal = useRef(contentSignal);
 
   // Bottom position captured when pinning is lost. It remains stable while
   // the user drags back toward the tail; streaming must not move the target
@@ -104,6 +112,11 @@ export function useStickyAutoScroll(
     // the raw value (often scrollHeight, one clientHeight past the max)
     // would make every echo event look like a user scroll.
     lastSetScrollTop.current = el.scrollTop;
+    // The next non-echo scroll event must measure direction from the position
+    // the user actually saw after our pin. Leaving this at its initial zero
+    // makes a first upward wheel gesture look stationary/downward and applies
+    // the broad catch-up threshold, which can silently re-pin short overflows.
+    lastUserScrollTop.current = el.scrollTop;
   }, []);
 
   const prepareForPrepend = useCallback(() => {
@@ -199,6 +212,7 @@ export function useStickyAutoScroll(
           // Capture both growth and the bottom the user could see at the exact
           // moment they detached. Keep this bottom stable until they re-pin.
           newContentBaseline.current = el.scrollHeight;
+          pinLossContentSignal.current = contentSignalRef.current;
           pinLossBottom.current = Math.max(0, el.scrollHeight - el.clientHeight);
         }
       }
@@ -222,6 +236,8 @@ export function useStickyAutoScroll(
       if (
         !pinnedRef.current &&
         !hasNewContentRef.current &&
+        (contentSignalRef.current === undefined ||
+          contentSignalRef.current !== pinLossContentSignal.current) &&
         scroller.scrollHeight > newContentBaseline.current
       ) {
         hasNewContentRef.current = true;
@@ -242,7 +258,7 @@ export function useStickyAutoScroll(
     requestAnimationFrame(stickToBottomIfPinned);
 
     return () => obs.disconnect();
-  }, [contentSignal, scrollerMounted, stickToBottomIfPinned]);
+  }, [scrollerMounted, stickToBottomIfPinned]);
 
   // Track when the scroller DOM node appears or disappears so observers
   // are reattached (e.g. WelcomeScreen → first message transition).
@@ -259,6 +275,7 @@ export function useStickyAutoScroll(
     if (!scrollerRef.current) return;
     pinnedRef.current = true;
     newContentBaseline.current = scrollerRef.current.scrollHeight;
+    pinLossContentSignal.current = contentSignalRef.current;
     pinLossBottom.current = Math.max(
       0,
       scrollerRef.current.scrollHeight - scrollerRef.current.clientHeight,

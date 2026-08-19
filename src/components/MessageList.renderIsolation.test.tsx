@@ -99,9 +99,13 @@ describe("MessageList render isolation", () => {
       (_, turn): UIMessage[] => {
         const toolCalls = Array.from({ length: 36 }, (_, tool) => ({
           id: `turn-${turn}-tool-${tool}`,
-          name: tool % 2 === 0 ? "read_file" : "bash",
+          // A production-shaped turn contains a large routine discovery run
+          // followed by a small number of causal verification commands.
+          // Routine evidence may compact; commands must remain directly
+          // visible even when that costs more DOM than the legacy group-all.
+          name: tool < 30 ? "read_file" : "bash",
           args:
-            tool % 2 === 0
+            tool < 30
               ? JSON.stringify({ path: `/project/src/file-${tool}.ts` })
               : JSON.stringify({
                   command: `pnpm test --filter turn-${turn}-${tool}`,
@@ -138,11 +142,11 @@ describe("MessageList render isolation", () => {
     );
 
     expect(container.querySelectorAll("[data-message-row]")).toHaveLength(16);
-    expect(container.querySelectorAll("[data-tool-status]")).toHaveLength(0);
+    expect(container.querySelectorAll("[data-tool-status]")).toHaveLength(48);
     expect(
-      getAllByRole("button", { name: /查看 36 个已完成操作/ }),
+      getAllByRole("button", { name: /展开 30 项例行操作.*读取 30/ }),
     ).toHaveLength(8);
-    expect(container.querySelectorAll("*").length).toBeLessThanOrEqual(250);
+    expect(container.querySelectorAll("*").length).toBeLessThanOrEqual(850);
   });
 
   it("shows the truthful safety-budget notice only for a truncated history page", () => {

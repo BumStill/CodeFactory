@@ -15,7 +15,7 @@
 | CF-CCE-R7 | 重启 hydration 遇到无活跃 owner 的悬空工具尾部时，5 秒内显示 system-owned 恢复状态；30 秒内 claim identity 完整的 objective，不继续显示旧计时、假运行或人工恢复动作 | SQLite fixture + real app |
 | CF-CCE-R8 | supervisor 自动复用原 root goal 和检查点，从最后确认边界继续，不重复执行已成功的非幂等工具；用户主动“继续”只用于批准方案/新 steer，不是技术恢复依赖 | resume integration + forbidden-CTA + side-effect counter |
 | CF-CCE-R9 | 助手正文是主阅读线；成功工具默认为无全周边框、无阴影的行内证据，运行/权限/失败使用轻背景或左侧状态线 | component + compiled CSS + real app |
-| CF-CCE-R10 | 相邻三个及以上例行成功工具可原位聚合，但当前 objective 未 completed/cancelled 时不得按固定 segment 阈值整体折叠；turn error、waiting_system 或 platform incident 都仍显示恢复状态。只有业务 completed 或显式 cancelled 后才可收束较早过程。不得跨助手正文、失败、权限或用户消息分组，展开后顺序与审计内容不变 | timeline component tests + objective transition real app |
+| CF-CCE-R10 | 相邻三个及以上已知例行成功工具可原位聚合，但不得按固定 segment 位置隐藏较早内容。当前 objective 未 completed/cancelled、或同一已挂载回合刚从 active 进入终态时保持完整展开；只有下一条用户消息使其成为历史回合、重新打开历史会话或用户手动收起后才进入紧凑态。turn error、waiting_system 或 platform incident 始终展开 | timeline component tests + objective transition real app |
 | CF-CCE-R11 | 工具折叠态不解析大 diff/完整输出，摘要有界且不泄漏 prompt、凭据或未脱敏参数 | lazy/payload tests |
 | CF-CCE-R12 | 主题 token 支持 Tailwind `<alpha-value>`；生产 CSS 必须真实生成工具证据使用的 border/background opacity 类 | production CSS assertion |
 | CF-CCE-R13 | 历史 hydration 按真实用户回合重组 narration、tool replay、continuity 和 final；同一回合密度与 live timeline 一致 | hydration/store + component fixture |
@@ -25,12 +25,16 @@
 | CF-CCE-R17 | 普通短会话、超长历史、排队消息、匿名会话、completion recovery、sticky-scroll 和工具权限语义不得回归 | compatibility matrix |
 | CF-CCE-R18 | PR+CI、main、公开安装包和精确版本真实 App 验收完成前保持 `not live` | Release Harness evidence pack |
 | CF-CCE-R19 | 长任务以结构化 plan event 提交有界步骤、等待原因和计划变化；进度条展示当前/下一步，百分比只取 `completed / total` 并标明来源 | tool/event/store/component |
-| CF-CCE-R20 | 终态后 5 秒内形成结果快照；结果视图、完整过程切换和证据化重新总结只引用最终回复、plan 与真实工具 evidence | component + headless/real app |
+| CF-CCE-R20 | 终态后 5 秒内形成结果快照；结果视图和证据化重新总结只引用最终回复、plan 与真实工具 evidence。过程展开入口只存在于 timeline 原位置，结果卡不得再提供第二套过程控制 | component + headless/real app |
 | CF-CCE-R21 | 时间估算结合任务阶段、同项目历史 build/test 时长和关联外部 job 状态；相关样本少于 3 个时不展示 | estimator unit + SQLite profile |
 | CF-CCE-R22 | 1000 个 plan/tool 事件仍遵守超长会话有界 hydration 和惰性 payload 契约，不造成新的无界数组或大输出复制 | store/perf fixture |
 | CF-CCE-R23 | 同一可见会话按 root turn 持久化内部 task segment；每个 segment 至少包含 `segment_id`、`goal_digest`、`status`、`checkpoint`、`handoff`、开始/结束时间。新目标只加载当前 segment 与有界 handoff，不回灌旧 recovery/tool 噪音 | SQLite migration + context fixture + restart |
 | CF-CCE-R24 | 每个 root turn 的实时进度是一个可覆盖快照，至少包含 `phase`、`current_step`、`next_step`、`waiting_reason`、`updated_at`、`elapsed_ms`。重复微更新保留审计事件但 UI/store 不追加同义 assistant message | reducer coalescing + hydration + 100-event fixture |
 | CF-CCE-R25 | `task_run` 是逻辑子任务，retry 是 `task_attempts` 的 append-only 记录。每个 attempt 保存 ordinal、sub-session、状态、失败码、时间和 evidence；UI 只显示一张任务卡并可展开 attempts，空 child 也必须成为失败 attempt | additive migration + scheduler + component |
+| CF-CCE-R26 | 语义紧凑仅允许收束成功的 `read`/`read_file`/`grep`/`glob`/`list_files`；所有助手正文、edit/write、bash/exec、delegate/subagent、未知工具以及 error/blocked/denied/cancelled/waiting/permission 均始终可见 | semantic timeline fixtures |
+| CF-CCE-R27 | 紧凑摘要只包含有界总数和读取/搜索/文件类别计数，不得读取或显示参数、路径、prompt、stdout、结果正文或 secret | secret-negative payload tests |
+| CF-CCE-R28 | disclosure 使用原生键盘语义、`aria-expanded` 和 `aria-controls`；展开/收起后焦点留在触发器，且不能触发 sticky-scroll 的“有新内容”提示 | component accessibility + real browser scroll |
+| CF-CCE-R29 | 旧会话与缺少 objectiveStatus/segments 的 hydration 保守展示；不迁移、不回写旧消息，不认识的工具或状态默认可见 | legacy hydration fixtures |
 
 ## Primary User Paths
 
@@ -44,7 +48,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 
 ### 自然对话路径
 
-助手先解释正在检查的问题，随后出现低对比的搜索/读取证据行；助手给出判断，再显示编辑和测试证据；最后用正常回复交付结论。运行中的回合始终保持连续阅读线；20 个成功工具不会形成 20 个黑框，相邻例行项可原位聚合，失败仍直接显示首行原因。终态到达后，较早过程才收束到展开入口。
+助手先解释正在检查的问题，随后出现低对比的搜索/读取证据行；助手给出判断，再显示编辑和测试证据；最后用正常回复交付结论。运行中及刚完成的同一已挂载回合始终保持连续阅读线，完成瞬间不删内容、不改变滚动锚点。用户发出下一条消息或重新打开历史后，仅相邻的例行读取/搜索/列文件可在原位置收束；叙述、修改、验证、失败、等待和未知证据始终可见。
 
 ### 历史恢复路径
 
@@ -52,7 +56,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-CCE-R1..R25 与 CF-ORC-R1..R21 联合追踪。
+- Spec Harness：CF-CCE-R1..R29 与 CF-ORC-R1..R21 联合追踪。
 - Compatibility Harness：旧 SQLite、旧 completion state、Interactive/Execute/Autonomous、匿名会话、队列与 recovery。
 - Observation Harness：segment 接管耗时、panic 反馈、重启恢复、stream 终态和进程 owner。
 - Payload Harness：大 diff、长 stdout、文件参数、凭据和 continuity 摘要脱敏。
@@ -69,14 +73,14 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 | Rust panic | spawned chat future 在工具完成后 panic | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml chat_task_panic -- --nocapture` | 2 秒内 waiting_system/remediation 落库与事件；失效 owner 清理；同 objective 自动接管 |
 | Rust resume | 非幂等 fake tool 计数后模拟进程重启 | `npm run cargo:shared -- test --manifest-path src-tauri/Cargo.toml continuity_resume -- --nocapture` | 计数保持 1；从 tool outcome 后续跑；最终终态唯一 |
 | Frontend event | checkpoint/resumed/interrupted/terminal 乱序与迟到尾页 | `npm test -- --run src/stores/chatEvents.test.ts src/stores/chatEvents.gate.test.ts src/stores/chatEvents.longSession.test.ts` | 同一 root turn 定点更新；迟到 hydration 不覆盖 live segment |
-| Tool UI | success/running/permission/error、6 个连续成功项与超过 10 个 segment 的 active→system-wait→completed 回合 | `pnpm exec vitest run src/components/ToolCallCard.test.tsx src/components/ToolCallCard.error.test.tsx src/components/ToolCallCard.lazy.test.tsx src/components/MessageList.timeline.test.tsx` | success 无全边框；attention 有文字；分组边界正确；system wait 仍显示且无整体折叠入口；objective completed 才收束；折叠不解析 diff |
+| Tool UI | success/running/permission/error、例行/关键/未知工具与超过 10 个 segment 的 active→system-wait→completed→next-user 回合 | `pnpm exec vitest run src/components/ToolCallCard.test.tsx src/components/ToolCallCard.error.test.tsx src/components/ToolCallCard.lazy.test.tsx src/components/MessageList.timeline.test.tsx` | 完成瞬间仍平铺且早期叙述存在；下一用户回合后仅例行成功项收束；edit/bash/unknown/attention 可见；摘要不含参数或结果；折叠不解析 diff |
 | History/Memory | 一个回合被持久化为多条 assistant/tool/notice 行；postmortem 生成安全 memory 候选 | `npm test -- --run src/components/MessageList.gate.test.tsx src/components/MessageList.renderIsolation.test.tsx src/stores/chatEvents.segments.test.ts` + Rust learning materialization tests | hydration 后仍是一条自然流；气泡无 Remember；安全 memory 自动写入且 marker 去重 |
 | Theme build | `border-border/25`、`bg-surface-1/30` 等 opacity token | `npm run build` 后检查 `dist/assets/*.css` | 生产 CSS 含 alpha 规则；浅色不回退为不透明 `#1e293b` 黑框 |
-| Browser | 20-tool fixture，短流、长流、active→terminal、失败、用户上翻 | `pnpm dev`，用真实浏览器执行 1366×768 与 800×600 | 无横向溢出；正文优先；active 长回合不整体折叠；terminal 后才收束；上翻不强拉回 |
+| Browser | 20-tool fixture，短流、长流、active→terminal→next-user、失败、用户上翻及手动 disclosure | `pnpm dev`，用受管真实浏览器执行 1366×768 与 800×600 | 无横向溢出；完成瞬间内容与可见锚点不变；下一用户回合后仅例行项紧凑；手动展开不误报新内容；焦点稳定 |
 | Dev App | 低 segment budget、panic hook、强制退出/重启 fixture | `pnpm tauri dev` 或 `scripts/install-dev-app-wrapper.sh` 启动 `CodeFactoryDev.app` | 自动续段、panic system-owned 可见、重启 30 秒内自动 claim；无人工继续 CTA；成功/边界路径各一次 |
 | Release App | 从公开 macOS/Windows 产物安装精确版本 | 标准 release workflow 后在产物上重走 Dev App 路径 | 版本匹配；真实 app 四视口/主题和连续性全部通过 |
 | Structured plan | 首次计划、步骤推进、等待、增删步骤无 change reason | `pnpm test -- --run src/stores/chatPlan.test.ts src/components/TurnProgress.test.tsx` | revision 有序；当前/下一步正确；计划变化有理由；百分比来源明确 |
-| Result snapshot | completed/partial/failed 与 1000-event turn | `pnpm test -- --run src/components/TurnResultSnapshot.test.tsx` | 5 秒内本地形成；完整过程可切；重新总结不调用模型；证据有界 |
+| Result snapshot | completed/partial/failed 与 1000-event turn | `pnpm test -- --run src/components/TurnResultSnapshot.test.tsx` | 5 秒内本地形成；不出现重复过程入口；重新总结不调用模型；证据有界且不泄漏 secret |
 | Time estimate | 0/2/3+ 历史样本、build/test、external job | `pnpm test -- --run src/lib/turnEstimate.test.ts` + Rust timing profile tests | 少于 3 不显示；区间和样本来源确定；不输出伪精确 ETA |
 
 测试名在实现时必须落到上述筛选关键字，避免矩阵变成不可执行的占位描述。若新增独立 headless 脚本，应加入 `package.json` 并由 CI 调用。
@@ -85,9 +89,9 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 
 | 优先级 | Req IDs | 完成定义 |
 | --- | --- | --- |
-| P0 | R10 | objective active/system-wait 平铺，completed/cancelled 才收束（PR #235 的 turn 终态语义由 CF-ORC 扩展） |
+| P0 | R10、R26–R29 | active/system-wait 与刚完成回合平铺；历史回合只收束安全例行项，保留关键因果与可访问性 |
 | P1 | R19、R22 | 结构化执行路线、紧凑进度、等待/变更 |
-| P2 | R10、R13、R20、R22 | 结果快照、结果/过程切换、证据化重新总结 |
+| P2 | R10、R13、R20、R22 | 结果快照、timeline 单一过程入口、证据化重新总结 |
 | P3 | R21 | 有来源的时间区间；数据不足不展示 |
 
 ## Evidence Pack Requirements

@@ -27,6 +27,7 @@ interface HarnessHandle {
 
 function Harness(props: {
   conversationKey: string | null;
+  contentSignal?: string;
   onMount: (h: HarnessHandle) => void;
   pinnedRef: { current: boolean };
   hasNewContentRef: { current: boolean };
@@ -37,7 +38,7 @@ function Harness(props: {
     hasNewContent,
     jumpToBottom,
     prepareForPrepend,
-  } = useStickyAutoScroll(props.conversationKey);
+  } = useStickyAutoScroll(props.conversationKey, props.contentSignal);
   // Mirror live state so the test handle returns up-to-date values across
   // re-renders (not stale closures captured at first render).
   props.pinnedRef.current = pinned;
@@ -109,6 +110,32 @@ function renderHarness(initialKey: string | null = "session-1"): RenderResult {
   };
 }
 
+function renderSignalHarness(initialSignal: string): {
+  handle: HarnessHandle;
+  rerenderSignal: (contentSignal: string) => void;
+} {
+  let handle: HarnessHandle | null = null;
+  const pinnedRef = { current: true };
+  const hasNewContentRef = { current: false };
+  const onMount = (value: HarnessHandle) => { handle = value; };
+  const renderHarnessWithSignal = (contentSignal: string) => (
+    <Harness
+      conversationKey="session-1"
+      contentSignal={contentSignal}
+      onMount={onMount}
+      pinnedRef={pinnedRef}
+      hasNewContentRef={hasNewContentRef}
+    />
+  );
+  const utils = render(renderHarnessWithSignal(initialSignal));
+  if (!handle) throw new Error("Harness did not provide handle");
+  return {
+    handle,
+    rerenderSignal: (contentSignal: string) =>
+      utils.rerender(renderHarnessWithSignal(contentSignal)),
+  };
+}
+
 function DelayedHarness(props: {
   showScroller: boolean;
   conversationKey: string | null;
@@ -144,6 +171,31 @@ function DelayedHarness(props: {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe("useStickyAutoScroll", () => {
+  it("detaches on the first upward scroll after an initial programmatic pin", async () => {
+    const { handle } = renderHarness("short-overflow");
+    setLayout(handle.scroller, {
+      scrollHeight: 765,
+      clientHeight: 638,
+      scrollTop: 0,
+    });
+    await flushAsync();
+    expect(handle.scroller.scrollTop).toBe(765);
+
+    // The first real wheel gesture goes to the top. Its 127px distance is
+    // inside the down-scroll catch-up threshold but outside the up-scroll
+    // threshold, so direction must be measured from our pinned position.
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", {
+        value: 0,
+        configurable: true,
+        writable: true,
+      });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+
+    expect(handle.pinned()).toBe(false);
+  });
+
   it("preserves the reading anchor when older history is prepended", async () => {
     const { handle } = renderHarness("long-session");
     setLayout(handle.scroller, {
@@ -560,7 +612,10 @@ describe("useStickyAutoScroll", () => {
     // Distance: 10000 - 9250 - 600 = 150.
     await act(async () => {
       // First a smaller down-step so the direction detector sees "down"
-      Object.defineProperty(handle.scroller, "scrollTop", { value: 5000, configurable: true, writable: true });
+      // Stay above the bottom that was visible when pinning was lost. Going
+      // past that old bottom would intentionally trigger the separate
+      // reachedSeenBottom recovery path and snap before this second event.
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 1000, configurable: true, writable: true });
       handle.scroller.dispatchEvent(new Event("scroll"));
       Object.defineProperty(handle.scroller, "scrollTop", { value: 9250, configurable: true, writable: true });
       handle.scroller.dispatchEvent(new Event("scroll"));
@@ -698,6 +753,46 @@ describe("useStickyAutoScroll", () => {
       const node = document.createElement("p");
       node.textContent = "fresh streaming";
       handle.scroller.appendChild(node);
+    });
+    await flushAsync();
+    expect(handle.hasNewContent()).toBe(true);
+  });
+
+  it("does not treat a user disclosure expansion as new streamed content", async () => {
+    const { handle, rerenderSignal } = renderSignalHarness("turn:10");
+    setLayout(handle.scroller, { scrollHeight: 3000, clientHeight: 600 });
+    await flushAsync();
+
+    await act(async () => {
+      Object.defineProperty(handle.scroller, "scrollTop", { value: 500, configurable: true, writable: true });
+      handle.scroller.dispatchEvent(new Event("scroll"));
+    });
+    expect(handle.pinned()).toBe(false);
+
+    // Expanding already-present evidence increases layout height, but the
+    // actual conversation content signal is unchanged.
+    setLayout(handle.scroller, { scrollHeight: 4200 });
+    await act(async () => {
+      rerenderSignal("turn:10");
+      const details = document.createElement("div");
+      details.textContent = "already received routine evidence";
+      handle.scroller.appendChild(details);
+    });
+    await flushAsync();
+
+    expect(handle.hasNewContent()).toBe(false);
+    expect(handle.scroller.scrollTop).toBe(500);
+
+    // A real token/tool update changes the signal and should still light the
+    // badge when it produces additional height.
+    setLayout(handle.scroller, { scrollHeight: 4400 });
+    await act(async () => {
+      rerenderSignal("turn:11");
+    });
+    await act(async () => {
+      const token = document.createElement("p");
+      token.textContent = "fresh streamed content";
+      handle.scroller.appendChild(token);
     });
     await flushAsync();
     expect(handle.hasNewContent()).toBe(true);

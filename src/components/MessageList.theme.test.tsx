@@ -135,7 +135,7 @@ describe("MessageList theme readability", () => {
     expect(container.querySelector("th")?.textContent).toBe("A");
   });
 
-  it("renders grouped successful tools as an unframed conversational activity line", () => {
+  it("renders grouped routine tools as an unframed conversational activity line", () => {
     const { container } = render(
       <MessageList
         messages={[
@@ -145,7 +145,7 @@ describe("MessageList theme readability", () => {
             toolCalls: [
               { id: "t1", name: "read_file", args: JSON.stringify({ path: "a.ts" }), result: "ok", status: "done", isError: false },
               { id: "t2", name: "read_file", args: JSON.stringify({ path: "b.ts" }), result: "ok", status: "done", isError: false },
-              { id: "t3", name: "bash", args: JSON.stringify({ command: "git status" }), result: "ok", status: "done", isError: false },
+              { id: "t3", name: "grep", args: JSON.stringify({ pattern: "status" }), result: "ok", status: "done", isError: false },
             ],
           }),
         ]}
@@ -153,12 +153,12 @@ describe("MessageList theme readability", () => {
         cwd={null}
       />,
     );
-    const group = screen.getByRole("button", { name: /查看 3 个已完成操作/ }).parentElement;
+    const group = screen.getByRole("button", { name: /展开 3 项例行操作.*读取 2.*搜索 1/ }).parentElement;
     const classes = group?.className.split(/\s+/) ?? [];
     expect(classes).not.toContain("border-b");
     expect(classes).not.toContain("border");
     expect(group?.className).not.toMatch(/bg-surface/);
-    expect(container.querySelector("[data-tool-group='success']"), "expected a low-emphasis success group").toBeTruthy();
+    expect(container.querySelector("[data-tool-group='routine']"), "expected a low-emphasis routine group").toBeTruthy();
   });
 
   it("keeps persisted assistant/tool rounds close and reserves metadata for the settled answer", () => {
