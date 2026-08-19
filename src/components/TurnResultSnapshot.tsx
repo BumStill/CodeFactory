@@ -6,7 +6,6 @@ import {
   ChevronDown,
   CircleDashed,
   FileCode2,
-  ListTree,
   PanelRightOpen,
   RefreshCw,
   TestTube2,
@@ -48,6 +47,19 @@ function pushUniqueBounded(values: string[], value: unknown): boolean {
   return false;
 }
 
+function redactEvidenceText(value: string): string {
+  return value
+    .replace(
+      /(^|[\s/?&])([A-Za-z_][A-Za-z0-9_-]*)=([^\s&]+)/gi,
+      (match, prefix: string, name: string) =>
+        /(key|token|secret|password|passwd|credential)/i.test(name)
+          ? `${prefix}${name}=[redacted]`
+          : match,
+    )
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk|rk|pk)[-_][A-Za-z0-9_-]{6,}\b/gi, "[redacted]");
+}
+
 export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceSummary {
   const changedFiles: string[] = [];
   const verificationCommands: string[] = [];
@@ -69,7 +81,7 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
         !changedFileKeys.has(args.path)
       ) {
         changedFileKeys.add(args.path);
-        truncated = pushUniqueBounded(changedFiles, args.path) || truncated;
+        truncated = pushUniqueBounded(changedFiles, redactEvidenceText(args.path)) || truncated;
       }
     }
     if (succeeded && tool.name === "bash" && typeof args.command === "string") {
@@ -79,7 +91,10 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
         !verificationKeys.has(command)
       ) {
         verificationKeys.add(command);
-        truncated = pushUniqueBounded(verificationCommands, command) || truncated;
+        truncated = pushUniqueBounded(
+          verificationCommands,
+          redactEvidenceText(command),
+        ) || truncated;
       }
     }
   }
@@ -100,8 +115,6 @@ interface Props {
   /** A provider/runtime/turn boundary failed even when no tool call did. */
   turnBoundaryFailure?: boolean;
   durationMs: number | null;
-  processExpanded: boolean;
-  onToggleProcess?: () => void;
   onOpenEvidence?: () => void;
   evidenceControlsId?: string;
   evidenceOpen?: boolean;
@@ -112,8 +125,6 @@ export function TurnResultSnapshot({
   evidence,
   turnBoundaryFailure = false,
   durationMs,
-  processExpanded,
-  onToggleProcess,
   onOpenEvidence,
   evidenceControlsId,
   evidenceOpen = false,
@@ -225,18 +236,6 @@ export function TurnResultSnapshot({
               ? <PanelRightOpen size={14} aria-hidden="true" />
               : <ChevronDown size={14} aria-hidden="true" className={resultOpen ? "rotate-180" : ""} />}
           </button>
-          {onToggleProcess && (
-            <button
-              type="button"
-              aria-label="执行过程"
-              aria-expanded={processExpanded}
-              onClick={onToggleProcess}
-              className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-note text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
-            >
-              <ListTree size={14} aria-hidden="true" />
-              执行过程
-            </button>
-          )}
           <button
             type="button"
             aria-label="结果摘要"

@@ -96,16 +96,31 @@ panic 文案只说明“执行意外中断，已保留完成内容”，详细 b
 ```ts
 type ToolEvidencePresentation =
   | { kind: "quiet"; summary: string }
-  | { kind: "group"; count: number; summary: string }
+  | { kind: "routine_group"; count: number; categories: { read: number; search: number; file: number } }
+  | { kind: "key"; summary: string }
   | { kind: "attention"; tone: "running" | "permission" | "error"; summary: string };
 ```
 
 - `quiet`：成功且无需立即处理，默认无全周边框；
-- `group`：相邻三个及以上例行成功项，折叠但不改变原始顺序和展开内容；
+- `routine_group`：只接受成功的 `read`/`read_file`/`grep`/`glob`/`list_files`，相邻三个及以上才折叠；摘要只由总数和读取/搜索/文件计数构成；
+- `key`：助手正文、edit/write、bash/exec、delegate/subagent 和未知工具，始终平铺；
 - `attention`：运行、权限、失败、中断，仅使用轻背景/左侧状态线；
 - 展开时才解析大 diff、知识结果和完整输出，继续满足超长会话惰性解析契约。
 
 分组只能跨相邻工具记录，不能跨助手正文、失败、权限或用户消息。
+
+展示状态与 objective 状态分离，且只存在于前端派生层：
+
+```text
+active/system-owned -> fresh_expanded -> compact_history <-> expanded_history
+```
+
+- `active/system-owned` 与 `fresh_expanded` 完全按原 timeline 平铺；active→completed/cancelled 不改变已挂载 DOM 的信息密度。
+- 下一条用户消息使当前回合成为历史时进入 `compact_history`；历史会话初次 mount 也从该状态开始。
+- disclosure 只在原位置切换 `compact_history`/`expanded_history`，结果卡不持有第二套过程状态。
+- 会话 key 变化必须重置展示状态，不能把上一会话的展开偏好带入新会话。
+- 缺少 segments 或 objectiveStatus 的旧会话默认保守展示；本变更不修改 DB、stream event 或 `TurnSegment` schema。
+- 未知工具、未知状态一律按 `key`/`attention` 可见；安全摘要不得读取 args、path、prompt、stdout 或 result。
 
 ## 7. 主题透明度契约
 
@@ -180,4 +195,4 @@ type PlanEvent = {
 
 ### 结果快照
 
-终态结果快照由前端在 5 秒内从最终助手正文、最终 plan 和有界工具证据派生。重新总结只计算计划完成数、修改文件、验证命令、失败/等待证据和用时，不发起新的模型请求。完整过程仍引用原消息/工具记录，结果视图不复制完整 stdout 或 diff。
+终态结果快照由前端在 5 秒内从最终助手正文、最终 plan 和有界工具证据派生。重新总结只计算计划完成数、修改文件、验证命令、失败/等待证据和用时，不发起新的模型请求。完整过程仍引用原消息/工具记录并只由 timeline 原位 disclosure 展开；结果卡不复制完整 stdout/diff，也不再提供重复过程按钮。

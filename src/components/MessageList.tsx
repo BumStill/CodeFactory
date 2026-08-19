@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { UrlTransform } from "react-markdown";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -355,9 +355,26 @@ export function MessageList({
   externalJobs = [],
 }: Props) {
   const resolvedConversationKey = conversationKey ?? messages[0]?.id ?? null;
-  const contentSignal = messages.length === 0
+  const tailMessage = messages[messages.length - 1];
+  const tailSegment = tailMessage?.segments?.[tailMessage.segments.length - 1];
+  const tailTool = tailMessage?.toolCalls?.[tailMessage.toolCalls.length - 1];
+  // This signal changes for actual conversation arrivals, not for local UI
+  // disclosure state. The scroll hook can therefore distinguish a user
+  // expanding old evidence from a new token/tool/result reaching the tail.
+  const contentSignal = !tailMessage
     ? null
-    : `${messages.length}:${messages[messages.length - 1]?.id ?? ""}:${turnActive ? "active" : "idle"}`;
+    : [
+        messages.length,
+        tailMessage.id,
+        tailMessage.content.length,
+        tailMessage.segments?.length ?? 0,
+        tailSegment?.kind === "text" ? tailSegment.text.length : tailSegment?.toolCallId ?? "",
+        tailMessage.toolCalls?.length ?? 0,
+        tailTool?.id ?? "",
+        tailTool?.status ?? "",
+        tailTool?.result?.length ?? 0,
+        tailMessage.completionState ?? "",
+      ].join(":");
   const {
     scrollerRef,
     pinned,
@@ -412,8 +429,16 @@ export function MessageList({
       m.completionState !== "rejected_candidate" &&
       (m.role !== "system" || m.completionState === "turn_notice"),
   );
-  const lastAssistantId =
-    [...visible].reverse().find((m) => m.role === "assistant")?.id ?? null;
+  let latestUserIndex = -1;
+  let latestAssistantIndex = -1;
+  visible.forEach((message, index) => {
+    if (message.role === "user") latestUserIndex = index;
+    if (message.role === "assistant") latestAssistantIndex = index;
+  });
+  const currentAssistantId =
+    latestAssistantIndex > latestUserIndex
+      ? visible[latestAssistantIndex]?.id ?? null
+      : null;
   const activeProgressMessage = [...visible]
     .reverse()
     .find((message) => {
@@ -566,10 +591,16 @@ export function MessageList({
           >
             <MessageRow
               msg={msg}
-              isStreamingTail={streaming && msg.id === lastAssistantId}
+              isStreamingTail={streaming && msg.id === currentAssistantId}
+              isTurnActive={
+                msg.id === currentAssistantId &&
+                (turnActive || systemOwnsObjective(msg.turnActivity?.objectiveStatus))
+              }
+              isCurrentAssistant={msg.id === currentAssistantId}
               isLastAssistantInUserTurn={lastAssistantIdsByUserTurn.has(msg.id)}
               turnTokenTotal={turnTokenTotalsByAssistantId.get(msg.id) ?? 0}
               turnStartedAt={turnStartedAtByAssistantId.get(msg.id) ?? msg.createdAt}
+              conversationKey={resolvedConversationKey}
               onOpenDocument={onOpenDocument}
               onOpenEvidence={onOpenEvidence}
               evidenceControlsId={evidenceControlsId}
@@ -698,21 +729,37 @@ function InlineTurnStatus({
   );
 }
 
-function SuccessfulToolGroup({ tools }: { tools: NonNullable<UIMessage["toolCalls"]> }) {
-  const [open, setOpen] = useState(false);
+function RoutineToolGroup({
+  tools,
+  open,
+  controlsId,
+  onToggle,
+}: {
+  tools: ToolCallState[];
+  open: boolean;
+  controlsId: string;
+  onToggle: () => void;
+}) {
+  const summary = routineToolSummary(tools);
   return (
-    <div data-tool-group="success" className="my-0.5 w-fit max-w-full">
+    <div data-tool-group="routine" className="my-0.5 w-fit max-w-full">
       <button
         type="button"
-        aria-label={`${open ? "收起" : "查看"} ${tools.length} 个已完成操作`}
-        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        aria-controls={controlsId}
+        aria-label={`${open ? "收起" : "展开"} ${tools.length} 项例行操作${summary ? `，${summary}` : ""}`}
+        onClick={onToggle}
         className="inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-lg px-1.5 text-left text-note text-gray-600 transition-colors hover:bg-surface-3/55 hover:text-gray-400"
       >
         <Check size={14} className="text-status-success/70" />
-        <span>已完成 {tools.length} 个操作</span>
+        <span>{open ? "收起" : "已收起"} {tools.length} 项例行操作{summary ? ` · ${summary}` : ""}</span>
         <ChevronDown size={14} className={`ml-auto transition-transform motion-reduce:transition-none ${open ? "rotate-180" : ""}`} />
       </button>
-      {open && <div className="ml-2 border-l border-border/40 pl-2">{tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />)}</div>}
+      {open && (
+        <div id={controlsId} role="group" aria-label="例行操作详情" className="ml-2 border-l border-border/40 pl-2">
+          {tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />)}
+        </div>
+      )}
     </div>
   );
 }
@@ -795,8 +842,38 @@ function ActiveTurnProgress({
   );
 }
 
-function isQuietSuccess(tool: NonNullable<UIMessage["toolCalls"]>[number] | undefined): boolean {
-  return Boolean(tool && tool.status === "done" && !tool.isError);
+type ToolCallState = NonNullable<UIMessage["toolCalls"]>[number];
+
+const ROUTINE_TOOL_CATEGORIES: Readonly<Record<string, string>> = {
+  read_file: "读取",
+  read: "读取",
+  grep: "搜索",
+  glob: "文件",
+  list_files: "文件",
+};
+
+function isRoutineSuccess(tool: ToolCallState | undefined): tool is ToolCallState {
+  return Boolean(
+    tool &&
+    tool.status === "done" &&
+    !tool.isError &&
+    ROUTINE_TOOL_CATEGORIES[tool.name],
+  );
+}
+
+function routineToolSummary(tools: ToolCallState[]): string {
+  const counts = new Map<string, number>();
+  for (const tool of tools) {
+    const label = ROUTINE_TOOL_CATEGORIES[tool.name];
+    if (!label) continue;
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  return ["读取", "搜索", "文件"]
+    .flatMap((label) => {
+      const count = counts.get(label);
+      return count ? [`${label} ${count}`] : [];
+    })
+    .join(" · ");
 }
 
 function isModelRouteSwitchNotice(detail: string): boolean {
@@ -810,9 +887,12 @@ function isToolAmplificationNotice(detail: string): boolean {
 const MessageRow = memo(function MessageRow({
   msg,
   isStreamingTail,
+  isTurnActive,
+  isCurrentAssistant,
   isLastAssistantInUserTurn,
   turnTokenTotal,
   turnStartedAt,
+  conversationKey,
   onOpenDocument,
   onOpenEvidence,
   evidenceControlsId,
@@ -820,16 +900,41 @@ const MessageRow = memo(function MessageRow({
 }: {
   msg: UIMessage;
   isStreamingTail: boolean;
+  isTurnActive: boolean;
+  isCurrentAssistant: boolean;
   isLastAssistantInUserTurn: boolean;
   turnTokenTotal: number;
   turnStartedAt: number;
+  conversationKey: string | null;
   onOpenDocument?: (path: string) => void;
   onOpenEvidence?: (messageId: string) => void;
   evidenceControlsId?: string;
   evidenceOpen: boolean;
 }) {
   const isUser = msg.role === "user";
-  const [showAllSteps, setShowAllSteps] = useState(false);
+  const [processMode, setProcessMode] = useState<"compact" | "fresh" | "expanded">("compact");
+  const previousTurnActiveRef = useRef(isTurnActive);
+  const previousCurrentAssistantRef = useRef(isCurrentAssistant);
+  const previousConversationKeyRef = useRef(conversationKey);
+  useLayoutEffect(() => {
+    const conversationChanged = previousConversationKeyRef.current !== conversationKey;
+    const justSettled =
+      previousTurnActiveRef.current && !isTurnActive && isCurrentAssistant;
+    const becameHistorical =
+      previousCurrentAssistantRef.current && !isCurrentAssistant;
+
+    if (conversationChanged || becameHistorical) {
+      setProcessMode("compact");
+    } else if (justSettled) {
+      // Preserve what the user just watched. useLayoutEffect prevents the
+      // active timeline from flashing compact before this state lands.
+      setProcessMode("fresh");
+    }
+
+    previousTurnActiveRef.current = isTurnActive;
+    previousCurrentAssistantRef.current = isCurrentAssistant;
+    previousConversationKeyRef.current = conversationKey;
+  }, [conversationKey, isCurrentAssistant, isTurnActive]);
   const turnBoundaryFailure = Boolean(
     msg.failureEvidence ||
     msg.runtimeError ||
@@ -994,7 +1099,7 @@ const MessageRow = memo(function MessageRow({
   // answers. Only a tool-free hydrated answer (or a live timeline ending in
   // prose) owns settled metadata such as elapsed time.
   const isSettledAnswer =
-    !isStreamingTail &&
+    !isTurnActive &&
     isLastAssistantInUserTurn &&
     !!msg.content &&
     (timeline
@@ -1012,16 +1117,9 @@ const MessageRow = memo(function MessageRow({
   const settledDuration = isSettledTurnTail
     ? formatElapsedClock(msg.turnSettledAt! - turnStartedAt)
     : null;
-  // Keep the active turn as one continuous reading flow. Once the turn
-  // reaches a terminal state, collapse its older segments behind the
-  // existing disclosure so completed history stays compact.
-  const COLLAPSE_THRESHOLD = 10;
-  const TAIL_VISIBLE = 4;
-  const collapsible =
-    !isStreamingTail && (timeline?.length ?? 0) > COLLAPSE_THRESHOLD;
-  const visibleFrom =
-    collapsible && !showAllSteps ? (timeline?.length ?? 0) - TAIL_VISIBLE : 0;
-  const hiddenSteps = collapsible && !showAllSteps ? visibleFrom : 0;
+  // Compact only known, successful read-only evidence. Narration, writes,
+  // commands, unknown tools and every attention state stay in the causal
+  // reading flow; position in the array is never treated as importance.
   const groupedTimeline = timeline
     ? timeline.reduce<Array<{ kind: "segment"; segment: TurnSegment; index: number } | { kind: "tools"; tools: NonNullable<UIMessage["toolCalls"]>; startIndex: number; endIndex: number }>>((items, segment, index) => {
         if (segment.kind !== "tool") {
@@ -1029,7 +1127,7 @@ const MessageRow = memo(function MessageRow({
           return items;
         }
         const tool = toolById.get(segment.toolCallId);
-        if (isStreamingTail || !isQuietSuccess(tool)) {
+        if (isTurnActive || !isRoutineSuccess(tool)) {
           items.push({ kind: "segment", segment, index });
           return items;
         }
@@ -1078,34 +1176,25 @@ const MessageRow = memo(function MessageRow({
       )}
       {timeline ? (
         <>
-          {collapsible && (
-            <button
-              type="button"
-              aria-expanded={showAllSteps}
-              aria-label={
-                showAllSteps
-                  ? "收起较早的执行过程"
-                  : `展开较早的执行过程，共 ${hiddenSteps} 条`
-              }
-              onClick={() => setShowAllSteps((v) => !v)}
-              className="inline-flex min-h-7 items-center gap-1 rounded-lg px-1.5 text-note leading-5 text-gray-500 transition-colors hover:bg-surface-3/55 hover:text-gray-300"
-            >
-              <ChevronDown
-                size={14}
-                aria-hidden="true"
-                className={`transition-transform motion-reduce:transition-none ${showAllSteps ? "" : "-rotate-90"}`}
-              />
-              {showAllSteps ? "收起较早的执行过程" : "展开较早的执行过程"}
-            </button>
-          )}
           {groupedTimeline!.map((item, itemIndex) => {
             if (item.kind === "tools") {
-              if (item.endIndex < visibleFrom && !showAllSteps) return null;
-              if (item.tools.length >= 3) return <SuccessfulToolGroup key={`tool-group-${itemIndex}`} tools={item.tools} />;
+              if (item.tools.length >= 3) {
+                if (processMode === "fresh") {
+                  return item.tools.map((tool) => <ToolCallCard key={`tool-${tool.id}`} tc={tool} />);
+                }
+                return (
+                  <RoutineToolGroup
+                    key={`tool-group-${itemIndex}`}
+                    tools={item.tools}
+                    open={processMode === "expanded"}
+                    controlsId={`routine-tools-${msg.id}-${itemIndex}`}
+                    onToggle={() => setProcessMode((value) => value === "expanded" ? "compact" : "expanded")}
+                  />
+                );
+              }
               return item.tools.map((tool) => <ToolCallCard key={`tool-${tool.id}`} tc={tool} />);
             }
             const { segment, index } = item;
-            if (index < visibleFrom && !showAllSteps) return null;
             if (segment.kind === "tool") {
               const tc = toolById.get(segment.toolCallId);
               return tc ? <ToolCallCard key={`tool-${segment.toolCallId}`} tc={tc} /> : null;
@@ -1126,7 +1215,7 @@ const MessageRow = memo(function MessageRow({
             const tools = msg.toolCalls ?? [];
             const items: Array<{ kind: "tools"; tools: typeof tools } | { kind: "tool"; tool: typeof tools[number] }> = [];
             for (const tool of tools) {
-              if (!isStreamingTail && isQuietSuccess(tool)) {
+              if (!isTurnActive && isRoutineSuccess(tool)) {
                 const last = items[items.length - 1];
                 if (last?.kind === "tools") last.tools.push(tool);
                 else items.push({ kind: "tools", tools: [tool] });
@@ -1136,7 +1225,17 @@ const MessageRow = memo(function MessageRow({
             }
             return items.map((item, index) => {
               if (item.kind === "tool") return <ToolCallCard key={item.tool.id} tc={item.tool} />;
-              if (item.tools.length >= 3) return <SuccessfulToolGroup key={`hydrated-tool-group-${index}`} tools={item.tools} />;
+              if (item.tools.length >= 3) {
+                return (
+                  <RoutineToolGroup
+                    key={`hydrated-tool-group-${index}`}
+                    tools={item.tools}
+                    open={processMode === "expanded"}
+                    controlsId={`hydrated-routine-tools-${msg.id}-${index}`}
+                    onToggle={() => setProcessMode((value) => value === "expanded" ? "compact" : "expanded")}
+                  />
+                );
+              }
               return item.tools.map((tool) => <ToolCallCard key={tool.id} tc={tool} />);
             });
           })()}
@@ -1209,10 +1308,6 @@ const MessageRow = memo(function MessageRow({
             evidence={evidence}
             turnBoundaryFailure={turnBoundaryFailure}
             durationMs={msg.durationMs ?? null}
-            processExpanded={showAllSteps}
-            onToggleProcess={
-              collapsible ? () => setShowAllSteps((value) => !value) : undefined
-            }
             onOpenEvidence={
               onOpenEvidence ? () => onOpenEvidence(msg.id) : undefined
             }

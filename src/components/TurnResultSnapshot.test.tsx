@@ -48,15 +48,12 @@ function withNextActionOwner(
 }
 
 describe("TurnResultSnapshot", () => {
-  it("forms a completed result footer with evidence/process/summary controls", () => {
-    const onToggleProcess = vi.fn();
+  it("forms a completed result footer with evidence and summary controls", () => {
     render(
       <TurnResultSnapshot
         plan={plan}
         evidence={summarizeTurnEvidence(tools)}
         durationMs={80_000}
-        processExpanded={false}
-        onToggleProcess={onToggleProcess}
       />,
     );
 
@@ -71,11 +68,7 @@ describe("TurnResultSnapshot", () => {
     expect(screen.getByText("等待 · 等待 CI")).toBeInTheDocument();
     expect(screen.getByText("没有失败操作证据")).toBeInTheDocument();
 
-    const processButton = screen.getByRole("button", { name: "执行过程" });
-    expect(processButton).toHaveAttribute("aria-expanded", "false");
-    expect(processButton).not.toHaveAttribute("aria-pressed");
-    fireEvent.click(processButton);
-    expect(onToggleProcess).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "执行过程" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "结果摘要" }));
     expect(screen.getByRole("status")).toHaveTextContent(
@@ -109,7 +102,6 @@ describe("TurnResultSnapshot", () => {
           },
         ])}
         durationMs={80_000}
-        processExpanded={false}
       />,
     );
 
@@ -155,7 +147,6 @@ describe("TurnResultSnapshot", () => {
         plan={plan}
         evidence={summarizeTurnEvidence(tools)}
         durationMs={80_000}
-        processExpanded={false}
         onOpenEvidence={onOpenEvidence}
         evidenceControlsId="workspace-auxiliary-pane"
         evidenceOpen
@@ -178,7 +169,6 @@ describe("TurnResultSnapshot", () => {
         evidence={summarizeTurnEvidence(tools)}
         turnBoundaryFailure
         durationMs={80_000}
-        processExpanded={false}
       />,
     );
 
@@ -207,7 +197,6 @@ describe("TurnResultSnapshot", () => {
         plan={legacyPlan}
         evidence={summarizeTurnEvidence(tools)}
         durationMs={80_000}
-        processExpanded={false}
       />,
     );
 
@@ -235,7 +224,6 @@ describe("TurnResultSnapshot", () => {
         plan={externalPlan}
         evidence={summarizeTurnEvidence(tools)}
         durationMs={80_000}
-        processExpanded={false}
       />,
     );
 
@@ -262,7 +250,6 @@ describe("TurnResultSnapshot", () => {
         plan={userPlan}
         evidence={summarizeTurnEvidence(tools)}
         durationMs={80_000}
-        processExpanded={false}
       />,
     );
 
@@ -285,5 +272,34 @@ describe("TurnResultSnapshot", () => {
     expect(evidence.changedFileCount).toBe(1_000);
     expect(evidence.changedFiles).toHaveLength(20);
     expect(JSON.stringify(evidence).length).toBeLessThan(4_000);
+  });
+
+  it("redacts credentials from bounded file and command evidence", () => {
+    const evidence = summarizeTurnEvidence([
+      {
+        id: "secret-edit",
+        name: "edit_file",
+        args: JSON.stringify({ path: "fixtures/token=SECRET-private.ts" }),
+        status: "done",
+        result: "ok",
+      },
+      {
+        id: "secret-test",
+        name: "bash",
+        args: JSON.stringify({ command: "API_KEY=sk-secret-value pnpm test" }),
+        status: "done",
+        result: "passed",
+      },
+    ]);
+
+    render(
+      <TurnResultSnapshot plan={plan} evidence={evidence} durationMs={1_000} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "查看证据" }));
+
+    const snapshot = screen.getByTestId("turn-result-snapshot");
+    expect(snapshot).not.toHaveTextContent(/SECRET|sk-secret-value/);
+    expect(snapshot).toHaveTextContent("token=[redacted]");
+    expect(snapshot).toHaveTextContent("API_KEY=[redacted] pnpm test");
   });
 });
