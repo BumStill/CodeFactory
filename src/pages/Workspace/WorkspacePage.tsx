@@ -247,6 +247,9 @@ export function WorkspacePage({
   const turnInFlight = activeDraft
     ? false
     : !currentTurnWasReleased && (streaming || durableTurnActive || systemHoldsTurn);
+  const turnExecutionActive = activeDraft
+    ? false
+    : !currentTurnWasReleased && (streaming || durableTurnActive);
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
     if (!trimmed || activeDraft) return;
@@ -846,6 +849,7 @@ export function WorkspacePage({
             messages={messages}
             streaming={streaming}
             turnActive={turnInFlight}
+            turnExecutionActive={turnExecutionActive}
             cwd={activeCwd}
             conversationKey={activeSession?.id ?? activeDraft?.id ?? sessionId}
             hasOlderHistory={hasOlderHistory}

@@ -360,6 +360,11 @@ export function reduceChatStreamEvent(
         transportDoneSucceeded: true,
         inputTokenTotal: state.inputTokenTotal + event.input_tokens,
         outputTokenTotal: state.outputTokenTotal + event.output_tokens,
+        messages: updateMessageById(state.messages, msgId, (message) => ({
+          ...message,
+          inputTokens: (message.inputTokens ?? 0) + event.input_tokens,
+          outputTokens: (message.outputTokens ?? 0) + event.output_tokens,
+        })),
       };
     }
 

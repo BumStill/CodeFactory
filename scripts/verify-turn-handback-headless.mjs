@@ -137,7 +137,7 @@ async function main() {
       "a running turn must keep showing its next step",
     );
     assert(
-      (await runningBanner.textContent() ?? "").includes("命令已连续运行约 3 分钟"),
+      (await runningBanner.textContent() ?? "").includes("交付任务已连续运行约 3 分钟"),
       "a running turn must keep its human waiting reason",
     );
     assert(
@@ -147,12 +147,17 @@ async function main() {
     const inlineStatus = running.getByTestId("inline-turn-status");
     assert(
       (await inlineStatus.count()) === 1
-        && /^(Thinking|执行中|等待中|整理结果) · \d{2}:\d{2}$/.test((await inlineStatus.textContent() ?? "").trim()),
-      "a running turn must render exactly one compact icon/status/clock receipt",
+        && /^执行中 · \d{2}:\d{2}$/.test((await inlineStatus.textContent() ?? "").trim()),
+      "a durable long-running tool must render exactly one executing status/clock receipt",
     );
     assert(
       (await handedBack.getByTestId("inline-turn-status").count()) === 0,
       "the inline running receipt must disappear after handback",
+    );
+    assert(
+      (await handedBack.getByTestId("settled-turn-status").textContent() ?? "").trim()
+        === "已结束 · 12K tokens · 06:00",
+      "a settled turn must retain one completed token/time receipt",
     );
     assert(
       !(await running.textContent() ?? "").includes("正在处理")
@@ -185,6 +190,7 @@ async function main() {
         waitingToolBecomesBlocked: true,
         runningTurnKeepsItsBanner: true,
         runningTurnKeepsOneInlineReceipt: true,
+        durableLongToolShowsExecuting: true,
         inlineReceiptFitsNarrowViewport: true,
         reducedMotionStopsInlineIcon: true,
       },

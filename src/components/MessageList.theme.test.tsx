@@ -202,7 +202,10 @@ describe("MessageList theme readability", () => {
       "turn-continuation",
     );
     expect(screen.queryByText("Remember")).not.toBeInTheDocument();
-    expect(screen.getAllByText(/用时/)).toHaveLength(1);
+    expect(screen.getAllByTestId("settled-turn-status")).toHaveLength(1);
+    expect(screen.getByTestId("settled-turn-status")).toHaveTextContent(
+      /已结束 · 0 tokens · 00:03/,
+    );
   });
 
   it("keeps operational narration at body size while elapsed time stays auxiliary", () => {

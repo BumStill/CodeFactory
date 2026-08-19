@@ -1713,6 +1713,16 @@ export function dbMessagesToUI(
     // durable objective projection to the root user row instead of silently
     // dropping it during hydration.
     const activityTarget = assistant ?? hydrated[rootIndex];
+    const terminalObjective =
+      activity.objective_status === "waiting_core_input" ||
+      activity.objective_status === "waiting_authorization" ||
+      activity.objective_status === "waiting_business_decision" ||
+      activity.objective_status === "completed" ||
+      activity.objective_status === "cancelled" ||
+      activity.objective_status === "legacy_orphan";
+    if (assistant && assistant.durationMs == null && terminalObjective) {
+      assistant.durationMs = Math.max(0, activity.updated_at - hydrated[rootIndex].createdAt);
+    }
     activityTarget.turnActivity = {
       rootTurnId: activity.root_turn_id,
       revision: activity.revision,

@@ -24,6 +24,7 @@ import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
 import { formatDuration, formatElapsedClock, useNowTick } from "../lib/duration";
+import { formatUsageTokens } from "./TokenUsageHeatmap";
 import { TurnProgress } from "./TurnProgress";
 import { systemOwnsObjective } from "../lib/turnOwnership";
 import { humanWaitingReason } from "../lib/waitingReason";
@@ -49,6 +50,10 @@ interface Props {
    * between provider stream segments. Defaults to `streaming` for standalone
    * acceptance fixtures and older call sites. */
   turnActive?: boolean;
+  /** A live frontend stream or backend chat owner is currently executing the
+   * turn. Kept separate from durable ownership so stale activity snapshots do
+   * not look live after a restart. */
+  turnExecutionActive?: boolean;
   /** Working directory of the active session. */
   cwd?: string | null;
   /** Called when the user picks an example prompt from the welcome screen. */
@@ -332,6 +337,7 @@ export function MessageList({
   messages,
   streaming,
   turnActive = streaming,
+  turnExecutionActive = streaming,
   onUsePrompt,
   onOpenUsage,
   onOpenSession,
@@ -391,6 +397,7 @@ export function MessageList({
             <InlineTurnStatus
               message={undefined}
               streaming={streaming}
+              turnExecutionActive={turnExecutionActive}
               startedAt={Date.now()}
             />
           </div>
@@ -451,13 +458,18 @@ export function MessageList({
   const activeTurnStartedAt =
     activeRootMessage?.createdAt ?? activeTurnMessage?.createdAt ?? Date.now();
   const lastAssistantIdsByUserTurn = new Set<string>();
+  const turnTokenTotalsByAssistantId = new Map<string, number>();
   let pendingLastAssistantId: string | null = null;
+  let pendingTurnTokenTotal = 0;
   for (const message of visible) {
     if (message.role === "user") {
       if (pendingLastAssistantId) lastAssistantIdsByUserTurn.add(pendingLastAssistantId);
       pendingLastAssistantId = null;
+      pendingTurnTokenTotal = 0;
     } else if (message.role === "assistant") {
       pendingLastAssistantId = message.id;
+      pendingTurnTokenTotal += (message.inputTokens ?? 0) + (message.outputTokens ?? 0);
+      turnTokenTotalsByAssistantId.set(message.id, pendingTurnTokenTotal);
     }
   }
   if (pendingLastAssistantId) lastAssistantIdsByUserTurn.add(pendingLastAssistantId);
@@ -531,6 +543,7 @@ export function MessageList({
               msg={msg}
               isStreamingTail={streaming && msg.id === lastAssistantId}
               isLastAssistantInUserTurn={lastAssistantIdsByUserTurn.has(msg.id)}
+              turnTokenTotal={turnTokenTotalsByAssistantId.get(msg.id) ?? 0}
               onOpenDocument={onOpenDocument}
               onOpenEvidence={onOpenEvidence}
               evidenceControlsId={evidenceControlsId}
@@ -542,7 +555,9 @@ export function MessageList({
         {turnActive && (
           <InlineTurnStatus
             message={activeTurnMessage}
+            activity={activeProgressMessage?.turnActivity ?? activeTurnMessage?.turnActivity}
             streaming={streaming}
+            turnExecutionActive={turnExecutionActive}
             startedAt={activeTurnStartedAt}
           />
         )}
@@ -576,9 +591,11 @@ type InlineTurnPhase = "thinking" | "executing" | "waiting" | "finalizing";
 function inlineTurnPhase(
   message: UIMessage | undefined,
   streaming: boolean,
+  turnExecutionActive: boolean,
+  activity: UIMessage["turnActivity"] | undefined,
 ): InlineTurnPhase {
-  const phase = message?.turnActivity?.phase;
-  const kind = message?.turnActivity?.kind;
+  const phase = activity?.phase;
+  const kind = activity?.kind;
   if (phase === "finalizing" || kind === "finalizing") return "finalizing";
 
   const toolStatuses = (message?.toolCalls ?? []).map((tool) => tool.status);
@@ -587,9 +604,20 @@ function inlineTurnPhase(
   ) {
     return "waiting";
   }
-  if (toolStatuses.includes("running")) return "executing";
+  if (turnExecutionActive && toolStatuses.includes("running")) return "executing";
+  // `tool_wait` is the long-tool heartbeat emitted while the tool future is
+  // still running. After a real wait result the runtime projects a distinct
+  // waiting activity such as `tool_recovery_waiting`, so do not let a durable
+  // stream gap relabel active delivery/build work as waiting.
   if (
-    message?.turnActivity?.objectiveStatus === "waiting_system" ||
+    turnExecutionActive &&
+    activity?.status === "active" &&
+    (kind === "tool" || kind === "tool_wait")
+  ) {
+    return "executing";
+  }
+  if (
+    activity?.objectiveStatus === "waiting_system" ||
     !streaming
   ) {
     return "waiting";
@@ -606,15 +634,19 @@ const INLINE_TURN_PHASE = {
 
 function InlineTurnStatus({
   message,
+  activity = message?.turnActivity,
   streaming,
+  turnExecutionActive,
   startedAt,
 }: {
   message: UIMessage | undefined;
+  activity?: UIMessage["turnActivity"];
   streaming: boolean;
+  turnExecutionActive: boolean;
   startedAt: number;
 }) {
   const nowMs = useNowTick(true);
-  const phase = inlineTurnPhase(message, streaming);
+  const phase = inlineTurnPhase(message, streaming, turnExecutionActive, activity);
   const { label, Icon } = INLINE_TURN_PHASE[phase];
   const animated = phase === "thinking" || phase === "finalizing";
 
@@ -753,6 +785,7 @@ const MessageRow = memo(function MessageRow({
   msg,
   isStreamingTail,
   isLastAssistantInUserTurn,
+  turnTokenTotal,
   onOpenDocument,
   onOpenEvidence,
   evidenceControlsId,
@@ -761,6 +794,7 @@ const MessageRow = memo(function MessageRow({
   msg: UIMessage;
   isStreamingTail: boolean;
   isLastAssistantInUserTurn: boolean;
+  turnTokenTotal: number;
   onOpenDocument?: (path: string) => void;
   onOpenEvidence?: (messageId: string) => void;
   evidenceControlsId?: string;
@@ -938,6 +972,8 @@ const MessageRow = memo(function MessageRow({
     (timeline
       ? lastTextIndex === timeline.length - 1
       : !msg.toolCalls || msg.toolCalls.length === 0);
+  const isSettledTurnTail =
+    !isStreamingTail && isLastAssistantInUserTurn && msg.durationMs != null;
   const hasActiveTool = (msg.toolCalls ?? []).some(
     (tool) =>
       tool.status === "running" ||
@@ -945,9 +981,9 @@ const MessageRow = memo(function MessageRow({
       tool.status === "waiting_permission",
   );
   const isWaitingOnModelTransport = isStreamingTail && !hasActiveTool;
-  const durationLabel = isSettledAnswer && msg.durationMs != null
-      ? formatDuration(msg.durationMs)
-      : null;
+  const settledDuration = isSettledTurnTail
+    ? formatElapsedClock(msg.durationMs!)
+    : null;
   // Keep the active turn as one continuous reading flow. Once the turn
   // reaches a terminal state, collapse its older segments behind the
   // existing disclosure so completed history stays compact.
@@ -1127,9 +1163,13 @@ const MessageRow = memo(function MessageRow({
           </div>
         </details>
       )}
-      {durationLabel && (
-        <div className="text-caption text-gray-600 tabular-nums select-none">
-          用时 {durationLabel}
+      {settledDuration && (
+        <div
+          data-testid="settled-turn-status"
+          className="inline-flex items-center gap-1.5 text-caption text-gray-500 tabular-nums select-none"
+        >
+          <Check size={14} aria-hidden="true" className="text-status-success" />
+          <span>已结束 · {formatUsageTokens(turnTokenTotal)} tokens · {settledDuration}</span>
         </div>
       )}
       {isSettledAnswer && msg.plan && (() => {

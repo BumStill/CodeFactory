@@ -103,6 +103,98 @@ describe("inline active-turn status", () => {
     );
   });
 
+  it("shows a durable long-running delivery tool as executing", () => {
+    render(
+      <MessageList
+        messages={[
+          assistant({
+            turnActivity: {
+              rootTurnId: "user",
+              revision: 4,
+              phase: "delivering",
+              status: "active",
+              kind: "tool_wait",
+              label: "交付任务仍在运行（约 2 分钟）",
+              waitingReason: "交付任务已连续运行约 2 分钟",
+              updatedAt: NOW,
+              terminalReason: null,
+            },
+          }),
+        ]}
+        streaming={false}
+        turnActive
+        turnExecutionActive
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
+      "执行中 · 01:24",
+    );
+  });
+
+  it("keeps an explicit system recovery wait in the waiting phase", () => {
+    render(
+      <MessageList
+        messages={[
+          assistant({
+            turnActivity: {
+              rootTurnId: "user",
+              revision: 5,
+              phase: "recovering",
+              status: "waiting",
+              kind: "tool_recovery_waiting",
+              label: "外部状态尚未确认，系统正在只读对账",
+              waitingReason: "等待安全观察器确认副作用状态",
+              updatedAt: NOW,
+              terminalReason: "external_state_uncertain",
+              objectiveStatus: "waiting_system",
+            },
+          }),
+        ]}
+        streaming={false}
+        turnActive
+        turnExecutionActive
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
+      "等待中 · 01:24",
+    );
+  });
+
+  it("does not revive a stale long-tool heartbeat without a current execution owner", () => {
+    render(
+      <MessageList
+        messages={[
+          assistant({
+            turnActivity: {
+              rootTurnId: "user",
+              revision: 6,
+              phase: "delivering",
+              status: "active",
+              kind: "tool_wait",
+              label: "交付任务仍在运行（约 2 分钟）",
+              waitingReason: "交付任务已连续运行约 2 分钟",
+              updatedAt: NOW - 60_000,
+              terminalReason: null,
+              objectiveStatus: "waiting_system",
+            },
+          }),
+        ]}
+        streaming={false}
+        turnActive
+        turnExecutionActive={false}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
+      "等待中 · 01:24",
+    );
+  });
+
   it("stays visible when a durable turn owns an otherwise empty conversation", () => {
     render(
       <MessageList
@@ -143,6 +235,7 @@ describe("inline active-turn status", () => {
           ]}
           streaming={streaming}
           turnActive
+          turnExecutionActive
           cwd={null}
         />,
       );
@@ -237,10 +330,23 @@ describe("inline active-turn status", () => {
     );
   });
 
-  it("disappears immediately after the turn settles", () => {
+  it("keeps one completed receipt with whole-turn tokens and elapsed time", () => {
     render(
       <MessageList
-        messages={[assistant({ content: "完成。", durationMs: 84_000 })]}
+        messages={[
+          {
+            id: "user",
+            role: "user",
+            content: "开始",
+            createdAt: NOW - 84_000,
+          },
+          assistant({
+            content: "完成。",
+            durationMs: 84_000,
+            inputTokens: 12_000,
+            outputTokens: 345,
+          }),
+        ]}
         streaming={false}
         turnActive={false}
         cwd={null}
@@ -248,5 +354,34 @@ describe("inline active-turn status", () => {
     );
 
     expect(screen.queryByTestId("inline-turn-status")).not.toBeInTheDocument();
+    expect(screen.getByTestId("settled-turn-status")).toHaveTextContent(
+      "已结束 · 12K tokens · 01:24",
+    );
+    expect(screen.queryByText(/^用时 /)).not.toBeInTheDocument();
+  });
+
+  it("sums token usage across every assistant segment in the root turn", () => {
+    render(
+      <MessageList
+        messages={[
+          { id: "user", role: "user", content: "开始", createdAt: NOW - 120_000 },
+          assistant({ id: "round-1", content: "阶段一", inputTokens: 8_000, outputTokens: 500 }),
+          assistant({
+            id: "round-2",
+            content: "完成。",
+            durationMs: 120_000,
+            inputTokens: 4_000,
+            outputTokens: 345,
+          }),
+        ]}
+        streaming={false}
+        turnActive={false}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getByTestId("settled-turn-status")).toHaveTextContent(
+      "已结束 · 13K tokens · 02:00",
+    );
   });
 });

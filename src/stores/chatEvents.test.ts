@@ -131,6 +131,24 @@ describe("chat tool call stream events", () => {
     expect(settled.streaming).toBe(false);
   });
 
+  it("attaches every completed round usage to its assistant segment", () => {
+    const first = reduceChatStreamEvent(
+      baseState(),
+      { type: "done", input_tokens: 1200, output_tokens: 34 },
+      "assistant-1",
+    );
+    const second = reduceChatStreamEvent(
+      first,
+      { type: "done", input_tokens: 800, output_tokens: 16 },
+      "assistant-1",
+    );
+
+    expect(second.messages[0]).toMatchObject({
+      inputTokens: 2000,
+      outputTokens: 50,
+    });
+  });
+
   it("terminalizes transient tools when durable recovery hands the turn back", () => {
     const waiting: ChatEventState = {
       ...baseState(),
