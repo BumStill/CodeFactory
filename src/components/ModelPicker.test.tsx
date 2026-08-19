@@ -150,4 +150,50 @@ describe("ModelPicker", () => {
       screen.getByRole("button", { name: /chatgpt.*gpt-5\.5.*首选/ }),
     ).toBeInTheDocument();
   });
+
+  it("anchors the portal above a trigger near the viewport bottom", async () => {
+    const user = userEvent.setup();
+    mocks.loadModels.mockResolvedValue(undefined);
+    const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if ((this as HTMLElement).getAttribute("aria-label") === "选择模型") {
+        return { left: 600, right: 780, top: 650, bottom: 682, width: 180, height: 32, x: 600, y: 650, toJSON: () => ({}) } as DOMRect;
+      }
+      return { left: 0, right: 288, top: 0, bottom: 300, width: 288, height: 300, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+    });
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 800 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 720 });
+
+    render(<ModelPicker portal prominent />);
+    await user.click(screen.getByRole("button", { name: "选择模型" }));
+
+    await waitFor(() => {
+      const menu = screen.getByTestId("model-picker-portal-menu");
+      expect(Number.parseFloat(menu.style.top)).toBeLessThan(650);
+      expect(Number.parseFloat(menu.style.left)).toBeGreaterThanOrEqual(8);
+      expect(Number.parseFloat(menu.style.left) + 288).toBeLessThanOrEqual(792);
+    });
+    rectSpy.mockRestore();
+  });
+
+  it("anchors the portal below a trigger near the viewport top", async () => {
+    const user = userEvent.setup();
+    mocks.loadModels.mockResolvedValue(undefined);
+    const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if ((this as HTMLElement).getAttribute("aria-label") === "选择模型") {
+        return { left: 20, right: 200, top: 40, bottom: 72, width: 180, height: 32, x: 20, y: 40, toJSON: () => ({}) } as DOMRect;
+      }
+      return { left: 0, right: 288, top: 0, bottom: 300, width: 288, height: 300, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+    });
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 800 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 720 });
+
+    render(<ModelPicker portal prominent />);
+    await user.click(screen.getByRole("button", { name: "选择模型" }));
+
+    await waitFor(() => {
+      const menu = screen.getByTestId("model-picker-portal-menu");
+      expect(Number.parseFloat(menu.style.top)).toBeGreaterThanOrEqual(76);
+    });
+    rectSpy.mockRestore();
+  });
 });

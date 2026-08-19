@@ -48,7 +48,6 @@ interface ContextUsagePresentation {
   tone: ContextUsageTone;
   label: string;
   textClass: string;
-  barClass: string;
 }
 
 export function contextUsagePresentation(percent: number): ContextUsagePresentation {
@@ -57,7 +56,6 @@ export function contextUsagePresentation(percent: number): ContextUsagePresentat
       tone: "danger",
       label: "上下文紧张",
       textClass: "text-status-danger",
-      barClass: "bg-status-danger",
     };
   }
   if (percent >= 70) {
@@ -65,14 +63,12 @@ export function contextUsagePresentation(percent: number): ContextUsagePresentat
       tone: "warning",
       label: "上下文偏高",
       textClass: "text-status-warning",
-      barClass: "bg-status-warning",
     };
   }
   return {
     tone: "progress",
     label: "上下文充足",
     textClass: "text-status-progress",
-    barClass: "bg-status-progress",
   };
 }
 
@@ -212,20 +208,6 @@ export function ContextUsageBar({ sessionId, onOpenUsage }: Props) {
           <span className={presentation.textClass}>
             {formatContextTokens(usage!.used)} / {formatContextTokens(usage!.limit)}
           </span>
-          <div
-            className="h-1.5 w-24 overflow-hidden rounded-full bg-surface-4"
-            role="meter"
-            aria-label="上下文占用"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={Math.round(pct)}
-            aria-valuetext={`${presentation.label}，已使用 ${pct.toFixed(0)}%`}
-          >
-            <div
-              className={`h-full rounded-full ${presentation.barClass} transition-all duration-300 motion-reduce:transition-none`}
-              style={{ width: `${pct}%` }}
-            />
-          </div>
           <span className={`${presentation.textClass} w-9 text-right`}>{pct.toFixed(0)}%</span>
         </div>
       )}

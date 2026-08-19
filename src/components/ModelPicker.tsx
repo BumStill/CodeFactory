@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, Sparkles } from "lucide-react";
 import { useChatStore } from "../stores/chat";
@@ -29,6 +29,27 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
   const [loadingEndpoint, setLoadingEndpoint] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const [portalPosition, setPortalPosition] = useState<{ left: number; top: number } | null>(null);
+
+  const updatePortalPosition = useCallback(() => {
+    if (!portal) return;
+    const trigger = ref.current?.getBoundingClientRect();
+    if (!trigger) return;
+    const gutter = 8;
+    const gap = 4;
+    const menuWidth = menuRef.current?.offsetWidth ?? 288;
+    const menuHeight = menuRef.current?.offsetHeight ?? 320;
+    const left = Math.max(
+      gutter,
+      Math.min(trigger.right - menuWidth, window.innerWidth - menuWidth - gutter),
+    );
+    const spaceBelow = window.innerHeight - trigger.bottom - gutter;
+    const spaceAbove = trigger.top - gutter;
+    const top = spaceBelow >= menuHeight || spaceBelow >= spaceAbove
+      ? Math.min(trigger.bottom + gap, window.innerHeight - menuHeight - gutter)
+      : Math.max(gutter, trigger.top - menuHeight - gap);
+    setPortalPosition({ left, top: Math.max(gutter, top) });
+  }, [portal]);
 
   // When the active endpoint changes:
   //   1. Reload the model list for that endpoint
@@ -69,6 +90,24 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
     return () => document.removeEventListener("mousedown", close);
   }, []);
 
+  useLayoutEffect(() => {
+    if (!open || !portal) return;
+    updatePortalPosition();
+    const frame = requestAnimationFrame(updatePortalPosition);
+    window.addEventListener("resize", updatePortalPosition);
+    window.addEventListener("scroll", updatePortalPosition, true);
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updatePortalPosition);
+    if (menuRef.current) observer?.observe(menuRef.current);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updatePortalPosition);
+      window.removeEventListener("scroll", updatePortalPosition, true);
+      observer?.disconnect();
+    };
+  }, [open, portal, updatePortalPosition]);
+
   const displayed = activeModel.split("/").pop() ?? activeModel;
   const activeEndpoint =
     activeSession?.endpoint_id ?? settings?.default_endpoint ?? "openrouter";
@@ -90,8 +129,8 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
     });
 
   const menu = (
-      <div ref={menuRef} className="z-[100] w-72 rounded-lg border border-border bg-surface-2 shadow-xl">
-      <div className="space-y-2 border-b border-border p-2">
+      <div ref={menuRef} className="z-[100] w-72 rounded-lg border border-border/50 bg-surface-2 shadow-lg">
+      <div className="space-y-2 border-b border-border/35 p-2">
         {activeSession && (
           <>
             <select
@@ -214,12 +253,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
       <div
         data-testid="model-picker-portal-menu"
         className="fixed z-[100]"
-        style={(() => {
-          const rect = ref.current?.getBoundingClientRect();
-          return rect
-            ? { left: Math.max(8, Math.min(rect.right - 288, window.innerWidth - 296)), top: rect.bottom + 4 }
-            : { left: 8, top: 8 };
-        })()}
+        style={portalPosition ?? { left: 8, top: 8 }}
       >
         {menu}
       </div>,
