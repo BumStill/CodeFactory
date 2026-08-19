@@ -1,6 +1,6 @@
 {
   "name": "codefactory",
-  "version": "1.81.11",
+  "version": "1.81.15",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,6 +16,7 @@
     "worktree:start": "node scripts/worktree-start.mjs",
     "test:worktree-start": "node --test scripts/worktree-start.test.mjs",
     "test:unattended-contract": "node --test scripts/unattended-long-task-contract.test.mjs",
+    "test:history-session-contract": "node --test scripts/history-session-smoke-contract.test.mjs",
     "test": "vitest run",
     "test:rust:fast": "node scripts/cargo-shared.mjs test --manifest-path src-tauri/Cargo.toml",
     "test:evolution:headless": "node scripts/verify-evolution-workbench-headless.mjs",

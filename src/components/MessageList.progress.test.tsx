@@ -197,7 +197,7 @@ describe("MessageList structured progress and result", () => {
             turnActivity: activity,
           },
         ]}
-        streaming={false}
+        streaming
         cwd={null}
       />,
     );

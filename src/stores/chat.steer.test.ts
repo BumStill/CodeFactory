@@ -204,6 +204,12 @@ describe("steering a run in flight", () => {
       ["user", "改用 chrome channel"],
       ["assistant", "好的，改用 chrome channel"],
     ]);
+    const rootTurnId = messages().find((message) => message.role === "user")?.id;
+    expect(
+      messages()
+        .filter((message) => message.role === "assistant")
+        .map((message) => message.rootTurnId),
+    ).toEqual([rootTurnId, rootTurnId]);
   });
 
   it("keeps feeding the new bubble after the split, not the closed one", async () => {

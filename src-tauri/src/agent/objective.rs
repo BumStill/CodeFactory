@@ -77,6 +77,11 @@ string_enum!(ObjectiveStatus {
 /// objective that produced it name the same thing.
 pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
 
+/// A typed durable wait for another local execution owner to release the App.
+/// Observing the same unsafe restart point is expected state, not a failed
+/// recovery attempt, so it must never consume the technical recovery budget.
+pub const UPDATE_SAFE_POINT_PENDING: &str = "update_safe_point_pending";
+
 /// How many durable remediations one failure signature may buy before the
 /// system admits it is not making progress. Counted as a cumulative tally per
 /// `(objective, recovery_generation, failure_signature)` rather than a
@@ -2817,6 +2822,11 @@ impl ObjectiveStore {
         &self,
         mut decision: DecisionEnvelope,
     ) -> anyhow::Result<DecisionEnvelope> {
+        if decision.domain == RecoveryDomain::Update
+            && decision.failure_code.as_deref() == Some(UPDATE_SAFE_POINT_PENDING)
+        {
+            return Ok(decision);
+        }
         if decision.status != ObjectiveStatus::WaitingSystem
             || !matches!(
                 decision.decision_type,
@@ -2906,6 +2916,15 @@ impl ObjectiveStore {
         let now = Utc::now().timestamp_millis();
         let process_instance = current_process_instance();
         let completed_at = decision.status.is_terminal().then_some(now);
+        let recovery_generation = if current.status == ObjectiveStatus::WaitingCoreInput
+            && current.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
+            && decision.status == ObjectiveStatus::WaitingSystem
+            && decision.decision_type == DecisionType::ApplyRecommended
+        {
+            current.recovery_generation + 1
+        } else {
+            current.recovery_generation
+        };
         let evidence_ref = decision
             .evidence
             .as_ref()
@@ -3531,7 +3550,7 @@ impl ObjectiveStore {
                side_effect_started=MAX(side_effect_started, ?), next_observation_at=?,
                lease_owner=NULL, lease_expires_at=NULL, evidence_ref=?,
                cancellation_provenance=?, last_observed_process_instance=?,
-               last_progress_at=?, updated_at=?, completed_at=?
+               recovery_generation=?, last_progress_at=?, updated_at=?, completed_at=?
              WHERE id=? AND revision=?",
         )
         .bind(decision.revision)
@@ -3554,6 +3573,7 @@ impl ObjectiveStore {
         .bind(&evidence_ref)
         .bind(&decision.cancellation_provenance)
         .bind(&process_instance)
+        .bind(recovery_generation)
         .bind(now)
         .bind(now)
         .bind(completed_at)
@@ -3606,19 +3626,79 @@ impl ObjectiveStore {
             .fetch_one(&mut *tx)
             .await?;
             if turn_projection_columns == 10 {
-                sqlx::query(
+                let durable_settlement_columns: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM pragma_table_info('chat_turn_state')
+                     WHERE name IN ('turn_settled_at','stream_closed_at')",
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                let statement = if durable_settlement_columns == 2 {
+                    "UPDATE chat_turn_state
+                     SET revision=revision+1, phase='waiting', status='waiting_core_input',
+                         recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
+                         updated_at=?, completed_at=?, terminal_reason=?,
+                         turn_settled_at=COALESCE(turn_settled_at, ?),
+                         stream_closed_at=COALESCE(stream_closed_at, ?)
+                     WHERE objective_id=?"
+                } else {
                     "UPDATE chat_turn_state
                      SET revision=revision+1, phase='waiting', status='waiting_core_input',
                          recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
                          updated_at=?, completed_at=?, terminal_reason=?
-                     WHERE objective_id=?",
-                )
+                     WHERE objective_id=?"
+                };
+                let mut query = sqlx::query(statement)
                 .bind(TECHNICAL_RECOVERY_EXHAUSTED)
                 .bind("系统多轮自动恢复没有进展，已停止并把当前结论交还给你")
                 .bind(TECHNICAL_RECOVERY_EXHAUSTED)
                 .bind(now)
                 .bind(now)
-                .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+                .bind(TECHNICAL_RECOVERY_EXHAUSTED);
+                if durable_settlement_columns == 2 {
+                    query = query.bind(now).bind(now);
+                }
+                query
+                    .bind(&decision.objective_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            let terminalizable_tool_columns: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('tool_calls')
+                 WHERE name IN ('objective_id','status','result')",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if terminalizable_tool_columns == 3 {
+                sqlx::query(
+                    "UPDATE tool_calls
+                     SET status='blocked', result=?
+                     WHERE objective_id=?
+                       AND status IN ('pending','running','waiting','waiting_permission')",
+                )
+                .bind("系统已停止自动恢复，当前步骤未继续执行。")
+                .bind(&decision.objective_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let has_chat_run_controls: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='chat_run_controls'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_chat_run_controls == 1 {
+                sqlx::query(
+                    "UPDATE chat_run_controls
+                     SET status='completed', objective_revision=?,
+                         settled_at=COALESCE(settled_at, ?), updated_at=?
+                     WHERE objective_id=?
+                       AND status IN ('active','cancel_requested')",
+                )
+                .bind(decision.revision)
+                .bind(now)
+                .bind(now)
                 .bind(&decision.objective_id)
                 .execute(&mut *tx)
                 .await?;
@@ -3877,12 +3957,19 @@ impl ObjectiveStore {
         .await?;
 
         if decision.status == ObjectiveStatus::WaitingSystem {
+            let strategy = if decision.domain == RecoveryDomain::Update
+                && decision.failure_code.as_deref() == Some(UPDATE_SAFE_POINT_PENDING)
+            {
+                "wait_for_restart_safe_point"
+            } else {
+                "reconcile_then_resume"
+            };
             sqlx::query(
                 "INSERT INTO objective_remediations
                  (id, objective_id, binding_id, domain, status, failure_code, failure_signature,
                   strategy, approach_index, attempt_index, recovery_generation, resume_cursor,
                   next_observation_at, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, 'queued', ?, ?, 'reconcile_then_resume', 0, 0,
+                 VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, 0, 0,
                          (SELECT recovery_generation FROM objectives WHERE id=?), ?, ?, ?, ?)",
             )
             .bind(
@@ -3906,6 +3993,7 @@ impl ObjectiveStore {
                     .as_deref()
                     .ok_or_else(|| anyhow!("waiting_system failure signature missing"))?,
             )
+            .bind(strategy)
             .bind(&decision.objective_id)
             .bind(&decision.resume_cursor)
             .bind(
@@ -7335,6 +7423,81 @@ mod tests {
         let pool = pool().await;
         let store = ObjectiveStore::new(pool.clone());
         let mut current = recovery_ceiling_objective(&pool, "objective-recovery-ceiling").await;
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               revision INTEGER NOT NULL DEFAULT 1, phase TEXT NOT NULL,
+               status TEXT NOT NULL, recent_activity_kind TEXT,
+               recent_activity_label TEXT, waiting_reason TEXT,
+               updated_at INTEGER NOT NULL, completed_at INTEGER,
+               terminal_reason TEXT, objective_id TEXT,
+               turn_settled_at INTEGER, stream_closed_at INTEGER
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, phase, status, updated_at, objective_id)
+             VALUES (?, ?, 'recovering', 'active', ?, ?)",
+        )
+        .bind(current.root_turn_id.as_deref().unwrap())
+        .bind(current.session_id.as_deref().unwrap())
+        .bind(Utc::now().timestamp_millis())
+        .bind(&current.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance,
+              created_at, updated_at)
+             VALUES ('run-recovery-ceiling', ?, ?, ?, ?, 'active',
+                     'process-recovery-ceiling', ?, ?)",
+        )
+        .bind(current.session_id.as_deref().unwrap())
+        .bind(current.root_turn_id.as_deref().unwrap())
+        .bind(&current.id)
+        .bind(current.revision)
+        .bind(Utc::now().timestamp_millis())
+        .bind(Utc::now().timestamp_millis())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE tool_calls (
+               id TEXT PRIMARY KEY, objective_id TEXT,
+               status TEXT NOT NULL, result TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls(id, objective_id, status, result)
+             VALUES ('waiting-read-only-command', ?, 'waiting', 'external_state_uncertain')",
+        )
+        .bind(&current.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, revision, action_fingerprint, idempotency_key,
+              status, created_at, observed_at)
+             VALUES ('recovery-ceiling-unknown-receipt', ?, ?,
+                     'sha256:unknown', 'sha256:unknown-key', 'unknown', ?, ?)",
+        )
+        .bind(&current.id)
+        .bind(current.revision)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
         let signature = format!("{}:Finished:none", current.id);
 
         let mut queued_rounds = 0_i64;
@@ -7363,6 +7526,52 @@ mod tests {
             claimable_remediations(&pool, &current.id).await,
             0,
             "the supervisor must have nothing left to claim"
+        );
+        let projection: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT status, turn_settled_at, stream_closed_at
+             FROM chat_turn_state WHERE objective_id=?",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(projection.0, "waiting_core_input");
+        assert!(
+            projection.1.is_some() && projection.2.is_some(),
+            "handback must durably settle the turn and close its stream"
+        );
+        let run_control: (String, Option<i64>) = sqlx::query_as(
+            "SELECT status, settled_at FROM chat_run_controls
+             WHERE objective_id=?",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run_control.0, "completed");
+        assert!(run_control.1.is_some(), "handback must release the run lock");
+        let tool: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, result FROM tool_calls WHERE objective_id=?",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tool.0, "blocked", "no tool may keep a live clock after handback");
+        assert!(
+            !tool.1.unwrap_or_default().contains("external_state_uncertain"),
+            "the terminal tool projection must not expose an internal recovery code"
+        );
+        let receipt_status: String = sqlx::query_scalar(
+            "SELECT status FROM side_effect_receipts
+             WHERE id='recovery-ceiling-unknown-receipt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt_status, "unknown",
+            "handback must not rewrite unresolved external-state audit truth"
         );
     }
 
@@ -7863,6 +8072,86 @@ mod tests {
             assert!(!current.requires_user_action);
         }
         assert_eq!(claimable_remediations(&pool, &current.id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn update_safe_point_observation_does_not_spend_the_recovery_budget() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = store
+            .create(CreateObjective {
+                id: "objective-update-safe-point-wait".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: None,
+                root_turn_id: None,
+                domain: RecoveryDomain::Update,
+                requested_acceptance: "installed_exact_update".into(),
+                created_surface: "updater".into(),
+            })
+            .await
+            .unwrap();
+        let signature = "sha256:update-safe-point-wait";
+        current = store
+            .apply_decision(
+                current.revision,
+                DecisionRouter::route(
+                    &current,
+                    RouteSignal::TechnicalFailure {
+                        domain: RecoveryDomain::Update,
+                        failure_code: UPDATE_SAFE_POINT_PENDING.into(),
+                        failure_signature: signature.into(),
+                        next_observation_at: Utc::now().timestamp_millis() - 1,
+                        resume_cursor: None,
+                    },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        for round in 0..(MAX_SIGNATURE_RECOVERY_ATTEMPTS + 3) {
+            sqlx::query(
+                "UPDATE objective_remediations SET next_observation_at=? WHERE objective_id=?
+                 AND status IN ('queued','waiting')",
+            )
+            .bind(Utc::now().timestamp_millis() - 1)
+            .bind(&current.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let claim = store
+                .claim_due_remediations("update-safe-point-test", 1, 30_000)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap_or_else(|| panic!("safe-point observation {round} exhausted recovery"));
+            let permit = codefactory_agent_loop::tool::MutationPermit {
+                objective_id: claim.objective.id.clone(),
+                remediation_id: claim.remediation_id,
+                owner: "update-safe-point-test".into(),
+                claim_epoch: claim.claim_epoch,
+                binding_id: claim.binding_id,
+                resource_generation: claim.resource_generation,
+            };
+            current = claim.objective;
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::TechnicalFailure {
+                    domain: RecoveryDomain::Update,
+                    failure_code: UPDATE_SAFE_POINT_PENDING.into(),
+                    failure_signature: signature.into(),
+                    next_observation_at: Utc::now().timestamp_millis() - 1,
+                    resume_cursor: None,
+                },
+            )
+            .unwrap();
+            current = store
+                .apply_claimed_decision(current.revision, decision, &permit)
+                .await
+                .unwrap();
+            assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+            assert!(!current.requires_user_action);
+        }
     }
 
     /// Permission authorization writes its remediation directly, with no

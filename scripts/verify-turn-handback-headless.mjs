@@ -115,6 +115,16 @@ async function main() {
       !(await handedBack.textContent() ?? "").includes("technical_recovery_exhausted"),
       "the internal reason code must never reach the screen",
     );
+    assert(
+      (await handedBack.getByRole("button", { name: "发送" }).count()) === 1
+        && (await handedBack.getByRole("button", { name: "停止后续生成" }).count()) === 0,
+      "handback must restore the real composer to Send instead of Stop",
+    );
+    assert(
+      (await handedBack.getByLabel("已阻断").count()) === 1
+        && !(await handedBack.textContent() ?? "").includes("等待远端"),
+      "the waiting tool must remain visible as blocked without a live clock",
+    );
 
     const runningBanner = running.getByTestId("turn-progress");
     await runningBanner.waitFor({ timeout: 10_000 });
@@ -130,8 +140,40 @@ async function main() {
       (await runningBanner.textContent() ?? "").includes("命令已连续运行约 3 分钟"),
       "a running turn must keep its human waiting reason",
     );
+    assert(
+      await running.getByRole("button", { name: "停止后续生成" }).isVisible(),
+      "the running control panel must keep the real Stop control",
+    );
+    const inlineStatus = running.getByTestId("inline-turn-status");
+    assert(
+      (await inlineStatus.count()) === 1
+        && /^(Thinking|执行中|等待中|整理结果) · \d{2}:\d{2}$/.test((await inlineStatus.textContent() ?? "").trim()),
+      "a running turn must render exactly one compact icon/status/clock receipt",
+    );
+    assert(
+      (await handedBack.getByTestId("inline-turn-status").count()) === 0,
+      "the inline running receipt must disappear after handback",
+    );
+    assert(
+      !(await running.textContent() ?? "").includes("正在处理")
+        && !(await running.textContent() ?? "").includes("运行中 ·"),
+      "the body must not keep either legacy running indicator",
+    );
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    assert(
+      await inlineStatus.locator("svg").evaluate((icon) => getComputedStyle(icon).animationName) === "none",
+      "the inline activity icon must stop animating when reduced motion is requested",
+    );
+    await page.emulateMedia({ reducedMotion: "no-preference" });
 
-    await page.screenshot({ path: path.join(artifactDir, "turn-handback.png"), fullPage: true });
+    await page.screenshot({ path: path.join(artifactDir, "turn-handback-wide.png"), fullPage: true });
+    await page.setViewportSize({ width: 430, height: 780 });
+    await inlineStatus.scrollIntoViewIfNeeded();
+    assert(
+      await inlineStatus.isVisible(),
+      "the compact running receipt must remain visible in a narrow viewport",
+    );
+    await page.screenshot({ path: path.join(artifactDir, "turn-handback-narrow.png"), fullPage: true });
     console.log(JSON.stringify({
       status: "pass",
       artifactDir,
@@ -139,7 +181,12 @@ async function main() {
         handedBackTurnRetiresTheBanner: true,
         handedBackTurnQuotesNoRemainingTime: true,
         internalReasonCodeNeverRendered: true,
+        composerReturnsToSend: true,
+        waitingToolBecomesBlocked: true,
         runningTurnKeepsItsBanner: true,
+        runningTurnKeepsOneInlineReceipt: true,
+        inlineReceiptFitsNarrowViewport: true,
+        reducedMotionStopsInlineIcon: true,
       },
     }, null, 2));
   } finally {

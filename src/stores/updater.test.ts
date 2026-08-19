@@ -34,7 +34,7 @@ function idleSafety(overrides: Partial<UpdateSafetyStatus> = {}): UpdateSafetySt
     active_chat_turns: 0,
     active_task_schedulers: 0,
     active_delivery_leases: 0,
-    nonterminal_objectives: 0,
+    active_objective_leases: 0,
     objective_blocker_owners: [],
     pending_permissions: 0,
     managed_browser_sessions: 0,
@@ -63,17 +63,17 @@ describe("updater safe restart gate", () => {
     });
   });
 
-  it("counts durable Objective blockers and exposes their recovery owners", () => {
+  it("counts active Objective leases and exposes their recovery owners", () => {
     const safety = idleSafety({
       safe_to_restart: false,
       restart_reserved: false,
-      nonterminal_objectives: 2,
-      objective_blocker_owners: ["objective-supervisor:chat", "core-input:user"],
+      active_objective_leases: 2,
+      objective_blocker_owners: ["objective-supervisor:chat", "objective-supervisor:provider"],
     });
 
     expect(countUpdateBlockers(safety)).toBe(2);
     expect(describeUpdateObjectiveBlockers(safety)).toBe(
-      "2 个目标仍由 objective-supervisor:chat、core-input:user 持有",
+      "2 个目标仍由 objective-supervisor:chat、objective-supervisor:provider 持有",
     );
   });
 

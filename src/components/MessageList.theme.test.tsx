@@ -79,7 +79,7 @@ describe("MessageList theme readability", () => {
     );
   });
 
-  it("uses Chinese processing copy instead of an English thinking hint", () => {
+  it("uses one compact Thinking status instead of separate processing copy", () => {
     render(
       <MessageList
         messages={[baseMsg({ content: "", toolCalls: [] })]}
@@ -88,8 +88,8 @@ describe("MessageList theme readability", () => {
       />,
     );
 
-    expect(screen.getByText("正在处理")).toBeInTheDocument();
-    expect(screen.queryByText("Thinking")).not.toBeInTheDocument();
+    expect(screen.getByTestId("inline-turn-status")).toHaveTextContent("Thinking ·");
+    expect(screen.queryByText("正在处理")).not.toBeInTheDocument();
   });
 
   it("shows model transport retries as a quiet expandable assistant status", () => {
@@ -118,7 +118,8 @@ describe("MessageList theme readability", () => {
     expect(summary.closest("details")).toBeTruthy();
     expect(summary.closest("details")?.className).not.toMatch(/\bborder\b|\bbg-/);
     expect(screen.getByText(/HTTP 503 Service Unavailable/)).toBeTruthy();
-    expect(screen.queryByText(/Thinking/)).toBeNull();
+    expect(screen.getAllByTestId("inline-turn-status")).toHaveLength(1);
+    expect(screen.getByTestId("inline-turn-status")).toHaveTextContent("Thinking ·");
   });
 
   it("renders GFM tables as HTML table elements, not raw pipe text", () => {
@@ -226,7 +227,7 @@ describe("MessageList theme readability", () => {
     expect(
       screen.getByText("Checking the workspace.").closest("[data-segment='step']"),
     ).toHaveClass("text-reading");
-    expect(screen.getByText(/运行中/)).toHaveClass("text-caption");
+    expect(screen.getByTestId("inline-turn-status")).toHaveClass("text-caption");
   });
 
   it("renders markdown image links as visible image previews", () => {

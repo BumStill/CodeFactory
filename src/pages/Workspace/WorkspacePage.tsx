@@ -218,21 +218,35 @@ export function WorkspacePage({
   // Steering covers both in-flight surfaces: a streaming chat turn and an
   // autonomous task run. Same keystroke, same meaning, same queue — which of
   // the two happens to be running is the framework's business, not the user's.
-  const steerActive = activeDraft ? false : streaming || persistedRunActive;
+  const latestUserIndex = messages.reduce(
+    (latest, message, index) => (message.role === "user" ? index : latest),
+    -1,
+  );
+  const currentTurnObjectiveStatus = [...messages]
+    .slice(latestUserIndex + 1)
+    .reverse()
+    .find((message) => message.turnActivity?.objectiveStatus)
+    ?.turnActivity?.objectiveStatus;
+  const currentTurnWasReleased = Boolean(
+    currentTurnObjectiveStatus && !systemOwnsObjective(currentTurnObjectiveStatus),
+  );
+  const steerActive = activeDraft
+    ? false
+    : !currentTurnWasReleased && (streaming || persistedRunActive);
   // A turn the system still owns is exactly the state a user could not escape:
   // once streaming stopped the composer went back to "发送", so system-owned
   // recovery kept the turn alive with no way to end it — across restarts too.
   // Same predicate the progress banner uses to decide it is still working.
   const systemHoldsTurn = useMemo(
     () =>
-      messages.some((message) =>
+      messages.slice(latestUserIndex + 1).some((message) =>
         systemOwnsObjective(message.turnActivity?.objectiveStatus),
       ),
-    [messages],
+    [latestUserIndex, messages],
   );
   const turnInFlight = activeDraft
     ? false
-    : streaming || durableTurnActive || systemHoldsTurn;
+    : !currentTurnWasReleased && (streaming || durableTurnActive || systemHoldsTurn);
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
     if (!trimmed || activeDraft) return;
@@ -831,6 +845,7 @@ export function WorkspacePage({
           <MessageList
             messages={messages}
             streaming={streaming}
+            turnActive={turnInFlight}
             cwd={activeCwd}
             conversationKey={activeSession?.id ?? activeDraft?.id ?? sessionId}
             hasOlderHistory={hasOlderHistory}

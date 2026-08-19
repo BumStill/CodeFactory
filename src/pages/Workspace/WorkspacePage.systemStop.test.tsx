@@ -102,7 +102,11 @@ vi.mock("../../components/ReasoningEffortPicker", () => ({ ReasoningEffortPicker
 vi.mock("../../components/GitStatusBar", () => ({ GitStatusBar: () => null }));
 vi.mock("../../components/CheckpointsPanel", () => ({ CheckpointsPanel: () => null }));
 vi.mock("../../components/ExecutionStream", () => ({ ExecutionStream: () => null }));
-vi.mock("../../components/MessageList", () => ({ MessageList: () => <div>会话</div> }));
+vi.mock("../../components/MessageList", () => ({
+  MessageList: ({ turnActive }: { turnActive?: boolean }) => (
+    <div data-testid="body-turn-state">{turnActive ? "正文运行中" : "正文空闲"}</div>
+  ),
+}));
 vi.mock("../../components/MessageInput", () => ({
   // Surface the prop that decides whether the composer offers stop or send.
   MessageInput: ({ streaming, onCancel }: { streaming: boolean; onCancel: () => void }) => (
@@ -167,6 +171,15 @@ describe("system-owned turns stay stoppable", () => {
     }
   });
 
+  it("returns to send when recovery hands back even if a stale stream flag remains true", () => {
+    runtime.streaming = true;
+    runtime.messages = [assistantMessage("waiting_core_input")];
+
+    renderWorkspace();
+
+    expect(screen.getByTestId("composer-mode")).toHaveTextContent("发送");
+  });
+
   it("returns to send for a turn that never carried objective activity", () => {
     runtime.streaming = false;
     runtime.messages = [assistantMessage(undefined)];
@@ -186,6 +199,7 @@ describe("system-owned turns stay stoppable", () => {
     await waitFor(() =>
       expect(screen.getByTestId("composer-mode")).toHaveTextContent("停止后续生成"),
     );
+    expect(screen.getByTestId("body-turn-state")).toHaveTextContent("正文运行中");
   });
 
   it("targets the rendered session explicitly when stop is clicked", async () => {

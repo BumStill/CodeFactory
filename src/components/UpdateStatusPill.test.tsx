@@ -44,13 +44,13 @@ describe("UpdateStatusPill", () => {
     expect(pill.getAttribute("title")).not.toMatch(/重试|继续执行|回到对话/);
   });
 
-  it("shows the durable Objective blocker count and recovery owner", () => {
+  it("shows the active Objective lease count without claiming the package is downloaded", () => {
     mocks.state = {
       phase: {
         kind: "waiting_for_safe_restart",
         update: { version: "1.79.1" },
         blockers: {
-          nonterminal_objectives: 2,
+          active_objective_leases: 2,
           objective_blocker_owners: ["objective-supervisor:chat"],
         },
         safetyCheckError: null,
@@ -67,10 +67,13 @@ describe("UpdateStatusPill", () => {
 
     render(<UpdateStatusPill />);
 
-    expect(screen.getByText("等待安全更新 · 2")).toHaveAttribute(
+    const pill = screen.getByText("等待安全更新 · 2");
+    expect(pill).toHaveAttribute(
       "title",
       expect.stringContaining("2 个目标仍由 objective-supervisor:chat 持有"),
     );
+    expect(pill.getAttribute("title")).toContain("自动下载、安装并重启");
+    expect(pill.getAttribute("title")).not.toContain("已下载");
   });
 
   it("describes an unknown install as observe-only instead of promising replay", () => {

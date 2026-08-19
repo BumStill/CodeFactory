@@ -434,6 +434,19 @@ fn bash_segment_is_read_only(segment: &str) -> bool {
     })
 }
 
+fn bash_segment_is_strict_mode_prelude(segment: &str) -> bool {
+    matches!(
+        segment.trim().to_ascii_lowercase().as_str(),
+        "set -e"
+            | "set -u"
+            | "set -eu"
+            | "set -ue"
+            | "set -o pipefail"
+            | "set -euo pipefail"
+            | "set -ueo pipefail"
+    )
+}
+
 /// Agents routinely probe a repository with compound read-only pipelines such
 /// as `cd repo && ls src 2>/dev/null | head -50`. Rejecting every command that
 /// merely contains `&`, `>` or `;` pushed those probes into the mutation
@@ -452,9 +465,10 @@ fn bash_is_explicit_read_only(command: &str) -> bool {
     }
     let segments = split_shell_segments(&normalized);
     !segments.is_empty()
-        && segments
-            .iter()
-            .all(|segment| bash_segment_is_read_only(segment))
+        && segments.iter().enumerate().all(|(index, segment)| {
+            bash_segment_is_read_only(segment)
+                || (index == 0 && bash_segment_is_strict_mode_prelude(segment))
+        })
 }
 
 /// Completion evidence and durable side-effect admission answer different
@@ -489,6 +503,11 @@ fn native_requires_mutation_receipt(
         ),
         "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" | "read_pptx"
         | "skill_list" | "skill_search" | "read_xlsx" => false,
+        // update_plan mutates only CodeFactory's transactional control-plane
+        // projection. A rejected schema/plan revision is known not-applied;
+        // treating it as an unobservable external effect creates a false
+        // `unknown` receipt that poisons every later tool in the Objective.
+        "update_plan" => false,
         _ => true,
     }
 }
@@ -2422,6 +2441,7 @@ mod tests {
     fn compound_read_only_pipelines_never_demand_an_observation_contract() {
         for command in [
             "cd /repo && ls src",
+            "set -euo pipefail; cd /repo; git diff --check; git status --short",
             "cd /repo && ls src && echo \"---\" && ls src/components 2>/dev/null | head -50",
             "ls src 2>/dev/null | head -50",
             "git status; git diff",
@@ -2434,6 +2454,105 @@ mod tests {
                 "{command} only reads and must not be fenced behind a receipt"
             );
         }
+    }
+
+    #[test]
+    fn update_plan_is_transactional_control_state_not_an_external_side_effect() {
+        let args = serde_json::json!({
+            "steps": [
+                {"id":"inspect","title":"Inspect","kind":"analysis","status":"completed"},
+                {"id":"verify","title":"Verify","kind":"verification","status":"in_progress"}
+            ]
+        });
+        assert!(
+            !native_requires_mutation_receipt("update_plan", &args, &ToolKind::Mutation),
+            "a rejected plan validation must not create an unknown external-side-effect receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_plan_revision_never_poison_receipts_or_the_next_tool() {
+        let backend = objective_backend(false).await;
+        sqlx::query(
+            "CREATE TABLE chat_plan_events (
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               root_turn_id TEXT NOT NULL, revision INTEGER NOT NULL,
+               plan_json TEXT NOT NULL, explanation TEXT,
+               waiting_reason TEXT, next_action_owner TEXT NOT NULL,
+               change_reason TEXT, created_at INTEGER NOT NULL
+             )",
+        )
+        .execute(&backend.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_plan_events
+             (id, session_id, root_turn_id, revision, plan_json,
+              next_action_owner, created_at)
+             VALUES ('plan-1', ?, ?, 1, ?, 'system', ?)",
+        )
+        .bind(TEST_SESSION_ID)
+        .bind(TEST_ROOT_TURN_ID)
+        .bind(serde_json::json!([
+            {"id":"inspect","title":"Inspect","kind":"analysis","status":"in_progress","external_job_id":null},
+            {"id":"verify","title":"Verify","kind":"verification","status":"pending","external_job_id":null}
+        ]).to_string())
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&backend.db)
+        .await
+        .unwrap();
+
+        let args = serde_json::json!({
+            "steps": [
+                {"id":"inspect","title":"Inspect","kind":"analysis","status":"completed"},
+                {"id":"deliver","title":"Deliver","kind":"delivery","status":"in_progress"}
+            ]
+        });
+        let call = call_with_args("invalid-plan-revision", "update_plan", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let output = backend
+            .execute(&call, &args, &objective_ctx(std::path::Path::new(".")))
+            .await
+            .expect("plan rejection is a normal tool result");
+        assert!(output.is_error);
+        assert!(output.content.contains("change_reason is required"));
+
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM side_effect_receipts WHERE objective_id=?",
+        )
+        .bind(TEST_OBJECTIVE_ID)
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        let plan_revisions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_plan_events WHERE session_id=? AND root_turn_id=?",
+        )
+        .bind(TEST_SESSION_ID)
+        .bind(TEST_ROOT_TURN_ID)
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        let side_effect_started: i64 =
+            sqlx::query_scalar("SELECT side_effect_started FROM objectives WHERE id=?")
+                .bind(TEST_OBJECTIVE_ID)
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(receipts, 0);
+        assert_eq!(plan_revisions, 1);
+        assert_eq!(side_effect_started, 0);
+
+        let audit_args = serde_json::json!({
+            "command": "set -euo pipefail; git diff --check; git status --short"
+        });
+        let audit_call = call_with_args("read-only-after-invalid-plan", "bash", &audit_args);
+        register_tool_call(&backend, &audit_call, &audit_args).await;
+        let audit = backend
+            .execute(&audit_call, &audit_args, &objective_ctx(std::path::Path::new(".")))
+            .await
+            .expect("read-only audit dispatches after a rejected plan");
+        assert_eq!(audit.status, ToolExecutionStatus::Done);
+        assert!(!audit.content.contains("external_state_uncertain"));
     }
 
     /// Widening the whitelist to pipelines must not widen it to writers: one

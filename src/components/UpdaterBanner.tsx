@@ -112,7 +112,7 @@ export function UpdaterBanner() {
               {phase.blockers?.update_install_state === "still_unknown" ||
               phase.blockers?.update_install_state === "observe_only"
                 ? "正在核对上次安装结果…"
-                : "更新已下载，等待执行中的 session 到达安全点…"}
+                : "更新已排队，正在等待安全安装…"}
             </span>
           </div>
           {phase.blockers?.update_install_state === "still_unknown" ||
@@ -122,7 +122,7 @@ export function UpdaterBanner() {
             </p>
           ) : (
             <p className="text-caption text-gray-500">
-              当前 {countUpdateBlockers(phase.blockers)} 项本地工作仍在运行；归零后会自动安装，无需再次操作。
+              当前 {countUpdateBlockers(phase.blockers)} 项本地执行仍在运行；结束后会自动下载、安装并重启。
             </p>
           )}
           {describeUpdateObjectiveBlockers(phase.blockers) && (
