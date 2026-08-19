@@ -3195,6 +3195,66 @@ mod tests {
         }
     }
 
+    /// Admission is not execution. The gate tests above stop at
+    /// `mutation_preflight`, so on their own they would still hold if dispatch
+    /// went on to fail — and "the gate opened" is not the thing that was broken
+    /// for the user, "the file never arrived" is. This drives the whole path:
+    /// classify → admit → run the real shell → observe the file → commit the
+    /// receipt.
+    ///
+    /// `file://` keeps it hermetic. The point under test is the receipt path,
+    /// not HTTP, and a network fetch would make the case flaky for a reason
+    /// that has nothing to do with what broke.
+    #[tokio::test]
+    async fn a_download_actually_lands_its_file_and_commits_the_receipt() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("payload.txt");
+        std::fs::write(&source, b"agentcenter installer").unwrap();
+        // A `file://` URL wants forward slashes on every platform.
+        let url = format!("file:///{}", source.display().to_string().replace('\\', "/").trim_start_matches('/'));
+        // Windows runs commands through PowerShell, where `curl` is an alias
+        // for `Invoke-WebRequest` and would reject curl's own flags.
+        let command = if cfg!(windows) {
+            format!("Invoke-WebRequest -Uri {url} -OutFile fetched.txt")
+        } else {
+            format!("curl -fsSL {url} -o fetched.txt")
+        };
+
+        let args = serde_json::json!({"command": command});
+        let call = call_with_args("bash-download-e2e", "bash", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let out = backend
+            .execute(&call, &args, &objective_ctx(dir.path()))
+            .await
+            .expect("a download must not be fatal");
+
+        assert_eq!(
+            out.status,
+            ToolExecutionStatus::Done,
+            "download did not run: {}",
+            out.content
+        );
+        assert!(!out.is_error, "download reported an error: {}", out.content);
+        assert_eq!(
+            std::fs::read(dir.path().join("fetched.txt")).unwrap(),
+            b"agentcenter installer",
+            "the file the observation contract names must actually exist"
+        );
+
+        let (kind, state): (String, String) = sqlx::query_as(
+            "SELECT resource_kind, state FROM tool_recovery_contracts LIMIT 1",
+        )
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(kind, "workspace_file");
+        assert_eq!(
+            state, "settled_committed",
+            "a landed download must settle its receipt, not linger as unknown"
+        );
+    }
+
     /// A verb that merely looks like a read-only one is still not read-only:
     /// `lsmalware` must never be admitted through the `ls` prefix. What it does
     /// earn is an observer — the workspace digest — because an unfamiliar local
