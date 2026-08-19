@@ -1435,9 +1435,9 @@ pub async fn run_agent_loop(
                         events.as_ref(),
                         root_turn_id.as_deref(),
                         "finalizing",
-                        "completed",
-                        "completed",
-                        "任务已完成",
+                        "finalizing",
+                        "completion_candidate",
+                        "正在核对完成证据",
                         None,
                         None,
                     )
@@ -4021,6 +4021,21 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, StreamEvent::Done { .. })));
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated {
+                status,
+                recent_activity_kind,
+                ..
+            } if status == "finalizing" && recent_activity_kind == "completion_candidate"
+        )));
+        assert!(
+            !events.events().iter().any(|event| matches!(
+                event,
+                StreamEvent::TurnActivityUpdated { status, .. } if status == "completed"
+            )),
+            "the outer Objective arbiter is the only completed authority"
+        );
     }
 
     #[tokio::test]

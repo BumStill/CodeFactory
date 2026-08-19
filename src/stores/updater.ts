@@ -9,6 +9,7 @@
 import { create } from "zustand";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
 
 const POLL_INTERVAL_MS = 30 * 60 * 1000; // 30 min — light on the GitHub CDN, fresh enough for users
@@ -55,6 +56,14 @@ export interface UpdateInstallObservation {
   observed_at: number;
 }
 
+interface UpdateInstallProgress {
+  target_version: string;
+  target_build: string;
+  phase: "downloading" | "installing";
+  received: number;
+  total: number | null;
+}
+
 export function countUpdateBlockers(status: UpdateSafetyStatus | null): number {
   if (!status) return 1;
   return status.active_chat_turns
@@ -85,7 +94,7 @@ export type UpdaterPhase =
   | { kind: "checking" }
   | { kind: "up_to_date"; checkedAt: number }
   | { kind: "available"; update: Update; checkedAt: number }
-  | { kind: "downloading"; received: number; total: number | null }
+  | { kind: "downloading"; update: Update; received: number; total: number | null }
   | {
       kind: "waiting_for_safe_restart";
       update: Update;
@@ -93,7 +102,7 @@ export type UpdaterPhase =
       safetyCheckError: string | null;
       checkedAt: number;
     }
-  | { kind: "installing" }
+  | { kind: "installing"; update: Update }
   | { kind: "ready" }
   | { kind: "error"; message: string; checkedAt: number };
 
@@ -102,6 +111,7 @@ interface UpdaterStore {
   currentVersion: string | null;
   pollHandle: number | null;
   safeRetryHandle: number | null;
+  progressListening: boolean;
   dismissedVersion: string | null;        // user dismissed this version's banner; new versions still show
 
   initialize: () => Promise<void>;        // start polling, fetch current version
@@ -115,9 +125,64 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
   currentVersion: null,
   pollHandle: null,
   safeRetryHandle: null,
+  progressListening: false,
   dismissedVersion: null,
 
   initialize: async () => {
+    // Download and installation are backend-owned after the renderer queues a
+    // durable Update Objective. Subscribe before any update check so the UI
+    // cannot spend the actual package transfer claiming it is still waiting
+    // for local work to finish.
+    if (!get().progressListening) {
+      set({ progressListening: true });
+      try {
+        await listen<UpdateInstallProgress>("update-install-progress", (event) => {
+          const progress = event.payload;
+          const phase = get().phase;
+          const update =
+            phase.kind === "available" ||
+            phase.kind === "waiting_for_safe_restart" ||
+            phase.kind === "downloading" ||
+            phase.kind === "installing"
+              ? phase.update
+              : null;
+          if (
+            !update ||
+            update.version !== progress.target_version ||
+            targetBuildIdentity(update) !== progress.target_build
+          ) {
+            return;
+          }
+          if (phase.kind === "installing" && progress.phase === "downloading") {
+            return;
+          }
+          const retryHandle = get().safeRetryHandle;
+          if (retryHandle !== null) window.clearTimeout(retryHandle);
+          if (progress.phase === "installing") {
+            set({
+              safeRetryHandle: null,
+              phase: { kind: "installing", update },
+            });
+            return;
+          }
+          const previousReceived = phase.kind === "downloading" ? phase.received : 0;
+          const previousTotal = phase.kind === "downloading" ? phase.total : null;
+          set({
+            safeRetryHandle: null,
+            phase: {
+              kind: "downloading",
+              update,
+              received: Math.max(previousReceived, progress.received),
+              total: progress.total ?? previousTotal,
+            },
+          });
+        });
+      } catch (error) {
+        set({ progressListening: false });
+        console.warn("[updater] progress listener failed:", error);
+      }
+    }
+
     // Resolve current installed version once.
     try {
       const v = await getVersion();
@@ -213,6 +278,17 @@ export const useUpdaterStore = create<UpdaterStore>((set, get) => ({
         // Unknown safety is unsafe. Keep retrying locally instead of asking the
         // user to click install again or risking an in-flight session.
         safetyCheckError = error instanceof Error ? error.message : String(error);
+      }
+
+      // The backend may have acquired its exact mutation permit and started
+      // transferring the package while this renderer observation was in
+      // flight. Never overwrite that newer phase with another queued snapshot.
+      if (
+        get().phase.kind === "downloading" ||
+        get().phase.kind === "installing" ||
+        get().phase.kind === "ready"
+      ) {
+        return;
       }
 
       if (safety?.update_install_state === "applied") {

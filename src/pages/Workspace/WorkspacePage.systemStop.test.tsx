@@ -8,7 +8,14 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 type TurnActivity = { objectiveStatus?: string };
-type RuntimeMessage = { id: string; role: string; content: string; createdAt: number; turnActivity?: TurnActivity };
+type RuntimeMessage = {
+  id: string;
+  role: string;
+  content: string;
+  createdAt: number;
+  turnSettledAt?: number;
+  turnActivity?: TurnActivity;
+};
 
 const runtime: {
   messages: RuntimeMessage[];
@@ -212,6 +219,24 @@ describe("system-owned turns stay stoppable", () => {
     );
     expect(screen.getByTestId("body-turn-state")).toHaveTextContent("正文运行中");
     expect(screen.getByTestId("body-turn-execution")).toHaveTextContent("正文执行中");
+  });
+
+  it("does not revive a turn with a durable completed receipt after restart", async () => {
+    runtime.streaming = false;
+    runtime.messages = [{
+      ...assistantMessage(undefined),
+      turnSettledAt: 10,
+    }];
+    invokeMock.mockResolvedValueOnce(true);
+
+    renderWorkspace();
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("is_chat_running", {
+      sessionId: "session-1",
+    }));
+    expect(screen.getByTestId("composer-mode")).toHaveTextContent("发送");
+    expect(screen.getByTestId("body-turn-state")).toHaveTextContent("正文空闲");
+    expect(screen.getByTestId("body-turn-execution")).toHaveTextContent("正文未执行");
   });
 
   it("targets the rendered session explicitly when stop is clicked", async () => {

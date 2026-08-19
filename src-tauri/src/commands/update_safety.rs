@@ -1063,6 +1063,11 @@ pub(crate) async fn reserve_update_install_inner(
     } else {
         None
     };
+    // The Objective supervisor takes this same gate around claim admission.
+    // Once this guard is held, its already-admitted work is visible through
+    // durable leases, and no new remediation can slip between our safety
+    // snapshot and the restart reservation bit.
+    let _restart_admission = state.update_restart_admission.lock().await;
     // Hold every admission map until the reservation bit is set. Each producer
     // rechecks that bit while holding its own map, closing the check/install
     // race instead of relying on a best-effort snapshot.

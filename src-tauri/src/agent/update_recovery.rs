@@ -8,7 +8,11 @@
 
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
-use tauri::{AppHandle, Manager};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 use uuid::Uuid;
 
@@ -30,6 +34,38 @@ use crate::AppState;
 
 const UPDATE_TARGET_RESOURCE_KIND: &str = "app_update_target";
 const SAFE_POINT_REOBSERVE_MS: i64 = 5_000;
+const UPDATE_INSTALL_PROGRESS_EVENT: &str = "update-install-progress";
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct UpdateInstallProgressEvent<'a> {
+    target_version: &'a str,
+    target_build: &'a str,
+    phase: &'a str,
+    received: u64,
+    total: Option<u64>,
+}
+
+fn emit_update_install_progress(
+    app: &AppHandle,
+    target_version: &str,
+    target_build: &str,
+    phase: &str,
+    received: u64,
+    total: Option<u64>,
+) {
+    if let Err(error) = app.emit(
+        UPDATE_INSTALL_PROGRESS_EVENT,
+        UpdateInstallProgressEvent {
+            target_version,
+            target_build,
+            phase,
+            received,
+            total,
+        },
+    ) {
+        tracing::debug!(%error, phase, "could not project updater progress");
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaimedUpdateTarget {
@@ -349,7 +385,38 @@ pub(crate) async fn resume_update_objective(
             Ok(())
         }
         UpdateInstallState::InstallPermitted => {
-            let bytes = match update.download(|_, _| {}, || {}).await {
+            emit_update_install_progress(
+                &app,
+                &target.version,
+                &target.build,
+                "downloading",
+                0,
+                None,
+            );
+            let received = Arc::new(AtomicU64::new(0));
+            let progress_app = app.clone();
+            let progress_version = target.version.clone();
+            let progress_build = target.build.clone();
+            let progress_received = received.clone();
+            let bytes = match update
+                .download(
+                    move |chunk_length, content_length| {
+                        let cumulative = progress_received
+                            .fetch_add(chunk_length as u64, Ordering::Relaxed)
+                            + chunk_length as u64;
+                        emit_update_install_progress(
+                            &progress_app,
+                            &progress_version,
+                            &progress_build,
+                            "downloading",
+                            cumulative,
+                            content_length,
+                        );
+                    },
+                    || {},
+                )
+                .await
+            {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     mark_update_install_unknown(&pool, &receipt.id).await?;
@@ -368,6 +435,14 @@ pub(crate) async fn resume_update_objective(
                     "update mutation permit became stale before install; package discarded".into(),
                 ));
             }
+            emit_update_install_progress(
+                &app,
+                &target.version,
+                &target.build,
+                "installing",
+                received.load(Ordering::Relaxed),
+                None,
+            );
             if let Err(error) = update.install(bytes) {
                 mark_update_install_unknown(&pool, &receipt.id).await?;
                 release_update_install_reservation_inner(state.inner());

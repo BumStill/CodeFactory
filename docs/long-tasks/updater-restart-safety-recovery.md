@@ -5,7 +5,7 @@
 - Task ID: CF-UPDATER-SAFETY-20260818
 - Title: 无活跃会话时更新仍被 durable wait 永久阻塞
 - Feature spec: `docs/specs/feature-specs/durable-delivery-recovery.md`
-- Related Req IDs: CF-DR-R14、CF-DR-R15、CF-DR-R16、CF-DR-R17
+- Related Req IDs: CF-DR-R14、CF-DR-R15、CF-DR-R16、CF-DR-R17、CF-DR-R18、CF-DR-R19、CF-DR-R20
 
 ## Completion Standard
 
@@ -15,9 +15,9 @@
 ## Current State
 
 - Current phase: PR/CI/Release 交付准备
-- Current checkpoint: 完整前端/Rust/build/治理门禁与 CodeFactoryDev 成功、边界 UI 路径均已通过
-- Next owner: 开发完成分支同步与 PR，QA/CI 独立验收后进入 merge/release
-- Updated at: 2026-08-18
+- Current checkpoint: 失败优先回归、完整前端/Rust 套件、生产 build、治理门禁与差异审计全部通过；Windows 签名 updater 真实路径待 release 资产
+- Next owner: 开发提交 PR，QA/CI 独立验收后进入 merge/release
+- Updated at: 2026-08-19
 
 ## Completed Items
 
@@ -28,10 +28,13 @@
 - 增加同 target rearm 与新 target auditable supersede 兼容路径，不修改生产 DB。
 - 前端完整测试 628 项、Rust fast suite 1115 项（另 7 项按既有配置 ignored）、provider/no-window suites、生产构建与治理门禁全部通过。
 - CodeFactoryDev 真实界面验证普通安全等待与 `observe_only` 边界文案；wrapper 日志确认运行本 worktree，验证后已退出并恢复主 checkout 指针。
+- 2026-08-19 Windows 反馈证实两个新缺口：backend 实际下载/安装时 renderer 仍显示“已排队/0 项运行”；更新重启夹在 Objective 终态与 task/turn 投影之间时，启动恢复会把完成项短暂重置为等待。
+- 已实现 backend 字节进度事件、零 blocker 真实文案、Update/Objective claim 共享入场门、journal/task completion 同事务、终态 Objective 启动自愈、`plan_resume` 终态保护与迟到 Chat 投影 CAS。
+- 新增回归均先证明旧逻辑失败，再转绿；前端 115 个文件/662 项、Rust 主库 1128 项（另 7 项 ignored）、no-window 2 项、provider recovery 13 项、生产 build、治理基线与 `git diff --check` 全部通过。
 
 ## Remaining Items
 
-- PR、CI、merge、刻意发版、公开资产与固定版安装验证。
+- PR、CI、merge、刻意发版、公开资产与 Windows 固定版安装验证。
 - 在后续真实版本存在时完成由固定版控制的 N→N+1 自动更新闭环。
 
 ## Blockers
@@ -40,7 +43,7 @@
 
 ## Evidence
 
-- Local evidence: 新增 Rust failure-first/兼容测试由红转绿；前端 114 个文件 628 项、Rust fast suite 1115 项、no-window/provider recovery suites、`pnpm build`、long-task validator、governance baseline 与 `git diff --check` 全部通过；正式 DB 仅使用 read-only/query-only 聚合。
+- Local evidence: 新增 failure-first/兼容测试由红转绿；本轮前端 115 个文件 662 项、Rust 主库 1128 项（另 7 项 ignored）、no-window 2 项、provider recovery 13 项、`pnpm build`、governance baseline 与 `git diff --check` 全部通过；正式 DB 仅使用 read-only/query-only 聚合。
 - UI evidence: CodeFactoryDev 普通等待显示“更新已排队，正在等待安全安装”，并明确结束后才下载/安装/重启；`observe_only` 显示仅核对上次安装结果且不会重放未知结果。
 - Release evidence: 待 PR/CI/merge/release 后补齐。
 - Blocking evidence: Dev 模式明确跳过 updater，不能替代签名发布版的自动更新证据。
@@ -50,7 +53,7 @@
 - context scope: update safety、Objective/remediation、Update adapter、updater store 与状态 UI；不读取聊天正文。
 - assumptions: 无 live runtime owner 且无未过期租约的 durable wait 可安全跨重启；unknown receipt 继续 fail closed。
 - review point: 独立规划与 QA 均确认仅过滤 blocker 不足，必须同时恢复历史 exhausted update Objective。
-- validation result: 完整本地测试、构建、治理与真实 Dev UI 验收已通过；CI、release artifact、固定版安装与后续 N→N+1 live 验收待完成。
+- validation result: 完整本地测试、构建、治理验收已通过；Dev 模式明确跳过 updater，无法伪造 Windows 签名更新的实机证据；CI、release artifact、固定版安装与后续 N→N+1 live 验收待完成。
 
 ## Stop Boundary
 

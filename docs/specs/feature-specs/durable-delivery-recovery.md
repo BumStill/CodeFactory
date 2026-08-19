@@ -27,6 +27,9 @@
 | CF-DR-R15 | 等待更新安全点是非失败 observation：重复观察不得消耗 technical recovery budget、不得进入 `technical_recovery_exhausted`；真正的 manifest、网络、签名、receipt 或安装错误仍使用有界恢复 | Objective remediation strategy、Update adapter | 超过恢复上限的安全点轮询 + 真实错误预算测试 |
 | CF-DR-R16 | 历史 `domain=update + waiting_core_input + technical_recovery_exhausted` 必须兼容恢复：同一 target 保留 Objective identity 并递增 recovery generation；新 target 到来时旧目标以可审计 `legacy_orphan/update_target_superseded` 结算后新建目标。不得伪造 applied receipt、重放 unknown receipt 或直接修改生产 DB | update objective admission、decision/event audit | 历史状态 SQLite 集成 + exact/new target tests |
 | CF-DR-R17 | 更新 UI 必须陈述真实阶段：取得 mutation permit 前只能称“已排队”，不得称“已下载”；只展示实际 live blocker owner，归零后说明将自动下载、安装并重启 | updater store、banner、settings、status pill | copy/component tests + real App |
+| CF-DR-R18 | 下载和安装由 backend 持有的精确 target permit 执行时，必须向 renderer 投影真实阶段与单调字节进度；迟到的“已排队”快照不得覆盖 `downloading/installing`，丢失事件时仍由持久 receipt fail closed | Update adapter、Tauri event、updater store、进度 UI | backend callback + renderer race test + signed updater |
+| CF-DR-R19 | 更新重启预留必须与所有新工作入场串行化，包括不在 chat/task runtime map 中的 Objective remediation claim；预留期间非 Update domain `claim_count=0`，释放后才可继续 | AppState admission gate、Objective supervisor、update safety | 真实 SQLite claim gate + active-owner safety test |
+| CF-DR-R20 | Objective 终态必须单调：更新/崩溃发生在 Objective 完成与 turn/task 投影落盘之间时，启动恢复必须以终态 Objective 或 durable done journal 修复投影，不得重置为 Pending/Waiting；旧 revision 和迟到 transport heartbeat 不得覆盖终态，journal 与 task completion 必须同事务 | Completion Arbiter、journal、startup recovery、chat projection | crash-window SQLite fixtures + stale projection CAS + signed relaunch |
 
 ## Completion predicate
 

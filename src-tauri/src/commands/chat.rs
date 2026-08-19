@@ -1056,11 +1056,16 @@ async fn project_chat_objective(
         .or(objective.request_key.as_deref())
         .or(objective.decision_key.as_deref());
     let completed_at = terminal_reason.is_some().then_some(now);
-    let revision: i64 = sqlx::query_scalar(
+    let revision: Option<i64> = sqlx::query_scalar(
         "UPDATE chat_turn_state SET revision=revision+1, phase=?, status=?,
            recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
-           updated_at=?, completed_at=?, terminal_reason=?
-         WHERE root_turn_id=? RETURNING revision",
+           updated_at=?, completed_at=?, terminal_reason=?, objective_revision=?
+         WHERE root_turn_id=? AND objective_id=?
+           AND EXISTS (
+             SELECT 1 FROM objectives current
+             WHERE current.id=? AND current.revision=? AND current.status=?
+           )
+         RETURNING revision",
     )
     .bind(phase)
     .bind(objective.status.as_str())
@@ -1070,9 +1075,23 @@ async fn project_chat_objective(
     .bind(now)
     .bind(completed_at)
     .bind(terminal_reason)
+    .bind(objective.revision)
     .bind(root_turn_id)
-    .fetch_one(db)
+    .bind(&objective.id)
+    .bind(&objective.id)
+    .bind(objective.revision)
+    .bind(objective.status.as_str())
+    .fetch_optional(db)
     .await?;
+    let Some(revision) = revision else {
+        tracing::debug!(
+            objective_id = %objective.id,
+            objective_revision = objective.revision,
+            objective_status = %objective.status.as_str(),
+            "ignored stale Chat projection after Objective advanced"
+        );
+        return Ok(());
+    };
     app.emit(
         event_name,
         StreamEvent::TurnActivityUpdated {

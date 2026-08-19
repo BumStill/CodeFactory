@@ -31,6 +31,16 @@ export function UpdaterBanner() {
     phase.kind === "waiting_for_safe_restart" ||
     phase.kind === "installing" ||
     phase.kind === "ready";
+  const observingUnknownInstall =
+    phase.kind === "waiting_for_safe_restart" &&
+    (phase.blockers?.update_install_state === "still_unknown" ||
+      phase.blockers?.update_install_state === "observe_only");
+  const startingDownload =
+    phase.kind === "waiting_for_safe_restart" &&
+    !observingUnknownInstall &&
+    !phase.safetyCheckError &&
+    phase.blockers?.update_install_state === "queued" &&
+    countUpdateBlockers(phase.blockers) === 0;
   if (!visible) return null;
 
   return (
@@ -109,16 +119,20 @@ export function UpdaterBanner() {
           <div className="flex items-center gap-2">
             <RefreshCw size={14} />
             <span>
-              {phase.blockers?.update_install_state === "still_unknown" ||
-              phase.blockers?.update_install_state === "observe_only"
+              {observingUnknownInstall
                 ? "正在核对上次安装结果…"
+                : startingDownload
+                  ? "安全检查已通过，正在启动下载…"
                 : "更新已排队，正在等待安全安装…"}
             </span>
           </div>
-          {phase.blockers?.update_install_state === "still_unknown" ||
-          phase.blockers?.update_install_state === "observe_only" ? (
+          {observingUnknownInstall ? (
             <p className="text-caption text-gray-500">
               当前仅观察目标版本与 build_git_sha，不会重复安装未知结果。
+            </p>
+          ) : startingDownload ? (
+            <p className="text-caption text-gray-500">
+              后端正在取得安装许可；下载开始后会显示实时进度。
             </p>
           ) : (
             <p className="text-caption text-gray-500">
