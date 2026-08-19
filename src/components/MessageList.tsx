@@ -459,17 +459,42 @@ export function MessageList({
     activeRootMessage?.createdAt ?? activeTurnMessage?.createdAt ?? Date.now();
   const lastAssistantIdsByUserTurn = new Set<string>();
   const turnTokenTotalsByAssistantId = new Map<string, number>();
+  const turnStartedAtByAssistantId = new Map<string, number>();
+  const userIndexById = new Map<string, number>();
+  const tokenPrefix = [0];
+  for (const [index, message] of visible.entries()) {
+    if (message.role === "user") userIndexById.set(message.id, index);
+    tokenPrefix.push(
+      tokenPrefix[index] +
+      (message.role === "assistant"
+        ? (message.inputTokens ?? 0) + (message.outputTokens ?? 0)
+        : 0),
+    );
+  }
   let pendingLastAssistantId: string | null = null;
-  let pendingTurnTokenTotal = 0;
-  for (const message of visible) {
+  let pendingUserIndex = 0;
+  for (const [index, message] of visible.entries()) {
     if (message.role === "user") {
       if (pendingLastAssistantId) lastAssistantIdsByUserTurn.add(pendingLastAssistantId);
       pendingLastAssistantId = null;
-      pendingTurnTokenTotal = 0;
+      pendingUserIndex = index;
     } else if (message.role === "assistant") {
       pendingLastAssistantId = message.id;
-      pendingTurnTokenTotal += (message.inputTokens ?? 0) + (message.outputTokens ?? 0);
-      turnTokenTotalsByAssistantId.set(message.id, pendingTurnTokenTotal);
+      const rootTurnId =
+        message.rootTurnId ??
+        message.turnActivity?.rootTurnId ??
+        message.plan?.rootTurnId;
+      const rootIndex = rootTurnId != null
+        ? (userIndexById.get(rootTurnId) ?? pendingUserIndex)
+        : pendingUserIndex;
+      turnTokenTotalsByAssistantId.set(
+        message.id,
+        tokenPrefix[index + 1] - tokenPrefix[rootIndex],
+      );
+      turnStartedAtByAssistantId.set(
+        message.id,
+        visible[rootIndex]?.createdAt ?? message.createdAt,
+      );
     }
   }
   if (pendingLastAssistantId) lastAssistantIdsByUserTurn.add(pendingLastAssistantId);
@@ -544,6 +569,7 @@ export function MessageList({
               isStreamingTail={streaming && msg.id === lastAssistantId}
               isLastAssistantInUserTurn={lastAssistantIdsByUserTurn.has(msg.id)}
               turnTokenTotal={turnTokenTotalsByAssistantId.get(msg.id) ?? 0}
+              turnStartedAt={turnStartedAtByAssistantId.get(msg.id) ?? msg.createdAt}
               onOpenDocument={onOpenDocument}
               onOpenEvidence={onOpenEvidence}
               evidenceControlsId={evidenceControlsId}
@@ -786,6 +812,7 @@ const MessageRow = memo(function MessageRow({
   isStreamingTail,
   isLastAssistantInUserTurn,
   turnTokenTotal,
+  turnStartedAt,
   onOpenDocument,
   onOpenEvidence,
   evidenceControlsId,
@@ -795,6 +822,7 @@ const MessageRow = memo(function MessageRow({
   isStreamingTail: boolean;
   isLastAssistantInUserTurn: boolean;
   turnTokenTotal: number;
+  turnStartedAt: number;
   onOpenDocument?: (path: string) => void;
   onOpenEvidence?: (messageId: string) => void;
   evidenceControlsId?: string;
@@ -973,7 +1001,7 @@ const MessageRow = memo(function MessageRow({
       ? lastTextIndex === timeline.length - 1
       : !msg.toolCalls || msg.toolCalls.length === 0);
   const isSettledTurnTail =
-    !isStreamingTail && isLastAssistantInUserTurn && msg.durationMs != null;
+    !isStreamingTail && isLastAssistantInUserTurn && msg.turnSettledAt != null;
   const hasActiveTool = (msg.toolCalls ?? []).some(
     (tool) =>
       tool.status === "running" ||
@@ -982,7 +1010,7 @@ const MessageRow = memo(function MessageRow({
   );
   const isWaitingOnModelTransport = isStreamingTail && !hasActiveTool;
   const settledDuration = isSettledTurnTail
-    ? formatElapsedClock(msg.durationMs!)
+    ? formatElapsedClock(msg.turnSettledAt! - turnStartedAt)
     : null;
   // Keep the active turn as one continuous reading flow. Once the turn
   // reaches a terminal state, collapse its older segments behind the

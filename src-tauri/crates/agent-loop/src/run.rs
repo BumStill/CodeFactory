@@ -1447,13 +1447,9 @@ pub async fn run_agent_loop(
                 // flag clears — even when the provider omitted usage on the
                 // final turn. Previously Done was gated behind `usage`, so a
                 // missing usage left the chat hung "running" forever.
-                let (done_in, done_out) = usage
-                    .as_ref()
-                    .map(|u| (u.prompt_tokens, u.completion_tokens))
-                    .unwrap_or((0, 0));
                 events.emit(crate::types::StreamEvent::Done {
-                    input_tokens: done_in,
-                    output_tokens: done_out,
+                    input_tokens: total_input_tokens.min(u32::MAX as u64) as u32,
+                    output_tokens: total_output_tokens.min(u32::MAX as u64) as u32,
                 });
                 emitted_terminal = true;
                 break;
@@ -5210,7 +5206,7 @@ mod tests {
         let persistence = Arc::new(RecordingPersistence::default());
         let events = Arc::new(CollectingEventSink::new());
 
-        run_agent_loop(
+        let outcome = run_agent_loop(
             inputs(),
             config(),
             services(transport.clone(), persistence.clone(), events.clone()),
@@ -5247,7 +5243,10 @@ mod tests {
             StreamEvent::Done {
                 input_tokens,
                 output_tokens
-            } if input_tokens > 0 && output_tokens > 0
+            } if input_tokens as u64 == outcome.input_tokens
+                && output_tokens as u64 == outcome.output_tokens
+                && input_tokens > 0
+                && output_tokens > 0
         ));
     }
 

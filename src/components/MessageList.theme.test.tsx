@@ -186,6 +186,7 @@ describe("MessageList theme readability", () => {
             content: "修复完成，测试通过。",
             createdAt: 4,
             durationMs: 3_000,
+            turnSettledAt: 3_001,
           }),
         ]}
         streaming={false}

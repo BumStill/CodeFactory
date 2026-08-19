@@ -156,7 +156,7 @@ async function main() {
     );
     assert(
       (await handedBack.getByTestId("settled-turn-status").textContent() ?? "").trim()
-        === "已结束 · 12K tokens · 06:00",
+        === "已结束 · 12K tokens · 09:00",
       "a settled turn must retain one completed token/time receipt",
     );
     assert(

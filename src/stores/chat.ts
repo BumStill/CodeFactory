@@ -1715,11 +1715,12 @@ export function dbMessagesToUI(
     const activityTarget = assistant ?? hydrated[rootIndex];
     const terminalObjective =
       activity.objective_status === "waiting_core_input" ||
-      activity.objective_status === "waiting_authorization" ||
-      activity.objective_status === "waiting_business_decision" ||
       activity.objective_status === "completed" ||
       activity.objective_status === "cancelled" ||
       activity.objective_status === "legacy_orphan";
+    if (assistant && terminalObjective) {
+      assistant.turnSettledAt = activity.updated_at;
+    }
     if (assistant && assistant.durationMs == null && terminalObjective) {
       assistant.durationMs = Math.max(0, activity.updated_at - hydrated[rootIndex].createdAt);
     }

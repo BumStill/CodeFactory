@@ -76,9 +76,7 @@ const beforeHandback: ChatEventState = {
   ],
 };
 
-const handedBack = reduceChatStreamEvent(
-  beforeHandback,
-  {
+const handedBackActivity = reduceChatStreamEvent(beforeHandback, {
     type: "turn_activity_updated",
     root_turn_id: "user",
     revision: 52,
@@ -91,9 +89,14 @@ const handedBack = reduceChatStreamEvent(
     terminal_reason: "technical_recovery_exhausted",
     objective_id: "objective-handback",
     objective_status: "waiting_core_input",
-  },
-  "assistant",
-);
+  }, "assistant");
+const handedBack = reduceChatStreamEvent(handedBackActivity, {
+  type: "turn_settled",
+  run_instance_id: "run-handback",
+  root_turn_id: "user",
+  objective_id: "objective-handback",
+  status: "waiting_user",
+}, "assistant");
 
 // The guard against over-suppression: a turn that really is running keeps its
 // banner, its next step and its estimate.

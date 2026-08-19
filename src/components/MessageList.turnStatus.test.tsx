@@ -343,6 +343,7 @@ describe("inline active-turn status", () => {
           assistant({
             content: "完成。",
             durationMs: 84_000,
+            turnSettledAt: NOW,
             inputTokens: 12_000,
             outputTokens: 345,
           }),
@@ -370,6 +371,7 @@ describe("inline active-turn status", () => {
             id: "round-2",
             content: "完成。",
             durationMs: 120_000,
+            turnSettledAt: NOW,
             inputTokens: 4_000,
             outputTokens: 345,
           }),
@@ -382,6 +384,27 @@ describe("inline active-turn status", () => {
 
     expect(screen.getByTestId("settled-turn-status")).toHaveTextContent(
       "已结束 · 13K tokens · 02:00",
+    );
+  });
+
+  it("keeps one settled receipt anchored to the root turn across a steer", () => {
+    render(
+      <MessageList
+        messages={[
+          { id: "root", role: "user", content: "开始", createdAt: NOW - 120_000 },
+          assistant({ id: "before-steer", content: "阶段一", rootTurnId: "root", durationMs: 60_000, inputTokens: 2_000 }),
+          { id: "steer", role: "user", content: "继续", createdAt: NOW - 60_000 },
+          assistant({ id: "after-steer", content: "完成", rootTurnId: "root", durationMs: 10_000, turnSettledAt: NOW, outputTokens: 500 }),
+        ]}
+        streaming={false}
+        turnActive={false}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.getAllByTestId("settled-turn-status")).toHaveLength(1);
+    expect(screen.getByTestId("settled-turn-status")).toHaveTextContent(
+      "已结束 · 2.5K tokens · 02:00",
     );
   });
 });

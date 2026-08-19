@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { StreamEvent } from "../lib/tauri.js";
 import { turnPlanFromEvent, type TurnPlan } from "../lib/chatPlan.js";
+import { SYSTEM_RELEASED_OBJECTIVE_STATUSES } from "../lib/turnOwnership.js";
 
 export interface ToolCallState {
   id: string;
@@ -61,6 +62,10 @@ export interface UIMessage {
   /** Wall-clock the turn took, frozen only when the durable run settles.
    * Transport completion/error can still be followed by recovery work. */
   durationMs?: number;
+  /** Authoritative root-turn settlement wall clock. Segment duration alone is
+   * not terminal evidence: steering and waiting_system can both freeze a
+   * segment while the system still owns the turn. */
+  turnSettledAt?: number;
   /** Internal completion-review provenance from the DB. Drafts and
    *  injected review instructions are excluded from the chat transcript. */
   completionState?: string;
@@ -408,16 +413,29 @@ export function reduceChatStreamEvent(
 
     case "turn_settled": {
       const endedAt = Date.now();
-      const terminalForTurn = event.status !== "waiting_system";
       return {
         ...state,
         streaming: false,
         pendingPermission: null,
         messages: updateMessageById(state.messages, msgId, (message) => {
+          const objectiveStatus = message.turnActivity?.objectiveStatus;
+          const waitingUserReleased =
+            event.status === "waiting_user" &&
+            Boolean(
+              objectiveStatus &&
+              SYSTEM_RELEASED_OBJECTIVE_STATUSES.includes(objectiveStatus),
+            );
+          const terminalForTurn =
+            event.status === "completed" ||
+            event.status === "cancelled" ||
+            event.status === "failed_setup" ||
+            waitingUserReleased;
           const settled = message.durationMs == null
             ? { ...message, durationMs: Math.max(0, endedAt - message.createdAt) }
             : message;
-          return terminalForTurn ? terminalizeTransientTools(settled) : settled;
+          return terminalForTurn
+            ? terminalizeTransientTools({ ...settled, turnSettledAt: endedAt })
+            : settled;
         }),
       };
     }

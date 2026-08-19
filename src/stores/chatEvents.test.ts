@@ -129,25 +129,48 @@ describe("chat tool call stream events", () => {
       "assistant-1",
     );
     expect(settled.streaming).toBe(false);
+    expect(settled.messages[0].turnSettledAt).toBeUndefined();
   });
 
-  it("attaches every completed round usage to its assistant segment", () => {
-    const first = reduceChatStreamEvent(
+  it("attaches the run-cumulative terminal usage to its assistant segment", () => {
+    const done = reduceChatStreamEvent(
       baseState(),
-      { type: "done", input_tokens: 1200, output_tokens: 34 },
-      "assistant-1",
-    );
-    const second = reduceChatStreamEvent(
-      first,
-      { type: "done", input_tokens: 800, output_tokens: 16 },
+      { type: "done", input_tokens: 2000, output_tokens: 50 },
       "assistant-1",
     );
 
-    expect(second.messages[0]).toMatchObject({
+    expect(done.messages[0]).toMatchObject({
       inputTokens: 2000,
       outputTokens: 50,
     });
   });
+
+  it.each(["waiting_authorization", "waiting_business_decision"] as const)(
+    "keeps %s system-owned when turn_settled reports waiting_user",
+    (objectiveStatus) => {
+      const active = reduceChatStreamEvent(baseState(), {
+        type: "turn_activity_updated",
+        root_turn_id: "root",
+        revision: 2,
+        phase: "waiting",
+        status: objectiveStatus,
+        recent_activity_kind: "waiting",
+        recent_activity_label: "等待系统输入",
+        waiting_reason: null,
+        updated_at: Date.now(),
+        terminal_reason: null,
+        objective_status: objectiveStatus,
+      }, "assistant-1");
+      const settled = reduceChatStreamEvent(active, {
+        type: "turn_settled",
+        run_instance_id: "run",
+        root_turn_id: "root",
+        status: "waiting_user",
+      }, "assistant-1");
+
+      expect(settled.messages[0].turnSettledAt).toBeUndefined();
+    },
+  );
 
   it("terminalizes transient tools when durable recovery hands the turn back", () => {
     const waiting: ChatEventState = {
