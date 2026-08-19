@@ -106,6 +106,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 - 生产 CSS 中 opacity token 的编译结果，不以 jsdom className 断言替代；
 - 聊天气泡无手动 `Remember` 控件的组件断言，以及安全 memory 候选自动写入/去重的文件证据；
 - PR、CI、merge、release workflow、公开 artifact URL/校验和、安装后精确版本。
+- release-facing 修复在 dispatch 前必须用 `tools/release/plan_release.py` 复验最终 main commit 的 urgency trailer 可被机器解析；PR 页面肉眼可见但含字面量转义符的伪 trailer 不算证据。
 
 ## 兼容与发布边界
 
