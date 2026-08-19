@@ -102,6 +102,10 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:history-session-contract
 
+      - name: Shared cargo wrapper contract
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:cargo-shared
+
       - name: README contract
         if: ${{ !cancelled() }}
         env:
