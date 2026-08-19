@@ -48,6 +48,8 @@ const beforeHandback: ChatEventState = {
     content: "分析结论如上，当前未修改代码。",
     createdAt: Date.now() - 10_000,
     durationMs: 6 * 60 * 1000,
+    inputTokens: 12_000,
+    outputTokens: 345,
     plan,
     toolCalls: [{
       id: "audit-tool",
@@ -74,9 +76,7 @@ const beforeHandback: ChatEventState = {
   ],
 };
 
-const handedBack = reduceChatStreamEvent(
-  beforeHandback,
-  {
+const handedBackActivity = reduceChatStreamEvent(beforeHandback, {
     type: "turn_activity_updated",
     root_turn_id: "user",
     revision: 52,
@@ -89,9 +89,14 @@ const handedBack = reduceChatStreamEvent(
     terminal_reason: "technical_recovery_exhausted",
     objective_id: "objective-handback",
     objective_status: "waiting_core_input",
-  },
-  "assistant",
-);
+  }, "assistant");
+const handedBack = reduceChatStreamEvent(handedBackActivity, {
+  type: "turn_settled",
+  run_instance_id: "run-handback",
+  root_turn_id: "user",
+  objective_id: "objective-handback",
+  status: "waiting_user",
+}, "assistant");
 
 // The guard against over-suppression: a turn that really is running keeps its
 // banner, its next step and its estimate.
@@ -106,11 +111,11 @@ const running: UIMessage[] = [
     turnActivity: {
       rootTurnId: "user-2",
       revision: 8,
-      phase: "working",
+      phase: "delivering",
       status: "active",
-      kind: "tool",
-      label: "构建仍在运行",
-      waitingReason: "命令已连续运行约 3 分钟",
+      kind: "tool_wait",
+      label: "交付任务仍在运行（约 3 分钟）",
+      waitingReason: "交付任务已连续运行约 3 分钟",
       updatedAt: Date.now(),
       terminalReason: null,
       objectiveId: "objective-running",
@@ -150,7 +155,13 @@ createRoot(document.getElementById("root")!).render(
         <Composer streaming={handedBack.streaming} />
       </Panel>
       <Panel title="Still running">
-        <MessageList messages={running} streaming cwd={null} />
+        <MessageList
+          messages={running}
+          streaming={false}
+          turnActive
+          turnExecutionActive
+          cwd={null}
+        />
         <Composer streaming />
       </Panel>
     </main>
