@@ -7,12 +7,13 @@ import { describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-type TurnActivity = { objectiveStatus?: string };
+type TurnActivity = { objectiveStatus?: string; terminalReason?: string | null; rootTurnId?: string };
 type RuntimeMessage = {
   id: string;
   role: string;
   content: string;
   createdAt: number;
+  rootTurnId?: string;
   turnSettledAt?: number;
   turnActivity?: TurnActivity;
 };
@@ -237,6 +238,73 @@ describe("system-owned turns stay stoppable", () => {
     expect(screen.getByTestId("composer-mode")).toHaveTextContent("发送");
     expect(screen.getByTestId("body-turn-state")).toHaveTextContent("正文空闲");
     expect(screen.getByTestId("body-turn-execution")).toHaveTextContent("正文未执行");
+  });
+
+  it("uses root-turn settlement across a steer instead of keeping Stop alive", () => {
+    runtime.streaming = true;
+    runtime.messages = [
+      { id: "root-1", role: "user", content: "完成任务", createdAt: 1 },
+      {
+        id: "assistant-before-steer",
+        role: "assistant",
+        content: "等待恢复",
+        createdAt: 2,
+        rootTurnId: "root-1",
+        turnActivity: { rootTurnId: "root-1", objectiveStatus: "waiting_system", terminalReason: null },
+      },
+      { id: "steer-1", role: "user", content: "继续收尾", createdAt: 3 },
+      {
+        id: "assistant-after-steer",
+        role: "assistant",
+        content: "系统已登记故障",
+        createdAt: 4,
+        rootTurnId: "root-1",
+        turnSettledAt: 5,
+        turnActivity: {
+          rootTurnId: "root-1",
+          objectiveStatus: "waiting_system",
+          terminalReason: "technical_recovery_exhausted",
+        },
+      },
+    ];
+
+    renderWorkspace();
+
+    expect(screen.getByTestId("composer-mode")).toHaveTextContent("发送");
+    expect(screen.getByTestId("body-turn-state")).toHaveTextContent("正文空闲");
+  });
+
+  it("keeps a genuinely active next root independent from an older incident", () => {
+    runtime.streaming = false;
+    runtime.messages = [
+      {
+        id: "old-answer",
+        role: "assistant",
+        content: "旧任务已停止",
+        createdAt: 1,
+        rootTurnId: "root-1",
+        turnSettledAt: 2,
+        turnActivity: {
+          rootTurnId: "root-1",
+          objectiveStatus: "waiting_system",
+          terminalReason: "technical_recovery_exhausted",
+        },
+      },
+      { id: "root-2", role: "user", content: "新任务", createdAt: 3 },
+      {
+        id: "new-answer",
+        role: "assistant",
+        content: "正在执行",
+        createdAt: 4,
+        rootTurnId: "root-2",
+        turnActivity: { rootTurnId: "root-2", objectiveStatus: "active", terminalReason: null },
+      },
+    ];
+
+    renderWorkspace();
+
+    expect(screen.getByTestId("composer-mode")).toHaveTextContent("停止后续生成");
+    expect(screen.getByTestId("body-turn-state")).toHaveTextContent("正文运行中");
   });
 
   it("targets the rendered session explicitly when stop is clicked", async () => {

@@ -233,6 +233,206 @@ describe("chat tool call stream events", () => {
     });
   });
 
+  it("settles every live segment that belongs to the same root turn", () => {
+    const waiting: ChatEventState = {
+      ...baseState(),
+      messages: [
+        {
+          id: "root-handback",
+          role: "user",
+          content: "继续完成",
+          createdAt: 1,
+        },
+        {
+          id: "assistant-before-steer",
+          role: "assistant",
+          rootTurnId: "root-handback",
+          content: "正在检查 CI。",
+          createdAt: 2,
+          turnActivity: {
+            rootTurnId: "root-handback",
+            revision: 8,
+            phase: "waiting",
+            status: "waiting_system",
+            kind: "remediation",
+            label: "系统仍在处理",
+            waitingReason: "等待 CI",
+            updatedAt: 8,
+            terminalReason: null,
+            objectiveStatus: "waiting_system",
+          },
+          toolCalls: [{
+            id: "tool-before-steer",
+            name: "bash",
+            args: "git status --short",
+            status: "waiting",
+          }],
+        },
+        {
+          id: "assistant-after-steer",
+          role: "assistant",
+          rootTurnId: "root-handback",
+          content: "",
+          createdAt: 3,
+          toolCalls: [{
+            id: "tool-after-steer",
+            name: "bash",
+            args: "git log -1",
+            status: "running",
+          }],
+        },
+      ],
+    };
+
+    const activity = reduceChatStreamEvent(
+      waiting,
+      {
+        type: "turn_activity_updated",
+        root_turn_id: "root-handback",
+        revision: 9,
+        phase: "waiting",
+        status: "waiting_system",
+        recent_activity_kind: "technical_recovery_exhausted",
+        recent_activity_label: "系统已登记故障，无需补充输入",
+        waiting_reason: "technical_recovery_exhausted",
+        updated_at: 9,
+        terminal_reason: "technical_recovery_exhausted",
+        objective_status: "waiting_system",
+      },
+      "assistant-after-steer",
+    );
+    const settled = reduceChatStreamEvent(
+      activity,
+      {
+        type: "turn_settled",
+        run_instance_id: "run-handback",
+        root_turn_id: "root-handback",
+        status: "system_incident",
+      },
+      "assistant-after-steer",
+    );
+
+    for (const assistant of settled.messages.filter((message) => message.role === "assistant")) {
+      expect(assistant.turnActivity?.terminalReason).toBe("technical_recovery_exhausted");
+      expect(assistant.turnSettledAt).toBeDefined();
+      expect(assistant.toolCalls?.[0]).toMatchObject({ status: "blocked", isError: false });
+    }
+    expect(settled.streaming).toBe(false);
+
+    const afterLateActivity = reduceChatStreamEvent(
+      settled,
+      {
+        type: "turn_activity_updated",
+        root_turn_id: "root-handback",
+        revision: 8,
+        phase: "working",
+        status: "active",
+        recent_activity_kind: "tool",
+        recent_activity_label: "迟到的旧执行事件",
+        waiting_reason: null,
+        updated_at: 8,
+        terminal_reason: null,
+        objective_status: "active",
+      },
+      "assistant-before-steer",
+    );
+    expect(afterLateActivity.streaming).toBe(false);
+    for (const assistant of afterLateActivity.messages.filter(
+      (message) => message.role === "assistant",
+    )) {
+      expect(assistant.turnActivity?.terminalReason).toBe(
+        "technical_recovery_exhausted",
+      );
+      expect(assistant.turnSettledAt).toBeDefined();
+      expect(assistant.toolCalls?.[0]).toMatchObject({ status: "blocked" });
+    }
+  });
+
+  it("does not let a terminal event for an older root stop the active next root", () => {
+    const activeNextRoot: ChatEventState = {
+      ...baseState(),
+      messages: [
+        { id: "root-old", role: "user", content: "旧任务", createdAt: 1 },
+        {
+          id: "assistant-old",
+          role: "assistant",
+          rootTurnId: "root-old",
+          content: "旧任务正在恢复",
+          createdAt: 2,
+        },
+        { id: "root-new", role: "user", content: "新任务", createdAt: 3 },
+        {
+          id: "assistant-new",
+          role: "assistant",
+          rootTurnId: "root-new",
+          content: "新任务正在执行",
+          createdAt: 4,
+          turnActivity: {
+            rootTurnId: "root-new",
+            revision: 2,
+            phase: "working",
+            status: "active",
+            kind: "tool",
+            label: "正在执行新任务",
+            waitingReason: null,
+            updatedAt: 4,
+            terminalReason: null,
+            objectiveStatus: "active",
+          },
+        },
+      ],
+    };
+
+    const oldActivity = reduceChatStreamEvent(
+      activeNextRoot,
+      {
+        type: "turn_activity_updated",
+        root_turn_id: "root-old",
+        revision: 9,
+        phase: "waiting",
+        status: "waiting_system",
+        recent_activity_kind: "technical_recovery_exhausted",
+        recent_activity_label: "旧任务已登记故障",
+        waiting_reason: "technical_recovery_exhausted",
+        updated_at: 9,
+        terminal_reason: "technical_recovery_exhausted",
+        objective_status: "waiting_system",
+      },
+      "assistant-old",
+    );
+    const oldSettlement = reduceChatStreamEvent(
+      oldActivity,
+      {
+        type: "turn_settled",
+        run_instance_id: "run-old",
+        root_turn_id: "root-old",
+        status: "system_incident",
+      },
+      "assistant-old",
+    );
+
+    expect(oldSettlement.streaming).toBe(true);
+    expect(oldSettlement.messages[1].turnSettledAt).toBeDefined();
+    expect(oldSettlement.messages[3].turnSettledAt).toBeUndefined();
+    expect(oldSettlement.messages[3].turnActivity?.objectiveStatus).toBe("active");
+
+    const unknownOldSettlement = reduceChatStreamEvent(
+      {
+        ...activeNextRoot,
+        messages: activeNextRoot.messages.slice(2),
+      },
+      {
+        type: "turn_settled",
+        run_instance_id: "run-missing-old",
+        root_turn_id: "root-missing-old",
+        status: "system_incident",
+      },
+      "assistant-new",
+    );
+    expect(unknownOldSettlement.streaming).toBe(true);
+    expect(unknownOldSettlement.messages[1].turnSettledAt).toBeUndefined();
+  });
+
   it("marks the tool card cancelled and clears pending permission", () => {
     const waiting = reduceChatStreamEvent(
       baseState(),

@@ -26,3 +26,93 @@ export function systemOwnsObjective(status: string | null | undefined): boolean 
     status && !SYSTEM_RELEASED_OBJECTIVE_STATUSES.includes(status as ObjectiveStatus),
   );
 }
+
+export function rootTurnIdForMessage(message: UIMessage): string | null {
+  return (
+    message.rootTurnId ??
+    message.turnActivity?.rootTurnId ??
+    message.plan?.rootTurnId ??
+    null
+  );
+}
+
+export interface CurrentTurnOwnership {
+  rootTurnId: string | null;
+  messages: UIMessage[];
+  released: boolean;
+  systemHeld: boolean;
+}
+
+/**
+ * Resolve ownership for the latest durable root turn. Mid-run steers are user
+ * rows too, but they do not start a new root; the assistant bubbles on either
+ * side retain the original root identity. Consumers must therefore group by
+ * root identity instead of treating the last role=user row as a turn boundary.
+ */
+export function currentTurnOwnership(messages: UIMessage[]): CurrentTurnOwnership {
+  const knownRootIds = new Set(
+    messages.map(rootTurnIdForMessage).filter((id): id is string => Boolean(id)),
+  );
+  let latestKnownRootId: string | null = null;
+  let latestKnownRootIndex = -1;
+  let latestUserIndex = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    if (messages[index].role === "user") latestUserIndex = index;
+    const candidate = rootTurnIdForMessage(messages[index]);
+    if (candidate) {
+      latestKnownRootId = candidate;
+      latestKnownRootIndex = index;
+    }
+  }
+  // A user row after every durable projection is a newly submitted root. If
+  // a later assistant binds back to the previous root, this same row is a
+  // steer and latestKnownRootIndex moves past it.
+  const rootTurnId =
+    latestUserIndex > latestKnownRootIndex
+      ? messages[latestUserIndex]?.id ?? null
+      : latestKnownRootId ?? messages[latestUserIndex]?.id ?? null;
+  const rootIndex = rootTurnId
+    ? messages.findIndex(
+        (message) => message.role === "user" && message.id === rootTurnId,
+      )
+    : -1;
+  const fallbackUserIndex = messages.reduce(
+    (latest, message, index) => (message.role === "user" ? index : latest),
+    -1,
+  );
+  const startIndex = rootIndex >= 0 ? rootIndex : Math.max(0, fallbackUserIndex);
+  let endIndex = messages.length;
+  for (let index = startIndex + 1; index < messages.length && rootTurnId; index += 1) {
+    const message = messages[index];
+    if (
+      message.role === "user" &&
+      message.id !== rootTurnId &&
+      knownRootIds.has(message.id)
+    ) {
+      endIndex = index;
+      break;
+    }
+  }
+  const turnMessages = messages.slice(startIndex, endIndex);
+  const currentActivity = [...turnMessages]
+    .reverse()
+    .find((message) => message.turnActivity?.objectiveStatus)
+    ?.turnActivity;
+  const hasSettlement = turnMessages.some(
+    (message) =>
+      message.turnSettledAt != null || message.turnActivity?.terminalReason != null,
+  );
+  const objectiveStatus = currentActivity?.objectiveStatus;
+  const released = Boolean(
+    hasSettlement ||
+    (objectiveStatus && !systemOwnsObjective(objectiveStatus)),
+  );
+  const systemHeld =
+    !released &&
+    turnMessages.some(
+      (message) =>
+        !message.turnActivity?.terminalReason &&
+        systemOwnsObjective(message.turnActivity?.objectiveStatus),
+    );
+  return { rootTurnId, messages: turnMessages, released, systemHeld };
+}

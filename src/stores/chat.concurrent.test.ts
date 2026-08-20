@@ -52,10 +52,14 @@ function lastContent(id: string) {
   return msgs[msgs.length - 1]?.content;
 }
 function settle(id: string) {
+  const rootTurnId = [...rt(id).messages]
+    .reverse()
+    .find((message) => message.role === "assistant")?.rootTurnId;
+  expect(rootTurnId).toBeTruthy();
   streamHandlers[id]({
     type: "turn_settled",
     run_instance_id: `run-${id}`,
-    root_turn_id: `root-${id}`,
+    root_turn_id: rootTurnId,
     objective_id: `objective-${id}`,
     status: "completed",
   });

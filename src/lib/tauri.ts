@@ -225,8 +225,12 @@ export interface TurnActivitySnapshot {
   waiting_reason?: string | null;
   updated_at: number;
   terminal_reason?: string | null;
+  turn_settled_at?: number | null;
+  stream_closed_at?: number | null;
+  terminal_revision?: number | null;
   objective_id?: string;
   objective_status?: "active" | "waiting_system" | "waiting_core_input" | "waiting_authorization" | "waiting_business_decision" | "completed" | "cancelled" | "legacy_orphan";
+  is_current_objective_turn?: boolean;
   recovery_owner?: string | null;
   next_observation_at?: number | null;
   last_progress_at?: number | null;

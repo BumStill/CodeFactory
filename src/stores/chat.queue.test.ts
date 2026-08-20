@@ -62,10 +62,14 @@ function q() {
 function settle(
   status: "completed" | "cancelled" | "waiting_system" | "waiting_user" | "failed_setup" = "completed",
 ) {
+  const rootTurnId = [...(useChatStore.getState().runtime[SID]?.messages ?? [])]
+    .reverse()
+    .find((message) => message.role === "assistant")?.rootTurnId;
+  expect(rootTurnId).toBeTruthy();
   streamMock.handler?.({
     type: "turn_settled",
     run_instance_id: "run-1",
-    root_turn_id: "root-1",
+    root_turn_id: rootTurnId,
     objective_id: "objective-1",
     status,
   });

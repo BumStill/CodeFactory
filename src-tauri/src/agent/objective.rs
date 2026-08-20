@@ -1092,6 +1092,14 @@ pub struct ClaimedRemediation {
     pub resource_generation: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ClaimDueBatch {
+    pub claims: Vec<ClaimedRemediation>,
+    /// Objective transitions committed while evaluating claim eligibility.
+    /// These are post-commit publication receipts, not new work claims.
+    pub terminal_transitions: Vec<ObjectiveSnapshot>,
+}
+
 fn objective_binding_digest(objective_id: &str, resource_kind: &str, resource_id: &str) -> String {
     let material = format!("{objective_id}\0{resource_kind}\0{resource_id}");
     format!("sha256:{:x}", Sha256::digest(material.as_bytes()))
@@ -2235,12 +2243,12 @@ impl ObjectiveStore {
     /// Lease due recovery work with compare-and-swap semantics. A stale
     /// process can observe candidates but cannot claim a row after another
     /// supervisor has advanced its lease or status.
-    pub async fn claim_due_remediations(
+    pub async fn claim_due_remediation_batch(
         &self,
         owner: &str,
         limit: i64,
         lease_ms: i64,
-    ) -> anyhow::Result<Vec<ClaimedRemediation>> {
+    ) -> anyhow::Result<ClaimDueBatch> {
         let now = Utc::now().timestamp_millis();
         let rows = sqlx::query(
             "SELECT remediation.id AS remediation_id,
@@ -2267,6 +2275,7 @@ impl ObjectiveStore {
         .fetch_all(&self.pool)
         .await?;
         let mut claimed = Vec::new();
+        let mut terminal_transitions = Vec::new();
         for row in rows {
             let remediation_id: String = row.try_get("remediation_id")?;
             let objective_id: String = row.try_get("objective_id")?;
@@ -2319,8 +2328,22 @@ impl ObjectiveStore {
                         },
                     )?;
                     match self.apply_decision(current.revision, decision).await {
-                        Ok(_) => {}
-                        Err(error) if error.to_string().contains("revision") => {}
+                        Ok(transition) => terminal_transitions.push(transition),
+                        Err(error) if error.to_string().contains("revision") => {
+                            // Another process may have committed the same
+                            // terminal transition after this poll selected the
+                            // row. Re-read the durable winner so this process
+                            // can still publish the idempotent UI projection.
+                            if let Some(transition) = self.get(&objective_id).await? {
+                                if transition.failure_code.as_deref()
+                                    == Some(TECHNICAL_RECOVERY_EXHAUSTED)
+                                    && transition.recovery_owner.as_deref()
+                                        == Some(OBJECTIVE_INCIDENT_CONTROLLER)
+                                {
+                                    terminal_transitions.push(transition);
+                                }
+                            }
+                        }
                         Err(error) => return Err(error),
                     }
                     continue;
@@ -2403,7 +2426,22 @@ impl ObjectiveStore {
                 });
             }
         }
-        Ok(claimed)
+        Ok(ClaimDueBatch {
+            claims: claimed,
+            terminal_transitions,
+        })
+    }
+
+    pub async fn claim_due_remediations(
+        &self,
+        owner: &str,
+        limit: i64,
+        lease_ms: i64,
+    ) -> anyhow::Result<Vec<ClaimedRemediation>> {
+        Ok(self
+            .claim_due_remediation_batch(owner, limit, lease_ms)
+            .await?
+            .claims)
     }
 
     pub async fn defer_claimed_remediation(
@@ -8738,11 +8776,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store
-            .claim_due_remediations("replacement-process", 1, 30_000)
+        let terminal_poll = store
+            .claim_due_remediation_batch("replacement-process", 1, 30_000)
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        assert!(terminal_poll.claims.is_empty());
+        assert_eq!(terminal_poll.terminal_transitions.len(), 1);
+        assert_parked_system_incident(&terminal_poll.terminal_transitions[0]);
         let exhausted = store.get(&waiting.id).await.unwrap().unwrap();
         assert_parked_system_incident(&exhausted);
         assert_eq!(claimable_remediations(&pool, &waiting.id).await, 0);

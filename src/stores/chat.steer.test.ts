@@ -54,10 +54,14 @@ function queue() {
   return useChatStore.getState().runtime[SID]?.queue ?? [];
 }
 function settle() {
+  const rootTurnId = [...messages()]
+    .reverse()
+    .find((message) => message.role === "assistant")?.rootTurnId;
+  expect(rootTurnId).toBeTruthy();
   streamMock.handler?.({
     type: "turn_settled",
     run_instance_id: "run-1",
-    root_turn_id: "root-1",
+    root_turn_id: rootTurnId,
     objective_id: "objective-1",
     status: "completed",
   });

@@ -18,6 +18,7 @@ import { turnPlanFromEvent } from "../lib/chatPlan";
 import {
   markPermissionResponse,
   reduceChatStreamEvent,
+  terminalizeTransientTools,
   formatToolArgs,
   presentChatInvocationError,
   type ChatEventState,
@@ -1609,6 +1610,10 @@ export function dbMessagesToUI(
 ): UIMessage[] {
   const hydrated: UIMessage[] = [];
   const toolOwners = new Map<string, number>();
+  const registeredRootIds = new Set([
+    ...plans.map((plan) => plan.root_turn_id),
+    ...turnStates.map((activity) => activity.root_turn_id),
+  ]);
 
   for (const message of messages) {
     const completionState = message.completion_state;
@@ -1671,12 +1676,18 @@ export function dbMessagesToUI(
     if (rootIndex < 0) continue;
     let nextRootIndex = hydrated.length;
     for (let index = rootIndex + 1; index < hydrated.length; index += 1) {
-      if (hydrated[index].role === "user") {
+      if (
+        hydrated[index].role === "user" &&
+        registeredRootIds.has(hydrated[index].id)
+      ) {
         nextRootIndex = index;
         break;
       }
     }
     const turnRows = hydrated.slice(rootIndex + 1, nextRootIndex);
+    for (const message of turnRows) {
+      if (message.role === "assistant") message.rootTurnId = plan.root_turn_id;
+    }
     const finalAssistant = [...turnRows]
       .reverse()
       .find((message) => message.role === "assistant" && message.content.trim());
@@ -1701,12 +1712,19 @@ export function dbMessagesToUI(
     if (rootIndex < 0) continue;
     let nextRootIndex = hydrated.length;
     for (let index = rootIndex + 1; index < hydrated.length; index += 1) {
-      if (hydrated[index].role === "user") {
+      if (
+        hydrated[index].role === "user" &&
+        registeredRootIds.has(hydrated[index].id)
+      ) {
         nextRootIndex = index;
         break;
       }
     }
-    const assistant = [...hydrated.slice(rootIndex + 1, nextRootIndex)]
+    const turnRows = hydrated.slice(rootIndex + 1, nextRootIndex);
+    for (const message of turnRows) {
+      if (message.role === "assistant") message.rootTurnId = activity.root_turn_id;
+    }
+    const assistant = [...turnRows]
       .reverse()
       .find((message) => message.role === "assistant");
     // A crash may happen before the first assistant row exists. Bind the
@@ -1714,15 +1732,20 @@ export function dbMessagesToUI(
     // dropping it during hydration.
     const activityTarget = assistant ?? hydrated[rootIndex];
     const terminalObjective =
+      activity.turn_settled_at != null ||
+      activity.terminal_reason != null ||
       activity.objective_status === "waiting_core_input" ||
       activity.objective_status === "completed" ||
       activity.objective_status === "cancelled" ||
       activity.objective_status === "legacy_orphan";
     if (assistant && terminalObjective) {
-      assistant.turnSettledAt = activity.updated_at;
+      assistant.turnSettledAt = activity.turn_settled_at ?? activity.updated_at;
     }
     if (assistant && assistant.durationMs == null && terminalObjective) {
-      assistant.durationMs = Math.max(0, activity.updated_at - hydrated[rootIndex].createdAt);
+      assistant.durationMs = Math.max(
+        0,
+        (activity.turn_settled_at ?? activity.updated_at) - hydrated[rootIndex].createdAt,
+      );
     }
     activityTarget.turnActivity = {
       rootTurnId: activity.root_turn_id,
@@ -1736,10 +1759,21 @@ export function dbMessagesToUI(
       terminalReason: activity.terminal_reason ?? null,
       objectiveId: activity.objective_id,
       objectiveStatus: activity.objective_status,
+      isCurrentObjectiveTurn: activity.is_current_objective_turn,
       recoveryOwner: activity.recovery_owner ?? null,
       nextObservationAt: activity.next_observation_at ?? null,
       lastProgressAt: activity.last_progress_at ?? null,
     };
+    if (
+      activity.terminal_reason === "technical_recovery_exhausted" ||
+      activity.recent_activity_kind === "technical_recovery_exhausted"
+    ) {
+      for (let index = rootIndex + 1; index < nextRootIndex; index += 1) {
+        if (hydrated[index].role === "assistant") {
+          hydrated[index] = terminalizeTransientTools(hydrated[index]);
+        }
+      }
+    }
   }
 
   return hydrated;

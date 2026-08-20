@@ -208,6 +208,128 @@ describe("MessageList structured progress and result", () => {
     expect(screen.queryByText(/预计还需/)).not.toBeInTheDocument();
   });
 
+  it("does not revive progress from an older segment after the root turn settles", () => {
+    render(
+      <MessageList
+        messages={[
+          { id: "user", role: "user", content: "继续完成", createdAt: 1 },
+          {
+            id: "assistant-before-steer",
+            role: "assistant",
+            rootTurnId: "user",
+            content: "正在等待 CI。",
+            createdAt: 2,
+            plan,
+            turnActivity: {
+              rootTurnId: "user",
+              revision: 8,
+              phase: "waiting",
+              status: "waiting_system",
+              kind: "remediation",
+              label: "系统仍在处理",
+              waitingReason: "等待 CI",
+              updatedAt: 8,
+              terminalReason: null,
+              objectiveStatus: "waiting_system",
+            },
+          },
+          {
+            id: "steer",
+            role: "user",
+            content: "继续收尾",
+            createdAt: 8.5,
+          },
+          {
+            id: "assistant-final",
+            role: "assistant",
+            rootTurnId: "user",
+            content: "系统已登记故障，无需补充输入。",
+            createdAt: 9,
+            turnSettledAt: 9,
+            turnActivity: {
+              rootTurnId: "user",
+              revision: 9,
+              phase: "waiting",
+              status: "waiting_system",
+              kind: "technical_recovery_exhausted",
+              label: "系统已登记故障，无需补充输入",
+              waitingReason: "technical_recovery_exhausted",
+              updatedAt: 9,
+              terminalReason: "technical_recovery_exhausted",
+              objectiveStatus: "waiting_system",
+            },
+          },
+        ]}
+        streaming={false}
+        turnActive={false}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.queryByTestId("turn-progress")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("turn-activity-progress")).not.toBeInTheDocument();
+    expect(screen.queryByText(/等待中/)).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("settled-turn-status")).toHaveLength(1);
+  });
+
+  it("does not revive progress from an older root after the latest root settles", () => {
+    render(
+      <MessageList
+        messages={[
+          { id: "root-old", role: "user", content: "旧任务", createdAt: 1 },
+          {
+            id: "assistant-old",
+            role: "assistant",
+            rootTurnId: "root-old",
+            content: "旧任务正在等待 CI。",
+            createdAt: 2,
+            plan: { ...plan, rootTurnId: "root-old" },
+            turnActivity: {
+              rootTurnId: "root-old",
+              revision: 8,
+              phase: "waiting",
+              status: "waiting_system",
+              kind: "remediation",
+              label: "旧任务仍在处理",
+              waitingReason: "等待 CI",
+              updatedAt: 8,
+              terminalReason: null,
+              objectiveStatus: "waiting_system",
+            },
+          },
+          { id: "root-new", role: "user", content: "新任务", createdAt: 9 },
+          {
+            id: "assistant-new",
+            role: "assistant",
+            rootTurnId: "root-new",
+            content: "新任务已登记系统故障。",
+            createdAt: 10,
+            turnSettledAt: 10,
+            turnActivity: {
+              rootTurnId: "root-new",
+              revision: 2,
+              phase: "waiting",
+              status: "waiting_system",
+              kind: "technical_recovery_exhausted",
+              label: "系统已登记故障，无需补充输入",
+              waitingReason: "technical_recovery_exhausted",
+              updatedAt: 10,
+              terminalReason: "technical_recovery_exhausted",
+              objectiveStatus: "waiting_system",
+            },
+          },
+        ]}
+        streaming={false}
+        turnActive={false}
+        cwd={null}
+      />,
+    );
+
+    expect(screen.queryByTestId("turn-progress")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("turn-activity-progress")).not.toBeInTheDocument();
+    expect(screen.queryByText("旧任务仍在处理")).not.toBeInTheDocument();
+  });
+
   it("keeps a long-tool waiting reason visible even when a structured plan exists", () => {
     const running = messages(false);
     running[1] = {

@@ -26,7 +26,11 @@ import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
 import { formatDuration, formatElapsedClock, useNowTick } from "../lib/duration";
 import { formatUsageTokens } from "./TokenUsageHeatmap";
 import { TurnProgress } from "./TurnProgress";
-import { systemOwnsObjective } from "../lib/turnOwnership";
+import {
+  currentTurnOwnership,
+  rootTurnIdForMessage,
+  systemOwnsObjective,
+} from "../lib/turnOwnership";
 import { humanWaitingReason } from "../lib/waitingReason";
 import {
   summarizeTurnEvidence,
@@ -439,9 +443,21 @@ export function MessageList({
     latestAssistantIndex > latestUserIndex
       ? visible[latestAssistantIndex]?.id ?? null
       : null;
-  const activeProgressMessage = [...visible]
+  const settledRootTurnIds = new Set(
+    visible.flatMap((message) => {
+      if (message.turnSettledAt == null && !message.turnActivity?.terminalReason) return [];
+      const rootTurnId = rootTurnIdForMessage(message);
+      return rootTurnId ? [rootTurnId] : [];
+    }),
+  );
+  const currentOwnership = currentTurnOwnership(visible);
+  const activeProgressMessage = [...currentOwnership.messages]
     .reverse()
     .find((message) => {
+      const rootTurnId = rootTurnIdForMessage(message);
+      if (rootTurnId && settledRootTurnIds.has(rootTurnId)) {
+        return false;
+      }
       if (message.turnActivity?.terminalReason) {
         return false;
       }
@@ -486,7 +502,7 @@ export function MessageList({
     : [...visible].reverse().find((message) => message.role === "user");
   const activeTurnStartedAt =
     activeRootMessage?.createdAt ?? activeTurnMessage?.createdAt ?? Date.now();
-  const lastAssistantIdsByUserTurn = new Set<string>();
+  const lastAssistantIdByRootTurn = new Map<string, string>();
   const turnTokenTotalsByAssistantId = new Map<string, number>();
   const turnStartedAtByAssistantId = new Map<string, number>();
   const userIndexById = new Map<string, number>();
@@ -500,19 +516,21 @@ export function MessageList({
         : 0),
     );
   }
-  let pendingLastAssistantId: string | null = null;
+  let currentLegacyUserId = "conversation-start";
   let pendingUserIndex = 0;
   for (const [index, message] of visible.entries()) {
     if (message.role === "user") {
-      if (pendingLastAssistantId) lastAssistantIdsByUserTurn.add(pendingLastAssistantId);
-      pendingLastAssistantId = null;
+      currentLegacyUserId = message.id;
       pendingUserIndex = index;
     } else if (message.role === "assistant") {
-      pendingLastAssistantId = message.id;
       const rootTurnId =
         message.rootTurnId ??
         message.turnActivity?.rootTurnId ??
         message.plan?.rootTurnId;
+      lastAssistantIdByRootTurn.set(
+        rootTurnId ?? currentLegacyUserId,
+        message.id,
+      );
       const rootIndex = rootTurnId != null
         ? (userIndexById.get(rootTurnId) ?? pendingUserIndex)
         : pendingUserIndex;
@@ -526,7 +544,7 @@ export function MessageList({
       );
     }
   }
-  if (pendingLastAssistantId) lastAssistantIdsByUserTurn.add(pendingLastAssistantId);
+  const lastAssistantIdsByUserTurn = new Set(lastAssistantIdByRootTurn.values());
 
   return (
     <div className="relative flex-1 min-h-0">

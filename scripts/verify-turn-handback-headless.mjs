@@ -121,9 +121,9 @@ async function main() {
       "a settled incident must restore the composer to Send instead of Stop",
     );
     assert(
-      (await incident.getByLabel("已阻断").count()) === 1
+      (await incident.getByLabel("已阻断").count()) === 2
         && !(await incident.textContent() ?? "").includes("等待远端"),
-      "the waiting tool must remain visible as blocked without a live clock",
+      "every waiting/running tool across steer segments must remain visible as blocked without a live clock",
     );
     const incidentText = await incident.textContent() ?? "";
     assert(
@@ -196,7 +196,8 @@ async function main() {
         systemIncidentRequestsNoUserInput: true,
         internalReasonCodeNeverRendered: true,
         composerReturnsToSend: true,
-        waitingToolBecomesBlocked: true,
+        everyTransientToolAcrossSteerBecomesBlocked: true,
+        multiSegmentRootUsesProductionOwnership: true,
         runningTurnKeepsItsBanner: true,
         runningTurnKeepsOneInlineReceipt: true,
         durableLongToolShowsExecuting: true,

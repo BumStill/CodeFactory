@@ -936,6 +936,83 @@ fn emit_chat_turn_settled(
     .ok();
 }
 
+async fn committed_chat_projection_is_current(
+    db: &sqlx::SqlitePool,
+    root_turn_id: &str,
+    objective: &crate::agent::objective::ObjectiveSnapshot,
+) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT 1
+         FROM chat_turn_state turn
+         JOIN objectives current ON current.id=turn.objective_id
+         WHERE turn.root_turn_id=? AND turn.objective_id=?
+           AND turn.terminal_revision=?
+           AND current.revision=? AND current.status=?
+         LIMIT 1",
+    )
+    .bind(root_turn_id)
+    .bind(&objective.id)
+    .bind(objective.revision)
+    .bind(objective.revision)
+    .bind(objective.status.as_str())
+    .fetch_optional(db)
+    .await?
+    .is_some())
+}
+
+/// Publish a terminal Objective transition that was committed by the recovery
+/// supervisor outside any foreground Chat run. The durable transaction is the
+/// authority; this post-commit event only brings the currently-open WebView to
+/// the same state. Replaying it is safe because both projections carry the
+/// committed root/objective revision.
+pub(crate) async fn publish_committed_objective_transition(
+    app: &AppHandle,
+    objective: &crate::agent::objective::ObjectiveSnapshot,
+) -> Result<(), AppError> {
+    let session_id = objective
+        .session_id
+        .as_deref()
+        .ok_or_else(|| AppError::Other("committed Chat transition has no session".into()))?;
+    let root_turn_id = objective
+        .resume_cursor
+        .as_deref()
+        .or(objective.root_turn_id.as_deref())
+        .ok_or_else(|| AppError::Other("committed Chat transition has no root turn".into()))?;
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| AppError::Other("application state is unavailable".into()))?;
+    let pool = state.db.read().await.clone();
+    let event_name = format!("stream:{session_id}");
+    project_chat_objective(&pool, app, &event_name, root_turn_id, objective).await?;
+    if !committed_chat_projection_is_current(&pool, root_turn_id, objective).await? {
+        tracing::debug!(
+            objective_id = %objective.id,
+            objective_revision = objective.revision,
+            root_turn_id,
+            "did not publish a stale supervisor settlement after the Objective advanced"
+        );
+        return Ok(());
+    }
+    app.emit(
+        &event_name,
+        StreamEvent::TurnSettled {
+            run_instance_id: format!(
+                "objective-supervisor:{}:{}",
+                objective.id, objective.revision
+            ),
+            root_turn_id: Some(root_turn_id.to_string()),
+            objective_id: Some(objective.id.clone()),
+            status: chat_settlement_status(objective).to_string(),
+        },
+    )
+    .map_err(|error| {
+        AppError::Other(format!(
+            "failed to publish committed Chat settlement: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 /// Await the actual agent future through a JoinHandle so panics and runtime
 /// cancellation cannot disappear when the outer fire-and-forget task is
 /// detached from the command response.
@@ -3320,6 +3397,72 @@ mod tests {
         assert!(
             projection.activity_label.contains("无需补充输入"),
             "the user must be told the incident remains system-owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_terminal_projection_rejects_an_advanced_objective() {
+        use crate::agent::objective::{
+            DecisionType, ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED,
+        };
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+               id TEXT PRIMARY KEY, revision INTEGER NOT NULL, status TEXT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY, objective_id TEXT,
+               terminal_revision INTEGER
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let objective = projection_objective(
+            ObjectiveStatus::WaitingSystem,
+            DecisionType::FailedInternal,
+            Some(TECHNICAL_RECOVERY_EXHAUSTED),
+        );
+        sqlx::query("INSERT INTO objectives(id, revision, status) VALUES (?, ?, ?)")
+            .bind(&objective.id)
+            .bind(objective.revision)
+            .bind(objective.status.as_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, objective_id, terminal_revision)
+             VALUES ('root-projection', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(objective.revision)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            committed_chat_projection_is_current(&pool, "root-projection", &objective,)
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE objectives SET revision=revision+1, status='active' WHERE id=?")
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !committed_chat_projection_is_current(&pool, "root-projection", &objective,)
+                .await
+                .unwrap()
         );
     }
 
