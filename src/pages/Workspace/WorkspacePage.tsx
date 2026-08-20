@@ -222,16 +222,18 @@ export function WorkspacePage({
     (latest, message, index) => (message.role === "user" ? index : latest),
     -1,
   );
-  const currentTurnObjectiveStatus = [...messages]
+  const currentTurnActivity = [...messages]
     .slice(latestUserIndex + 1)
     .reverse()
     .find((message) => message.turnActivity?.objectiveStatus)
-    ?.turnActivity?.objectiveStatus;
+    ?.turnActivity;
+  const currentTurnObjectiveStatus = currentTurnActivity?.objectiveStatus;
   const currentTurnHasSettlement = messages
     .slice(latestUserIndex + 1)
     .some((message) => message.role === "assistant" && message.turnSettledAt != null);
   const currentTurnWasReleased = Boolean(
     currentTurnHasSettlement ||
+    currentTurnActivity?.terminalReason ||
     (currentTurnObjectiveStatus && !systemOwnsObjective(currentTurnObjectiveStatus)),
   );
   const steerActive = activeDraft
@@ -244,6 +246,7 @@ export function WorkspacePage({
   const systemHoldsTurn = useMemo(
     () =>
       messages.slice(latestUserIndex + 1).some((message) =>
+        !message.turnActivity?.terminalReason &&
         systemOwnsObjective(message.turnActivity?.objectiveStatus),
       ),
     [latestUserIndex, messages],

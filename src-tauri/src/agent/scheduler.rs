@@ -50,7 +50,7 @@ use crate::agent::hooks::{HookEvent, HookRunner};
 use crate::agent::journal;
 use crate::agent::objective::{
     CompletionArbiter, DecisionRouter, EvidenceKind, ObjectiveEvidence, ObjectiveSnapshot,
-    ObjectiveStatus, ObjectiveStore, RecoveryDomain, RouteSignal,
+    ObjectiveStatus, ObjectiveStore, RecoveryDomain, RouteSignal, TECHNICAL_RECOVERY_EXHAUSTED,
 };
 use crate::agent::subagent::{self, SubagentBrief, SubagentResult};
 use crate::agent::verification;
@@ -339,10 +339,10 @@ async fn handoff_task_to_system_recovery(
     .map_err(|apply_error| {
         AppError::Other(format!("persist task recovery decision: {apply_error:#}"))
     })?;
-    // The store bounds system-owned recovery. Once it hands the objective back
-    // to the user, projecting the task as `waiting_system` would re-arm the
-    // scheduler and rebuild the very loop the ceiling just broke.
-    if waiting.requires_user_action {
+    // The store bounds system-owned recovery. A parked incident already
+    // settles the task in the same transaction; a second waiting projection
+    // would either reopen it or lose the Objective/task atomic boundary.
+    if waiting.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED) {
         // ObjectiveStore settles the task projection in the same transaction
         // as exhaustion. A second write here would reopen a crash window.
         return Ok(waiting);
@@ -1857,7 +1857,9 @@ mod tests {
         let mut objective = objective_for_task(&pool, &task).await.unwrap();
 
         let mut handoffs = 0_i64;
-        while !objective.requires_user_action && handoffs < MAX_SIGNATURE_RECOVERY_ATTEMPTS * 4 {
+        while objective.failure_code.as_deref() != Some("technical_recovery_exhausted")
+            && handoffs < MAX_SIGNATURE_RECOVERY_ATTEMPTS * 4
+        {
             objective = handoff_task_to_system_recovery(
                 &pool,
                 &objective,
@@ -1869,7 +1871,7 @@ mod tests {
             .await
             .unwrap();
             handoffs += 1;
-            if objective.requires_user_action {
+            if objective.failure_code.as_deref() == Some("technical_recovery_exhausted") {
                 break;
             }
             sqlx::query(
@@ -1905,10 +1907,9 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(
-            objective.requires_user_action,
-            "task recovery must reach the ceiling and hand back to the user"
-        );
+        assert!(!objective.requires_user_action);
+        assert_eq!(objective.status.as_str(), "waiting_system");
+        assert_eq!(objective.decision_type.as_str(), "failed_internal");
         let remediations: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations WHERE objective_id=?")
                 .bind(&objective.id)

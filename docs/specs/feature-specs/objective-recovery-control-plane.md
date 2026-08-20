@@ -43,9 +43,9 @@
 | CF-ORC-R32 | 本原则/规格进入 Feature Specs 索引和可执行治理规则；CI 拒绝未标 superseded 的技术 retry/continue/resend 契约以及缺 Req→test 映射 | governance validator negative fixtures |
 | CF-ORC-R33 | 每个 fence 资源必须有明确的释放责任人和释放时机，不得只靠"下一次准入顺手关闭"。回合结束时必须释放该回合证据已确定的 provider episode（无未结副作用且所有 attempt 已终态）；`prepared`/`in_flight`/`streaming`/`unknown` 或存在未结副作用时保持关闭，交由 supervisor 观察 | 回合结算释放测试 + 不确定证据保持 fenced 的负例 |
 | CF-ORC-R34 | 只读 bash 探查（含 `&&`/`;`/管道/丢弃型重定向的复合命令）不得被判定为需要观察契约的外部变更；判定按 segment 逐段进行，任一段不在只读白名单、含真实重定向、含命令替换或后台 `&` 则整条命令继续 fenced | 复合只读命令与逐段 fence 的双向单测 |
-| CF-ORC-R35 | system-owned 恢复必须有界。持久 remediation 历史按 `(objective, recovery_generation, failure_signature)` 在一次用户授权代际内累计计数，并对该代际设总量兜底；任一上限达成后不得再排下一次 observation，必须以 `technical_recovery_exhausted` 进入 typed core input 等待并结算 transport turn。计数不因 failure code 变化而重置；用户明确新输入续接 exhausted Objective 时保留同一 Objective 与全部历史、递增 `recovery_generation` 并获得一份新的有界预算；用户驱动的 remediation（`apply_recommended` 与 `resume_authorized_action`）不计入预算 | 上限/同代签名抖动/跨代续接/再次耗尽/证据门禁/权限豁免单测 + 真实 app 复现 |
+| CF-ORC-R35 | system-owned 恢复必须有界。持久 remediation 历史按 `(objective, recovery_generation, failure_signature)` 在一次系统策略代际内累计计数，并对该代际设总量兜底；任一上限达成后不得继续同策略紧密重跑，必须以 `technical_recovery_exhausted` 进入 system-owned incident pause、结算 transport turn，并等待恢复策略/能力版本变化。没有真实 `missing_inputs[]` 的技术失败不得生成 core-input request，也不得要求用户发送“继续”。用户主动 steer 可以保留同一 Objective 并开启新代际，但不是恢复该 Objective 的必要条件；用户驱动的 remediation（`apply_recommended` 与 `resume_authorized_action`）不计入预算 | 上限/同代签名抖动/system incident pause/真实输入对照/证据门禁/权限豁免单测 + 真实 app 复现 |
 | CF-ORC-R36 | `update_plan` 等只修改 CodeFactory 事务型控制面的工具保持 Mutation capability，但不得创建外部副作用 receipt；校验拒绝必须确定为未应用，plan revision、Objective side-effect latch 和后续工具准入均不得被污染 | 真实 ToolBackend + SQLite plan revision/receipt sequence |
-| CF-ORC-R37 | `technical_recovery_exhausted` 必须在同一 SQLite 事务结算 `chat_turn_state.turn_settled_at/stream_closed_at`、精确 run-control 与非终态 tool projection；Objective 保持 `waiting_core_input`，unknown receipt 保持审计真相但不得继续呈现为运行中 | ObjectiveStore fault injection + cross-process restart smoke + browser integration |
+| CF-ORC-R37 | Completion Arbiter 与 system incident pause 必须在同一 SQLite 事务写入唯一 `terminal_revision`、`visible_final_message_id/kind`、`chat_turn_state.turn_settled_at/stream_closed_at/terminal_reason/next_action`、精确 run-control 与非终态 tool projection。`technical_recovery_exhausted` 保持 `waiting_system + failed_internal + requires_user_action=false`；unknown receipt 保持审计真相但不得继续呈现为运行中。旧 revision、迟到 stream 或投影重放不得覆盖该终态元组 | ObjectiveStore fault injection + cross-process restart smoke + browser integration |
 | CF-ORC-R38 | bash 的观察契约按**效果范围**判定，不按命令是否出现在白名单里。落在本机的效果必须获得可用观察者并放行：下载到指定文件由该文件的 sha256 观察，其余本机命令由 workspace digest 观察且 replay policy 为 `never_after_dispatch`。只有效果落在本机之外（远端推送/发布/集群/其他主机/带 method 或 body 的网络写入）、目标在工作区之外的文件破坏性操作、以及后台化命令才继续 fenced；fenced 文案必须指出可达替代路径，不得只描述门禁本身 | 下载文件观察者、依赖安装放行、工作区外破坏性操作与远端写入 fenced 的双向单测 |
 | CF-ORC-R39 | 单次 root turn 内已建立的 browser session 归属已由 task/chat 唯一确定时，后续 browser 动作省略 `session_id` 必须自动续用该 session；只有零个或多个归属会话时才要求显式命名 | 单会话续用 + 跨会话不可达 + 多会话必须命名的单测 |
 
@@ -64,13 +64,13 @@ CF-ORC-R34 已经把"只读探查不是外部变更"写进规格。R38 把同一
 
 因此本条明确边界：**不能恢复的状态不属于"可恢复"，持续持有它不是持有目标，而是空转**。
 
-- 判定"无进展"的依据是同一用户授权代际内 failure signature 重复，而不是 failure code。代际内计数为累计而非连续 streak——否则中间插入一个不同的 failure code 就能把计数清零，同一条坏路径可以无限续命。跨代历史不删除；只有 exhausted 后收到真实用户新 turn 才递增代际，普通系统重试、进程重启或 permission 恢复都不能重置预算。
+- 判定"无进展"的依据是同一恢复策略代际内 failure signature 重复，而不是 failure code。代际内计数为累计而非连续 streak——否则中间插入一个不同的 failure code 就能把计数清零，同一条坏路径可以无限续命。跨代历史不删除；exhausted 后只有恢复策略/能力版本变化或用户主动 steer 才开启新代际，普通系统重试、进程重启或 permission 恢复都不能重置预算，用户消息不是系统恢复的必要条件。
 - `completion_evidence_incomplete` 明确计入：完成证据门禁驳回后重跑同一 prompt 得到同一答案，是无进展的典型形态。
-- 达到上限后的出口是 `core_input_required`（CF-ORC-R3 允许的两种回交之一），不是 `completed`／`cancelled`，因此不违反 CF-ORC-R22 的双终态约束；objective 仍然存活，用户的下一条消息以 `core_input_response` 续接同一 objective。
-- `core_input_response` 续接 exhausted Objective 时必须先持久递增 `recovery_generation`，再把同一 Objective 恢复为 `active`；新代际仍受相同 5/20 上限约束，不能因用户说“继续”永久解除熔断。
+- 达到上限后的出口是 system-owned incident pause，不是 `core_input_required`、`completed` 或 `cancelled`。Objective 仍然存活，但 transport turn 原子结算；系统只在恢复策略、产品 build、provider/tool capability 等可审计版本变化后开启新代际，不能继续支付同一条无进展模型路径。
+- 用户主动 steer exhausted Objective 时可持久递增 `recovery_generation` 并恢复同一 Objective，但系统不得把该 steer 作为必需输入或恢复前提；新代际仍受相同 5/20 上限约束。
 - 续接 turn 的持久身份是同一 Objective 的当前 `resume_cursor`；setup/settlement guard 必须接受原始 `root_turn_id` 或这个精确 cursor，不能把合法续接误判为 identity mismatch，也不能接受其他 session、Objective 或 turn。
 - 上限只约束**系统自发**的重试。用户恢复能力（`CapabilityRestored`）与用户授权权限（`resume_authorized_action`）不消耗预算。
-- 上限达成时 transport turn 必须结算并写入 `terminal_reason='technical_recovery_exhausted'`，否则界面会继续呈现"仍在恢复"而实际已无任何 observation 排队。
+- 上限达成时 transport turn 必须结算并写入 `terminal_reason='technical_recovery_exhausted'`、`next_action='await_system_recovery'` 和 system incident owner；界面停止显示当前 turn 的运行时钟，但不得显示用户输入 CTA。
 
 ## Decision Envelope
 
@@ -150,7 +150,7 @@ App 在 provider、permission、task、browser 或 delivery 等待中退出或�
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-ORC-R1..R35 与所有 superseded 规格反向追踪。
+- Spec Harness：CF-ORC-R1..R37 与所有 superseded 规格反向追踪。
 - Compatibility Harness：旧 SQLite、旧 turn/task/delivery 状态、旧 auth 错误、旧设置和历史会话 hydration。
 - Observation Harness：typed decisions、lease、owner、真实 progress、attempt、receipt 和 KPI。
 - Release Harness：PR/CI/merge、正式 artifact、安装版和 rollback。
@@ -189,7 +189,7 @@ App 在 provider、permission、task、browser 或 delivery 等待中退出或�
 
 ## Evidence Pack Requirements
 
-- Req R1..R35 的实现文件、测试文件、命令与结果追踪表。
+- Req R1..R37 的实现文件、测试文件、命令与结果追踪表。
 - SQLite migration/constraint/legacy fixture 和 objective transition journal。
 - permission/provider/task/auth/browser/delivery/release 的成功、边界与跨重启 fault receipts。
 - CodeFactoryDev 真实主路径截图/录屏，包含 system-owned、core input、business decision、completed 四态。

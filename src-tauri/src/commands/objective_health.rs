@@ -32,6 +32,9 @@ pub struct ObjectiveHealthMetrics {
     pub system_owned: i64,
     /// Open Objectives in one of the three structurally typed attention states.
     pub typed_user_attention: i64,
+    /// User-attention rows that lack the typed payload required to prove a
+    /// real core input, authorization, or irreversible business decision.
+    pub invalid_user_attention_requests: i64,
     /// Distinct Objective revisions that projected technical work to the user.
     pub technical_user_handoff_violations: i64,
     /// The same violation scoped to the trailing production-review window.
@@ -45,6 +48,9 @@ pub struct ObjectiveHealthMetrics {
     /// Completed Objective rows that do not retain the completion predicate.
     pub invalid_completions: i64,
     pub invalid_completions_24h: i64,
+    /// Chat Objectives whose terminal revision is not atomically bound to an
+    /// accepted visible final, settled turn, closed stream and run projection.
+    pub invalid_terminal_convergences: i64,
     /// Committed receipts beyond the first for one Objective/action fingerprint.
     pub duplicate_committed_side_effect_receipts: i64,
     pub duplicate_committed_side_effect_receipts_24h: i64,
@@ -121,7 +127,12 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "status",
             "decision_type",
             "domain",
+            "session_id",
+            "root_turn_id",
             "requires_user_action",
+            "action_signature",
+            "attention_request_json",
+            "failure_code",
             "recovery_owner",
             "remediation_id",
             "evidence_ref",
@@ -175,8 +186,23 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
     ),
     (
         "chat_turn_state",
-        &["objective_id", "user_reprompt_driver", "updated_at"],
+        &[
+            "objective_id",
+            "status",
+            "terminal_reason",
+            "turn_settled_at",
+            "stream_closed_at",
+            "terminal_revision",
+            "objective_revision",
+            "visible_final_message_id",
+            "visible_final_kind",
+            "next_action",
+            "user_reprompt_driver",
+            "updated_at",
+        ],
     ),
+    ("objective_incidents", &["objective_id", "status", "owner"]),
+    ("messages", &["id", "role", "completion_state"]),
     ("tool_calls", &["tool_name", "metadata", "created_at"]),
 ];
 
@@ -398,6 +424,36 @@ async fn aggregate_health(
     )
     .fetch_one(pool)
     .await?;
+    let invalid_user_attention_requests: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives
+         WHERE requires_user_action<>0 AND NOT (
+           (status='waiting_authorization'
+             AND decision_type='authorization_required'
+             AND NULLIF(TRIM(action_signature),'') IS NOT NULL) OR
+           (status='waiting_core_input' AND decision_type='core_input_required'
+             AND CASE WHEN json_valid(attention_request_json) THEN
+               json_extract(attention_request_json, '$.kind')='core_input'
+               AND NULLIF(TRIM(json_extract(attention_request_json, '$.prompt')), '') IS NOT NULL
+               AND json_array_length(attention_request_json, '$.missing_inputs')>0
+               AND json_array_length(attention_request_json, '$.attempted_routes')>0
+             ELSE 0 END) OR
+           (status='waiting_business_decision' AND decision_type='needs_business_decision'
+             AND CASE WHEN json_valid(attention_request_json) THEN
+               json_extract(attention_request_json, '$.kind')='business_decision'
+               AND NULLIF(TRIM(json_extract(attention_request_json, '$.prompt')), '') IS NOT NULL
+               AND json_array_length(attention_request_json, '$.decision_options')>=2
+               AND NULLIF(TRIM(json_extract(attention_request_json, '$.recommended_option')), '') IS NOT NULL
+               AND EXISTS (
+                 SELECT 1 FROM json_each(attention_request_json, '$.decision_options') option
+                 WHERE option.value=json_extract(attention_request_json, '$.recommended_option')
+               )
+               AND json_extract(attention_request_json, '$.irreversible')=1
+               AND NULLIF(TRIM(json_extract(attention_request_json, '$.no_safe_default_reason')), '') IS NOT NULL
+             ELSE 0 END)
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
     let overdue_ownerless_remediations: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objective_remediations
          WHERE status NOT IN ('completed','cancelled','superseded')
@@ -507,6 +563,46 @@ async fn aggregate_health(
     )
     .bind(window_start_ms)
     .bind(now_ms)
+    .fetch_one(pool)
+    .await?;
+    let invalid_terminal_convergences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives objective
+         WHERE objective.root_turn_id IS NOT NULL AND (
+           (objective.status='completed' AND NOT EXISTS (
+             SELECT 1 FROM chat_turn_state turn
+             JOIN messages message ON message.id=turn.visible_final_message_id
+             WHERE turn.objective_id=objective.id
+               AND turn.status='completed'
+               AND turn.terminal_reason='complete'
+               AND turn.turn_settled_at IS NOT NULL
+               AND turn.stream_closed_at IS NOT NULL
+               AND turn.terminal_revision=objective.revision
+               AND turn.objective_revision=objective.revision
+               AND turn.visible_final_kind='assistant_final'
+               AND message.role='assistant'
+               AND (message.completion_state IS NULL OR message.completion_state='')
+           )) OR
+           (objective.status='waiting_system'
+             AND objective.failure_code='technical_recovery_exhausted'
+             AND NOT EXISTS (
+               SELECT 1 FROM chat_turn_state turn
+               JOIN messages message ON message.id=turn.visible_final_message_id
+               JOIN objective_incidents incident ON incident.objective_id=objective.id
+               WHERE turn.objective_id=objective.id
+                 AND turn.status='waiting_system'
+                 AND turn.terminal_reason='technical_recovery_exhausted'
+                 AND turn.turn_settled_at IS NOT NULL
+                 AND turn.stream_closed_at IS NOT NULL
+                 AND turn.terminal_revision=objective.revision
+                 AND turn.objective_revision=objective.revision
+                 AND turn.visible_final_kind='system_incident'
+                 AND turn.next_action='await_system_recovery'
+                 AND message.role='assistant'
+                 AND incident.status='open'
+                 AND NULLIF(TRIM(incident.owner),'') IS NOT NULL
+             ))
+         )",
+    )
     .fetch_one(pool)
     .await?;
     let duplicate_committed_side_effect_receipts: i64 = sqlx::query_scalar(
@@ -670,6 +766,7 @@ async fn aggregate_health(
         open,
         system_owned,
         typed_user_attention,
+        invalid_user_attention_requests,
         technical_user_handoff_violations: handoff_revisions.len() as i64,
         technical_user_handoff_violations_24h,
         avoidable_user_reprompts_24h,
@@ -678,6 +775,7 @@ async fn aggregate_health(
         unavailable_domain_adapter_objectives,
         invalid_completions,
         invalid_completions_24h,
+        invalid_terminal_convergences,
         duplicate_committed_side_effect_receipts,
         duplicate_committed_side_effect_receipts_24h,
         requested_ceiling_downgrades_24h,
@@ -752,7 +850,12 @@ mod tests {
                 status TEXT NOT NULL,
                 decision_type TEXT NOT NULL,
                 domain TEXT NOT NULL DEFAULT 'chat',
+                session_id TEXT,
+                root_turn_id TEXT,
                 requires_user_action INTEGER NOT NULL,
+                action_signature TEXT,
+                attention_request_json TEXT,
+                failure_code TEXT,
                 recovery_owner TEXT,
                 remediation_id TEXT,
                 evidence_ref TEXT,
@@ -800,8 +903,27 @@ mod tests {
              );
              CREATE TABLE chat_turn_state (
                 objective_id TEXT,
+                status TEXT,
+                terminal_reason TEXT,
+                turn_settled_at INTEGER,
+                stream_closed_at INTEGER,
+                terminal_revision INTEGER,
+                objective_revision INTEGER,
+                visible_final_message_id TEXT,
+                visible_final_kind TEXT,
+                next_action TEXT,
                 user_reprompt_driver TEXT,
                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE objective_incidents (
+                objective_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                owner TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                completion_state TEXT
              );
              CREATE TABLE tool_calls (
                 tool_name TEXT NOT NULL,
@@ -942,6 +1064,7 @@ mod tests {
         assert_eq!(metrics.open, 0);
         assert_eq!(metrics.system_owned, 0);
         assert_eq!(metrics.typed_user_attention, 0);
+        assert_eq!(metrics.invalid_user_attention_requests, 0);
         assert_eq!(metrics.technical_user_handoff_violations, 0);
         assert_eq!(metrics.technical_user_handoff_violations_24h, 0);
         assert_eq!(metrics.avoidable_user_reprompts_24h, 0);
@@ -950,6 +1073,7 @@ mod tests {
         assert_eq!(metrics.unavailable_domain_adapter_objectives, 0);
         assert_eq!(metrics.invalid_completions, 0);
         assert_eq!(metrics.invalid_completions_24h, 0);
+        assert_eq!(metrics.invalid_terminal_convergences, 0);
         assert_eq!(metrics.duplicate_committed_side_effect_receipts, 0);
         assert_eq!(metrics.duplicate_committed_side_effect_receipts_24h, 0);
         assert_eq!(metrics.requested_ceiling_downgrades_24h, 0);
@@ -961,6 +1085,55 @@ mod tests {
         assert_eq!(metrics.recovered_objectives_24h, 0);
         assert_eq!(metrics.recovery_latency_p50_ms_24h, None);
         assert_eq!(metrics.recovery_latency_p95_ms_24h, None);
+    }
+
+    #[tokio::test]
+    async fn missing_attention_payload_and_split_terminal_tuple_are_release_visible() {
+        let pool = pool().await;
+        install_health_schema(&pool).await;
+        insert_objective(
+            &pool,
+            "attention-without-proof",
+            2,
+            "waiting_core_input",
+            "core_input_required",
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        insert_objective(
+            &pool,
+            "completed-without-terminal-tuple",
+            3,
+            "completed",
+            "complete",
+            false,
+            None,
+            None,
+            Some("evidence:answer"),
+            Some("answer"),
+            Some(NOW_MS),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE objectives SET session_id='session-terminal',
+             root_turn_id='turn-terminal'
+             WHERE id='completed-without-terminal-tuple'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let metrics = query_objective_health(&pool, NOW_MS)
+            .await
+            .metrics
+            .expect("available metrics");
+        assert_eq!(metrics.invalid_user_attention_requests, 1);
+        assert_eq!(metrics.invalid_terminal_convergences, 1);
     }
 
     #[tokio::test]
@@ -1151,6 +1324,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0018_objective_terminal_convergence.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("ALTER TABLE chat_turn_state ADD COLUMN user_reprompt_driver TEXT")
             .execute(&pool)
             .await
@@ -1163,6 +1342,11 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("ALTER TABLE messages ADD COLUMN completion_state TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
 
         let snapshot = query_objective_health(&pool, NOW_MS).await;
         assert_eq!(

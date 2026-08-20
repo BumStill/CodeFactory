@@ -165,7 +165,10 @@ pub fn run_unattended_long_task_smoke_cli() -> bool {
                 Ok(receipt) => {
                     let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
                     if let Err(error) = std::fs::write(&output, rendered.as_bytes()) {
-                        eprintln!("Unattended smoke could not write {}: {error}", output.display());
+                        eprintln!(
+                            "Unattended smoke could not write {}: {error}",
+                            output.display()
+                        );
                         std::process::exit(1);
                     }
                     println!("{rendered}");
@@ -197,9 +200,7 @@ pub fn run_unattended_long_task_smoke_cli() -> bool {
                 std::process::exit(2);
             });
             if let Err(error) = runtime.block_on(agent::unattended_smoke::run_worker(
-                &state_dir,
-                &args[3],
-                phase,
+                &state_dir, &args[3], phase,
             )) {
                 eprintln!("Unattended long-task worker failed: {error}");
                 std::process::exit(1);
@@ -778,6 +779,15 @@ pub fn run() {
                 tracing::info!(
                     count = recovered_exhausted_reprompts,
                     "startup: resumed user messages swallowed by the exhausted recovery ceiling"
+                );
+            }
+            let reclassified_technical_handbacks = tauri::async_runtime::block_on(
+                objective_store.reclassify_synthetic_technical_handbacks(),
+            )?;
+            if reclassified_technical_handbacks > 0 {
+                tracing::info!(
+                    count = reclassified_technical_handbacks,
+                    "startup: reclassified synthetic technical handbacks as system-owned incidents"
                 );
             }
             let provider_recoveries = tauri::async_runtime::block_on(

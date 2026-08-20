@@ -172,7 +172,7 @@ describe("chat tool call stream events", () => {
     },
   );
 
-  it("terminalizes transient tools when durable recovery hands the turn back", () => {
+  it("terminalizes transient tools when a durable system incident settles the turn", () => {
     const waiting: ChatEventState = {
       ...baseState(),
       messages: [{
@@ -187,33 +187,50 @@ describe("chat tool call stream events", () => {
       }],
     };
 
-    const handedBack = reduceChatStreamEvent(
+    const settledIncident = reduceChatStreamEvent(
       waiting,
       {
         type: "turn_activity_updated",
         root_turn_id: "root-handback",
         revision: 9,
         phase: "waiting",
-        status: "waiting_core_input",
+        status: "waiting_system",
         recent_activity_kind: "technical_recovery_exhausted",
-        recent_activity_label: "系统已停止并把当前结论交还给你",
+        recent_activity_label: "系统已登记故障，无需补充输入",
         waiting_reason: "technical_recovery_exhausted",
         updated_at: 9,
         terminal_reason: "technical_recovery_exhausted",
         objective_id: "objective-handback",
-        objective_status: "waiting_core_input",
+        objective_status: "waiting_system",
       },
       "assistant-1",
     );
 
-    expect(handedBack.streaming).toBe(false);
-    expect(handedBack.messages[0].toolCalls?.[0]).toMatchObject({
+    expect(settledIncident.streaming).toBe(false);
+    expect(settledIncident.messages[0].toolCalls?.[0]).toMatchObject({
       status: "blocked",
       isError: false,
     });
-    expect(handedBack.messages[0].toolCalls?.[0]?.result).not.toContain(
+    expect(settledIncident.messages[0].toolCalls?.[0]?.result).not.toContain(
       "external_state_uncertain",
     );
+
+    const settledEvent = reduceChatStreamEvent(
+      waiting,
+      {
+        type: "turn_settled",
+        run_instance_id: "run-handback",
+        root_turn_id: "root-handback",
+        objective_id: "objective-handback",
+        status: "system_incident",
+      },
+      "assistant-1",
+    );
+    expect(settledEvent.messages[0].turnSettledAt).toBeDefined();
+    expect(settledEvent.messages[0].toolCalls?.[0]).toMatchObject({
+      status: "blocked",
+      isError: false,
+    });
   });
 
   it("marks the tool card cancelled and clears pending permission", () => {

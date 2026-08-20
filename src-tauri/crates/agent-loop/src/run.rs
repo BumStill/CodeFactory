@@ -540,6 +540,11 @@ pub async fn finish_cancelled_tool_batch(
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
     pub final_text: String,
+    /// Exact persisted assistant row that produced `final_text`. Completion
+    /// settlement binds this identity to the terminal Objective revision so a
+    /// newer tool-call draft or an older provisional answer cannot become the
+    /// visible final by row ordering alone.
+    pub final_message_id: Option<String>,
     pub completion_evidence: CompletionEvidence,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -720,6 +725,7 @@ pub async fn run_agent_loop(
     let mut total_input_tokens = 0_u64;
     let mut total_output_tokens = 0_u64;
     let mut last_final_text = String::new();
+    let mut last_final_message_id: Option<String> = None;
     // Sticky across all provider rounds in this run. `last_final_text` only
     // tracks a terminal prose candidate; earlier assistant text paired with a
     // tool call is still output and makes a blind Context replay unsafe.
@@ -1245,6 +1251,7 @@ pub async fn run_agent_loop(
             if tool_calls.is_empty() {
                 if blocker_summary_round {
                     last_final_text = text.clone();
+                    last_final_message_id = assistant_message_id.clone();
                     publish_turn_activity(
                         persistence.as_ref(),
                         events.as_ref(),
@@ -1271,6 +1278,7 @@ pub async fn run_agent_loop(
                 }
                 if structural_denial_seen {
                     last_final_text = text.clone();
+                    last_final_message_id = assistant_message_id.clone();
                     publish_turn_activity(
                         persistence.as_ref(),
                         events.as_ref(),
@@ -1416,6 +1424,7 @@ pub async fn run_agent_loop(
                     }
                 }
                 last_final_text = text.clone();
+                last_final_message_id = assistant_message_id.clone();
                 if matches!(terminal_stop_reason, Some(StopReason::FailedInternal)) {
                     publish_turn_activity(
                         persistence.as_ref(),
@@ -2517,7 +2526,7 @@ pub async fn run_agent_loop(
                 &last_final_text,
             ));
         }
-        persistence
+        let checkpoint_message_id = persistence
             .persist_message(
                 "assistant",
                 &checkpoint_text,
@@ -2540,7 +2549,7 @@ pub async fn run_agent_loop(
             .await?;
         messages.push(crate::types::ChatMessage {
             role: "assistant".into(),
-            content: crate::types::MessageContent::Text(checkpoint_text),
+            content: crate::types::MessageContent::Text(checkpoint_text.clone()),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -2549,6 +2558,8 @@ pub async fn run_agent_loop(
 
         match checkpoint_decision {
             crate::policy::SegmentCheckpointDecision::Complete => {
+                last_final_text = checkpoint_text.clone();
+                last_final_message_id = checkpoint_message_id;
                 events.emit(crate::types::StreamEvent::Done {
                     input_tokens: checkpoint_usage
                         .as_ref()
@@ -2655,12 +2666,14 @@ pub async fn run_agent_loop(
     } else {
         StopReason::IterationCeiling
     });
-    Ok(run_outcome_for_terminal(
+    let mut outcome = run_outcome_for_terminal(
         &completion_gate,
         stop_reason,
         (total_input_tokens, total_output_tokens),
         &last_final_text,
-    ))
+    );
+    outcome.final_message_id = last_final_message_id;
+    Ok(outcome)
 }
 
 /// The `RunOutcome` for a terminal. The desktop adapter discards it (it already
@@ -2674,6 +2687,7 @@ fn run_outcome_for_terminal(
 ) -> RunOutcome {
     RunOutcome {
         final_text: final_text.to_string(),
+        final_message_id: None,
         completion_evidence: gate.evidence(),
         input_tokens: tokens.0,
         output_tokens: tokens.1,

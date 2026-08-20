@@ -41,7 +41,7 @@
 | CF-SCC-R33 | 同一 root turn 首次达到 40 次工具调用时只持久化并展示 1 次放大风险提醒，并在下一模型轮注入 1 次收敛提示；计数本身不得强行取消、阻断、完成或扩大 capability | scripted 41-call loop + persistence/event assertions |
 | CF-SCC-R34 | 长等待心跳与放大提醒必须在 anonymous/headless/desktop surface 保持既有隐私和兼容语义；旧数据库无需 schema 迁移，reload 只恢复最后活动快照和去重后的 notice | compatibility + hydration + privacy negative assertions |
 | CF-SCC-R35 | 命令开头的精确 strict-mode 前导（`set -e/-u/-o pipefail/-eu/-euo pipefail`）不改变后续逐段只读分类；任意其他 `set`、命令替换、真实重定向、后台执行或 writer 仍必须 fenced | production command-shape positive/negative classifier tests |
-| CF-SCC-R36 | 同一当前回合的 durable `waiting_core_input` handback 必须压过 stale `streaming=true`：composer 回到发送、进度/ETA/停止态消失，waiting/running/permission 工具收敛为可见终态；真实 system-owned running 对照不得被误隐藏 | reducer + Workspace + real-browser production-component gate |
+| CF-SCC-R36 | 同一当前回合的 durable terminal tuple（业务终态、真实用户门禁或 system incident pause）必须压过 stale `streaming=true`：composer 回到发送、进度/ETA/停止态消失，waiting/running/permission 工具收敛为可见终态；`technical_recovery_exhausted` 不得投影成 core-input CTA，真实 system-owned running 对照不得被误隐藏 | reducer + Workspace + real-browser production-component gate |
 
 ## Primary User Paths
 

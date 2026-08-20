@@ -242,10 +242,10 @@ export function reduceChatStreamEvent(
       };
 
     case "turn_activity_updated": {
-      const releasedToUser = event.objective_status === "waiting_core_input";
+      const transportSettled = event.terminal_reason != null;
       return {
         ...state,
-        ...(releasedToUser ? { streaming: false, pendingPermission: null } : {}),
+        ...(transportSettled ? { streaming: false, pendingPermission: null } : {}),
         messages: updateMessageById(state.messages, msgId, (message) => {
           if (
             message.turnActivity &&
@@ -272,7 +272,7 @@ export function reduceChatStreamEvent(
               lastProgressAt: event.last_progress_at ?? null,
             },
           };
-          return releasedToUser ? terminalizeTransientTools(projected) : projected;
+          return transportSettled ? terminalizeTransientTools(projected) : projected;
         }),
       };
     }
@@ -428,6 +428,7 @@ export function reduceChatStreamEvent(
           const terminalForTurn =
             event.status === "completed" ||
             event.status === "cancelled" ||
+            event.status === "system_incident" ||
             event.status === "failed_setup" ||
             waitingUserReleased;
           const settled = message.durationMs == null

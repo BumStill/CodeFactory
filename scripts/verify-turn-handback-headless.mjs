@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
-// Real-browser gate for turn handback: once the objective settles into
-// waiting_core_input the progress banner must be gone from the layout, and no
-// internal reason code may reach the screen. A turn that is genuinely running
-// must keep its banner, so the fix cannot pass by suppressing everything.
+// Real-browser gate for terminal convergence: once technical recovery is parked
+// as a system-owned incident the progress banner must be gone from the layout,
+// no internal reason code may reach the screen, and no user-input CTA may be
+// fabricated. A genuinely running turn must keep its banner.
 
 import { spawn, spawnSync } from "node:child_process";
 import { access, mkdir, rm } from "node:fs/promises";
@@ -91,39 +91,47 @@ async function main() {
     browser = await chromium.launch({ executablePath, headless: true, args: ["--disable-gpu", "--no-sandbox"] });
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
     await page.goto(baseUrl, { waitUntil: "networkidle" });
-    await page.getByRole("main", { name: "Turn handback acceptance" }).waitFor({ timeout: 10_000 });
+    await page.getByRole("main", { name: "Turn terminal convergence acceptance" }).waitFor({ timeout: 10_000 });
 
-    const handedBack = page.getByRole("region", { name: "Handed back to the user" });
+    const incident = page.getByRole("region", { name: "System-owned incident" });
     const running = page.getByRole("region", { name: "Still running" });
-    await handedBack.waitFor();
+    await incident.waitFor();
     await running.waitFor();
 
     assert(
-      (await handedBack.getByTestId("turn-progress").count()) === 0
-        && (await handedBack.getByTestId("turn-activity-progress").count()) === 0,
-      "a turn handed back to the user must not keep a progress banner on screen",
+      (await incident.getByTestId("turn-progress").count()) === 0
+        && (await incident.getByTestId("turn-activity-progress").count()) === 0,
+      "a parked system incident must not keep a progress banner on screen",
     );
     assert(
-      (await handedBack.getByText(/下一步 · /).count()) === 0,
-      "a handed-back turn must not advertise a next step",
+      (await incident.getByText(/下一步 · /).count()) === 0,
+      "a parked system incident must not advertise an executing next step",
     );
     assert(
-      (await handedBack.getByText(/预计还需/).count()) === 0,
-      "a handed-back turn must not quote a remaining time",
+      (await incident.getByText(/预计还需/).count()) === 0,
+      "a parked system incident must not quote a remaining time",
     );
     assert(
-      !(await handedBack.textContent() ?? "").includes("technical_recovery_exhausted"),
+      !(await incident.textContent() ?? "").includes("technical_recovery_exhausted"),
       "the internal reason code must never reach the screen",
     );
     assert(
-      (await handedBack.getByRole("button", { name: "发送" }).count()) === 1
-        && (await handedBack.getByRole("button", { name: "停止后续生成" }).count()) === 0,
-      "handback must restore the real composer to Send instead of Stop",
+      (await incident.getByRole("button", { name: "发送" }).count()) === 1
+        && (await incident.getByRole("button", { name: "停止后续生成" }).count()) === 0,
+      "a settled incident must restore the composer to Send instead of Stop",
     );
     assert(
-      (await handedBack.getByLabel("已阻断").count()) === 1
-        && !(await handedBack.textContent() ?? "").includes("等待远端"),
+      (await incident.getByLabel("已阻断").count()) === 1
+        && !(await incident.textContent() ?? "").includes("等待远端"),
       "the waiting tool must remain visible as blocked without a live clock",
+    );
+    const incidentText = await incident.textContent() ?? "";
+    assert(
+      incidentText.includes("已登记为系统故障")
+        && incidentText.includes("你不需要补充输入")
+        && !incidentText.includes("请提供")
+        && !incidentText.includes("请继续"),
+      `technical exhaustion must explain system ownership without fabricating a user-input gate; rendered=${JSON.stringify(incidentText)}`,
     );
 
     const runningBanner = running.getByTestId("turn-progress");
@@ -151,11 +159,11 @@ async function main() {
       "a durable long-running tool must render exactly one executing status/clock receipt",
     );
     assert(
-      (await handedBack.getByTestId("inline-turn-status").count()) === 0,
-      "the inline running receipt must disappear after handback",
+      (await incident.getByTestId("inline-turn-status").count()) === 0,
+      "the inline running receipt must disappear after terminal convergence",
     );
     assert(
-      (await handedBack.getByTestId("settled-turn-status").textContent() ?? "").trim()
+      (await incident.getByTestId("settled-turn-status").textContent() ?? "").trim()
         === "已结束 · 12K tokens · 09:00",
       "a settled turn must retain one completed token/time receipt",
     );
@@ -183,8 +191,9 @@ async function main() {
       status: "pass",
       artifactDir,
       checks: {
-        handedBackTurnRetiresTheBanner: true,
-        handedBackTurnQuotesNoRemainingTime: true,
+        systemIncidentRetiresTheBanner: true,
+        systemIncidentQuotesNoRemainingTime: true,
+        systemIncidentRequestsNoUserInput: true,
         internalReasonCodeNeverRendered: true,
         composerReturnsToSend: true,
         waitingToolBecomesBlocked: true,
