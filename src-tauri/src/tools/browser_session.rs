@@ -44,6 +44,7 @@ static LOCAL: Lazy<ChromiumDriver> = Lazy::new(ChromiumDriver::new);
 pub static BRIDGE: Lazy<Arc<ExtensionBridge>> = Lazy::new(|| Arc::new(ExtensionBridge::new()));
 
 const LEASE_TTL: Duration = Duration::from_secs(20 * 60);
+const ATTACH_RECONNECT_GRACE: Duration = Duration::from_secs(6);
 
 fn recovery_digest(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
@@ -694,6 +695,14 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         });
     }
     let output = dispatch(&args, ctx, &session_id, session_kind, authorizer).await;
+    let output = retry_attached_transport_once(
+        session_kind,
+        &args.action,
+        output,
+        |deadline| BRIDGE.wait_until_connected(deadline),
+        || dispatch(&args, ctx, &session_id, session_kind, authorizer),
+    )
+    .await;
     match output {
         Ok(output) => {
             if args.action == "close" {
@@ -768,8 +777,35 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                     "recoverable": true,
                 })));
             }
-            // Any surfaced error closes the owned session, so a caller that
-            // aborts the turn cannot leak a browser process.
+            if preserve_attached_lease_after_error(&args.action, session_kind) {
+                let transport_error = is_extension_transport_error(&error);
+                if transport_error {
+                    if let Some(mut lease) = read_leases()
+                        .into_iter()
+                        .find(|lease| lease.session_id == session_id)
+                    {
+                        lease.status = if BRIDGE.connected().await {
+                            "active".into()
+                        } else {
+                            "reconnecting".into()
+                        };
+                        lease.updated_at_unix_secs = now_secs();
+                        write_lease(&lease);
+                    }
+                }
+                return Ok(ToolOutput::err(error).with_metadata(json!({
+                    "code": if transport_error {
+                        "browser_extension_transport_failed"
+                    } else {
+                        "browser_extension_command_rejected"
+                    },
+                    "recoverable": transport_error,
+                    "session_preserved": true,
+                    "session_id": session_id,
+                })));
+            }
+            // Managed-browser and lifecycle errors close the owned session, so
+            // a caller that aborts the turn cannot leak a browser process.
             shutdown(&session_id, session_kind).await;
             remove_lease(&session_id);
             if args.action == "attach" {
@@ -791,8 +827,52 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
 fn attach_blocked_guidance(error: &str) -> String {
     format!(
-        "还没有连上你的浏览器。请在「设置 → 浏览器会话」里按步骤安装 CodeFactory 扩展并填入配对码；这是访问当前浏览器所需的一次性授权，任务状态已保留。\n{error}"
+        "还没有连上你的浏览器。请在「设置 → 浏览器会话」里准备并加载 CodeFactory 扩展；配对信息会自动写入，不需要手动填写。任务状态已保留，扩展连上后会自动恢复。\n{error}"
     )
+}
+
+fn preserve_attached_lease_after_error(action: &str, kind: BrowserSessionKind) -> bool {
+    kind == BrowserSessionKind::AttachedChrome && !matches!(action, "attach" | "close")
+}
+
+fn is_extension_transport_error(error: &str) -> bool {
+    [
+        "browser extension isn't connected",
+        "browser extension connection dropped",
+        "browser extension disconnected before replying",
+        "browser did not reply within",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+async fn retry_attached_transport_once<Wait, WaitFuture, Retry, RetryFuture>(
+    kind: BrowserSessionKind,
+    action: &str,
+    first: std::result::Result<String, String>,
+    wait_for_connection: Wait,
+    retry: Retry,
+) -> std::result::Result<String, String>
+where
+    Wait: FnOnce(Duration) -> WaitFuture,
+    WaitFuture: std::future::Future<Output = bool>,
+    Retry: FnOnce() -> RetryFuture,
+    RetryFuture: std::future::Future<Output = std::result::Result<String, String>>,
+{
+    let error = match first {
+        Ok(output) => return Ok(output),
+        Err(error) => error,
+    };
+    if kind != BrowserSessionKind::AttachedChrome
+        || !matches!(action, "tabs" | "read" | "find" | "snapshot")
+        || !is_extension_transport_error(&error)
+    {
+        return Err(error);
+    }
+    if !wait_for_connection(ATTACH_RECONNECT_GRACE).await {
+        return Err(error);
+    }
+    retry().await
 }
 
 /// Actions whose output came from a web page, and therefore must be labelled
@@ -885,7 +965,7 @@ async fn dispatch(
     match (kind, args.action.as_str()) {
         // ── The user's own browser, through the extension ──────────────────
         (_, "attach") => {
-            if !BRIDGE.connected().await {
+            if !BRIDGE.wait_until_connected(ATTACH_RECONNECT_GRACE).await {
                 return Err("browser_pairing_required".into());
             }
             authorizer.authorize().await.map_err(to_message)?;
@@ -1412,12 +1492,84 @@ mod tests {
     fn attach_failure_requests_only_the_required_pairing_authorization() {
         let message = attach_blocked_guidance("extension bridge unavailable");
 
-        assert!(message.contains("安装 CodeFactory 扩展并填入配对码"));
-        assert!(message.contains("访问当前浏览器所需的一次性授权"));
+        assert!(message.contains("准备并加载 CodeFactory 扩展"));
+        assert!(message.contains("不需要手动填写"));
         assert!(message.contains("任务状态已保留"));
+        assert!(message.contains("自动恢复"));
         assert!(message.contains("extension bridge unavailable"));
         assert!(!message.contains("重试"));
         assert!(!message.contains("继续执行"));
+    }
+
+    #[test]
+    fn a_transient_extension_command_error_preserves_the_attached_session() {
+        for action in ["tabs", "select_tab", "read", "find", "snapshot"] {
+            assert!(
+                preserve_attached_lease_after_error(action, BrowserSessionKind::AttachedChrome),
+                "{action} must keep the selected tab and session identity"
+            );
+        }
+        for semantic_error in ["click", "fill", "press", "screenshot"] {
+            assert!(
+                preserve_attached_lease_after_error(
+                    semantic_error,
+                    BrowserSessionKind::AttachedChrome
+                ),
+                "{semantic_error} rejection must not detach the user's browser"
+            );
+        }
+        assert!(!preserve_attached_lease_after_error(
+            "attach",
+            BrowserSessionKind::AttachedChrome
+        ));
+        assert!(!preserve_attached_lease_after_error(
+            "close",
+            BrowserSessionKind::AttachedChrome
+        ));
+        assert!(!preserve_attached_lease_after_error(
+            "read",
+            BrowserSessionKind::Managed
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_attached_transport_drop_gets_one_system_owned_retry() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let output = retry_attached_transport_once(
+            BrowserSessionKind::AttachedChrome,
+            "read",
+            Err("The browser extension disconnected before replying".into()),
+            |_| async { true },
+            || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok("page recovered".into())
+            },
+        )
+        .await;
+
+        assert_eq!(output.expect("retry succeeds"), "page recovered");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let semantic = retry_attached_transport_once(
+            BrowserSessionKind::AttachedChrome,
+            "read",
+            Err("Could not extract readable content from that tab".into()),
+            |_| async { true },
+            || async {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok("must not replay".into())
+            },
+        )
+        .await;
+        assert!(
+            semantic.is_err(),
+            "semantic failures are not transport retries"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        assert!(is_extension_transport_error(
+            "The browser did not reply within 20s — the tab may be busy or closed"
+        ));
     }
 
     fn lease_for(session_id: &str, owner_session: Option<&str>) -> Lease {
@@ -1463,11 +1615,8 @@ mod tests {
         let mut ctx = ExecCtx::new(std::env::temp_dir(), None);
         ctx.session_id = Some("chat-1".into());
 
-        let none = sole_owned_lease(
-            vec![lease_for("codefactory-other", Some("chat-2"))],
-            &ctx,
-        )
-        .expect_err("another chat's browser is not reachable by omission");
+        let none = sole_owned_lease(vec![lease_for("codefactory-other", Some("chat-2"))], &ctx)
+            .expect_err("another chat's browser is not reachable by omission");
         assert!(none.contains("no open session here"));
 
         let ambiguous = sole_owned_lease(

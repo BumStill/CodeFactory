@@ -37,6 +37,30 @@ CodeFactory 有两条读取网页的路径：**用户自己的浏览器**（扩�
 | CF-BP-R15 | 扩展 service worker 每次连接都重读 `pairing.json`（`cache: no-store`），不使用缓存值；文件不可用时回退到手工填写的值，手工值不得覆盖 App 写入的实时值 | `extension/background.js` | unit |
 | CF-BP-R16 | 设置页一键完成「准备扩展」，并提供打开 Chrome 扩展页、打开扩展目录、复制目录路径；已连接后不再展示安装步骤 | `SettingsPage` | component |
 | CF-BP-R17 | 手动配对入口保留但折叠，用于 App 无法写入的扩展副本（商店安装） | `SettingsPage` + `extension/options.*` | component |
+| CF-BP-R19 | 每个已鉴权 WebSocket 必须有单调递增的 connection generation；旧连接的 close/reply 只能结算自己的 pending，不能清除或回答新连接；多浏览器 profile 接管必须以带原因的 `4001/superseded` Close 把 loser 转入持久 standby，standby alarm probe 不得驱逐健康 winner，winner 退出后 probe 才可接管 | `browser::extension` + `extension/background.js` | real loopback integration + fake-clock unit |
+| CF-BP-R20 | MV3 扩展在连接健康期间必须以 `<30s` 间隔发送 heartbeat；支持 `ready` 的 App 必须按同一 generation 回 ACK，authenticated 模式连续 40 秒无 ACK 时扩展主动关闭半开 socket；旧 App 的 legacy 模式继续发 keepalive 但不得因其没有 ACK 而自断；重连退避上限不得超过 5 秒 | `browser::extension` + `extension/background.js` | fake-clock unit + loopback integration + native lifecycle smoke |
+| CF-BP-R21 | 扩展只有收到 bridge 鉴权成功信号后才能显示「已连接」；WebSocket open、TCP accept 或端口可监听都不是健康证据 | `browser::extension` + `extension/background.js` | unit + integration |
+| CF-BP-R22 | `browser_session.attach` 必须给已安装扩展一个有界自动重连窗口；窗口内恢复不得转成新的用户配对请求 | `tools::browser_session` | integration |
+| CF-BP-R23 | 已建立的 attached session 遇到 `tabs/read/find/snapshot` 明确 transport 瞬断或命令超时时必须保留 session identity、selected tab、owner 与 lease；命令超时必须立即驱逐半开 connection generation，并在 6 秒窗口内等待重连、只重放一次只读调用；参数/页面语义错误不得冒充 transport recovery | `browser::extension` + `tools::browser_session` | real loopback integration + unit + SQLite/tool integration |
+| CF-BP-R24 | 设置页轮询必须串行，慢于 5 秒的响应仍可结算；从健康态收到一次 `connected=false` 只投影为「重连中」并保留安装完成态，连续两次负结果才投影「未连接」 | `SettingsPage` | component |
+
+## 扩展连接可靠性状态机
+
+```text
+unpaired -> connecting -> authorized_healthy
+               |                |
+               v                v
+            refused         reconnecting
+                                |
+                                +----> authorized_healthy
+```
+
+- `connecting`：已经读到有效 pairing 并开始拨号，但尚未通过 origin/token/protocol 鉴权。
+- `authorized_healthy`：bridge 已分配 connection generation，扩展收到 ready，heartbeat 发送 gap 小于 30 秒且 ACK 未超过 40 秒，命令可路由到该 generation。兼容旧 App 时标记为 `legacy`，继续发 keepalive，但不把缺少新协议 ACK 判成半开。
+- `reconnecting`：已安装、已配对但 transport 暂时中断；这不是 `unpaired`，不得要求用户重新安装、复制配对码或发送「继续」。
+- `refused`：token、origin 或 protocol 明确不匹配；只有这个状态才需要修复配对/版本。
+
+健康转换必须由同一 generation 的事件驱动。A 被 B 替换后，A 的迟到 close、reply、error 和 UI poll 均不得修改 B 的状态。
 
 ## Primary User Path
 
@@ -80,11 +104,18 @@ CodeFactory 有两条读取网页的路径：**用户自己的浏览器**（扩�
 | token 持久化；损坏配对文件被拒 | unit | `browser::extension::tests` |
 | 扩展从 `pairing.json` 取配对、不用缓存、无文件时回退手工值、手工值不覆盖实时值、坏文件不拨号 | unit | `src/lib/browserExtension.test.ts` |
 | 设置页调用 prepare、不再出现 `pnpm ext:build`、复制路径、打开扩展页/目录、无 Chrome 时的说明、已连接后收起步骤 | component | `SettingsPage.browser.test.tsx` |
-| 真实 Chrome 里仅靠 `pairing.json` 完成握手并读到真实页面 | 真实浏览器 e2e | `scripts/verify-extension-bridge.mjs` |
+| 真实 Chrome 里仅靠 `pairing.json` 完成一次握手并读页 | legacy diagnostic（非正式 gate；未持有原生 lease） | `scripts/verify-extension-bridge.mjs` |
+| A 连接被 B 替换后，A 迟到关闭不清除 B；A 的在途 pending 立即取消，新 generation 的 pending 不受影响；A 转 standby 后的 alarm probe 不驱逐 B，B 退出后 A probe 可接管 | real loopback integration + fake-clock unit | `browser::extension::tests` + `src/lib/browserExtension.test.ts` |
+| 鉴权前不显示 connected；20 秒 heartbeat/同 generation ACK；authenticated 40 秒无 ACK 主动关闭；legacy 120 秒无 ACK 不自断；拒绝状态不被 close 覆盖 | fake-clock unit + loopback integration | `src/lib/browserExtension.test.ts` + `browser::extension::tests` |
+| attached session 明确 transport 瞬断或命令超时后等待 6 秒并只重放一次只读调用；超时 generation 立即失活；语义错误不重放且 lease identity 保留 | real loopback integration + unit | `browser::extension::tests` + `tools::browser_session::tests` |
+| 轮询串行接受慢响应；一次负结果显示重连中，连续两次才显示未连接 | component | `SettingsPage.browser.test.tsx` |
+| 空闲 120 秒、强制断 socket、App 重启、第二实例交错退出后仍可 `attach → tabs → select_tab → read` | L2 native smoke | `--browser-extension-lifecycle-smoke`（待实现） |
 
 ## Evidence Pack Requirements
 
 - 不接受「UI 显示已连接」「命令返回 200」作为完成证据。扩展路径必须有真实浏览器握手记录（`chrome-extension://…` origin + 真实页面抽取内容）。
+- 稳定性验收还必须记录 connection generation、最大 heartbeat gap、断线/重连时间线、同一 lease/session/tab identity 和重连后的真实 `read`；一次 happy-path 读页不能替代该证据。
+- 正式 L2/L4 不得由直接 spawn Chrome 的脚本提供；必须迁移到 CodeFactory 原生测试入口，为 profile、进程、session、task lease 和所有退出路径留下同一 receipt。
 - 受管浏览器路径必须有安装后 `install::detect` 认可、且二进制可执行的记录。
 - Windows 权限行为若未在 Windows 实机验证，必须在交付说明中显式写出未验证场景与原因，不得默认通过。
 

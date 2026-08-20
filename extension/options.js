@@ -15,6 +15,7 @@ const STATUS_TEXT = {
   connecting: "正在连接 CodeFactory…",
   not_paired: "还没拿到配对信息。请确认 CodeFactory 正在运行,或在下面手动填入。",
   disconnected: "未连接。请确认 CodeFactory 正在运行——它启动后这里会自动恢复。",
+  standby: "待机中 — 另一个浏览器配置正在连接 CodeFactory；当前配置会定期探测并在对方退出后接管。",
   refused: "被拒绝。配对码可能已更换 — CodeFactory 运行时会自动更新,稍等一下。",
   error: "连接出错。请确认 CodeFactory 正在运行。",
 };
@@ -67,7 +68,12 @@ document.getElementById("save").addEventListener("click", async () => {
     return;
   }
 
-  await chrome.storage.local.set({ port, token, status: "disconnected" });
+  await chrome.storage.local.set({
+    port,
+    token,
+    status: "disconnected",
+    bridgeStandby: false,
+  });
   document.getElementById("status").textContent = "已保存,正在连接…";
 });
 

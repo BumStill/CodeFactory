@@ -36,6 +36,8 @@ CodeFactory 现有测试数量很多，但场景分散在 Rust 测试、Vitest�
 | CF-STG-R14 | 增量约束、失败修复、PR/CI/merge/artifact 必须保持同一交付身份 | `E2E-004` |
 | CF-STG-R15 | 浏览器失败必须证明进程树和租约回收，不得只断言命令返回 | `E2E-005` |
 | CF-STG-R16 | 自动更新必须覆盖历史卡住 objective、旧进程锁和首次启动 reconciliation | `E2E-006` |
+| CF-STG-R17 | 浏览器扩展稳定性必须覆盖 MV3 idle、connection generation、迟到 close/reply、heartbeat ACK、半开失活关闭与多 profile 稳定 winner/standby 接管，不得用单次连接 happy path 代替 | `RTE-002` + `E2E-008` |
+| CF-STG-R18 | attached session 瞬断恢复必须保持 objective、lease、selected tab，并在有界窗口内只重放一次只读调用，不能依赖模型或人工 continue | `RTE-003` + `E2E-008` |
 
 ## Primary User Path
 
@@ -81,15 +83,15 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 
 | 分类 | 当前数量 | 代表风险 |
 | --- | ---: | --- |
-| 长任务连续性与恢复 | 4 | 中断、恢复预算、历史续接、持久停止 |
+| 长任务连续性与恢复 | 5 | 中断、恢复预算、历史续接、持久停止、恢复交还 |
 | 对话协作与交付 | 2 | 增量约束、完成证据 |
-| 工作区与会话体验 | 6 | 启动、导航、恢复日志、断线 |
+| 工作区与会话体验 | 7 | 启动、导航、恢复日志、断线、浏览器连接投影 |
 | 内容输入与呈现 | 2 | 图片、流式 Markdown |
 | 权限与安全 | 1 | 权限模式与可见状态 |
 | 能力演进与用量 | 2 | Evolution、token/cost |
-| 运行时资源生命周期 | 1 | 浏览器进程与租约回收 |
+| 运行时资源生命周期 | 3 | 浏览器进程/租约回收、扩展健康、attached session 续接 |
 
-当前统一注册表共有 18 个逻辑 Scenario。任何新增主路径能力必须在合并实现前新增或扩展一个 Scenario。
+当前统一注册表共有 22 个逻辑 Scenario。任何新增主路径能力必须在合并实现前新增或扩展一个 Scenario。
 
 ## 证据等级
 
@@ -129,6 +131,8 @@ Scenario-Test: HLT-003, HLT-004
 | E2E-004 | 增量约束贯穿交付 | 测试失败、CI transient、dirty worktree | nightly L2/L3 |
 | E2E-005 | 浏览器失败回收并继续 | 零退出逻辑失败、子进程残留 | PR L2 + release L4 |
 | E2E-006 | 卡住历史任务下完成升级 | 旧进程锁、WAL、安装中断、首次 reconciliation | release L4 |
+| E2E-007 | 恢复耗尽后一致交还 | 计划拒绝、旧 streaming、unknown receipt、两次重启 | PR L1/L2 + release L4 |
+| E2E-008 | 扩展空闲/瞬断/多连接后同一会话续接 | MV3 idle、旧连接迟到关闭、socket drop、App restart | PR L1 + nightly L2 + release L4 |
 
 完整 step、fixture 和 oracle 以机器注册表为准。
 
@@ -186,13 +190,14 @@ Scenario-Test: HLT-003, HLT-004
 
 ## 实施顺序
 
-1. 已完成：统一 18 个场景，加入 validator、PR 声明门和 6 个复杂 E2E 设计；
+1. 已完成：统一 22 个场景，加入 validator、PR 声明门和 8 个复杂 E2E 设计；
 2. 已完成第一阶段：E2E-003、E2E-002 使用同一正式二进制和真实 SQLite，在 required Windows CI、nightly、release exact executable 覆盖分页历史、无内存控制、hard kill、session 全量取消和两次重启；当前状态为 `partially_implemented`；
 3. 把现有 unattended smoke 和 browser smoke 扩展成 E2E-001/E2E-005 完整 oracle；
 4. 建立 fake-forge，自动化 E2E-004；
 5. 在 Windows release runner 建前一版本升级 fixture，自动化 E2E-006；
 6. 补齐 E2E-002/E2E-003 的真实 WebView L3、旧 schema 迁移矩阵和部分投影失败并发，再提升为 `implemented`；
-7. 当 6 个 case 均达到声明层级后，将 P0 release gate 从设计状态提升为硬阻断。
+7. 建立 E2E-008 原生扩展 lifecycle smoke，覆盖 120 秒 idle、generation 交错、断 socket、App restart 与同 lease/tab 续接；
+8. 当 8 个 case 均达到声明层级后，将 P0 release gate 从设计状态提升为硬阻断。
 
 ## 验收标准
 
@@ -200,7 +205,7 @@ Scenario-Test: HLT-003, HLT-004
 - change contract 拒绝未声明或漏声明受影响 P0 场景的产品 `feat/fix`；
 - CI 同时运行 validator 的单元测试和仓库真实注册表验证；
 - 原历史场景目录不再维护第二份场景数据，只保留 canonical registry 指针；
-- 18 个现有场景和 6 个复杂 E2E 设计可由机器读取；
+- 22 个现有场景和 8 个复杂 E2E 设计可由机器读取；
 - E2E-001 明确保证无人参与执行；
 - 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`，不得报告为全覆盖。
 

@@ -35,8 +35,9 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::protocol::frame::{coding::CloseCode, CloseFrame};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::bridge::{self, Command, Hello, Reply};
@@ -44,6 +45,14 @@ use crate::errors::{AppError, Result};
 
 /// How long to wait for the extension to answer one command.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const SUPERSEDED_CLOSE_CODE: u16 = 4001;
+
+fn superseded_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: CloseCode::Library(SUPERSEDED_CLOSE_CODE),
+        reason: "superseded".into(),
+    }))
+}
 
 /// Port the bridge asks for before falling back to whatever the OS offers.
 ///
@@ -70,16 +79,29 @@ pub struct Pairing {
     pub token: String,
 }
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Reply>>>>;
-type Outbound = Arc<Mutex<Option<futures::channel::mpsc::UnboundedSender<Message>>>>;
+struct PendingCall {
+    connection_id: u64,
+    reply: oneshot::Sender<Reply>,
+}
+
+#[derive(Clone)]
+struct ActiveConnection {
+    id: u64,
+    sender: futures::channel::mpsc::UnboundedSender<Message>,
+}
+
+type Pending = Arc<Mutex<HashMap<u64, PendingCall>>>;
+type Outbound = Arc<Mutex<Option<ActiveConnection>>>;
 
 /// The extension-backed browser.
 pub struct ExtensionBridge {
     token: String,
     port: Mutex<Option<u16>>,
     next_id: AtomicU64,
+    next_connection_id: AtomicU64,
     pending: Pending,
     outbound: Outbound,
+    connection_changed: Notify,
 }
 
 impl ExtensionBridge {
@@ -88,8 +110,10 @@ impl ExtensionBridge {
             token: load_or_create_token(),
             port: Mutex::new(None),
             next_id: AtomicU64::new(1),
+            next_connection_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             outbound: Arc::new(Mutex::new(None)),
+            connection_changed: Notify::new(),
         }
     }
 
@@ -145,6 +169,28 @@ impl ExtensionBridge {
         self.outbound.lock().await.is_some()
     }
 
+    /// Give an already-installed extension one bounded reconnect window.
+    ///
+    /// MV3 workers and sleeping browsers can disappear between two tool calls.
+    /// Treating that short transport gap as a fresh pairing request made a
+    /// healthy installation feel broken and discarded the caller's lease.
+    pub async fn wait_until_connected(&self, deadline: Duration) -> bool {
+        if self.connected().await {
+            return true;
+        }
+        tokio::time::timeout(deadline, async {
+            loop {
+                let changed = self.connection_changed.notified();
+                if self.connected().await {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     async fn serve(self: Arc<Self>, stream: tokio::net::TcpStream) {
         // Capture Origin during the handshake: it is the check a web page cannot
         // defeat, and it is only available here.
@@ -152,8 +198,14 @@ impl ExtensionBridge {
         let captured = Arc::clone(&origin);
         let accepted = tokio_tungstenite::accept_hdr_async(
             stream,
-            move |request: &Request, response: Response| -> std::result::Result<Response, ErrorResponse> {
-                if let Some(value) = request.headers().get("origin").and_then(|v| v.to_str().ok()) {
+            move |request: &Request,
+                  response: Response|
+                  -> std::result::Result<Response, ErrorResponse> {
+                if let Some(value) = request
+                    .headers()
+                    .get("origin")
+                    .and_then(|v| v.to_str().ok())
+                {
                     if let Ok(mut slot) = captured.try_lock() {
                         *slot = Some(value.to_string());
                     }
@@ -171,9 +223,12 @@ impl ExtensionBridge {
             _ => None,
         };
         let origin = origin.lock().await.clone();
-        let refusal = match hello {
-            Some(hello) => bridge::authorize(origin.as_deref(), &hello, &self.token).err(),
-            None => Some(bridge::Refusal::BadToken),
+        let (refusal, standby_probe) = match hello.as_ref() {
+            Some(hello) => (
+                bridge::authorize(origin.as_deref(), hello, &self.token).err(),
+                hello.standby_probe,
+            ),
+            None => (Some(bridge::Refusal::BadToken), false),
         };
         if let Some(refusal) = refusal {
             // Tell the extension why so it can stop retrying and prompt for
@@ -190,9 +245,51 @@ impl ExtensionBridge {
         }
 
         // One extension at a time: replacing the channel drops the previous one,
-        // so two connections cannot both answer the same command.
+        // so two connections cannot both answer the same command. The identity is
+        // essential: the superseded socket can finish closing after this point and
+        // must not clear the newer connection or its pending calls.
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let (sender, mut receiver) = futures::channel::mpsc::unbounded::<Message>();
-        *self.outbound.lock().await = Some(sender);
+        let registration = {
+            let mut outbound = self.outbound.lock().await;
+            if standby_probe && outbound.is_some() {
+                None
+            } else {
+                Some(outbound.replace(ActiveConnection {
+                    id: connection_id,
+                    sender,
+                }))
+            }
+        };
+        let Some(superseded) = registration else {
+            // A profile that already lost ownership may periodically probe for
+            // vacancy, but must not evict the healthy winner and restart the
+            // multi-profile takeover loop.
+            let _ = writer.send(superseded_close()).await;
+            return;
+        };
+        if let Some(superseded) = superseded {
+            // Calls already sent to the old socket cannot be completed by the
+            // replacement. Cancel them immediately so the browser-session
+            // layer can replay the read-only command on this generation.
+            let _ = superseded.sender.unbounded_send(superseded_close());
+            self.clear_pending(superseded.id).await;
+        }
+        self.connection_changed.notify_waiters();
+
+        // `open` only proves TCP/WebSocket establishment. This acknowledgment is
+        // sent after origin/token/protocol authorization so the extension does not
+        // flash "connected" before the bridge has actually accepted it.
+        if writer
+            .send(Message::Text(
+                serde_json::json!({"ready": true}).to_string().into(),
+            ))
+            .await
+            .is_err()
+        {
+            self.clear_connection(connection_id).await;
+            return;
+        }
 
         let pump = tokio::spawn(async move {
             while let Some(message) = receiver.next().await {
@@ -203,10 +300,45 @@ impl ExtensionBridge {
         });
 
         while let Some(Ok(message)) = reader.next().await {
-            let Message::Text(text) = message else { continue };
-            if let Ok(reply) = serde_json::from_str::<Reply>(&text) {
-                if let Some(waiting) = self.pending.lock().await.remove(&reply.id) {
-                    let _ = waiting.send(reply);
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if value.get("heartbeat").and_then(serde_json::Value::as_bool) == Some(true) {
+                let current = self.outbound.lock().await.clone();
+                if let Some(current) = current.filter(|active| active.id == connection_id) {
+                    if current
+                        .sender
+                        .unbounded_send(Message::Text(
+                            serde_json::json!({
+                                "heartbeat_ack": value.get("sent_at").cloned().unwrap_or_default()
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if let Ok(reply) = serde_json::from_value::<Reply>(value) {
+                let waiting = {
+                    let mut pending = self.pending.lock().await;
+                    if pending
+                        .get(&reply.id)
+                        .is_some_and(|call| call.connection_id == connection_id)
+                    {
+                        pending.remove(&reply.id)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(waiting) = waiting {
+                    let _ = waiting.reply.send(reply);
                 }
             }
         }
@@ -214,12 +346,51 @@ impl ExtensionBridge {
         // The extension went away: clear the channel so `connected()` is honest
         // and later commands fail fast instead of waiting for a timeout.
         pump.abort();
-        *self.outbound.lock().await = None;
-        self.pending.lock().await.clear();
+        self.clear_connection(connection_id).await;
+    }
+
+    async fn clear_connection(&self, connection_id: u64) {
+        let cleared_current = {
+            let mut outbound = self.outbound.lock().await;
+            if outbound
+                .as_ref()
+                .is_some_and(|active| active.id == connection_id)
+            {
+                outbound.take()
+            } else {
+                None
+            }
+        };
+        if let Some(active) = &cleared_current {
+            // Dropping SplitSink alone does not close the peer while the serve
+            // task still owns SplitStream. Send an explicit close frame before
+            // dropping the last sender so the extension's close handler can
+            // reconnect inside the browser-session retry grace.
+            let _ = active.sender.unbounded_send(Message::Close(None));
+        }
+        self.clear_pending(connection_id).await;
+        if cleared_current.is_some() {
+            self.connection_changed.notify_waiters();
+        }
+    }
+
+    async fn clear_pending(&self, connection_id: u64) {
+        self.pending
+            .lock()
+            .await
+            .retain(|_, call| call.connection_id != connection_id);
     }
 
     /// Send one command and await its reply.
     async fn call(&self, command: Command) -> Result<serde_json::Value> {
+        self.call_with_timeout(command, COMMAND_TIMEOUT).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        command: Command,
+        command_timeout: Duration,
+    ) -> Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let frame = {
             let mut value = serde_json::to_value(&command)
@@ -229,36 +400,61 @@ impl ExtensionBridge {
         };
 
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(id, sender);
-
-        {
+        let (connection_id, send_failed) = {
+            // Snapshotting the generation, registering its pending reply and
+            // sending the frame are one outbound-locked interval. Otherwise B
+            // can replace A after the snapshot but before the pending insert;
+            // B then has nothing to cancel and the orphaned A call waits 20s.
             let outbound = self.outbound.lock().await;
-            let Some(channel) = outbound.as_ref() else {
-                self.pending.lock().await.remove(&id);
-                return Err(AppError::Other(
+            let active = outbound.as_ref().ok_or_else(|| {
+                AppError::Other(
                     "The CodeFactory browser extension isn't connected. Install it and pair it \
                      from Settings → Browser."
                         .into(),
-                ));
-            };
-            channel.unbounded_send(frame).map_err(|_| {
-                AppError::Other("The browser extension connection dropped".into())
+                )
             })?;
+            let mut pending = self.pending.lock().await;
+            pending.insert(
+                id,
+                PendingCall {
+                    connection_id: active.id,
+                    reply: sender,
+                },
+            );
+            let send_failed = active.sender.unbounded_send(frame).is_err();
+            if send_failed {
+                pending.remove(&id);
+            }
+            (active.id, send_failed)
+        };
+        if send_failed {
+            self.clear_connection(connection_id).await;
+            return Err(AppError::Other(
+                "The browser extension connection dropped".into(),
+            ));
         }
 
-        match tokio::time::timeout(COMMAND_TIMEOUT, receiver).await {
+        match tokio::time::timeout(command_timeout, receiver).await {
             Ok(Ok(reply)) if reply.ok => Ok(reply.data.unwrap_or(serde_json::Value::Null)),
             Ok(Ok(reply)) => Err(AppError::Other(
-                reply.error.unwrap_or_else(|| "The browser reported an error".into()),
+                reply
+                    .error
+                    .unwrap_or_else(|| "The browser reported an error".into()),
             )),
             Ok(Err(_)) => Err(AppError::Other(
                 "The browser extension disconnected before replying".into(),
             )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
+                // A socket that accepted a command but never answered is not
+                // healthy enough to advertise as connected. Evict it now so
+                // the extension reconnects and an attached read can perform
+                // its single bounded transport retry instead of waiting for
+                // the later heartbeat-staleness window.
+                self.clear_connection(connection_id).await;
                 Err(AppError::Other(format!(
                     "The browser did not reply within {}s — the tab may be busy or closed",
-                    COMMAND_TIMEOUT.as_secs()
+                    command_timeout.as_secs_f64()
                 )))
             }
         }
@@ -275,8 +471,9 @@ impl ExtensionBridge {
     pub async fn read(&self, tab_id: i64) -> Result<super::PageContent> {
         let data = self.call(Command::Read { tab_id }).await?;
         let raw = data.to_string();
-        super::page::parse_readable(&raw)
-            .ok_or_else(|| AppError::Other("Could not extract readable content from that tab".into()))
+        super::page::parse_readable(&raw).ok_or_else(|| {
+            AppError::Other("Could not extract readable content from that tab".into())
+        })
     }
 
     /// Search within a tab.
@@ -306,7 +503,9 @@ async fn bind_listener() -> Result<TcpListener> {
     match TcpListener::bind(("127.0.0.1", PREFERRED_PORT)).await {
         Ok(listener) => Ok(listener),
         Err(error) => {
-            tracing::debug!("bridge: port {PREFERRED_PORT} unavailable ({error}); using an ephemeral port");
+            tracing::debug!(
+                "bridge: port {PREFERRED_PORT} unavailable ({error}); using an ephemeral port"
+            );
             TcpListener::bind(("127.0.0.1", 0)).await.map_err(|error| {
                 AppError::Other(format!("Could not open the bridge port: {error}"))
             })
@@ -344,8 +543,7 @@ fn read_token(path: PathBuf) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let stored: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let token = stored.get("token")?.as_str()?.trim().to_string();
-    let looks_like_a_token =
-        token.len() == 32 && token.chars().all(|c| c.is_ascii_hexdigit());
+    let looks_like_a_token = token.len() == 32 && token.chars().all(|c| c.is_ascii_hexdigit());
     looks_like_a_token.then_some(token)
 }
 
@@ -432,7 +630,8 @@ fn publish(pairing: &Pairing) {
     // The step that removes the copy-and-paste: stamp the live port and token
     // into the extension's own folder, if one has been prepared.
     if let Some(dir) = super::extension_package::existing_dir() {
-        if let Err(error) = super::extension_package::write_pairing(&dir, pairing.port, &pairing.token)
+        if let Err(error) =
+            super::extension_package::write_pairing(&dir, pairing.port, &pairing.token)
         {
             tracing::warn!("bridge: could not update the extension pairing file: {error}");
         }
@@ -466,6 +665,65 @@ fn write_pairing_file(pairing: &Pairing) {
 mod tests {
     use super::*;
 
+    const TEST_EXTENSION_ORIGIN: &str = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+
+    async fn dial_test_extension(
+        pairing: &Pairing,
+        standby_probe: bool,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", pairing.port))
+            .await
+            .expect("connect to bridge");
+        let mut request = format!("ws://127.0.0.1:{}", pairing.port)
+            .into_client_request()
+            .expect("websocket request");
+        request.headers_mut().insert(
+            "Origin",
+            TEST_EXTENSION_ORIGIN.parse().expect("extension origin"),
+        );
+        let (mut socket, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .expect("websocket handshake");
+        socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "protocol_version": bridge::PROTOCOL_VERSION,
+                    "token": pairing.token,
+                    "extension_version": "test",
+                    "standby_probe": standby_probe,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send extension hello");
+        socket
+    }
+
+    async fn connect_test_extension(
+        bridge: &ExtensionBridge,
+        pairing: &Pairing,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let mut socket = dial_test_extension(pairing, false).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    panic!("socket closed before authenticated ready");
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).expect("bridge json");
+                if value.get("ready").and_then(serde_json::Value::as_bool) == Some(true) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("authenticated ready deadline");
+        assert!(bridge.connected().await, "bridge observes extension");
+        socket
+    }
+
     #[tokio::test]
     async fn a_command_without_a_connected_extension_says_so_immediately() {
         // The failure users will actually hit: extension not installed yet. It
@@ -476,7 +734,10 @@ mod tests {
 
         assert!(error.to_string().contains("isn't connected"));
         assert!(error.to_string().contains("Settings"));
-        assert!(started.elapsed() < Duration::from_secs(1), "must not wait for the timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must not wait for the timeout"
+        );
     }
 
     #[tokio::test]
@@ -565,7 +826,10 @@ mod tests {
             ("empty.json", ""),
             ("blank-token.json", r#"{"token": ""}"#),
             ("short.json", r#"{"token": "abc"}"#),
-            ("not-hex.json", r#"{"token": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}"#),
+            (
+                "not-hex.json",
+                r#"{"token": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}"#,
+            ),
             ("wrong-shape.json", r#"{"token": 12345}"#),
             ("garbage.json", "not json at all"),
         ] {
@@ -594,12 +858,284 @@ mod tests {
         let pairing = bridge.start().await.expect("start");
 
         // Reachable on loopback…
-        assert!(
-            tokio::net::TcpStream::connect(("127.0.0.1", pairing.port))
-                .await
-                .is_ok()
-        );
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", pairing.port))
+            .await
+            .is_ok());
         // …and not bound on a routable interface.
         assert!(!bridge.connected().await);
+    }
+
+    #[tokio::test]
+    async fn an_old_connection_closing_cannot_clear_the_new_extension() {
+        let bridge = Arc::new(ExtensionBridge::new());
+        let pairing = bridge.start().await.expect("start");
+
+        let mut first = connect_test_extension(&bridge, &pairing).await;
+        let mut second = connect_test_extension(&bridge, &pairing).await;
+
+        let (command_seen, wait_for_command) = oneshot::channel();
+        let (allow_reply, wait_to_reply) = oneshot::channel();
+        let responder = tokio::spawn(async move {
+            while let Some(Ok(Message::Text(text))) = second.next().await {
+                let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if request.get("cmd").and_then(|value| value.as_str()) != Some("list_tabs") {
+                    continue;
+                }
+                let _ = command_seen.send(());
+                let _ = wait_to_reply.await;
+                second
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "id": request["id"],
+                            "ok": true,
+                            "data": [{
+                                "tab_id": 7,
+                                "title": "Synthetic page",
+                                "url": "https://example.test/",
+                                "active": true
+                            }]
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("reply on current extension");
+                return second;
+            }
+            panic!("current extension closed before receiving the command");
+        });
+
+        let call = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move { bridge.list_tabs().await })
+        };
+        wait_for_command
+            .await
+            .expect("command reached current extension");
+
+        first.close(None).await.expect("close old extension");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            bridge.connected().await,
+            "a superseded socket must not clear the newer live extension"
+        );
+        allow_reply.send(()).expect("allow current reply");
+        let tabs = call
+            .await
+            .expect("browser call task")
+            .expect("new extension answers commands");
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].tab_id, 7);
+        let mut second = responder.await.expect("extension responder");
+        second.close(None).await.expect("close current extension");
+    }
+
+    #[tokio::test]
+    async fn a_superseded_profiles_standby_probe_cannot_evict_the_winner() {
+        let bridge = Arc::new(ExtensionBridge::new());
+        let pairing = bridge.start().await.expect("start");
+        let mut winner = connect_test_extension(&bridge, &pairing).await;
+
+        let mut standby = dial_test_extension(&pairing, true).await;
+        let close = tokio::time::timeout(Duration::from_secs(1), standby.next())
+            .await
+            .expect("standby probe response deadline")
+            .expect("standby close frame")
+            .expect("valid standby close frame");
+        let Message::Close(Some(frame)) = close else {
+            panic!("standby probe must receive a reasoned close");
+        };
+        assert_eq!(u16::from(frame.code), SUPERSEDED_CLOSE_CODE);
+        assert_eq!(frame.reason, "superseded");
+        assert!(bridge.connected().await, "winner remains current");
+
+        winner.close(None).await.expect("close winner");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bridge.connected().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("winner close observed");
+
+        let mut recovery = dial_test_extension(&pairing, true).await;
+        let ready = tokio::time::timeout(Duration::from_secs(1), recovery.next())
+            .await
+            .expect("vacant bridge response deadline")
+            .expect("ready frame")
+            .expect("valid ready frame");
+        let Message::Text(ready) = ready else {
+            panic!("vacant bridge must accept the standby probe");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ready).expect("ready json")["ready"],
+            true
+        );
+        assert!(bridge.connected().await);
+        recovery.close(None).await.expect("close recovery");
+    }
+
+    #[tokio::test]
+    async fn a_new_connection_cancels_a_command_stranded_on_the_old_generation() {
+        let bridge = Arc::new(ExtensionBridge::new());
+        let pairing = bridge.start().await.expect("start");
+        let mut first = connect_test_extension(&bridge, &pairing).await;
+
+        let (command_seen, wait_for_command) = oneshot::channel();
+        let stranded = tokio::spawn(async move {
+            while let Some(Ok(Message::Text(text))) = first.next().await {
+                let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if request.get("cmd").and_then(|value| value.as_str()) == Some("list_tabs") {
+                    let _ = command_seen.send(());
+                    return first;
+                }
+            }
+            panic!("old extension closed before receiving the command");
+        });
+        let call = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move { bridge.list_tabs().await })
+        };
+        wait_for_command
+            .await
+            .expect("command reached old extension");
+
+        let mut current = connect_test_extension(&bridge, &pairing).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("superseding must cancel promptly")
+            .expect("browser call task")
+            .expect_err("old generation cannot complete on the new socket");
+        assert!(error.to_string().contains("disconnected before replying"));
+        assert!(bridge.connected().await);
+
+        let mut first = stranded.await.expect("stranded extension task");
+        first.close(None).await.expect("close old extension");
+        current.close(None).await.expect("close current extension");
+    }
+
+    #[tokio::test]
+    async fn registering_a_pending_call_is_atomic_with_its_generation_snapshot() {
+        let bridge = Arc::new(ExtensionBridge::new());
+        let pairing = bridge.start().await.expect("start");
+        let mut first = connect_test_extension(&bridge, &pairing).await;
+
+        // Hold pending so `call` can reach the critical lock boundary. A correct
+        // implementation keeps outbound locked while it waits; the old TOCTOU
+        // implementation cloned A, released outbound, then waited here.
+        let pending_guard = bridge.pending.lock().await;
+        let call = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move { bridge.list_tabs().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bridge.outbound.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("call must hold outbound until pending registration completes");
+
+        let replacement = {
+            let bridge = Arc::clone(&bridge);
+            let pairing = pairing.clone();
+            tokio::spawn(async move { connect_test_extension(&bridge, &pairing).await })
+        };
+        drop(pending_guard);
+        let mut current = replacement.await.expect("replacement connection");
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("replacement must cancel A's registered call")
+            .expect("browser call task")
+            .expect_err("superseded generation cannot complete the call");
+        assert!(error.to_string().contains("disconnected before replying"));
+
+        first.close(None).await.expect("close old extension");
+        current.close(None).await.expect("close current extension");
+    }
+
+    #[tokio::test]
+    async fn an_authorized_heartbeat_is_acknowledged_on_the_same_generation() {
+        let bridge = Arc::new(ExtensionBridge::new());
+        let pairing = bridge.start().await.expect("start");
+        let mut socket = connect_test_extension(&bridge, &pairing).await;
+        socket
+            .send(Message::Text(
+                serde_json::json!({"heartbeat": true, "sent_at": 1234})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send heartbeat");
+
+        let ack = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    panic!("socket closed before heartbeat ack");
+                };
+                let value: serde_json::Value = serde_json::from_str(&text).expect("json frame");
+                if value.get("heartbeat_ack").is_some() {
+                    return value;
+                }
+            }
+        })
+        .await
+        .expect("heartbeat ack deadline");
+        assert_eq!(ack["heartbeat_ack"], 1234);
+    }
+
+    #[tokio::test]
+    async fn a_command_timeout_evicts_the_half_open_connection() {
+        let bridge = Arc::new(ExtensionBridge::new());
+        let pairing = bridge.start().await.expect("start");
+        let mut socket = connect_test_extension(&bridge, &pairing).await;
+        let bridge_for_extension = Arc::clone(&bridge);
+        let pairing_for_extension = pairing.clone();
+        let (close_seen, wait_for_close) = oneshot::channel();
+        let (allow_reconnect, wait_to_reconnect) = oneshot::channel();
+        let silent_extension = tokio::spawn(async move {
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: serde_json::Value = serde_json::from_str(&text).expect("command json");
+                if request.get("cmd").and_then(|value| value.as_str()) == Some("list_tabs") {
+                    let close = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                        .await
+                        .expect("bridge must close a timed-out socket")
+                        .expect("close frame")
+                        .expect("valid close frame");
+                    assert!(matches!(close, Message::Close(_)));
+                    close_seen.send(()).expect("report close frame");
+                    wait_to_reconnect.await.expect("allow reconnect");
+                    return connect_test_extension(&bridge_for_extension, &pairing_for_extension)
+                        .await;
+                }
+            }
+            panic!("socket closed before receiving command");
+        });
+
+        let error = bridge
+            .call_with_timeout(Command::ListTabs, Duration::from_millis(50))
+            .await
+            .expect_err("silent extension must time out");
+        assert!(error.to_string().contains("did not reply within"));
+        assert!(
+            !bridge.connected().await,
+            "a timed-out socket is half-open and must no longer be advertised"
+        );
+        wait_for_close.await.expect("client observed close frame");
+        allow_reconnect.send(()).expect("allow reconnect");
+        assert!(
+            bridge.wait_until_connected(Duration::from_secs(6)).await,
+            "the close frame must let the extension reconnect inside the retry grace"
+        );
+        let mut replacement = silent_extension.await.expect("extension reconnect task");
+        replacement.close(None).await.expect("close replacement");
     }
 }

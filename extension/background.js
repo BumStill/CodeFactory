@@ -28,7 +28,13 @@ const PROTOCOL_VERSION = 1;
 const PAGE_SCRIPT = "content/page.js";
 const PAIRING_FILE = "pairing.json";
 const KEEPALIVE_ALARM = "codefactory-bridge-keepalive";
-const RECONNECT_CEILING_MS = 30_000;
+// Chrome can stop an MV3 worker after 30s without extension activity. Keep the
+// socket active well inside that boundary and retry quickly enough that a tool
+// call made just after CodeFactory starts can use the existing pairing.
+const HEARTBEAT_INTERVAL_MS = 20_000;
+const HEARTBEAT_STALE_MS = 40_000;
+const RECONNECT_CEILING_MS = 5_000;
+const LEGACY_READY_FALLBACK_MS = 1_000;
 
 // The port CodeFactory asks for before falling back to an ephemeral one. Kept
 // here as a second address to try, because a pairing file can outlive the
@@ -39,8 +45,27 @@ const RECONNECT_CEILING_MS = 30_000;
 const STABLE_PORT = 47615;
 
 let socket = null;
+let heartbeatTimer = null;
 let reconnectDelayMs = 1000;
 let addressAttempt = 0;
+
+function stopHeartbeat() {
+  if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+}
+
+function startHeartbeat(candidate, lastAckAt, ackRequired) {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (socket === candidate && candidate.readyState === WebSocket.OPEN) {
+      if (ackRequired() && Date.now() - lastAckAt() >= HEARTBEAT_STALE_MS) {
+        candidate.close();
+        return;
+      }
+      candidate.send(JSON.stringify({ heartbeat: true, sent_at: Date.now() }));
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+}
 
 /**
  * Pairing written into this extension's folder by the running app.
@@ -100,7 +125,7 @@ function addressesFor(paired) {
 }
 
 function connect() {
-  pairing().then((paired) => {
+  pairing().then(async (paired) => {
     if (!paired) {
       setStatus("not_paired");
       return;
@@ -109,6 +134,10 @@ function connect() {
       return;
     }
 
+    const { bridgeStandby = false } = await chrome.storage.local.get(["bridgeStandby"]);
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
     const addresses = addressesFor(paired);
     const port = addresses[addressAttempt % addresses.length];
     // Recorded so the options page can say "paired automatically" instead of
@@ -117,21 +146,40 @@ function connect() {
 
     // Loopback only. The app refuses any origin that is not this extension, so
     // a page cannot stand in for us even though it could open the same socket.
-    socket = new WebSocket(`ws://127.0.0.1:${port}`);
+    const candidate = new WebSocket(`ws://127.0.0.1:${port}`);
+    let lastHeartbeatAckAt = Date.now();
+    let authorizationRefused = false;
+    let heartbeatAckRequired = false;
+    socket = candidate;
 
-    socket.addEventListener("open", () => {
+    candidate.addEventListener("open", () => {
       reconnectDelayMs = 1000;
-      socket.send(
+      candidate.send(
         JSON.stringify({
           protocol_version: PROTOCOL_VERSION,
           token: paired.token,
           extension_version: chrome.runtime.getManifest().version,
+          standby_probe: Boolean(bridgeStandby),
         }),
       );
-      setStatus("connected");
+      lastHeartbeatAckAt = Date.now();
+      startHeartbeat(candidate, () => lastHeartbeatAckAt, () => heartbeatAckRequired);
+      // Protocol v1 apps released before the explicit `ready` frame stay
+      // compatible. They refuse a bad token immediately; a socket that remains
+      // open for this grace window is the legacy success signal.
+      setTimeout(() => {
+        if (
+          !authorizationRefused &&
+          !heartbeatAckRequired &&
+          socket === candidate &&
+          candidate.readyState === WebSocket.OPEN
+        ) {
+          setStatus("connected", { connectionMode: "legacy", bridgeStandby: false });
+        }
+      }, LEGACY_READY_FALLBACK_MS);
     });
 
-    socket.addEventListener("message", async (event) => {
+    candidate.addEventListener("message", async (event) => {
       let request;
       try {
         request = JSON.parse(event.data);
@@ -141,19 +189,44 @@ function connect() {
       // A refusal arrives as a message with no command; surface it so the
       // options page can tell the user to re-pair instead of looping silently.
       if (request.refused) {
+        authorizationRefused = true;
         setStatus("refused");
-        socket.close();
+        candidate.close();
+        return;
+      }
+      // The bridge sends this only after origin, token and protocol checks. A
+      // WebSocket `open` alone is not proof that CodeFactory accepted us.
+      if (request.ready) {
+        heartbeatAckRequired = true;
+        lastHeartbeatAckAt = Date.now();
+        setStatus("connected", { connectionMode: "authenticated", bridgeStandby: false });
+        return;
+      }
+      if (request.heartbeat_ack !== undefined) {
+        lastHeartbeatAckAt = Date.now();
         return;
       }
       const reply = await handle(request);
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ id: request.id, ...reply }));
+      if (socket === candidate && candidate.readyState === WebSocket.OPEN) {
+        candidate.send(JSON.stringify({ id: request.id, ...reply }));
       }
     });
 
-    socket.addEventListener("close", () => {
+    candidate.addEventListener("close", (event) => {
+      // A late close/error from a superseded socket must not tear down the newer
+      // connection or overwrite its status.
+      if (socket !== candidate) return;
       socket = null;
-      setStatus("disconnected");
+      stopHeartbeat();
+      if (event.code === 4001 && event.reason === "superseded") {
+        // Another authenticated browser profile owns the bridge. Fast retrying
+        // here makes the two profiles evict each other forever. Persist standby
+        // across worker eviction. A later cold start or one-minute alarm may
+        // probe; the server accepts that probe only after the owner is gone.
+        setStatus("standby", { bridgeStandby: true });
+        return;
+      }
+      setStatus(authorizationRefused ? "refused" : "disconnected");
       // Next attempt tries the other address. Without this the extension would
       // keep dialling one stale port forever, which is precisely how a working
       // pairing turned into "the app no longer sees my browser".
@@ -164,7 +237,9 @@ function connect() {
       setTimeout(connect, reconnectDelayMs);
     });
 
-    socket.addEventListener("error", () => setStatus("error"));
+    candidate.addEventListener("error", () => {
+      if (socket === candidate) setStatus("error");
+    });
   });
 }
 

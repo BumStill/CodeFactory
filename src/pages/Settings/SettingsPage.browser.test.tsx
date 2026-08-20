@@ -6,7 +6,7 @@
 // against a stubbed Tauri bridge and assert what the user ends up seeing.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const mocks = vi.hoisted(() => ({
@@ -244,6 +244,92 @@ describe("browser bridge pairing panel", () => {
     // Once connected there is nothing left to set up, so the instructions go away.
     expect(screen.getByText(/重启后会自己恢复/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "复制路径" })).not.toBeInTheDocument();
+  });
+
+  it("accepts a slow poll instead of starving behind newer generations", async () => {
+    vi.useFakeTimers();
+    let prepareCalls = 0;
+    let resolveFirst!: (value: Record<string, unknown>) => void;
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "browser_extension_prepare") {
+        prepareCalls += 1;
+        if (prepareCalls === 1) {
+          return new Promise<Record<string, unknown>>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+        return {
+          dir: "/home/ada/.codefactory/browser/extension",
+          port: 47615,
+          token: "t".repeat(32),
+          connected: true,
+          chrome_available: true,
+        };
+      }
+      if (command === "browser_chromium_status") return { supported: true, installed: false };
+      return [];
+    });
+
+    const view = renderBrowserTab();
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      expect(prepareCalls).toBe(1);
+
+      await act(async () => {
+        resolveFirst({
+          dir: "/home/ada/.codefactory/browser/extension",
+          port: 47615,
+          token: "t".repeat(32),
+          connected: true,
+          chrome_available: true,
+        });
+        await Promise.resolve();
+      });
+      expect(screen.getByText("已连接")).toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4999);
+      });
+      expect(prepareCalls).toBe(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(prepareCalls).toBe(2);
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not flash disconnected setup after one transient negative poll", { timeout: 20_000 }, async () => {
+    let prepareCalls = 0;
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "browser_extension_prepare") {
+        prepareCalls += 1;
+        return {
+          dir: "/home/ada/.codefactory/browser/extension",
+          port: 47615,
+          token: "t".repeat(32),
+          connected: prepareCalls === 1,
+          chrome_available: true,
+        };
+      }
+      if (command === "browser_chromium_status") return { supported: true, installed: false };
+      return [];
+    });
+
+    renderBrowserTab();
+    expect(await screen.findByText("已连接")).toBeInTheDocument();
+
+    await waitFor(() => expect(prepareCalls).toBeGreaterThanOrEqual(2), { timeout: 8000 });
+    expect(screen.getByText("重连中")).toBeInTheDocument();
+    expect(screen.getByText(/当前会话和已选标签页会继续保留/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "复制路径" })).not.toBeInTheDocument();
+
+    await waitFor(() => expect(prepareCalls).toBeGreaterThanOrEqual(3), { timeout: 8000 });
+    expect(screen.getByText("未连接")).toBeInTheDocument();
   });
 
   it("surfaces a folder that could not be prepared", async () => {

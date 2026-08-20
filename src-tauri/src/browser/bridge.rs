@@ -41,6 +41,10 @@ pub struct Hello {
     /// Extension version, for diagnosing a stale install.
     #[serde(default)]
     pub extension_version: Option<String>,
+    /// A profile previously superseded by another authenticated profile. Its
+    /// alarm may probe for vacancy, but it must not evict a healthy owner.
+    #[serde(default)]
+    pub standby_probe: bool,
 }
 
 /// What the app asks the extension to do.
@@ -166,6 +170,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             token: token.into(),
             extension_version: None,
+            standby_probe: false,
         }
     }
 
