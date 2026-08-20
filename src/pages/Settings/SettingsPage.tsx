@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ArrowLeft, Plus, Trash2, Eye, EyeOff, Check, AlertCircle, ChevronDown,
   RefreshCw, Download, Package, LogIn, LogOut, Sparkles, Github, ExternalLink,
@@ -1270,18 +1270,6 @@ function BrowserSessionsTab() {
         </button>
       </div>
 
-      <div className="rounded-xl border border-blue-500/20 bg-blue-500/5 px-4 py-3 text-label leading-5 text-gray-400">
-        <div className="font-medium text-gray-200">读取普通 Chrome 登录态前的一次性设置</div>
-        <div className="mt-1">
-          在普通 Chrome 打开{" "}
-          <code className="select-all rounded bg-surface-2 px-1 py-0.5 text-blue-700 dark:text-blue-300">
-            chrome://inspect/#remote-debugging
-          </code>
-          ，开启 “Allow remote debugging for this browser instance”。这是 Chrome 自己的安全边界；
-          CodeFactory 不会代替你静默开启，也不会在失败后改用本地源码冒充现网页面。
-        </div>
-      </div>
-
       {error && (
         <div role="alert" className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-label text-red-700 dark:text-red-300">
           {error}
@@ -1891,26 +1879,59 @@ function BrowserBridgePanel() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [copied, setCopied] = useState<"dir" | "port" | "token" | null>(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const loadGeneration = useRef(0);
+  const acceptedConnected = useRef(false);
+  const consecutiveDisconnectedPolls = useRef(0);
 
   // Preparing is idempotent and writes only what changed, so it is safe to do on
   // mount: opening this panel is a good enough signal that the user wants the
   // extension ready, and it means the pairing file is refreshed for an extension
   // that is already installed.
   const load = async () => {
+    const generation = ++loadGeneration.current;
     try {
-      setState(await invoke("browser_extension_prepare"));
-      setError(null);
+      const next = await invoke<NonNullable<typeof state>>("browser_extension_prepare");
+      if (generation === loadGeneration.current) {
+        if (next.connected) {
+          acceptedConnected.current = true;
+          consecutiveDisconnectedPolls.current = 0;
+          setReconnecting(false);
+        } else if (acceptedConnected.current) {
+          consecutiveDisconnectedPolls.current += 1;
+          if (consecutiveDisconnectedPolls.current < 2) {
+            setReconnecting(true);
+            setError(null);
+            return;
+          }
+          acceptedConnected.current = false;
+          setReconnecting(false);
+        }
+        setState(next);
+        setError(null);
+      }
     } catch (loadError) {
-      setError(String(loadError));
+      if (generation === loadGeneration.current) setError(String(loadError));
     }
   };
 
   useEffect(() => {
-    void load();
-    // Connection state changes when the user finishes loading the extension in
-    // Chrome, and there is no event for that — a slow poll is honest and cheap.
-    const timer = setInterval(() => void load(), 5000);
-    return () => clearInterval(timer);
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Schedule the next poll only after the previous one settles. A fixed
+    // interval permanently discarded every response when the command took
+    // longer than five seconds, because each result was already an old
+    // generation by the time it arrived.
+    const poll = async () => {
+      await load();
+      if (active) timer = setTimeout(() => void poll(), 5000);
+    };
+    void poll();
+    return () => {
+      active = false;
+      loadGeneration.current += 1;
+      if (timer) clearTimeout(timer);
+    };
   }, []);
 
   const copy = async (what: "dir" | "port" | "token", value: string) => {
@@ -1941,18 +1962,24 @@ function BrowserBridgePanel() {
         </div>
         <span
           className={`shrink-0 rounded-full px-2 py-0.5 text-caption ${
-            state?.connected
+            reconnecting
+              ? "bg-amber-500/15 text-amber-700 dark:text-amber-400"
+              : state?.connected
               ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
               : "bg-surface-3 text-gray-500"
           }`}
         >
-          {state?.connected ? "已连接" : "未连接"}
+          {reconnecting ? "重连中" : state?.connected ? "已连接" : "未连接"}
         </span>
       </div>
 
       {error && <p className="text-label leading-5 text-rose-500">{error}</p>}
 
-      {state?.connected ? (
+      {reconnecting ? (
+        <p className="text-label leading-5 text-amber-600 dark:text-amber-400">
+          扩展连接短暂中断，正在自动恢复；当前会话和已选标签页会继续保留。
+        </p>
+      ) : state?.connected ? (
         <p className="text-label leading-5 text-gray-500">
           扩展已连接,配对信息由 CodeFactory 自动维护——重启后会自己恢复,不需要再填端口或配对码。
         </p>

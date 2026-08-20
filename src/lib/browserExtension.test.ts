@@ -78,18 +78,37 @@ describe("service worker command dispatch", () => {
     const executeScript = vi.fn(async ({ func, args }: Record<string, unknown>) =>
       func ? [{ result: { called: args } }] : [{ result: undefined }],
     );
-    const sockets: { url: string }[] = [];
+    type SocketEvent = { data?: string; code?: number; reason?: string };
+    type SocketListener = (event: SocketEvent) => void;
     class SocketStub {
       static OPEN = 1;
       static CONNECTING = 0;
+      static CLOSED = 3;
       readyState = 0;
+      readonly sent: string[] = [];
+      private listeners = new Map<string, SocketListener[]>();
       constructor(public url: string) {
-        sockets.push({ url });
+        sockets.push(this);
       }
-      addEventListener() {}
-      send() {}
-      close() {}
+      addEventListener(name: string, listener: SocketListener) {
+        const current = this.listeners.get(name) ?? [];
+        current.push(listener);
+        this.listeners.set(name, current);
+      }
+      send(message: string) {
+        this.sent.push(message);
+      }
+      close(code = 1000, reason = "") {
+        this.readyState = SocketStub.CLOSED;
+        this.emit("close", { code, reason });
+      }
+      emit(name: string, event: SocketEvent = {}) {
+        if (name === "open") this.readyState = SocketStub.OPEN;
+        for (const listener of this.listeners.get(name) ?? []) listener(event);
+      }
     }
+    const sockets: SocketStub[] = [];
+    const alarmListeners: Array<(alarm: { name: string }) => void> = [];
     // The init argument is part of the signature on purpose: the worker must ask
     // for `cache: "no-store"`, and a stub that dropped it could not assert that.
     const fetchStub = vi.fn(async (url: string, _init?: { cache?: string }) => {
@@ -116,7 +135,11 @@ describe("service worker command dispatch", () => {
       alarms: {
         create: vi.fn(),
         get: vi.fn(async () => undefined),
-        onAlarm: { addListener: vi.fn() },
+        onAlarm: {
+          addListener: vi.fn((listener: (alarm: { name: string }) => void) => {
+            alarmListeners.push(listener);
+          }),
+        },
       },
       runtime: {
         onInstalled: { addListener: vi.fn() },
@@ -140,7 +163,7 @@ describe("service worker command dispatch", () => {
       packagedPairing: () => Promise<Record<string, unknown> | null>;
       addressesFor: (paired: { port: number }) => number[];
     };
-    return { api, storage, executeScript, sockets, fetchStub, chromeStub };
+    return { api, storage, executeScript, sockets, fetchStub, chromeStub, alarmListeners };
   }
 
   it("pairs from the file the app writes, with nothing typed in", async () => {
@@ -207,6 +230,181 @@ describe("service worker command dispatch", () => {
     expect(api.addressesFor({ port: 64530 })).toEqual([64530, 47615]);
     // Already on the stable port: no point dialling it twice.
     expect(api.addressesFor({ port: 47615 })).toEqual([47615]);
+  });
+
+  it("becomes healthy only after bridge authorization and keeps the MV3 worker alive", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sockets, storage } = await loadWorker([], {
+        packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sockets).toHaveLength(1);
+
+      const socket = sockets[0];
+      socket.emit("open");
+      await Promise.resolve();
+
+      expect(storage.status).toBe("connecting");
+
+      socket.emit("message", { data: JSON.stringify({ ready: true }) });
+      await Promise.resolve();
+      expect(storage.status).toBe("connected");
+
+      await vi.advanceTimersByTimeAsync(21_000);
+      expect(socket.sent.some((frame) => JSON.parse(frame).heartbeat === true)).toBe(true);
+      socket.emit("message", { data: JSON.stringify({ heartbeat_ack: 20_000 }) });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes a half-open bridge that stops acknowledging heartbeats", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sockets, storage } = await loadWorker([], {
+        packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const socket = sockets[0];
+      socket.emit("open");
+      socket.emit("message", { data: JSON.stringify({ ready: true }) });
+
+      await vi.advanceTimersByTimeAsync(41_000);
+
+      expect(socket.readyState).toBe(3);
+      expect(storage.status).toBe("disconnected");
+      expect(socket.sent.filter((frame) => JSON.parse(frame).heartbeat === true)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stays authorized through 120 seconds of MV3 idle when every heartbeat is acknowledged", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sockets, storage } = await loadWorker([], {
+        packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const socket = sockets[0];
+      socket.emit("open");
+      socket.emit("message", { data: JSON.stringify({ ready: true }) });
+
+      for (let elapsed = 20_000; elapsed <= 120_000; elapsed += 20_000) {
+        await vi.advanceTimersByTimeAsync(20_000);
+        socket.emit("message", { data: JSON.stringify({ heartbeat_ack: elapsed }) });
+        await Promise.resolve();
+      }
+
+      expect(socket.readyState).toBe(1);
+      expect(storage.status).toBe("connected");
+      expect(socket.sent.filter((frame) => JSON.parse(frame).heartbeat === true)).toHaveLength(6);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a protocol-v1 legacy App connected without heartbeat acknowledgements", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sockets, storage } = await loadWorker([], {
+        packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const socket = sockets[0];
+      socket.emit("open");
+
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(socket.readyState).toBe(1);
+      expect(storage.status).toBe("connected");
+      expect(storage.connectionMode).toBe("legacy");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an authorization refusal visible after the socket closes", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sockets, storage } = await loadWorker([], {
+        packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const socket = sockets[0];
+      socket.emit("open");
+      socket.emit("message", { data: JSON.stringify({ refused: true }) });
+      await vi.advanceTimersByTimeAsync(1500);
+
+      expect(socket.readyState).toBe(3);
+      expect(storage.status).toBe("refused");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores a late close from a superseded socket", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sockets, storage } = await loadWorker([], {
+        packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const first = sockets[0];
+      first.emit("open");
+      first.emit("message", { data: JSON.stringify({ ready: true }) });
+      first.close();
+
+      await vi.advanceTimersByTimeAsync(2000);
+      const second = sockets[1];
+      second.emit("open");
+      second.emit("message", { data: JSON.stringify({ ready: true }) });
+      await Promise.resolve();
+      expect(storage.status).toBe("connected");
+
+      first.emit("close");
+      await Promise.resolve();
+      expect(storage.status).toBe("connected");
+      expect(second.readyState).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("backs a superseded browser profile off to standby probes without fast reconnect", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sockets, storage, alarmListeners } = await loadWorker([], {
+        packaged: { port: 47615, token: "0123456789abcdef0123456789abcdef" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const first = sockets[0];
+      first.emit("open");
+      first.emit("message", { data: JSON.stringify({ ready: true }) });
+
+      first.close(4001, "superseded");
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(storage.status).toBe("standby");
+      expect(storage.bridgeStandby).toBe(true);
+      expect(sockets).toHaveLength(1);
+
+      alarmListeners[0]({ name: "codefactory-bridge-keepalive" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sockets).toHaveLength(2);
+      const probe = sockets[1];
+      probe.emit("open");
+      const hello = JSON.parse(probe.sent[0]);
+      expect(hello.standby_probe).toBe(true);
+
+      probe.emit("message", { data: JSON.stringify({ ready: true }) });
+      await Promise.resolve();
+      expect(storage.status).toBe("connected");
+      expect(storage.bridgeStandby).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("ignores a pairing file that is not usable rather than dialling a bad port", async () => {

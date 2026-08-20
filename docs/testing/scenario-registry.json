@@ -242,6 +242,39 @@
       "automated_by": ["binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke"],
       "required_evidence": ["L1", "L2", "L4"],
       "gates": ["pull_request"]
+    },
+    {
+      "id": "RTE-002",
+      "name": "浏览器扩展鉴权健康与无抖动重连",
+      "category": "runtime_lifecycle",
+      "priority": "P0",
+      "source_kind": "incident_shape",
+      "change_patterns": ["src-tauri/src/browser/bridge.rs", "src-tauri/src/browser/extension.rs", "extension/background.js", "extension/options.js", "src/lib/browserExtension.test.ts"],
+      "automated_by": ["rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:an_authorized_heartbeat_is_acknowledged_on_the_same_generation", "rust:a_command_timeout_evicts_the_half_open_connection", "path:src/lib/browserExtension.test.ts"],
+      "required_evidence": ["L0", "L1", "L2", "L4"],
+      "gates": ["pull_request"]
+    },
+    {
+      "id": "RTE-003",
+      "name": "扩展瞬断后保留 attached session 并自动续接",
+      "category": "runtime_lifecycle",
+      "priority": "P0",
+      "source_kind": "incident_shape",
+      "change_patterns": ["src-tauri/src/tools/browser_session.rs", "src-tauri/src/commands/browser_sessions.rs", "src-tauri/src/agent/objective*.rs"],
+      "automated_by": ["rust:a_transient_extension_command_error_preserves_the_attached_session", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "binary:--browser-chrome-attach-smoke"],
+      "required_evidence": ["L1", "L2", "L3", "L4"],
+      "gates": ["pull_request"]
+    },
+    {
+      "id": "UI-012",
+      "name": "浏览器扩展连接状态区分重连且慢轮询不饥饿",
+      "category": "workspace_session",
+      "priority": "P1",
+      "source_kind": "incident_shape",
+      "change_patterns": ["src/pages/Settings/SettingsPage.tsx", "src/pages/Settings/SettingsPage.browser.test.tsx"],
+      "automated_by": ["path:src/pages/Settings/SettingsPage.browser.test.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["pull_request"]
     }
   ],
   "complex_e2e_cases": [
@@ -419,6 +452,32 @@
       "automation_status": "partially_implemented",
       "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_exhausts_system_recovery_and_returns_to_user", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "workflow:Historical session continue/stop/handback cross-process smoke"],
       "remaining_gaps": ["L3 真实桌面 WebView 中以正式 session 数据走完整 provider recovery exhaustion", "macOS 安装版仍需绑定 exact release SHA 的人工 canary"]
+    },
+    {
+      "id": "E2E-008",
+      "name": "浏览器扩展空闲、瞬断与多连接交错后同一会话自动续接",
+      "priority": "P0",
+      "covers": ["RTE-002", "RTE-003", "UI-012"],
+      "fixture": {"synthetic": true, "shape": "受管 Chrome profile、真实 MV3 扩展、本地可读页面、持久 attached lease 与可编排 loopback bridge"},
+      "steps": [
+        "真实扩展仅靠 pairing 文件完成鉴权并以同一 session attach、选择合成页面 tab",
+        "空闲 120 秒验证 heartbeat 维持 worker 与首次 read 可用",
+        "注入旧连接 A、替代连接 B 与 A 迟到关闭，并在 B 上执行 tabs/read",
+        "强制断开当前 socket 后等待无人工输入自动重连，继续使用同一 selected tab",
+        "独立进程重启 App 后恢复 bridge 与同一 objective，完成 read 并回收受管测试 profile"
+      ],
+      "fault_injection": ["MV3 idle window", "old connection late close", "two browser profiles competing for ownership", "socket drop during command", "App hard kill and restart", "out-of-order Settings poll"],
+      "oracles": {
+        "ui": ["鉴权前不显示已连接", "重连中不退化为重新安装", "迟到未连接响应不覆盖健康状态"],
+        "durable_state": ["同一 objective、attached session、lease owner 与 selected tab", "零新增 user message 与零人工 continue"],
+        "process": ["connection generation 单调递增", "authenticated heartbeat 发送 gap 小于 30 秒且 ACK 失活上限 40 秒", "legacy App 120 秒无 ACK 不得触发自断", "多 profile loser 持久 standby 且 alarm probe 不驱逐健康 winner", "测试 Chrome/profile/bridge 全部回收"],
+        "side_effects": ["每个 command id 只由所属 generation 结算", "旧 close/reply 不影响新 pending", "命令超时立即驱逐半开 generation 且只读动作最多系统重放一次"],
+        "delivery": ["receipt 绑定 build SHA、App/extension/protocol version、状态时间线、重连后真实 read 与 cleanup"]
+      },
+      "execution": {"pull_request": "deterministic loopback generation and fake-clock heartbeat", "nightly": "native managed-profile extension lifecycle smoke", "release_artifact": "exact installed App plus existing extension upgrade/restart canary"},
+      "automation_status": "partially_implemented",
+      "automated_by": ["rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:a_command_timeout_evicts_the_half_open_connection", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "path:src/lib/browserExtension.test.ts", "path:src/pages/Settings/SettingsPage.browser.test.tsx"],
+      "remaining_gaps": ["L2 --browser-extension-lifecycle-smoke 尚未实现", "L3 真实 CodeFactoryDev 会话内断线续接尚未自动化", "L4 exact release artifact 的扩展升级与重启 canary 尚未接入"]
     }
   ]
 }
