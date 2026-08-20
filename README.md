@@ -58,7 +58,7 @@ your own API key, or sign in with ChatGPT for the Codex-backed provider.
 | 📦 **Docker sandbox** | Optional `sandbox_mode: Docker` runs every shell/tool command in a disposable container instead of your host shell. |
 | 🔔 **IM notifications** | Optional WeCom / Feishu / generic-JSON webhook pings you when a task finishes, fails, or needs permission — fire-and-forget, no secrets in the payload. |
 | 🚚 **Controlled delivery** | Turn a completed task into an auditable PR → CI → merge → release flow. CI, metadata, branch, remote-observation, and restart failures remain system-owned recovery; only irreducible core input or a material business decision is handed back. |
-| 🔁 **Auto-update** | Signed updates over GitHub Releases. New version arrives → in-app banner → one-click install + relaunch. Your data stays. |
+| 🔁 **Auto-update** | Signed updates over GitHub Releases. One click queues the update, waits only for live local work to reach a safe point, then shows real download/install progress and relaunches without reopening completed tasks. |
 
 ## Install
 

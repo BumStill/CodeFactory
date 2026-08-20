@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Update } from "@tauri-apps/plugin-updater";
 
 const mocks = vi.hoisted(() => ({
   check: vi.fn(),
@@ -8,11 +9,13 @@ const mocks = vi.hoisted(() => ({
   relaunch: vi.fn(),
   getVersion: vi.fn(),
   invoke: vi.fn(),
+  listen: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: mocks.check }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: mocks.relaunch }));
 vi.mock("@tauri-apps/api/app", () => ({ getVersion: mocks.getVersion }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 vi.mock("../lib/tauri", async (orig) => {
   const real = (await orig()) as Record<string, unknown>;
   return { ...real, invoke: mocks.invoke };
@@ -54,11 +57,13 @@ describe("updater safe restart gate", () => {
     mocks.relaunch.mockReset().mockResolvedValue(undefined);
     mocks.getVersion.mockReset().mockResolvedValue("1.79.0");
     mocks.invoke.mockReset();
+    mocks.listen.mockReset().mockResolvedValue(() => undefined);
     useUpdaterStore.setState({
       phase: { kind: "idle" },
       currentVersion: "1.79.0",
       pollHandle: null,
       safeRetryHandle: null,
+      progressListening: false,
       dismissedVersion: null,
     });
   });
@@ -300,5 +305,82 @@ describe("updater safe restart gate", () => {
     expect(useUpdaterStore.getState().currentVersion).toBe("1.79.1");
     expect(warn).toHaveBeenCalledWith("[updater] getVersion failed:", expect.any(Error));
     warn.mockRestore();
+  });
+
+  it("projects backend download progress instead of leaving a zero-blocker update queued", async () => {
+    let progressHandler: ((event: { payload: Record<string, unknown> }) => void) | null = null;
+    mocks.invoke.mockResolvedValue(null);
+    mocks.listen.mockImplementation(async (_event, handler) => {
+      progressHandler = handler;
+      return () => undefined;
+    });
+    const update = {
+      available: true,
+      version: "1.79.1",
+      body: "backend owned download",
+      rawJson: { build_git_sha: TARGET_BUILD },
+      download: mocks.download,
+      install: mocks.install,
+    } as unknown as Update;
+
+    await useUpdaterStore.getState().initialize();
+    expect(mocks.listen).toHaveBeenCalledWith(
+      "update-install-progress",
+      expect.any(Function),
+    );
+    useUpdaterStore.setState({
+      phase: {
+        kind: "waiting_for_safe_restart",
+        update,
+        blockers: idleSafety({
+          safe_to_restart: false,
+          restart_reserved: false,
+          update_install_state: "queued",
+        }),
+        safetyCheckError: null,
+        checkedAt: Date.now(),
+      },
+    });
+
+    expect(progressHandler).not.toBeNull();
+    const emitProgress = progressHandler as unknown as (event: {
+      payload: Record<string, unknown>;
+    }) => void;
+    emitProgress({
+      payload: {
+        target_version: update.version,
+        target_build: TARGET_BUILD,
+        phase: "downloading",
+        received: 8 * 1024 * 1024,
+        total: 32 * 1024 * 1024,
+      },
+    });
+
+    expect(useUpdaterStore.getState().phase).toMatchObject({
+      kind: "downloading",
+      received: 8 * 1024 * 1024,
+      total: 32 * 1024 * 1024,
+    });
+
+    emitProgress({
+      payload: {
+        target_version: update.version,
+        target_build: TARGET_BUILD,
+        phase: "installing",
+        received: 32 * 1024 * 1024,
+        total: 32 * 1024 * 1024,
+      },
+    });
+    emitProgress({
+      payload: {
+        target_version: update.version,
+        target_build: TARGET_BUILD,
+        phase: "downloading",
+        received: 16 * 1024 * 1024,
+        total: 32 * 1024 * 1024,
+      },
+    });
+
+    expect(useUpdaterStore.getState().phase.kind).toBe("installing");
   });
 });

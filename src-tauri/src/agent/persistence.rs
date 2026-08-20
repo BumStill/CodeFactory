@@ -232,14 +232,19 @@ impl Persistence for SqlitePersistence {
                 | "failed_internal"
                 | "platform_incident"
         );
-        sqlx::query(
+        let projected = sqlx::query(
             "UPDATE chat_turn_state SET
                revision=revision+1, phase=?, status=?,
                recent_activity_kind=?, recent_activity_label=?,
                waiting_reason=?, updated_at=?,
                completed_at=CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE NULL END,
                terminal_reason=?
-             WHERE root_turn_id=?",
+             WHERE root_turn_id=?
+               AND NOT EXISTS (
+                 SELECT 1 FROM objectives objective
+                 WHERE objective.id=chat_turn_state.objective_id
+                   AND objective.status IN ('completed','cancelled')
+               )",
         )
         .bind(&update.phase)
         .bind(&update.status)
@@ -253,13 +258,15 @@ impl Persistence for SqlitePersistence {
         .bind(&update.root_turn_id)
         .execute(&self.db)
         .await
-        .map_err(perr)?;
+        .map_err(perr)?
+        .rows_affected()
+            == 1;
         // `chat_task_segments` is the durable objective projection, not the
         // transport-turn lifecycle. A Done/failed_internal/platform_incident
         // settles the current turn above but cannot complete or fail the
         // business objective. Only reopening work or an explicit user cancel
         // changes the segment here; CompletionArbiter owns completed.
-        if update.status == "active" || update.status == "cancelled" {
+        if projected && (update.status == "active" || update.status == "cancelled") {
             sqlx::query(
                 "UPDATE chat_task_segments SET status=?, updated_at=?
                  WHERE id=(SELECT task_segment_id FROM chat_turn_state WHERE root_turn_id=?)",
@@ -670,6 +677,7 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        crate::agent::objective::ensure_schema(&db).await.unwrap();
         sqlx::query(
             "CREATE TABLE objective_recovery_attempts (
                 id TEXT PRIMARY KEY, objective_id TEXT, root_turn_id TEXT,
@@ -1089,6 +1097,65 @@ mod tests {
         assert_eq!(
             objective_status, "active",
             "Done/RunOutcome must not bypass the objective completion arbiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_transport_activity_cannot_reopen_completed_objective_projection() {
+        let db = pool().await;
+        sqlx::query(
+            "INSERT INTO objectives \
+             (id, revision, kind, status, decision_type, domain, autonomous_completion, \
+              requested_acceptance, reached_acceptance, requires_user_action, evidence_ref, \
+              created_surface, last_progress_at, created_at, updated_at, completed_at) \
+             VALUES ('objective-1', 1, 'informational', 'completed', 'complete', 'chat', 1, \
+                     'answered', 'answered', 0, 'test:evidence', 'test', 1, 1, 1, 1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state \
+             (root_turn_id, revision, objective_id, phase, status, updated_at, completed_at, terminal_reason) \
+             VALUES ('root-terminal', 7, 'objective-1', 'completed', 'completed', 7, 7, 'complete')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "s1".into(),
+            anonymous: false,
+        };
+
+        p.update_turn_activity(&TurnActivityUpdate {
+            root_turn_id: "root-terminal".into(),
+            phase: "working".into(),
+            status: "active".into(),
+            recent_activity_kind: "tool_running".into(),
+            recent_activity_label: "late heartbeat".into(),
+            waiting_reason: None,
+            terminal_reason: None,
+        })
+        .await
+        .unwrap();
+
+        let row: (i64, String, String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT revision, phase, status, completed_at, terminal_reason \
+             FROM chat_turn_state WHERE root_turn_id='root-terminal'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                7,
+                "completed".into(),
+                "completed".into(),
+                Some(7),
+                Some("complete".into())
+            )
         );
     }
 

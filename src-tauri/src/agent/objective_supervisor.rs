@@ -5,11 +5,15 @@
 //! technical state into a user handoff: it releases the lease with another
 //! observation time until an identity-complete adapter is available.
 
-use std::{future::Future, time::Duration};
+use std::{
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::objective::{ClaimedRemediation, ObjectiveStore, RecoveryDomain};
 
@@ -17,6 +21,19 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LEASE_MS: i64 = 60_000;
 const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const UNHANDLED_REOBSERVE_MS: i64 = 15_000;
+
+fn restart_reservation_blocks_domain(reserved: bool, domain: RecoveryDomain) -> bool {
+    reserved && domain != RecoveryDomain::Update
+}
+
+fn update_restart_blocks_claim(app: &AppHandle, domain: RecoveryDomain) -> bool {
+    app.try_state::<crate::AppState>().is_some_and(|state| {
+        restart_reservation_blocks_domain(
+            state.update_restart_reserved.load(Ordering::SeqCst),
+            domain,
+        )
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterExecutor {
@@ -577,6 +594,31 @@ async fn process_claim(
     owner: String,
     claim: ClaimedRemediation,
 ) {
+    if update_restart_blocks_claim(&app, claim.domain) {
+        tracing::info!(
+            objective_id = %claim.objective.id,
+            remediation_id = %claim.remediation_id,
+            domain = ?claim.domain,
+            "objective remediation deferred behind update restart reservation"
+        );
+        if let Err(error) = store
+            .defer_claimed_remediation(
+                &claim.objective.id,
+                &claim.remediation_id,
+                &owner,
+                claim.claim_epoch,
+                UNHANDLED_REOBSERVE_MS,
+            )
+            .await
+        {
+            tracing::debug!(
+                objective_id = %claim.objective.id,
+                %error,
+                "reserved update observed an already-advanced remediation"
+            );
+        }
+        return;
+    }
     let permit = mutation_permit(&claim, &owner);
     let adapter = DEFAULT_ADAPTER_REGISTRY.adapter_for(claim.domain);
     let result = match adapter {
@@ -944,6 +986,25 @@ where
     Ok(claimed_count)
 }
 
+async fn poll_once_with_restart_admission<Schedule>(
+    restart_admission: &tokio::sync::Mutex<()>,
+    restart_reserved: &AtomicBool,
+    store: &ObjectiveStore,
+    owner: &str,
+    limit: i64,
+    lease_ms: i64,
+    schedule: Schedule,
+) -> anyhow::Result<usize>
+where
+    Schedule: FnMut(ClaimedRemediation),
+{
+    let _admission = restart_admission.lock().await;
+    if restart_reserved.load(Ordering::SeqCst) {
+        return Ok(0);
+    }
+    poll_once(store, owner, limit, lease_ms, schedule).await
+}
+
 pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
     let owner = format!(
         "objective-supervisor:{}:{}",
@@ -989,19 +1050,33 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
         }
         let store = ObjectiveStore::new(pool.clone());
         loop {
+            let Some(state) = app.try_state::<crate::AppState>() else {
+                tracing::error!("objective supervisor stopped: application state is unavailable");
+                return;
+            };
+            let restart_admission = state.update_restart_admission.clone();
+            let restart_reserved = state.update_restart_reserved.clone();
             let claim_app = app.clone();
             let claim_pool = pool.clone();
             let claim_store = store.clone();
             let claim_owner = owner.clone();
-            if let Err(error) = poll_once(&store, &owner, 8, LEASE_MS, move |claim| {
-                tauri::async_runtime::spawn(process_claim(
-                    claim_app.clone(),
-                    claim_pool.clone(),
-                    claim_store.clone(),
-                    claim_owner.clone(),
-                    claim,
-                ));
-            })
+            if let Err(error) = poll_once_with_restart_admission(
+                &restart_admission,
+                &restart_reserved,
+                &store,
+                &owner,
+                8,
+                LEASE_MS,
+                move |claim| {
+                    tauri::async_runtime::spawn(process_claim(
+                        claim_app.clone(),
+                        claim_pool.clone(),
+                        claim_store.clone(),
+                        claim_owner.clone(),
+                        claim,
+                    ));
+                },
+            )
             .await
             {
                 tracing::warn!(%error, "objective supervisor poll failed");
@@ -1023,6 +1098,18 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     };
+
+    #[test]
+    fn update_restart_reservation_blocks_every_non_update_recovery_domain() {
+        for domain in RecoveryDomain::ALL {
+            assert_eq!(
+                restart_reservation_blocks_domain(true, domain),
+                domain != RecoveryDomain::Update,
+                "unexpected update reservation policy for {domain:?}"
+            );
+            assert!(!restart_reservation_blocks_domain(false, domain));
+        }
+    }
 
     fn claim_for(domain: RecoveryDomain, objective: ObjectiveSnapshot) -> ClaimedRemediation {
         ClaimedRemediation {
@@ -2048,7 +2135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_once_claims_a_bounded_batch_without_a_tauri_runtime() {
+    async fn update_restart_admission_blocks_then_releases_objective_claims() {
         let (pool, store, prior_claim) =
             claimed_chat_objective("poll-once", "old-poll-owner", false).await;
         let expired = chrono::Utc::now().timestamp_millis() - 1;
@@ -2066,10 +2153,32 @@ mod tests {
             .unwrap();
         let scheduled = Arc::new(Mutex::new(Vec::new()));
         let scheduled_claims = scheduled.clone();
+        let restart_admission = tokio::sync::Mutex::new(());
+        let restart_reserved = AtomicBool::new(true);
 
-        let claimed = poll_once(&store, "new-poll-owner", 1, 30_000, move |claim| {
-            scheduled_claims.lock().unwrap().push(claim);
-        })
+        let blocked = poll_once_with_restart_admission(
+            &restart_admission,
+            &restart_reserved,
+            &store,
+            "blocked-poll-owner",
+            1,
+            30_000,
+            |_| panic!("restart reservation must prevent Objective claims"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked, 0);
+        restart_reserved.store(false, Ordering::SeqCst);
+
+        let claimed = poll_once_with_restart_admission(
+            &restart_admission,
+            &restart_reserved,
+            &store,
+            "new-poll-owner",
+            1,
+            30_000,
+            move |claim| scheduled_claims.lock().unwrap().push(claim),
+        )
         .await
         .unwrap();
 

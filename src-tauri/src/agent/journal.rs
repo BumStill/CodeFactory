@@ -35,7 +35,7 @@ use std::process::Command;
 use chrono::Utc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 
 use crate::errors::Result;
 use crate::storage::tasks::TaskRun;
@@ -315,28 +315,44 @@ pub async fn recover_orphaned_tasks(
             continue;
         }
         let j = journal_get(pool, &id).await?;
-        let outcome = match j.as_ref() {
-            Some(j)
-                if j.state == "merging"
-                    && j.isolation_mode == "worktree"
-                    && j.patch_path
-                        .as_deref()
-                        .is_some_and(|p| Path::new(p).exists())
-                    && j.repo_root.is_some() =>
-            {
-                let patch = j.patch_path.as_deref().unwrap();
-                let root = j.repo_root.as_deref().unwrap();
-                if git(root, &["apply", "--reverse", "--check", patch]).is_ok() {
-                    finalize_merging_to_done(pool, &id, j).await?;
+        let linked_objective_status: Option<String> = sqlx::query_scalar(
+            "SELECT o.status FROM task_runs t \
+             JOIN objectives o ON o.id=t.objective_id WHERE t.id=?",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await?;
+        let outcome = if linked_objective_status.as_deref() == Some("completed") {
+            finalize_completed_projection(pool, &id, j.as_ref()).await?;
+            "finalized"
+        } else {
+            match j.as_ref() {
+                Some(j) if j.state == "done" && j.result_json.is_some() => {
+                    finalize_completed_projection(pool, &id, Some(j)).await?;
                     "finalized"
-                } else {
-                    reset_to_pending(pool, &id, true).await?;
+                }
+                Some(j)
+                    if j.state == "merging"
+                        && j.isolation_mode == "worktree"
+                        && j.patch_path
+                            .as_deref()
+                            .is_some_and(|p| Path::new(p).exists())
+                        && j.repo_root.is_some() =>
+                {
+                    let patch = j.patch_path.as_deref().unwrap();
+                    let root = j.repo_root.as_deref().unwrap();
+                    if git(root, &["apply", "--reverse", "--check", patch]).is_ok() {
+                        finalize_merging_to_done(pool, &id, j).await?;
+                        "finalized"
+                    } else {
+                        reset_to_pending(pool, &id, true).await?;
+                        "reset"
+                    }
+                }
+                _ => {
+                    reset_to_pending(pool, &id, j.is_some()).await?;
                     "reset"
                 }
-            }
-            _ => {
-                reset_to_pending(pool, &id, j.is_some()).await?;
-                "reset"
             }
         };
         out.push(Recovered {
@@ -346,6 +362,35 @@ pub async fn recover_orphaned_tasks(
         });
     }
     Ok(out)
+}
+
+/// Rebuild the task-list projection from an already-terminal Objective or a
+/// durable `done` journal. Neither proof is allowed to become pending merely
+/// because the process restarted between the authoritative commit and this
+/// projection write.
+async fn finalize_completed_projection(
+    pool: &SqlitePool,
+    id: &str,
+    journal: Option<&JournalRow>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let completed_at = journal.map(|row| row.completed_at.as_str());
+    let result = journal.and_then(|row| row.result_json.as_deref());
+    sqlx::query(
+        "UPDATE task_runs SET status='completed', \
+         completed_at=COALESCE(?, completed_at, ?), \
+         result=COALESCE(?, result, ?), error=NULL, \
+         recovery_state=NULL, next_observation_at=NULL, \
+         owner_pid=NULL, owner_start_token=NULL WHERE id=?",
+    )
+    .bind(completed_at)
+    .bind(&now)
+    .bind(result)
+    .bind(r#"{"summary":"reconciled from completed objective evidence"}"#)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The reset shared by orphan recovery and invalidation. Clears live state;
@@ -467,8 +512,9 @@ pub async fn record_completion(
     m: &Materialization,
     result_json: &str,
 ) -> Result<()> {
-    upsert_journal(
-        pool,
+    let mut tx = pool.begin().await?;
+    upsert_journal_with(
+        &mut *tx,
         t,
         inputs,
         dep_keys,
@@ -486,8 +532,9 @@ pub async fn record_completion(
     .bind(&now)
     .bind(result_json)
     .bind(&t.id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -502,6 +549,33 @@ async fn upsert_journal(
     m: &Materialization,
     result_json: Option<&str>,
 ) -> Result<()> {
+    upsert_journal_with(
+        pool,
+        t,
+        inputs,
+        dep_keys,
+        state,
+        checkpoint_id,
+        m,
+        result_json,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_journal_with<'e, E>(
+    executor: E,
+    t: &TaskRun,
+    inputs: &DispatchInputs,
+    dep_keys: &[(String, String)],
+    state: &str,
+    checkpoint_id: Option<&str>,
+    m: &Materialization,
+    result_json: Option<&str>,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let local = local_digest(t, inputs);
     let key = compute_dispatch_key(t, inputs, dep_keys);
     let mut sorted = dep_keys.to_vec();
@@ -545,7 +619,7 @@ async fn upsert_journal(
     .bind(result_json)
     .bind(&now)
     .bind(&now)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -647,6 +721,16 @@ pub async fn plan_resume(
         .into_iter()
         .map(|j| (j.task_id.clone(), j))
         .collect();
+    let terminal_objective_tasks: HashSet<String> = sqlx::query_scalar(
+        "SELECT t.id FROM task_runs t \
+         JOIN objectives o ON o.id=t.objective_id \
+         WHERE t.session_id=? AND o.status='completed'",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect();
 
     // Dependency edges for the whole session.
     let mut deps: HashMap<String, Vec<String>> = HashMap::new();
@@ -723,6 +807,23 @@ pub async fn plan_resume(
             .any(|d| dirty.get(d).copied().unwrap_or(false));
 
         if t.status == "completed" {
+            // A terminal Objective is the business authority. A settings or
+            // dispatch-key change after completion may create a new Objective,
+            // but it must never silently reopen this historical execution.
+            if terminal_objective_tasks.contains(id) {
+                let effective = journal
+                    .get(id)
+                    .map(|row| row.dispatch_key.clone())
+                    .unwrap_or_else(|| expected.clone());
+                eff.insert(id.to_string(), effective.clone());
+                dirty.insert(id.to_string(), false);
+                report.restored.push(TaskView {
+                    task_id: id.to_string(),
+                    title: t.title.clone(),
+                    key_short: effective.chars().take(12).collect(),
+                });
+                continue;
+            }
             match should_replay_cached(journal.get(id), &expected, dep_dirty) {
                 Replay::Restore => {
                     eff.insert(id.to_string(), expected.clone());
@@ -776,7 +877,7 @@ pub async fn plan_resume(
 
     for id in cycle_members {
         let t = by_id[id];
-        if t.status == "completed" {
+        if t.status == "completed" && !terminal_objective_tasks.contains(id) {
             reset_to_pending(pool, id, journal.contains_key(id)).await?;
             report.invalidated.push(InvalidatedView {
                 task_id: id.to_string(),
@@ -808,7 +909,8 @@ mod tests {
                 started_at TEXT, completed_at TEXT, result TEXT, error TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0, verification_results TEXT,
                 task_context_json TEXT, acceptance_criteria_json TEXT,
-                spec_req_id TEXT, spec_title TEXT, owner_pid INTEGER, owner_start_token TEXT
+                spec_req_id TEXT, spec_title TEXT, owner_pid INTEGER, owner_start_token TEXT,
+                objective_id TEXT, recovery_state TEXT, next_observation_at INTEGER
             )",
         )
         .execute(&pool)
@@ -833,6 +935,15 @@ mod tests {
                 merge_applied INTEGER NOT NULL DEFAULT 0, materialization TEXT NOT NULL,
                 checkpoint_id TEXT, base_sha TEXT, patch_path TEXT, repo_root TEXT,
                 result_json TEXT, completed_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
             )",
         )
         .execute(&pool)
@@ -1002,6 +1113,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.0, "running");
+    }
+
+    #[tokio::test]
+    async fn orphan_with_durable_done_journal_stays_completed_after_restart() {
+        let pool = test_pool().await;
+        let running = task("done-before-crash", "s1", "running", "d");
+        insert(&pool, &running, Some((999_999_999, "gone"))).await;
+        upsert_journal(
+            &pool,
+            &running,
+            &inputs(),
+            &[],
+            "done",
+            None,
+            &shared_materialization(),
+            Some("{\"summary\":\"verified\"}"),
+        )
+        .await
+        .unwrap();
+
+        let recovered = recover_orphaned_tasks(&pool, OrphanScope::Session("s1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].outcome, "finalized");
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, result FROM task_runs WHERE id='done-before-crash'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "completed");
+        assert_eq!(row.1.as_deref(), Some("{\"summary\":\"verified\"}"));
+    }
+
+    #[tokio::test]
+    async fn orphan_linked_to_completed_objective_stays_completed_after_restart() {
+        let pool = test_pool().await;
+        let running = task("objective-done-before-crash", "s1", "running", "d");
+        insert(&pool, &running, Some((999_999_999, "gone"))).await;
+        sqlx::query("INSERT INTO objectives (id, status) VALUES ('objective-done', 'completed')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE task_runs SET objective_id='objective-done', \
+             recovery_state='resuming' WHERE id='objective-done-before-crash'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let recovered = recover_orphaned_tasks(&pool, OrphanScope::Session("s1".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].outcome, "finalized");
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, result, recovery_state FROM task_runs \
+             WHERE id='objective-done-before-crash'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "completed");
+        assert!(
+            row.1.is_some(),
+            "completed projection keeps durable evidence"
+        );
+        assert_eq!(row.2, None);
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_reopen_task_bound_to_completed_objective() {
+        let pool = test_pool().await;
+        let completed = task("terminal-objective", "s1", "completed", "d");
+        insert(&pool, &completed, None).await;
+        record_completion(
+            &pool,
+            &completed,
+            &inputs(),
+            &[],
+            None,
+            &shared_materialization(),
+            "{\"summary\":\"verified\"}",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives (id, status) VALUES ('objective-terminal', 'completed')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE task_runs SET objective_id='objective-terminal' WHERE id='terminal-objective'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut changed_inputs = inputs();
+        changed_inputs.resolved_model = "new-model-after-update".into();
+
+        let report = plan_resume(&pool, "s1", &changed_inputs).await.unwrap();
+
+        assert!(report.invalidated.is_empty());
+        assert_eq!(report.restored.len(), 1);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM task_runs WHERE id='terminal-objective'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "completed");
     }
 
     // ── I9: CAS claim ───────────────────────────────────────────────────────

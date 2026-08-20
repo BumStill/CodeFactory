@@ -227,8 +227,12 @@ export function WorkspacePage({
     .reverse()
     .find((message) => message.turnActivity?.objectiveStatus)
     ?.turnActivity?.objectiveStatus;
+  const currentTurnHasSettlement = messages
+    .slice(latestUserIndex + 1)
+    .some((message) => message.role === "assistant" && message.turnSettledAt != null);
   const currentTurnWasReleased = Boolean(
-    currentTurnObjectiveStatus && !systemOwnsObjective(currentTurnObjectiveStatus),
+    currentTurnHasSettlement ||
+    (currentTurnObjectiveStatus && !systemOwnsObjective(currentTurnObjectiveStatus)),
   );
   const steerActive = activeDraft
     ? false
