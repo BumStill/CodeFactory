@@ -35,6 +35,7 @@
 | CF-CCE-R27 | 紧凑摘要只包含有界总数和读取/搜索/文件类别计数，不得读取或显示参数、路径、prompt、stdout、结果正文或 secret | secret-negative payload tests |
 | CF-CCE-R28 | disclosure 使用原生键盘语义、`aria-expanded` 和 `aria-controls`；展开/收起后焦点留在触发器，且不能触发 sticky-scroll 的“有新内容”提示 | component accessibility + real browser scroll |
 | CF-CCE-R29 | 旧会话与缺少 objectiveStatus/segments 的 hydration 保守展示；不迁移、不回写旧消息，不认识的工具或状态默认可见 | legacy hydration fixtures |
+| CF-CCE-R30 | 一个 root turn 跨多个 assistant segment 或用户 steer 时，plan/activity/tool/settlement/回执按 semantic root 合并，durable terminal tuple 压过同 root 的旧 activity、迟到 revision 与 stale streaming；所有瞬态工具收敛且最多显示一个终态回执。历史 root 的迟到事件不得停止或隐藏真正 active 的下一 root；刚提交但尚未收到投影的新 user row也视为新 root | reducer multi-segment/late-event tests + shared ownership selector + Workspace/MessageList root isolation + real-browser steer fixture |
 
 ## Primary User Paths
 
@@ -56,7 +57,7 @@ Agent 在成功编辑文件后 panic 或应用退出。数据库已记录工具 
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-CCE-R1..R29 与 CF-ORC-R1..R21 联合追踪。
+- Spec Harness：CF-CCE-R1..R30 与 CF-ORC-R1..R40 联合追踪。
 - Compatibility Harness：旧 SQLite、旧 completion state、Interactive/Execute/Autonomous、匿名会话、队列与 recovery。
 - Observation Harness：segment 接管耗时、panic 反馈、重启恢复、stream 终态和进程 owner。
 - Payload Harness：大 diff、长 stdout、文件参数、凭据和 continuity 摘要脱敏。

@@ -84,8 +84,8 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/tool_backend.rs", "src/stores/chatEvents.ts", "src/pages/Workspace/WorkspacePage.tsx"],
-      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke"],
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/tool_backend.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/commands/session.rs", "src/stores/chat.ts", "src/stores/chatEvents.ts", "src/lib/turnOwnership.ts", "src/components/MessageList.tsx", "src/pages/Workspace/WorkspacePage.tsx", "src/acceptance/turn-handback.tsx", "scripts/verify-turn-handback-headless.mjs"],
+      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/pages/Workspace/WorkspacePage.systemStop.test.tsx", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke"],
       "required_evidence": ["L0", "L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -432,17 +432,19 @@
       "name": "计划拒绝与只读误判后恢复耗尽一致收敛",
       "priority": "P0",
       "covers": ["HLT-002", "HLT-005", "UI-003", "UI-005"],
-      "fixture": {"synthetic": true, "shape": "已有计划、缺 change_reason 的更新、strict-mode 只读审计、waiting tool 与 unknown 历史 receipt"},
+      "fixture": {"synthetic": true, "shape": "已有计划、缺 change_reason 的更新、strict-mode 只读审计、同一 root 的多 assistant segment 与 steer、waiting/running tool、unknown 历史 receipt 及随后 active 新 root"},
       "steps": [
         "真实 ToolBackend 拒绝无 change_reason 的结构变化且不创建外部 receipt",
         "紧接执行 strict-mode 只读仓库审计并确认实际 Done",
         "注入重复 technical failure 直到 production recovery ceiling 暂停同策略并登记 system incident",
+        "让 supervisor 在 claim poll 内提交 incident，确认没有新 claim 时仍发布 post-commit terminal projection",
+        "把 terminal activity/settlement 投到 steer 前 segment，确认同 root 全部收敛且随后 active 新 root 不受迟到事件影响",
         "独立进程两次重开同一 SQLite 并验证 turn、stream、run-control 与工具不复活",
         "真实浏览器渲染 production reducer、MessageList、ToolCallCard 与 MessageInput"
       ],
-      "fault_injection": ["transactional plan validation rejection", "stale streaming flag", "waiting tool projection", "unknown historical receipt", "two process restarts"],
+      "fault_injection": ["transactional plan validation rejection", "supervisor terminal transition without a foreground claim", "live root split by steer", "terminal event routed through an earlier segment", "late terminal event for an older root", "stale streaming flag", "waiting and running tool projection", "unknown historical receipt", "reload from authoritative settlement tuple", "two process restarts"],
       "oracles": {
-        "ui": ["composer 为发送且无停止按钮、进度、ETA、等待时钟或核心输入 CTA", "system incident 原因可见且 running 对照仍活跃"],
+        "ui": ["composer 为发送且无停止按钮、进度、ETA、等待时钟或核心输入 CTA", "同 root 所有瞬态工具终态化且只显示一个结束回执", "system incident 原因可见、旧 root 不污染且 active 新 root 对照仍活跃"],
         "durable_state": ["Objective waiting_system/failed_internal 且 requires_user_action=0", "terminal_revision、visible_final、turn_settled_at/stream_closed_at 与 run settled_at 原子一致", "unknown receipt 保留且同策略无 claimable remediation"],
         "process": ["两个新 PID 重开后旧策略不复活，只有系统能力版本变化可重新排队"],
         "side_effects": ["invalid update_plan 零 receipt、plan revision 不变、strict read-only bash 为 Done"],
@@ -450,7 +452,7 @@
       },
       "execution": {"pull_request": "ToolBackend/SQLite/browser integration", "nightly": "cross-process restart", "release_artifact": "exact Windows executable plus installed desktop canary"},
       "automation_status": "partially_implemented",
-      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke"],
+      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:committed_terminal_projection_rejects_an_advanced_objective", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/lib/turnOwnership.test.ts", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke"],
       "remaining_gaps": ["L3 真实桌面 WebView 中以正式 session 数据走完整 provider recovery exhaustion", "macOS 安装版仍需绑定 exact release SHA 的人工 canary"]
     },
     {

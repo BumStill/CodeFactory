@@ -486,8 +486,12 @@ pub struct TurnActivitySnapshot {
     pub waiting_reason: Option<String>,
     pub updated_at: i64,
     pub terminal_reason: Option<String>,
+    pub turn_settled_at: Option<i64>,
+    pub stream_closed_at: Option<i64>,
+    pub terminal_revision: Option<i64>,
     pub objective_id: Option<String>,
     pub objective_status: Option<String>,
+    pub is_current_objective_turn: bool,
     pub recovery_owner: Option<String>,
     pub next_observation_at: Option<i64>,
     pub last_progress_at: Option<i64>,
@@ -795,8 +799,11 @@ async fn load_turn_activity_states(
         "SELECT turn.root_turn_id, turn.revision, turn.phase, turn.status,
                 turn.recent_activity_kind, turn.recent_activity_label,
                 turn.waiting_reason, turn.updated_at, turn.terminal_reason,
+                turn.turn_settled_at, turn.stream_closed_at, turn.terminal_revision,
                 turn.objective_id AS objective_id,
                 objective.status AS objective_status,
+                CASE WHEN turn.root_turn_id=COALESCE(objective.resume_cursor, objective.root_turn_id)
+                     THEN 1 ELSE 0 END AS is_current_objective_turn,
                 objective.recovery_owner AS recovery_owner,
                 objective.next_observation_at AS next_observation_at,
                 objective.last_progress_at AS last_progress_at
@@ -830,7 +837,22 @@ async fn load_turn_activity_states(
             if error.to_string().contains("no such table: objectives")
                 || error
                     .to_string()
-                    .contains("no such column: turn.objective_id") =>
+                    .contains("no such column: turn.objective_id")
+                || error
+                    .to_string()
+                    .contains("no such column: objective.resume_cursor")
+                || error
+                    .to_string()
+                    .contains("no such column: objective.root_turn_id")
+                || error
+                    .to_string()
+                    .contains("no such column: turn.turn_settled_at")
+                || error
+                    .to_string()
+                    .contains("no such column: turn.stream_closed_at")
+                || error
+                    .to_string()
+                    .contains("no such column: turn.terminal_revision") =>
         {
             // A copied pre-objective database must remain readable. App startup
             // installs the additive objective schema before normal commands,
@@ -840,7 +862,10 @@ async fn load_turn_activity_states(
                 "SELECT root_turn_id, revision, phase, status,
                         recent_activity_kind, recent_activity_label,
                         waiting_reason, updated_at, terminal_reason,
+                        NULL AS turn_settled_at, NULL AS stream_closed_at,
+                        NULL AS terminal_revision,
                         NULL AS objective_id, NULL AS objective_status,
+                        0 AS is_current_objective_turn,
                         NULL AS recovery_owner, NULL AS next_observation_at,
                         NULL AS last_progress_at
                  FROM chat_turn_state
@@ -1383,6 +1408,8 @@ mod tests {
             "CREATE TABLE objectives (
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
+                root_turn_id TEXT,
+                resume_cursor TEXT,
                 recovery_owner TEXT,
                 next_observation_at INTEGER,
                 last_progress_at INTEGER
@@ -1403,6 +1430,9 @@ mod tests {
                 waiting_reason TEXT,
                 updated_at INTEGER NOT NULL,
                 terminal_reason TEXT,
+                turn_settled_at INTEGER,
+                stream_closed_at INTEGER,
+                terminal_revision INTEGER,
                 objective_id TEXT
             )",
         )
@@ -1420,15 +1450,21 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO messages (id, session_id, role, content, created_at)
-             VALUES ('objective-root', 'objective-session', 'user', '完成并发布', 1)",
+             VALUES
+               ('objective-root-old', 'objective-session', 'user', '完成并发布', 1),
+               ('objective-root-current', 'objective-session', 'user', '继续收尾', 2)",
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO objectives (
-                id, status, recovery_owner, next_observation_at, last_progress_at
-             ) VALUES ('objective-1', 'waiting_system', 'objective-supervisor', 42000, 41000)",
+                id, status, root_turn_id, resume_cursor, recovery_owner,
+                next_observation_at, last_progress_at
+             ) VALUES (
+                'objective-1', 'waiting_system', 'objective-root-old',
+                'objective-root-current', 'objective-supervisor', 42000, 41000
+             )",
         )
         .execute(&pool)
         .await
@@ -1437,11 +1473,20 @@ mod tests {
             "INSERT INTO chat_turn_state (
                 root_turn_id, session_id, revision, phase, status,
                 recent_activity_kind, recent_activity_label, waiting_reason,
-                updated_at, terminal_reason, objective_id
-             ) VALUES (
-                'objective-root', 'objective-session', 7, 'recovering', 'active',
-                'remediation', '已切换备用 route', '等待退避', 41500, NULL, 'objective-1'
-             )",
+                updated_at, terminal_reason, turn_settled_at, stream_closed_at,
+                terminal_revision, objective_id
+             ) VALUES
+               (
+                 'objective-root-old', 'objective-session', 7, 'recovering', 'active',
+                 'remediation', '已切换备用 route', '等待退避', 41500, NULL,
+                 NULL, NULL, NULL, 'objective-1'
+               ),
+               (
+                 'objective-root-current', 'objective-session', 9, 'waiting', 'waiting_system',
+                 'technical_recovery_exhausted', '系统已登记故障',
+                 'technical_recovery_exhausted', 43000,
+                 'technical_recovery_exhausted', 42500, 42500, 9, 'objective-1'
+               )",
         )
         .execute(&pool)
         .await
@@ -1450,8 +1495,12 @@ mod tests {
         let page = load_message_page(&pool, "objective-session", None, 8)
             .await
             .expect("load objective projection");
-        assert_eq!(page.turn_states.len(), 1);
-        let state = &page.turn_states[0];
+        assert_eq!(page.turn_states.len(), 2);
+        let old = &page.turn_states[0];
+        let state = &page.turn_states[1];
+        assert!(!old.is_current_objective_turn);
+        assert_eq!(old.turn_settled_at, None);
+        assert!(state.is_current_objective_turn);
         assert_eq!(state.objective_id.as_deref(), Some("objective-1"));
         assert_eq!(state.objective_status.as_deref(), Some("waiting_system"));
         assert_eq!(
@@ -1460,6 +1509,9 @@ mod tests {
         );
         assert_eq!(state.next_observation_at, Some(42000));
         assert_eq!(state.last_progress_at, Some(41000));
+        assert_eq!(state.turn_settled_at, Some(42500));
+        assert_eq!(state.stream_closed_at, Some(42500));
+        assert_eq!(state.terminal_revision, Some(9));
     }
 
     #[tokio::test]

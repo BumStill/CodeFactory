@@ -556,6 +556,103 @@ describe("persisted chat hydration", () => {
     expect(dbMessagesToUI(rows, [], states)[1].durationMs).toBe(84_000);
   });
 
+  it("restores a parked system incident as a settled turn after reload", () => {
+    const rows: Message[] = [
+      { id: "root", session_id: "session-1", role: "user", content: "继续完成", created_at: 1_000 },
+      { id: "answer", session_id: "session-1", role: "assistant", content: "系统已登记故障。", created_at: 2_000 },
+    ];
+    const states: TurnActivitySnapshot[] = [{
+      root_turn_id: "root",
+      revision: 9,
+      phase: "waiting",
+      status: "waiting_system",
+      recent_activity_kind: "technical_recovery_exhausted",
+      recent_activity_label: "系统已登记故障，无需补充输入",
+      waiting_reason: "technical_recovery_exhausted",
+      updated_at: 9_000,
+      terminal_reason: "technical_recovery_exhausted",
+      objective_status: "waiting_system",
+    }];
+
+    const hydrated = dbMessagesToUI(rows, [], states);
+
+    expect(hydrated[1].turnSettledAt).toBe(9_000);
+    expect(hydrated[1].durationMs).toBe(8_000);
+    expect(hydrated[1].turnActivity?.terminalReason).toBe("technical_recovery_exhausted");
+  });
+
+  it("hydrates steers inside their registered root and isolates the next root", () => {
+    const rows: Message[] = [
+      { id: "root-1", session_id: "session-1", role: "user", content: "完成任务", created_at: 1_000 },
+      {
+        id: "answer-1",
+        session_id: "session-1",
+        role: "assistant",
+        content: "正在等待。",
+        tool_calls: JSON.stringify([{
+          id: "tool-1",
+          type: "function",
+          function: { name: "bash", arguments: "{}" },
+        }]),
+        created_at: 2_000,
+      },
+      { id: "steer-1", session_id: "session-1", role: "user", content: "继续收尾", created_at: 3_000 },
+      { id: "answer-2", session_id: "session-1", role: "assistant", content: "系统已登记故障。", created_at: 4_000 },
+      { id: "root-2", session_id: "session-1", role: "user", content: "新任务", created_at: 5_000 },
+      { id: "answer-3", session_id: "session-1", role: "assistant", content: "正在执行新任务。", created_at: 6_000 },
+    ];
+    const plans: TurnPlanSnapshot[] = [{
+      root_turn_id: "root-1",
+      revision: 2,
+      explanation: null,
+      waiting_reason: "等待远端",
+      change_reason: null,
+      created_at: 1_000,
+      steps: [],
+    }];
+    const states: TurnActivitySnapshot[] = [
+      {
+        root_turn_id: "root-1",
+        revision: 9,
+        phase: "waiting",
+        status: "waiting_system",
+        recent_activity_kind: "technical_recovery_exhausted",
+        recent_activity_label: "系统已登记故障，无需补充输入",
+        waiting_reason: "technical_recovery_exhausted",
+        updated_at: 4_500,
+        terminal_reason: "technical_recovery_exhausted",
+        objective_status: "waiting_system",
+      },
+      {
+        root_turn_id: "root-2",
+        revision: 1,
+        phase: "working",
+        status: "active",
+        recent_activity_kind: "tool",
+        recent_activity_label: "正在执行新任务",
+        waiting_reason: null,
+        updated_at: 6_500,
+        terminal_reason: null,
+        objective_status: "active",
+      },
+    ];
+
+    const hydrated = dbMessagesToUI(rows, plans, states);
+    const first = hydrated.find((message) => message.id === "answer-1")!;
+    const final = hydrated.find((message) => message.id === "answer-2")!;
+    const next = hydrated.find((message) => message.id === "answer-3")!;
+
+    expect(first.rootTurnId).toBe("root-1");
+    expect(first.toolCalls?.[0]).toMatchObject({ status: "blocked", isError: false });
+    expect(final.rootTurnId).toBe("root-1");
+    expect(final.plan?.rootTurnId).toBe("root-1");
+    expect(final.turnSettledAt).toBe(4_500);
+    expect(final.turnActivity?.terminalReason).toBe("technical_recovery_exhausted");
+    expect(next.rootTurnId).toBe("root-2");
+    expect(next.turnSettledAt).toBeUndefined();
+    expect(next.turnActivity?.objectiveStatus).toBe("active");
+  });
+
   it("keeps a hydrated system-owned objective when no assistant row exists yet", () => {
     const rows: Message[] = [
       {

@@ -13,9 +13,9 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
-use super::objective::{ClaimedRemediation, ObjectiveStore, RecoveryDomain};
+use super::objective::{ClaimedRemediation, ObjectiveSnapshot, ObjectiveStore, RecoveryDomain};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LEASE_MS: i64 = 60_000;
@@ -973,17 +973,40 @@ async fn poll_once<Schedule>(
     owner: &str,
     limit: i64,
     lease_ms: i64,
-    mut schedule: Schedule,
+    schedule: Schedule,
 ) -> anyhow::Result<usize>
 where
     Schedule: FnMut(ClaimedRemediation),
 {
-    let claims = store.claim_due_remediations(owner, limit, lease_ms).await?;
-    let claimed_count = claims.len();
-    for claim in claims {
+    let (claimed_count, _) =
+        poll_once_with_transitions(store, owner, limit, lease_ms, schedule, |_| {}).await?;
+    Ok(claimed_count)
+}
+
+async fn poll_once_with_transitions<Schedule, Publish>(
+    store: &ObjectiveStore,
+    owner: &str,
+    limit: i64,
+    lease_ms: i64,
+    mut schedule: Schedule,
+    mut publish: Publish,
+) -> anyhow::Result<(usize, usize)>
+where
+    Schedule: FnMut(ClaimedRemediation),
+    Publish: FnMut(ObjectiveSnapshot),
+{
+    let batch = store
+        .claim_due_remediation_batch(owner, limit, lease_ms)
+        .await?;
+    let claimed_count = batch.claims.len();
+    let transition_count = batch.terminal_transitions.len();
+    for claim in batch.claims {
         schedule(claim);
     }
-    Ok(claimed_count)
+    for transition in batch.terminal_transitions {
+        publish(transition);
+    }
+    Ok((claimed_count, transition_count))
 }
 
 async fn poll_once_with_restart_admission<Schedule>(
@@ -1003,6 +1026,66 @@ where
         return Ok(0);
     }
     poll_once(store, owner, limit, lease_ms, schedule).await
+}
+
+async fn poll_once_with_restart_admission_and_transitions<Schedule, Publish>(
+    restart_admission: &tokio::sync::Mutex<()>,
+    restart_reserved: &AtomicBool,
+    store: &ObjectiveStore,
+    owner: &str,
+    limit: i64,
+    lease_ms: i64,
+    schedule: Schedule,
+    publish: Publish,
+) -> anyhow::Result<(usize, usize)>
+where
+    Schedule: FnMut(ClaimedRemediation),
+    Publish: FnMut(ObjectiveSnapshot),
+{
+    let _admission = restart_admission.lock().await;
+    if restart_reserved.load(Ordering::SeqCst) {
+        return Ok((0, 0));
+    }
+    poll_once_with_transitions(store, owner, limit, lease_ms, schedule, publish).await
+}
+
+async fn publish_committed_terminal_transition(app: AppHandle, objective: ObjectiveSnapshot) {
+    if objective.task_id.is_none()
+        && (objective.root_turn_id.is_some() || objective.resume_cursor.is_some())
+    {
+        if let Err(error) =
+            crate::commands::chat::publish_committed_objective_transition(&app, &objective).await
+        {
+            tracing::warn!(
+                objective_id = %objective.id,
+                %error,
+                "committed Chat terminal transition remains durable but its live projection failed"
+            );
+        }
+    }
+    if let (Some(session_id), Some(task_id)) = (
+        objective.session_id.as_deref(),
+        objective.task_id.as_deref(),
+    ) {
+        // Task subscribers refresh the authoritative row on any task_failed
+        // event; no result/error body is duplicated onto the event bus.
+        let payload = serde_json::json!({
+            "task_id": task_id,
+            "title": null,
+            "message": "自动恢复已达到安全上限；系统已登记故障",
+            "result": null,
+            "error": "系统未继续执行该任务",
+            "files_changed": null,
+            "cwd": null,
+        });
+        if let Err(error) = app.emit(&format!("task_failed:{session_id}"), payload) {
+            tracing::warn!(
+                objective_id = %objective.id,
+                %error,
+                "committed Task terminal transition remains durable but its live refresh failed"
+            );
+        }
+    }
 }
 
 pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
@@ -1060,7 +1143,8 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             let claim_pool = pool.clone();
             let claim_store = store.clone();
             let claim_owner = owner.clone();
-            if let Err(error) = poll_once_with_restart_admission(
+            let transition_app = app.clone();
+            if let Err(error) = poll_once_with_restart_admission_and_transitions(
                 &restart_admission,
                 &restart_reserved,
                 &store,
@@ -1074,6 +1158,12 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                         claim_store.clone(),
                         claim_owner.clone(),
                         claim,
+                    ));
+                },
+                move |transition| {
+                    tauri::async_runtime::spawn(publish_committed_terminal_transition(
+                        transition_app.clone(),
+                        transition,
                     ));
                 },
             )
@@ -1091,7 +1181,7 @@ mod tests {
     use super::*;
     use crate::agent::objective::{
         CreateObjective, DecisionRouter, ObjectiveKind, ObjectiveSnapshot, ObjectiveStatus,
-        RecoveryDomain, RouteSignal,
+        RecoveryDomain, RouteSignal, MAX_SIGNATURE_RECOVERY_ATTEMPTS,
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::{
@@ -2190,6 +2280,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_once_publishes_a_parked_incident_instead_of_dropping_it() {
+        let (pool, store, prior_claim) =
+            claimed_chat_objective("publish-terminal-transition", "prior-owner", false).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE objective_remediations
+             SET status='waiting', attempt_index=?, next_observation_at=?,
+                 lease_owner=NULL, lease_expires_at=NULL
+             WHERE id=?",
+        )
+        .bind(MAX_SIGNATURE_RECOVERY_ATTEMPTS)
+        .bind(now - 1)
+        .bind(&prior_claim.remediation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE objectives SET lease_owner=NULL, lease_expires_at=NULL WHERE id=?")
+            .bind(&prior_claim.objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let scheduled_claims = scheduled.clone();
+        let published_transitions = published.clone();
+        let counts = poll_once_with_transitions(
+            &store,
+            "replacement-owner",
+            1,
+            30_000,
+            move |claim| scheduled_claims.lock().unwrap().push(claim),
+            move |transition| published_transitions.lock().unwrap().push(transition),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counts, (0, 1));
+        assert!(scheduled.lock().unwrap().is_empty());
+        let published = published.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].id, prior_claim.objective.id);
+        assert_eq!(
+            published[0].failure_code.as_deref(),
+            Some("technical_recovery_exhausted")
+        );
+        assert_eq!(
+            published[0].recovery_owner.as_deref(),
+            Some("objective-incident-controller")
+        );
+        assert_eq!(
+            store
+                .get(&prior_claim.objective.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            published[0].revision,
+            "the published transition must be the committed durable winner",
+        );
+    }
+
+    #[tokio::test]
     async fn restart_context_claim_reuses_same_objective_and_authorizes_one_recompaction() {
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -2622,7 +2775,8 @@ mod tests {
                     candidate_snapshot_digest:
                         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                             .into(),
-                    candidate_snapshot_json: r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
+                    candidate_snapshot_json:
+                        r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
                     resume_cursor: objective.root_turn_id.clone().unwrap(),
                 },
                 now,
@@ -2771,8 +2925,7 @@ mod tests {
                     candidate_snapshot_digest:
                         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                             .into(),
-                    candidate_snapshot_json:
-                        r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
+                    candidate_snapshot_json: r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
                     resume_cursor: objective.root_turn_id.clone().unwrap(),
                 },
                 now,

@@ -40,7 +40,7 @@ import { useTasksStore } from "../../stores/tasks";
 import type { BrowserSession, TaskRun, VerificationResult } from "../../lib/tauri";
 import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
-import { systemOwnsObjective } from "../../lib/turnOwnership";
+import { currentTurnOwnership } from "../../lib/turnOwnership";
 
 type WorkspaceBrowserSession = BrowserSession & {
   status?: string | null;
@@ -218,24 +218,8 @@ export function WorkspacePage({
   // Steering covers both in-flight surfaces: a streaming chat turn and an
   // autonomous task run. Same keystroke, same meaning, same queue — which of
   // the two happens to be running is the framework's business, not the user's.
-  const latestUserIndex = messages.reduce(
-    (latest, message, index) => (message.role === "user" ? index : latest),
-    -1,
-  );
-  const currentTurnActivity = [...messages]
-    .slice(latestUserIndex + 1)
-    .reverse()
-    .find((message) => message.turnActivity?.objectiveStatus)
-    ?.turnActivity;
-  const currentTurnObjectiveStatus = currentTurnActivity?.objectiveStatus;
-  const currentTurnHasSettlement = messages
-    .slice(latestUserIndex + 1)
-    .some((message) => message.role === "assistant" && message.turnSettledAt != null);
-  const currentTurnWasReleased = Boolean(
-    currentTurnHasSettlement ||
-    currentTurnActivity?.terminalReason ||
-    (currentTurnObjectiveStatus && !systemOwnsObjective(currentTurnObjectiveStatus)),
-  );
+  const currentOwnership = useMemo(() => currentTurnOwnership(messages), [messages]);
+  const currentTurnWasReleased = currentOwnership.released;
   const steerActive = activeDraft
     ? false
     : !currentTurnWasReleased && (streaming || persistedRunActive);
@@ -243,14 +227,7 @@ export function WorkspacePage({
   // once streaming stopped the composer went back to "发送", so system-owned
   // recovery kept the turn alive with no way to end it — across restarts too.
   // Same predicate the progress banner uses to decide it is still working.
-  const systemHoldsTurn = useMemo(
-    () =>
-      messages.slice(latestUserIndex + 1).some((message) =>
-        !message.turnActivity?.terminalReason &&
-        systemOwnsObjective(message.turnActivity?.objectiveStatus),
-      ),
-    [latestUserIndex, messages],
-  );
+  const systemHoldsTurn = currentOwnership.systemHeld;
   const turnInFlight = activeDraft
     ? false
     : !currentTurnWasReleased && (streaming || durableTurnActive || systemHoldsTurn);

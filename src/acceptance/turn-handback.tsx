@@ -11,6 +11,7 @@ import "../styles/globals.css";
 import { MessageList } from "../components/MessageList";
 import { MessageInput } from "../components/MessageInput";
 import type { TurnPlan } from "../lib/chatPlan";
+import { currentTurnOwnership } from "../lib/turnOwnership";
 import {
   reduceChatStreamEvent,
   type ChatEventState,
@@ -41,45 +42,72 @@ const beforeHandback: ChatEventState = {
   contextUsage: null,
   compressionToast: null,
   messages: [
-  { id: "user", role: "user", content: "只读分析输入框与弹层问题", createdAt: Date.now() - 9 * 60 * 1000 },
-  {
-    id: "assistant",
-    role: "assistant",
-    content: "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。",
-    createdAt: Date.now() - 10_000,
-    durationMs: 6 * 60 * 1000,
-    inputTokens: 12_000,
-    outputTokens: 345,
-    turnSettledAt: Date.now(),
-    plan,
-    toolCalls: [{
-      id: "audit-tool",
-      name: "bash",
-      args: "set -euo pipefail; git diff --check; git status --short",
-      result: "external_state_uncertain",
-      status: "waiting",
-    }],
-    segments: [
-      {
-        kind: "text",
-        text: "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。",
-      },
-      { kind: "tool", toolCallId: "audit-tool" },
-    ],
-    turnActivity: {
+    {
+      id: "user",
+      role: "user",
+      content: "只读分析输入框与弹层问题",
+      createdAt: Date.now() - 9 * 60 * 1000,
+    },
+    {
+      id: "assistant-before-steer",
+      role: "assistant",
       rootTurnId: "user",
-      revision: 51,
-      phase: "recovering",
-      status: "active",
-      kind: "tool",
-      label: "正在恢复工具状态",
-      waitingReason: "工具状态待确认",
-      updatedAt: Date.now() - 1,
-      terminalReason: null,
-      objectiveId: "objective-handback",
-      objectiveStatus: "waiting_system",
-    } as UIMessage["turnActivity"],
-  },
+      content: "正在核对输入框与弹层状态。",
+      createdAt: Date.now() - 8 * 60 * 1000,
+      inputTokens: 12_000,
+      outputTokens: 345,
+      plan,
+      toolCalls: [{
+        id: "audit-tool-before-steer",
+        name: "bash",
+        args: "set -euo pipefail; git diff --check; git status --short",
+        result: "external_state_uncertain",
+        status: "waiting",
+      }],
+      segments: [
+        { kind: "text", text: "正在核对输入框与弹层状态。" },
+        { kind: "tool", toolCallId: "audit-tool-before-steer" },
+      ],
+      turnActivity: {
+        rootTurnId: "user",
+        revision: 51,
+        phase: "recovering",
+        status: "active",
+        kind: "tool",
+        label: "正在恢复工具状态",
+        waitingReason: "工具状态待确认",
+        updatedAt: Date.now() - 2,
+        terminalReason: null,
+        objectiveId: "objective-handback",
+        objectiveStatus: "waiting_system",
+      } as UIMessage["turnActivity"],
+    },
+    {
+      id: "steer",
+      role: "user",
+      content: "继续完成，不需要我补充输入",
+      createdAt: Date.now() - 7 * 60 * 1000,
+    },
+    {
+      id: "assistant-after-steer",
+      role: "assistant",
+      rootTurnId: "user",
+      content: "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。",
+      createdAt: Date.now() - 10_000,
+      toolCalls: [{
+        id: "audit-tool-after-steer",
+        name: "bash",
+        args: "git log -1 --oneline",
+        status: "running",
+      }],
+      segments: [
+        {
+          kind: "text",
+          text: "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。",
+        },
+        { kind: "tool", toolCallId: "audit-tool-after-steer" },
+      ],
+    },
   ],
 };
 
@@ -96,14 +124,14 @@ const incidentActivity = reduceChatStreamEvent(beforeHandback, {
     terminal_reason: "technical_recovery_exhausted",
     objective_id: "objective-handback",
     objective_status: "waiting_system",
-  }, "assistant");
+  }, "assistant-before-steer");
 const incident = reduceChatStreamEvent(incidentActivity, {
   type: "turn_settled",
   run_instance_id: "run-handback",
   root_turn_id: "user",
   objective_id: "objective-handback",
   status: "system_incident",
-}, "assistant");
+}, "assistant-before-steer");
 
 // The guard against over-suppression: a turn that really is running keeps its
 // banner, its next step and its estimate.
@@ -154,22 +182,36 @@ function Composer({ streaming }: { streaming: boolean }) {
   );
 }
 
+function turnInFlight(messages: UIMessage[], streaming: boolean): boolean {
+  const ownership = currentTurnOwnership(messages);
+  return !ownership.released && (streaming || ownership.systemHeld);
+}
+
+const incidentInFlight = turnInFlight(incident.messages, incident.streaming);
+const runningInFlight = turnInFlight(running, false);
+
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <main aria-label="Turn terminal convergence acceptance" className="flex flex-col gap-4 bg-surface-0">
       <Panel title="System-owned incident">
-        <MessageList messages={incident.messages} streaming={incident.streaming} cwd={null} />
-        <Composer streaming={incident.streaming} />
+        <MessageList
+          messages={incident.messages}
+          streaming={incident.streaming}
+          turnActive={incidentInFlight}
+          turnExecutionActive={incidentInFlight}
+          cwd={null}
+        />
+        <Composer streaming={incidentInFlight} />
       </Panel>
       <Panel title="Still running">
         <MessageList
           messages={running}
           streaming={false}
-          turnActive
-          turnExecutionActive
+          turnActive={runningInFlight}
+          turnExecutionActive={runningInFlight}
           cwd={null}
         />
-        <Composer streaming />
+        <Composer streaming={runningInFlight} />
       </Panel>
     </main>
   </React.StrictMode>,

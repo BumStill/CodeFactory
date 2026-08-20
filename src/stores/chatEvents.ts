@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { StreamEvent } from "../lib/tauri.js";
 import { turnPlanFromEvent, type TurnPlan } from "../lib/chatPlan.js";
-import { SYSTEM_RELEASED_OBJECTIVE_STATUSES } from "../lib/turnOwnership.js";
+import {
+  currentTurnOwnership,
+  SYSTEM_RELEASED_OBJECTIVE_STATUSES,
+} from "../lib/turnOwnership.js";
 
 export interface ToolCallState {
   id: string;
@@ -25,6 +28,7 @@ export interface TurnActivityState {
   terminalReason: string | null;
   objectiveId?: string;
   objectiveStatus?: "active" | "waiting_system" | "waiting_core_input" | "waiting_authorization" | "waiting_business_decision" | "completed" | "cancelled" | "legacy_orphan";
+  isCurrentObjectiveTurn?: boolean;
   recoveryOwner?: string | null;
   nextObservationAt?: number | null;
   lastProgressAt?: number | null;
@@ -191,13 +195,62 @@ function updateMessageById(
   return next;
 }
 
+function messageBelongsToRootTurn(message: UIMessage, rootTurnId: string): boolean {
+  return (
+    message.rootTurnId === rootTurnId ||
+    message.turnActivity?.rootTurnId === rootTurnId ||
+    message.plan?.rootTurnId === rootTurnId
+  );
+}
+
+function messageRootTurnId(message: UIMessage): string | null {
+  return (
+    message.rootTurnId ??
+    message.turnActivity?.rootTurnId ??
+    message.plan?.rootTurnId ??
+    null
+  );
+}
+
+/**
+ * A steer can split one durable root turn into several live assistant bubbles.
+ * Terminal receipts belong to the root turn, not whichever bubble happened to
+ * be open when the event crossed the bridge. Settle every matching bubble so
+ * an older waiting snapshot cannot keep the progress card or Stop button alive.
+ */
+function updateRootTurnMessages(
+  messages: UIMessage[],
+  rootTurnId: string | null | undefined,
+  fallbackMsgId: string,
+  update: (message: UIMessage) => UIMessage,
+): UIMessage[] {
+  if (!rootTurnId) return updateMessageById(messages, fallbackMsgId, update);
+  const matchingAssistantIds = new Set(
+    messages
+      .filter(
+        (message) =>
+          message.role === "assistant" && messageBelongsToRootTurn(message, rootTurnId),
+      )
+      .map((message) => message.id),
+  );
+  if (matchingAssistantIds.size === 0) {
+    return updateMessageById(messages, fallbackMsgId, (message) => {
+      const messageRoot = messageRootTurnId(message);
+      return messageRoot && messageRoot !== rootTurnId ? message : update(message);
+    });
+  }
+  return messages.map((message) =>
+    matchingAssistantIds.has(message.id) ? update(message) : message,
+  );
+}
+
 const TRANSIENT_TOOL_STATUSES = new Set<ToolCallState["status"]>([
   "waiting_permission",
   "running",
   "waiting",
 ]);
 
-function terminalizeTransientTools(message: UIMessage): UIMessage {
+export function terminalizeTransientTools(message: UIMessage): UIMessage {
   const terminalize = (tool: ToolCallState): ToolCallState =>
     TRANSIENT_TOOL_STATUSES.has(tool.status)
       ? {
@@ -243,37 +296,51 @@ export function reduceChatStreamEvent(
 
     case "turn_activity_updated": {
       const transportSettled = event.terminal_reason != null;
+      const currentRootTurnId = currentTurnOwnership(state.messages).rootTurnId;
+      const settlesCurrentTurn =
+        !currentRootTurnId || currentRootTurnId === event.root_turn_id;
+      const updateActivity = (message: UIMessage): UIMessage => {
+        if (
+          message.turnActivity &&
+          message.turnActivity.revision >= event.revision
+        ) {
+          return transportSettled ? terminalizeTransientTools(message) : message;
+        }
+        const projected = {
+          ...message,
+          turnActivity: {
+            rootTurnId: event.root_turn_id,
+            revision: event.revision,
+            phase: event.phase,
+            status: event.status,
+            kind: event.recent_activity_kind,
+            label: event.recent_activity_label,
+            waitingReason: event.waiting_reason ?? null,
+            updatedAt: event.updated_at,
+            terminalReason: event.terminal_reason ?? null,
+            objectiveId: event.objective_id,
+            objectiveStatus: event.objective_status,
+            isCurrentObjectiveTurn: true,
+            recoveryOwner: event.recovery_owner ?? null,
+            nextObservationAt: event.next_observation_at ?? null,
+            lastProgressAt: event.last_progress_at ?? null,
+          },
+        };
+        return transportSettled ? terminalizeTransientTools(projected) : projected;
+      };
       return {
         ...state,
-        ...(transportSettled ? { streaming: false, pendingPermission: null } : {}),
-        messages: updateMessageById(state.messages, msgId, (message) => {
-          if (
-            message.turnActivity &&
-            message.turnActivity.revision >= event.revision
-          ) {
-            return message;
-          }
-          const projected = {
-            ...message,
-            turnActivity: {
-              rootTurnId: event.root_turn_id,
-              revision: event.revision,
-              phase: event.phase,
-              status: event.status,
-              kind: event.recent_activity_kind,
-              label: event.recent_activity_label,
-              waitingReason: event.waiting_reason ?? null,
-              updatedAt: event.updated_at,
-              terminalReason: event.terminal_reason ?? null,
-              objectiveId: event.objective_id,
-              objectiveStatus: event.objective_status,
-              recoveryOwner: event.recovery_owner ?? null,
-              nextObservationAt: event.next_observation_at ?? null,
-              lastProgressAt: event.last_progress_at ?? null,
-            },
-          };
-          return transportSettled ? terminalizeTransientTools(projected) : projected;
-        }),
+        ...(transportSettled && settlesCurrentTurn
+          ? { streaming: false, pendingPermission: null }
+          : {}),
+        messages: transportSettled
+          ? updateRootTurnMessages(
+              state.messages,
+              event.root_turn_id,
+              msgId,
+              updateActivity,
+            )
+          : updateMessageById(state.messages, msgId, updateActivity),
       };
     }
 
@@ -413,31 +480,40 @@ export function reduceChatStreamEvent(
 
     case "turn_settled": {
       const endedAt = Date.now();
+      const currentRootTurnId = currentTurnOwnership(state.messages).rootTurnId;
+      const settlesCurrentTurn =
+        !event.root_turn_id ||
+        !currentRootTurnId ||
+        event.root_turn_id === currentRootTurnId;
       return {
         ...state,
-        streaming: false,
-        pendingPermission: null,
-        messages: updateMessageById(state.messages, msgId, (message) => {
-          const objectiveStatus = message.turnActivity?.objectiveStatus;
-          const waitingUserReleased =
-            event.status === "waiting_user" &&
-            Boolean(
-              objectiveStatus &&
-              SYSTEM_RELEASED_OBJECTIVE_STATUSES.includes(objectiveStatus),
-            );
-          const terminalForTurn =
-            event.status === "completed" ||
-            event.status === "cancelled" ||
-            event.status === "system_incident" ||
-            event.status === "failed_setup" ||
-            waitingUserReleased;
-          const settled = message.durationMs == null
-            ? { ...message, durationMs: Math.max(0, endedAt - message.createdAt) }
-            : message;
-          return terminalForTurn
-            ? terminalizeTransientTools({ ...settled, turnSettledAt: endedAt })
-            : settled;
-        }),
+        ...(settlesCurrentTurn ? { streaming: false, pendingPermission: null } : {}),
+        messages: updateRootTurnMessages(
+          state.messages,
+          event.root_turn_id,
+          msgId,
+          (message) => {
+            const objectiveStatus = message.turnActivity?.objectiveStatus;
+            const waitingUserReleased =
+              event.status === "waiting_user" &&
+              Boolean(
+                objectiveStatus &&
+                SYSTEM_RELEASED_OBJECTIVE_STATUSES.includes(objectiveStatus),
+              );
+            const terminalForTurn =
+              event.status === "completed" ||
+              event.status === "cancelled" ||
+              event.status === "system_incident" ||
+              event.status === "failed_setup" ||
+              waitingUserReleased;
+            const settled = message.durationMs == null
+              ? { ...message, durationMs: Math.max(0, endedAt - message.createdAt) }
+              : message;
+            return terminalForTurn
+              ? terminalizeTransientTools({ ...settled, turnSettledAt: endedAt })
+              : settled;
+          },
+        ),
       };
     }
 

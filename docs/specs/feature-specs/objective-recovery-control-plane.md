@@ -48,6 +48,7 @@
 | CF-ORC-R37 | Completion Arbiter 与 system incident pause 必须在同一 SQLite 事务写入唯一 `terminal_revision`、`visible_final_message_id/kind`、`chat_turn_state.turn_settled_at/stream_closed_at/terminal_reason/next_action`、精确 run-control 与非终态 tool projection。`technical_recovery_exhausted` 保持 `waiting_system + failed_internal + requires_user_action=false`；unknown receipt 保持审计真相但不得继续呈现为运行中。旧 revision、迟到 stream 或投影重放不得覆盖该终态元组 | ObjectiveStore fault injection + cross-process restart smoke + browser integration |
 | CF-ORC-R38 | bash 的观察契约按**效果范围**判定，不按命令是否出现在白名单里。落在本机的效果必须获得可用观察者并放行：下载到指定文件由该文件的 sha256 观察，其余本机命令由 workspace digest 观察且 replay policy 为 `never_after_dispatch`。只有效果落在本机之外（远端推送/发布/集群/其他主机/带 method 或 body 的网络写入）、目标在工作区之外的文件破坏性操作、以及后台化命令才继续 fenced；fenced 文案必须指出可达替代路径，不得只描述门禁本身 | 下载文件观察者、依赖安装放行、工作区外破坏性操作与远端写入 fenced 的双向单测 |
 | CF-ORC-R39 | 单次 root turn 内已建立的 browser session 归属已由 task/chat 唯一确定时，后续 browser 动作省略 `session_id` 必须自动续用该 session；只有零个或多个归属会话时才要求显式命名 | 单会话续用 + 跨会话不可达 + 多会话必须命名的单测 |
+| CF-ORC-R40 | 任何在 claim、reconcile、startup 或后台 supervisor 内提交、且改变当前 turn/task ownership 或 settlement 的 Objective transition，都必须作为 post-commit receipt 返回并发布 typed projection；不得因为“没有新 claim”而吞掉已提交 transition。发布前必须复核 `(objective_id, revision, root/resume_cursor, terminal_revision)` 仍是 SQLite 当前胜者；旧 revision 不得终止新 root。事件丢失或发布失败不回滚真相，history hydration 必须从权威 settlement tuple 恢复 | supervisor ceiling callback + committed revision fence + task refresh payload + reducer old/new-root isolation + hydration SQLite integration |
 
 ## 效果范围决定观察契约（CF-ORC-R38）
 
@@ -150,7 +151,7 @@ App 在 provider、permission、task、browser 或 delivery 等待中退出或�
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-ORC-R1..R37 与所有 superseded 规格反向追踪。
+- Spec Harness：CF-ORC-R1..R40 与所有 superseded 规格反向追踪。
 - Compatibility Harness：旧 SQLite、旧 turn/task/delivery 状态、旧 auth 错误、旧设置和历史会话 hydration。
 - Observation Harness：typed decisions、lease、owner、真实 progress、attempt、receipt 和 KPI。
 - Release Harness：PR/CI/merge、正式 artifact、安装版和 rollback。

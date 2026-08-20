@@ -89,7 +89,7 @@
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-SCC-R1..R34，并与 CF-CCE-R1..R25、CF-ORC-R1..R21 的连续性与 ownership 契约联合验证。
+- Spec Harness：CF-SCC-R1..R36，并与 CF-CCE-R1..R30、CF-ORC-R1..R40 的连续性与 ownership 契约联合验证。
 - Compatibility Harness：旧 settings、旧 completion state、旧会话 hydration。
 - Viewport Harness：1366×768、800×600 下状态卡与输入区不重叠。
 - Observation Harness：真实 App 中 Full access 诊断、Execute 恢复和取消路径。
