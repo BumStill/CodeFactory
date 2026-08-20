@@ -247,9 +247,7 @@ describe("SettingsPage parallel-task controls", () => {
       screen.getByRole("heading", { name: "浏览器会话" }),
     ).toBeInTheDocument();
     expect(screen.getByText(/不会关闭你的普通 Chrome/)).toBeInTheDocument();
-    expect(
-      screen.getByText("chrome://inspect/#remote-debugging"),
-    ).toBeInTheDocument();
+    expect(screen.queryByText("chrome://inspect/#remote-debugging")).toBeNull();
 
     fireEvent.click(
       screen.getByRole("button", {
