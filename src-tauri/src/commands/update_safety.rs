@@ -773,12 +773,17 @@ async fn count_active_delivery_leases(
     pool: &sqlx::SqlitePool,
     now: i64,
 ) -> Result<i64, sqlx::Error> {
+    // A takeover claim is observe-only until its positive epoch has been
+    // reconciled. Its lease serializes observers, but it cannot authorize a
+    // local or remote mutation and is safe to interrupt for an app restart.
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM delivery_runs
-         WHERE status <> 'completed'
+         WHERE status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
            AND lease_owner IS NOT NULL
            AND lease_expires_at IS NOT NULL
-           AND lease_expires_at > ?",
+           AND lease_expires_at > ?
+           AND claim_epoch > 0
+           AND reconciled_claim_epoch = claim_epoch",
     )
     .bind(now)
     .fetch_one(pool)
@@ -1352,7 +1357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_unexpired_nonterminal_delivery_leases_block_restart() {
+    async fn only_mutation_capable_unexpired_delivery_leases_block_restart() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1363,26 +1368,64 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 lease_owner TEXT,
-                lease_expires_at INTEGER
+                lease_expires_at INTEGER,
+                claim_epoch INTEGER NOT NULL,
+                reconciled_claim_epoch INTEGER NOT NULL
             )",
         )
         .execute(&pool)
         .await
         .unwrap();
-        for (id, status, owner, expiry) in [
-            ("active", "waiting", Some("worker"), Some(2_000_i64)),
-            ("expired", "waiting", Some("worker"), Some(999_i64)),
-            ("done", "completed", Some("worker"), Some(2_000_i64)),
-            ("unowned", "waiting", None, Some(2_000_i64)),
+        for (id, status, owner, expiry, claim_epoch, reconciled_claim_epoch) in [
+            ("active", "waiting", Some("worker"), Some(2_000_i64), 3, 3),
+            (
+                "observe-only-takeover",
+                "platform_incident",
+                Some("observer"),
+                Some(2_000_i64),
+                708,
+                2,
+            ),
+            (
+                "legacy-zero-epoch",
+                "waiting",
+                Some("legacy-owner"),
+                Some(2_000_i64),
+                0,
+                0,
+            ),
+            ("expired", "waiting", Some("worker"), Some(999_i64), 3, 3),
+            ("done", "completed", Some("worker"), Some(2_000_i64), 3, 3),
+            ("failed", "failed", Some("worker"), Some(2_000_i64), 3, 3),
+            (
+                "cancelled",
+                "cancelled",
+                Some("worker"),
+                Some(2_000_i64),
+                3,
+                3,
+            ),
+            (
+                "rejected",
+                "rejected",
+                Some("worker"),
+                Some(2_000_i64),
+                3,
+                3,
+            ),
+            ("unowned", "waiting", None, Some(2_000_i64), 3, 3),
         ] {
             sqlx::query(
-                "INSERT INTO delivery_runs (id,status,lease_owner,lease_expires_at)
-                 VALUES (?,?,?,?)",
+                "INSERT INTO delivery_runs
+                 (id,status,lease_owner,lease_expires_at,claim_epoch,reconciled_claim_epoch)
+                 VALUES (?,?,?,?,?,?)",
             )
             .bind(id)
             .bind(status)
             .bind(owner)
             .bind(expiry)
+            .bind(claim_epoch)
+            .bind(reconciled_claim_epoch)
             .execute(&pool)
             .await
             .unwrap();
