@@ -130,6 +130,7 @@ export type StreamEvent =
       status:
         | "completed"
         | "cancelled"
+        | "system_incident"
         | "waiting_system"
         | "waiting_user"
         | "failed_setup";

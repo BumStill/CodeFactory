@@ -279,6 +279,7 @@ where
                 final_text: format!(
                     "Stopped after a model transport failure in the final wall-clock reserve: {error}"
                 ),
+                final_message_id: None,
                 completion_evidence: Default::default(),
                 input_tokens: 0,
                 output_tokens: 0,

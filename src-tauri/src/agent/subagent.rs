@@ -422,6 +422,7 @@ mod outcome_integrity_tests {
     fn outcome(stop_reason: StopReason, evidence_completed: bool) -> RunOutcome {
         RunOutcome {
             final_text: "terminal summary".into(),
+            final_message_id: None,
             completion_evidence: CompletionEvidence {
                 completed: evidence_completed,
                 ..CompletionEvidence::default()

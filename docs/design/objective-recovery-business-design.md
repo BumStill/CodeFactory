@@ -28,7 +28,7 @@ CodeFactory 负责把等待、provider、CI、远端对账、分支、权限通�
 - 用户不再靠“继续”“？”或追问停止原因来推动执行。
 - 相同目标只有一个 objective、一个 revision 轨迹和一个 canonical delivery identity。
 - 阶段性回复、stream 结束、turn settled 与业务完成严格分离。
-- 技术恢复耗尽进入可观测 remediation queue，不伪装成用户 blocker。
+- 技术恢复耗尽结算当前 transport turn 并进入可观测 system incident；同策略不再空转，也不伪装成用户 blocker。Objective 仍由系统持有，恢复策略或能力版本变化后续接。
 - 必要输入只请求一次；输入满足后自动续接，不要求重述任务。
 - 任何恢复先观察 receipt，再决定是否重放，外部副作用至多一次。
 

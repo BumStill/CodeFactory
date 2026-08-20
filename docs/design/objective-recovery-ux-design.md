@@ -13,13 +13,14 @@
 | `waiting_business_decision` | 需要业务决定 | 互斥选项、推荐项、各自业务影响、系统不能代选原因 | 一组互斥选择 |
 | `reconciling_side_effect` | 正在核对已发生操作 | receipt/远端状态未知、禁止盲重放说明 | 无 |
 | `completed` | 已完成 | evidence ref、达到的验收层级、delivery ladder | 查看证据 |
+| `waiting_system + failed_internal`（恢复耗尽） | 系统故障已登记，本回合已停止 | 明确“无需补充输入”、系统 owner 与恢复触发条件；不显示仍运行的 ETA/下一步 | 可发送新任务，但不以“继续”作为恢复门禁 |
 | `cancelled` | 已停止 | 谁、何时、取消的 action/objective、已保留副作用 | 可创建新目标；不自动恢复 |
 | `legacy_orphan` | 历史任务无法安全恢复 | 缺失的身份字段和零副作用保证 | 只读查看；不伪造恢复 |
 
 ## 会话与恢复卡
 
 - objective 卡与原 root turn 绑定，不新增“重新开始”消息。
-- stream/turn 结束后，只要 objective 仍 system-owned，卡继续显示；刷新和 App 重启后从 DB hydration 恢复。
+- stream/turn 结束后，可执行 remediation 的 objective 卡继续显示；恢复耗尽的 parked incident 改为固定结算说明，不保留运行进度、ETA 或下一步。刷新和 App 重启后两者都从 DB hydration 恢复。
 - card 顶部只展示一句当前状态；owner、failure code、attempt、最近进展和 next observation 放在可展开详情。
 - heartbeat 不更新“最近进展”；只有 receipt、验证、head/revision 或 state transition 才更新。
 - 同一 objective 的 provider/task/delivery 阶段在一张卡内演进，不堆叠多个警告。

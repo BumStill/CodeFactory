@@ -20,10 +20,10 @@ test("the formal binary exposes the historical session restart smoke", async () 
   assert.ok(lib.includes("history_session_smoke::run_parent"));
 });
 
-test("required Windows CI runs the cross-process continue, stop and handback oracle", async () => {
+test("required Windows CI runs the cross-process continue, stop and incident oracle", async () => {
   const ci = await source(".github/workflows/ci.yml");
   for (const marker of [
-    "Historical session continue/stop/handback cross-process smoke",
+    "Historical session continue/stop/incident cross-process smoke",
     "--history-session-smoke",
     "E2E-002",
     "E2E-003",
@@ -33,7 +33,7 @@ test("required Windows CI runs the cross-process continue, stop and handback ora
     "all_live_objectives_cancelled",
     "second_restart_stayed_cancelled",
     "claimable_remediation_count",
-    "handback_survived_two_restarts",
+    "system_incident_survived_two_restarts",
   ]) {
     assert.ok(ci.includes(marker), `required CI is missing ${marker}`);
   }
@@ -46,7 +46,7 @@ test("nightly repeats the historical session restart fault path", async () => {
     "--history-session-smoke",
     "stop_request_was_hard_killed",
     "second_restart_stayed_cancelled",
-    "handback_survived_two_restarts",
+    "system_incident_survived_two_restarts",
     "Upload historical session receipt",
   ]) {
     assert.ok(nightly.includes(marker), `nightly is missing ${marker}`);
@@ -62,7 +62,7 @@ test("the exact Windows release executable runs the same smoke", async () => {
     "stop_request_was_hard_killed",
     "second_restart_stayed_cancelled",
     "E2E-007",
-    "handback_survived_two_restarts",
+    "system_incident_survived_two_restarts",
   ]) {
     assert.ok(release.includes(marker), `release is missing ${marker}`);
   }

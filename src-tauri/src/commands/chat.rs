@@ -446,9 +446,7 @@ pub async fn cancel_chat(
     if let Some(control) = control.as_ref() {
         clear_chat_running_if_current(&state.chat_cancels, &session_id, control).await;
     }
-    tracing::info!(
-        "cancel_chat: durably stopped {stopped} objective(s) for session {session_id}"
-    );
+    tracing::info!("cancel_chat: durably stopped {stopped} objective(s) for session {session_id}");
     Ok(())
 }
 
@@ -856,7 +854,9 @@ pub async fn is_chat_running(
     let system_owned: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objectives objective
          WHERE objective.session_id=? AND objective.root_turn_id IS NOT NULL
-           AND objective.status IN ('active','waiting_system')",
+           AND objective.status IN ('active','waiting_system')
+           AND NOT (objective.status='waiting_system'
+                    AND objective.failure_code='technical_recovery_exhausted')",
     )
     .bind(session_id)
     .fetch_one(&pool)
@@ -898,7 +898,12 @@ async fn admit_chat_run(
 }
 
 fn chat_settlement_status(objective: &crate::agent::objective::ObjectiveSnapshot) -> &'static str {
-    use crate::agent::objective::ObjectiveStatus;
+    use crate::agent::objective::{ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED};
+    if objective.status == ObjectiveStatus::WaitingSystem
+        && objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
+    {
+        return "system_incident";
+    }
     match objective.status {
         ObjectiveStatus::Completed => "completed",
         ObjectiveStatus::Cancelled => "cancelled",
@@ -997,17 +1002,17 @@ fn chat_turn_projection(
     // Recovery that ran out of budget is a settled turn, not a live one. The
     // objective stays non-terminal (the work was never finished), but the
     // transport turn must stop presenting itself as still recovering.
-    let recovery_exhausted = objective.status == ObjectiveStatus::WaitingCoreInput
+    let recovery_exhausted = objective.status == ObjectiveStatus::WaitingSystem
         && objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED);
     let (phase, activity_kind, activity_label) = match objective.status {
         ObjectiveStatus::Completed => ("finalizing", "objective_completed", "目标证据已满足"),
         ObjectiveStatus::Cancelled => ("finalizing", "objective_cancelled", "已按用户要求停止"),
-        ObjectiveStatus::WaitingSystem => ("recovering", "system_recovery", "系统正在恢复并续接"),
-        ObjectiveStatus::WaitingCoreInput if recovery_exhausted => (
+        ObjectiveStatus::WaitingSystem if recovery_exhausted => (
             "waiting",
             TECHNICAL_RECOVERY_EXHAUSTED,
-            "系统多轮自动恢复没有进展，已停止并把当前结论交还给你",
+            "自动恢复已达到安全上限；系统已登记故障，无需补充输入",
         ),
+        ObjectiveStatus::WaitingSystem => ("recovering", "system_recovery", "系统正在恢复并续接"),
         ObjectiveStatus::WaitingCoreInput => ("waiting", "core_input_required", "需要补充核心输入"),
         ObjectiveStatus::WaitingAuthorization => {
             ("waiting", "authorization_required", "等待必要授权")
@@ -1059,8 +1064,12 @@ async fn project_chat_objective(
     let revision: Option<i64> = sqlx::query_scalar(
         "UPDATE chat_turn_state SET revision=revision+1, phase=?, status=?,
            recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
-           updated_at=?, completed_at=?, terminal_reason=?, objective_revision=?
+           updated_at=?,
+           completed_at=CASE WHEN terminal_revision IS NULL THEN ? ELSE completed_at END,
+           terminal_reason=CASE WHEN terminal_revision IS NULL THEN ? ELSE terminal_reason END,
+           objective_revision=?
          WHERE root_turn_id=? AND objective_id=?
+           AND terminal_revision IS NULL
            AND EXISTS (
              SELECT 1 FROM objectives current
              WHERE current.id=? AND current.revision=? AND current.status=?
@@ -1083,7 +1092,33 @@ async fn project_chat_objective(
     .bind(objective.status.as_str())
     .fetch_optional(db)
     .await?;
-    let Some(revision) = revision else {
+    let revision = if let Some(revision) = revision {
+        revision
+    } else if let Some(revision) = sqlx::query_scalar::<_, i64>(
+        "SELECT turn.revision FROM chat_turn_state turn
+         WHERE turn.root_turn_id=? AND turn.objective_id=?
+           AND turn.terminal_revision=?
+           AND EXISTS (
+             SELECT 1 FROM objectives current
+             WHERE current.id=? AND current.revision=? AND current.status=?
+           )",
+    )
+    .bind(root_turn_id)
+    .bind(&objective.id)
+    .bind(objective.revision)
+    .bind(&objective.id)
+    .bind(objective.revision)
+    .bind(objective.status.as_str())
+    .fetch_optional(db)
+    .await?
+    {
+        tracing::debug!(
+            root_turn_id,
+            objective_revision = objective.revision,
+            "published an already-persisted terminal projection without rewriting it"
+        );
+        revision
+    } else {
         tracing::debug!(
             objective_id = %objective.id,
             objective_revision = objective.revision,
@@ -3271,8 +3306,8 @@ mod tests {
             DecisionType, ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED,
         };
         let projection = chat_turn_projection(&projection_objective(
-            ObjectiveStatus::WaitingCoreInput,
-            DecisionType::CoreInputRequired,
+            ObjectiveStatus::WaitingSystem,
+            DecisionType::FailedInternal,
             Some(TECHNICAL_RECOVERY_EXHAUSTED),
         ));
         assert_eq!(projection.phase, "waiting");
@@ -3283,8 +3318,8 @@ mod tests {
             "the settled turn must name why the system stopped"
         );
         assert!(
-            projection.activity_label.contains("交还"),
-            "the user must be told the work is theirs now, not still running"
+            projection.activity_label.contains("无需补充输入"),
+            "the user must be told the incident remains system-owned"
         );
     }
 
@@ -3930,7 +3965,10 @@ mod tests {
         .unwrap();
         let continued = store.get(&objective.id).await.unwrap().unwrap();
         assert_eq!(continued.status, ObjectiveStatus::WaitingSystem);
-        assert_eq!(continued.root_turn_id.as_deref(), Some("turn-original-root"));
+        assert_eq!(
+            continued.root_turn_id.as_deref(),
+            Some("turn-original-root")
+        );
         assert_eq!(
             continued.resume_cursor.as_deref(),
             Some("turn-continuation-root")
@@ -3959,14 +3997,10 @@ mod tests {
         .await
         .unwrap();
 
-        let settled = converge_aborted_chat_setup(
-            &pool,
-            &control,
-            "session-continuation-setup",
-        )
-        .await
-        .expect("the durable continuation identity should converge")
-        .expect("the continuation keeps its Objective receipt");
+        let settled = converge_aborted_chat_setup(&pool, &control, "session-continuation-setup")
+            .await
+            .expect("the durable continuation identity should converge")
+            .expect("the continuation keeps its Objective receipt");
         assert_eq!(settled.root_turn_id, "turn-continuation-root");
         assert_eq!(settled.objective.id, objective.id);
         assert_eq!(settled.objective.status, ObjectiveStatus::WaitingSystem);
@@ -4246,13 +4280,12 @@ mod tests {
                 .is_empty(),
             "a stopped session must leave the supervisor nothing to resume"
         );
-        let intent_status: String = sqlx::query_scalar(
-            "SELECT status FROM chat_session_cancel_intents WHERE session_id=?",
-        )
-        .bind(&session_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let intent_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_session_cancel_intents WHERE session_id=?")
+                .bind(&session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(intent_status, "settled");
         assert_eq!(
             store.get(&unprojected.id).await.unwrap().unwrap().status,

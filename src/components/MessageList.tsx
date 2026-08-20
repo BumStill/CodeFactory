@@ -442,6 +442,9 @@ export function MessageList({
   const activeProgressMessage = [...visible]
     .reverse()
     .find((message) => {
+      if (message.turnActivity?.terminalReason) {
+        return false;
+      }
       if (
         message.turnActivity?.objectiveStatus &&
         !systemOwnsObjective(message.turnActivity.objectiveStatus)
@@ -469,6 +472,7 @@ export function MessageList({
             (message) =>
               message.role === "assistant" &&
               Boolean(message.turnActivity?.rootTurnId) &&
+              !message.turnActivity?.terminalReason &&
               systemOwnsObjective(message.turnActivity?.objectiveStatus),
           );
   const activeRootTurnId =
@@ -594,6 +598,7 @@ export function MessageList({
               isStreamingTail={streaming && msg.id === currentAssistantId}
               isTurnActive={
                 msg.id === currentAssistantId &&
+                !msg.turnActivity?.terminalReason &&
                 (turnActive || systemOwnsObjective(msg.turnActivity?.objectiveStatus))
               }
               isCurrentAssistant={msg.id === currentAssistantId}

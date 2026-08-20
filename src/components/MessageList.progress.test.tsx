@@ -163,25 +163,25 @@ describe("MessageList structured progress and result", () => {
     }
   });
 
-  it("retires the progress banner once the objective hands the turn back to the user", () => {
-    // technical_recovery_exhausted settles the objective into waiting_core_input:
-    // the system is done and the user must type. The banner must not keep
+  it("retires the progress banner once a system incident settles the transport turn", () => {
+    // technical_recovery_exhausted remains system-owned but settles this turn.
+    // The banner must not keep
     // advertising a next step, a live timer and an ETA for a turn nobody is running.
     const activity = {
       rootTurnId: "user",
       revision: 52,
       phase: "waiting",
-      status: "waiting_core_input",
+      status: "waiting_system",
       kind: "technical_recovery_exhausted",
-      label: "系统多轮自动恢复没有进展，已停止并把当前结论交还给你",
+      label: "自动恢复已达到安全上限；系统已登记故障，无需补充输入",
       waitingReason: "technical_recovery_exhausted",
       updatedAt: Date.now(),
       terminalReason: "technical_recovery_exhausted",
       objectiveId: "objective-1",
-      objectiveStatus: "waiting_core_input",
+      objectiveStatus: "waiting_system",
     } as UIMessage["turnActivity"] & {
       objectiveId: string;
-      objectiveStatus: "waiting_core_input";
+      objectiveStatus: "waiting_system";
     };
 
     render(

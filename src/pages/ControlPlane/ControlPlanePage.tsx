@@ -83,6 +83,7 @@ interface ObjectiveHealthMetrics {
   open: number;
   system_owned: number;
   typed_user_attention: number;
+  invalid_user_attention_requests: number;
   technical_user_handoff_violations: number;
   technical_user_handoff_violations_24h: number;
   avoidable_user_reprompts_24h: number;
@@ -91,6 +92,7 @@ interface ObjectiveHealthMetrics {
   unavailable_domain_adapter_objectives: number;
   invalid_completions: number;
   invalid_completions_24h: number;
+  invalid_terminal_convergences: number;
   duplicate_committed_side_effect_receipts: number;
   duplicate_committed_side_effect_receipts_24h: number;
   requested_ceiling_downgrades_24h: number;
@@ -475,6 +477,8 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
     metrics.overdue_ownerless_remediations +
     metrics.stalled_system_owned_objectives +
     metrics.unavailable_domain_adapter_objectives +
+    metrics.invalid_user_attention_requests +
+    metrics.invalid_terminal_convergences +
     metrics.invalid_completions_24h +
     metrics.duplicate_committed_side_effect_receipts_24h +
     metrics.requested_ceiling_downgrades_24h;
@@ -488,6 +492,18 @@ function ObjectiveHealthPanel({ health }: { health: ObjectiveHealthSnapshot | nu
       label: "Technical handoff violations",
       value: metrics.technical_user_handoff_violations,
       detail: "Technical recovery incorrectly projected to the user.",
+    },
+    {
+      testId: "objective-invalid-attention",
+      label: "Invalid user attention",
+      value: metrics.invalid_user_attention_requests,
+      detail: "User action was requested without a complete typed input or decision payload.",
+    },
+    {
+      testId: "objective-invalid-terminal-convergence",
+      label: "Invalid terminal convergence",
+      value: metrics.invalid_terminal_convergences,
+      detail: "Objective terminal revision is not bound to one visible final and settled turn.",
     },
     {
       testId: "objective-ownerless-remediations",

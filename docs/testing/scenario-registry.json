@@ -52,7 +52,7 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs"],
-      "automated_by": ["rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling", "rust:repeated_failure_signature_exhausts_system_recovery_and_returns_to_user"],
+      "automated_by": ["rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling", "rust:repeated_failure_signature_parks_a_system_owned_incident"],
       "required_evidence": ["L0", "L1", "L2"],
       "gates": ["pull_request", "nightly"]
     },
@@ -80,12 +80,12 @@
     },
     {
       "id": "HLT-005",
-      "name": "恢复耗尽后回合、工具与输入面一致交还",
+      "name": "恢复耗尽后系统事故暂停与输入面一致收敛",
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/tool_backend.rs", "src/stores/chatEvents.ts", "src/pages/Workspace/WorkspacePage.tsx"],
-      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_exhausts_system_recovery_and_returns_to_user", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke"],
+      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke"],
       "required_evidence": ["L0", "L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -326,7 +326,7 @@
       },
       "execution": {"pull_request": "SQLite plus native UI integration", "nightly": "old-schema matrix", "release_artifact": "installed historical-session canary"},
       "automation_status": "partially_implemented",
-      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/handback cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
+      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
       "remaining_gaps": ["L3 真实桌面 WebView 中选择历史 session、发送继续并观察即时 stream projection", "旧 schema fixture 迁移矩阵仍需扩展"]
     },
     {
@@ -352,7 +352,7 @@
       },
       "execution": {"pull_request": "race-focused integration", "nightly": "real App restart", "release_artifact": "Windows installed/manual canary until automated"},
       "automation_status": "partially_implemented",
-      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/handback cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
+      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
       "remaining_gaps": ["L3 真实桌面 WebView 中点击停止、失败态和 persisted cancelled projection", "partial projection failure 与真实 UI listener 并发仍需桌面自动化"]
     },
     {
@@ -429,28 +429,28 @@
     },
     {
       "id": "E2E-007",
-      "name": "计划拒绝与只读误判后恢复耗尽一致交还",
+      "name": "计划拒绝与只读误判后恢复耗尽一致收敛",
       "priority": "P0",
       "covers": ["HLT-002", "HLT-005", "UI-003", "UI-005"],
       "fixture": {"synthetic": true, "shape": "已有计划、缺 change_reason 的更新、strict-mode 只读审计、waiting tool 与 unknown 历史 receipt"},
       "steps": [
         "真实 ToolBackend 拒绝无 change_reason 的结构变化且不创建外部 receipt",
         "紧接执行 strict-mode 只读仓库审计并确认实际 Done",
-        "注入重复 technical failure 直到 production recovery ceiling 交还回合",
+        "注入重复 technical failure 直到 production recovery ceiling 暂停同策略并登记 system incident",
         "独立进程两次重开同一 SQLite 并验证 turn、stream、run-control 与工具不复活",
         "真实浏览器渲染 production reducer、MessageList、ToolCallCard 与 MessageInput"
       ],
       "fault_injection": ["transactional plan validation rejection", "stale streaming flag", "waiting tool projection", "unknown historical receipt", "two process restarts"],
       "oracles": {
-        "ui": ["composer 为发送且无停止按钮、进度、ETA 或等待时钟", "blocked 工具证据可见且 running 对照仍活跃"],
-        "durable_state": ["Objective waiting_core_input", "turn_settled_at/stream_closed_at 与 run settled_at 非空", "unknown receipt 保留且无 claimable remediation"],
-        "process": ["两个新 PID 重开后 handback 不复活"],
+        "ui": ["composer 为发送且无停止按钮、进度、ETA、等待时钟或核心输入 CTA", "system incident 原因可见且 running 对照仍活跃"],
+        "durable_state": ["Objective waiting_system/failed_internal 且 requires_user_action=0", "terminal_revision、visible_final、turn_settled_at/stream_closed_at 与 run settled_at 原子一致", "unknown receipt 保留且同策略无 claimable remediation"],
+        "process": ["两个新 PID 重开后旧策略不复活，只有系统能力版本变化可重新排队"],
         "side_effects": ["invalid update_plan 零 receipt、plan revision 不变、strict read-only bash 为 Done"],
         "delivery": ["required CI、nightly 与 exact release executable 运行同一 history-session smoke"]
       },
       "execution": {"pull_request": "ToolBackend/SQLite/browser integration", "nightly": "cross-process restart", "release_artifact": "exact Windows executable plus installed desktop canary"},
       "automation_status": "partially_implemented",
-      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_exhausts_system_recovery_and_returns_to_user", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "workflow:Historical session continue/stop/handback cross-process smoke"],
+      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke"],
       "remaining_gaps": ["L3 真实桌面 WebView 中以正式 session 数据走完整 provider recovery exhaustion", "macOS 安装版仍需绑定 exact release SHA 的人工 canary"]
     },
     {

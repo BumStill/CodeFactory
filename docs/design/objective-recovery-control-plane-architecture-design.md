@@ -63,7 +63,9 @@ append-only decision journal：revision、domain、decision envelope JSON、fail
 
 ### `objective_remediations`
 
-durable queue：`queued/claimed/observing/repairing/verifying/waiting/completed`、adapter、attempt/approach、resume cursor、next attempt、lease、last progress、failure code。恢复耗尽只切 approach 或进入 platform incident，不把 objective 交给用户。
+durable queue：`queued/claimed/observing/repairing/verifying/waiting/completed`、adapter、attempt/approach、resume cursor、next attempt、lease、last progress、failure code。恢复耗尽只切 approach 或进入 system incident，不把 objective 交给用户；incident 必须停止同策略 claim，等待恢复策略或能力 revision 变化。
+
+完成或 system incident 的收敛由 ObjectiveStore 在一个 SQLite 事务内写入同一 `terminal_revision`：Objective decision、精确 `visible_final_message_id/kind`、turn settlement、stream closure、run-control 与暂态 tool projection不可拆分提交。AgentLoop 返回实际持久化的 `final_message_id`，Completion Arbiter 不得依靠消息 row order 猜测终答。
 
 ### `side_effect_receipts`
 

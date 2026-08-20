@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Real-browser acceptance entry for turn handback. It mounts the production
+// Real-browser acceptance entry for terminal turn convergence. It mounts the production
 // production reducer, MessageList, ToolCallCard and MessageInput with bounded
 // fixtures so browser layout decides whether every in-flight surface actually
-// converges after durable handback.
+// converges after a system-owned incident.
 
 import React from "react";
 import { createRoot } from "react-dom/client";
@@ -31,8 +31,8 @@ const plan: TurnPlan = {
   ],
 };
 
-// The turn this whole change came from: recovery exhausted, objective settled
-// into waiting_core_input, nothing running, the user must type.
+// Recovery exhausted: the current run settles into a system-owned incident.
+// The objective remains durable and the user is not asked to type anything.
 const beforeHandback: ChatEventState = {
   streaming: true,
   inputTokenTotal: 0,
@@ -45,11 +45,12 @@ const beforeHandback: ChatEventState = {
   {
     id: "assistant",
     role: "assistant",
-    content: "分析结论如上，当前未修改代码。",
+    content: "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。",
     createdAt: Date.now() - 10_000,
     durationMs: 6 * 60 * 1000,
     inputTokens: 12_000,
     outputTokens: 345,
+    turnSettledAt: Date.now(),
     plan,
     toolCalls: [{
       id: "audit-tool",
@@ -58,7 +59,13 @@ const beforeHandback: ChatEventState = {
       result: "external_state_uncertain",
       status: "waiting",
     }],
-    segments: [{ kind: "tool", toolCallId: "audit-tool" }],
+    segments: [
+      {
+        kind: "text",
+        text: "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。",
+      },
+      { kind: "tool", toolCallId: "audit-tool" },
+    ],
     turnActivity: {
       rootTurnId: "user",
       revision: 51,
@@ -76,26 +83,26 @@ const beforeHandback: ChatEventState = {
   ],
 };
 
-const handedBackActivity = reduceChatStreamEvent(beforeHandback, {
+const incidentActivity = reduceChatStreamEvent(beforeHandback, {
     type: "turn_activity_updated",
     root_turn_id: "user",
     revision: 52,
     phase: "waiting",
-    status: "waiting_core_input",
+    status: "waiting_system",
     recent_activity_kind: "technical_recovery_exhausted",
-    recent_activity_label: "系统多轮自动恢复没有进展，已停止并把当前结论交还给你",
+    recent_activity_label: "系统多轮自动恢复没有进展，已登记为系统故障；你不需要补充输入",
     waiting_reason: "technical_recovery_exhausted",
     updated_at: Date.now(),
     terminal_reason: "technical_recovery_exhausted",
     objective_id: "objective-handback",
-    objective_status: "waiting_core_input",
+    objective_status: "waiting_system",
   }, "assistant");
-const handedBack = reduceChatStreamEvent(handedBackActivity, {
+const incident = reduceChatStreamEvent(incidentActivity, {
   type: "turn_settled",
   run_instance_id: "run-handback",
   root_turn_id: "user",
   objective_id: "objective-handback",
-  status: "waiting_user",
+  status: "system_incident",
 }, "assistant");
 
 // The guard against over-suppression: a turn that really is running keeps its
@@ -149,10 +156,10 @@ function Composer({ streaming }: { streaming: boolean }) {
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <main aria-label="Turn handback acceptance" className="flex flex-col gap-4 bg-surface-0">
-      <Panel title="Handed back to the user">
-        <MessageList messages={handedBack.messages} streaming={handedBack.streaming} cwd={null} />
-        <Composer streaming={handedBack.streaming} />
+    <main aria-label="Turn terminal convergence acceptance" className="flex flex-col gap-4 bg-surface-0">
+      <Panel title="System-owned incident">
+        <MessageList messages={incident.messages} streaming={incident.streaming} cwd={null} />
+        <Composer streaming={incident.streaming} />
       </Panel>
       <Panel title="Still running">
         <MessageList

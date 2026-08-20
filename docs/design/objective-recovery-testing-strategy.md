@@ -2,7 +2,7 @@
 
 ## 目标
 
-证明 `CF-ORC-R1..R32` 在正式产品端到端成立，而不是证明某个模块存在重试代码。每个场景都必须同时断言状态真相、用户投影、恢复行为、副作用幂等和跨进程连续性。
+证明 `CF-ORC-R1..R37` 在正式产品端到端成立，而不是证明某个模块存在重试代码。每个场景都必须同时断言状态真相、用户投影、恢复行为、副作用幂等和跨进程连续性。
 
 ## 测试金字塔
 
@@ -19,12 +19,13 @@
 2. AgentLoop 返回 typed outcome，desktop 不丢弃；
 3. permission timeout/channel closed 进入 waiting_system，显式 deny 保持终止；
 4. stream Done 后 system-owned objective 卡仍可见；
-5. scheduler attempt exhaustion 自动进入 durable remediation；
-6. auth 成功后自动续接且不增加 user message；
-7. browser pairing/2FA lease 保活与自动 attach；
-8. release branch policy 自动使用支持的 merge/queue 路径；
-9. 跨进程 fault matrix；
-10. KPI/semantic release gate。
+5. scheduler attempt exhaustion 结算当前 turn 并进入不可重复 claim 的 system incident；
+6. completion 用 AgentLoop 返回的精确 final message identity 原子绑定 terminal revision，较新的 provisional/tool draft 不能被误选；
+7. auth 成功后自动续接且不增加 user message；
+8. browser pairing/2FA lease 保活与自动 attach；
+9. release branch policy 自动使用支持的 merge/queue 路径；
+10. 跨进程 fault matrix；
+11. KPI/semantic release gate。
 
 每项先在未实现代码上观察红测，再实现并保存 before/after 命令结果。
 
@@ -35,7 +36,7 @@
 - `objective_id` 和 requested acceptance 不变；
 - 没有新增伪 user message 或技术 CTA；
 - `turn_settled_at/stream_closed_at` 可写，但 `objective_completed_at` 仅由 arbiter 写；
-- system-owned 状态始终有 owner、lease/remediation 和 next safe observation；
+- 可执行的 system-owned remediation 始终有 owner、lease/remediation 和 next safe observation；parked incident 则有 incident owner、resume cursor 且没有 claimable remediation；
 - receipt/counter 证明外部副作用至多一次；
 - 恢复后使用同一 canonical PR/head/session/task/browser identity；
 - 明确 deny/cancel 不被绕过；
