@@ -2954,10 +2954,6 @@ mod tests {
         }
     }
 
-    struct SlowTools {
-        delay: std::time::Duration,
-    }
-
     struct BlockedDeliveryTools;
 
     #[async_trait::async_trait]
@@ -2998,38 +2994,80 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl ToolBackend for SlowTools {
-        async fn list_schemas(&self) -> Vec<ToolDefinition> {
-            vec![tool_definition()]
-        }
-
-        async fn execute(
-            &self,
-            call: &ToolCall,
-            _args: &serde_json::Value,
-            _ctx: &ToolCtx,
-        ) -> Result<ToolInvocationResult, ToolError> {
-            tokio::time::sleep(self.delay).await;
-            Ok(ToolInvocationResult {
-                content: "long tool finished".into(),
-                is_error: false,
-                status: crate::tool::ToolExecutionStatus::Done,
-                command: call.function.name.clone(),
-                kind: ToolKind::Verification,
-                return_code: Some(0),
-                stdout: "ok".into(),
-                stderr: String::new(),
-                error: None,
-                metadata: None,
-                next_working_directory: None,
-                duration_ms: self.delay.as_millis() as u64,
-            })
-        }
+    /// Long-running tool double whose completion is driven by the heartbeats
+    /// the loop actually published, never by a wall-clock sleep.
+    ///
+    /// Its predecessor slept for a fixed delay while the tests asserted how
+    /// many heartbeats fit inside that delay. That made every cadence
+    /// assertion a race against the scheduler: on a loaded runner only one
+    /// heartbeat lands inside a 45ms window and CI goes red for scheduling
+    /// reasons rather than for a defect (#417). Worse, `tokio::time::timeout`
+    /// polls the tool before it checks the deadline, so a tool that comes due
+    /// in the same instant as the heartbeat always wins the tie.
+    ///
+    /// Holding the tool open until the loop has published `release_after`
+    /// heartbeats makes "the loop keeps reporting while a tool runs" an
+    /// assertion about the loop's behaviour. It also gives the elapsed-time
+    /// assertions a monotonic floor for free: the k-th heartbeat cannot fire
+    /// before `k * tool_heartbeat_interval` has elapsed.
+    struct HeartbeatGatedTools {
+        events: Arc<CollectingEventSink>,
+        /// Heartbeats to observe before returning. `None` never returns, so the
+        /// turn has to end some other way (cancellation).
+        release_after: Option<usize>,
+        /// Flipped once, the moment execution starts, so a test can make the
+        /// loop observe cancellation while this tool is genuinely in flight.
+        cancel_on_start: Option<Arc<AtomicBool>>,
+        /// Terminal status of the eventual result.
+        fails: bool,
     }
 
-    struct HeartbeatGatedErrorTools {
-        events: Arc<CollectingEventSink>,
+    impl HeartbeatGatedTools {
+        /// Succeeds once the loop has published `heartbeats` of them.
+        fn releasing_after(events: Arc<CollectingEventSink>, heartbeats: usize) -> Self {
+            Self {
+                events,
+                release_after: Some(heartbeats),
+                cancel_on_start: None,
+                fails: false,
+            }
+        }
+
+        /// Same gate, but reports a recoverable tool failure.
+        fn failing_after(events: Arc<CollectingEventSink>, heartbeats: usize) -> Self {
+            Self {
+                fails: true,
+                ..Self::releasing_after(events, heartbeats)
+            }
+        }
+
+        /// Never returns, and raises `cancel` as soon as the loop starts it.
+        fn cancelled_in_flight(events: Arc<CollectingEventSink>, cancel: Arc<AtomicBool>) -> Self {
+            Self {
+                release_after: None,
+                cancel_on_start: Some(cancel),
+                ..Self::releasing_after(events, 0)
+            }
+        }
+
+        /// Heartbeats the loop has published so far. Counted from the sink
+        /// rather than from a timer, so a heartbeat whose persistence was
+        /// injected to fail correctly does not count: it never reached a user.
+        fn published_heartbeats(&self) -> usize {
+            self.events
+                .events()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        StreamEvent::TurnActivityUpdated {
+                            recent_activity_kind,
+                            ..
+                        } if recent_activity_kind == "tool_wait"
+                    )
+                })
+                .count()
+        }
     }
 
     #[derive(Default)]
@@ -3073,7 +3111,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ToolBackend for HeartbeatGatedErrorTools {
+    impl ToolBackend for HeartbeatGatedTools {
         async fn list_schemas(&self) -> Vec<ToolDefinition> {
             vec![tool_definition()]
         }
@@ -3084,34 +3122,47 @@ mod tests {
             _args: &serde_json::Value,
             _ctx: &ToolCtx,
         ) -> Result<ToolInvocationResult, ToolError> {
-            // Do not use a wall-clock delay to prove the long-tool path. On
-            // Windows the timer granularity can let the tool finish at the
-            // same instant as the heartbeat timeout. Hold the tool open until
-            // the loop has actually emitted its first heartbeat instead.
-            while !self.events.events().iter().any(|event| {
-                matches!(
-                    event,
-                    StreamEvent::TurnActivityUpdated {
-                        recent_activity_kind,
-                        ..
-                    } if recent_activity_kind == "tool_wait"
-                )
-            }) {
+            if let Some(cancel) = &self.cancel_on_start {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            // Yield — never sleep — until the loop has published the heartbeats
+            // this case is about. The loop re-polls this future at the top of
+            // every heartbeat interval, so the gate advances with the loop
+            // instead of with the clock.
+            let release_after = self.release_after.unwrap_or(usize::MAX);
+            while self.published_heartbeats() < release_after {
                 tokio::task::yield_now().await;
             }
-            Ok(ToolInvocationResult {
-                content: "command failed and can be repaired".into(),
-                is_error: true,
-                status: crate::tool::ToolExecutionStatus::Error,
-                command: call.function.name.clone(),
-                kind: ToolKind::Verification,
-                return_code: Some(1),
-                stdout: String::new(),
-                stderr: "failed".into(),
-                error: Some("failed".into()),
-                metadata: None,
-                next_working_directory: None,
-                duration_ms: 1,
+            Ok(if self.fails {
+                ToolInvocationResult {
+                    content: "command failed and can be repaired".into(),
+                    is_error: true,
+                    status: crate::tool::ToolExecutionStatus::Error,
+                    command: call.function.name.clone(),
+                    kind: ToolKind::Verification,
+                    return_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "failed".into(),
+                    error: Some("failed".into()),
+                    metadata: None,
+                    next_working_directory: None,
+                    duration_ms: 1,
+                }
+            } else {
+                ToolInvocationResult {
+                    content: "long tool finished".into(),
+                    is_error: false,
+                    status: crate::tool::ToolExecutionStatus::Done,
+                    command: call.function.name.clone(),
+                    kind: ToolKind::Verification,
+                    return_code: Some(0),
+                    stdout: "ok".into(),
+                    stderr: String::new(),
+                    error: None,
+                    metadata: None,
+                    next_working_directory: None,
+                    duration_ms: 1,
+                }
             })
         }
     }
@@ -3740,6 +3791,12 @@ mod tests {
 
     #[tokio::test]
     async fn long_tool_emits_sanitized_coalesced_activity_until_its_terminal_result() {
+        // The tool returns only once the loop has published this many
+        // heartbeats, so the cadence asserted below is observed rather than
+        // raced against a sleep. Three also puts the final heartbeat past
+        // `long_tool_wait_threshold` by construction: heartbeat k cannot fire
+        // before k * `tool_heartbeat_interval` has elapsed.
+        const HEARTBEATS_BEFORE_RESULT: usize = 3;
         let transport = Arc::new(ScriptedTransport::new(vec![
             response(
                 "执行长验证",
@@ -3758,9 +3815,10 @@ mod tests {
         cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(10));
         cfg.long_tool_wait_threshold = std::time::Duration::from_millis(20);
         let mut svc = services(transport, persistence.clone(), events.clone());
-        svc.tools = Arc::new(SlowTools {
-            delay: std::time::Duration::from_millis(45),
-        });
+        svc.tools = Arc::new(HeartbeatGatedTools::releasing_after(
+            events.clone(),
+            HEARTBEATS_BEFORE_RESULT,
+        ));
 
         run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
 
@@ -3779,13 +3837,20 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            heartbeat_positions.len() >= 2,
-            "expected periodic heartbeat: {recorded:?}"
+        assert_eq!(
+            heartbeat_positions.len(),
+            HEARTBEATS_BEFORE_RESULT,
+            "expected exactly one heartbeat per elapsed interval: {recorded:?}"
         );
-        assert!(heartbeat_positions
-            .iter()
-            .any(|(_, _, reason)| reason.as_deref().is_some_and(|text| text.contains("运行"))));
+        // >= 3 * 10ms have elapsed by the last heartbeat, so it is past the
+        // 20ms long-wait threshold and must carry the reason.
+        let (_, _, last_reason) = heartbeat_positions.last().expect("a heartbeat");
+        assert!(
+            last_reason
+                .as_deref()
+                .is_some_and(|text| text.contains("运行")),
+            "expected a long-wait reason once the threshold passed: {recorded:?}"
+        );
         assert!(heartbeat_positions.iter().all(|(_, label, reason)| {
             !label.contains("SECRET_COMMAND")
                 && !label.contains("hidden")
@@ -3885,15 +3950,24 @@ mod tests {
             .activity_fail_kind
             .lock()
             .expect("activity fail kind") = Some("tool_wait".into());
-        let mut svc = services(transport, persistence, events.clone());
-        svc.tools = Arc::new(SlowTools {
-            delay: std::time::Duration::from_millis(25),
-        });
+        let mut svc = services(transport, persistence.clone(), events.clone());
+        // The injected failure swallows the FIRST heartbeat publish, so waiting
+        // for one heartbeat to actually reach the sink proves the failing
+        // publish was hit and that the tool stayed alive across it.
+        svc.tools = Arc::new(HeartbeatGatedTools::releasing_after(events.clone(), 1));
 
         run_agent_loop(inputs(), cfg, svc)
             .await
             .expect("diagnostic heartbeat failure must not abort the tool");
 
+        assert!(
+            persistence
+                .activity_fail_kind
+                .lock()
+                .expect("activity fail kind")
+                .is_none(),
+            "the injected heartbeat persistence failure must actually have fired"
+        );
         assert!(events.events().iter().any(|event| matches!(
             event,
             StreamEvent::ToolResult { tool_call_id, status, .. }
@@ -3916,13 +3990,14 @@ mod tests {
         let mut cfg = config();
         cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(2));
         let mut svc = services(transport, persistence, events.clone());
-        svc.tools = Arc::new(SlowTools {
-            delay: std::time::Duration::from_millis(100),
-        });
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
-            cancel.store(true, Ordering::SeqCst);
-        });
+        // Cancellation is raised from inside the tool, which then never
+        // returns. A spawned timer would instead race the tool's own delay, and
+        // a runner slow enough to let the tool finish first would turn this
+        // into a red "not cancelled" rather than a real regression.
+        svc.tools = Arc::new(HeartbeatGatedTools::cancelled_in_flight(
+            events.clone(),
+            cancel,
+        ));
 
         let outcome = run_agent_loop(loop_inputs, cfg, svc)
             .await
@@ -4003,15 +4078,24 @@ mod tests {
         let events = Arc::new(CollectingEventSink::new());
         let mut cfg = config();
         cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(10));
-        let mut svc = services(transport, persistence, events.clone());
-        svc.tools = Arc::new(SlowTools {
-            delay: std::time::Duration::from_millis(25),
-        });
+        let mut svc = services(transport, persistence.clone(), events.clone());
+        // One published heartbeat is what puts this round on the long-tool
+        // path, which is the only path that publishes the terminal
+        // `tool_finished` activity injected to fail below.
+        svc.tools = Arc::new(HeartbeatGatedTools::releasing_after(events.clone(), 1));
 
         run_agent_loop(inputs(), cfg, svc)
             .await
             .expect("terminal activity failure must not fail a completed tool round");
 
+        assert!(
+            persistence
+                .activity_fail_kind
+                .lock()
+                .expect("activity fail kind")
+                .is_none(),
+            "the injected terminal activity failure must actually have fired"
+        );
         assert!(events.events().iter().any(|event| matches!(
             event,
             StreamEvent::ToolResult { tool_call_id, status, .. }
@@ -4057,9 +4141,7 @@ mod tests {
         let mut cfg = config();
         cfg.tool_heartbeat_interval = Some(std::time::Duration::from_millis(10));
         let mut svc = services(transport, persistence, events.clone());
-        svc.tools = Arc::new(HeartbeatGatedErrorTools {
-            events: events.clone(),
-        });
+        svc.tools = Arc::new(HeartbeatGatedTools::failing_after(events.clone(), 1));
 
         run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
 

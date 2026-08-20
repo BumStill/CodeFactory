@@ -175,6 +175,14 @@ fn handle_provider_request(
     blocked_round_seen: &AtomicBool,
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
+    // Windows hands back an accepted socket that INHERITS the listener's
+    // non-blocking mode; POSIX does not. The listener is non-blocking so the
+    // accept loop can poll `stop`, which left this connection non-blocking on
+    // Windows only -- `set_read_timeout` is then ignored and the first read
+    // fails with WSAEWOULDBLOCK (os error 10035) whenever this handler thread
+    // wins the race against the client's bytes arriving on loopback. Restore
+    // blocking mode for the whole connection instead of retrying the symptom.
+    stream.set_nonblocking(false)?;
     read_http_request(&mut stream)?;
     if request_index == 2 {
         blocked_round_seen.store(true, Ordering::SeqCst);
