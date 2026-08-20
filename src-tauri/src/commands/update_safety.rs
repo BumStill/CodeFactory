@@ -773,15 +773,16 @@ async fn count_active_delivery_leases(
     pool: &sqlx::SqlitePool,
     now: i64,
 ) -> Result<i64, sqlx::Error> {
-    // A takeover claim is observe-only until its epoch has been reconciled.
-    // Its lease serializes observers, but it cannot authorize a local or
-    // remote mutation and is therefore safe to interrupt for an app restart.
+    // A takeover claim is observe-only until its positive epoch has been
+    // reconciled. Its lease serializes observers, but it cannot authorize a
+    // local or remote mutation and is safe to interrupt for an app restart.
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM delivery_runs
          WHERE status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
            AND lease_owner IS NOT NULL
            AND lease_expires_at IS NOT NULL
            AND lease_expires_at > ?
+           AND claim_epoch > 0
            AND reconciled_claim_epoch = claim_epoch",
     )
     .bind(now)
@@ -1384,6 +1385,14 @@ mod tests {
                 Some(2_000_i64),
                 708,
                 2,
+            ),
+            (
+                "legacy-zero-epoch",
+                "waiting",
+                Some("legacy-owner"),
+                Some(2_000_i64),
+                0,
+                0,
             ),
             ("expired", "waiting", Some("worker"), Some(999_i64), 3, 3),
             ("done", "completed", Some("worker"), Some(2_000_i64), 3, 3),

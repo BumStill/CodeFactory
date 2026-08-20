@@ -54,7 +54,7 @@
 ## AI Collaboration
 
 - context scope: update safety、Objective/remediation、Update adapter、updater store 与状态 UI；不读取聊天正文。
-- assumptions: 没有 mutation permit 的 takeover observer 可安全跨重启；只有 `claim_epoch = reconciled_claim_epoch` 的未终态 live Delivery lease 才能授权 mutation 并阻塞更新；unknown receipt 继续 fail closed。
+- assumptions: 没有 mutation permit 的 takeover observer 可安全跨重启；只有 `claim_epoch > 0` 且 `claim_epoch = reconciled_claim_epoch` 的未终态 live Delivery lease 才能授权 mutation 并阻塞更新；unknown receipt 继续 fail closed。
 - review point: 独立规划与 QA 均确认仅过滤 blocker 不足，必须同时恢复历史 exhausted update Objective。
 - validation result: 完整本地测试、构建、治理验收已通过；仓库级 `cargo fmt --check` 仍暴露 main 已存在且不属于本分支的大面积格式漂移，本次修改文件单独检查通过。Dev 模式明确跳过 updater，无法伪造签名更新的实机证据；CI、release artifact、固定版安装与后续 N→N+1 live 验收待完成。
 
