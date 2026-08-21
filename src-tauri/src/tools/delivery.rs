@@ -1712,6 +1712,7 @@ async fn reconcile_receipted_branch_update_head<R: delivery::DeliveryRemote>(
             &repo,
             next_head,
             &intent.operation_key,
+            Some(number),
         )
         .map_err(crate::errors::AppError::Other)?;
         let request = delivery::BranchUpdateMaterialization {

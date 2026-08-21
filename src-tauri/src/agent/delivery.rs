@@ -1738,10 +1738,23 @@ pub(crate) fn fetch_updated_pr_head(
 /// Fetch a provider-produced PR head into an operation-owned internal ref.
 /// Network latency is deliberately outside the SQLite owner fence; only the
 /// later fast local HEAD/worktree CAS is performed while authority is locked.
+/// Materialise an exact, already-receipted PR head into a temporary local ref.
+///
+/// The head branch is not a dependable address for it: a provider with "delete
+/// branch on merge" enabled removes the branch the instant the PR merges, while
+/// the commit itself stays reachable through the merge and through the PR ref.
+/// Recovery therefore tries every ref that can still name the head and accepts
+/// only the one resolving to exactly `expected_head`, so a stale or force-moved
+/// branch can neither strand the run nor smuggle in a foreign commit.
+///
+/// Provenance is established before this call — the caller has already observed
+/// the PR at this head — so this is materialisation, not verification. The SHA
+/// equality check below is what keeps it fail-closed regardless.
 pub(crate) fn fetch_updated_pr_head_for_operation(
     repo: &RepoContext,
     expected_head: &str,
     operation_key: &str,
+    pr_number: Option<u64>,
 ) -> Result<String, String> {
     let remote = default_remote(&repo.root);
     let suffix = operation_key
@@ -1751,16 +1764,43 @@ pub(crate) fn fetch_updated_pr_head_for_operation(
         "refs/codefactory/delivery/{}",
         &suffix[..suffix.len().min(32)]
     );
-    let refspec = format!("+{}:{}", repo.branch, temporary_ref);
-    git(&repo.root, &["fetch", &remote, &refspec])?;
-    let fetched = git(&repo.root, &["rev-parse", &temporary_ref])?;
-    if fetched != expected_head {
-        let _ = git(&repo.root, &["update-ref", "-d", &temporary_ref]);
-        return Err(format!(
-            "更新后的 PR head 尚未收敛: provider 返回 {expected_head}，临时观察 ref 为 {fetched}"
-        ));
+
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(number) = pr_number {
+        // The PR ref is pinned to this PR's head and outlives the branch.
+        candidates.push(format!("refs/pull/{number}/head"));
+        candidates.push(format!("refs/merge-requests/{number}/head"));
     }
-    Ok(temporary_ref)
+    candidates.push(repo.branch.clone());
+    // Deliberately NOT a raw-SHA candidate: `fetch <remote> +<sha>:<ref>` is
+    // satisfied from objects this clone already holds, so it would write the
+    // observation ref without the remote ever confirming it still has the
+    // commit. Only server-advertised refs are asked for.
+
+    let mut last_error: Option<String> = None;
+    for candidate in &candidates {
+        let refspec = format!("+{candidate}:{temporary_ref}");
+        if let Err(error) = git(&repo.root, &["fetch", &remote, &refspec]) {
+            last_error = Some(format!("{candidate}: {error}"));
+            continue;
+        }
+        match git(&repo.root, &["rev-parse", &temporary_ref]) {
+            Ok(fetched) if fetched == expected_head => return Ok(temporary_ref),
+            Ok(fetched) => {
+                last_error = Some(format!("{candidate} 指向 {fetched}"));
+            }
+            Err(error) => last_error = Some(format!("{candidate}: {error}")),
+        }
+        let _ = git(&repo.root, &["update-ref", "-d", &temporary_ref]);
+    }
+
+    Err(format!(
+        "更新后的 PR head 尚未收敛: provider 返回 {expected_head}，但 {} 都没有解析到它{}",
+        candidates.join("、"),
+        last_error
+            .map(|error| format!("（最后一次失败: {error}）"))
+            .unwrap_or_default()
+    ))
 }
 
 pub(crate) fn clear_delivery_operation_ref(repo: &RepoContext, reference: &str) {
@@ -1895,6 +1935,7 @@ async fn resume_queued_merge<R: DeliveryRemote>(
                 repo,
                 &new_head,
                 &operation_key,
+                Some(pr_number),
             ) {
                 Ok(remote_ref) => remote_ref,
                 Err(error) => {
@@ -11208,6 +11249,86 @@ else:
         git(&root, &["checkout", "-q", "-b", "feat/x"]).unwrap();
         std::fs::write(root.join("feature.rs"), "pub fn f() {}\n").unwrap();
         root
+    }
+
+    #[test]
+    fn a_receipted_branch_update_head_stays_fetchable_after_the_provider_deletes_the_branch() {
+        // Providers with "delete branch on merge" enabled remove the PR's head
+        // branch the moment it merges. The commit stays reachable — through the
+        // merge and through the PR ref — but the branch is no longer an address
+        // for it, so a recovery that can only fetch `repo.branch` strands a run
+        // whose receipt already names the exact head.
+        let root = feature_branch_repo("branch-update-deleted-head");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "feature A"]).unwrap();
+        let head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        git(&root, &["push", "-q", "origin", "feat/x"]).unwrap();
+
+        let origin = root.parent().unwrap().join("origin.git");
+        git(&origin, &["update-ref", "refs/pull/7/head", &head]).unwrap();
+        git(&origin, &["update-ref", "refs/heads/main", &head]).unwrap();
+        git(&origin, &["update-ref", "-d", "refs/heads/feat/x"]).unwrap();
+
+        let repo = RepoContext {
+            root: root.clone(),
+            branch: "feat/x".to_string(),
+            default_branch: "main".to_string(),
+            remote: "origin".to_string(),
+            remote_url: None,
+        };
+        let fetched = fetch_updated_pr_head_for_operation(
+            &repo,
+            &head,
+            "sha256:0123456789abcdef0123456789abcdef",
+            Some(7),
+        )
+        .expect("a receipted head must stay addressable after its branch is deleted");
+        assert_eq!(git(&root, &["rev-parse", &fetched]).unwrap(), head);
+        clear_delivery_operation_ref(&repo, &fetched);
+    }
+
+    #[test]
+    fn a_branch_update_fetch_refuses_every_ref_that_does_not_hold_the_receipted_head() {
+        // Trying more addresses must not mean accepting more heads: if the
+        // branch AND the PR ref have both moved to a foreign commit, the
+        // receipted head is simply not materialisable and the run must stay
+        // stuck rather than advance onto someone else's commit.
+        let root = feature_branch_repo("branch-update-foreign-everywhere");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "feature A"]).unwrap();
+        let receipted_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        git(&root, &["push", "-q", "origin", "feat/x"]).unwrap();
+
+        std::fs::write(root.join("foreign.rs"), "pub fn foreign() {}\n").unwrap();
+        git(&root, &["add", "foreign.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "foreign B"]).unwrap();
+        let foreign_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        git(&root, &["push", "-q", "-f", "origin", "feat/x"]).unwrap();
+        git(&root, &["reset", "-q", "--hard", &receipted_head]).unwrap();
+
+        let origin = root.parent().unwrap().join("origin.git");
+        git(&origin, &["update-ref", "refs/pull/7/head", &foreign_head]).unwrap();
+
+        let repo = RepoContext {
+            root: root.clone(),
+            branch: "feat/x".to_string(),
+            default_branch: "main".to_string(),
+            remote: "origin".to_string(),
+            remote_url: None,
+        };
+        let error = fetch_updated_pr_head_for_operation(
+            &repo,
+            &receipted_head,
+            "sha256:fedcba9876543210fedcba9876543210",
+            Some(7),
+        )
+        .expect_err("a foreign head must never satisfy a receipted branch update");
+        assert!(error.contains(&receipted_head), "{error}");
+
+        // A rejected attempt may not leave the temporary observation ref behind.
+        let leaked = git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/"])
+            .unwrap();
+        assert!(leaked.is_empty(), "leaked observation ref: {leaked}");
     }
 
     #[cfg(unix)]
