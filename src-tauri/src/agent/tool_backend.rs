@@ -913,10 +913,7 @@ impl DesktopToolBackend {
         // before any repository-local mutation reaches the receipt/dispatch
         // boundary. This second fence also covers a ReviewOnly turn that was
         // steered to Implement after the AgentLoop had already started.
-        if !is_task
-            && requires_managed_git_workspace(&call.function.name)
-            && super::execution_workspace::is_git_repository(&ctx.working_directory)
-        {
+        if !is_task && requires_managed_git_workspace(&call.function.name) {
             let objective_id = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT objective_id FROM chat_turn_state WHERE root_turn_id=?",
             )
@@ -927,17 +924,32 @@ impl DesktopToolBackend {
                 message: format!("resolve managed workspace Objective: {error}"),
             })?
             .flatten();
-            let workspace_ready = match objective_id.as_deref() {
-                Some(objective_id) => super::execution_workspace::verify_objective_workspace(
-                    &self.db,
-                    objective_id,
-                    &ctx.working_directory,
-                )
-                .await
-                .is_ok(),
-                None => false,
+            let workspace_required = match objective_id.as_deref() {
+                Some(objective_id) => {
+                    super::execution_workspace::has_workspace_record(&self.db, objective_id)
+                        .await
+                        .map_err(|error| ToolError {
+                            message: format!("inspect managed workspace Objective: {error}"),
+                        })?
+                        || super::execution_workspace::is_git_repository(&ctx.working_directory)
+                }
+                None => super::execution_workspace::is_git_repository(&ctx.working_directory),
             };
-            if !workspace_ready {
+            let workspace_ready = if workspace_required {
+                match objective_id.as_deref() {
+                    Some(objective_id) => super::execution_workspace::verify_objective_workspace(
+                        &self.db,
+                        objective_id,
+                        &ctx.working_directory,
+                    )
+                    .await
+                    .is_ok(),
+                    None => false,
+                }
+            } else {
+                true
+            };
+            if workspace_required && !workspace_ready {
                 return Ok(MutationAdmission::Waiting(waiting_result(
                     command,
                     kind,
@@ -2328,7 +2340,10 @@ mod tests {
             panic!("a primary Git mutation without an Objective workspace must wait");
         };
         assert_eq!(
-            result.metadata.as_ref().and_then(|value| value["code"].as_str()),
+            result
+                .metadata
+                .as_ref()
+                .and_then(|value| value["code"].as_str()),
             Some("managed_workspace_identity_required")
         );
         assert!(!repo.path().join("blocked.txt").exists());
@@ -2372,6 +2387,69 @@ mod tests {
             "isolated\n"
         );
         assert!(!source.join("managed.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn missing_managed_workspace_path_stays_fenced_before_receipt() {
+        let backend = objective_backend(false).await;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        init_local_git_repo(&source);
+        let workspace = super::super::execution_workspace::allocate_or_attach(
+            &backend.db,
+            super::super::execution_workspace::ExecutionWorkspaceRequest {
+                objective_id: TEST_OBJECTIVE_ID.into(),
+                session_id: Some(TEST_SESSION_ID.into()),
+                source_cwd: source,
+                workspace_container: temp.path().join("managed"),
+                process_instance: "test-process".into(),
+            },
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&workspace.worktree_path).unwrap();
+        std::fs::create_dir_all(&workspace.worktree_path).unwrap();
+
+        let args = serde_json::json!({"path": "blocked.txt", "content": "must not exist\n"});
+        let call = call_with_args("workspace-path-missing", "write_file", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(&workspace.worktree_path),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let MutationAdmission::Waiting(result) = admission else {
+            panic!("a missing managed worktree must not disable the identity fence");
+        };
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|value| value["code"].as_str()),
+            Some("managed_workspace_identity_required")
+        );
+        assert!(!workspace.worktree_path.join("blocked.txt").exists());
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0);
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM execution_workspaces WHERE objective_id=?")
+                .bind(TEST_OBJECTIVE_ID)
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(state, "incident");
     }
 
     async fn prime_file_receipt_without_dispatch(
@@ -3271,11 +3349,7 @@ mod tests {
             .await
             .unwrap();
             if let Some(contents) = prepare {
-                std::fs::write(
-                    workspace.worktree_path.join("tracked.txt"),
-                    contents,
-                )
-                .unwrap();
+                std::fs::write(workspace.worktree_path.join("tracked.txt"), contents).unwrap();
             }
             sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
                 .bind(workspace.worktree_path.to_string_lossy().as_ref())

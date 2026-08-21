@@ -394,6 +394,17 @@ pub async fn latest_for_session(
     .await?)
 }
 
+pub async fn has_workspace_record(pool: &SqlitePool, objective_id: &str) -> Result<bool> {
+    ensure_schema(pool).await?;
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM execution_workspaces WHERE objective_id=?)",
+    )
+    .bind(objective_id)
+    .fetch_one(pool)
+    .await?
+        != 0)
+}
+
 async fn objective_has_unmanaged_side_effects(
     pool: &SqlitePool,
     objective_id: &str,
@@ -783,26 +794,34 @@ pub async fn verify_objective_workspace(
     cwd: &Path,
 ) -> Result<ExecutionWorkspace> {
     ensure_schema(pool).await?;
-    let row = load_workspace(pool, objective_id)
-        .await?
-        .ok_or_else(|| anyhow!("managed workspace identity missing for mutation objective"))?;
-    if !matches!(row.state.as_str(), "active" | "delivering") {
-        bail!("managed workspace is not mutable in state {}", row.state);
+    let result = async {
+        let row = load_workspace(pool, objective_id)
+            .await?
+            .ok_or_else(|| anyhow!("managed workspace identity missing for mutation objective"))?;
+        if !matches!(row.state.as_str(), "active" | "delivering") {
+            bail!("managed workspace is not mutable in state {}", row.state);
+        }
+        let expected = PathBuf::from(&row.worktree_path).canonicalize()?;
+        let actual_root =
+            PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?).canonicalize()?;
+        if actual_root != expected {
+            bail!("managed workspace identity mismatch: mutation cwd differs");
+        }
+        let branch = git(&actual_root, &["branch", "--show-current"])?;
+        let (repo_identity, worktree_identity, _head_sha) = workspace_identity(&actual_root)?;
+        if branch != row.branch_name
+            || repo_identity != row.repo_identity
+            || row.worktree_identity.as_deref() != Some(worktree_identity.as_str())
+        {
+            bail!("managed workspace identity mismatch: repo, gitdir, or branch differs");
+        }
+        row.ready()
     }
-    let expected = PathBuf::from(&row.worktree_path).canonicalize()?;
-    let actual_root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?).canonicalize()?;
-    if actual_root != expected {
-        bail!("managed workspace identity mismatch: mutation cwd differs");
+    .await;
+    if let Err(error) = &result {
+        mark_identity_incident(pool, objective_id, &error.to_string()).await;
     }
-    let branch = git(&actual_root, &["branch", "--show-current"])?;
-    let (repo_identity, worktree_identity, _head_sha) = workspace_identity(&actual_root)?;
-    if branch != row.branch_name
-        || repo_identity != row.repo_identity
-        || row.worktree_identity.as_deref() != Some(worktree_identity.as_str())
-    {
-        bail!("managed workspace identity mismatch: repo, gitdir, or branch differs");
-    }
-    row.ready()
+    result
 }
 
 #[cfg(test)]
@@ -938,7 +957,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(visible.worktree_path, workspace.worktree_path.to_string_lossy());
+        assert_eq!(
+            visible.worktree_path,
+            workspace.worktree_path.to_string_lossy()
+        );
         assert_eq!(visible.branch_name, workspace.branch_name);
         assert_eq!(visible.state, "active");
         assert_eq!(
@@ -1087,9 +1109,20 @@ mod tests {
         assert!(error
             .to_string()
             .contains("managed workspace identity mismatch"));
-        verify_objective_workspace(&pool, "objective-dirty-root", &workspace.worktree_path)
-            .await
-            .unwrap();
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM execution_workspaces WHERE objective_id=?")
+                .bind("objective-dirty-root")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "incident");
+        assert!(verify_objective_workspace(
+            &pool,
+            "objective-dirty-root",
+            &workspace.worktree_path,
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
