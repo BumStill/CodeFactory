@@ -744,28 +744,56 @@ fn prepare_skill_dir_handle(root: &Path, id: &str) -> Result<SecureDir, String> 
     SecureDir::open_or_create(root)?.create_child_dir(id)
 }
 
+/// Judge a literal IP written straight into a source URL. Every special-purpose
+/// range is refused: a user or agent naming one of these by address has no
+/// legitimate skill source to reach there.
 fn is_forbidden_remote_ip(ip: IpAddr) -> bool {
+    forbidden_ip(ip, FakeIpRanges::Blocked)
+}
+
+/// Judge an address a *hostname* resolved to, which is a weaker signal than a
+/// literal IP: on a machine running a fake-IP proxy (Clash TUN and friends,
+/// whose default range is 198.18.0.1/16) every DNS answer is a synthetic
+/// address that the proxy maps back to the real host by SNI. Such an address is
+/// a local redirection token, not a destination — refusing it prevents no SSRF
+/// and instead makes every URL install fail on a very common setup. Ranges that
+/// do name a real internal target — loopback, RFC1918, link-local including
+/// cloud instance metadata — stay blocked either way.
+fn is_forbidden_resolved_ip(ip: IpAddr) -> bool {
+    forbidden_ip(ip, FakeIpRanges::Tolerated)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FakeIpRanges {
+    Blocked,
+    Tolerated,
+}
+
+fn forbidden_ip(ip: IpAddr, fake_ip: FakeIpRanges) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [a, b, c, _d] = ip.octets();
+            // Benchmarking (198.18.0.0/15) and CGNAT (100.64.0.0/10): the two
+            // ranges fake-IP proxies allocate from.
+            if (a == 198 && (b == 18 || b == 19)) || (a == 100 && (64..=127).contains(&b)) {
+                return fake_ip == FakeIpRanges::Blocked;
+            }
             a == 0
                 || a == 10
                 || a == 127
-                || (a == 100 && (64..=127).contains(&b))
                 || (a == 169 && b == 254)
                 || (a == 172 && (16..=31).contains(&b))
                 || (a == 192 && b == 0 && c == 0)
                 || (a == 192 && b == 0 && c == 2)
                 || (a == 192 && b == 88 && c == 99)
                 || (a == 192 && b == 168)
-                || (a == 198 && (b == 18 || b == 19))
                 || (a == 198 && b == 51 && c == 100)
                 || (a == 203 && b == 0 && c == 113)
                 || a >= 224
         }
         IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
-                return is_forbidden_remote_ip(IpAddr::V4(mapped));
+                return forbidden_ip(IpAddr::V4(mapped), fake_ip);
             }
             // Phase 0 cannot yet prove every IPv6 special-purpose allocation
             // is globally reachable. Fail closed until the resolver uses a
@@ -828,10 +856,19 @@ async fn resolve_public_source(url: &reqwest::Url) -> Result<(String, SocketAddr
     .map_err(|e| format!("SKILL_SOURCE_DNS_FAILED: {e}"))?
     .map_err(|e| format!("SKILL_SOURCE_DNS_FAILED: {e}"))?;
     let address = resolved
-        .into_iter()
-        .find(|address| !is_forbidden_remote_ip(address.ip()))
+        .iter()
+        .copied()
+        .find(|address| !is_forbidden_resolved_ip(address.ip()))
         .ok_or_else(|| {
-            "SKILL_SOURCE_PRIVATE_NETWORK: source resolved only to blocked addresses".to_string()
+            let seen = resolved
+                .iter()
+                .map(|address| address.ip().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "SKILL_SOURCE_PRIVATE_NETWORK: {host} resolved only to blocked addresses ({seen}); \
+                 if a VPN or proxy is active, check that it is not answering DNS with a private address"
+            )
         })?;
     Ok((host, address))
 }
@@ -2530,6 +2567,50 @@ mod tests {
             assert!(
                 validate_explicit_skill_url(source).is_err(),
                 "{source} must fail before network access"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostname_resolved_behind_a_fake_ip_proxy_is_not_a_private_target() {
+        // Clash-style TUN proxies answer every DNS query out of the
+        // benchmarking (198.18.0.0/15, the Clash default) or CGNAT
+        // (100.64.0.0/10) ranges and map the synthetic address back to the real
+        // host by SNI. Those addresses are local redirection tokens, not
+        // destinations — refusing them blocks no SSRF, it only makes every URL
+        // install fail on a machine running such a proxy.
+        for raw in ["198.18.0.93", "198.19.255.1", "100.64.0.1", "100.127.255.254"] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(
+                is_forbidden_remote_ip(ip),
+                "{raw} must stay blocked when written straight into the URL"
+            );
+            assert!(
+                !is_forbidden_resolved_ip(ip),
+                "{raw} must be reachable when a hostname resolved to it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolved_address_still_fails_closed_on_real_internal_targets() {
+        for raw in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254", // cloud instance metadata
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(
+                is_forbidden_resolved_ip(ip),
+                "{raw} names a real internal target and must stay blocked"
             );
         }
     }
