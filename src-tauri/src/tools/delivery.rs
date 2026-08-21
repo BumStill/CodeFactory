@@ -25,6 +25,7 @@ use crate::agent::objective::ObjectiveStore;
 use crate::config::settings::DeliveryCeiling;
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
+use sqlx::Row;
 
 const RECOVERY_SUPERVISOR_POLL_MS: u64 = 15_000;
 const DELIVERY_LEASE_HEARTBEAT_MS: u64 = 20_000;
@@ -555,14 +556,9 @@ async fn prepare_durable_run(
         next_action_authorized: true,
         autonomous_completion: autonomous_completion_from_args(args),
     };
-    let claim_epoch = delivery_run::create_delivery_run(
-        db,
-        &run,
-        &process,
-        chrono::Utc::now().timestamp_millis(),
-        90_000,
-    )
-    .await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    reconcile_advanced_delivery_run_identity(db, &repo.root, &run, &process, now).await?;
+    let claim_epoch = delivery_run::create_delivery_run(db, &run, &process, now, 90_000).await?;
     Ok(Some(PreparedDurableRun {
         id,
         process,
@@ -575,6 +571,95 @@ async fn prepare_durable_run(
         expected_head_sha,
         head_branch,
     }))
+}
+
+/// If a durable DeliveryRun already exists for this objective/repo but its
+/// expected head and change-set advanced legitimately (for example the branch
+/// was merged-forward to pick up a newer baseline while resolving a BEHIND PR),
+/// record a receipt-backed identity revision and rewrite the run's identity so
+/// the subsequent `create_delivery_run` re-admission renews the lease instead
+/// of colliding. Genuine conflicts (different objective/repo/worktree/branch/
+/// workspace) are left to `create_delivery_run`, which refuses them.
+async fn reconcile_advanced_delivery_run_identity(
+    db: &sqlx::SqlitePool,
+    repo_root: &std::path::Path,
+    run: &NewDeliveryRun,
+    process: &ProcessIdentity,
+    now: i64,
+) -> Result<()> {
+    let existing = sqlx::query(
+        "SELECT objective_id, run_kind, session_id, task_id, workspace_path,
+                worktree_identity, repo_identity, base_branch, head_branch,
+                change_set_digest, expected_head_sha, requested_ceiling
+         FROM delivery_runs WHERE id=?",
+    )
+    .bind(&run.id)
+    .fetch_optional(db)
+    .await?;
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    let existing_head: String = existing.try_get("expected_head_sha")?;
+    let existing_digest: String = existing.try_get("change_set_digest")?;
+    if existing_head == run.expected_head_sha && existing_digest == run.change_set_digest {
+        return Ok(());
+    }
+    // Only a legitimate forward advance of the expected head may reconcile.
+    let non_head_matches =
+        existing.try_get::<String, _>("objective_id")? == run.objective_id
+            && existing.try_get::<String, _>("run_kind")? == run.run_kind
+            && existing.try_get::<Option<String>, _>("session_id")? == run.session_id
+            && existing.try_get::<Option<String>, _>("task_id")? == run.task_id
+            && existing.try_get::<String, _>("workspace_path")? == run.workspace_path
+            && existing.try_get::<String, _>("worktree_identity")? == run.worktree_identity
+            && existing.try_get::<String, _>("repo_identity")? == run.repo_identity
+            && existing.try_get::<String, _>("base_branch")? == run.base_branch
+            && existing.try_get::<String, _>("head_branch")? == run.head_branch
+            && existing.try_get::<String, _>("requested_ceiling")? == run.requested_ceiling;
+    if !non_head_matches
+        || !delivery_is_forward_advance(repo_root, &existing_head, &run.expected_head_sha)?
+    {
+        // Genuine conflict (or not a forward advance): let create_delivery_run
+        // apply the existing identity-collision guard.
+        return Ok(());
+    }
+    let mut revision = DeliveryIdentityRevision {
+        receipt_id: String::new(),
+        objective_id: run.objective_id.clone(),
+        repo_identity: run.repo_identity.clone(),
+        worktree_identity: run.worktree_identity.clone(),
+        previous_expected_head_sha: existing_head,
+        previous_change_set_digest: existing_digest,
+        next_expected_head_sha: run.expected_head_sha.clone(),
+        next_change_set_digest: run.change_set_digest.clone(),
+    };
+    revision.receipt_id = delivery_run::delivery_identity_revision_receipt_id(&run.id, &revision);
+    delivery_run::reconcile_delivery_run_identity(db, run, process, now, &revision).await?;
+    Ok(())
+}
+
+/// True when `previous_head` is a real ancestor of `next_head` in `repo_root`,
+/// i.e. the branch moved forward (merge/fast-forward) rather than being
+/// rewritten. A rewrite (rebase/force-push) is not a legitimate advance and
+/// must not reconcile the delivery identity. Fails closed on any ambiguity.
+fn delivery_is_forward_advance(
+    repo_root: &std::path::Path,
+    previous_head: &str,
+    next_head: &str,
+) -> Result<bool> {
+    if previous_head.is_empty() || next_head.is_empty() || previous_head == next_head {
+        return Ok(false);
+    }
+    let Ok(repository) = git2::Repository::open(repo_root) else {
+        return Ok(false);
+    };
+    let Ok(previous) = repository.revparse_single(previous_head) else {
+        return Ok(false);
+    };
+    let Ok(next) = repository.revparse_single(next_head) else {
+        return Ok(false);
+    };
+    Ok(repository.graph_descendant_of(next.id(), previous.id()).unwrap_or(false))
 }
 
 fn foreground_delivery_process_identity() -> ProcessIdentity {
