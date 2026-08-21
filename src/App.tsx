@@ -14,6 +14,7 @@ import { OnboardingWizard } from "./components/OnboardingWizard";
 import { useSettingsStore } from "./stores/settings";
 import { syncChatGptCatalog } from "./stores/chatgptCatalog";
 import { useChatStore, openSessionId } from "./stores/chat";
+import { useAppNavigationStore } from "./stores/appNavigation";
 
 export type AppView = "workspace" | "resources" | "settings" | "profile" | "control-plane" | "benchmarks" | "evolution";
 
@@ -23,6 +24,10 @@ export default function App() {
   const [workspaceTaskLogId, setWorkspaceTaskLogId] = useState<string | null>(null);
   const [evolutionCwd, setEvolutionCwd] = useState<string | null>(null);
   const [evidenceViewerPath, setEvidenceViewerPath] = useState<string | null>(null);
+  const skillReview = useAppNavigationStore((state) => state.skillReview);
+  const skillReviewId = skillReview?.skillId ?? null;
+  const clearSkillReview = useAppNavigationStore((state) => state.clearSkillReview);
+  const finishSkillReview = useAppNavigationStore((state) => state.finishSkillReview);
   const loadSettings = useSettingsStore((s) => s.load);
   const settings = useSettingsStore((s) => s.settings);
   const { beginDraft, loadSessions, selectSession } = useChatStore();
@@ -64,6 +69,10 @@ export default function App() {
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
 
+  useEffect(() => {
+    if (skillReviewId) setView("resources");
+  }, [skillReviewId]);
+
   const settingsLoaded = settings != null;
   useEffect(() => {
     if (settingsLoaded) void syncChatGptCatalog();
@@ -91,7 +100,23 @@ export default function App() {
     setView("workspace");
   };
 
+  const returnToReviewOrigin = (restoreReceiptFocus: boolean) => {
+    const review = restoreReceiptFocus ? finishSkillReview() : skillReview;
+    if (!restoreReceiptFocus) clearSkillReview();
+    const originSessionId = review?.originSessionId ?? null;
+    const showWorkspace = () => setView("workspace");
+    if (originSessionId && originSessionId !== openSession) {
+      void selectSession(originSessionId).then(showWorkspace, showWorkspace);
+    } else {
+      showWorkspace();
+    }
+  };
+
   const backToWorkspace = () => {
+    if (skillReview) {
+      returnToReviewOrigin(true);
+      return;
+    }
     if (!openSession) {
       startNewConversation(null);
       return;
@@ -131,7 +156,14 @@ export default function App() {
         />
       )}
 
-      {view === "resources" && <ResourcesPage onBack={backToWorkspace} />}
+      {view === "resources" && (
+        <ResourcesPage
+          onBack={backToWorkspace}
+          initialTab={skillReviewId ? "skills" : undefined}
+          initialSkillId={skillReviewId}
+          onSkillEnabled={() => returnToReviewOrigin(true)}
+        />
+      )}
       {view === "control-plane" && <ControlPlanePage onBack={backToWorkspace} />}
       {view === "benchmarks" && <BenchmarksPage onBack={backToWorkspace} />}
       {view === "evolution" && <EvolutionWorkbenchPage onBack={backToWorkspace} initialCwd={evolutionCwd} />}
@@ -142,7 +174,10 @@ export default function App() {
           initialTab={settingsInitialTab}
           onOpenSession={openExistingSession}
           onOpenJobLog={openJobLog}
-          onOpenResources={() => setView("resources")}
+          onOpenResources={() => {
+            clearSkillReview();
+            setView("resources");
+          }}
           onOpenControlPlane={() => setView("control-plane")}
           onOpenBenchmarks={() => setView("benchmarks")}
           onOpenProfile={() => setView("profile")}

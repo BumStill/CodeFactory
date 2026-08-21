@@ -196,6 +196,18 @@
 7. 审核通过后选择 scope；
 8. 返回 Workspace 后，从下一 root turn 起可参与匹配。
 
+#### 连续性合同
+
+“默认禁用”不能表现为安装结束后把用户留在目录页。所有安装入口必须遵守同一连续性合同：
+
+1. 安装操作成功后，不整页重载、不丢失当前任务上下文，立即打开该 operation 实际提交的精确 package/revision；
+2. 焦点按 `安装结果 → 内容检查/审核 → scope/启用` 顺序移动；系统拥有的刷新或加载失败由系统自动安全续接，恢复期间保留已完成结果和当前上下文；只有恢复已穷尽或确需用户决策时才展示明确原因与对应动作，不把用户弹回起点；
+3. 用户可选择“稍后处理”并安全离开，package 保持已安装、未启用；系统不得用连续体验为隐式批准；
+4. 完整 v2 必须分别保存 `InstallReceipt → ReviewReceipt → ActivationReceipt`，只有收到前一步 receipt 才推进；activation 失败不得撤销已完成的安装/审核；
+5. Phase 0 过渡实现尚无持久 review receipt 与项目 scope，因此只允许“安装后自动打开实际内容 + 显式全局启用确认”。确认框必须写明当前会对所有项目生效，不能显示“已审核”或伪造 receipt。
+
+这意味着：用户明确给出一个公开 HTTPS manifest 地址时，系统可在安全下载与校验成功后直接进入内容检查；用户完成显式确认后可立即启用，但安装动作本身永远不等于启用。
+
 ### 5.2 Agent 查找并安装
 
 1. 用户要求查找；Agent 调用 `skill_search`；
@@ -209,17 +221,21 @@
 6. 卡片提供 `审核技能` 深链；
 7. 资源中心通过 catalog event 实时出现，不需重开。
 
+Phase 0 先实现持久可重建的 installed-disabled 工具结果与精确 Skill 深链：版本化 receipt 逐项保存 `id/name/version/installed/activation`，会话重载从结构化 receipt 重建而不解析文案；结果卡显示安装当时“未启用”与每项 `检查并管理 <name> v<version>`。点击后打开资源中心 `技能` tab 与对应详情并聚焦审核状态；仅启用成功后自动返回原会话的原 receipt 按钮并恢复焦点，取消、失败、损坏或内容漂移继续留在详情。receipt 的历史事实与详情的实时状态分开显示。完整实时 operation 进度与 catalog event 在 Phase 1 接入 canonical installer 后补齐。
+
 Agent 主动认为 Skill 可能有帮助时，只能推荐，不得自行安装。
 
 ### 5.3 本地/Git/OpenClaw 导入
 
-1. 用户选择 source；
+1. 用户通过 CodeFactory 的系统目录选择器选择 source；backend 只把用于显示的路径和短期一次性 source handle 返回 UI，renderer 与 Agent 不得把任意路径字符串变成本机读取权限；
 2. 系统先扫描并显示发现项；
 3. 每项标记可导入、已存在、损坏、不兼容、ID 冲突；
 4. 用户选择要安装的 package；
 5. 每项独立原子提交、统一进入待审核；
 6. 包含 unsupported scripts/resources 时，完整保留并明确 compatibility 结论；
 7. 不允许“只复制 prompt 但返回成功”。
+
+用户从“选择目录”到“发现项、逐项安装结果、精确内容检查、显式启用确认”保持在同一条旅程中；source handle 过期或已使用时，页面保留现有结果并明确要求重新选择，不能伪装成安装失败后无状态返回。
 
 ### 5.4 Agent 创建或修改
 

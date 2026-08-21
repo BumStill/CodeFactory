@@ -24,7 +24,8 @@
     {"id": "content_rendering", "name": "内容输入与呈现"},
     {"id": "permission_safety", "name": "权限与安全"},
     {"id": "capability_usage", "name": "能力演进与用量"},
-    {"id": "runtime_lifecycle", "name": "运行时资源生命周期"}
+    {"id": "runtime_lifecycle", "name": "运行时资源生命周期"},
+    {"id": "skill_lifecycle", "name": "Skill 安装、审核与运行生命周期"}
   ],
   "evidence_levels": [
     {"id": "L0", "name": "契约与纯逻辑", "oracle": "字段、状态机和分类规则"},
@@ -285,6 +286,39 @@
       "change_patterns": ["src/pages/Settings/SettingsPage.tsx", "src/pages/Settings/SettingsPage.browser.test.tsx"],
       "automated_by": ["path:src/pages/Settings/SettingsPage.browser.test.tsx"],
       "required_evidence": ["L0", "L3"],
+      "gates": ["pull_request"]
+    },
+    {
+      "id": "SKL-002",
+      "name": "Skill 路径、远程来源与权限不可越界",
+      "category": "skill_lifecycle",
+      "priority": "P0",
+      "source_kind": "incident_shape",
+      "change_patterns": ["src-tauri/src/commands/skill_fs.rs", "src-tauri/src/commands/skills.rs", "src-tauri/src/tools/skill_mgmt.rs", "src-tauri/src/agent/mod.rs", "src-tauri/crates/agent-loop/src/policy.rs", "src-tauri/src/agent/tool_backend.rs"],
+      "automated_by": ["rust:is_safe_skill_id_blocks_path_traversal", "rust:skill_path_is_resolved_only_after_id_validation", "rust:skill_path_process_sentinel_keeps_outside_tree_unchanged", "rust:root_replacement_in_a_child_process_cannot_write_outside_the_handle", "rust:atomic_write_replaces_a_hardlink_without_mutating_its_outside_target", "rust:delete_consumes_the_open_directory_not_a_replacement_symlink", "rust:windows_recursive_skill_removal_fails_closed", "rust:local_source_handle_is_single_use_and_pins_the_selected_directory", "rust:agent_fetch_rejects_raw_local_paths_without_reading_them", "rust:explicit_remote_skill_sources_require_public_https", "rust:marketplace_install_uses_backend_catalog_not_renderer_content", "rust:marketplace_install_cannot_replace_an_existing_enabled_skill", "rust:install_target_rejects_a_symlink_before_writing", "rust:local_import_does_not_follow_source_directory_or_file_symlinks", "rust:local_import_rejects_explicit_noncanonical_ids_instead_of_slugifying_them", "rust:package_file_rejects_a_symlink_before_writing", "rust:rejected_proposal_state_never_follows_symlinks_or_hardlinks", "rust:skill_management_mutations_use_the_normal_permission_gate", "rust:skill_fetch_is_a_mutation_and_is_not_visible_to_review_only_turns"],
+      "required_evidence": ["L0", "L1", "L2"],
+      "gates": ["pull_request"]
+    },
+    {
+      "id": "SKL-003",
+      "name": "外部 Skill 安装默认禁用且不会隐式进入上下文",
+      "category": "skill_lifecycle",
+      "priority": "P0",
+      "source_kind": "product_contract",
+      "change_patterns": ["src-tauri/src/commands/skills.rs", "src-tauri/src/tools/skill_mgmt.rs", "src-tauri/src/agent/mod.rs", "src/stores/skills.ts"],
+      "automated_by": ["rust:external_directory_import_is_installed_disabled", "rust:directory_import_returns_successes_and_failures_in_one_result", "rust:damaged_skill_directory_remains_visible_but_ineligible", "rust:updating_an_enabled_skill_disables_it_before_replacing_content", "rust:headless_skill_prompts_require_current_external_review_receipt", "rust:enable_requires_the_exact_fingerprint_that_was_displayed", "rust:disable_revokes_review_so_manifest_tampering_cannot_reactivate_after_restart", "rust:builtin_enabled_bit_is_not_an_unverified_release_approval", "path:src/pages/Skills/SkillsPage.lifecycle.test.tsx"],
+      "required_evidence": ["L0", "L1", "L2"],
+      "gates": ["pull_request"]
+    },
+    {
+      "id": "UI-013",
+      "name": "安装成功连续进入内容检查与显式启用确认",
+      "category": "skill_lifecycle",
+      "priority": "P0",
+      "source_kind": "product_contract",
+      "change_patterns": ["src-tauri/src/commands/skills.rs", "src-tauri/src/tools/skill_mgmt.rs", "src/components/ToolCallCard.tsx", "src/components/ToolCallCard.test.tsx", "src/stores/appNavigation.ts", "src/App.tsx", "src/App.resources.test.tsx", "src/pages/Resources/ResourcesPage.tsx", "src/pages/Resources/ResourcesPage.test.tsx", "src/pages/Skills/SkillsPage.tsx", "src/pages/Skills/SkillsPage.lifecycle.test.tsx", "src/stores/skills.ts"],
+      "automated_by": ["path:src/pages/Skills/SkillsPage.lifecycle.test.tsx", "path:src/stores/skills.lifecycle.test.ts", "rust:skill_fetch_receipt_targets_exact_installed_ids_for_review", "path:src/components/ToolCallCard.test.tsx", "path:src/App.resources.test.tsx", "path:src/pages/Resources/ResourcesPage.test.tsx"],
+      "required_evidence": ["L0", "L1", "L3"],
       "gates": ["pull_request"]
     }
   ],
