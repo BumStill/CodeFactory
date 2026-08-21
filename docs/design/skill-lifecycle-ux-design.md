@@ -107,7 +107,7 @@
 - queued、fetching、staged、validating、committing、succeeded/succeeded_with_errors/recoverable_failed/failed/rolled_back 等 operation 阶段；另显示 pending/recovered/recovery_failed 恢复 badge；审核是安装后的 package 状态，不是 operation 阶段；
 - discovered/succeeded/failed 数量；
 - 每个 package 的版本、digest、状态和错误码；
-- 重试、继续审核、打开详情、移除暂存等动作。
+- 可安全恢复的技术中断由 Objective recovery 自动续跑；需要凭据、来源选择等用户输入时展示精确输入门禁，输入后自动继续；用户另可继续审核、打开详情或取消并移除暂存。
 
 批量导入可以部分成功，但总结果必须写成：
 
