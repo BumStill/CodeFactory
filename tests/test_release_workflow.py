@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -390,11 +391,221 @@ class ReleaseWorkflowTests(unittest.TestCase):
             4,
             "draft creation, both build uploads, and final publication must all recheck tag identity",
         )
+        # The comparison itself now lives in one executable guard rather than
+        # being copy-pasted into every job that mutates the release.
+        guard = (REPO_ROOT / "tools/release/require_authorized_tag.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('REMOTE_TAG_SHA="$(git rev-parse "${TAG}^{commit}")"', guard)
         self.assertIn(
-            'REMOTE_TAG_SHA="$(git rev-parse "${TAG}^{commit}")"', workflow
+            'if [ "$REMOTE_TAG_SHA" != "$AUTHORIZED_TAG_SHA" ]; then', guard
+        )
+
+    def _moved_tag_fixture(self) -> tuple[Path, Path, str, str]:
+        """A bare origin whose tag can move behind a runner's back.
+
+        Returns (runner, mover, authorized_sha, moved_sha). `runner` has already
+        fetched the tag at `authorized_sha`; `mover` is a second clone used to
+        force-push the tag somewhere else, exactly like a human retagging while a
+        release build is still compiling.
+        """
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+
+        origin = root / "origin.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "main", str(origin)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        runner = root / "runner"
+        subprocess.run(
+            ["git", "clone", str(origin), str(runner)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self._git(runner, "config", "user.name", "Release Test")
+        self._git(runner, "config", "user.email", "release-test@example.invalid")
+        self._commit(runner, "chore: authorized commit")
+        authorized_sha = subprocess.run(
+            ["git", "-C", str(runner), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self._git(runner, "tag", "v9.9.9")
+        self._git(runner, "push", "origin", "main", "--tags")
+
+        mover = root / "mover"
+        subprocess.run(
+            ["git", "clone", str(origin), str(mover)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self._git(mover, "config", "user.name", "Release Test")
+        self._git(mover, "config", "user.email", "release-test@example.invalid")
+        self._commit(mover, "chore: someone retagged mid-build")
+        moved_sha = subprocess.run(
+            ["git", "-C", str(mover), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self._git(mover, "push", "origin", "main")
+
+        return runner, mover, authorized_sha, moved_sha
+
+    def _guard(self, repo: Path, tag: str, authorized: str, context: str,
+               mutation_log: Path | None = None) -> subprocess.CompletedProcess[str]:
+        """Run the guard, optionally chaining a stand-in mutation behind it."""
+        guard = str(REPO_ROOT / "tools/release/require_authorized_tag.sh")
+        command = f'"$1" "$2" "$3" "$4"'
+        if mutation_log is not None:
+            command += f' && echo mutated >> "$5"'
+        args = ["bash", "-c", command, "guard", guard, tag, authorized, context]
+        if mutation_log is not None:
+            args.append(str(mutation_log))
+        return subprocess.run(args, cwd=repo, capture_output=True, text=True)
+
+    def test_a_tag_moved_mid_build_blocks_the_mutation_that_follows_it(self) -> None:
+        runner, mover, authorized_sha, moved_sha = self._moved_tag_fixture()
+        log = runner / "mutations.log"
+
+        allowed = self._guard(runner, "v9.9.9", authorized_sha, "upload assets", log)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(
+            log.read_text(encoding="utf-8").count("mutated"),
+            1,
+            "an unmoved tag must let the release mutation proceed",
+        )
+
+        # Someone retags while the build is still compiling.
+        self._git(mover, "tag", "-f", "v9.9.9")
+        self._git(mover, "push", "--force", "origin", "refs/tags/v9.9.9")
+
+        blocked = self._guard(runner, "v9.9.9", authorized_sha, "upload assets", log)
+        self.assertEqual(
+            blocked.returncode,
+            1,
+            "a moved tag must fail closed, not warn",
+        )
+        self.assertIn("::error::release tag moved", blocked.stderr)
+        self.assertIn(moved_sha, blocked.stderr)
+        self.assertIn("blocked before: upload assets", blocked.stderr)
+        self.assertEqual(
+            log.read_text(encoding="utf-8").count("mutated"),
+            1,
+            "publish/tag/build/upload count after the tag moved must be 0",
+        )
+
+    def test_the_guard_never_mutates_the_repository_it_checks(self) -> None:
+        runner, mover, authorized_sha, _ = self._moved_tag_fixture()
+        self._git(mover, "tag", "-f", "v9.9.9")
+        self._git(mover, "push", "--force", "origin", "refs/tags/v9.9.9")
+
+        def remote_state() -> str:
+            return subprocess.run(
+                ["git", "-C", str(runner), "ls-remote", "origin"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+
+        before = remote_state()
+        blocked = self._guard(runner, "v9.9.9", authorized_sha, "publish release")
+        self.assertEqual(blocked.returncode, 1, blocked.stderr)
+        self.assertEqual(
+            before,
+            remote_state(),
+            "the guard must be read-only; a failed check may not rewrite the remote",
+        )
+
+    @staticmethod
+    def _job_steps(workflow: str, job: str) -> list[str]:
+        """Split one job's `steps:` block into individual step texts."""
+        body = workflow.split(f"\n  {job}:\n", 1)[1]
+        # A job ends where the next top-level job begins.
+        body = re.split(r"\n  [a-z][a-z0-9-]*:\n", body, maxsplit=1)[0]
+        steps = re.split(r"\n(?=      - (?:name|uses):)", body)
+        return [step for step in steps if step.strip().startswith("- ")]
+
+    def test_every_slow_release_mutation_rechecks_the_tag_next_to_it(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        guard = "tools/release/require_authorized_tag.sh"
+
+        self.assertIn(
+            guard,
+            workflow,
+            "the tag guard must be a real executable, not prose duplicated per job",
+        )
+        self.assertNotIn(
+            'REMOTE_TAG_SHA="$(git rev-parse "${TAG}^{commit}")"',
+            workflow,
+            "the comparison belongs in the guard script, not copy-pasted per job",
+        )
+
+        # A check when the job starts is not enough: a full Tauri compile sits
+        # between it and tauri-action's upload. Require a guarded step on both
+        # sides of every upload.
+        for job in ("build-windows", "build-macos"):
+            steps = self._job_steps(workflow, job)
+            upload = [
+                i for i, step in enumerate(steps)
+                if "tauri-apps/tauri-action@v0" in step
+            ]
+            self.assertEqual(
+                len(upload), 1, f"{job} must upload through exactly one tauri-action step"
+            )
+            index = upload[0]
+            self.assertIn(
+                guard,
+                steps[index - 1],
+                f"{job} must recheck the tag in the step immediately before uploading",
+            )
+            self.assertIn(
+                guard,
+                steps[index + 1],
+                f"{job} must recheck the tag immediately after uploading, so a tag "
+                f"moved during the compile cannot leave assets on the wrong tag",
+            )
+
+        # Publication is the one mutation that cannot be undone, and the
+        # latest.json assembly ahead of it is itself slow.
+        publish_step = [
+            step for step in self._job_steps(workflow, "finalize")
+            if 'gh release edit   "$TAG"' in step
+        ]
+        self.assertEqual(len(publish_step), 1)
+        head = publish_step[0].split("gh release upload", 1)[0]
+        self.assertIn(
+            guard,
+            head.rsplit("cat latest.json", 1)[-1],
+            "the final upload and publish must be guarded adjacently, not only at "
+            "the top of finalize",
+        )
+        self.assertNotIn(
+            guard,
+            publish_step[0].split("gh release upload", 1)[1],
+            "the guard belongs ahead of the irreversible mutations, not between them",
         )
         self.assertIn(
-            'if [ "$REMOTE_TAG_SHA" != "$AUTHORIZED_TAG_SHA" ]; then', workflow
+            "AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}",
+            publish_step[0],
+            "the publish step must carry the frozen SHA the guard compares against",
+        )
+
+        self.assertIn(
+            "needs: [changelog, prepare-release, build-windows, build-macos]",
+            workflow,
+            "a failed post-upload recheck must keep the draft unpublished: only "
+            "finalize publishes, and it may not run unless both builds passed",
         )
 
     def test_latest_manifest_carries_the_binary_build_identity(self) -> None:
