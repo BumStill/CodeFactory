@@ -2769,6 +2769,7 @@ mod tests {
     #[tokio::test]
     async fn native_mutation_without_observer_fails_before_receipt_or_dispatch() {
         let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
         let args = serde_json::json!({
             "command": "curl -X POST https://example.invalid/hooks -d secret"
         });
@@ -2780,7 +2781,7 @@ mod tests {
             .mutation_preflight(
                 &call,
                 &args,
-                &objective_ctx(std::path::Path::new(".")),
+                &objective_ctx(dir.path()),
                 &command,
                 kind,
                 false,
@@ -3233,18 +3234,20 @@ mod tests {
             ),
         ] {
             let backend = objective_backend(false).await;
-            let dir = tempfile::tempdir().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            std::fs::create_dir_all(&source).unwrap();
             let run = |args: &[&str]| {
                 let output = std::process::Command::new("git")
                     .no_window()
                     .args(args)
-                    .current_dir(dir.path())
+                    .current_dir(&source)
                     .output()
                     .unwrap();
                 assert!(output.status.success(), "git {:?} failed", args);
             };
             run(&["init", "-q"]);
-            std::fs::write(dir.path().join("tracked.txt"), b"original").unwrap();
+            std::fs::write(source.join("tracked.txt"), b"original").unwrap();
             run(&["add", "tracked.txt"]);
             run(&[
                 "-c",
@@ -3255,11 +3258,27 @@ mod tests {
                 "-qm",
                 "fixture",
             ]);
+            let workspace = super::super::execution_workspace::allocate_or_attach(
+                &backend.db,
+                super::super::execution_workspace::ExecutionWorkspaceRequest {
+                    objective_id: TEST_OBJECTIVE_ID.into(),
+                    session_id: Some(TEST_SESSION_ID.into()),
+                    source_cwd: source.clone(),
+                    workspace_container: temp.path().join("managed"),
+                    process_instance: "observer-test-process".into(),
+                },
+            )
+            .await
+            .unwrap();
             if let Some(contents) = prepare {
-                std::fs::write(dir.path().join("tracked.txt"), contents).unwrap();
+                std::fs::write(
+                    workspace.worktree_path.join("tracked.txt"),
+                    contents,
+                )
+                .unwrap();
             }
             sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
-                .bind(dir.path().to_string_lossy().as_ref())
+                .bind(workspace.worktree_path.to_string_lossy().as_ref())
                 .bind(TEST_SESSION_ID)
                 .execute(&backend.db)
                 .await
@@ -3273,7 +3292,7 @@ mod tests {
                     .mutation_preflight(
                         &call,
                         &args,
-                        &objective_ctx(dir.path()),
+                        &objective_ctx(&workspace.worktree_path),
                         &classified,
                         kind,
                         false,
@@ -3285,7 +3304,7 @@ mod tests {
             let effect = std::process::Command::new("sh")
                 .no_window()
                 .args(["-c", mutate])
-                .current_dir(dir.path())
+                .current_dir(&workspace.worktree_path)
                 .output()
                 .unwrap();
             assert!(effect.status.success());
