@@ -221,6 +221,8 @@
 6. 卡片提供 `审核技能` 深链；
 7. 资源中心通过 catalog event 实时出现，不需重开。
 
+Phase 0 先实现持久可重建的 installed-disabled 工具结果与精确 Skill 深链：版本化 receipt 逐项保存 `id/name/version/installed/activation`，会话重载从结构化 receipt 重建而不解析文案；结果卡显示安装当时“未启用”与每项 `检查并管理 <name> v<version>`。点击后打开资源中心 `技能` tab 与对应详情并聚焦审核状态；仅启用成功后自动返回原会话的原 receipt 按钮并恢复焦点，取消、失败、损坏或内容漂移继续留在详情。receipt 的历史事实与详情的实时状态分开显示。完整实时 operation 进度与 catalog event 在 Phase 1 接入 canonical installer 后补齐。
+
 Agent 主动认为 Skill 可能有帮助时，只能推荐，不得自行安装。
 
 ### 5.3 本地/Git/OpenClaw 导入

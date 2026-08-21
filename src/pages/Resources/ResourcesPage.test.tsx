@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   deleteLibrary: vi.fn(),
   open: vi.fn(),
   loadSkills: vi.fn(),
+  getSkillDetail: vi.fn(),
 }));
 
 const knowledgeState = vi.hoisted(() => ({
@@ -62,7 +63,7 @@ vi.mock("../../stores/skills", () => ({
     createSkill: vi.fn(),
     updateSkill: vi.fn(),
     deleteSkill: vi.fn(),
-    getSkillDetail: vi.fn(),
+    getSkillDetail: mocks.getSkillDetail,
   }),
 }));
 
@@ -82,8 +83,25 @@ describe("ResourcesPage", () => {
     mocks.setLibraryEnabled.mockResolvedValue(undefined);
     mocks.deleteLibrary.mockResolvedValue(undefined);
     mocks.loadSkills.mockResolvedValue(undefined);
+    mocks.getSkillDetail.mockResolvedValue({
+      manifest: { id: "continuity-helper", name: "Continuity Helper", description: "", version: "1.0.0", author: "fixture", tags: [], enabled: false, source: "user" },
+      system_prompt: "Stay continuous.",
+      slash_commands: [],
+      has_tool_policy: false,
+      tool_policy: null,
+      review_fingerprint: "sha256:continuity",
+    });
     mocks.open.mockResolvedValue("/Users/x/NewKnowledge");
     vi.spyOn(window, "confirm").mockReturnValue(true);
+  });
+
+  it("opens the skills tab and exact review target from a chat receipt", async () => {
+    render(<ResourcesPage onBack={() => {}} initialTab="skills" initialSkillId="continuity-helper" />);
+
+    expect(await screen.findByRole("heading", { name: "Continuity Helper" })).toBeInTheDocument();
+    expect(mocks.getSkillDetail).toHaveBeenCalledWith("continuity-helper");
+    expect(screen.getByText("已安装，尚未启用。检查内容后再启用。")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "技能" })).toHaveAttribute("aria-selected", "true");
   });
 
   it("manages knowledge libraries from the backend page", async () => {
@@ -91,8 +109,8 @@ describe("ResourcesPage", () => {
     render(<ResourcesPage onBack={() => {}} />);
 
     expect(await screen.findByRole("heading", { name: "资源中心" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "知识库" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "技能" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "知识库" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "技能" })).toBeInTheDocument();
     expect(screen.getByText("产品资料")).toBeInTheDocument();
     expect(screen.getByText(/3 文档 · 22 片段 · 1 失败/)).toBeInTheDocument();
 
@@ -114,7 +132,7 @@ describe("ResourcesPage", () => {
     await user.click(screen.getByRole("button", { name: "添加知识库" }));
     await waitFor(() => expect(mocks.registerLibrary).toHaveBeenCalledWith("NewKnowledge", "/Users/x/NewKnowledge"));
 
-    await user.click(screen.getByRole("button", { name: "技能" }));
+    await user.click(screen.getByRole("tab", { name: "技能" }));
     expect(await screen.findByText("已安装")).toBeInTheDocument();
     expect(screen.getByText("市场")).toBeInTheDocument();
   });

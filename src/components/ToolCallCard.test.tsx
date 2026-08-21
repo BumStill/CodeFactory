@@ -5,11 +5,11 @@
 // app — the path (often relative) is resolved against the session cwd.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { act, render, screen, fireEvent } from "@testing-library/react";
 
 const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
 
-const fakeChatState = { activeSession: { cwd: "/proj" } };
+const fakeChatState = { activeSession: { id: "session-1", cwd: "/proj" } };
 
 vi.mock("../stores/chat", () => ({
   useChatStore: (selector?: (s: typeof fakeChatState) => unknown) =>
@@ -22,6 +22,7 @@ vi.mock("../lib/tauri", async (orig) => {
 
 import { ToolCallCard } from "./ToolCallCard";
 import type { ToolCallState } from "../stores/chatEvents";
+import { useAppNavigationStore } from "../stores/appNavigation";
 
 const tc = (over: Partial<ToolCallState>): ToolCallState => ({
   id: "t",
@@ -37,6 +38,35 @@ describe("ToolCallCard — open generated file", () => {
   beforeEach(() => {
     mocks.invoke.mockReset();
     mocks.invoke.mockResolvedValue(undefined);
+    useAppNavigationStore.getState().reset();
+  });
+
+  it("rebuilds a successful skill_fetch receipt from persisted structured content", () => {
+    render(<ToolCallCard tc={tc({
+      id: "tool-skill-fetch",
+      name: "skill_fetch",
+      args: JSON.stringify({ source: "https://example.com/skill.json" }),
+      result: '已获取 1 个技能。\nCODEFACTORY_SKILL_RECEIPT_V1:{"schema_version":1,"kind":"skill_install","items":[{"id":"continuity-helper","name":"Continuity Helper","version":"1.0.0","installed":true,"activation":"disabled"}]}',
+    })} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "检查并管理 Continuity Helper v1.0.0" }));
+    expect(useAppNavigationStore.getState().skillReview).toEqual({
+      skillId: "continuity-helper",
+      originSessionId: "session-1",
+      originToolCallId: "tool-skill-fetch",
+    });
+  });
+
+  it("restores focus to the originating receipt after review navigation returns", async () => {
+    render(<ToolCallCard tc={tc({
+      id: "tool-skill-fetch",
+      name: "skill_fetch",
+      result: 'CODEFACTORY_SKILL_RECEIPT_V1:{"schema_version":1,"kind":"skill_install","items":[{"id":"continuity-helper","name":"Continuity Helper","version":"1.0.0","installed":true,"activation":"disabled"}]}',
+    })} />);
+
+    act(() => useAppNavigationStore.getState().restoreReceiptFocus("tool-skill-fetch"));
+    expect(await screen.findByRole("button", { name: "检查并管理 Continuity Helper v1.0.0" })).toHaveFocus();
+    expect(useAppNavigationStore.getState().returnFocusToolCallId).toBeNull();
   });
 
   it("offers to open a file a write tool just produced (cwd-resolved)", () => {

@@ -16,6 +16,8 @@ interface SkillsPageProps {
 
 interface SkillsPanelProps {
   onBack?: () => void;
+  initialSkillId?: string | null;
+  onReviewEnabled?: (id: string) => void;
 }
 
 type Tab = "installed" | "marketplace";
@@ -37,7 +39,7 @@ export function SkillsPage({ onBack }: SkillsPageProps) {
   return <SkillsPanel onBack={onBack} />;
 }
 
-export function SkillsPanel({ onBack }: SkillsPanelProps) {
+export function SkillsPanel({ onBack, initialSkillId, onReviewEnabled }: SkillsPanelProps) {
   const { skills, loading, catalogError, loadSkills, enableSkill, disableSkill, installFromUrl, installMarketplace, selectSourceDirectory, importFromDirectory, createSkill, updateSkill, deleteSkill, getSkillDetail } =
     useSkillsStore();
 
@@ -287,6 +289,13 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
     }
   };
 
+  useEffect(() => {
+    if (!initialSkillId) return;
+    setTab("installed");
+    setReviewingInstalledId(initialSkillId);
+    void handleSelectSkill(initialSkillId);
+  }, [initialSkillId]);
+
   const revealInstalledSkill = async (skill: SkillManifest) => {
     setTab("installed");
     setReviewingInstalledId(skill.id);
@@ -366,6 +375,10 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
     setTogglingId(skill.id);
     try {
       await enableSkill(skill.id, reviewed.review_fingerprint);
+      if (initialSkillId === skill.id && onReviewEnabled) {
+        onReviewEnabled(skill.id);
+        return;
+      }
       setReviewingInstalledId(null);
       setConfirmingEnable(null);
       setEnableReviewRefresh(null);
@@ -736,7 +749,7 @@ export function SkillsPanel({ onBack }: SkillsPanelProps) {
         ) : detailError ? (
           <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <div className="text-label text-red-400 whitespace-pre-wrap" role="alert">
-              Skill “{selectedId}” 已安装，但详情加载失败：{detailError}
+              Skill “{selectedId}” 的安装收据存在，但当前状态无法确认：{detailError}
             </div>
             <button
               className="rounded bg-surface-3 px-3 py-1.5 text-label text-gray-300 hover:bg-surface-4"

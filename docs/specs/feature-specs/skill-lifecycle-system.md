@@ -193,7 +193,8 @@ Catalog 投影也必须区分对象归属：已提交 package 的 `missing/corru
 - 所有写入、更新、删除和 marketplace ID 复用同一安全 path validator；
 - 本地/Git/OpenClaw 导入改为默认禁用；
 - 本地目录只能由 backend native picker 回调立即打开，并向 renderer 返回短期、一次性的 opaque source handle；renderer 与 Agent API 不得提交原始本机路径来获得读取权限。Phase 0 的授权提交点是 backend callback 成功完成 no-follow open 的时刻，后续扫描和导入只使用该 directory capability。OpenClaw 例外入口只在用户点击“一键导入”后扫描 backend-owned well-known roots（`~/.openclaw/skills`、`~/.claude/skills`）并签发相同 handle，不接受 renderer/model 自由路径；主动控制同一用户文件系统并在 picker callback 内竞态替换真实目录的攻击者不属于 Phase 0 包威胁模型，Phase 1 native identity/bookmark adapter 继续收紧该边界；
-- Phase 0 过渡 UI 必须保持操作连续：安装成功后原地切到“已安装”并打开刚安装的精确条目，显示实际保存内容与“尚未启用”；用户从同一详情进入显式启用确认。不得要求用户自行重新查找、刷新或猜测下一步；
+- Phase 0 过渡 UI 必须保持操作连续：资源中心安装成功后原地切到“已安装”并打开刚安装的精确条目；Agent `skill_fetch` 成功后在原聊天工具结果中持久化版本化 installed-disabled receipt（逐项包含 `id/name/version/installed/activation`），并显示每个精确 Skill 的“检查并管理”动作。会话重载必须从结构化 receipt 重建动作，禁止解析自然语言文案。点击后深链到资源中心对应条目并保留原会话与原工具调用；仅在启用 receipt 成功后自动返回原工具卡并恢复焦点，取消、失败或内容漂移留在详情。历史 receipt 只陈述安装当时的事实，当前是否启用由详情实时状态决定。两条入口都显示实际保存内容与“尚未启用”，再从同一详情进入显式启用确认；不得要求用户自行重新查找、刷新或猜测下一步；
+- 当前执行中的 root turn 在启动时冻结 Skill prompt 快照；审核导航、取消或在详情中启用都不改变该 root turn 后续模型轮次。只有启用 receipt 成功之后启动的新 root turn 才能重新解析并加载该 fingerprint；
 - 在 project scope 与持久 review/activation receipt 尚未交付前，过渡确认必须如实写明“当前对所有项目生效”，且只能称为“安装结果 + 显式全局启用确认”，不得宣称已完成 v2 审核、scope 或 receipt；
 - 移除 `skill_*` 前缀级无条件 Allow；search/list/get 是普通 read-only，load/resource-read 是受 activation 与预算约束的 `RuntimeContextRead`，fetch/install/update/delete 重新进入正常 mutation permission gate；
 - 在签名 envelope 与不可变 package digest 交付前，Phase 0 关闭远程 marketplace/registry，只使用随签名 App 发布的内置目录；用户显式 public HTTPS source 走单独确认并阻断私网/redirect/超限/慢流；Git source 暂停并显示稳定错误码，待独立受限 adapter 交付后恢复；

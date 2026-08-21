@@ -47,7 +47,7 @@ vi.mock("../../stores/chat", () => ({
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 
-import { SkillsPage } from "./SkillsPage";
+import { SkillsPage, SkillsPanel } from "./SkillsPage";
 
 beforeEach(() => {
   mocks.skillList.current = [];
@@ -90,6 +90,22 @@ describe("Skill lifecycle continuity", () => {
       "continuity-helper",
       "sha256:reviewed-continuity-helper",
     ));
+  });
+
+  it("returns a chat-origin review only after the enable receipt succeeds", async () => {
+    const onReviewEnabled = vi.fn();
+    render(
+      <SkillsPanel
+        initialSkillId="continuity-helper"
+        onReviewEnabled={onReviewEnabled}
+      />,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "检查并启用…" }));
+    expect(onReviewEnabled).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "批准并在所有项目启用" }));
+
+    await waitFor(() => expect(onReviewEnabled).toHaveBeenCalledWith("continuity-helper"));
   });
 
   it("keeps the enable dialog visible while saving and after a failed enable", async () => {

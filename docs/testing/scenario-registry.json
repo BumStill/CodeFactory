@@ -316,8 +316,8 @@
       "category": "skill_lifecycle",
       "priority": "P0",
       "source_kind": "product_contract",
-      "change_patterns": ["src-tauri/src/commands/skills.rs", "src/pages/Skills/SkillsPage.tsx", "src/pages/Skills/SkillsPage.lifecycle.test.tsx", "src/stores/skills.ts"],
-      "automated_by": ["path:src/pages/Skills/SkillsPage.lifecycle.test.tsx", "path:src/stores/skills.lifecycle.test.ts"],
+      "change_patterns": ["src-tauri/src/commands/skills.rs", "src-tauri/src/tools/skill_mgmt.rs", "src/components/ToolCallCard.tsx", "src/components/ToolCallCard.test.tsx", "src/stores/appNavigation.ts", "src/App.tsx", "src/App.resources.test.tsx", "src/pages/Resources/ResourcesPage.tsx", "src/pages/Resources/ResourcesPage.test.tsx", "src/pages/Skills/SkillsPage.tsx", "src/pages/Skills/SkillsPage.lifecycle.test.tsx", "src/stores/skills.ts"],
+      "automated_by": ["path:src/pages/Skills/SkillsPage.lifecycle.test.tsx", "path:src/stores/skills.lifecycle.test.ts", "rust:skill_fetch_receipt_targets_exact_installed_ids_for_review", "path:src/components/ToolCallCard.test.tsx", "path:src/App.resources.test.tsx", "path:src/pages/Resources/ResourcesPage.test.tsx"],
       "required_evidence": ["L0", "L1", "L3"],
       "gates": ["pull_request"]
     }

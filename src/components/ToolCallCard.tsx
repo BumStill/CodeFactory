@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown, ChevronRight,
   AlertCircle, Ban, CheckCircle, Clock3, ShieldQuestion,
   FileText, Edit3, Save, TerminalSquare, Search, FolderTree,
-  Globe, Wrench, Bot, BookOpen, ExternalLink,
+  Globe, Wrench, Bot, BookOpen, ExternalLink, Puzzle,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import type { ToolCallState } from "../stores/chat";
 import { invoke } from "../lib/tauri";
 import { DiffViewer, parseUnifiedDiffResult } from "./DiffViewer";
+import { useAppNavigationStore } from "../stores/appNavigation";
 
 interface Props {
   tc: ToolCallState;
@@ -67,6 +68,8 @@ function styleForTool(name: string): ToolStyle {
     case "kb_search":
     case "kb_get_chunk":
       return { icon: BookOpen, iconClass: "text-status-info" };
+    case "skill_fetch":
+      return { icon: Puzzle, iconClass: "text-accent" };
     default:
       return { icon: Wrench, iconClass: "text-accent" };
   }
@@ -93,7 +96,66 @@ function toolLabel(name: string): string {
     case "task": return "委派";
     case "kb_search":
     case "kb_get_chunk": return "知识";
+    case "skill_fetch": return "技能安装";
     default: return name;
+  }
+}
+
+function isPortableSkillId(value: unknown): value is string {
+  return typeof value === "string"
+    && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value)
+    && !value.includes("..")
+    && !value.endsWith(".");
+}
+
+interface SkillInstallReceiptItem {
+  id: string;
+  name: string;
+  version: string;
+  installed: true;
+  activation: "disabled";
+}
+
+const SKILL_RECEIPT_PREFIX = "CODEFACTORY_SKILL_RECEIPT_V1:";
+
+function isSkillInstallReceiptItem(value: unknown): value is SkillInstallReceiptItem {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return isPortableSkillId(item.id)
+    && typeof item.name === "string"
+    && item.name.trim().length > 0
+    && typeof item.version === "string"
+    && item.version.trim().length > 0
+    && item.installed === true
+    && item.activation === "disabled";
+}
+
+function receiptItems(value: unknown): SkillInstallReceiptItem[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const receipt = value as Record<string, unknown>;
+  if (receipt.schema_version !== 1 || receipt.kind !== "skill_install" || !Array.isArray(receipt.items)) {
+    return [];
+  }
+  const unique = new Map<string, SkillInstallReceiptItem>();
+  for (const item of receipt.items) {
+    if (isSkillInstallReceiptItem(item)) unique.set(item.id, item);
+  }
+  return [...unique.values()];
+}
+
+function skillReviewItems(tc: ToolCallState): SkillInstallReceiptItem[] {
+  if (tc.name !== "skill_fetch" || tc.status !== "done" || tc.isError) return [];
+  const action = tc.metadata?.codefactory_ui;
+  const liveItems = receiptItems(action);
+  if (liveItems.length > 0) return liveItems;
+
+  const marker = (tc.result ?? "").lastIndexOf(SKILL_RECEIPT_PREFIX);
+  if (marker < 0) return [];
+  const rawReceipt = (tc.result ?? "").slice(marker + SKILL_RECEIPT_PREFIX.length).trim();
+  try {
+    return receiptItems(JSON.parse(rawReceipt));
+  } catch {
+    return [];
   }
 }
 
@@ -327,6 +389,25 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
   );
   const cwd = useChatStore((s) => s.activeSession?.cwd);
   const filePath = generatedFilePath(tc);
+  const reviewItems = useMemo(() => skillReviewItems(tc), [tc]);
+  const requestSkillReview = useAppNavigationStore((state) => state.requestSkillReview);
+  const returnFocusToolCallId = useAppNavigationStore((state) => state.returnFocusToolCallId);
+  const returnFocusSkillId = useAppNavigationStore((state) => state.returnFocusSkillId);
+  const consumeReceiptFocus = useAppNavigationStore((state) => state.consumeReceiptFocus);
+  const activeSessionId = useChatStore((state) => state.activeSession?.id ?? null);
+  const reviewButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+
+  useEffect(() => {
+    if (returnFocusToolCallId !== tc.id || reviewItems.length === 0) return;
+    const target = returnFocusSkillId && reviewButtonRefs.current.get(returnFocusSkillId)
+      ? returnFocusSkillId
+      : reviewItems[0].id;
+    const button = reviewButtonRefs.current.get(target);
+    if (!button) return;
+    button.focus();
+    button.scrollIntoView?.({ block: "nearest" });
+    consumeReceiptFocus({ toolCallId: tc.id, skillId: target });
+  }, [consumeReceiptFocus, returnFocusSkillId, returnFocusToolCallId, reviewItems, tc.id]);
 
   const statusIcon =
     tc.status === "waiting_permission" ? (
@@ -410,6 +491,30 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
           <span className="truncate font-mono">{basename(filePath)}</span>
           <span className="ml-auto shrink-0 text-caption text-gray-500">打开文件</span>
         </button>
+      )}
+
+      {reviewItems.length > 0 && (
+        <div className="ml-7 max-w-[56ch] space-y-1 rounded-lg border border-accent/25 bg-accent/5 px-2.5 py-2" role="group" aria-label="技能安装结果">
+          <p className="text-label text-gray-300" role="status">安装成功；安装当时保持未启用。请查看当前状态和实际内容。</p>
+          {reviewItems.map((item) => (
+            <button
+              key={item.id}
+              ref={(element) => {
+                if (element) reviewButtonRefs.current.set(item.id, element);
+                else reviewButtonRefs.current.delete(item.id);
+              }}
+              type="button"
+              onClick={() => requestSkillReview({
+                skillId: item.id,
+                originSessionId: activeSessionId,
+                originToolCallId: tc.id,
+              })}
+              className="block min-h-9 rounded px-2 text-left text-label font-medium text-accent hover:bg-accent/10"
+            >
+              检查并管理 {item.name} v{item.version}
+            </button>
+          ))}
+        </div>
       )}
 
       {open && (

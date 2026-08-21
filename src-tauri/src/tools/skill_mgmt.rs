@@ -226,7 +226,7 @@ pub fn fetch_definition() -> ToolDefinition {
             description: "Install a skill from a source: a registry id (from skill_search) or a public \
                 HTTPS manifest JSON URL. Raw local paths and Git sources are unavailable during security \
                 containment; local directories must use the Resource Center picker. Installs DISABLED — \
-                tell the user to review and enable it on the Skills page."
+                the tool result includes an exact review action; tell the user to use that action before enabling."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -237,6 +237,26 @@ pub fn fetch_definition() -> ToolDefinition {
             }),
         },
     }
+}
+
+const SKILL_RECEIPT_PREFIX: &str = "CODEFACTORY_SKILL_RECEIPT_V1:";
+
+fn skill_install_receipt(manifests: &[crate::commands::skills::SkillManifest]) -> Value {
+    json!({
+        "schema_version": 1,
+        "kind": "skill_install",
+        "items": manifests.iter().map(|manifest| json!({
+            "id": manifest.id,
+            "name": manifest.name,
+            "version": manifest.version,
+            "installed": true,
+            "activation": "disabled",
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn skill_review_metadata(receipt: &Value) -> Value {
+    json!({ "codefactory_ui": receipt })
 }
 
 pub async fn execute_fetch(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
@@ -255,11 +275,51 @@ pub async fn execute_fetch(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
                 .map(|m| format!("「{}」(id: {})", m.name, m.id))
                 .collect::<Vec<_>>()
                 .join("、");
+            let receipt = skill_install_receipt(&ms);
             Ok(ToolOutput::ok(format!(
-                "已获取 {} 个技能(均未启用):{names}。请到 Skills 页预览内容并启用后即生效。",
-                ms.len()
-            )))
+                "已获取 {} 个技能(均未启用):{names}。请使用本结果的检查入口预览实际内容。当前 root turn 的 Skill 快照不会变化；显式启用成功后，只有之后启动的新 root turn 才可加载。\n{SKILL_RECEIPT_PREFIX}{receipt}",
+                ms.len(),
+            ))
+            .with_metadata(skill_review_metadata(&receipt)))
         }
         Err(e) => Ok(ToolOutput::err(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{skill_install_receipt, skill_review_metadata, SKILL_RECEIPT_PREFIX};
+    use crate::commands::skills::SkillManifest;
+
+    #[test]
+    fn skill_fetch_receipt_targets_exact_installed_ids_for_review() {
+        let manifests = [SkillManifest {
+            id: "continuity-helper".into(),
+            name: "Continuity Helper".into(),
+            description: "fixture".into(),
+            version: "1.0.0".into(),
+            author: "fixture".into(),
+            tags: Vec::new(),
+            enabled: false,
+            path: "/fixture/continuity-helper".into(),
+            source: "user".into(),
+            lifecycle_status: "ready".into(),
+        }];
+        let receipt = skill_install_receipt(&manifests);
+        let metadata = skill_review_metadata(&receipt);
+        assert_eq!(metadata["codefactory_ui"]["schema_version"], 1);
+        assert_eq!(metadata["codefactory_ui"]["kind"], "skill_install");
+        assert_eq!(
+            metadata["codefactory_ui"]["items"][0],
+            serde_json::json!({
+                "id": "continuity-helper",
+                "name": "Continuity Helper",
+                "version": "1.0.0",
+                "installed": true,
+                "activation": "disabled",
+            })
+        );
+        assert!(format!("{SKILL_RECEIPT_PREFIX}{receipt}")
+            .starts_with("CODEFACTORY_SKILL_RECEIPT_V1:{"));
     }
 }

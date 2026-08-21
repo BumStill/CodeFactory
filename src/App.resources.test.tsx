@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
+import { useAppNavigationStore } from "./stores/appNavigation";
 
 
 vi.mock("./pages/Resources/ResourcesPage", () => ({
-  ResourcesPage: () => <main aria-label="资源中心页面">资源中心已打开</main>,
+  ResourcesPage: ({ initialTab, initialSkillId, onSkillEnabled }: { initialTab?: string; initialSkillId?: string | null; onSkillEnabled?: (id: string) => void }) => (
+    <main aria-label="资源中心页面" data-tab={initialTab} data-skill-id={initialSkillId}>
+      资源中心已打开
+      {initialSkillId && <button onClick={() => onSkillEnabled?.(initialSkillId)}>模拟启用成功</button>}
+    </main>
+  ),
 }));
 vi.mock("./pages/Workspace/WorkspacePage", () => ({
   WorkspacePage: ({ onOpenSettings }: { onOpenSettings?: () => void }) => (
@@ -37,6 +43,36 @@ vi.mock("./stores/chatgptCatalog", () => ({ syncChatGptCatalog: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 describe("App resource navigation", () => {
+  beforeEach(() => useAppNavigationStore.getState().reset());
+  it("routes a chat skill receipt to the exact installed skill", async () => {
+    render(<App />);
+
+    act(() => useAppNavigationStore.getState().requestSkillReview({
+      skillId: "continuity-helper",
+      originSessionId: "session-1",
+      originToolCallId: "tool-skill-fetch",
+    }));
+
+    const resources = await screen.findByRole("main", { name: "资源中心页面" });
+    expect(resources).toHaveAttribute("data-tab", "skills");
+    expect(resources).toHaveAttribute("data-skill-id", "continuity-helper");
+  });
+
+  it("returns to the originating receipt only after enable succeeds", async () => {
+    render(<App />);
+    act(() => useAppNavigationStore.getState().requestSkillReview({
+      skillId: "continuity-helper",
+      originSessionId: "session-1",
+      originToolCallId: "tool-skill-fetch",
+    }));
+
+    await userEvent.click(await screen.findByRole("button", { name: "模拟启用成功" }));
+
+    expect(screen.queryByRole("main", { name: "资源中心页面" })).not.toBeInTheDocument();
+    expect(useAppNavigationStore.getState().skillReview).toBeNull();
+    expect(useAppNavigationStore.getState().returnFocusToolCallId).toBe("tool-skill-fetch");
+  });
+
   it("routes the settings capability entry to ResourcesPage", async () => {
     render(<App />);
 
