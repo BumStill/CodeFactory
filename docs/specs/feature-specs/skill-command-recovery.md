@@ -23,6 +23,7 @@
 - 明确的命令解析/调用/超时失败不能直接结束原任务，也不能要求用户发送“继续”。
 - 系统先执行一次有界正确性诊断，再用有证据变化的命令继续。
 - 无新证据时不得原样重复失败命令；相同 Objective、root turn 和权限边界保持不变。
+- 纠正命令成功且无需工作区变更时，以有界探针形成 `CurrentStateAcceptance` 并一次结算 Objective；不得由 supervisor 重复生成相同最终答复。
 - 用户能看到简洁的“正在检查命令”状态和最终工具证据，不暴露内部 prompt 或敏感参数。
 
 ### 非目标
@@ -41,7 +42,7 @@
 | CF-SCR-R3 | bash/run-shell 对 `command_not_found`、`resource_not_found`、`invalid_invocation`、`command_timeout` 和 `shell_unavailable` 产生 typed、脱敏、可恢复 metadata；普通无匹配/业务非零退出不误触发 | tool runtime + shared core | classifier matrix |
 | CF-SCR-R4 | typed command failure 创建 command-repair obligation，不能因工具仍属 `ReadOnly` 就接受最终回复；下一 provider round 必须要求一个工具动作 | shared AgentLoop | scripted transport sequence |
 | CF-SCR-R5 | repair round 必须先做至少一项有界只读诊断：解析 skill root/脚本存在性、`command -v`/`Get-Command`、帮助/版本/README 或平台适配；没有诊断证据时禁止原样重跑同一命令 | shared AgentLoop policy | same-command negative + diagnostic positive |
-| CF-SCR-R6 | 纠正尝试必须在可审计的命令名、路径、调用方式、参数或有依据的 timeout 策略上发生变化；失败批次中尚未开始的后续调用取消后由模型基于真实错误重新规划 | AgentLoop + persistence | multi-call cancellation sequence |
+| CF-SCR-R6 | 纠正尝试必须在可审计的命令名、路径、调用方式、参数或有依据的 timeout 策略上发生变化；失败批次中尚未开始的后续调用取消后由模型基于真实错误重新规划；成功的有界纠正命令必须形成 typed verification，若无需工作区变更则以 `CurrentStateAcceptance` 一次结算 Objective | AgentLoop + Objective + persistence | multi-call cancellation + no-change acceptance sequence |
 | CF-SCR-R7 | timeout 必须先回收本次 shell 进程树，再诊断前台服务/真实进度/超时预算；bash 暴露 `1..=1800` 秒的有界 `timeout_sec`，只有诊断证据后的 timeout 变化才算更正，不得无依据原样重跑 | bash + AgentLoop | descendant cleanup + timeout recovery trajectory |
 | CF-SCR-R8 | 普通 operational command failure 作为 `ToolResult(error)` 回送模型；`command_not_found`、`invalid_invocation` 或 `shell_unavailable` 只有在有界观察确认工作区未变化时，才把旧 receipt 原子结算为 `cancelled`；观察到变化、timeout、资源缺失或状态不可读仍保持 `unknown` 并转 system-owned remediation | ToolBackend + Objective boundary | receipt cancellation positive/negative + recoverable/fatal boundary unit |
 | CF-SCR-R9 | 持久化 replay 保留 typed failure code、脱敏错误和 tool-call identity；进程恢复后不得退化为无错误语义的 placeholder 或新 Objective | trajectory + history repair | SQLite restart integration |
@@ -82,7 +83,9 @@ AgentLoop 在收到 typed failure 后：
 2. 取消同一预先生成批次里尚未开始的调用；
 3. 注入内部 repair prompt，并令下一 provider round `tool_choice=required`；
 4. 先接受一项有界只读诊断，再接受改变后的纠正命令；
-5. 成功后清除 obligation，继续原任务；新的 typed failure 更新 failure signature 和策略。
+5. 成功后清除 obligation，并把有界纠正命令记录为 functional probe；若没有工作区变更，
+   Completion Arbiter 以 `CurrentStateAcceptance` 完成同一 Objective，若发生了变更则仍要求
+   `ChangeSet + PostChangeValidation`；新的 typed failure 更新 failure signature 和策略。
 
 同一命令 fingerprint 在没有中间诊断证据时不得重新 dispatch。已有 completion gate 的
 失败上限和 Objective remediation 上限继续充当总兜底，不能因普通模型轮次、进程重启
@@ -111,7 +114,7 @@ timeout/resource-not-found，receipt 继续保持 `unknown`。数据库无法提
 - 首次 typed failure 后，工具卡保留真实错误；回合状态显示“命令执行失败，正在检查正确调用方式”。
 - 诊断和纠正继续出现在同一 root turn，不插入伪用户消息，不显示“请继续/请重试”。
 - timeout 状态说明系统正在判断“仍在运行、前台服务还是命令配置错误”，不承诺盲目延长等待。
-- 修复成功后只给用户最终结果和相关验证；内部 repair prompt、fingerprint 和策略计数不进入正文。
+- 修复成功后只给用户一份最终结果和相关验证；内部 repair prompt、fingerprint 和策略计数不进入正文，supervisor 不得因“无变更”重复同一最终答复。
 - 两条不同安全策略仍不能推进时，显示 system incident 的 owner、失败类别和已检查范围；composer 回到发送态，但不把技术输入责任转给用户。
 
 ## Primary User Paths
@@ -156,7 +159,8 @@ turn 并保留 Objective 为 system-owned incident；不显示业务完成或人
 | Shared core unit | failure text matrix | 仅明确 command failure 得到 typed code；普通 `grep` no-match 不触发 |
 | Bash unit | timeout/127/invalid option | ToolOutput Error 含脱敏 typed metadata；timeout 后代回收 |
 | Timeout repair | 同一命令 300 秒失败，诊断后改为 600 秒 | fingerprint 发生变化并允许更正；仍用 300 秒则拒绝 |
-| AgentLoop scripted | wrong command → diagnostic → corrected command | 下一轮 required tool；同一 root；纠正后继续并完成 |
+| AgentLoop scripted | wrong command → diagnostic → corrected command | 下一轮 required tool；同一 root；纠正后成为有界验证并完成 |
+| Objective no-change | corrected bounded probe → final | `CurrentStateAcceptance`、单一 completed revision、无重复 final message；纯文本答复仍不能完成 LocalMutation |
 | AgentLoop negative | wrong command → unchanged retry | 第二次 dispatch 被拒绝；要求诊断；无副作用 |
 | AgentLoop batch | failed first + queued second | 第二个调用记 cancelled，下一轮基于真实错误重新生成 |
 | SQLite receipt | invalid invocation + unchanged/changed workspace | 未变化时 receipt/contract 为 `cancelled` 且失败工具可终结；有变化时仍为 `unknown/observed_changed`；成功工具不能用 cancelled 绕过证据 |

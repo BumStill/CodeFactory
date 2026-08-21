@@ -868,13 +868,28 @@ pub fn decision_for_run_outcome_with_reason(
                         observed_at: now,
                         reached_acceptance: objective.requested_acceptance.clone(),
                     });
-                }
-                if let Some(sequence) = validation {
+                    if let Some(sequence) = validation {
+                        evidence.push(ObjectiveEvidence {
+                            id: Uuid::new_v4().to_string(),
+                            kind: EvidenceKind::PostChangeValidation,
+                            scope: scope.clone(),
+                            digest: digest(&format!("validation:{sequence}")),
+                            evidence_ref: evidence_ref.clone(),
+                            observed_at: now,
+                            reached_acceptance: objective.requested_acceptance.clone(),
+                        });
+                    }
+                } else if let Some(sequence) = validation {
+                    // An implementation-capable turn may discover that no
+                    // workspace mutation is needed (for example a corrected
+                    // installed-Skill command).  A real successful probe is
+                    // typed current-state acceptance; prose alone still emits
+                    // no evidence and remains non-terminal.
                     evidence.push(ObjectiveEvidence {
                         id: Uuid::new_v4().to_string(),
-                        kind: EvidenceKind::PostChangeValidation,
+                        kind: EvidenceKind::CurrentStateAcceptance,
                         scope: scope.clone(),
-                        digest: digest(&format!("validation:{sequence}")),
+                        digest: digest(&format!("current-state-validation:{sequence}")),
                         evidence_ref: evidence_ref.clone(),
                         observed_at: now,
                         reached_acceptance: objective.requested_acceptance.clone(),
@@ -7695,6 +7710,32 @@ mod tests {
         let prose_only = decision_for_run_outcome(&local, &answer).unwrap();
         assert_eq!(prose_only.status, ObjectiveStatus::WaitingSystem);
         assert!(!prose_only.requires_user_action);
+
+        let verified_current_state = RunOutcome {
+            final_text: "SKILL_RECOVERY_OK".into(),
+            final_message_id: Some("assistant-skill-recovery".into()),
+            completion_evidence: CompletionEvidence {
+                outcome_count: 3,
+                last_successful_verification_sequence: Some(3),
+                last_bounded_probe_sequence: Some(3),
+                completed: true,
+                ..Default::default()
+            },
+            input_tokens: 12,
+            output_tokens: 3,
+            stop_reason: StopReason::Finished,
+        };
+        let no_change_complete = decision_for_run_outcome(&local, &verified_current_state).unwrap();
+        assert_eq!(no_change_complete.status, ObjectiveStatus::Completed);
+        assert_eq!(no_change_complete.decision_type, DecisionType::Complete);
+        assert_eq!(
+            no_change_complete.evidence.as_ref().map(|item| item.kind),
+            Some(EvidenceKind::CurrentStateAcceptance),
+        );
+        assert_eq!(
+            no_change_complete.visible_final_message_id.as_deref(),
+            Some("assistant-skill-recovery"),
+        );
     }
 
     #[test]

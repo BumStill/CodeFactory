@@ -2288,6 +2288,41 @@ pub async fn run_agent_loop(
                                         &cwd,
                                     ) =>
                             {
+                                // The changed command is the bounded functional
+                                // probe for this recovery.  Preserve a stronger
+                                // backend classification (mutation, runtime or
+                                // an explicit machine assertion), but do not
+                                // leave an otherwise opaque/read-only Skill CLI
+                                // invisible to the completion and Objective
+                                // arbiters after it succeeded.
+                                if matches!(
+                                    output.kind,
+                                    codefactory_agent_core::ToolKind::ReadOnly
+                                ) {
+                                    output.kind =
+                                        codefactory_agent_core::ToolKind::FunctionalProbe {
+                                            bounded: true,
+                                        };
+                                }
+                                let metadata = output
+                                    .metadata
+                                    .get_or_insert_with(|| serde_json::json!({}));
+                                if let Some(fields) = metadata.as_object_mut() {
+                                    fields.insert(
+                                        "code".into(),
+                                        serde_json::Value::String(repair.code.clone()),
+                                    );
+                                    fields.insert(
+                                        "command_repair_completed".into(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                    fields.insert(
+                                        "stage".into(),
+                                        serde_json::Value::String(
+                                            "corrected_attempt_succeeded".into(),
+                                        ),
+                                    );
+                                }
                                 command_repair = None;
                             }
                             _ => {}
@@ -4876,6 +4911,18 @@ mod tests {
         assert_eq!(outcome.stop_reason, StopReason::Finished);
         assert!(outcome.completion_evidence.completed);
         assert_eq!(outcome.final_text, "SKILL_RECOVERY_OK");
+        assert_eq!(
+            outcome.completion_evidence.last_bounded_probe_sequence,
+            Some(3),
+            "a successful changed command after bounded diagnosis is the recovery probe",
+        );
+        assert_eq!(
+            outcome
+                .completion_evidence
+                .last_successful_verification_sequence,
+            Some(3),
+            "the Objective layer needs typed current-state evidence instead of another model turn",
+        );
         assert_eq!(
             tools.executed(),
             vec![
