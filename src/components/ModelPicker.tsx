@@ -94,28 +94,51 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
     const triggerRect = ref.current?.getBoundingClientRect();
     if (!triggerRect) return;
     const viewportPadding = 8;
+    const gap = 4;
     const menuWidth = Math.min(288, Math.max(0, window.innerWidth - viewportPadding * 2));
-    const availableAbove = Math.max(96, triggerRect.top - viewportPadding * 2);
+    const availableAbove = Math.max(0, triggerRect.top - gap - viewportPadding);
+    const availableBelow = Math.max(
+      0,
+      window.innerHeight - triggerRect.bottom - gap - viewportPadding,
+    );
     const measuredHeight = menuRef.current?.getBoundingClientRect().height || 360;
-    const menuHeight = Math.min(measuredHeight, availableAbove, window.innerHeight - viewportPadding * 2);
+    const opensBelow = availableBelow >= measuredHeight || availableBelow > availableAbove;
+    const availableHeight = opensBelow ? availableBelow : availableAbove;
+    const menuHeight = Math.min(
+      measuredHeight,
+      availableHeight,
+      window.innerHeight - viewportPadding * 2,
+    );
     setPortalPosition({
       left: Math.max(
         viewportPadding,
         Math.min(triggerRect.right - menuWidth, window.innerWidth - menuWidth - viewportPadding),
       ),
-      top: Math.max(viewportPadding, triggerRect.top - menuHeight - viewportPadding),
-      maxHeight: availableAbove,
+      top: opensBelow
+        ? Math.min(
+            triggerRect.bottom + gap,
+            window.innerHeight - menuHeight - viewportPadding,
+          )
+        : Math.max(viewportPadding, triggerRect.top - menuHeight - gap),
+      maxHeight: availableHeight,
     });
   }, [portal]);
 
   useLayoutEffect(() => {
     if (!open || !portal) return;
     updatePortalPosition();
+    const frame = requestAnimationFrame(updatePortalPosition);
     window.addEventListener("resize", updatePortalPosition);
     window.addEventListener("scroll", updatePortalPosition, true);
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(updatePortalPosition);
+    if (menuRef.current) observer?.observe(menuRef.current);
     return () => {
+      cancelAnimationFrame(frame);
       window.removeEventListener("resize", updatePortalPosition);
       window.removeEventListener("scroll", updatePortalPosition, true);
+      observer?.disconnect();
     };
   }, [open, portal, updatePortalPosition]);
 
@@ -151,9 +174,9 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
         id={menuId}
         role="dialog"
         aria-label="选择下一回合模型"
-        className="z-[100] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-border bg-surface-2 shadow-xl"
+        className="z-[100] w-72 max-w-[calc(100vw-1rem)] rounded-lg border border-border/50 bg-surface-2 shadow-lg"
       >
-      <div className="space-y-2 border-b border-border p-2">
+      <div className="space-y-2 border-b border-border/35 p-2">
         {activeSession && (
           <>
             <select

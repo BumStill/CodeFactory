@@ -199,17 +199,34 @@ describe("ModelPicker", () => {
   it("exposes an owned popup, opens upward from the composer, and returns focus on Escape", async () => {
     const user = userEvent.setup();
     mocks.loadModels.mockResolvedValue(undefined);
-    const rectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
-      x: 600,
-      y: 600,
-      top: 600,
-      right: 820,
-      bottom: 632,
-      left: 600,
-      width: 220,
-      height: 32,
-      toJSON: () => ({}),
-    });
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        if (this.getAttribute("role") === "dialog") {
+          return {
+            x: 0,
+            y: 0,
+            top: 0,
+            right: 288,
+            bottom: 300,
+            left: 0,
+            width: 288,
+            height: 300,
+            toJSON: () => ({}),
+          };
+        }
+        return {
+          x: 600,
+          y: 600,
+          top: 600,
+          right: 820,
+          bottom: 632,
+          left: 600,
+          width: 220,
+          height: 32,
+          toJSON: () => ({}),
+        };
+      });
 
     try {
       render(<ModelPicker portal />);
@@ -233,6 +250,57 @@ describe("ModelPicker", () => {
       expect(trigger).toHaveFocus();
     } finally {
       rectSpy.mockRestore();
+    }
+  });
+
+  it("opens below a trigger near the viewport top instead of crushing the menu above it", async () => {
+    const user = userEvent.setup();
+    mocks.loadModels.mockResolvedValue(undefined);
+    const originalWidth = window.innerWidth;
+    const originalHeight = window.innerHeight;
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        if (this.getAttribute("role") === "dialog") {
+          return {
+            x: 0,
+            y: 0,
+            top: 0,
+            right: 288,
+            bottom: 300,
+            left: 0,
+            width: 288,
+            height: 300,
+            toJSON: () => ({}),
+          };
+        }
+        return {
+          x: 20,
+          y: 40,
+          top: 40,
+          right: 200,
+          bottom: 72,
+          left: 20,
+          width: 180,
+          height: 32,
+          toJSON: () => ({}),
+        };
+      });
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 800 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 720 });
+
+    try {
+      render(<ModelPicker portal />);
+      await user.click(screen.getByRole("button", { name: /选择下一回合模型/ }));
+
+      await waitFor(() => {
+        const portal = screen.getByTestId("model-picker-portal-menu");
+        expect(Number.parseFloat(portal.style.top)).toBeGreaterThanOrEqual(76);
+      });
+    } finally {
+      rectSpy.mockRestore();
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: originalWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: originalHeight });
     }
   });
 });
