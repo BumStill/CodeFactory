@@ -126,6 +126,7 @@ effective permission = user ceiling
 
 - 每个 archive/resource path 在写入前逐 component 校验；
 - 文件系统访问只能以已打开 root handle 逐级 no-follow/reparse-safe 解析；禁止“先 canonicalize parent、再按字符串路径访问”的 TOCTOU 模式；
+- 本地 source 授权只能由 backend native picker callback 签发短期一次性 opaque handle；renderer/model 提交的 `PathBuf` 或路径字符串永远不是授权。授权提交点是 callback 内 no-follow open 成功时，之后扫描与导入只复用该 directory handle。OpenClaw well-known roots 只有在用户点击专用导入动作后由 backend 打开。能主动控制同一用户文件系统并在 callback 的 path-return/open 窗口把真实目录替换成另一真实目录的本机攻击者不在 Phase 0 包威胁模型内，列为 Phase 1 native file-identity/bookmark hardening；静态 symlink/reparse/hardlink 与 open 后替换仍必须 fail-closed；
 - 拒绝 symlink、hardlink、reparse point、device/FIFO/socket；
 - 不允许 optional copy error 被忽略；
 - manifest 声明的 resource 必须存在并匹配 size/digest；
@@ -260,17 +261,18 @@ Given同一 package，When分别经 marketplace、URL、Git、本地/OpenClaw、
 | --- | --- | --- | --- |
 | P0-1 / SEC-001 | R2/R6/R17 | SKL-002、SKL-007(P1 remove) | L0/L1/L2；remove UX L3 |
 | P0-2 / SEC-002/003 | R2/R3/R7/R19 | SKL-001、SKL-002 | L0/L1/L2 |
-| P0-3 | R5/R11 | SKL-003、SKL-005 | SKL-003 L0-L3；SKL-005 L1-L4 |
-| P0-4 / SEC-004/005 | R8/R9/R10 | SKL-002/003/004 | L0/L1/L2/L3 |
+| P0-3 | R5/R11 | SKL-003、UI-013、SKL-005(P1) | SKL-003 L0-L2；UI-013 L0/L1/L3；SKL-005 L1-L4 |
+| P0-4 / SEC-004/005 | R8/R9/R10 | SKL-002；SKL-004/009(Phase 2) | Phase 0 权限 L0/L1/L2；Phase 2 runtime L0/L1/L2/L3 |
 | REL-001/002 | R3/R13 | SKL-001；SKL-006(P1) | P0 install L1/L2；P1 update L1-L4 |
 | REL-003/004/005 | R1/R2/R4/R10/R11 | SKL-001/004/005、UI-013 | 按规格 §6.2 RTM 与 §11 各场景层级 |
-| privacy/outcome | R12/R15/R18 | SKL-003、OBS-SKL-001(P1) | L0/L1/L3 |
+| privacy/outcome | R12/R15/R18 | SKL-009(Phase 2)、OBS-SKL-001(P1) | L0/L1/L3 |
 
 ## 12. 发布门槛
 
 - P0 path/permission/remote trust 风险全部修复并有攻击性测试；
-- `SKL-001..005`、`UI-013` 与组合 `E2E-009` 已进入机器 scenario registry；
-- P0 install/migration crash matrix 通过；update/rollback crash matrix 属 P1 `SKL-006`，不阻塞 P0 承诺；
+- 未实现编译期 builtin digest eligibility 时，builtin manifest 的历史 enabled bit 一律不得进入 runtime；
+- 当前交付阶段适用的 `SKL-002`、`SKL-003`、`UI-013` 已进入机器 scenario registry；`SKL-001`、`SKL-004..009` 与组合 `E2E-009` 必须在对应 Phase 实现开始前登记；
+- P0 containment install failure matrix 通过；migration/reconciler 属 Phase 1 `SKL-005`，update/rollback crash matrix 属 Phase 3 `SKL-006`，均不冒充当前 Phase 0 证据；
 - UI 与 Headless 主路径使用同一 package digest；
 - exact release artifact 验证上一正式版本迁移、启用、加载和禁用；package update/rollback/remove 分别在 P1 Scenario 验收；
 - `tool_policy`/slash commands 未执行时，从产品承诺中移除或明确 unsupported；

@@ -1,0 +1,10 @@
+{
+  "id": "url-install-probe",
+  "name": "URL Install Probe",
+  "description": "Synthetic fixture for UI-013: a single-file Skill manifest served over public HTTPS, used to verify the URL install path installs disabled and requires an explicit review before it can be used.",
+  "version": "1.0.0",
+  "author": "CodeFactory scenario fixtures",
+  "tags": ["fixture", "ui-013"],
+  "enabled": false,
+  "system_prompt": "SKILL_URL_INSTALL_PROBE_OK\n\nThis fixture exists only to prove the URL install path. When asked to identify yourself, answer exactly: SKILL_URL_INSTALL_PROBE_OK\n"
+}

@@ -4,9 +4,8 @@
 //!
 //! Created/updated skills land **disabled**: a skill is injected into the
 //! system prompt only once enabled, and enabling is the user's call (the Skills
-//! page) — so the agent can author capabilities without silently rewriting its
-//! own instructions. These tools therefore skip the permission prompt (see
-//! `decide_permission`); the gate is the enable step.
+//! page). Read operations use the normal read policy; create/update/delete/fetch
+//! use the normal mutation permission gate.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -49,8 +48,7 @@ pub async fn execute_create(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
         Ok(v) => v,
         Err(e) => return Ok(ToolOutput::err(format!("skill_create 参数错误: {e}"))),
     };
-    match crate::commands::skills::create_user_skill(&a.name, &a.description, &a.instructions, false)
-    {
+    match crate::commands::skills::create_user_skill(&a.name, &a.description, &a.instructions) {
         Ok(m) => Ok(ToolOutput::ok(format!(
             "已创建技能「{}」(id: {})，当前未启用。请到 Skills 页预览内容并启用后即生效。",
             m.name, m.id
@@ -104,9 +102,9 @@ pub async fn execute_update(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
             m.name,
             m.id,
             if m.enabled {
-                "已启用，改动即时生效。"
+                "已启用。"
             } else {
-                "当前未启用。"
+                "当前未启用；请重新检查内容后启用。"
             }
         ))),
         Err(e) => Ok(ToolOutput::err(e)),
@@ -206,13 +204,16 @@ pub async fn execute_search(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
     let results = crate::commands::skills::search_registry_skills(&a.query).await;
     if results.is_empty() {
         return Ok(ToolOutput::ok(format!(
-            "registry 里没找到和「{}」匹配的技能。你也可以给我一个 GitHub 仓库或 SKILL.md 链接,用 skill_fetch 直接装。",
+            "registry 里没找到和「{}」匹配的技能。你也可以提供一个公开 HTTPS manifest URL；本机目录需要在资源中心用原生目录选择器导入。",
             a.query
         )));
     }
     let mut out = String::from("找到这些可安装技能(用 skill_fetch <id> 安装):\n");
     for s in results.iter().take(15) {
-        out.push_str(&format!("- {} (id: {}) — {}\n", s.name, s.id, s.description));
+        out.push_str(&format!(
+            "- {} (id: {}) — {}\n",
+            s.name, s.id, s.description
+        ));
     }
     Ok(ToolOutput::ok(out))
 }
@@ -222,20 +223,40 @@ pub fn fetch_definition() -> ToolDefinition {
         r#type: "function".into(),
         function: FunctionDefinition {
             name: "skill_fetch".into(),
-            description: "Install a skill from a source: a registry id (from skill_search), a git \
-                repo URL (github/gitlab — shallow-cloned, finds every SKILL.md), a manifest JSON \
-                URL, or a local directory path. Installs DISABLED — tell the user to review and \
-                enable it on the Skills page."
+            description: "Install a skill from a source: a registry id (from skill_search) or a public \
+                HTTPS manifest JSON URL. Raw local paths and Git sources are unavailable during security \
+                containment; local directories must use the Resource Center picker. Installs DISABLED — \
+                the tool result includes an exact review action; tell the user to use that action before enabling."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "registry id, git URL, JSON URL, or a local directory path" }
+                    "source": { "type": "string", "description": "embedded registry id or public HTTPS manifest URL" }
                 },
                 "required": ["source"]
             }),
         },
     }
+}
+
+const SKILL_RECEIPT_PREFIX: &str = "CODEFACTORY_SKILL_RECEIPT_V1:";
+
+fn skill_install_receipt(manifests: &[crate::commands::skills::SkillManifest]) -> Value {
+    json!({
+        "schema_version": 1,
+        "kind": "skill_install",
+        "items": manifests.iter().map(|manifest| json!({
+            "id": manifest.id,
+            "name": manifest.name,
+            "version": manifest.version,
+            "installed": true,
+            "activation": "disabled",
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn skill_review_metadata(receipt: &Value) -> Value {
+    json!({ "codefactory_ui": receipt })
 }
 
 pub async fn execute_fetch(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
@@ -254,11 +275,51 @@ pub async fn execute_fetch(args: Value, _ctx: &ExecCtx) -> Result<ToolOutput> {
                 .map(|m| format!("「{}」(id: {})", m.name, m.id))
                 .collect::<Vec<_>>()
                 .join("、");
+            let receipt = skill_install_receipt(&ms);
             Ok(ToolOutput::ok(format!(
-                "已获取 {} 个技能(均未启用):{names}。请到 Skills 页预览内容并启用后即生效。",
-                ms.len()
-            )))
+                "已获取 {} 个技能(均未启用):{names}。请使用本结果的检查入口预览实际内容。当前 root turn 的 Skill 快照不会变化；显式启用成功后，只有之后启动的新 root turn 才可加载。\n{SKILL_RECEIPT_PREFIX}{receipt}",
+                ms.len(),
+            ))
+            .with_metadata(skill_review_metadata(&receipt)))
         }
         Err(e) => Ok(ToolOutput::err(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{skill_install_receipt, skill_review_metadata, SKILL_RECEIPT_PREFIX};
+    use crate::commands::skills::SkillManifest;
+
+    #[test]
+    fn skill_fetch_receipt_targets_exact_installed_ids_for_review() {
+        let manifests = [SkillManifest {
+            id: "continuity-helper".into(),
+            name: "Continuity Helper".into(),
+            description: "fixture".into(),
+            version: "1.0.0".into(),
+            author: "fixture".into(),
+            tags: Vec::new(),
+            enabled: false,
+            path: "/fixture/continuity-helper".into(),
+            source: "user".into(),
+            lifecycle_status: "ready".into(),
+        }];
+        let receipt = skill_install_receipt(&manifests);
+        let metadata = skill_review_metadata(&receipt);
+        assert_eq!(metadata["codefactory_ui"]["schema_version"], 1);
+        assert_eq!(metadata["codefactory_ui"]["kind"], "skill_install");
+        assert_eq!(
+            metadata["codefactory_ui"]["items"][0],
+            serde_json::json!({
+                "id": "continuity-helper",
+                "name": "Continuity Helper",
+                "version": "1.0.0",
+                "installed": true,
+                "activation": "disabled",
+            })
+        );
+        assert!(format!("{SKILL_RECEIPT_PREFIX}{receipt}")
+            .starts_with("CODEFACTORY_SKILL_RECEIPT_V1:{"));
     }
 }

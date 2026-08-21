@@ -542,6 +542,7 @@ pub fn completion_command_and_kind(
                 | "skill_create"
                 | "skill_update"
                 | "skill_delete"
+                | "skill_fetch"
         )
     {
         ToolKind::Mutation
@@ -685,7 +686,6 @@ fn is_review_safe_named_tool(tool_name: &str) -> bool {
             | "read_xlsx"
             | "skill_list"
             | "skill_search"
-            | "skill_fetch"
             | "bash"
             | "browser_session"
             // Offered so a planning turn can persist its own document. The
@@ -1557,6 +1557,24 @@ mod tests {
             let (_, kind) = completion_command_and_kind(name, &serde_json::json!({}));
             assert_eq!(kind, ToolKind::Mutation, "{name}");
         }
+    }
+
+    #[test]
+    fn skill_fetch_is_a_mutation_and_is_not_visible_to_review_only_turns() {
+        let (_, kind) = completion_command_and_kind("skill_fetch", &serde_json::json!({}));
+        assert_eq!(kind, ToolKind::Mutation);
+        assert!(!tool_visible_for_capability(
+            TurnCapability::ReviewOnly,
+            "skill_fetch"
+        ));
+        assert!(capability_denial(
+            TurnCapability::ReviewOnly,
+            "skill_fetch",
+            "skill_fetch",
+            &kind,
+            &serde_json::json!({"source": "python-expert"}),
+        )
+        .is_some());
     }
 
     #[test]

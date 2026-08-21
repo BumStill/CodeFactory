@@ -34,9 +34,9 @@ pub mod sse_buffer;
 pub mod subagent;
 mod tool_backend;
 pub(crate) mod tool_recovery;
-pub(crate) mod update_recovery;
 #[cfg(not(test))]
 pub(crate) mod unattended_smoke;
+pub(crate) mod update_recovery;
 pub mod user_context;
 pub mod verification;
 pub mod worktree;
@@ -2720,6 +2720,8 @@ pub(super) fn permission_policy_for_mode(mode: &str) -> PermissionPolicy {
         "read_file".to_string(),
         "glob".to_string(),
         "grep".to_string(),
+        "skill_list".to_string(),
+        "skill_search".to_string(),
         "read_pptx".to_string(),
         "read_xlsx".to_string(),
         "kb_search".to_string(),
@@ -2729,6 +2731,8 @@ pub(super) fn permission_policy_for_mode(mode: &str) -> PermissionPolicy {
         "read_file".to_string(),
         "glob".to_string(),
         "grep".to_string(),
+        "skill_list".to_string(),
+        "skill_search".to_string(),
         "read_pptx".to_string(),
         "write_file".to_string(),
         "edit_file".to_string(),
@@ -2851,7 +2855,29 @@ fn decide_permission_for_call(
         }
         return PermissionDecision::Ask;
     }
-    decide_permission(policy, tool_name, cmd)
+    let base = decide_permission(policy, tool_name, cmd);
+    if matches!(base, PermissionDecision::Deny(_)) {
+        return base;
+    }
+    if tool_name == "skill_fetch" {
+        let Some(source) = args.get("source").and_then(serde_json::Value::as_str) else {
+            return PermissionDecision::Ask;
+        };
+        let source = source.trim();
+        let looks_external = source.starts_with("http://")
+            || source.starts_with("https://")
+            || source.starts_with('.')
+            || source.contains('/')
+            || source.contains('\\')
+            || std::path::Path::new(source).is_absolute();
+        if looks_external {
+            // A model-supplied URL or local path crosses a distinct trust
+            // boundary. Even trusted mode must show the exact source before
+            // any fetch/read; embedded registry IDs keep the normal gate.
+            return PermissionDecision::Ask;
+        }
+    }
+    base
 }
 
 fn decide_permission(
@@ -2859,11 +2885,19 @@ fn decide_permission(
     tool_name: &str,
     cmd: Option<&str>,
 ) -> PermissionDecision {
-    // Skill-management tools create *disabled* skills — nothing is injected into
-    // the system prompt until the user enables it on the Skills page, which is
-    // the real gate. So they never need a per-call permission prompt.
-    if tool_name.starts_with("skill_") || tool_name == "update_plan" {
+    if tool_name == "update_plan" {
         return PermissionDecision::Allow;
+    }
+    const KNOWN_SKILL_TOOLS: &[&str] = &[
+        "skill_list",
+        "skill_search",
+        "skill_create",
+        "skill_update",
+        "skill_delete",
+        "skill_fetch",
+    ];
+    if tool_name.starts_with("skill_") && !KNOWN_SKILL_TOOLS.contains(&tool_name) {
+        return PermissionDecision::Deny(format!("unknown skill management tool '{tool_name}'"));
     }
     if tool_name == "bash" {
         let Some(command) = cmd else {
@@ -3989,6 +4023,72 @@ mod tests {
             decide_permission(&policy, "bash", Some("pnpm build")),
             PermissionDecision::Ask
         );
+    }
+
+    #[test]
+    fn skill_management_mutations_use_the_normal_permission_gate() {
+        let standard = permission_policy_for_mode("standard");
+
+        assert_eq!(
+            decide_permission(&standard, "skill_list", None),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            decide_permission(&standard, "skill_search", None),
+            PermissionDecision::Allow
+        );
+        for mutation in [
+            "skill_create",
+            "skill_update",
+            "skill_delete",
+            "skill_fetch",
+        ] {
+            assert_eq!(
+                decide_permission(&standard, mutation, None),
+                PermissionDecision::Ask,
+                "{mutation} must not bypass the configured mutation gate"
+            );
+        }
+
+        let denied = policy(&["*"], &[], &["skill_fetch"]);
+        assert_eq!(
+            decide_permission(&denied, "skill_fetch", None),
+            PermissionDecision::Deny("Denied by policy: matches 'skill_fetch'".into())
+        );
+        assert!(matches!(
+            decide_permission(&standard, "skill_future_mutation", None),
+            PermissionDecision::Deny(reason) if reason.contains("unknown skill management tool")
+        ));
+
+        let trusted = permission_policy_for_mode("trusted");
+        assert_eq!(
+            decide_permission_for_call(
+                &trusted,
+                "skill_fetch",
+                &serde_json::json!({"source":"python-expert"}),
+                None,
+                false,
+            ),
+            PermissionDecision::Allow,
+            "backend-owned embedded registry ids follow the normal trusted mutation gate"
+        );
+        for source in [
+            "https://example.com/skill.json",
+            "/tmp/local-skill",
+            "../local-skill",
+        ] {
+            assert_eq!(
+                decide_permission_for_call(
+                    &trusted,
+                    "skill_fetch",
+                    &serde_json::json!({"source":source}),
+                    None,
+                    false,
+                ),
+                PermissionDecision::Ask,
+                "external source {source} needs an exact-source confirmation even in trusted mode"
+            );
+        }
     }
 
     #[test]

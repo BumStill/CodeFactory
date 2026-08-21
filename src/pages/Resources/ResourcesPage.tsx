@@ -16,12 +16,15 @@ import type { KnowledgeLibrary } from "../../lib/tauri";
 
 interface ResourcesPageProps {
   onBack: () => void;
+  initialTab?: ResourceTab;
+  initialSkillId?: string | null;
+  onSkillEnabled?: (id: string) => void;
 }
 
 type ResourceTab = "knowledge" | "skills";
 
-export function ResourcesPage({ onBack }: ResourcesPageProps) {
-  const [tab, setTab] = useState<ResourceTab>("knowledge");
+export function ResourcesPage({ onBack, initialTab, initialSkillId, onSkillEnabled }: ResourcesPageProps) {
+  const [tab, setTab] = useState<ResourceTab>(initialTab ?? (initialSkillId ? "skills" : "knowledge"));
 
   return (
     <div className="flex h-full flex-col bg-surface-0">
@@ -41,7 +44,7 @@ export function ResourcesPage({ onBack }: ResourcesPageProps) {
             <p className="text-caption text-gray-600">统一管理 Agent 自动使用的知识库与技能</p>
           </div>
         </div>
-        <nav className="flex rounded border border-border bg-surface-2 p-0.5" aria-label="资源类型">
+        <nav className="flex rounded border border-border bg-surface-2 p-0.5" aria-label="资源类型" role="tablist">
           <TabButton active={tab === "knowledge"} onClick={() => setTab("knowledge")}>
             知识库
           </TabButton>
@@ -51,7 +54,11 @@ export function ResourcesPage({ onBack }: ResourcesPageProps) {
         </nav>
       </header>
       <main className="min-h-0 flex-1">
-        {tab === "knowledge" ? <KnowledgeLibrariesPanel /> : <SkillsPanel />}
+        {tab === "knowledge" ? (
+          <KnowledgeLibrariesPanel />
+        ) : (
+          <SkillsPanel initialSkillId={initialSkillId} onReviewEnabled={onSkillEnabled} />
+        )}
       </main>
     </div>
   );
@@ -69,6 +76,8 @@ function TabButton({
   return (
     <button
       onClick={onClick}
+      role="tab"
+      aria-selected={active}
       className={`rounded px-3 py-1.5 text-label transition-colors ${
         active ? "bg-accent text-white" : "text-gray-500 hover:bg-surface-3 hover:text-gray-200"
       }`}

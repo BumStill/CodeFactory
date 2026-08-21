@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-use crate::util::no_window::NoWindow;
+use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
+use super::skill_fs::SecureDir;
 use crate::AppState;
 
 // ── Data structures ───────────────────────────────────────────────────────────
@@ -19,6 +27,9 @@ pub struct SkillManifest {
     pub enabled: bool,
     pub path: String,
     pub source: String,
+    /// Transitional Phase 0 projection. `corrupt` remains visible in the
+    /// resource center but can never be enabled or loaded.
+    pub lifecycle_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +45,27 @@ pub struct SkillDetail {
     pub system_prompt: String,
     pub slash_commands: Vec<SlashCommand>,
     pub has_tool_policy: bool,
+    pub tool_policy: Option<String>,
+    /// Digest of the exact metadata and bytes rendered by this detail view.
+    /// Enabling uses it as a compare-and-swap precondition.
+    pub review_fingerprint: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillSourceSelection {
+    pub source_handle: String,
+    pub display_path: String,
+}
+
+struct SkillSourceGrant {
+    directory: SecureDir,
+    expires_at_ms: u128,
+}
+
+const SKILL_SOURCE_GRANT_TTL_MS: u128 = 10 * 60 * 1000;
+const MAX_SKILL_SOURCE_GRANTS: usize = 64;
+static SKILL_SOURCE_GRANTS: Lazy<Mutex<HashMap<String, SkillSourceGrant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 // ── Manifest file on disk (without path/source which we add ourselves) ────────
 
@@ -70,26 +101,197 @@ fn user_skills_dir() -> PathBuf {
         .join("skills")
 }
 
+const ACTIVATION_REVIEW_SUFFIX: &str = ".review-v1";
+
+fn activation_reviews_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("CodeFactory")
+        .join("skill-activation-reviews")
+}
+
+fn activation_review_filename(id: &str) -> Result<String, String> {
+    validate_skill_id(id)?;
+    Ok(format!("{id}{ACTIVATION_REVIEW_SUFFIX}"))
+}
+
+fn now_epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn register_skill_source(directory: SecureDir) -> Result<SkillSourceSelection, String> {
+    let display_path = directory.path().to_string_lossy().to_string();
+    let source_handle = format!("skill-source-{}", uuid::Uuid::new_v4());
+    let now = now_epoch_ms();
+    let mut grants = SKILL_SOURCE_GRANTS.lock().map_err(|_| {
+        "SKILL_SOURCE_HANDLE_STATE_FAILED: source grants are unavailable".to_string()
+    })?;
+    grants.retain(|_, grant| grant.expires_at_ms > now);
+    if grants.len() >= MAX_SKILL_SOURCE_GRANTS {
+        if let Some(oldest) = grants
+            .iter()
+            .min_by_key(|(_, grant)| grant.expires_at_ms)
+            .map(|(id, _)| id.clone())
+        {
+            grants.remove(&oldest);
+        }
+    }
+    grants.insert(
+        source_handle.clone(),
+        SkillSourceGrant {
+            directory,
+            expires_at_ms: now + SKILL_SOURCE_GRANT_TTL_MS,
+        },
+    );
+    Ok(SkillSourceSelection {
+        source_handle,
+        display_path,
+    })
+}
+
+fn consume_skill_source(source_handle: &str) -> Result<SecureDir, String> {
+    if !source_handle.starts_with("skill-source-") {
+        return Err(
+            "SKILL_SOURCE_HANDLE_REQUIRED: choose the directory in CodeFactory before importing"
+                .to_string(),
+        );
+    }
+    let now = now_epoch_ms();
+    let mut grants = SKILL_SOURCE_GRANTS.lock().map_err(|_| {
+        "SKILL_SOURCE_HANDLE_STATE_FAILED: source grants are unavailable".to_string()
+    })?;
+    let grant = grants.remove(source_handle).ok_or_else(|| {
+        "SKILL_SOURCE_HANDLE_INVALID: the directory selection expired or was already used"
+            .to_string()
+    })?;
+    if grant.expires_at_ms <= now {
+        return Err("SKILL_SOURCE_HANDLE_EXPIRED: choose the directory again".to_string());
+    }
+    Ok(grant.directory)
+}
+
+#[tauri::command]
+pub async fn select_skill_source_directory(
+    app: AppHandle,
+) -> Result<Option<SkillSourceSelection>, String> {
+    let directory =
+        tauri::async_runtime::spawn_blocking(move || -> Result<Option<SecureDir>, String> {
+            let picked = app
+                .dialog()
+                .file()
+                .set_title("选择 Skill 目录（含 SKILL.md 或 manifest.json，可整个仓库）")
+                .blocking_pick_folder();
+            let Some(path) = picked else {
+                return Ok(None);
+            };
+            let path = path
+                .into_path()
+                .map_err(|error| format!("SKILL_SOURCE_DIALOG_PATH_INVALID: {error}"))?;
+            SecureDir::open_existing(&path)
+                .map(Some)
+                .map_err(|error| format!("SKILL_SOURCE_NOT_DIRECTORY: {error}"))
+        })
+        .await
+        .map_err(|error| format!("SKILL_SOURCE_DIALOG_FAILED: {error}"))??;
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    register_skill_source(directory).map(Some)
+}
+
 // ── Scan a directory for skill manifests ──────────────────────────────────────
 
 fn scan_skill_dir(dir: &PathBuf, source: &str) -> Vec<SkillManifest> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(root) = SecureDir::open_existing(dir) else {
         return vec![];
     };
+    let reviews = if source == "user" {
+        SecureDir::open_existing(&activation_reviews_dir()).ok()
+    } else {
+        None
+    };
+    scan_skill_root_with_reviews(&root, source, reviews.as_ref())
+}
 
+fn scan_skill_root(root: &SecureDir, source: &str) -> Vec<SkillManifest> {
+    let reviews = if source == "user" {
+        SecureDir::open_existing(&activation_reviews_dir()).ok()
+    } else {
+        None
+    };
+    scan_skill_root_with_reviews(root, source, reviews.as_ref())
+}
+
+fn scan_skill_root_with_reviews(
+    root: &SecureDir,
+    source: &str,
+    reviews: Option<&SecureDir>,
+) -> Vec<SkillManifest> {
+    let Ok(entries) = root.entry_names() else {
+        return vec![];
+    };
     let mut skills = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let manifest_path = path.join("manifest.json");
-        let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+    for entry_name in entries {
+        let path = root.path().join(&entry_name);
+        let Ok(skill_dir) = root.open_child_dir(&entry_name) else {
             continue;
         };
-        let Ok(mf) = serde_json::from_str::<ManifestFile>(&raw) else {
-            continue;
+        let folder_id = entry_name.to_str();
+        let projected_id = folder_id
+            .filter(|id| is_safe_skill_id(id))
+            .map(str::to_string)
+            .unwrap_or_else(|| corrupt_projection_id(&path));
+        let manifest_result = skill_dir
+            .read_string_required("manifest.json")
+            .map_err(|error| format!("SKILL_MANIFEST_UNREADABLE: {error}"))
+            .and_then(|raw| {
+                serde_json::from_str::<ManifestFile>(&raw)
+                    .map_err(|error| format!("SKILL_MANIFEST_INVALID: {error}"))
+            });
+        let mf = match manifest_result {
+            Ok(mf) if is_safe_skill_id(&mf.id) && folder_id == Some(mf.id.as_str()) => mf,
+            Ok(mf) => {
+                skills.push(corrupt_skill_projection(
+                    projected_id,
+                    &path,
+                    source,
+                    format!(
+                        "SKILL_MANIFEST_ID_MISMATCH: folder={:?}, manifest={:?}",
+                        folder_id, mf.id
+                    ),
+                ));
+                continue;
+            }
+            Err(error) => {
+                skills.push(corrupt_skill_projection(projected_id, &path, source, error));
+                continue;
+            }
         };
+        // Legacy user manifests predate the explicit review gate. Only the
+        // package-external authority can approve the exact reviewed bytes; a
+        // marker shipped inside an untrusted package has no effect.
+        let expected_review = activation_review_fingerprint_in_dir(
+            &skill_dir,
+            &mf.id,
+            &mf.name,
+            &mf.description,
+            &mf.version,
+            &mf.author,
+            &mf.tags,
+        );
+        let enabled = source == "user"
+            && mf.enabled
+            && expected_review.is_ok_and(|expected| {
+                reviews
+                    .and_then(|reviews| {
+                        let filename = activation_review_filename(&mf.id).ok()?;
+                        reviews.read_string_optional(&filename).ok().flatten()
+                    })
+                    .is_some_and(|actual| actual == expected)
+            });
         skills.push(SkillManifest {
             id: mf.id,
             name: mf.name,
@@ -97,17 +299,133 @@ fn scan_skill_dir(dir: &PathBuf, source: &str) -> Vec<SkillManifest> {
             version: mf.version,
             author: mf.author,
             tags: mf.tags,
-            enabled: mf.enabled,
+            enabled,
             path: path.to_string_lossy().to_string(),
             source: source.to_string(),
+            lifecycle_status: "ready".to_string(),
         });
     }
     skills
 }
 
+fn corrupt_projection_id(path: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("corrupt-{hash:016x}")
+}
+
+fn corrupt_skill_projection(id: String, path: &Path, source: &str, error: String) -> SkillManifest {
+    let folder = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| id.clone());
+    SkillManifest {
+        id,
+        name: folder,
+        description: error,
+        version: "unknown".to_string(),
+        author: "unknown".to_string(),
+        tags: vec![],
+        enabled: false,
+        path: path.to_string_lossy().to_string(),
+        source: source.to_string(),
+        lifecycle_status: "corrupt".to_string(),
+    }
+}
+
+#[cfg(test)]
+fn activation_review_fingerprint(
+    skill_dir: &Path,
+    id: &str,
+    name: &str,
+    description: &str,
+    version: &str,
+    author: &str,
+    tags: &[String],
+) -> Result<String, String> {
+    let skill_dir = SecureDir::open_existing(skill_dir)?;
+    activation_review_snapshot_in_dir(&skill_dir, id, name, description, version, author, tags)
+        .map(|snapshot| snapshot.fingerprint)
+}
+
+fn activation_review_fingerprint_in_dir(
+    skill_dir: &SecureDir,
+    id: &str,
+    name: &str,
+    description: &str,
+    version: &str,
+    author: &str,
+    tags: &[String],
+) -> Result<String, String> {
+    activation_review_snapshot_in_dir(skill_dir, id, name, description, version, author, tags)
+        .map(|snapshot| snapshot.fingerprint)
+}
+
+struct ActivationReviewSnapshot {
+    fingerprint: String,
+    system_prompt: Vec<u8>,
+    slash_commands: Vec<u8>,
+    tool_policy: Option<Vec<u8>>,
+}
+
+fn activation_review_snapshot_in_dir(
+    skill_dir: &SecureDir,
+    id: &str,
+    name: &str,
+    description: &str,
+    version: &str,
+    author: &str,
+    tags: &[String],
+) -> Result<ActivationReviewSnapshot, String> {
+    let mut hasher = Sha256::new();
+    let mut system_prompt = Vec::new();
+    let mut slash_commands = Vec::new();
+    let mut tool_policy = None;
+    hasher.update(b"codefactory-skill-review-v1\0");
+    for field in [id, name, description, version, author] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hasher.update((tags.len() as u64).to_le_bytes());
+    for tag in tags {
+        hasher.update((tag.len() as u64).to_le_bytes());
+        hasher.update(tag.as_bytes());
+    }
+    for filename in [
+        "system_prompt.md",
+        "slash_commands.json",
+        "tool_policy.json",
+    ] {
+        let bytes = skill_dir
+            .read_optional(filename)
+            .map_err(|error| format!("SKILL_REVIEW_READ_FAILED: {filename}: {error}"))?
+            .unwrap_or_default();
+        if filename == "system_prompt.md" {
+            system_prompt = bytes.clone();
+        } else if filename == "slash_commands.json" {
+            slash_commands = bytes.clone();
+        } else if filename == "tool_policy.json" && !bytes.is_empty() {
+            tool_policy = Some(bytes.clone());
+        }
+        hasher.update((filename.len() as u64).to_le_bytes());
+        hasher.update(filename.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(ActivationReviewSnapshot {
+        fingerprint: format!("sha256:{:x}", hasher.finalize()),
+        system_prompt,
+        slash_commands,
+        tool_policy,
+    })
+}
+
 // ── Write manifest back to disk ───────────────────────────────────────────────
 
-fn write_manifest(skill_path: &str, manifest: &SkillManifest) -> Result<(), String> {
+fn write_manifest_to_dir(skill_dir: &SecureDir, manifest: &SkillManifest) -> Result<(), String> {
     let mf = serde_json::json!({
         "id": manifest.id,
         "name": manifest.name,
@@ -117,32 +435,49 @@ fn write_manifest(skill_path: &str, manifest: &SkillManifest) -> Result<(), Stri
         "tags": manifest.tags,
         "enabled": manifest.enabled,
     });
-    let path = PathBuf::from(skill_path).join("manifest.json");
-    std::fs::write(path, serde_json::to_string_pretty(&mf).unwrap_or_default())
-        .map_err(|e| e.to_string())
+    skill_dir.write_atomic(
+        "manifest.json",
+        serde_json::to_string_pretty(&mf)
+            .unwrap_or_default()
+            .as_bytes(),
+    )
 }
 
 /// Copy a builtin skill directory to the user dir so we can mutate it.
 fn copy_to_user_dir(skill_path: &str) -> Result<String, String> {
-    let src = PathBuf::from(skill_path);
-    let dest = user_skills_dir().join(src.file_name().unwrap_or_default());
-    if dest.exists() {
-        // Already copied
-        return Ok(dest.to_string_lossy().to_string());
+    let src_path = PathBuf::from(skill_path);
+    let id = src_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "SKILL_ID_INVALID: builtin skill path has no portable id".to_string())?;
+    if !is_safe_skill_id(id) {
+        return Err(format!(
+            "SKILL_ID_INVALID: builtin id is not portable: {id:?}"
+        ));
     }
-    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-    for entry in std::fs::read_dir(&src).map_err(|e| e.to_string())?.flatten() {
-        let dest_file = dest.join(entry.file_name());
-        std::fs::copy(entry.path(), dest_file).map_err(|e| e.to_string())?;
+    let root = SecureDir::open_or_create(&user_skills_dir())?;
+    if let Ok(existing) = root.open_child_dir(std::ffi::OsStr::new(id)) {
+        return Ok(existing.path().to_string_lossy().to_string());
     }
-    Ok(dest.to_string_lossy().to_string())
+    let dest = root.create_child_dir(id)?;
+    let src = SecureDir::open_existing(&src_path)?;
+    for filename in src.entry_names()? {
+        let filename = filename
+            .into_string()
+            .map_err(|_| "SKILL_PATH_UNSAFE: non-UTF-8 package filename".to_string())?;
+        if let Some(bytes) = src.read_optional(&filename)? {
+            dest.write_atomic(&filename, &bytes)?;
+        }
+    }
+    Ok(dest.path().to_string_lossy().to_string())
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn list_skills(app: AppHandle) -> Result<Vec<SkillManifest>, String> {
-    let mut map: std::collections::HashMap<String, SkillManifest> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, SkillManifest> =
+        std::collections::HashMap::new();
 
     // 1. Builtin skills
     if let Some(dir) = builtin_skills_dir(&app) {
@@ -170,50 +505,133 @@ pub async fn get_skill(id: String, app: AppHandle) -> Result<SkillDetail, String
         .find(|s| s.id == id)
         .ok_or_else(|| format!("Skill '{id}' not found"))?;
 
-    let skill_path = PathBuf::from(&manifest.path);
+    if manifest.lifecycle_status != "ready" {
+        return Ok(SkillDetail {
+            manifest,
+            system_prompt: String::new(),
+            slash_commands: Vec::new(),
+            has_tool_policy: false,
+            tool_policy: None,
+            review_fingerprint: None,
+        });
+    }
 
-    let system_prompt = std::fs::read_to_string(skill_path.join("system_prompt.md"))
-        .unwrap_or_default();
-
-    let slash_commands: Vec<SlashCommand> = std::fs::read_to_string(skill_path.join("slash_commands.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-
-    let has_tool_policy = skill_path.join("tool_policy.json").exists();
+    let skill_dir = if manifest.source == "user" {
+        let folder = Path::new(&manifest.path)
+            .file_name()
+            .ok_or_else(|| "SKILL_PATH_UNSAFE: installed package has no folder".to_string())?;
+        SecureDir::open_existing(&user_skills_dir())?.open_child_dir(folder)?
+    } else {
+        SecureDir::open_existing(Path::new(&manifest.path))?
+    };
+    let snapshot = activation_review_snapshot_in_dir(
+        &skill_dir,
+        &manifest.id,
+        &manifest.name,
+        &manifest.description,
+        &manifest.version,
+        &manifest.author,
+        &manifest.tags,
+    )?;
+    let system_prompt = String::from_utf8(snapshot.system_prompt)
+        .map_err(|error| format!("SKILL_SYSTEM_PROMPT_INVALID: {error}"))?;
+    let slash_commands = if snapshot.slash_commands.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_slice::<Vec<SlashCommand>>(&snapshot.slash_commands)
+            .map_err(|error| format!("SKILL_SLASH_COMMANDS_INVALID: {error}"))?
+    };
+    let tool_policy = snapshot
+        .tool_policy
+        .map(|bytes| {
+            String::from_utf8(bytes).map_err(|error| format!("SKILL_TOOL_POLICY_INVALID: {error}"))
+        })
+        .transpose()?;
+    let has_tool_policy = tool_policy.is_some();
 
     Ok(SkillDetail {
         manifest,
         system_prompt,
         slash_commands,
         has_tool_policy,
+        tool_policy,
+        review_fingerprint: Some(snapshot.fingerprint),
     })
 }
 
 #[tauri::command]
-pub async fn enable_skill(id: String, app: AppHandle) -> Result<(), String> {
+pub async fn enable_skill(
+    id: String,
+    expected_review_fingerprint: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    validate_skill_id(&id)?;
     let skills = list_skills(app.clone()).await?;
     let mut manifest = skills
         .into_iter()
         .find(|s| s.id == id)
         .ok_or_else(|| format!("Skill '{id}' not found"))?;
+    if manifest.lifecycle_status != "ready" {
+        return Err(format!(
+            "SKILL_CORRUPT_NOT_ACTIVATABLE: '{}' must be repaired or removed before enabling",
+            manifest.id
+        ));
+    }
 
     // If builtin, copy to user dir first
-    let skill_path = if manifest.source == "builtin" {
+    let skill_dir_handle = if manifest.source == "builtin" {
         let new_path = copy_to_user_dir(&manifest.path)?;
-        manifest.path = new_path.clone();
+        manifest.path = new_path;
         manifest.source = "user".to_string();
-        new_path
+        SecureDir::open_existing(&user_skills_dir())?
+            .open_child_dir(std::ffi::OsStr::new(&manifest.id))?
     } else {
-        manifest.path.clone()
+        SecureDir::open_existing(&user_skills_dir())?
+            .open_child_dir(std::ffi::OsStr::new(&manifest.id))?
     };
 
+    enable_user_skill_in(
+        &skill_dir_handle,
+        &activation_reviews_dir(),
+        &mut manifest,
+        &expected_review_fingerprint,
+    )
+}
+
+fn enable_user_skill_in(
+    skill_dir: &SecureDir,
+    review_root: &Path,
+    manifest: &mut SkillManifest,
+    expected_review_fingerprint: &str,
+) -> Result<(), String> {
+    let current_review_fingerprint = activation_review_fingerprint_in_dir(
+        skill_dir,
+        &manifest.id,
+        &manifest.name,
+        &manifest.description,
+        &manifest.version,
+        &manifest.author,
+        &manifest.tags,
+    )?;
+    if current_review_fingerprint != expected_review_fingerprint {
+        return Err(
+            "SKILL_REVIEW_CONTENT_CHANGED: Skill content changed after it was displayed; review the current version before enabling"
+                .to_string(),
+        );
+    }
+    let reviews = SecureDir::open_or_create(review_root)
+        .map_err(|error| format!("SKILL_ACTIVATION_REVIEW_STORE_FAILED: {error}"))?;
+    let review_filename = activation_review_filename(&manifest.id)?;
+    reviews
+        .write_atomic(&review_filename, current_review_fingerprint.as_bytes())
+        .map_err(|error| format!("SKILL_ACTIVATION_REVIEW_STORE_FAILED: {error}"))?;
     manifest.enabled = true;
-    write_manifest(&skill_path, &manifest)
+    write_manifest_to_dir(skill_dir, manifest)
 }
 
 #[tauri::command]
 pub async fn disable_skill(id: String, app: AppHandle) -> Result<(), String> {
+    validate_skill_id(&id)?;
     let skills = list_skills(app.clone()).await?;
     let mut manifest = skills
         .into_iter()
@@ -221,74 +639,305 @@ pub async fn disable_skill(id: String, app: AppHandle) -> Result<(), String> {
         .ok_or_else(|| format!("Skill '{id}' not found"))?;
 
     // If builtin, copy to user dir first
-    let skill_path = if manifest.source == "builtin" {
+    let skill_dir_handle = if manifest.source == "builtin" {
         let new_path = copy_to_user_dir(&manifest.path)?;
-        manifest.path = new_path.clone();
+        manifest.path = new_path;
         manifest.source = "user".to_string();
-        new_path
+        SecureDir::open_existing(&user_skills_dir())?
+            .open_child_dir(std::ffi::OsStr::new(&manifest.id))?
     } else {
-        manifest.path.clone()
+        SecureDir::open_existing(&user_skills_dir())?
+            .open_child_dir(std::ffi::OsStr::new(&manifest.id))?
     };
 
+    disable_user_skill_in(&skill_dir_handle, &activation_reviews_dir(), &mut manifest)
+}
+
+fn disable_user_skill_in(
+    skill_dir: &SecureDir,
+    review_root: &Path,
+    manifest: &mut SkillManifest,
+) -> Result<(), String> {
+    // Revoke approval before persisting the disabled bit. A crash or an
+    // out-of-band manifest edit can then only leave the Skill ineligible.
+    remove_activation_review(review_root, &manifest.id)?;
     manifest.enabled = false;
-    write_manifest(&skill_path, &manifest)
+    write_manifest_to_dir(skill_dir, manifest)
 }
 
 #[tauri::command]
 pub async fn install_skill_from_url(url: String, _app: AppHandle) -> Result<SkillManifest, String> {
-    install_user_skill_from_url(&url, false).await
+    install_user_skill_from_url(&url).await
 }
 
 const MAX_REMOTE_MANIFEST_BYTES: usize = 1024 * 1024; // 1 MiB — a system prompt has no business being bigger.
+const MAX_SKILL_ID_BYTES: usize = 64;
+const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A skill id becomes a directory name under the user skills dir — reject
 /// anything that isn't a plain path component (blocks path traversal via a
 /// malicious/compromised remote manifest, e.g. `id: "../../.."`).
 fn is_safe_skill_id(id: &str) -> bool {
-    !id.is_empty()
-        && id != "."
-        && id != ".."
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    if id.is_empty()
+        || id.len() > MAX_SKILL_ID_BYTES
+        || !id.as_bytes()[0].is_ascii_lowercase() && !id.as_bytes()[0].is_ascii_digit()
+        || id.ends_with(['.', ' '])
+        || id.contains("..")
+        || !id.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.'
+        })
+    {
+        return false;
+    }
+
+    let basename = id.split('.').next().unwrap_or_default();
+    !matches!(
+        basename,
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
+}
+
+fn validate_skill_id(id: &str) -> Result<(), String> {
+    if !is_safe_skill_id(id) {
+        return Err(format!(
+            "SKILL_ID_INVALID: skill id is not portable: {id:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn skill_path_under(root: &Path, id: &str) -> Result<PathBuf, String> {
+    validate_skill_id(id)?;
+    Ok(root.join(id))
+}
+
+#[cfg(test)]
+fn prepare_skill_dir(root: &Path, id: &str) -> Result<PathBuf, String> {
+    prepare_skill_dir_handle(root, id).map(|dir| dir.path().to_path_buf())
+}
+
+fn prepare_skill_dir_handle(root: &Path, id: &str) -> Result<SecureDir, String> {
+    validate_skill_id(id)?;
+    SecureDir::open_or_create(root)?.create_child_dir(id)
+}
+
+/// Judge a literal IP written straight into a source URL. Every special-purpose
+/// range is refused: a user or agent naming one of these by address has no
+/// legitimate skill source to reach there.
+fn is_forbidden_remote_ip(ip: IpAddr) -> bool {
+    forbidden_ip(ip, FakeIpRanges::Blocked)
+}
+
+/// Judge an address a *hostname* resolved to, which is a weaker signal than a
+/// literal IP: on a machine running a fake-IP proxy (Clash TUN and friends,
+/// whose default range is 198.18.0.1/16) every DNS answer is a synthetic
+/// address that the proxy maps back to the real host by SNI. Such an address is
+/// a local redirection token, not a destination — refusing it prevents no SSRF
+/// and instead makes every URL install fail on a very common setup. Ranges that
+/// do name a real internal target — loopback, RFC1918, link-local including
+/// cloud instance metadata — stay blocked either way.
+fn is_forbidden_resolved_ip(ip: IpAddr) -> bool {
+    forbidden_ip(ip, FakeIpRanges::Tolerated)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FakeIpRanges {
+    Blocked,
+    Tolerated,
+}
+
+fn forbidden_ip(ip: IpAddr, fake_ip: FakeIpRanges) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _d] = ip.octets();
+            // Benchmarking (198.18.0.0/15) and CGNAT (100.64.0.0/10): the two
+            // ranges fake-IP proxies allocate from.
+            if (a == 198 && (b == 18 || b == 19)) || (a == 100 && (64..=127).contains(&b)) {
+                return fake_ip == FakeIpRanges::Blocked;
+            }
+            a == 0
+                || a == 10
+                || a == 127
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 192 && b == 168)
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return forbidden_ip(IpAddr::V4(mapped), fake_ip);
+            }
+            // Phase 0 cannot yet prove every IPv6 special-purpose allocation
+            // is globally reachable. Fail closed until the resolver uses a
+            // maintained global-address classifier.
+            let _ = ip;
+            true
+        }
+    }
+}
+
+fn validate_explicit_skill_url(raw: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("SKILL_SOURCE_URL_INVALID: {e}"))?;
+    if url.scheme() != "https" {
+        return Err("SKILL_SOURCE_HTTPS_REQUIRED: only public HTTPS sources are supported".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("SKILL_SOURCE_URL_INVALID: credentials are not allowed in source URLs".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(
+            "SKILL_SOURCE_URL_SENSITIVE_COMPONENT_BLOCKED: query and fragment are not supported"
+                .into(),
+        );
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "SKILL_SOURCE_URL_INVALID: source URL has no host".to_string())?;
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return Err("SKILL_SOURCE_PRIVATE_NETWORK: local hosts are blocked".into());
+    }
+    let literal_ip = match url.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        _ => None,
+    };
+    if literal_ip.is_some_and(is_forbidden_remote_ip) {
+        return Err("SKILL_SOURCE_PRIVATE_NETWORK: private network targets are blocked".into());
+    }
+    Ok(url)
+}
+
+async fn resolve_public_source(url: &reqwest::Url) -> Result<(String, SocketAddr), String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "SKILL_SOURCE_URL_INVALID: source URL has no host".to_string())?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let lookup_host = host.clone();
+    let resolved = tokio::time::timeout(
+        REMOTE_CONNECT_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            (lookup_host.as_str(), port)
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<_>>())
+        }),
+    )
+    .await
+    .map_err(|_| "SKILL_SOURCE_TIMEOUT: DNS resolution timed out".to_string())?
+    .map_err(|e| format!("SKILL_SOURCE_DNS_FAILED: {e}"))?
+    .map_err(|e| format!("SKILL_SOURCE_DNS_FAILED: {e}"))?;
+    let address = resolved
+        .iter()
+        .copied()
+        .find(|address| !is_forbidden_resolved_ip(address.ip()))
+        .ok_or_else(|| {
+            let seen = resolved
+                .iter()
+                .map(|address| address.ip().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "SKILL_SOURCE_PRIVATE_NETWORK: {host} resolved only to blocked addresses ({seen}); \
+                 if a VPN or proxy is active, check that it is not answering DNS with a private address"
+            )
+        })?;
+    Ok((host, address))
+}
+
+async fn fetch_bounded_public_https(raw_url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let url = validate_explicit_skill_url(raw_url)?;
+    let (host, address) = resolve_public_source(&url).await?;
+    let client = reqwest::Client::builder()
+        // A system proxy would bypass the DNS-pinned socket address above.
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .timeout(REMOTE_REQUEST_TIMEOUT)
+        .resolve(&host, address)
+        .build()
+        .map_err(|e| format!("SKILL_SOURCE_CLIENT_FAILED: {e}"))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("SKILL_SOURCE_FETCH_FAILED: {e}"))?;
+    if response.status().is_redirection() {
+        return Err("SKILL_SOURCE_REDIRECT_BLOCKED: redirects are not followed".into());
+    }
+    if !response.status().is_success() {
+        return Err(format!("SKILL_SOURCE_HTTP_STATUS: {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > max_bytes as u64)
+    {
+        return Err(format!(
+            "SKILL_SOURCE_TOO_LARGE: response exceeds {max_bytes} bytes"
+        ));
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("SKILL_SOURCE_READ_FAILED: {e}"))?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!(
+                "SKILL_SOURCE_TOO_LARGE: response exceeds {max_bytes} bytes"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Fetch a JSON skill manifest from `url` and write it to the user skills dir.
-/// `enabled` controls whether it activates immediately. App-independent.
-pub async fn install_user_skill_from_url(url: &str, enabled: bool) -> Result<SkillManifest, String> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("只支持 http(s) URL".to_string());
-    }
-
-    let response = reqwest::get(url)
-        .await
-        .map_err(|e| format!("拉取失败: {e}"))?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("读取响应失败: {e}"))?;
-    if bytes.len() > MAX_REMOTE_MANIFEST_BYTES {
-        return Err(format!(
-            "manifest 过大（{} 字节，上限 {} 字节）",
-            bytes.len(),
-            MAX_REMOTE_MANIFEST_BYTES
-        ));
-    }
-    let raw = String::from_utf8(bytes.to_vec()).map_err(|e| format!("响应不是合法 UTF-8: {e}"))?;
+/// External installs always land disabled for explicit review. App-independent.
+pub async fn install_user_skill_from_url(url: &str) -> Result<SkillManifest, String> {
+    let bytes = fetch_bounded_public_https(url, MAX_REMOTE_MANIFEST_BYTES).await?;
+    let raw = String::from_utf8(bytes).map_err(|e| format!("SKILL_SOURCE_UTF8_INVALID: {e}"))?;
 
     let mf: ManifestFile =
-        serde_json::from_str(&raw).map_err(|e| format!("manifest JSON 无效: {e}"))?;
+        serde_json::from_str(&raw).map_err(|e| format!("SKILL_MANIFEST_INVALID: {e}"))?;
     if !is_safe_skill_id(&mf.id) {
-        return Err(format!("manifest id 不合法: {:?}", mf.id));
+        return Err(format!(
+            "SKILL_ID_INVALID: manifest id is not portable: {:?}",
+            mf.id
+        ));
     }
 
-    let skill_dir = user_skills_dir().join(&mf.id);
-    std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
-    std::fs::write(
-        skill_dir.join("system_prompt.md"),
-        mf.system_prompt.clone().unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
+    let skill_dir = prepare_skill_dir_handle(&user_skills_dir(), &mf.id)?;
+    skill_dir.write_atomic(
+        "system_prompt.md",
+        mf.system_prompt.clone().unwrap_or_default().as_bytes(),
+    )?;
 
     let manifest = SkillManifest {
         id: mf.id,
@@ -297,11 +946,12 @@ pub async fn install_user_skill_from_url(url: &str, enabled: bool) -> Result<Ski
         version: mf.version,
         author: mf.author,
         tags: mf.tags,
-        enabled,
-        path: skill_dir.to_string_lossy().to_string(),
+        enabled: false,
+        path: skill_dir.path().to_string_lossy().to_string(),
         source: "user".to_string(),
+        lifecycle_status: "ready".to_string(),
     };
-    write_manifest(&manifest.path, &manifest)?;
+    write_manifest_to_dir(&skill_dir, &manifest)?;
     Ok(manifest)
 }
 
@@ -361,7 +1011,13 @@ fn parse_skill_md(content: &str) -> ParsedSkillMd {
             }
         }
     }
-    ParsedSkillMd { id, name, description, tags, body }
+    ParsedSkillMd {
+        id,
+        name,
+        description,
+        tags,
+        body,
+    }
 }
 
 fn slugify(s: &str) -> String {
@@ -384,8 +1040,8 @@ fn slugify(s: &str) -> String {
     }
 }
 
-fn is_skill_dir(d: &Path) -> bool {
-    d.join("SKILL.md").exists() || d.join("manifest.json").exists()
+fn is_skill_dir(d: &SecureDir) -> bool {
+    d.has_regular_file("SKILL.md") || d.has_regular_file("manifest.json")
 }
 
 const MAX_SKILL_PAYLOAD_FILES: usize = 2_048;
@@ -397,106 +1053,94 @@ const MAX_SKILL_PAYLOAD_ENTRIES: usize = 4_096;
 /// Copy the static bundle a Skill was authored with. Installation never
 /// executes payload files and never follows links; `.git` is source-control
 /// state, not part of the runnable Skill.
-fn copy_skill_payload(src: &Path, dest: &Path) -> Result<(), String> {
-    if src.canonicalize().ok().as_ref() == dest.canonicalize().ok().as_ref() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dest).map_err(|error| error.to_string())?;
-    let mut file_count = 0_usize;
-    let mut total_bytes = 0_u64;
-    let mut entry_count = 0_usize;
-    let walker = walkdir::WalkDir::new(src).follow_links(false);
-    for entry in walker
-        .into_iter()
-        .filter_entry(|entry| entry.file_name() != ".git")
-    {
-        let entry = entry.map_err(|error| format!("遍历 Skill payload 失败: {error}"))?;
-        entry_count = entry_count.saturating_add(1);
-        if entry_count > MAX_SKILL_PAYLOAD_ENTRIES || entry.depth() > MAX_SKILL_PAYLOAD_DEPTH {
+#[derive(Default)]
+struct SkillPayloadBudget {
+    files: usize,
+    bytes: u64,
+    entries: usize,
+}
+
+fn visit_skill_payload(
+    src: &SecureDir,
+    dest: Option<&SecureDir>,
+    depth: usize,
+    budget: &mut SkillPayloadBudget,
+) -> Result<(), String> {
+    for name in src.entry_names()? {
+        if name == ".git" || (depth == 0 && name == "manifest.json") {
+            continue;
+        }
+        budget.entries = budget.entries.saturating_add(1);
+        if budget.entries > MAX_SKILL_PAYLOAD_ENTRIES || depth >= MAX_SKILL_PAYLOAD_DEPTH {
             return Err("Skill payload 超过安全目录深度或条目数上限".into());
         }
-        let relative = entry
-            .path()
-            .strip_prefix(src)
-            .map_err(|error| format!("Skill payload 路径越界: {error}"))?;
-        if relative.as_os_str().is_empty() {
+        if let Ok(child) = src.open_child_dir(&name) {
+            let child_name = name
+                .to_str()
+                .ok_or_else(|| "SKILL_PATH_UNSAFE: non-UTF-8 payload directory".to_string())?;
+            let destination = dest
+                .map(|parent| parent.create_child_dir(child_name))
+                .transpose()?;
+            visit_skill_payload(&child, destination.as_ref(), depth + 1, budget)?;
             continue;
         }
-        let file_type = entry.file_type();
-        if file_type.is_symlink() {
-            return Err(format!(
-                "Skill payload 含不支持的符号链接: {}",
-                relative.display()
-            ));
-        }
-        let target = dest.join(relative);
-        if file_type.is_dir() {
-            std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
-            continue;
-        }
-        if !file_type.is_file() {
-            return Err(format!(
-                "Skill payload 含不支持的特殊文件: {}",
-                relative.display()
-            ));
-        }
-        file_count = file_count.saturating_add(1);
-        let bytes = entry.metadata().map_err(|error| error.to_string())?.len();
-        total_bytes = total_bytes.saturating_add(bytes);
-        if file_count > MAX_SKILL_PAYLOAD_FILES
-            || bytes > MAX_SKILL_PAYLOAD_FILE_BYTES
-            || total_bytes > MAX_SKILL_PAYLOAD_BYTES
+        let filename = name
+            .into_string()
+            .map_err(|_| "SKILL_PATH_UNSAFE: non-UTF-8 payload filename".to_string())?;
+        let bytes = src
+            .read_optional(&filename)?
+            .ok_or_else(|| format!("SKILL_PATH_UNSAFE: unsupported payload entry {filename:?}"))?;
+        budget.files = budget.files.saturating_add(1);
+        budget.bytes = budget.bytes.saturating_add(bytes.len() as u64);
+        if budget.files > MAX_SKILL_PAYLOAD_FILES
+            || bytes.len() as u64 > MAX_SKILL_PAYLOAD_FILE_BYTES
+            || budget.bytes > MAX_SKILL_PAYLOAD_BYTES
         {
             return Err("Skill payload 超过安全复制上限".into());
         }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        if let Some(destination) = dest {
+            destination.write_atomic(&filename, &bytes)?;
         }
-        std::fs::copy(entry.path(), &target).map_err(|error| {
-            format!(
-                "复制 Skill payload {} 失败: {error}",
-                relative.display()
-            )
-        })?;
     }
     Ok(())
+}
+
+fn validate_skill_payload(src: &SecureDir) -> Result<(), String> {
+    visit_skill_payload(src, None, 0, &mut SkillPayloadBudget::default())
+}
+
+fn copy_skill_payload(src: &SecureDir, dest: &SecureDir) -> Result<(), String> {
+    visit_skill_payload(src, Some(dest), 0, &mut SkillPayloadBudget::default())
 }
 
 /// Walk `dir` (bounded depth) collecting every skill directory — one holding a
 /// SKILL.md or manifest.json. A skill dir is a leaf (we don't descend into it),
 /// so a single skill, a `skills/<name>/` collection, or a whole repo all work.
 /// Hidden dirs (.git, …) are skipped.
-fn collect_skill_dirs(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
-    if is_skill_dir(dir) {
-        out.push(dir.to_path_buf());
+fn collect_skill_dirs(dir: SecureDir, depth: u8, out: &mut Vec<SecureDir>) {
+    if is_skill_dir(&dir) {
+        out.push(dir);
         return;
     }
     if depth == 0 {
         return;
     }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            let hidden = p
-                .file_name()
-                .map(|n| n.to_string_lossy().starts_with('.'))
-                .unwrap_or(false);
-            if p.is_dir() && !hidden {
-                collect_skill_dirs(&p, depth - 1, out);
+    if let Ok(entries) = dir.entry_names() {
+        for name in entries {
+            let hidden = name.to_string_lossy().starts_with('.');
+            if !hidden {
+                if let Ok(child) = dir.open_child_dir(&name) {
+                    collect_skill_dirs(child, depth - 1, out);
+                }
             }
         }
     }
 }
 
 /// Import one skill directory into the user skills folder. Returns its manifest.
-fn import_one_skill_dir(src: &Path, enabled: bool) -> Result<SkillManifest, String> {
-    import_one_skill_dir_into(src, enabled, &user_skills_dir())
-}
-
 fn import_one_skill_dir_into(
-    src: &Path,
-    enabled: bool,
-    skills_root: &Path,
+    src: &SecureDir,
+    install_root: &Path,
 ) -> Result<SkillManifest, String> {
     let (id_raw, name, description, version, author, tags, body): (
         String,
@@ -506,106 +1150,149 @@ fn import_one_skill_dir_into(
         String,
         Vec<String>,
         Option<String>,
-    ) = if src.join("manifest.json").exists() {
-        let raw =
-            std::fs::read_to_string(src.join("manifest.json")).map_err(|e| e.to_string())?;
+    ) = if let Some(raw) = src.read_string_optional("manifest.json")? {
         let mf: ManifestFile =
             serde_json::from_str(&raw).map_err(|e| format!("manifest.json 解析失败: {e}"))?;
-        (mf.id, mf.name, mf.description, mf.version, mf.author, mf.tags, mf.system_prompt)
+        (
+            mf.id,
+            mf.name,
+            mf.description,
+            mf.version,
+            mf.author,
+            mf.tags,
+            mf.system_prompt,
+        )
     } else {
-        let raw = std::fs::read_to_string(src.join("SKILL.md")).map_err(|e| e.to_string())?;
+        let raw = src.read_string_required("SKILL.md")?;
         let p = parse_skill_md(&raw);
-        (p.id, p.name, p.description, "1.0.0".into(), "imported".into(), p.tags, Some(p.body))
+        (
+            p.id,
+            p.name,
+            p.description,
+            "1.0.0".into(),
+            "imported".into(),
+            p.tags,
+            Some(p.body),
+        )
     };
 
     let dir_name = src
+        .path()
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let id = if !id_raw.trim().is_empty() {
-        slugify(&id_raw)
+        // An explicit package id is a security boundary, not display text.
+        // Reject traversal and non-canonical values instead of silently
+        // transforming an attack string into an installable id.
+        if id_raw != id_raw.trim() {
+            return Err(format!(
+                "SKILL_ID_INVALID: explicit package id is not canonical: {id_raw:?}"
+            ));
+        }
+        validate_skill_id(&id_raw)?;
+        id_raw
     } else if !name.trim().is_empty() {
         slugify(&name)
     } else {
         slugify(&dir_name)
     };
 
-    std::fs::create_dir_all(skills_root).map_err(|error| error.to_string())?;
-    let dest = skills_root.join(&id);
-    let staging = skills_root.join(format!(".{id}.import-{}", uuid::Uuid::new_v4()));
+    validate_skill_id(&id)?;
+    // Validate the complete source before creating or touching the target. The
+    // same no-follow traversal is repeated during the copy so a source race
+    // cannot bypass the package limits or introduce a link between passes.
+    validate_skill_payload(src)?;
+    let dest = prepare_skill_dir_handle(install_root, &id)?;
 
     let manifest = SkillManifest {
         id: id.clone(),
-        name: if name.trim().is_empty() { id.clone() } else { name },
+        name: if name.trim().is_empty() {
+            id.clone()
+        } else {
+            name
+        },
         description,
         version,
         author,
         tags,
-        enabled,
-        path: dest.to_string_lossy().to_string(),
+        enabled: false,
+        path: dest.path().to_string_lossy().to_string(),
         source: "user".to_string(),
+        lifecycle_status: "ready".to_string(),
     };
-    let prepared = (|| -> Result<(), String> {
-        copy_skill_payload(src, &staging)?;
-        write_manifest(&staging.to_string_lossy(), &manifest)?;
-        // system_prompt.md: SKILL.md body wins; else the copied existing file
-        // is retained and normalized in place.
-        if let Some(body) = body {
-            std::fs::write(staging.join("system_prompt.md"), body)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = prepared {
-        let _ = std::fs::remove_dir_all(&staging);
+    if let Err(error) = copy_skill_payload(src, &dest) {
+        let _ = dest.remove_open_dir_all();
         return Err(error);
     }
-    let backup = skills_root.join(format!(".{id}.backup-{}", uuid::Uuid::new_v4()));
-    let had_existing = dest.exists();
-    if had_existing {
-        if let Err(error) = std::fs::rename(&dest, &backup) {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(error.to_string());
-        }
+    // system_prompt.md: parsed SKILL.md body wins; otherwise the copied
+    // system_prompt.md is retained.
+    if let Some(body) = body {
+        dest.write_atomic("system_prompt.md", body.as_bytes())?;
     }
-    if let Err(error) = std::fs::rename(&staging, &dest) {
-        if had_existing {
-            let _ = std::fs::rename(&backup, &dest);
-        }
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(format!("提交 Skill 安装目录失败: {error}"));
-    }
-    if had_existing {
-        let _ = std::fs::remove_dir_all(&backup);
-    }
+    // The manifest is the visibility/eligibility commit point. Write it last
+    // so a failed copy is projected as `corrupt`, never as an installed Skill.
+    write_manifest_to_dir(&dest, &manifest)?;
     Ok(manifest)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillImportFailure {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillImportResult {
+    pub succeeded: Vec<SkillManifest>,
+    pub failed: Vec<SkillImportFailure>,
+}
+
+fn import_skill_directories_into(
+    source: &Path,
+    install_root: &Path,
+) -> Result<SkillImportResult, String> {
+    let source_dir =
+        SecureDir::open_existing(source).map_err(|e| format!("SKILL_SOURCE_NOT_DIRECTORY: {e}"))?;
+    import_skill_directories_from_handle(source_dir, install_root)
+}
+
+fn import_skill_directories_from_handle(
+    source_dir: SecureDir,
+    install_root: &Path,
+) -> Result<SkillImportResult, String> {
+    let mut dirs = Vec::new();
+    collect_skill_dirs(source_dir, 3, &mut dirs);
+    if dirs.is_empty() {
+        return Err(
+            "SKILL_SOURCE_EMPTY: 目录里没找到 skill（需要含 SKILL.md 或 manifest.json 的文件夹）"
+                .to_string(),
+        );
+    }
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    for dir in dirs {
+        let source_path = dir.path().to_string_lossy().to_string();
+        match import_one_skill_dir_into(&dir, install_root) {
+            Ok(manifest) => succeeded.push(manifest),
+            Err(error) => failed.push(SkillImportFailure {
+                path: source_path,
+                error,
+            }),
+        }
+    }
+    Ok(SkillImportResult { succeeded, failed })
 }
 
 /// Import skill(s) from a local directory — a single skill folder, a
 /// `skills/<name>/` collection, or a whole repo. Parses `SKILL.md` frontmatter
 /// (superpowers / openspec format) when there's no `manifest.json`.
 #[tauri::command]
-pub async fn install_skill_from_directory(dir_path: String) -> Result<Vec<SkillManifest>, String> {
-    let src = PathBuf::from(&dir_path);
-    if !src.is_dir() {
-        return Err("不是有效的目录".to_string());
-    }
-    let mut dirs = Vec::new();
-    collect_skill_dirs(&src, 3, &mut dirs);
-    if dirs.is_empty() {
-        return Err("目录里没找到 skill（需要含 SKILL.md 或 manifest.json 的文件夹）".to_string());
-    }
-    let mut imported = Vec::new();
-    for d in dirs {
-        match import_one_skill_dir(&d, true) {
-            Ok(m) => imported.push(m),
-            Err(e) => tracing::warn!("skill 导入跳过 {}: {e}", d.display()),
-        }
-    }
-    if imported.is_empty() {
-        return Err("找到了 skill 目录但全部导入失败".to_string());
-    }
-    Ok(imported)
+pub async fn install_skill_from_directory(
+    source_handle: String,
+) -> Result<SkillImportResult, String> {
+    let source = consume_skill_source(&source_handle)?;
+    import_skill_directories_from_handle(source, &user_skills_dir())
 }
 
 // ── OpenClaw one-click import (scan known roots) ──────────────────────────────
@@ -616,6 +1303,9 @@ pub struct OpenClawSkillPreview {
     pub name: String,
     pub description: String,
     pub path: String,
+    /// Opaque, short-lived, single-use capability for importing this exact
+    /// already-open directory. The renderer never submits a local path.
+    pub source_handle: String,
     /// A skill with the same slug already exists locally — the UI greys it
     /// out instead of double-importing.
     pub already_installed: bool,
@@ -640,34 +1330,37 @@ fn dirs_home() -> Option<PathBuf> {
 
 /// Scan `roots` for skill directories (SKILL.md / manifest.json) and build
 /// previews. `installed_ids` are the local skill slugs used to mark
-/// duplicates. Pure over its inputs — unit-tested with temp roots.
+/// duplicates. Each preview receives an opaque capability for the exact open
+/// directory, so importing never re-resolves a renderer-provided path.
 pub fn scan_skill_roots(roots: &[PathBuf], installed_ids: &[String]) -> Vec<OpenClawSkillPreview> {
     let mut previews = Vec::new();
     for root in roots {
-        if !root.is_dir() {
+        let Ok(root_dir) = SecureDir::open_existing(root) else {
             continue;
-        }
+        };
         let mut dirs = Vec::new();
-        collect_skill_dirs(root, 2, &mut dirs);
+        collect_skill_dirs(root_dir, 2, &mut dirs);
         for dir in dirs {
-            let (name, description) = if dir.join("SKILL.md").exists() {
-                match std::fs::read_to_string(dir.join("SKILL.md")) {
-                    Ok(raw) => {
-                        let parsed = parse_skill_md(&raw);
-                        let fallback = dir
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        (
-                            if parsed.name.trim().is_empty() { fallback } else { parsed.name },
-                            parsed.description,
-                        )
-                    }
-                    Err(_) => continue,
-                }
+            let (name, description) = if let Ok(Some(raw)) = dir.read_string_optional("SKILL.md") {
+                let parsed = parse_skill_md(&raw);
+                let fallback = dir
+                    .path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (
+                    if parsed.name.trim().is_empty() {
+                        fallback
+                    } else {
+                        parsed.name
+                    },
+                    parsed.description,
+                )
             } else {
-                match std::fs::read_to_string(dir.join("manifest.json"))
+                match dir
+                    .read_string_optional("manifest.json")
                     .ok()
+                    .flatten()
                     .and_then(|raw| serde_json::from_str::<ManifestFile>(&raw).ok())
                 {
                     Some(mf) => (mf.name, mf.description),
@@ -675,11 +1368,16 @@ pub fn scan_skill_roots(roots: &[PathBuf], installed_ids: &[String]) -> Vec<Open
                 }
             };
             let slug = slugify(&name);
+            let path = dir.path().to_string_lossy().to_string();
+            let Ok(selection) = register_skill_source(dir) else {
+                continue;
+            };
             previews.push(OpenClawSkillPreview {
                 already_installed: installed_ids.contains(&slug),
                 name,
                 description,
-                path: dir.to_string_lossy().to_string(),
+                path,
+                source_handle: selection.source_handle,
             });
         }
     }
@@ -696,10 +1394,10 @@ pub async fn scan_openclaw_skills() -> Result<Vec<OpenClawSkillPreview>, String>
 fn list_user_and_builtin_skill_ids() -> Vec<String> {
     let mut ids = Vec::new();
     let dir = user_skills_dir();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                ids.push(entry.file_name().to_string_lossy().to_string());
+    if let Ok(root) = SecureDir::open_existing(&dir) {
+        for entry in root.entry_names().unwrap_or_default() {
+            if root.open_child_dir(&entry).is_ok() {
+                ids.push(entry.to_string_lossy().to_string());
             }
         }
     }
@@ -715,14 +1413,15 @@ pub fn create_user_skill(
     name: &str,
     description: &str,
     instructions: &str,
-    enabled: bool,
 ) -> Result<SkillManifest, String> {
     let id = slugify(name);
-    let dest = user_skills_dir().join(&id);
-    if dest.exists() {
-        return Err(format!("技能 '{id}' 已存在，请改用更新（skill_update）"));
-    }
-    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+    let dest = prepare_skill_dir_handle(&user_skills_dir(), &id).map_err(|error| {
+        if error.starts_with("SKILL_ID_ALREADY_INSTALLED") {
+            format!("技能 '{id}' 已存在，请改用更新（skill_update）")
+        } else {
+            error
+        }
+    })?;
     let manifest = SkillManifest {
         id: id.clone(),
         name: name.to_string(),
@@ -730,28 +1429,47 @@ pub fn create_user_skill(
         version: "1.0.0".to_string(),
         author: "you".to_string(),
         tags: vec![],
-        enabled,
-        path: dest.to_string_lossy().to_string(),
+        enabled: false,
+        path: dest.path().to_string_lossy().to_string(),
         source: "user".to_string(),
+        lifecycle_status: "ready".to_string(),
     };
-    write_manifest(&manifest.path, &manifest)?;
-    std::fs::write(dest.join("system_prompt.md"), instructions).map_err(|e| e.to_string())?;
+    dest.write_atomic("system_prompt.md", instructions.as_bytes())?;
+    write_manifest_to_dir(&dest, &manifest)?;
     Ok(manifest)
 }
 
 /// Update an existing USER skill's fields / instructions. Each `Some` is applied;
-/// `None` leaves that field as-is. The enabled state is preserved.
+/// `None` leaves that field as-is. Any edit returns the skill to disabled so the
+/// changed content cannot affect a later turn before explicit re-review.
 pub fn update_user_skill(
     id: &str,
     name: Option<&str>,
     description: Option<&str>,
     instructions: Option<&str>,
 ) -> Result<SkillManifest, String> {
-    let dir = user_skills_dir().join(id);
-    if !dir.exists() {
-        return Err(format!("用户技能 '{id}' 不存在"));
+    let updated = update_user_skill_in(&user_skills_dir(), id, name, description, instructions)?;
+    remove_activation_review(&activation_reviews_dir(), id)?;
+    Ok(updated)
+}
+
+fn update_user_skill_in(
+    root: &Path,
+    id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    instructions: Option<&str>,
+) -> Result<SkillManifest, String> {
+    if !is_safe_skill_id(id) {
+        return Err(format!(
+            "SKILL_ID_INVALID: skill id is not portable: {id:?}"
+        ));
     }
-    let raw = std::fs::read_to_string(dir.join("manifest.json")).map_err(|e| e.to_string())?;
+    let root_dir = SecureDir::open_existing(root)?;
+    let dir = root_dir
+        .open_child_dir(std::ffi::OsStr::new(id))
+        .map_err(|_| format!("用户技能 '{id}' 不存在或路径不安全"))?;
+    let raw = dir.read_string_required("manifest.json")?;
     let mf: ManifestFile =
         serde_json::from_str(&raw).map_err(|e| format!("manifest.json 解析失败: {e}"))?;
     let manifest = SkillManifest {
@@ -761,13 +1479,18 @@ pub fn update_user_skill(
         version: mf.version,
         author: mf.author,
         tags: mf.tags,
-        enabled: mf.enabled,
-        path: dir.to_string_lossy().to_string(),
+        // Any content or metadata revision must be explicitly inspected again.
+        // Persist the disabled manifest before writing instructions so even an
+        // interrupted content write cannot leave an old enabled bit pointing at
+        // a partially updated prompt.
+        enabled: false,
+        path: dir.path().to_string_lossy().to_string(),
         source: "user".to_string(),
+        lifecycle_status: "ready".to_string(),
     };
-    write_manifest(&manifest.path, &manifest)?;
+    write_manifest_to_dir(&dir, &manifest)?;
     if let Some(instr) = instructions {
-        std::fs::write(dir.join("system_prompt.md"), instr).map_err(|e| e.to_string())?;
+        dir.write_atomic("system_prompt.md", instr.as_bytes())?;
     }
     Ok(manifest)
 }
@@ -779,21 +1502,43 @@ pub fn list_user_skills() -> Vec<SkillManifest> {
 
 /// Delete a USER skill by id. App-independent.
 pub fn delete_user_skill(id: &str) -> Result<(), String> {
-    let dir = user_skills_dir().join(id);
-    if !dir.exists() {
-        return Err(format!("用户技能 '{id}' 不存在"));
-    }
-    std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+    remove_activation_review(&activation_reviews_dir(), id)?;
+    delete_user_skill_in(&user_skills_dir(), id)
 }
 
-/// Create a skill from the UI form. User-authored → enabled immediately.
+fn remove_activation_review(review_root: &Path, id: &str) -> Result<(), String> {
+    let filename = activation_review_filename(id)?;
+    let reviews = match SecureDir::open_existing(review_root) {
+        Ok(reviews) => reviews,
+        Err(_) if !review_root.exists() => return Ok(()),
+        Err(error) => return Err(format!("SKILL_ACTIVATION_REVIEW_STORE_FAILED: {error}")),
+    };
+    reviews
+        .remove_file(&filename)
+        .map_err(|error| format!("SKILL_ACTIVATION_REVIEW_STORE_FAILED: {error}"))
+}
+
+fn delete_user_skill_in(root: &Path, id: &str) -> Result<(), String> {
+    if !is_safe_skill_id(id) {
+        return Err(format!(
+            "SKILL_ID_INVALID: skill id is not portable: {id:?}"
+        ));
+    }
+    let root_dir = SecureDir::open_existing(root)?;
+    let dir = root_dir
+        .open_child_dir(std::ffi::OsStr::new(id))
+        .map_err(|_| format!("用户技能 '{id}' 不存在或路径不安全"))?;
+    dir.remove_open_dir_all()
+}
+
+/// Create a skill from the UI form. It enters the same disabled review flow as imports.
 #[tauri::command]
 pub async fn create_skill(
     name: String,
     description: String,
     instructions: String,
 ) -> Result<SkillManifest, String> {
-    create_user_skill(&name, &description, &instructions, true)
+    create_user_skill(&name, &description, &instructions)
 }
 
 /// Update a USER skill from the UI form. Only the provided fields change.
@@ -828,10 +1573,15 @@ pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
     // (see propose_skills_from_patterns) — record it so the same cluster
     // never gets re-proposed.
     if !manifest.enabled && manifest.tags.iter().any(|t| t == "proposed") {
-        record_rejected_proposal_key(&manifest.name);
+        record_rejected_proposal_key(&manifest.name)?;
     }
 
-    std::fs::remove_dir_all(&manifest.path).map_err(|e| e.to_string())
+    let folder = Path::new(&manifest.path)
+        .file_name()
+        .ok_or_else(|| "SKILL_PATH_UNSAFE: installed package has no folder".to_string())?;
+    let root = SecureDir::open_existing(&user_skills_dir())?;
+    remove_activation_review(&activation_reviews_dir(), &manifest.id)?;
+    root.open_child_dir(folder)?.remove_open_dir_all()
 }
 
 /// The trimmed `system_prompt.md` body of every enabled skill, in list order.
@@ -840,27 +1590,93 @@ pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
 /// Assemble enabled-skill system prompts from a single skills directory —
 /// no `AppHandle` needed. The headless agent loop uses this (user skills
 /// only); the UI path merges builtin + user via [`enabled_skill_prompts`].
-fn render_enabled_skill_context(skill: &SkillManifest) -> Option<String> {
-    let root = PathBuf::from(&skill.path).canonicalize().ok()?;
-    let body = std::fs::read_to_string(root.join("system_prompt.md")).ok()?;
+pub fn prompts_from_skill_dir(dir: &Path) -> Vec<String> {
+    prompts_from_skill_dir_with_reviews(dir, Some(&activation_reviews_dir()))
+}
+
+fn prompts_from_skill_dir_with_reviews(dir: &Path, review_dir: Option<&Path>) -> Vec<String> {
+    let Ok(root) = SecureDir::open_existing(dir) else {
+        return Vec::new();
+    };
+    let reviews = review_dir.and_then(|path| SecureDir::open_existing(path).ok());
+    scan_skill_root_with_reviews(&root, "user", reviews.as_ref())
+        .iter()
+        .filter(|s| s.enabled)
+        .filter_map(|manifest| {
+            reviewed_prompt_for_manifest_in_root(manifest, &root, reviews.as_ref())
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+fn reviewed_prompt_for_manifest(manifest: &SkillManifest) -> Option<String> {
+    if !manifest.enabled || manifest.lifecycle_status != "ready" {
+        return None;
+    }
+    let skill_dir = if manifest.source == "user" {
+        SecureDir::open_existing(&user_skills_dir())
+            .ok()?
+            .open_child_dir(std::ffi::OsStr::new(&manifest.id))
+            .ok()?
+    } else {
+        SecureDir::open_existing(Path::new(&manifest.path)).ok()?
+    };
+    let reviews = if manifest.source == "user" {
+        SecureDir::open_existing(&activation_reviews_dir()).ok()
+    } else {
+        None
+    };
+    reviewed_prompt_from_dir(manifest, &skill_dir, reviews.as_ref())
+}
+
+fn reviewed_prompt_for_manifest_in_root(
+    manifest: &SkillManifest,
+    root: &SecureDir,
+    reviews: Option<&SecureDir>,
+) -> Option<String> {
+    if !manifest.enabled || manifest.lifecycle_status != "ready" {
+        return None;
+    }
+    let skill_dir = root
+        .open_child_dir(std::ffi::OsStr::new(&manifest.id))
+        .ok()?;
+    reviewed_prompt_from_dir(manifest, &skill_dir, reviews)
+}
+
+fn reviewed_prompt_from_dir(
+    manifest: &SkillManifest,
+    skill_dir: &SecureDir,
+    reviews: Option<&SecureDir>,
+) -> Option<String> {
+    let snapshot = activation_review_snapshot_in_dir(
+        skill_dir,
+        &manifest.id,
+        &manifest.name,
+        &manifest.description,
+        &manifest.version,
+        &manifest.author,
+        &manifest.tags,
+    )
+    .ok()?;
+    if manifest.source == "user" {
+        let filename = activation_review_filename(&manifest.id).ok()?;
+        let actual = reviews?.read_string_optional(&filename).ok().flatten()?;
+        if actual != snapshot.fingerprint {
+            return None;
+        }
+    }
+    let body = String::from_utf8(snapshot.system_prompt).ok()?;
     let body = body.trim();
     if body.is_empty() {
         return None;
     }
+    let root = skill_dir.path().canonicalize().ok()?;
     Some(format!(
         "<enabled_skill>\nskill_id: {}\nskill_root: {}\nResolve scripts/, references/, and assets/ relative to skill_root; do not resolve them from the project working directory.\n{}\n</enabled_skill>",
-        skill.id,
+        manifest.id,
         root.display(),
         body,
     ))
-}
-
-pub fn prompts_from_skill_dir(dir: &Path) -> Vec<String> {
-    scan_skill_dir(&dir.to_path_buf(), "user")
-        .iter()
-        .filter(|s| s.enabled)
-        .filter_map(render_enabled_skill_context)
-        .collect()
 }
 
 /// Enabled USER-skill prompts, headless (no builtin skills, no `AppHandle`).
@@ -876,7 +1692,8 @@ pub async fn enabled_skill_prompts(app: &AppHandle) -> Vec<String> {
     skills
         .iter()
         .filter(|s| s.enabled)
-        .filter_map(render_enabled_skill_context)
+        .filter_map(reviewed_prompt_for_manifest)
+        .filter(|p| !p.is_empty())
         .collect()
 }
 
@@ -1084,26 +1901,15 @@ pub struct MarketplaceSkill {
 
 #[tauri::command]
 pub async fn fetch_marketplace_skills(
-    registry_url: Option<String>,
+    _registry_url: Option<String>,
     app: AppHandle,
 ) -> Result<Vec<MarketplaceSkill>, String> {
-    // Try fetching from URL first, fall back to builtin
-    let (raw, from_remote) = if let Some(url) = registry_url {
-        match reqwest::get(&url).await {
-            Ok(resp) => match resp.text().await {
-                Ok(text) => (text, true),
-                Err(_) => (BUILTIN_REGISTRY.to_string(), false),
-            },
-            Err(_) => (BUILTIN_REGISTRY.to_string(), false),
-        }
-    } else {
-        (BUILTIN_REGISTRY.to_string(), false)
-    };
-
-    let _ = from_remote; // used by frontend via the "local_catalog" flag on each item
-
-    let mut skills: Vec<MarketplaceSkill> =
-        serde_json::from_str(&raw).map_err(|e| format!("Failed to parse registry: {e}"))?;
+    // Phase 0 containment: the existing remote registry has no signed envelope
+    // or immutable package digest. Until that contract ships, only expose the
+    // catalog embedded in the signed CodeFactory app; renderer-provided URLs
+    // are intentionally ignored.
+    let mut skills: Vec<MarketplaceSkill> = serde_json::from_str(BUILTIN_REGISTRY)
+        .map_err(|e| format!("SKILL_BUILTIN_CATALOG_INVALID: {e}"))?;
 
     // Mark already-installed skills
     let installed_ids: std::collections::HashSet<String> = list_skills(app)
@@ -1121,56 +1927,66 @@ pub async fn fetch_marketplace_skills(
 }
 
 #[tauri::command]
-pub async fn install_marketplace_skill(
+pub async fn install_marketplace_skill(skill_id: String) -> Result<SkillManifest, String> {
+    let skill = serde_json::from_str::<Vec<MarketplaceSkill>>(BUILTIN_REGISTRY)
+        .map_err(|e| format!("SKILL_BUILTIN_CATALOG_INVALID: {e}"))?
+        .into_iter()
+        .find(|candidate| candidate.id == skill_id)
+        .ok_or_else(|| format!("SKILL_MARKETPLACE_ID_UNKNOWN: {skill_id}"))?;
+    install_marketplace_skill_into(skill, &user_skills_dir())
+}
+
+fn install_marketplace_skill_into(
     skill: MarketplaceSkill,
+    install_root: &Path,
 ) -> Result<SkillManifest, String> {
-    let user_dir = user_skills_dir();
-    let skill_dir = user_dir.join(&skill.id);
-    std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
+    if !is_safe_skill_id(&skill.id) {
+        return Err(format!(
+            "SKILL_ID_INVALID: marketplace id is not portable: {:?}",
+            skill.id
+        ));
+    }
+    // The renderer submits only its selection intent. Re-resolve all package
+    // content from the backend-owned embedded catalog so forged prompt content
+    // cannot cross the renderer boundary.
+    let trusted: MarketplaceSkill = serde_json::from_str::<Vec<MarketplaceSkill>>(BUILTIN_REGISTRY)
+        .map_err(|e| format!("SKILL_BUILTIN_CATALOG_INVALID: {e}"))?
+        .into_iter()
+        .find(|candidate| candidate.id == skill.id)
+        .ok_or_else(|| format!("SKILL_MARKETPLACE_ID_UNKNOWN: {}", skill.id))?;
+    let skill_dir = prepare_skill_dir_handle(install_root, &trusted.id)?;
 
     // Write system_prompt.md
-    std::fs::write(skill_dir.join("system_prompt.md"), &skill.system_prompt)
-        .map_err(|e| e.to_string())?;
+    skill_dir.write_atomic("system_prompt.md", trusted.system_prompt.as_bytes())?;
 
     // Write slash_commands.json
-    let cmds_json = serde_json::to_string_pretty(&skill.slash_commands)
-        .unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(skill_dir.join("slash_commands.json"), &cmds_json)
-        .map_err(|e| e.to_string())?;
+    let cmds_json =
+        serde_json::to_string_pretty(&trusted.slash_commands).unwrap_or_else(|_| "[]".to_string());
+    skill_dir.write_atomic("slash_commands.json", cmds_json.as_bytes())?;
 
     let manifest = SkillManifest {
-        id: skill.id.clone(),
-        name: skill.name.clone(),
-        description: skill.description.clone(),
-        version: skill.version.clone(),
-        author: skill.author.clone(),
-        tags: skill.tags.clone(),
+        id: trusted.id.clone(),
+        name: trusted.name.clone(),
+        description: trusted.description.clone(),
+        version: trusted.version.clone(),
+        author: trusted.author.clone(),
+        tags: trusted.tags.clone(),
         enabled: false,
-        path: skill_dir.to_string_lossy().to_string(),
+        path: skill_dir.path().to_string_lossy().to_string(),
         source: "user".to_string(),
+        lifecycle_status: "ready".to_string(),
     };
 
-    write_manifest(&manifest.path, &manifest)?;
+    write_manifest_to_dir(&skill_dir, &manifest)?;
     Ok(manifest)
 }
 
 // ── Agent-facing discovery / fetch (search the registry, install from a source) ─
 
-/// The skill registry CodeFactory searches (same catalog as the Skills page).
-/// Remote; falls back to the embedded BUILTIN_REGISTRY on any error.
-const SKILL_REGISTRY_URL: &str =
-    "https://raw.githubusercontent.com/BumStill/codefactory-skills/main/registry.json";
-
 /// Search the registry for installable skills matching `query` (name /
 /// description / id / tags; empty query returns all). App-independent.
 pub async fn search_registry_skills(query: &str) -> Vec<MarketplaceSkill> {
-    let raw = match reqwest::get(SKILL_REGISTRY_URL).await {
-        Ok(r) => r.text().await.unwrap_or_else(|_| BUILTIN_REGISTRY.to_string()),
-        Err(_) => BUILTIN_REGISTRY.to_string(),
-    };
-    let all: Vec<MarketplaceSkill> = serde_json::from_str(&raw)
-        .or_else(|_| serde_json::from_str(BUILTIN_REGISTRY))
-        .unwrap_or_default();
+    let all: Vec<MarketplaceSkill> = serde_json::from_str(BUILTIN_REGISTRY).unwrap_or_default();
     let q = query.trim().to_lowercase();
     if q.is_empty() {
         return all;
@@ -1187,79 +2003,49 @@ pub async fn search_registry_skills(query: &str) -> Vec<MarketplaceSkill> {
 
 /// Install a registry skill by id (disabled). App-independent.
 async fn install_marketplace_skill_by_id(id: &str) -> Result<SkillManifest, String> {
-    let skill = search_registry_skills("")
-        .await
-        .into_iter()
-        .find(|s| s.id == id)
-        .ok_or_else(|| format!("registry 里没有 id 为 '{id}' 的技能（先用 skill_search 搜索）"))?;
-    install_marketplace_skill(skill).await
+    install_marketplace_skill(id.to_string()).await
 }
 
 /// Fetch + install skill(s) from a source, landing them DISABLED (the user
-/// reviews + enables). Accepts, in order: an existing local directory, a git
-/// repo URL (github/gitlab/*.git, shallow-cloned), a manifest JSON URL, or a
-/// registry id. App-independent — backs the agent's `skill_fetch` tool.
+/// reviews + enables). Accepts a public HTTPS manifest JSON URL or an embedded
+/// registry id. Raw local paths and Git sources are blocked during Phase 0;
+/// local directories must come from the Resource Center's native source picker.
+/// App-independent — backs `skill_fetch`.
 pub async fn fetch_skill_from_source(source: &str) -> Result<Vec<SkillManifest>, String> {
     let s = source.trim();
 
-    // 1) Existing local directory.
-    let as_path = PathBuf::from(s);
-    if as_path.is_dir() {
-        let mut dirs = Vec::new();
-        collect_skill_dirs(&as_path, 3, &mut dirs);
-        let out: Vec<_> = dirs
-            .iter()
-            .filter_map(|d| import_one_skill_dir(d, false).ok())
-            .collect();
-        return if out.is_empty() {
-            Err("目录里没找到可导入的 skill".into())
-        } else {
-            Ok(out)
-        };
-    }
-
-    // 2) Git repo → shallow clone to a temp dir, import, clean up.
+    // 1) Git repo.
     if s.starts_with("http")
         && (s.contains("github.com") || s.contains("gitlab.com") || s.ends_with(".git"))
     {
-        let tmp = std::env::temp_dir().join(format!("cf-skill-{}", slugify(s)));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let url = s.to_string();
-        let tmp_for_clone = tmp.clone();
-        let status = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("git")
-                .no_window()
-                .args(["clone", "--depth", "1", &url])
-                .arg(&tmp_for_clone)
-                .status()
-        })
-        .await
-        .map_err(|e| format!("clone 任务失败: {e}"))?
-        .map_err(|e| format!("git 不可用: {e}"))?;
-        if !status.success() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err("git clone 失败（检查仓库地址是否正确、可访问）".into());
-        }
-        let mut dirs = Vec::new();
-        collect_skill_dirs(&tmp, 3, &mut dirs);
-        let out: Vec<_> = dirs
-            .iter()
-            .filter_map(|d| import_one_skill_dir(d, false).ok())
-            .collect();
-        let _ = std::fs::remove_dir_all(&tmp);
-        return if out.is_empty() {
-            Err("仓库里没找到 skill（需要 SKILL.md 或 manifest.json）".into())
-        } else {
-            Ok(out)
-        };
+        return Err(
+            "SKILL_SOURCE_GIT_UNAVAILABLE_PHASE0: Git 导入将在受限下载与摘要校验接入后恢复；当前请使用公开 HTTPS manifest"
+                .into(),
+        );
     }
 
-    // 3) Plain http(s) URL → a JSON manifest.
-    if s.starts_with("http") {
-        return install_user_skill_from_url(s, false).await.map(|m| vec![m]);
+    // 2) Plain http(s) URL → a JSON manifest.
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return install_user_skill_from_url(s).await.map(|m| vec![m]);
     }
 
-    // 4) Otherwise: treat as a registry id.
+    // 3) Local paths require a backend-issued native-picker capability. Agent
+    // tools and renderer IPC cannot turn an arbitrary string into read access.
+    let as_path = Path::new(s);
+    if as_path.is_absolute()
+        || s.starts_with('.')
+        || s.starts_with('~')
+        || s.contains('/')
+        || s.contains('\\')
+        || (s.len() >= 2 && s.as_bytes()[1] == b':')
+    {
+        return Err(
+            "SKILL_SOURCE_HANDLE_REQUIRED: 请在资源中心使用“从本地目录导入”选择目录；Agent 不能直接读取任意本机路径"
+                .to_string(),
+        );
+    }
+
+    // 4) Otherwise: treat as a backend-owned embedded registry id.
     install_marketplace_skill_by_id(s).await.map(|m| vec![m])
 }
 
@@ -1280,30 +2066,41 @@ const MAX_PROPOSALS_PER_RUN: usize = 3;
 /// skill's `name` is always set to its cluster key (see `write_proposal_skill`
 /// / `cluster_task_intents`), so recovering the key at delete time is exact —
 /// no need to invert the filesystem-slug transform.
-fn rejected_proposals_path() -> PathBuf {
-    user_skills_dir().join(".rejected_proposals.json")
-}
+const REJECTED_PROPOSALS_FILE: &str = ".rejected_proposals.json";
 
 fn load_rejected_proposal_keys() -> std::collections::HashSet<String> {
-    std::fs::read_to_string(rejected_proposals_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-        .map(|v| v.into_iter().collect())
-        .unwrap_or_default()
+    let Ok(root) = SecureDir::open_existing(&user_skills_dir()) else {
+        return std::collections::HashSet::new();
+    };
+    load_rejected_proposal_keys_from(&root).unwrap_or_default()
 }
 
-fn record_rejected_proposal_key(key: &str) {
-    let mut keys = load_rejected_proposal_keys();
+fn load_rejected_proposal_keys_from(
+    root: &SecureDir,
+) -> Result<std::collections::HashSet<String>, String> {
+    let Some(raw) = root.read_string_optional(REJECTED_PROPOSALS_FILE)? else {
+        return Ok(std::collections::HashSet::new());
+    };
+    serde_json::from_str::<Vec<String>>(&raw)
+        .map(|values| values.into_iter().collect())
+        .map_err(|error| format!("SKILL_REJECTED_PROPOSALS_INVALID: {error}"))
+}
+
+fn record_rejected_proposal_key(key: &str) -> Result<(), String> {
+    let root = SecureDir::open_or_create(&user_skills_dir())?;
+    record_rejected_proposal_key_in(&root, key)
+}
+
+fn record_rejected_proposal_key_in(root: &SecureDir, key: &str) -> Result<(), String> {
+    let mut keys = load_rejected_proposal_keys_from(root)?;
     if !keys.insert(key.to_string()) {
-        return;
+        return Ok(());
     }
-    let path = rejected_proposals_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(&keys.into_iter().collect::<Vec<_>>()) {
-        let _ = std::fs::write(path, json);
-    }
+    let mut values = keys.into_iter().collect::<Vec<_>>();
+    values.sort();
+    let json = serde_json::to_vec(&values)
+        .map_err(|error| format!("SKILL_REJECTED_PROPOSALS_INVALID: {error}"))?;
+    root.write_atomic(REJECTED_PROPOSALS_FILE, &json)
 }
 
 #[derive(Debug, Clone)]
@@ -1324,7 +2121,13 @@ pub struct SkillProposalDraft {
 fn norm_task_title(t: &str) -> String {
     t.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .filter(|w| w.chars().count() > 1 && !w.chars().all(|c| c.is_numeric()))
@@ -1343,7 +2146,10 @@ fn cluster_task_intents(rows: &[TaskTitleRow]) -> Vec<SkillProposalDraft> {
         if key.is_empty() {
             continue;
         }
-        groups.entry(key).or_default().push(r.title.trim().to_string());
+        groups
+            .entry(key)
+            .or_default()
+            .push(r.title.trim().to_string());
     }
     let mut out: Vec<SkillProposalDraft> = groups
         .into_iter()
@@ -1395,9 +2201,11 @@ fn write_proposal_skill(d: &SkillProposalDraft) -> Result<SkillManifest, String>
         .collect::<String>()
         .trim_matches('-')
         .to_string();
-    let id = format!("proposed-{}", if slug.is_empty() { "task".into() } else { slug });
-    let skill_dir = user_skills_dir().join(&id);
-    std::fs::create_dir_all(&skill_dir).map_err(|e| e.to_string())?;
+    let id = format!(
+        "proposed-{}",
+        if slug.is_empty() { "task".into() } else { slug }
+    );
+    let skill_dir = prepare_skill_dir_handle(&user_skills_dir(), &id)?;
 
     let examples = d
         .examples
@@ -1411,7 +2219,7 @@ fn write_proposal_skill(d: &SkillProposalDraft) -> Result<SkillManifest, String>
         label = d.label,
         examples = examples,
     );
-    std::fs::write(skill_dir.join("system_prompt.md"), &system_prompt).map_err(|e| e.to_string())?;
+    skill_dir.write_atomic("system_prompt.md", system_prompt.as_bytes())?;
 
     let cmd_name: String = d
         .key
@@ -1426,11 +2234,12 @@ fn write_proposal_skill(d: &SkillProposalDraft) -> Result<SkillManifest, String>
         "description": format!("处理「{}」类任务", d.label),
         "template": format!("处理这个「{}」类任务：{{input}}", d.label),
     }]);
-    std::fs::write(
-        skill_dir.join("slash_commands.json"),
-        serde_json::to_string_pretty(&slash).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
+    skill_dir.write_atomic(
+        "slash_commands.json",
+        serde_json::to_string_pretty(&slash)
+            .unwrap_or_default()
+            .as_bytes(),
+    )?;
 
     let manifest = SkillManifest {
         id: id.clone(),
@@ -1443,10 +2252,11 @@ fn write_proposal_skill(d: &SkillProposalDraft) -> Result<SkillManifest, String>
         author: "CodeFactory (proposed)".into(),
         tags: vec!["proposed".into()],
         enabled: false,
-        path: skill_dir.to_string_lossy().to_string(),
+        path: skill_dir.path().to_string_lossy().to_string(),
         source: "user".into(),
+        lifecycle_status: "ready".to_string(),
     };
-    write_manifest(&manifest.path, &manifest)?;
+    write_manifest_to_dir(&skill_dir, &manifest)?;
     Ok(manifest)
 }
 
@@ -1469,8 +2279,10 @@ pub async fn propose_skills_from_patterns(
     .await
     .map_err(|e| e.to_string())?;
     drop(pool);
-    let task_rows: Vec<TaskTitleRow> =
-        rows.into_iter().map(|(title,)| TaskTitleRow { title }).collect();
+    let task_rows: Vec<TaskTitleRow> = rows
+        .into_iter()
+        .map(|(title,)| TaskTitleRow { title })
+        .collect();
 
     let existing = list_skills(app.clone()).await?;
     let existing_labels: Vec<String> = existing
@@ -1505,19 +2317,483 @@ mod tests {
         assert!(!is_safe_skill_id("../../etc/passwd"));
         assert!(!is_safe_skill_id("a/b"));
         assert!(!is_safe_skill_id("a\\b"));
+        assert!(!is_safe_skill_id("/tmp/outside"));
+        assert!(!is_safe_skill_id("C:\\outside"));
+        assert!(!is_safe_skill_id("\\\\server\\share"));
+        assert!(!is_safe_skill_id("CON"));
+        assert!(!is_safe_skill_id("nul.txt"));
+        assert!(!is_safe_skill_id("ends-with-dot."));
+        assert!(!is_safe_skill_id("MixedCase"));
+        assert!(!is_safe_skill_id(&"a".repeat(65)));
     }
 
     #[test]
-    fn headless_skill_prompts_read_enabled_skills_from_a_dir_without_an_app() {
-        // Keystone slice 3: the agent loop assembles enabled-skill prompts.
-        // The UI path needs the AppHandle (builtin resource dir); a HEADLESS
-        // run has none, so it reads enabled USER skills from a dir directly.
+    fn skill_path_is_resolved_only_after_id_validation() {
+        let root = Path::new("/synthetic/skill-root");
+        assert_eq!(
+            skill_path_under(root, "safe-skill").unwrap(),
+            root.join("safe-skill")
+        );
+        for id in ["../../victim", "/tmp/victim", "C:\\victim", "CON", "foo."] {
+            assert!(skill_path_under(root, id).is_err(), "{id} must fail closed");
+        }
+    }
+
+    #[test]
+    fn skill_path_subprocess_probe() {
+        let Some(root) = std::env::var_os("CODEFACTORY_SKILL_PROBE_ROOT") else {
+            return;
+        };
+        for id in ["../../victim", "/tmp/victim", "C:\\victim", "CON", "foo."] {
+            assert!(prepare_skill_dir(Path::new(&root), id).is_err());
+            assert!(delete_user_skill_in(Path::new(&root), id).is_err());
+        }
+    }
+
+    #[test]
+    fn skill_path_process_sentinel_keeps_outside_tree_unchanged() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("skills");
+        let victim = fixture.path().join("victim.txt");
+        std::fs::write(&victim, "UNCHANGED").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("commands::skills::tests::skill_path_subprocess_probe")
+            .arg("--exact")
+            .env("CODEFACTORY_SKILL_PROBE_ROOT", &root)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "UNCHANGED");
+    }
+
+    #[test]
+    fn external_directory_import_is_installed_disabled() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let install_root = fixture.path().join("installed");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nid: continuity-helper\nname: Continuity Helper\ndescription: synthetic\n---\n\nStay continuous.",
+        )
+        .unwrap();
+
+        let imported = import_skill_directories_into(&source, &install_root).unwrap();
+
+        assert_eq!(imported.succeeded.len(), 1);
+        assert!(imported.failed.is_empty());
+        assert!(!imported.succeeded[0].enabled);
+        let persisted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(install_root.join("continuity-helper/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["enabled"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_source_handle_is_single_use_and_pins_the_selected_directory() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let selected = fixture.path().join("selected");
+        let held = fixture.path().join("held");
+        let outside = fixture.path().join("outside");
+        let install_root = fixture.path().join("installed");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            selected.join("SKILL.md"),
+            "---\nid: pinned-source\nname: Pinned Source\n---\nSELECTED BODY",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("SKILL.md"),
+            "---\nid: outside-source\nname: Outside Source\n---\nOUTSIDE BODY",
+        )
+        .unwrap();
+
+        let selection =
+            register_skill_source(SecureDir::open_existing(&selected).unwrap()).unwrap();
+        std::fs::rename(&selected, &held).unwrap();
+        symlink(&outside, &selected).unwrap();
+
+        let source = consume_skill_source(&selection.source_handle).unwrap();
+        let imported = import_skill_directories_from_handle(source, &install_root).unwrap();
+
+        assert_eq!(imported.succeeded.len(), 1);
+        assert_eq!(imported.succeeded[0].id, "pinned-source");
+        assert_eq!(
+            std::fs::read_to_string(install_root.join("pinned-source/system_prompt.md")).unwrap(),
+            "SELECTED BODY"
+        );
+        assert!(!install_root.join("outside-source").exists());
+        assert!(consume_skill_source(&selection.source_handle).is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_fetch_rejects_raw_local_paths_without_reading_them() {
+        let fixture = tempfile::tempdir().unwrap();
+        let sentinel = fixture.path().join("sentinel.txt");
+        std::fs::write(&sentinel, "UNCHANGED").unwrap();
+
+        let error = fetch_skill_from_source(fixture.path().to_string_lossy().as_ref())
+            .await
+            .unwrap_err();
+
+        assert!(error.starts_with("SKILL_SOURCE_HANDLE_REQUIRED:"));
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "UNCHANGED");
+    }
+
+    #[test]
+    fn directory_import_returns_successes_and_failures_in_one_result() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let install_root = fixture.path().join("installed");
+        let good = source.join("good");
+        let bad = source.join("bad");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(
+            good.join("SKILL.md"),
+            "---\nid: good-skill\nname: Good Skill\n---\nSafe body",
+        )
+        .unwrap();
+        std::fs::write(bad.join("manifest.json"), "{not-json").unwrap();
+
+        let result = import_skill_directories_into(&source, &install_root).unwrap();
+
+        assert_eq!(result.succeeded.len(), 1);
+        assert_eq!(result.succeeded[0].id, "good-skill");
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(
+            Path::new(&result.failed[0].path)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("bad")
+        );
+        assert!(result.failed[0].error.contains("解析失败"));
+    }
+
+    #[test]
+    fn local_import_rejects_explicit_noncanonical_ids_instead_of_slugifying_them() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let install_root = fixture.path().join("installed");
+        let manifest_skill = source.join("manifest-skill");
+        let markdown_skill = source.join("markdown-skill");
+        std::fs::create_dir_all(&manifest_skill).unwrap();
+        std::fs::create_dir_all(&markdown_skill).unwrap();
+        std::fs::write(
+            manifest_skill.join("manifest.json"),
+            r#"{"id":"../../victim","name":"Bad","description":"bad","version":"1.0.0","author":"fixture"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            markdown_skill.join("SKILL.md"),
+            "---\nid: /tmp/victim\nname: Bad Markdown\n---\nMUST NOT INSTALL",
+        )
+        .unwrap();
+
+        let result = import_skill_directories_into(&source, &install_root).unwrap();
+
+        assert!(result.succeeded.is_empty());
+        assert_eq!(result.failed.len(), 2);
+        assert!(result
+            .failed
+            .iter()
+            .all(|failure| failure.error.starts_with("SKILL_ID_INVALID:")));
+        assert!(!install_root.join("victim").exists());
+        assert!(!install_root.join("tmp-victim").exists());
+    }
+
+    #[test]
+    fn damaged_skill_directory_remains_visible_but_ineligible() {
+        let fixture = tempfile::tempdir().unwrap();
+        let damaged = fixture.path().join("damaged-skill");
+        std::fs::create_dir_all(&damaged).unwrap();
+        std::fs::write(damaged.join("manifest.json"), "{not-json").unwrap();
+        std::fs::write(damaged.join("system_prompt.md"), "MUST NOT LOAD").unwrap();
+
+        let projected = scan_skill_dir(&fixture.path().to_path_buf(), "user");
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "damaged-skill");
+        assert_eq!(projected[0].lifecycle_status, "corrupt");
+        assert!(!projected[0].enabled);
+        assert!(prompts_from_skill_dir(fixture.path()).is_empty());
+    }
+
+    #[test]
+    fn builtin_enabled_bit_is_not_an_unverified_release_approval() {
+        let fixture = tempfile::tempdir().unwrap();
+        let builtin = fixture.path().join("builtin-skill");
+        std::fs::create_dir_all(&builtin).unwrap();
+        std::fs::write(
+            builtin.join("manifest.json"),
+            r#"{"id":"builtin-skill","name":"Builtin","description":"fixture","version":"1.0.0","author":"CodeFactory","tags":[],"enabled":true}"#,
+        )
+        .unwrap();
+        std::fs::write(builtin.join("system_prompt.md"), "MUST REQUIRE REVIEW").unwrap();
+
+        let projected = scan_skill_dir(&fixture.path().to_path_buf(), "builtin");
+
+        assert_eq!(projected.len(), 1);
+        assert!(!projected[0].enabled);
+    }
+
+    #[test]
+    fn explicit_remote_skill_sources_require_public_https() {
+        assert!(validate_explicit_skill_url("https://example.com/skill.json").is_ok());
+        for source in [
+            "http://example.com/skill.json",
+            "https://localhost/skill.json",
+            "https://127.0.0.1/skill.json",
+            "https://10.0.0.1/skill.json",
+            "https://100.64.0.1/skill.json",
+            "https://169.254.169.254/latest/meta-data",
+            "https://198.18.0.1/skill.json",
+            "https://192.0.2.1/skill.json",
+            "https://203.0.113.1/skill.json",
+            "https://[::1]/skill.json",
+            "https://[2001:db8::1]/skill.json",
+            "https://[2606:4700:4700::1111]/skill.json",
+            "https://[::ffff:127.0.0.1]/skill.json",
+            "https://user:secret@example.com/skill.json",
+            "https://example.com/skill.json?token=secret",
+            "https://example.com/skill.json#fragment",
+        ] {
+            assert!(
+                validate_explicit_skill_url(source).is_err(),
+                "{source} must fail before network access"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostname_resolved_behind_a_fake_ip_proxy_is_not_a_private_target() {
+        // Clash-style TUN proxies answer every DNS query out of the
+        // benchmarking (198.18.0.0/15, the Clash default) or CGNAT
+        // (100.64.0.0/10) ranges and map the synthetic address back to the real
+        // host by SNI. Those addresses are local redirection tokens, not
+        // destinations — refusing them blocks no SSRF, it only makes every URL
+        // install fail on a machine running such a proxy.
+        for raw in ["198.18.0.93", "198.19.255.1", "100.64.0.1", "100.127.255.254"] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(
+                is_forbidden_remote_ip(ip),
+                "{raw} must stay blocked when written straight into the URL"
+            );
+            assert!(
+                !is_forbidden_resolved_ip(ip),
+                "{raw} must be reachable when a hostname resolved to it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolved_address_still_fails_closed_on_real_internal_targets() {
+        for raw in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254", // cloud instance metadata
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+        ] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(
+                is_forbidden_resolved_ip(ip),
+                "{raw} names a real internal target and must stay blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn marketplace_install_uses_backend_catalog_not_renderer_content() {
+        let fixture = tempfile::tempdir().unwrap();
+        let forged = MarketplaceSkill {
+            id: "python-expert".into(),
+            name: "Forged".into(),
+            description: "Forged".into(),
+            version: "999.0.0".into(),
+            author: "attacker".into(),
+            tags: vec![],
+            download_url: None,
+            system_prompt: "PWNED RENDERER CONTENT".into(),
+            slash_commands: vec![],
+            installed: false,
+        };
+
+        let installed = install_marketplace_skill_into(forged, fixture.path()).unwrap();
+        let prompt =
+            std::fs::read_to_string(fixture.path().join("python-expert/system_prompt.md")).unwrap();
+
+        assert_eq!(installed.name, "Python 专家");
+        assert!(!installed.enabled);
+        assert!(!prompt.contains("PWNED"));
+        assert!(prompt.contains("expert Python developer"));
+    }
+
+    #[test]
+    fn marketplace_install_cannot_replace_an_existing_enabled_skill() {
+        let fixture = tempfile::tempdir().unwrap();
+        let existing = fixture.path().join("python-expert");
+        std::fs::create_dir_all(&existing).unwrap();
+        let old_manifest = r#"{"id":"python-expert","name":"Old","description":"old","version":"1.0.0","author":"fixture","tags":[],"enabled":true}"#;
+        std::fs::write(existing.join("manifest.json"), old_manifest).unwrap();
+        std::fs::write(existing.join("system_prompt.md"), "OLD REVIEWED CONTENT").unwrap();
+        let selected: MarketplaceSkill =
+            serde_json::from_str::<Vec<MarketplaceSkill>>(BUILTIN_REGISTRY)
+                .unwrap()
+                .into_iter()
+                .find(|skill| skill.id == "python-expert")
+                .unwrap();
+
+        let error = install_marketplace_skill_into(selected, fixture.path()).unwrap_err();
+
+        assert!(error.contains("SKILL_ID_ALREADY_INSTALLED"));
+        assert_eq!(
+            std::fs::read_to_string(existing.join("system_prompt.md")).unwrap(),
+            "OLD REVIEWED CONTENT"
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing.join("manifest.json")).unwrap(),
+            old_manifest
+        );
+    }
+
+    #[test]
+    fn updating_an_enabled_skill_disables_it_before_replacing_content() {
+        let fixture = tempfile::tempdir().unwrap();
+        let skill = fixture.path().join("review-again");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("manifest.json"),
+            r#"{"id":"review-again","name":"Review Again","description":"old","version":"1.0.0","author":"fixture","tags":[],"enabled":true}"#,
+        )
+        .unwrap();
+        std::fs::write(skill.join("system_prompt.md"), "old").unwrap();
+
+        let updated = update_user_skill_in(
+            fixture.path(),
+            "review-again",
+            None,
+            Some("new"),
+            Some("new prompt"),
+        )
+        .unwrap();
+
+        assert!(!updated.enabled);
+        assert_eq!(
+            std::fs::read_to_string(skill.join("system_prompt.md")).unwrap(),
+            "new prompt"
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(skill.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["enabled"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_target_rejects_a_symlink_before_writing() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), fixture.path().join("linked-skill")).unwrap();
+
+        assert!(prepare_skill_dir(fixture.path(), "linked-skill").is_err());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_import_does_not_follow_source_directory_or_file_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let install_root = fixture.path().join("installed");
+        std::fs::write(
+            outside.path().join("SKILL.md"),
+            "---\nid: outside-skill\nname: Outside\n---\nPWNED",
+        )
+        .unwrap();
+        symlink(outside.path(), fixture.path().join("linked-directory")).unwrap();
+
+        let linked_file_source = fixture.path().join("linked-file-source");
+        std::fs::create_dir_all(&linked_file_source).unwrap();
+        symlink(
+            outside.path().join("SKILL.md"),
+            linked_file_source.join("SKILL.md"),
+        )
+        .unwrap();
+
+        assert!(import_skill_directories_into(fixture.path(), &install_root).is_err());
+        assert!(!install_root.join("outside-skill").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_file_rejects_a_symlink_before_writing() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let skill = fixture.path().join("linked-file-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        symlink(outside.path(), skill.join("system_prompt.md")).unwrap();
+
+        let skill_dir = SecureDir::open_existing(&skill).unwrap();
+        assert!(skill_dir.read_optional("system_prompt.md").is_err());
+        assert_eq!(std::fs::read_to_string(outside.path()).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_proposal_state_never_follows_symlinks_or_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        for link_kind in ["symlink", "hardlink"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root_path = fixture.path().join("skills");
+            let outside = fixture.path().join("outside.json");
+            std::fs::create_dir(&root_path).unwrap();
+            std::fs::write(&outside, "[\"OUTSIDE\"]").unwrap();
+            let state_path = root_path.join(REJECTED_PROPOSALS_FILE);
+            if link_kind == "symlink" {
+                symlink(&outside, &state_path).unwrap();
+            } else {
+                std::fs::hard_link(&outside, &state_path).unwrap();
+            }
+            let root = SecureDir::open_existing(&root_path).unwrap();
+
+            let error = record_rejected_proposal_key_in(&root, "should-not-write").unwrap_err();
+
+            assert!(error.starts_with("SKILL_PATH_UNSAFE:"));
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "[\"OUTSIDE\"]");
+        }
+    }
+
+    #[test]
+    fn headless_skill_prompts_require_current_external_review_receipt() {
         let dir = std::env::temp_dir().join(format!("cf-headless-skills-{}", std::process::id()));
+        let review_dir =
+            std::env::temp_dir().join(format!("cf-headless-skill-reviews-{}", std::process::id()));
         let on = dir.join("on-skill");
         std::fs::create_dir_all(&on).unwrap();
+        std::fs::create_dir_all(&review_dir).unwrap();
         std::fs::write(
             on.join("manifest.json"),
-            r#"{"id":"on","name":"On","description":"d","version":"1.0.0","author":"a","tags":[],"enabled":true}"#,
+            r#"{"id":"on-skill","name":"On","description":"d","version":"1.0.0","author":"a","tags":[],"enabled":true}"#,
         )
         .unwrap();
         std::fs::write(on.join("system_prompt.md"), "  ENABLED PROMPT BODY  ").unwrap();
@@ -1526,25 +2802,158 @@ mod tests {
         std::fs::create_dir_all(&off).unwrap();
         std::fs::write(
             off.join("manifest.json"),
-            r#"{"id":"off","name":"Off","description":"d","version":"1.0.0","author":"a","tags":[],"enabled":false}"#,
+            r#"{"id":"off-skill","name":"Off","description":"d","version":"1.0.0","author":"a","tags":[],"enabled":false}"#,
         )
         .unwrap();
         std::fs::write(off.join("system_prompt.md"), "DISABLED PROMPT").unwrap();
 
-        let prompts = prompts_from_skill_dir(&dir);
+        assert!(prompts_from_skill_dir_with_reviews(&dir, Some(&review_dir)).is_empty());
+        let review =
+            activation_review_fingerprint(&on, "on-skill", "On", "d", "1.0.0", "a", &[]).unwrap();
+        // A legacy package-local marker is untrusted even if it contains the
+        // exact public fingerprint.
+        std::fs::write(on.join(".activation-reviewed-v1"), &review).unwrap();
+        assert!(prompts_from_skill_dir_with_reviews(&dir, Some(&review_dir)).is_empty());
+        std::fs::write(
+            review_dir.join(activation_review_filename("on-skill").unwrap()),
+            review,
+        )
+        .unwrap();
+        let prompts = prompts_from_skill_dir_with_reviews(&dir, Some(&review_dir));
         assert_eq!(prompts.len(), 1);
         let installed_root = on.canonicalize().unwrap();
         assert!(prompts[0].starts_with("<enabled_skill>"));
-        assert!(prompts[0].contains("skill_id: on"));
+        assert!(prompts[0].contains("skill_id: on-skill"));
         assert!(prompts[0].contains(&format!("skill_root: {}", installed_root.display())));
-        assert!(prompts[0].contains(
-            "Resolve scripts/, references/, and assets/ relative to skill_root"
-        ));
+        assert!(prompts[0]
+            .contains("Resolve scripts/, references/, and assets/ relative to skill_root"));
         assert!(prompts[0].ends_with("ENABLED PROMPT BODY\n</enabled_skill>"));
 
+        std::fs::write(on.join("system_prompt.md"), "CHANGED AFTER REVIEW").unwrap();
+        assert!(prompts_from_skill_dir_with_reviews(&dir, Some(&review_dir)).is_empty());
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("commands::skills::tests::headless_content_drift_restart_probe")
+            .arg("--exact")
+            .env("CODEFACTORY_SKILL_RESTART_PROBE_ROOT", &dir)
+            .env("CODEFACTORY_SKILL_RESTART_PROBE_REVIEW_ROOT", &review_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fresh headless process loaded drifted content: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
         // Missing dir → empty, never a panic.
-        assert!(prompts_from_skill_dir(std::path::Path::new("/definitely/not/here")).is_empty());
+        assert!(prompts_from_skill_dir_with_reviews(
+            std::path::Path::new("/definitely/not/here"),
+            Some(&review_dir)
+        )
+        .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&review_dir);
+    }
+
+    #[test]
+    fn enable_requires_the_exact_fingerprint_that_was_displayed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let skill_path = fixture.path().join("installed/review-cas");
+        let review_root = fixture.path().join("reviews");
+        std::fs::create_dir_all(&skill_path).unwrap();
+        std::fs::write(skill_path.join("system_prompt.md"), "DISPLAYED").unwrap();
+        let mut manifest = SkillManifest {
+            id: "review-cas".into(),
+            name: "Review CAS".into(),
+            description: "fixture".into(),
+            version: "1.0.0".into(),
+            author: "fixture".into(),
+            tags: vec![],
+            enabled: false,
+            path: skill_path.to_string_lossy().to_string(),
+            source: "user".into(),
+            lifecycle_status: "ready".into(),
+        };
+        let displayed = activation_review_fingerprint(
+            &skill_path,
+            &manifest.id,
+            &manifest.name,
+            &manifest.description,
+            &manifest.version,
+            &manifest.author,
+            &manifest.tags,
+        )
+        .unwrap();
+        std::fs::write(skill_path.join("system_prompt.md"), "CHANGED").unwrap();
+        let skill_dir = SecureDir::open_existing(&skill_path).unwrap();
+
+        let error =
+            enable_user_skill_in(&skill_dir, &review_root, &mut manifest, &displayed).unwrap_err();
+
+        assert!(error.starts_with("SKILL_REVIEW_CONTENT_CHANGED:"));
+        assert!(!manifest.enabled);
+        assert!(!review_root.exists());
+    }
+
+    #[test]
+    fn disable_revokes_review_so_manifest_tampering_cannot_reactivate_after_restart() {
+        let fixture = tempfile::tempdir().unwrap();
+        let install_root = fixture.path().join("installed");
+        let skill_path = install_root.join("disable-revokes");
+        let review_root = fixture.path().join("reviews");
+        std::fs::create_dir_all(&skill_path).unwrap();
+        std::fs::create_dir_all(&review_root).unwrap();
+        std::fs::write(skill_path.join("system_prompt.md"), "REVIEWED BODY").unwrap();
+        let mut manifest = SkillManifest {
+            id: "disable-revokes".into(),
+            name: "Disable Revokes".into(),
+            description: "fixture".into(),
+            version: "1.0.0".into(),
+            author: "fixture".into(),
+            tags: vec![],
+            enabled: true,
+            path: skill_path.to_string_lossy().to_string(),
+            source: "user".into(),
+            lifecycle_status: "ready".into(),
+        };
+        let review = activation_review_fingerprint(
+            &skill_path,
+            &manifest.id,
+            &manifest.name,
+            &manifest.description,
+            &manifest.version,
+            &manifest.author,
+            &manifest.tags,
+        )
+        .unwrap();
+        std::fs::write(
+            review_root.join(activation_review_filename(&manifest.id).unwrap()),
+            review,
+        )
+        .unwrap();
+        let skill_dir = SecureDir::open_existing(&skill_path).unwrap();
+        write_manifest_to_dir(&skill_dir, &manifest).unwrap();
+
+        disable_user_skill_in(&skill_dir, &review_root, &mut manifest).unwrap();
+        manifest.enabled = true;
+        write_manifest_to_dir(&skill_dir, &manifest).unwrap();
+
+        assert!(prompts_from_skill_dir_with_reviews(&install_root, Some(&review_root)).is_empty());
+        assert!(!review_root
+            .join(activation_review_filename(&manifest.id).unwrap())
+            .exists());
+    }
+
+    #[test]
+    fn headless_content_drift_restart_probe() {
+        let Some(root) = std::env::var_os("CODEFACTORY_SKILL_RESTART_PROBE_ROOT") else {
+            return;
+        };
+        let reviews = std::env::var_os("CODEFACTORY_SKILL_RESTART_PROBE_REVIEW_ROOT").unwrap();
+        assert!(
+            prompts_from_skill_dir_with_reviews(Path::new(&root), Some(Path::new(&reviews)))
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -1558,12 +2967,18 @@ mod tests {
         std::fs::create_dir_all(source.join("assets")).unwrap();
         std::fs::create_dir_all(source.join(".git/objects")).unwrap();
         std::fs::write(source.join("SKILL.md"), "# Fixture\nbody").unwrap();
-        std::fs::write(source.join("scripts/nested/run.sh"), "#!/bin/sh\necho SKILL_OK\n")
-            .unwrap();
+        std::fs::write(
+            source.join("scripts/nested/run.sh"),
+            "#!/bin/sh\necho SKILL_OK\n",
+        )
+        .unwrap();
         std::fs::write(source.join("references/usage.md"), "usage").unwrap();
         std::fs::write(source.join("assets/payload.txt"), "asset").unwrap();
         std::fs::write(source.join(".git/objects/secret"), "git internals").unwrap();
-        copy_skill_payload(&source, &destination).expect("safe bundle copy");
+        std::fs::create_dir_all(&destination).unwrap();
+        let source_dir = SecureDir::open_existing(&source).unwrap();
+        let destination_dir = SecureDir::open_existing(&destination).unwrap();
+        copy_skill_payload(&source_dir, &destination_dir).expect("safe bundle copy");
         std::fs::remove_dir_all(&source).unwrap();
 
         assert_eq!(
@@ -1600,9 +3015,10 @@ mod tests {
         .unwrap();
         symlink("/etc/passwd", source.join("assets/escape")).unwrap();
 
-        let error = import_one_skill_dir_into(&source, true, &installed).unwrap_err();
+        let source_dir = SecureDir::open_existing(&source).unwrap();
+        let error = import_one_skill_dir_into(&source_dir, &installed).unwrap_err();
 
-        assert!(error.contains("符号链接"), "{error}");
+        assert!(error.starts_with("SKILL_PATH_UNSAFE:"), "{error}");
         assert_eq!(
             std::fs::read_to_string(existing.join("manifest.json")).unwrap(),
             "existing-manifest"
@@ -1624,11 +3040,16 @@ mod tests {
         std::fs::write(source.join("scripts/run.sh"), "#!/bin/sh\necho SKILL_OK\n").unwrap();
         std::fs::write(source.join("references/usage.md"), "run usage").unwrap();
 
-        let manifest = import_one_skill_dir_into(&source, true, &installed).unwrap();
+        let source_dir = SecureDir::open_existing(&source).unwrap();
+        let mut manifest = import_one_skill_dir_into(&source_dir, &installed).unwrap();
+        // Production drops every source handle when the import call returns, so the
+        // caller can delete its temp clone. Windows refuses to remove a directory
+        // that still has an open handle, so release it here too.
+        drop(source_dir);
         std::fs::remove_dir_all(root.path().join("cloned-source")).unwrap();
 
         let installed_root = PathBuf::from(&manifest.path);
-        assert!(manifest.enabled);
+        assert!(!manifest.enabled);
         assert_eq!(
             std::fs::read_to_string(installed_root.join("scripts/run.sh")).unwrap(),
             "#!/bin/sh\necho SKILL_OK\n"
@@ -1637,7 +3058,23 @@ mod tests {
             std::fs::read_to_string(installed_root.join("references/usage.md")).unwrap(),
             "run usage"
         );
-        let context = render_enabled_skill_context(&manifest).unwrap();
+        let review_root = root.path().join("reviews");
+        let installed_dir = SecureDir::open_existing(&installed_root).unwrap();
+        let fingerprint = activation_review_fingerprint(
+            &installed_root,
+            &manifest.id,
+            &manifest.name,
+            &manifest.description,
+            &manifest.version,
+            &manifest.author,
+            &manifest.tags,
+        )
+        .unwrap();
+        enable_user_skill_in(&installed_dir, &review_root, &mut manifest, &fingerprint).unwrap();
+        let context = prompts_from_skill_dir_with_reviews(&installed, Some(&review_root))
+            .into_iter()
+            .next()
+            .unwrap();
         assert!(context.contains(&format!(
             "skill_root: {}",
             installed_root.canonicalize().unwrap().display()
@@ -1666,7 +3103,8 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("payload.txt"), "too deep").unwrap();
 
-        let error = import_one_skill_dir_into(&source, true, &installed).unwrap_err();
+        let source_dir = SecureDir::open_existing(&source).unwrap();
+        let error = import_one_skill_dir_into(&source_dir, &installed).unwrap_err();
 
         assert!(error.contains("安全目录深度"), "{error}");
         assert_eq!(
@@ -1760,20 +3198,36 @@ mod tests {
         // Every skill must ship a non-empty prompt + at least one slash command,
         // so it actually does something once installed.
         for s in &skills {
-            assert!(!s.system_prompt.trim().is_empty(), "{} has an empty system_prompt", s.id);
+            assert!(
+                !s.system_prompt.trim().is_empty(),
+                "{} has an empty system_prompt",
+                s.id
+            );
             assert!(!s.name.trim().is_empty(), "{} has an empty name", s.id);
-            assert!(!s.slash_commands.is_empty(), "{} has no slash commands", s.id);
+            assert!(
+                !s.slash_commands.is_empty(),
+                "{} has no slash commands",
+                s.id
+            );
         }
     }
 
     fn tr(title: &str) -> TaskTitleRow {
-        TaskTitleRow { title: title.into() }
+        TaskTitleRow {
+            title: title.into(),
+        }
     }
 
     #[test]
     fn norm_task_title_keeps_keywords_drops_ids() {
-        assert_eq!(norm_task_title("Write Release PR #128 for /a/b"), "write release pr for");
-        assert_eq!(norm_task_title("  Add   Tauri command  "), "add tauri command");
+        assert_eq!(
+            norm_task_title("Write Release PR #128 for /a/b"),
+            "write release pr for"
+        );
+        assert_eq!(
+            norm_task_title("  Add   Tauri command  "),
+            "add tauri command"
+        );
         assert_eq!(norm_task_title("123 / 456"), "");
     }
 
@@ -1797,8 +3251,18 @@ mod tests {
     #[test]
     fn filter_covered_drops_existing_and_rejected() {
         let drafts = vec![
-            SkillProposalDraft { key: "write release pr".into(), label: "write release pr".into(), support_count: 5, examples: vec![] },
-            SkillProposalDraft { key: "add tauri command".into(), label: "add tauri command".into(), support_count: 4, examples: vec![] },
+            SkillProposalDraft {
+                key: "write release pr".into(),
+                label: "write release pr".into(),
+                support_count: 5,
+                examples: vec![],
+            },
+            SkillProposalDraft {
+                key: "add tauri command".into(),
+                label: "add tauri command".into(),
+                support_count: 4,
+                examples: vec![],
+            },
         ];
         // An existing skill "Release PR helper" covers the first (overlap: release, pr).
         let existing = vec!["Release PR helper".to_string()];
