@@ -291,6 +291,86 @@ impl ToolRecoveryStore {
         Ok(true)
     }
 
+    /// A shell that rejected the executable or its invocation did not admit
+    /// the requested action. When the bounded workspace observer also proves
+    /// that nothing changed, terminalize the write-ahead receipt as cancelled
+    /// instead of leaving an `unknown` record that can restart the Objective
+    /// forever after the corrected command succeeds.
+    pub(crate) async fn settle_rejected_foreground(
+        &self,
+        receipt_id: &str,
+        cwd: &Path,
+        failure_code: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT resource_kind, safe_locator_json, precondition_digest, state
+             FROM tool_recovery_contracts WHERE receipt_id=?",
+        )
+        .bind(receipt_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let state: String = row.try_get("state")?;
+        if state == "cancelled" {
+            return Ok(true);
+        }
+        let kind: String = row.try_get("resource_kind")?;
+        let locator: String = row.try_get("safe_locator_json")?;
+        let precondition: String = row.try_get("precondition_digest")?;
+        let Some(current) = snapshot_digest(&self.pool, cwd, &kind, &locator).await? else {
+            return Ok(false);
+        };
+        if current != precondition {
+            return Ok(false);
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+        let contract = sqlx::query(
+            "UPDATE tool_recovery_contracts
+             SET state='cancelled', postcondition_digest=?,
+                 observation_count=observation_count+1, observed_at=?,
+                 settled_at=?, updated_at=?, dispatch_owner=NULL,
+                 dispatch_claim_epoch=0, dispatch_generation=0,
+                 dispatch_started_at=NULL
+             WHERE receipt_id=? AND state IN ('dispatching','unknown','observed_unchanged')",
+        )
+        .bind(&current)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(receipt_id)
+        .execute(&mut *tx)
+        .await?;
+        if contract.rows_affected() != 1 {
+            bail!("rejected Tool recovery contract changed before cancellation");
+        }
+        let receipt = sqlx::query(
+            "UPDATE side_effect_receipts
+             SET status='cancelled', summary_json=?, observed_at=?
+             WHERE id=? AND status IN ('started','unknown')",
+        )
+        .bind(
+            serde_json::json!({
+                "status": "cancelled",
+                "recovery": "typed_command_rejected",
+                "code": failure_code,
+            })
+            .to_string(),
+        )
+        .bind(now)
+        .bind(receipt_id)
+        .execute(&mut *tx)
+        .await?;
+        if receipt.rows_affected() != 1 {
+            bail!("rejected side-effect receipt changed before cancellation");
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub(crate) async fn reconcile_claimed(
         &self,
         claim: &ClaimedRemediation,

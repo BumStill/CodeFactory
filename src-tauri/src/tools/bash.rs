@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-use codefactory_agent_core::effective_command_timeout_sec;
+use codefactory_agent_core::{
+    classify_command_failure, command_fingerprint, effective_command_timeout_sec,
+    CommandFailureKind,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::process::Stdio;
@@ -18,9 +21,43 @@ const OUTPUT_LIMIT: usize = 30_000;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const MAX_TIMEOUT_SECS: u64 = 1800;
 
+fn command_failure_metadata(
+    kind: CommandFailureKind,
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_secs: u64,
+) -> Value {
+    json!({
+        "code": kind.as_str(),
+        "recoverable": true,
+        "system_owned": true,
+        "command_repair_required": true,
+        "command_fingerprint": command_fingerprint(
+            command,
+            &cwd.to_string_lossy(),
+            timeout_secs,
+        ),
+        "effective_timeout_sec": timeout_secs,
+    })
+}
+
+fn bounded_stream(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= OUTPUT_LIMIT {
+        return text.into_owned();
+    }
+    let mut end = OUTPUT_LIMIT;
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    text[..end].to_string()
+}
+
 #[derive(Deserialize)]
 struct Args {
     command: String,
+    #[serde(default)]
+    timeout_sec: Option<u64>,
     // Advertised in the tool schema (see definition() below) so the model sends a
     // one-line summary; accepted but not surfaced yet.
     #[serde(default)]
@@ -40,7 +77,13 @@ pub fn definition() -> ToolDefinition {
                 "type": "object",
                 "properties": {
                     "command":     { "type": "string" },
-                    "description": { "type": "string", "description": "One-line human summary" }
+                    "description": { "type": "string", "description": "One-line human summary" },
+                    "timeout_sec": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_TIMEOUT_SECS,
+                        "description": "Bounded command timeout in seconds. Increase only after progress/log/readiness evidence; default 300, maximum 1800."
+                    }
                 },
                 "required": ["command"]
             }),
@@ -277,21 +320,45 @@ async fn execute_inner(
         }
     };
 
-    let timeout_secs =
-        effective_command_timeout_sec(&a.command, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS);
+    let configured_timeout_secs = effective_command_timeout_sec(
+        &a.command,
+        a.timeout_sec.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        MAX_TIMEOUT_SECS,
+    );
+    let timeout_secs = timeout_override
+        .map(|duration| duration.as_secs().max(1).min(MAX_TIMEOUT_SECS))
+        .unwrap_or(configured_timeout_secs);
     let timeout_duration = timeout_override.unwrap_or(Duration::from_secs(timeout_secs));
+    let started = std::time::Instant::now();
     let result = process_tree::output_with_timeout(cmd, timeout_duration).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
 
     match result {
-        Err(ProcessOutputError::Timeout) => Ok(ToolOutput::err(format!(
-            "Command timed out after {timeout_secs}s"
-        ))),
+        Err(ProcessOutputError::Timeout) => {
+            let message = format!("Command timed out after {timeout_secs}s");
+            Ok(ToolOutput::err(&message)
+                .with_metadata(command_failure_metadata(
+                    CommandFailureKind::CommandTimeout,
+                    &a.command,
+                    &ctx.cwd,
+                    timeout_secs,
+                ))
+                .with_process_outcome(None, String::new(), message.clone(), Some(message), duration_ms))
+        }
         Err(ProcessOutputError::Unavailable | ProcessOutputError::Failed) => {
-            Ok(ToolOutput::err(format!(
+            let message = format!(
                 "Failed to execute shell '{}'. PATH={}",
                 launched_program,
                 std::env::var("PATH").unwrap_or_else(|_| "<unset>".into())
-            )))
+            );
+            Ok(ToolOutput::err(&message)
+                .with_metadata(command_failure_metadata(
+                    CommandFailureKind::ShellUnavailable,
+                    &a.command,
+                    &ctx.cwd,
+                    timeout_secs,
+                ))
+                .with_process_outcome(None, String::new(), message.clone(), Some(message), duration_ms))
         }
         Ok(output) => {
             // The guard before launch only knows whether the docker CLI is
@@ -317,12 +384,18 @@ async fn execute_inner(
                 }
             }
 
+            let stdout = bounded_stream(&output.stdout);
+            let stderr = bounded_stream(&output.stderr);
             let mut combined = String::new();
-            combined.push_str(&String::from_utf8_lossy(&output.stdout));
-            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+            combined.push_str(&stdout);
+            combined.push_str(&stderr);
 
             if combined.len() > OUTPUT_LIMIT {
-                combined.truncate(OUTPUT_LIMIT);
+                let mut end = OUTPUT_LIMIT;
+                while !combined.is_char_boundary(end) {
+                    end = end.saturating_sub(1);
+                }
+                combined.truncate(end);
                 combined.push_str("\n[output truncated]");
             }
             append_audit(
@@ -337,9 +410,31 @@ async fn execute_inner(
 
             let is_error = !output.status.success();
             if is_error {
-                Ok(ToolOutput::err(combined))
+                let return_code = output.status.code();
+                let mut result = ToolOutput::err(&combined).with_process_outcome(
+                    return_code,
+                    stdout,
+                    stderr,
+                    Some(combined.clone()),
+                    duration_ms,
+                );
+                if let Some(kind) = classify_command_failure(return_code, &combined) {
+                    result = result.with_metadata(command_failure_metadata(
+                        kind,
+                        &a.command,
+                        &ctx.cwd,
+                        timeout_secs,
+                    ));
+                }
+                Ok(result)
             } else {
-                Ok(ToolOutput::ok(combined))
+                Ok(ToolOutput::ok(combined).with_process_outcome(
+                    output.status.code(),
+                    stdout,
+                    stderr,
+                    None,
+                    duration_ms,
+                ))
             }
         }
     }
@@ -368,6 +463,24 @@ fn read_github_quota() -> Option<shell_policy::GithubQuota> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bash_definition_exposes_bounded_timeout_control() {
+        let definition = super::definition();
+        let timeout = &definition.function.parameters["properties"]["timeout_sec"];
+        assert_eq!(timeout["type"], "integer");
+        assert_eq!(timeout["minimum"], 1);
+        assert_eq!(timeout["maximum"], super::MAX_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn bounded_stream_truncates_multibyte_output_on_a_character_boundary() {
+        let input = "界".repeat(super::OUTPUT_LIMIT);
+        let bounded = super::bounded_stream(input.as_bytes());
+        assert!(bounded.len() <= super::OUTPUT_LIMIT);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+        assert!(bounded.ends_with('界'));
+    }
+
     #[test]
     fn docker_invocation_mounts_only_the_project_directory() {
         // WorkBuddy-gap P0-2: optional container isolation. The wrapper must
@@ -981,7 +1094,55 @@ unix:///var/run/docker.sock\n"
 
         assert!(output.is_error);
         assert!(output.content.contains("Command timed out"));
+        assert_eq!(
+            output
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(Value::as_str),
+            Some("command_timeout")
+        );
+        assert_eq!(
+            output
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("command_repair_required"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert!(exited, "timed-out descendant process {pid} survived");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_not_found_preserves_typed_error_and_shell_fields() {
+        let cwd = tempfile::tempdir().unwrap();
+        let output = execute(
+            json!({"command": "codefactory-command-that-does-not-exist"}),
+            &ExecCtx::new(cwd.path().to_path_buf(), None),
+        )
+        .await
+        .expect("ordinary shell failure is model-visible");
+
+        assert!(output.is_error);
+        assert_eq!(output.return_code, Some(127));
+        assert!(output.stderr.contains("command not found"));
+        assert_eq!(
+            output
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code"))
+                .and_then(Value::as_str),
+            Some("command_not_found")
+        );
+        assert_eq!(
+            output
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("system_owned"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[cfg(unix)]

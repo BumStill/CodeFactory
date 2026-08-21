@@ -44,6 +44,16 @@ pub struct ToolOutput {
     pub status: ToolExecutionStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_code: Option<i32>,
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 impl ToolOutput {
@@ -53,6 +63,11 @@ impl ToolOutput {
             is_error: false,
             status: ToolExecutionStatus::Done,
             metadata: None,
+            return_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            duration_ms: 0,
         }
     }
     pub fn blocked(content: impl Into<String>) -> Self {
@@ -61,6 +76,11 @@ impl ToolOutput {
             is_error: false,
             status: ToolExecutionStatus::Blocked,
             metadata: None,
+            return_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            duration_ms: 0,
         }
     }
     pub fn waiting(content: impl Into<String>) -> Self {
@@ -69,6 +89,11 @@ impl ToolOutput {
             is_error: false,
             status: ToolExecutionStatus::Waiting,
             metadata: None,
+            return_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            duration_ms: 0,
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
@@ -77,11 +102,32 @@ impl ToolOutput {
             is_error: true,
             status: ToolExecutionStatus::Error,
             metadata: None,
+            return_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            duration_ms: 0,
         }
     }
 
     pub fn with_metadata(mut self, metadata: Value) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_process_outcome(
+        mut self,
+        return_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        error: Option<String>,
+        duration_ms: u64,
+    ) -> Self {
+        self.return_code = return_code;
+        self.stdout = stdout;
+        self.stderr = stderr;
+        self.error = error;
+        self.duration_ms = duration_ms;
         self
     }
 }
@@ -274,6 +320,12 @@ mod headless_contract_tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn generic_tool_outputs_do_not_fabricate_process_exit_codes() {
+        assert_eq!(ToolOutput::ok("ok").return_code, None);
+        assert_eq!(ToolOutput::err("error").return_code, None);
+    }
 
     #[tokio::test]
     async fn core_tool_surface_runs_end_to_end_without_an_app_handle() {

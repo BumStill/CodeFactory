@@ -1582,8 +1582,9 @@ impl AgentLoop {
             name: None,
             reasoning_content: None,
         }];
-
-        for m in repair_incomplete_tool_history(replayable_history(history)) {
+        let repaired_history = repair_incomplete_tool_history(replayable_history(history));
+        let replayed_command_repair = replayed_command_repair_prompt(&repaired_history);
+        for m in repaired_history {
             match m.role.as_str() {
                 "tool" => {
                     // Content stored as: {"tool_call_id": "…", "content": "…"}
@@ -1635,6 +1636,16 @@ impl AgentLoop {
                     });
                 }
             }
+        }
+        if let Some(prompt) = replayed_command_repair {
+            msgs.push(ChatMessage {
+                role: "user".into(),
+                content: MessageContent::Text(prompt),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            });
         }
         msgs
     }
@@ -1743,6 +1754,7 @@ fn replayable_history(history: Vec<Message>) -> Vec<Message> {
                         | "rejected_candidate"
                         | "gate_blocked"
                         | "gate_warning"
+                        | "command_recovery"
                 )
             )
         })
@@ -2289,6 +2301,30 @@ fn parse_tool_message_content(raw: &str) -> (String, String) {
         return (id, content);
     }
     (String::new(), raw.to_string())
+}
+
+fn replayed_command_repair_prompt(history: &[Message]) -> Option<String> {
+    let mut pending = None;
+    for message in history {
+        match message.role.as_str() {
+            "tool" => {
+                pending = serde_json::from_str::<serde_json::Value>(&message.content)
+                    .ok()
+                    .and_then(|envelope| envelope.get("metadata").cloned())
+                    .filter(|metadata| {
+                        metadata
+                            .get("command_repair_required")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    });
+            }
+            "assistant" | "user" => pending = None,
+            _ => {}
+        }
+    }
+    pending
+        .as_ref()
+        .and_then(codefactory_agent_loop::run::command_repair_replay_prompt)
 }
 
 async fn persist_cancelled_tool_batch(
@@ -3699,6 +3735,12 @@ mod tests {
         rejected.completion_state = Some("rejected_candidate".into());
         let mut warning = stored_message("assistant", "Verification incomplete.", None);
         warning.completion_state = Some("gate_warning".into());
+        let mut command_recovery = stored_message(
+            "user",
+            "[codefactory_command_recovery] internal repair control",
+            None,
+        );
+        command_recovery.completion_state = Some("command_recovery".into());
 
         let filtered = replayable_history(vec![
             stored_message("user", "hi", None),
@@ -3707,6 +3749,7 @@ mod tests {
             ready,
             rejected,
             warning,
+            command_recovery,
             stored_message("assistant", "hello", None),
         ]);
 
@@ -5095,6 +5138,151 @@ mod tests {
         assert_eq!(tool_call_id, "call-denied");
         assert!(content.contains("unavailable in persisted history"));
         assert_eq!(repaired[2].role, "user");
+    }
+
+    #[test]
+    fn persisted_typed_command_failure_rebuilds_system_owned_repair_prompt() {
+        let history = vec![
+            stored_message(
+                "assistant",
+                "",
+                Some(
+                    serde_json::json!([{
+                        "id": "call-failed",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"}
+                    }])
+                    .to_string(),
+                ),
+            ),
+            stored_message(
+                "tool",
+                &serde_json::json!({
+                    "tool_call_id": "call-failed",
+                    "content": "zsh: command not found: old-skill-cli",
+                    "status": "error",
+                    "metadata": {
+                        "code": "command_not_found",
+                        "recoverable": true,
+                        "system_owned": true,
+                        "command_repair_required": true,
+                        "command_fingerprint": "digest",
+                        "effective_timeout_sec": 300,
+                        "stage": "diagnostic_required"
+                    }
+                })
+                .to_string(),
+                None,
+            ),
+        ];
+
+        let prompt = replayed_command_repair_prompt(&history).expect("repair prompt");
+        assert!(prompt.starts_with("[codefactory_command_recovery]"));
+        assert!(prompt.contains("command_not_found"));
+        assert!(prompt.contains("不要原样重试"));
+    }
+
+    #[tokio::test]
+    async fn command_failure_envelope_survives_file_sqlite_restart() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let temp = tempfile::tempdir().expect("temp sqlite directory");
+        let database = temp.path().join("command-recovery.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&database)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .expect("open file sqlite");
+        sqlx::query(
+            "CREATE TABLE tool_calls (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                arguments TEXT NOT NULL DEFAULT '{}',
+                result TEXT,
+                metadata TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                duration_ms INTEGER,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create tool_calls");
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create messages");
+
+        crate::trajectory::record_tool_call_started(
+            &pool,
+            "session-restart",
+            "assistant-restart",
+            "call-restart",
+            "bash",
+            &serde_json::json!({"command": "old-skill-cli run"}),
+        )
+        .await
+        .expect("record command start");
+        crate::trajectory::record_terminal_tool_outcome(
+            &pool,
+            "session-restart",
+            "call-restart",
+            "error",
+            None,
+            Some("zsh: command not found: old-skill-cli"),
+            9,
+        )
+        .await
+        .expect("record command error");
+        crate::trajectory::record_tool_call_metadata(
+            &pool,
+            "session-restart",
+            "call-restart",
+            &serde_json::json!({
+                "code": "command_not_found",
+                "recoverable": true,
+                "system_owned": true,
+                "command_repair_required": true,
+                "command_fingerprint": "persisted-digest",
+                "effective_timeout_sec": 300,
+                "stage": "diagnostic_required"
+            }),
+        )
+        .await
+        .expect("record command metadata");
+        pool.close().await;
+
+        let reopened = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("reopen file sqlite");
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM messages
+             WHERE session_id = 'session-restart' AND role = 'tool'",
+        )
+        .fetch_one(&reopened)
+        .await
+        .expect("load replay envelope after restart");
+        let history = vec![stored_message("tool", &content, None)];
+        let prompt = replayed_command_repair_prompt(&history).expect("repair prompt after restart");
+        assert!(prompt.contains("command_not_found"));
+        assert!(prompt.contains("persisted-digest"));
+        assert!(prompt.contains("不要原样重试"));
+        reopened.close().await;
     }
 
     #[test]
