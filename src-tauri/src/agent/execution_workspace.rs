@@ -831,12 +831,14 @@ mod tests {
         latest_for_session, release_repo_allocation_lock, verify_objective_workspace,
         ExecutionWorkspaceRequest,
     };
+    use crate::util::no_window::NoWindow;
     use sqlx::SqlitePool;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
     fn git(cwd: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
+            .no_window()
             .arg("-C")
             .arg(cwd)
             .args(args)
@@ -859,6 +861,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&seed).unwrap();
         assert!(Command::new("git")
+            .no_window()
             .args(["init", "--bare", "--initial-branch=main"])
             .arg(&remote)
             .status()
