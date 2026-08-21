@@ -51,10 +51,13 @@ vi.mock("../../stores/skills", () => ({
   useSkillsStore: () => ({
     skills: [],
     loading: false,
+    catalogError: null,
     loadSkills: mocks.loadSkills,
     enableSkill: vi.fn(),
     disableSkill: vi.fn(),
     installFromUrl: vi.fn(),
+    installMarketplace: vi.fn(),
+    selectSourceDirectory: vi.fn(),
     importFromDirectory: vi.fn(),
     createSkill: vi.fn(),
     updateSkill: vi.fn(),

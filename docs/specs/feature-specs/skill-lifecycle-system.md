@@ -139,11 +139,11 @@ Catalog 投影也必须区分对象归属：已提交 package 的 `missing/corru
 | R2 | Phase 0→1 | typed source、single installer | 市场/Agent/本地导入 | REL-005 | SKL-001 L0/L1/L2/L3 | Backend |
 | R3 | Phase 1 | staging、atomic commit、reconciler | 安装记录/恢复 | REL-001 | SKL-001 L0/L1/L2/L3 | Backend |
 | R4 | Phase 0→1 | catalog projection | 我的技能/需要处理 | REL-004 | UI-013 L1/L3 | UI + Backend |
-| R5 | Phase 0→2 | review、activation receipts | 审核并启用 | SEC-005 | SKL-003 L0/L1/L3 | Product + UI |
+| R5 | Phase 0→2 | review、activation receipts | 审核并启用 | SEC-005 | UI-013 L0/L1/L3；Phase 2: SKL-009 | Product + UI |
 | R6 | Phase 0→1 | strong ID、handle-relative FS | 所有 mutation | SEC-001 | SKL-002 L0/L1/L2 | Security |
 | R7 | Phase 0→1 | signed official registry、bounded fetch | 发现/安装 | SEC-002/003 | SKL-002 L0/L1/L2 | Security |
-| R8 | Phase 2 | resolver、runtime receipt | Workspace 本回合资源 | SEC-005 | SKL-003 L1/L2/L3 | Runtime |
-| R9 | Phase 0→2 | deterministic permission intersection | 审核/effective policy | SEC-004 | SKL-002 L0/L1/L2/L3 | Security + Runtime |
+| R8 | Phase 2 | resolver、runtime receipt | Workspace 本回合资源 | SEC-005 | SKL-009 L1/L2/L3 | Runtime |
+| R9 | Phase 0→2 | deterministic permission intersection | 审核/effective policy | SEC-004 | Phase 0: SKL-002 L0/L1/L2；Phase 2: SKL-009 L0/L1/L2/L3 | Security + Runtime |
 | R10 | Phase 2 | shared service、snapshot pin | UI/Headless/恢复 | REL-005 | SKL-004 L1/L2/L3 | Runtime |
 | R11 | Phase 1 | migration/reconciliation | 待重新审核 | REL-001/004 | SKL-005 L1-L4 | Migration + Release |
 | R12 | Phase 0→2 | receipt chain、scenario registry | P-SKL-001 | all P0 | E2E-009 L0-L4 | QA |
@@ -152,7 +152,7 @@ Catalog 投影也必须区分对象归属：已提交 package 的 `missing/corru
 | R15 | Phase 3 | privacy-safe aggregate events | 安装/使用漏斗 | privacy contract | OBS-SKL-001 L0/L1 | Data |
 | R16 | Phase 3+ | publisher/team trust | 组织审批 | supply-chain trust | future | Security |
 | R17 | Phase 3 | installation tombstone/removal receipt | 禁用/移除/恢复 | safe delete | SKL-007 L0-L3 | Backend + UI |
-| R18 | Phase 2 | ephemeral anonymous receipt | 匿名回合披露 | privacy contract | SKL-003 anonymous L0/L1/L3 | Runtime |
+| R18 | Phase 2 | ephemeral anonymous receipt | 匿名回合披露 | privacy contract | SKL-009 anonymous L0/L1/L3 | Runtime |
 | R19 | Phase 1 | digest algorithm v1 | 来源一致性 | digest mismatch | SKL-001 L0/L1 | Backend |
 
 文档中的 `R1` 等短写均指 `CF-SKL-R1`。Supporting design 不得脱离此矩阵另定义优先级或完成门槛。
@@ -192,11 +192,16 @@ Catalog 投影也必须区分对象归属：已提交 package 的 `missing/corru
 
 - 所有写入、更新、删除和 marketplace ID 复用同一安全 path validator；
 - 本地/Git/OpenClaw 导入改为默认禁用；
+- 本地目录只能由 backend native picker 回调立即打开，并向 renderer 返回短期、一次性的 opaque source handle；renderer 与 Agent API 不得提交原始本机路径来获得读取权限。Phase 0 的授权提交点是 backend callback 成功完成 no-follow open 的时刻，后续扫描和导入只使用该 directory capability。OpenClaw 例外入口只在用户点击“一键导入”后扫描 backend-owned well-known roots（`~/.openclaw/skills`、`~/.claude/skills`）并签发相同 handle，不接受 renderer/model 自由路径；主动控制同一用户文件系统并在 picker callback 内竞态替换真实目录的攻击者不属于 Phase 0 包威胁模型，Phase 1 native identity/bookmark adapter 继续收紧该边界；
+- Phase 0 过渡 UI 必须保持操作连续：安装成功后原地切到“已安装”并打开刚安装的精确条目，显示实际保存内容与“尚未启用”；用户从同一详情进入显式启用确认。不得要求用户自行重新查找、刷新或猜测下一步；
+- 在 project scope 与持久 review/activation receipt 尚未交付前，过渡确认必须如实写明“当前对所有项目生效”，且只能称为“安装结果 + 显式全局启用确认”，不得宣称已完成 v2 审核、scope 或 receipt；
 - 移除 `skill_*` 前缀级无条件 Allow；search/list/get 是普通 read-only，load/resource-read 是受 activation 与预算约束的 `RuntimeContextRead`，fetch/install/update/delete 重新进入正常 mutation permission gate；
-- 官方 marketplace/registry 只访问后端配置的 HTTPS allowlist；用户显式 public Git/HTTPS source 走单独确认；两者都阻断私网/redirect/超限/慢流，官方 registry 额外验证 envelope 与 package digest；
+- 在签名 envelope 与不可变 package digest 交付前，Phase 0 关闭远程 marketplace/registry，只使用随签名 App 发布的内置目录；用户显式 public HTTPS source 走单独确认并阻断私网/redirect/超限/慢流；Git source 暂停并显示稳定错误码，待独立受限 adapter 交付后恢复；
+- Phase 0 不把 builtin manifest 中历史 `enabled=true` 当作 release approval；在编译期 digest allowlist 与已验证 migration fact 交付前，所有 builtin 同样投影为未启用，用户检查精确内容并显式批准后才复制为 user installation 并写入包外审核凭据；
 - 暂停或明确标记未接入运行时的 `tool_policy` 与 slash command；
 - 失败包不再静默隐藏，最少显示稳定错误码和目标来源摘要；
 - 增加攻击性 ID、symlink、absolute path 和删除越界测试。
+- Windows 的 exact-handle recursive remove 在安全实现交付前 fail-closed 返回 `SKILL_REMOVE_UNAVAILABLE_WINDOWS_PHASE0`；不得回退到 path-based `remove_dir_all`。可恢复 remove 本身属于 Phase 3/R17，Phase 0 不以牺牲边界换取兼容。
 
 Phase 0 只封堵当前已知高风险安装、删除、权限与远程入口，不代表全部 P0 Requirement 已完成，也不构成完整 Skill v2。只有 R1-R12/R18/R19 各自对应的 Phase 与 RTM 证据全部通过后，才能关闭完整 P0。
 
@@ -247,17 +252,18 @@ Phase 1 + Phase 2 全部完成并通过 L3/L4 主路径后，只可恢复“可�
 
 ## 11. Scenario 设计与登记门禁
 
-实现开始前必须在 `docs/testing/scenario-registry.json` 登记以下稳定 Scenario；当前文档只保留建议 ID，不把尚无自动化的计划伪装成已登记 gate：
+Phase 0 已登记的稳定 Scenario 与后续阶段的计划 Scenario 必须分开：机器 registry 只登记已有 gate 的场景，后续场景在对应实现开始前再登记，不把计划伪装成当前证据。
 
 | 建议 ID | 场景 | 优先级 | 最低证据 |
 | --- | --- | --- | --- |
-| SKL-001 | 任意来源安装均原子提交并在 catalog 显示真实状态 | P0 | L0 + L1 + L2 + L3 |
 | SKL-002 | 恶意包不能逃逸 Skill 根目录或扩大权限 | P0 | L0 + L1 + L2 |
-| SKL-003 | 审核启用后只在匹配/显式回合加载并产生 receipt | P0 | L0 + L1 + L2 + L3 |
+| SKL-003 | 外部 Skill 默认禁用；旧 `enabled=true` 无当前审核凭据时不进入上下文；损坏安装可见且不可启用 | P0 | L0 + L1 + L2 |
+| UI-013 | 安装成功连续进入精确内容检查、批量逐项结果与显式全局启用确认 | P0 | L0 + L1 + L3 |
+| SKL-001（Phase 1 登记） | 任意来源安装均原子提交并在 catalog 显示真实状态 | P0 | L0 + L1 + L2 + L3 |
+| SKL-009（Phase 2 登记） | 审核启用后只在匹配/显式回合加载并产生 receipt | P0 | L0 + L1 + L2 + L3 |
 | SKL-004 | UI、Headless 和恢复任务固定同一 package digest | P0 | L1 + L2 + L3 |
 | SKL-005 | legacy 升级、损坏可见和 App migration 回退不丢包 | P0 | L1 + L2 + L3 + L4 |
 | SKL-006 | Skill 更新 diff、批准、失败回滚和旧版本恢复 | P1 | L1 + L2 + L3 + L4 |
-| UI-013 | 资源中心 Skill 状态、错误、审核和运行证据 | P0 | L0 + L1 + L3 |
 | E2E-009 | 安装→审核→启用→UI/Headless 加载→禁用；Phase 3 再扩展更新/回滚/移除 | P0 组合 | L0 + L1 + L2 + L3 + L4 |
 | SKL-007 | disable、recoverable remove、restore、purge 和 builtin override | P1 | L0 + L1 + L2 + L3 |
 | SKL-008 | slash command 建议、展开、发送和 receipt | P1 | L0 + L1 + L3 |
@@ -326,7 +332,7 @@ Phase 1 + Phase 2 全部完成并通过 L3/L4 主路径后，只可恢复“可�
 实现不得在以下条件缺失时开始：
 
 - 本规格与配套 business / architecture / UX 设计获批；
-- §11 中适用的 `SKL-*`、`UI-013`、`E2E-009` 和 Observation Scenario 已进入机器 registry；当前 `scenario-registry.json` 尚未登记这些建议 ID，因此本文获批也不等于实现门禁已满足；
+- 当前交付阶段适用的 Scenario 已进入机器 registry；Phase 0 先登记 `SKL-002`、`SKL-003`、`UI-013`，Phase 1/2/3 的 `SKL-001`、`SKL-004`—`SKL-009`、`E2E-009` 与 Observation Scenario 必须在对应实现开始前登记；
 - Phase 0 threat model 和兼容迁移 fixture 已确定；
 - 开发 worktree、Req ID owner、QA owner 和 release owner 已认领。
 

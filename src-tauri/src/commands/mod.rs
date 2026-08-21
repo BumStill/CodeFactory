@@ -6,8 +6,8 @@ pub mod chat;
 pub mod chat_progress;
 pub mod checkpoints;
 pub mod control_plane;
-pub mod document;
 pub mod costs;
+pub mod document;
 pub mod evidence;
 pub mod evolution;
 pub mod files;
@@ -26,6 +26,7 @@ pub mod session;
 #[cfg(test)]
 mod session_quick_tests;
 pub mod settings;
+mod skill_fs;
 pub mod skills;
 pub mod tasks;
 pub mod terminal;

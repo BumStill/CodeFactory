@@ -399,7 +399,7 @@ skill_create_draft
 skill_revise_draft
 ```
 
-canonical public names 是 `skill_install_start/status` 与 `skill_create_draft`。Phase 0 保留现有 `skill_fetch`、`skill_create` 作为 deprecated compatibility alias，但 alias 必须路由到同一 service、使用相同 permission 分类、返回 canonical operation/receipt 并带 replacement metadata；不得保留旧文件实现。L0/L1 兼容测试固定 alias 行为，下一 major 才可删除。（`CF-SKL-R2`）
+canonical public names 是 `skill_install_start/status` 与 `skill_create_draft`。Phase 0 只先把现有 `skill_fetch`、`skill_create` 收回同一 permission/path/default-disabled containment gate，并在返回文本标记 deprecated；Phase 1 unified installer/receipt 落地时，alias 才必须路由到同一 service、返回 canonical operation/receipt 与 replacement metadata，且不得保留旧文件实现。L0/L1 兼容测试从 Phase 1 起固定 canonical alias 行为，下一 major 才可删除。（`CF-SKL-R2`）
 
 Agent 可以安装或创建 `unreviewed + disabled` package，不能代替用户 review/enable。`skill_load`/`skill_resource_read` 分类为 `RuntimeContextRead`：它们会把不可信包内容带入模型上下文，必须同时满足固定 activation snapshot、package eligibility、预算与审计，不得仅因“不写文件”就按普通 read-only 放行。
 
@@ -461,6 +461,7 @@ Agent 可以安装或创建 `unreviewed + disabled` package，不能代替用户
 - 所有 id 先做 Unicode NFKC、大小写策略和 slug collision 检查；
 - 所有相对路径逐 component 校验，reject `.`、`..`、absolute、drive prefix、UNC、NUL 和平台替代分隔符；
 - 文件系统 mutation 必须以已打开的 staging/package root directory handle 为锚点逐级 no-follow 打开；Unix 使用 `openat`/`O_NOFOLLOW` 等价语义，Windows 使用拒绝 reparse point 的 handle-relative 等价实现；禁止“先 canonicalize 再按路径写入”的 TOCTOU 模式；
+- Phase 0 若平台库不能提供 exact-handle recursive remove（当前 Windows），该 mutation 必须稳定 fail-closed；Phase 3/R17 交付 native safe remove 后才开放，不得调用已知 racy 的 path fallback；
 - archive entry 在写入前检查，不能“先解压再扫描”；
 - update/delete 只接收数据库查得的 `package_id`，不接收自由路径或自由 id 作为删除目标；
 - trash/remove 同样通过 package locator，禁止 `remove_dir_all(root.join(user_input))`。
