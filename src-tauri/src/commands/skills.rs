@@ -2961,6 +2961,10 @@ mod tests {
 
         let source_dir = SecureDir::open_existing(&source).unwrap();
         let mut manifest = import_one_skill_dir_into(&source_dir, &installed).unwrap();
+        // Production drops every source handle when the import call returns, so the
+        // caller can delete its temp clone. Windows refuses to remove a directory
+        // that still has an open handle, so release it here too.
+        drop(source_dir);
         std::fs::remove_dir_all(root.path().join("cloned-source")).unwrap();
 
         let installed_root = PathBuf::from(&manifest.path);
