@@ -17,6 +17,21 @@ interface Props {
   tc: ToolCallState;
 }
 
+interface InlineDeliverySnapshot {
+  remote_available: boolean;
+  pr: { number: number } | null;
+  ci_status: string;
+  error: string | null;
+}
+
+function inlineDeliveryLabel(snapshot: InlineDeliverySnapshot | null): string | null {
+  if (!snapshot?.pr || !snapshot.remote_available || snapshot.error) return null;
+  if (snapshot.ci_status.startsWith("failure")) return "CI 失败";
+  if (snapshot.ci_status === "pending" || snapshot.ci_status.includes("running")) return "CI 运行中";
+  if (snapshot.ci_status === "success") return "CI 通过";
+  return null;
+}
+
 // ── Per-tool styling ────────────────────────────────────────────────────────
 // Maps the tool name to an icon + accent color. Unknown tools fall back to
 // a generic wrench. Keep the icon set lean — the goal is visual diff between
@@ -395,7 +410,33 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
   const returnFocusSkillId = useAppNavigationStore((state) => state.returnFocusSkillId);
   const consumeReceiptFocus = useAppNavigationStore((state) => state.consumeReceiptFocus);
   const activeSessionId = useChatStore((state) => state.activeSession?.id ?? null);
+  const [deliverySnapshot, setDeliverySnapshot] = useState<InlineDeliverySnapshot | null>(null);
+  const deliveryLabel = inlineDeliveryLabel(deliverySnapshot);
   const reviewButtonRefs = useRef(new Map<string, HTMLButtonElement>());
+
+  useEffect(() => {
+    if (tc.name !== "deliver_changes" || tc.status === "done" || tc.status === "error" || !cwd) {
+      setDeliverySnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    const refresh = () => invoke<InlineDeliverySnapshot>("workspace_delivery_status", {
+      cwd,
+      sessionId: activeSessionId,
+      branch: null,
+      prNumber: null,
+    }).then((snapshot) => {
+      if (!cancelled) setDeliverySnapshot(snapshot);
+    }).catch(() => {
+      if (!cancelled) setDeliverySnapshot(null);
+    });
+    void refresh();
+    const interval = window.setInterval(() => { void refresh(); }, 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [activeSessionId, cwd, tc.name, tc.status]);
 
   useEffect(() => {
     if (returnFocusToolCallId !== tc.id || reviewItems.length === 0) return;
@@ -459,6 +500,14 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
         )}
         {summary && (
           <span className="min-w-0 truncate font-mono text-note text-gray-600">· {summary}</span>
+        )}
+        {deliveryLabel && deliverySnapshot?.pr && (
+          <span className="flex shrink-0 items-center gap-1 text-status-progress" role="status">
+            <span aria-hidden="true">·</span>
+            <span>PR #{deliverySnapshot.pr.number}</span>
+            <span aria-hidden="true">·</span>
+            <span>{deliveryLabel}</span>
+          </span>
         )}
         <span className="ml-auto shrink-0">{statusIcon}</span>
       </button>
