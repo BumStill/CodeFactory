@@ -5,6 +5,7 @@ use sqlx::Row;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -19,6 +20,81 @@ use crate::session_title::{
     TITLE_SOURCE_PLACEHOLDER,
 };
 use crate::AppState;
+
+#[tauri::command]
+pub async fn get_session_execution_workspace(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<crate::agent::execution_workspace::ExecutionWorkspaceView>, AppError> {
+    let db = state.db.read().await.clone();
+    crate::agent::execution_workspace::latest_for_session(&db, &session_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))
+}
+
+fn emit_execution_workspace(
+    app: &AppHandle,
+    session_id: &str,
+    workspace: &crate::agent::execution_workspace::ExecutionWorkspace,
+) {
+    app.emit(
+        &format!("execution_workspace:{session_id}"),
+        workspace.view(),
+    )
+    .ok();
+}
+
+async fn resolve_chat_execution_cwd(
+    app: &AppHandle,
+    db: &sqlx::SqlitePool,
+    objective_id: &str,
+    session_id: &str,
+    source_cwd: &str,
+    capability: crate::agent::TurnCapability,
+) -> Result<PathBuf, AppError> {
+    let source = PathBuf::from(source_cwd);
+    let process_instance = crate::agent::objective::current_process_instance();
+    if let Some(workspace) =
+        crate::agent::execution_workspace::attach_existing(db, objective_id, &process_instance)
+            .await
+            .map_err(|error| {
+                AppError::Other(format!(
+            "MANAGED_WORKSPACE_IDENTITY_CONFLICT: existing workspace cannot be reattached: {error}"
+        ))
+            })?
+    {
+        emit_execution_workspace(app, session_id, &workspace);
+        return Ok(workspace.worktree_path);
+    }
+    if capability == crate::agent::TurnCapability::ReviewOnly
+        || !crate::agent::execution_workspace::is_git_repository(&source)
+    {
+        return Ok(source);
+    }
+    let workspace_container = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| AppError::Other(format!("resolve app data directory: {error}")))?
+        .join("execution-workspaces");
+    let workspace = crate::agent::execution_workspace::allocate_or_attach(
+        db,
+        crate::agent::execution_workspace::ExecutionWorkspaceRequest {
+            objective_id: objective_id.into(),
+            session_id: Some(session_id.into()),
+            source_cwd: source,
+            workspace_container,
+            process_instance,
+        },
+    )
+    .await
+    .map_err(|error| {
+        AppError::Other(format!(
+            "MANAGED_WORKSPACE_UNAVAILABLE: system-owned workspace preparation failed: {error}"
+        ))
+    })?;
+    emit_execution_workspace(app, session_id, &workspace);
+    Ok(workspace.worktree_path)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChatRunIdentity {
@@ -2424,6 +2500,17 @@ pub async fn send_message(
             .await
     };
     let session = setup_or_recover!(session);
+    let effective_cwd = setup_or_recover!(
+        resolve_chat_execution_cwd(
+            &app,
+            &db,
+            &objective.id,
+            &session_id,
+            &session.cwd,
+            contract.capability,
+        )
+        .await
+    );
     // A placeholder can survive a crash between the first reply and its
     // background title request. Re-read the first real user message on every
     // later turn while the source is still placeholder so the next successful
@@ -2451,9 +2538,8 @@ pub async fn send_message(
     // log and continue — we don't want to block the chat over a missing
     // safety net.
     {
-        use std::path::Path;
         let label: String = content.chars().take(80).collect();
-        match crate::agent::checkpoint::create(Path::new(&session.cwd), &label) {
+        match crate::agent::checkpoint::create(&effective_cwd, &label) {
             Ok(Some(sha)) => {
                 let cp_id = Uuid::new_v4().to_string();
                 let now = Utc::now().to_rfc3339();
@@ -2464,7 +2550,7 @@ pub async fn send_message(
                 )
                 .bind(&cp_id)
                 .bind(&session_id)
-                .bind(&session.cwd)
+                .bind(effective_cwd.to_string_lossy().into_owned())
                 .bind(&sha)
                 .bind(&label)
                 .bind(&now)
@@ -2601,7 +2687,7 @@ pub async fn send_message(
                 base_url,
                 api_key,
                 api_style,
-                std::path::PathBuf::from(session.cwd),
+                effective_cwd,
                 settings_state,
                 pending_permissions,
                 mcp_manager,
@@ -3005,6 +3091,15 @@ async fn resume_chat_objective_inner(
             ));
         }
     };
+    let effective_cwd = resolve_chat_execution_cwd(
+        &app,
+        &db,
+        &objective.id,
+        &session_id,
+        &session.cwd,
+        capability,
+    )
+    .await?;
 
     let event_name = format!("stream:{session_id}");
     let force_context_compression = context_authorization.and_then(|authorization| {
@@ -3028,7 +3123,7 @@ async fn resume_chat_objective_inner(
             primary_route.base_url,
             String::new(),
             primary_route.api_style,
-            std::path::PathBuf::from(session.cwd),
+            effective_cwd,
             settings_state,
             pending_permissions,
             mcp_manager,

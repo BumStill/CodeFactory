@@ -33,7 +33,12 @@ import { GitHistoryPanel } from "../../components/GitHistoryPanel";
 import { RemoteGitPanel } from "../../components/RemoteGitPanel";
 import { useGitStore } from "../../stores/git";
 import { recentProjects } from "../../lib/projects";
-import { invoke, onEmbeddedBrowserEscape } from "../../lib/tauri";
+import {
+  invoke,
+  onEmbeddedBrowserEscape,
+  onExecutionWorkspace,
+  type ExecutionWorkspaceView,
+} from "../../lib/tauri";
 import { useChatStore, activeRuntime, type UIMessage } from "../../stores/chat";
 import { QueueBadge } from "../../components/QueueBadge";
 import { useTasksStore } from "../../stores/tasks";
@@ -173,6 +178,36 @@ export function WorkspacePage({
     snapshot: null,
     unavailable: false,
   });
+  const [executionWorkspace, setExecutionWorkspace] =
+    useState<ExecutionWorkspaceView | null>(null);
+  useEffect(() => {
+    setExecutionWorkspace(null);
+    if (activeDraft) return;
+    let current = true;
+    let stop: (() => void) | undefined;
+    void Promise.resolve(
+      invoke<ExecutionWorkspaceView | null>("get_session_execution_workspace", { sessionId }),
+    )
+      .then((workspace) => {
+        if (current) setExecutionWorkspace(workspace ?? null);
+      })
+      .catch(() => {
+        // Older backends and non-Git sessions legitimately have no workspace.
+      });
+    const listener = onExecutionWorkspace?.(sessionId, (workspace) => {
+      if (current) setExecutionWorkspace(workspace);
+    });
+    if (listener) {
+      void listener.then((unlisten) => {
+        if (current) stop = unlisten;
+        else unlisten();
+      });
+    }
+    return () => {
+      current = false;
+      stop?.();
+    };
+  }, [activeDraft, sessionId]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return localStorage.getItem("cf.workspace.sidebarCollapsed") === "1";
@@ -283,7 +318,12 @@ export function WorkspacePage({
     }
   });
   const gitBranch = useGitStore((s) => s.status?.branch ?? "");
-  const activeCwd = activeSession?.cwd ?? activeDraft?.cwd ?? null;
+  const sourceCwd = activeSession?.cwd ?? activeDraft?.cwd ?? null;
+  const managedCwd = executionWorkspace
+    && ["active", "delivering", "cleanup_pending"].includes(executionWorkspace.state)
+    ? executionWorkspace.worktree_path
+    : null;
+  const activeCwd = managedCwd ?? sourceCwd;
   const draftProjects = useMemo(() => recentProjects(sessions ?? []), [sessions]);
   const projectTasks = useTasksStore((state) => state.tasks[sessionId]);
   const projectTasksLoading = Boolean(useTasksStore((state) => state.loading?.[sessionId]));
@@ -682,13 +722,31 @@ export function WorkspacePage({
                 匿名
               </span>
             )}
+            {executionWorkspace && (
+              <span
+                data-testid="execution-workspace-badge"
+                data-workspace-state={executionWorkspace.state}
+                className={`rounded-lg px-1.5 py-0.5 text-caption font-normal ${
+                  executionWorkspace.state === "incident"
+                    ? "bg-status-danger-soft text-status-danger"
+                    : "bg-status-progress-soft text-status-progress"
+                }`}
+                title={executionWorkspace.state === "incident"
+                  ? `受管工作区异常：${executionWorkspace.failure_detail ?? executionWorkspace.failure_code ?? "身份校验失败"}`
+                  : `${executionWorkspace.branch_name}\n${executionWorkspace.worktree_path}`}
+              >
+                {executionWorkspace.state === "incident" ? "工作区异常" : "受管 worktree"}
+              </span>
+            )}
           </div>
           <div className="hidden truncate font-mono text-caption text-gray-600 lg:block">
             {isAnonymous
               ? "无痕会话 · 不落库 · 不计费 · 不学习"
               : activeDraft
                 ? (activeDraft.cwd ?? "发送首条消息后创建会话")
-                : activeSession?.cwd}
+                : executionWorkspace && managedCwd
+                  ? `${executionWorkspace.branch_name} · ${executionWorkspace.worktree_path}`
+                  : activeSession?.cwd}
           </div>
         </div>
         {isAnonymous && (
