@@ -436,7 +436,7 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
       )}
       <div
         data-testid="message-input-control-row"
-        className="group rounded-2xl border border-control-border bg-surface-2 shadow-sm transition-colors focus-within:border-accent focus-within:shadow-md"
+        className="group rounded-2xl border border-border/40 bg-surface-2 shadow-sm transition-shadow focus-within:shadow-md"
       >
         <div className="flex items-end gap-2 px-3 py-2.5">
         <input

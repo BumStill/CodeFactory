@@ -33,7 +33,10 @@ describe("MessageInput guidance mode", () => {
     const { onSend } = setup();
     const shortcut = screen.getByTestId("composer-shortcut-hint");
     expect(shortcut).toHaveClass("hidden", "lg:group-focus-within:block");
-    expect(screen.getByTestId("message-input-control-row")).toHaveClass("border-control-border");
+    expect(screen.getByTestId("message-input-control-row")).toHaveClass("border-border/40");
+    expect(screen.getByTestId("message-input-control-row")).not.toHaveClass(
+      "focus-within:border-accent",
+    );
 
     const attach = screen.getByRole("button", { name: "附加文件" });
     const send = screen.getByRole("button", { name: "引导当前执行" });
