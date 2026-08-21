@@ -34,6 +34,7 @@
 
 ## Evidence
 - Local evidence: `execution_workspace` 8/8；`primary_git_mutation` 2/2；stale/normal delivery 2/2；Workspace UI 16/16；TypeScript 通过。
+- PR scenario gate: `RTE-004, HLT-003, HLT-004, HLT-005`；复杂全链路收敛记录为 `E2E-009`。
 - Release evidence: 待补 canonical PR、required checks、merge SHA、tag/artifact/installed build。
 - Blocking evidence: None
 
