@@ -93,10 +93,14 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
     if (!portal || typeof window === "undefined") return;
     const triggerRect = ref.current?.getBoundingClientRect();
     if (!triggerRect) return;
+    const composerRect = ref.current
+      ?.closest<HTMLElement>('[data-testid="message-input-control-row"]')
+      ?.getBoundingClientRect();
+    const upperAnchor = composerRect?.top ?? triggerRect.top;
     const viewportPadding = 8;
     const gap = 4;
     const menuWidth = Math.min(288, Math.max(0, window.innerWidth - viewportPadding * 2));
-    const availableAbove = Math.max(0, triggerRect.top - gap - viewportPadding);
+    const availableAbove = Math.max(0, upperAnchor - gap - viewportPadding);
     const availableBelow = Math.max(
       0,
       window.innerHeight - triggerRect.bottom - gap - viewportPadding,
@@ -119,7 +123,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
             triggerRect.bottom + gap,
             window.innerHeight - menuHeight - viewportPadding,
           )
-        : Math.max(viewportPadding, triggerRect.top - menuHeight - gap),
+        : Math.max(viewportPadding, upperAnchor - menuHeight - gap),
       maxHeight: availableHeight,
     });
   }, [portal]);
