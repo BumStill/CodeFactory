@@ -97,6 +97,28 @@ async function main() {
     assert(compactGeometry.targetSizes.every(({ width, height }) => width >= 44 && height >= 44), `narrow targets must be at least 44px: ${JSON.stringify(compactGeometry)}`);
     await page.screenshot({ path: path.join(artifactDir, "composer-375.png"), fullPage: true });
 
+    await page.getByRole("button", { name: /选择下一回合模型/ }).click();
+    await page.getByRole("dialog", { name: "选择下一回合模型" }).waitFor({ timeout: 10_000 });
+    const modelMenuGeometry = await page.evaluate(() => {
+      const menu = document.querySelector('[data-testid="model-picker-portal-menu"]');
+      const composer = document.querySelector('[data-testid="message-input-control-row"]');
+      if (!menu || !composer) throw new Error("missing model menu or composer");
+      const menuRect = menu.getBoundingClientRect();
+      const composerRect = composer.getBoundingClientRect();
+      return {
+        menuTop: menuRect.top,
+        menuBottom: menuRect.bottom,
+        composerTop: composerRect.top,
+        composerBottom: composerRect.bottom,
+      };
+    });
+    assert(
+      modelMenuGeometry.menuBottom <= modelMenuGeometry.composerTop + 1,
+      `model menu must stay above the whole composer: ${JSON.stringify(modelMenuGeometry)}`,
+    );
+    await page.screenshot({ path: path.join(artifactDir, "draft-model-picker-visible.png"), fullPage: true });
+    await page.keyboard.press("Escape");
+
     await page.getByRole("button", { name: "选择项目" }).click();
     const menu = page.getByRole("menu", { name: "项目选择" });
     await menu.waitFor({ timeout: 10_000 });
@@ -121,6 +143,10 @@ async function main() {
     assert(Number(geometry.menuZIndex) >= 100, `project picker menu z-index should sit above workspace overlays, got ${geometry.menuZIndex}`);
     assert(geometry.menuBottom <= geometry.composerTop + 1, `menu should render above clipped composer, geometry=${JSON.stringify(geometry)}`);
     assert(await page.getByRole("menuitemradio", { name: /独立任务/ }).getAttribute("aria-checked") === "true", "current draft scope must be exposed to assistive technology");
+    await page.waitForFunction(() => {
+      const current = document.querySelector('[role="menuitemradio"][aria-checked="true"]');
+      return current === document.activeElement;
+    });
     assert(await page.getByRole("menuitemradio", { name: /独立任务/ }).evaluate((node) => node === document.activeElement), "project menu must focus its current item");
     await page.keyboard.press("ArrowDown");
     await page.keyboard.press("Enter");
@@ -150,6 +176,7 @@ async function main() {
       artifactDir,
       checks: {
         compact375: compactGeometry,
+        modelMenuAvoidsComposer: modelMenuGeometry,
         menuEscapesComposerClip: true,
         projectKeyboardSelectable: true,
         wideFocusedComposer: wideGeometry,

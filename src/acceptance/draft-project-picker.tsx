@@ -7,7 +7,33 @@ import { createRoot } from "react-dom/client";
 import "../styles/globals.css";
 import { DraftScopeBar } from "../components/DraftScopeBar";
 import { MessageInput } from "../components/MessageInput";
+import { ModelPicker } from "../components/ModelPicker";
+import { useChatStore } from "../stores/chat";
+import { useSettingsStore } from "../stores/settings";
 import type { ProjectGroup } from "../lib/projects";
+
+useChatStore.setState({
+  models: [{ id: "gpt-5.6-sol", name: "gpt-5.6-sol", context_length: 272000 }],
+  activeModel: "gpt-5.6-sol",
+  activeSession: null,
+  loadModels: async () => {},
+});
+useSettingsStore.setState({
+  settings: {
+    default_endpoint: "acceptance",
+    default_model: "gpt-5.6-sol",
+    endpoints: {
+      acceptance: {
+        base_url: "https://acceptance.invalid",
+        api_key: "",
+        api_style: "openai",
+        custom_models: [{ id: "gpt-5.6-sol", name: "gpt-5.6-sol" }],
+        active_model: "gpt-5.6-sol",
+      },
+    },
+  } as never,
+  load: async () => {},
+});
 
 const projects: ProjectGroup[] = [
   { cwd: "/Users/leo/Projects/CodeFactory", name: "CodeFactory", sessions: [], updatedAt: 2 },
@@ -34,15 +60,7 @@ function DraftProjectPickerAcceptance() {
                 cwd={cwd}
                 anonymous={false}
                 projects={projects}
-                modelPicker={(
-                  <button
-                    type="button"
-                    aria-label="选择下一回合模型：gpt-5.6-sol"
-                    className="min-h-[44px] max-w-[132px] truncate rounded-lg px-2 text-label focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
-                  >
-                    gpt-5.6-sol
-                  </button>
-                )}
+                modelPicker={<ModelPicker portal />}
                 onPickProject={setCwd}
                 onToggleAnonymous={() => {}}
               />
