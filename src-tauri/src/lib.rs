@@ -1015,6 +1015,7 @@ pub fn run() {
             commands::chat::cancel_chat,
             commands::chat::is_chat_running,
             commands::chat::delivery_channel_status,
+            commands::chat::get_session_execution_workspace,
             commands::files::list_dir,
             commands::files::save_chat_attachment,
             commands::terminal::terminal_create,

@@ -266,6 +266,17 @@
       "gates": ["pull_request"]
     },
     {
+      "id": "RTE-004",
+      "name": "代码 Objective 使用受管 worktree 且根 checkout 不变",
+      "category": "runtime_lifecycle",
+      "priority": "P0",
+      "source_kind": "incident_shape",
+      "change_patterns": ["src-tauri/src/agent/execution_workspace.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/migrations/*execution_workspace*.sql"],
+      "automated_by": ["rust:dirty_root_gets_isolated_before_agent_execution", "rust:restart_reattaches_the_exact_objective_workspace", "rust:delivery_rejects_a_different_workspace_before_git_side_effects"],
+      "required_evidence": ["L1", "L2", "L3", "L4"],
+      "gates": ["pull_request", "nightly", "release_artifact"]
+    },
+    {
       "id": "UI-012",
       "name": "浏览器扩展连接状态区分重连且慢轮询不饥饿",
       "category": "workspace_session",
@@ -483,6 +494,33 @@
     },
     {
       "id": "E2E-009",
+      "name": "dirty 旧分支根目录上的新代码任务全程隔离并安全交付",
+      "priority": "P0",
+      "covers": ["RTE-004", "CXD-002", "HLT-001"],
+      "must_remain_unattended": true,
+      "fixture": {"synthetic": true, "shape": "根 checkout 停在已有 terminal PR 的旧分支并有未提交文件，远端默认分支更新，两个并发代码 Objective"},
+      "steps": [
+        "记录根 checkout 的 branch、HEAD、status、index 与 reflog",
+        "用户分别授权两个代码修改 Objective",
+        "每个 Objective 在 provider 首轮前从最新远端默认分支分配唯一受管 worktree",
+        "在受管 worktree 中读写、测试、提交并执行 delivery identity preflight",
+        "模拟一个进程重启并重附着原 workspace",
+        "squash merge 后完成 Objective，再按 clean/dirty 条件执行 closeout"
+      ],
+      "fault_injection": ["worktree add 后 SQLite CAS 前 hard kill", "existing terminal PR branch", "delivery invoked from sibling checkout", "fetch failure", "dirty post-merge workspace"],
+      "oracles": {
+        "ui": ["工作区准备、已隔离、系统核对、交付与清理状态分开呈现", "技术 identity 冲突不显示继续或重试 CTA"],
+        "durable_state": ["每个 Objective 唯一 repo/worktree/branch/base identity", "重启前后 identity 不变且 delivery run 精确绑定", "user message 总数为 1", "human prompt 总数为 0"],
+        "process": ["不同 PID 重附着同一 Objective workspace", "两个 Objective 不共享 cwd 或 branch"],
+        "side_effects": ["根 checkout 的 branch、HEAD、index、dirty 文件和 reflog 不变", "identity/fetch 失败时 stage/commit/push/PR 计数为零"],
+        "delivery": ["新分支不含 terminal PR 的旧提交", "canonical PR/CI/merge 与 workspace head 一致", "仅 clean merged workspace 自动 closeout"]
+      },
+      "execution": {"pull_request": "real Git plus SQLite integration", "nightly": "cross-process fake-forge lifecycle", "release_artifact": "exact installed App CodeFactoryDev-equivalent canary"},
+      "automation_status": "partially_implemented",
+      "remaining_gaps": ["L2 hard-kill reservation reconciliation", "L3 真实 CodeFactoryDev 双会话并发", "L4 exact release artifact closeout canary"]
+    },
+    {
+      "id": "E2E-010",
       "name": "同机 Skill 命令失败后自主诊断、修正并完成",
       "priority": "P0",
       "covers": ["HLT-001", "HLT-005"],

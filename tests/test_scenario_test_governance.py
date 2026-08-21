@@ -93,7 +93,7 @@ class ScenarioChangeContractTests(unittest.TestCase):
         self.assertEqual(
             validate_change_contract(
                 title="fix(chat): keep historical sessions resumable",
-                body="Scenario-Test: HLT-003, HLT-004, HLT-005",
+                body="Scenario-Test: RTE-004, HLT-003, HLT-004, HLT-005",
                 files=["src-tauri/src/commands/chat.rs"],
                 registry=self.registry,
             ),

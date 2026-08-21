@@ -504,9 +504,18 @@ async fn prepare_durable_run(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let (objective_id, task_segment_id) = durable_objective_identity(db, ctx).await?;
+    if ctx.task_id.is_none() && crate::agent::execution_workspace::is_git_repository(&ctx.cwd) {
+        crate::agent::execution_workspace::verify_objective_workspace(db, &objective_id, &ctx.cwd)
+            .await
+            .map_err(|error| {
+                crate::errors::AppError::Other(format!(
+                "系统身份冲突: deliver_changes cwd is not the Objective managed workspace: {error}"
+            ))
+            })?;
+    }
     let (repo, _) = delivery::resolve_delivery_repo(&ctx.cwd, None, expected_branch)
         .map_err(crate::errors::AppError::Other)?;
-    let (objective_id, task_segment_id) = durable_objective_identity(db, ctx).await?;
     let identity =
         delivery::capture_delivery_identity(&repo).map_err(crate::errors::AppError::Other)?;
     let repo_identity = identity.repo_identity;

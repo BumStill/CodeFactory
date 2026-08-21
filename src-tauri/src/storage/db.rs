@@ -862,6 +862,9 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     // recovery so startup never converts a recoverable objective into a user
     // terminal merely because a prior process died.
     crate::agent::objective::ensure_schema(pool).await?;
+    crate::agent::execution_workspace::ensure_schema(pool)
+        .await
+        .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
 
     // ── task_runs has a verification_results JSON column referenced by
     //    the verification engine. Some older DBs and all fresh installs
@@ -2585,6 +2588,8 @@ mod tests {
             "objective_remediations",
             "side_effect_receipts",
             "objective_evidence",
+            "execution_workspaces",
+            "execution_workspace_repo_locks",
         ] {
             let exists: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",

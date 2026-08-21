@@ -24,6 +24,7 @@
 - `evolution-agent-closed-loop.md`: Session 真实轨迹、信号提取、人工审核、受控改进与 Evals 门禁规格。
 - `task-failure-attribution-repair-loop.md`: Workspace 任务失败归因、修复建议和主产品闭环规格。
 - `objective-recovery-control-plane.md`: 跨 chat、task、permission、provider、browser、delivery、release 与进程重启的 objective 真相源、自动恢复和必要用户回交规格。
+- `managed-objective-workspaces.md`: 代码修改 Objective 的受管 Git worktree、根 checkout 保护、restart 重附着、delivery 身份绑定与 squash-safe closeout 规格。
 - `durable-delivery-recovery.md`: 同一 objective/repo/change-set/PR 的持久交付、恢复分类和 Completion Arbiter 领域规格。
 - `session-control-convergence.md`: turn capability、permission outcome、segment guard 与会话恢复投影规格。
 - `model-runtime-control-plane.md`: 会话模型策略、OAuth、CredentialBroker、route replay fence 与安全续接规格。
