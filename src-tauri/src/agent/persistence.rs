@@ -87,7 +87,10 @@ pub async fn persist_model_route_attempts(
 /// via [`Persistence::mark_rejected_candidate`] and is recorded as a
 /// `gate_events` row that points at the message id.
 fn is_gate_control_state(state: &str) -> bool {
-    matches!(state, "gate_recovery" | "gate_ready" | "gate_blocked")
+    matches!(
+        state,
+        "gate_recovery" | "gate_ready" | "gate_blocked" | "command_recovery"
+    )
 }
 
 /// In-process persistence for the desktop app. Owns the pool + session + the
@@ -755,7 +758,12 @@ mod tests {
             session_id: "s1".into(),
             anonymous: false,
         };
-        for state in ["gate_recovery", "gate_ready", "gate_blocked"] {
+        for state in [
+            "gate_recovery",
+            "gate_ready",
+            "gate_blocked",
+            "command_recovery",
+        ] {
             p.persist_gate_message("recover: verify then finish", state)
                 .await
                 .unwrap();
@@ -776,7 +784,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
-            ["gate_blocked", "gate_ready", "gate_recovery"],
+            [
+                "command_recovery",
+                "gate_blocked",
+                "gate_ready",
+                "gate_recovery",
+            ],
         );
         // RAW, not redacted — forensics is the only reason these rows exist.
         assert!(rows.iter().all(|(_, c)| c == "recover: verify then finish"));

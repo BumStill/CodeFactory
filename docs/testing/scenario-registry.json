@@ -40,8 +40,8 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/crates/agent-loop/src/*.rs"],
-      "automated_by": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"],
+      "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/crates/agent-loop/src/*.rs", "src-tauri/src/agent/mod.rs", "src-tauri/src/commands/skills.rs", "src-tauri/src/tools/bash.rs", "src-tauri/src/trajectory.rs"],
+      "automated_by": ["rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:persisted_command_repair_envelope_forces_diagnosis_after_restart", "rust:structured_tool_metadata_is_persisted_separately_from_result_text", "rust:command_failure_envelope_survives_file_sqlite_restart", "binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"],
       "required_evidence": ["L1", "L2", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -85,7 +85,7 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/tool_backend.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/commands/session.rs", "src/stores/chat.ts", "src/stores/chatEvents.ts", "src/lib/turnOwnership.ts", "src/components/MessageList.tsx", "src/pages/Workspace/WorkspacePage.tsx", "src/acceptance/turn-handback.tsx", "scripts/verify-turn-handback-headless.mjs"],
-      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/pages/Workspace/WorkspacePage.systemStop.test.tsx", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke"],
+      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/pages/Workspace/WorkspacePage.systemStop.test.tsx", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke"],
       "required_evidence": ["L0", "L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -480,6 +480,32 @@
       "automation_status": "partially_implemented",
       "automated_by": ["rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:a_command_timeout_evicts_the_half_open_connection", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "path:src/lib/browserExtension.test.ts", "path:src/pages/Settings/SettingsPage.browser.test.tsx"],
       "remaining_gaps": ["L2 --browser-extension-lifecycle-smoke 尚未实现", "L3 真实 CodeFactoryDev 会话内断线续接尚未自动化", "L4 exact release artifact 的扩展升级与重启 canary 尚未接入"]
+    },
+    {
+      "id": "E2E-009",
+      "name": "同机 Skill 命令失败后自主诊断、修正并完成",
+      "priority": "P0",
+      "covers": ["HLT-001", "HLT-005"],
+      "fixture": {"synthetic": true, "shape": "同机安装的外部 Skill，包含 scripts、references、assets；验收脚本首次使用错误参数，随后暴露 help 与确定性 version 输出"},
+      "steps": [
+        "从本地目录或 Git 形状安装 Skill，删除导入临时源后确认嵌套资源仍在稳定 skill_root",
+        "用户只发送一条验收消息，Skill 首次执行带错误参数的真实脚本",
+        "系统把 typed invalid_invocation 回送同一 Objective，并先执行有界 help 或资源存在性诊断",
+        "模型改用正确参数执行同一脚本，取得确定性成功输出后直接结束，不重复探测",
+        "独立进程重开同一 SQLite，确认失败 metadata、cancelled receipt 和 completed Objective 不复活"
+      ],
+      "fault_injection": ["Git 临时目录删除", "invalid CLI argument", "foreground mutation receipt preflight", "process restart after typed failure", "provider attempts premature final response"],
+      "oracles": {
+        "ui": ["同一 turn 依次显示错误、诊断与修正成功，最终 composer 可发送且无继续 CTA、停止按钮或重复验证"],
+        "durable_state": ["user message count=1，失败工具 metadata 保留 typed code，未变工作区对应 receipt/contract 为 cancelled，Objective completed 且 turn/stream settled"],
+        "process": ["重启后仍是同一 root/objective，已完成路径不重新执行脚本"],
+        "side_effects": ["错误调用未改变工作区才允许 cancelled；timeout、资源缺失、不可读或观察到变化时不得假装无副作用"],
+        "delivery": ["PR/CI 跑同一 fixture，exact release 安装包重新导入 Skill 并完成单消息 canary"]
+      },
+      "execution": {"pull_request": "Rust integration plus isolated CodeFactoryDev canary", "nightly": "two-process SQLite restart smoke", "release_artifact": "exact installed App Skill import and command-recovery canary"},
+      "automation_status": "partially_implemented",
+      "automated_by": ["rust:local_directory_install_survives_source_cleanup_with_nested_resources", "rust:symlinked_skill_payload_fails_closed_without_replacing_existing_install", "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:evidence_based_timeout_change_is_not_an_unchanged_retry", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:command_failure_envelope_survives_file_sqlite_restart"],
+      "remaining_gaps": ["L2 独立二进制 hard-kill smoke 尚未接入 nightly", "L4 exact release 安装版单消息 canary 待本次 release 执行"]
     }
   ]
 }

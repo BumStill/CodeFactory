@@ -3765,7 +3765,13 @@ impl ObjectiveStore {
                              ON exact_link.receipt_id=receipt.id
                            WHERE receipt.objective_id=tool.objective_id
                              AND receipt.binding_id=?
-                             AND receipt.status IN ('committed','reconciled')
+                             AND (
+                               receipt.status IN ('committed','reconciled')
+                               OR (
+                                 receipt.status='cancelled'
+                                 AND tool.status IN ('error','cancelled','denied')
+                               )
+                             )
                              AND (
                                exact_link.tool_call_id=tool.id
                                OR (
@@ -5413,6 +5419,51 @@ mod tests {
                 .unwrap();
             assert_eq!(completed.status, ObjectiveStatus::Completed, "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn completion_accepts_cancelled_receipt_only_for_a_failed_tool_call() {
+        let fixture = generic_receipt_completion_fixture("cancelled-rejected-command").await;
+        sqlx::query("UPDATE tool_calls SET status='error' WHERE objective_id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        insert_generic_receipt(
+            &fixture,
+            "receipt-cancelled-rejected-command",
+            &fixture.objective.id,
+            &fixture.current_binding_id,
+            CURRENT_ACTION_SIGNATURE,
+            "cancelled",
+        )
+        .await;
+
+        let completed = fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+
+        let done_fixture = generic_receipt_completion_fixture("cancelled-done-command").await;
+        insert_generic_receipt(
+            &done_fixture,
+            "receipt-cancelled-done-command",
+            &done_fixture.objective.id,
+            &done_fixture.current_binding_id,
+            CURRENT_ACTION_SIGNATURE,
+            "cancelled",
+        )
+        .await;
+        assert!(done_fixture
+            .store
+            .apply_decision(
+                done_fixture.objective.revision,
+                completion_decision(&done_fixture),
+            )
+            .await
+            .is_err());
     }
 
     async fn persist_delivery_completion_candidate(

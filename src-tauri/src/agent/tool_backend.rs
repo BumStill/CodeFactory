@@ -786,13 +786,13 @@ fn invocation_from_output(
         },
         command,
         kind,
-        return_code: None,
-        stdout: String::new(),
-        stderr: String::new(),
-        error: None,
+        return_code: output.return_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        error: output.error,
         metadata: output.metadata,
         next_working_directory: None,
-        duration_ms: 0,
+        duration_ms: output.duration_ms,
     }
 }
 
@@ -1678,7 +1678,36 @@ impl DesktopToolBackend {
     ) -> Result<(), ToolError> {
         let succeeded = result
             .is_some_and(|result| result.status == ToolExecutionStatus::Done && !result.is_error);
-        if super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
+        let recovery = super::tool_recovery::ToolRecoveryStore::new(self.db.clone());
+        let rejected_code = result.and_then(|result| {
+            let metadata = result.metadata.as_ref()?;
+            (result.is_error
+                && result.status == ToolExecutionStatus::Error
+                && metadata
+                    .get("command_repair_required")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true))
+            .then(|| metadata.get("code").and_then(serde_json::Value::as_str))
+            .flatten()
+            .filter(|code| {
+                matches!(
+                    *code,
+                    "command_not_found" | "invalid_invocation" | "shell_unavailable"
+                )
+            })
+        });
+        if let Some(code) = rejected_code {
+            if recovery
+                .settle_rejected_foreground(receipt_id, &ctx.working_directory, code)
+                .await
+                .map_err(|error| ToolError {
+                    message: format!("settle rejected Tool recovery contract: {error}"),
+                })?
+            {
+                return Ok(());
+            }
+        }
+        if recovery
             .settle_foreground(receipt_id, &ctx.working_directory, succeeded)
             .await
             .map_err(|error| ToolError {
@@ -2493,6 +2522,27 @@ mod tests {
     }
 
     #[test]
+    fn opaque_cli_diagnostics_remain_behind_the_mutation_receipt() {
+        for command in [
+            "bash '/Users/test/Library/Application Support/CodeFactory/skills/probe/scripts/probe.sh' --help",
+            "bash '/Users/test/Library/Application Support/CodeFactory/skills/probe/scripts/probe.sh' --version",
+            "opaque-skill-cli --help",
+            "opaque-skill-cli --help && touch changed.txt",
+            "opaque-skill-cli --help > help.txt",
+            "bash -c 'touch changed.txt' --help",
+        ] {
+            assert!(
+                native_requires_mutation_receipt(
+                    "bash",
+                    &serde_json::json!({"command": command}),
+                    &ToolKind::ReadOnly,
+                ),
+                "{command} executes untrusted code and must remain behind the mutation fence",
+            );
+        }
+    }
+
+    #[test]
     fn update_plan_is_transactional_control_state_not_an_external_side_effect() {
         let args = serde_json::json!({
             "steps": [
@@ -2795,6 +2845,179 @@ mod tests {
             assert_eq!(resource_kind, "workspace_git", "{call_id}");
             assert_eq!(replay_policy, "never_after_dispatch", "{call_id}");
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
+            .bind(dir.path().to_string_lossy().as_ref())
+            .bind(TEST_SESSION_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        let args = serde_json::json!({"command": "opaque-skill-cli --verison"});
+        let call = call_with_args("typed-invalid-invocation", "bash", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let MutationAdmission::Dispatch {
+            receipt_id: Some(receipt_id),
+            ..
+        } = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the opaque Skill command must start with a receipt")
+        };
+        let rejected = ToolInvocationResult {
+            content: "unrecognized option: --verison".into(),
+            is_error: true,
+            status: ToolExecutionStatus::Error,
+            command,
+            kind: ToolKind::ReadOnly,
+            return_code: Some(2),
+            stdout: String::new(),
+            stderr: "unrecognized option: --verison".into(),
+            error: Some("unrecognized option: --verison".into()),
+            metadata: Some(serde_json::json!({
+                "code": "invalid_invocation",
+                "recoverable": true,
+                "system_owned": true,
+                "command_repair_required": true
+            })),
+            next_working_directory: None,
+            duration_ms: 1,
+        };
+
+        backend
+            .settle_mutation_receipt(&receipt_id, Some(&rejected), &objective_ctx(dir.path()))
+            .await
+            .unwrap();
+
+        let (receipt_status, contract_state): (String, String) = sqlx::query_as(
+            "SELECT receipt.status, contract.state
+             FROM side_effect_receipts receipt
+             JOIN tool_recovery_contracts contract ON contract.receipt_id=receipt.id
+             WHERE receipt.id=?",
+        )
+        .bind(receipt_id)
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(receipt_status, "cancelled");
+        assert_eq!(contract_state, "cancelled");
+
+        let help_args = serde_json::json!({"command": "opaque-skill-cli --help"});
+        let help_call = call_with_args("typed-invalid-followed-by-help", "bash", &help_args);
+        register_tool_call(&backend, &help_call, &help_args).await;
+        let (help_command, help_kind) = backend.classify(&help_call, &help_args);
+        let MutationAdmission::Dispatch {
+            receipt_id: Some(help_receipt_id),
+            ..
+        } = backend
+            .mutation_preflight(
+                &help_call,
+                &help_args,
+                &objective_ctx(dir.path()),
+                &help_command,
+                help_kind,
+                false,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a bounded diagnostic must get a fresh receipt after cancellation")
+        };
+        let help_result = ToolInvocationResult {
+            content: "usage: opaque-skill-cli --version".into(),
+            is_error: false,
+            status: ToolExecutionStatus::Done,
+            command: help_command,
+            kind: ToolKind::ReadOnly,
+            return_code: Some(0),
+            stdout: "usage: opaque-skill-cli --version".into(),
+            stderr: String::new(),
+            error: None,
+            metadata: None,
+            next_working_directory: None,
+            duration_ms: 1,
+        };
+        backend
+            .settle_mutation_receipt(
+                &help_receipt_id,
+                Some(&help_result),
+                &objective_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        let (help_status, help_state): (String, String) = sqlx::query_as(
+            "SELECT receipt.status, contract.state
+             FROM side_effect_receipts receipt
+             JOIN tool_recovery_contracts contract ON contract.receipt_id=receipt.id
+             WHERE receipt.id=?",
+        )
+        .bind(help_receipt_id)
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(help_status, "committed");
+        assert_eq!(help_state, "settled_committed");
+
+        let changed_args = serde_json::json!({"command": "opaque-skill-cli --other-bad-option"});
+        let changed_call = call_with_args("typed-invalid-after-change", "bash", &changed_args);
+        register_tool_call(&backend, &changed_call, &changed_args).await;
+        let (changed_command, changed_kind) = backend.classify(&changed_call, &changed_args);
+        let MutationAdmission::Dispatch {
+            receipt_id: Some(changed_receipt_id),
+            ..
+        } = backend
+            .mutation_preflight(
+                &changed_call,
+                &changed_args,
+                &objective_ctx(dir.path()),
+                &changed_command,
+                changed_kind,
+                false,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the second opaque Skill command must reach dispatch")
+        };
+        std::fs::write(dir.path().join("changed.txt"), b"partial effect").unwrap();
+        let changed_rejection = ToolInvocationResult {
+            command: changed_command,
+            ..rejected
+        };
+        backend
+            .settle_mutation_receipt(
+                &changed_receipt_id,
+                Some(&changed_rejection),
+                &objective_ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        let (changed_status, changed_state): (String, String) = sqlx::query_as(
+            "SELECT receipt.status, contract.state
+             FROM side_effect_receipts receipt
+             JOIN tool_recovery_contracts contract ON contract.receipt_id=receipt.id
+             WHERE receipt.id=?",
+        )
+        .bind(changed_receipt_id)
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(changed_status, "unknown");
+        assert_eq!(changed_state, "observed_changed");
     }
 
     #[tokio::test]

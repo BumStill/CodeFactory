@@ -501,6 +501,263 @@ fn approximate_wait_label(elapsed: std::time::Duration) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandRepairStage {
+    DiagnosticRequired,
+    CorrectedAttemptRequired,
+}
+
+#[derive(Debug, Clone)]
+struct CommandRepairState {
+    code: String,
+    failed_command: String,
+    failed_fingerprint: Option<String>,
+    effective_timeout_sec: u64,
+    stage: CommandRepairStage,
+}
+
+fn normalized_command(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn command_attempt_fingerprint(
+    command: &str,
+    args: &serde_json::Value,
+    cwd: &std::path::Path,
+) -> String {
+    let requested_timeout = args
+        .get("timeout_sec")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(300);
+    let effective_timeout = codefactory_agent_core::effective_command_timeout_sec(
+        command,
+        requested_timeout,
+        1800,
+    );
+    codefactory_agent_core::command_fingerprint(
+        command,
+        &cwd.to_string_lossy(),
+        effective_timeout,
+    )
+}
+
+fn command_attempt_matches_failure(
+    repair: &CommandRepairState,
+    command: &str,
+    args: &serde_json::Value,
+    cwd: &std::path::Path,
+) -> bool {
+    if let Some(failed) = repair.failed_fingerprint.as_deref() {
+        return command_attempt_fingerprint(command, args, cwd) == failed;
+    }
+    normalized_command(command) == repair.failed_command
+}
+
+fn command_repair_code(result: &crate::tool::ToolInvocationResult) -> Option<&str> {
+    result
+        .metadata
+        .as_ref()
+        .filter(|metadata| {
+            metadata
+                .get("command_repair_required")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .and_then(|metadata| metadata.get("code"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn command_repair_diagnostic_completed(result: &crate::tool::ToolInvocationResult) -> bool {
+    !result.is_error
+        && matches!(
+            result.status,
+            crate::tool::ToolExecutionStatus::Done
+        )
+}
+
+fn command_repair_diagnostic(
+    code: &str,
+    tool_name: &str,
+    args: &serde_json::Value,
+    kind: &codefactory_agent_core::ToolKind,
+) -> bool {
+    if !matches!(
+        kind,
+        codefactory_agent_core::ToolKind::ReadOnly
+            | codefactory_agent_core::ToolKind::RuntimeProbe
+            | codefactory_agent_core::ToolKind::FunctionalProbe { bounded: true }
+    ) {
+        return false;
+    }
+    let command = args
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let path = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let reads_skill_docs = matches!(tool_name, "read_file" | "grep" | "glob")
+        && ["skill.md", "readme", "usage", "reference"]
+            .iter()
+            .any(|marker| path.contains(marker));
+    if reads_skill_docs {
+        return true;
+    }
+    match code {
+        "command_not_found" | "shell_unavailable" => [
+            "command -v ",
+            "which ",
+            "type -a ",
+            "get-command ",
+            "where.exe ",
+        ]
+        .iter()
+        .any(|marker| command.contains(marker)),
+        "resource_not_found" => ["test -e ", "test -f ", "test-path ", "ls ", "find "]
+            .iter()
+            .any(|marker| command.contains(marker)),
+        "invalid_invocation" => ["--help", " -h", "get-help "]
+            .iter()
+            .any(|marker| command.contains(marker)),
+        "command_timeout" => [
+            "--help", " -h", "ps ", "pgrep ", "tail ", "log", "readiness", "health",
+        ]
+        .iter()
+        .any(|marker| command.contains(marker)),
+        _ => false,
+    }
+}
+
+fn command_repair_prompt(state: &CommandRepairState) -> String {
+    let stage = match state.stage {
+        CommandRepairStage::DiagnosticRequired => "diagnostic_required",
+        CommandRepairStage::CorrectedAttemptRequired => "corrected_attempt_required",
+    };
+    let marker = serde_json::json!({
+        "code": state.code,
+        "stage": stage,
+        "command_fingerprint": state.failed_fingerprint,
+        "effective_timeout_sec": state.effective_timeout_sec,
+    });
+    let instruction = match state.stage {
+        CommandRepairStage::DiagnosticRequired => format!(
+            "系统检测到可恢复的命令失败（{}）。不要结束任务，也不要原样重试。下一步必须只做一项相关的有界只读诊断：检查已启用 Skill 的 skill_root/脚本或文档、command -v/Get-Command、--help，或 timeout 的进程/日志/readiness。诊断后再更正命令。",
+            state.code
+        ),
+        CommandRepairStage::CorrectedAttemptRequired => format!(
+            "命令失败（{}）的相关诊断已经完成。现在必须基于刚取得的证据执行有变化的更正尝试；至少改变可执行名、skill_root 绝对路径、解释器、参数或有依据的 timeout。不得原样重跑失败命令。",
+            state.code
+        ),
+    };
+    format!("[codefactory_command_recovery] {marker}\n{instruction}")
+}
+
+fn replayed_command_repair(messages: &[crate::types::ChatMessage]) -> Option<CommandRepairState> {
+    let text = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| match &message.content {
+            crate::types::MessageContent::Text(text) => text
+                .strip_prefix("[codefactory_command_recovery] ")
+                .and_then(|rest| rest.lines().next()),
+            crate::types::MessageContent::Parts(_) => None,
+        })?;
+    let metadata: serde_json::Value = serde_json::from_str(text).ok()?;
+    let code = metadata.get("code")?.as_str()?.to_string();
+    let stage = match metadata.get("stage")?.as_str()? {
+        "diagnostic_required" => CommandRepairStage::DiagnosticRequired,
+        "corrected_attempt_required" => CommandRepairStage::CorrectedAttemptRequired,
+        _ => return None,
+    };
+    Some(CommandRepairState {
+        code,
+        failed_command: String::new(),
+        failed_fingerprint: metadata
+            .get("command_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        effective_timeout_sec: metadata
+            .get("effective_timeout_sec")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(300),
+        stage,
+    })
+}
+
+/// Rebuild the system-owned recovery obligation from a persisted tool-result
+/// envelope. The marker is parsed by the shared loop and forces a tool round.
+pub fn command_repair_replay_prompt(metadata: &serde_json::Value) -> Option<String> {
+    if metadata
+        .get("command_repair_required")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    let stage = match metadata
+        .get("stage")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("diagnostic_required")
+    {
+        "corrected_attempt_required" => CommandRepairStage::CorrectedAttemptRequired,
+        _ => CommandRepairStage::DiagnosticRequired,
+    };
+    Some(command_repair_prompt(&CommandRepairState {
+        code: metadata
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("command_failed")
+            .to_string(),
+        failed_command: String::new(),
+        failed_fingerprint: metadata
+            .get("command_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        effective_timeout_sec: metadata
+            .get("effective_timeout_sec")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(300),
+        stage,
+    }))
+}
+
+async fn cancel_tool_suffix_for_replan(
+    persistence: &dyn Persistence,
+    events: &dyn EventSink,
+    remaining: &[ToolCall],
+) -> Result<Vec<crate::types::ChatMessage>, LoopError> {
+    let contents = persistence.persist_cancelled_tool_batch(remaining).await?;
+    let mut messages = Vec::with_capacity(remaining.len());
+    for (tool_call, content) in remaining.iter().zip(contents) {
+        let args = serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
+        events.emit(crate::types::StreamEvent::ToolCallStart {
+            id: tool_call.id.clone(),
+            name: tool_call.function.name.clone(),
+            args,
+        });
+        events.emit(crate::types::StreamEvent::ToolResult {
+            tool_call_id: tool_call.id.clone(),
+            content: content.clone(),
+            is_error: true,
+            status: "cancelled".into(),
+            metadata: None,
+        });
+        messages.push(crate::types::ChatMessage {
+            role: "tool".into(),
+            content: crate::types::MessageContent::Text(content),
+            tool_calls: None,
+            tool_call_id: Some(tool_call.id.clone()),
+            name: Some(tool_call.function.name.clone()),
+            reasoning_content: None,
+        });
+    }
+    Ok(messages)
+}
+
 /// Finish a tool batch that was cancelled mid-flight: persist each remaining
 /// call as cancelled and emit the terminal `Done{0,0}` exactly once. The crate
 /// twin of the bin's inherent method (keystone slice 4.6b).
@@ -710,7 +967,8 @@ pub async fn run_agent_loop(
     let mut delivery_failure_signature: Option<String> = None;
     let mut structural_denial_seen = false;
     let mut fact_check_used = false;
-    let mut require_tool_next = false;
+    let mut command_repair = replayed_command_repair(&messages);
+    let mut require_tool_next = command_repair.is_some();
     let mut model_round_index = 0_usize;
     let mut stalled_chat_segments = 0_u32;
     let mut root_tool_call_count = match root_turn_id.as_deref() {
@@ -1469,6 +1727,7 @@ pub async fn run_agent_loop(
             let mut blocked_tool_result = false;
             let mut delivery_recovery_action = None;
             let mut structured_delivery_blocker = None;
+            let mut command_repair_interrupted_batch = false;
             let completion_evidence_before_tool_batch = completion_gate.evidence();
 
             for (tool_index, tc) in tool_calls.iter().enumerate() {
@@ -1558,6 +1817,76 @@ pub async fn run_agent_loop(
                 // rule is bash-only, so a surface whose shell tool has another
                 // name must override it or every call reads as ReadOnly.
                 let (classified_command, classified_kind) = tool_backend.classify(tc, &args);
+                if let Some(repair) = command_repair.as_ref() {
+                    let rejection = match repair.stage {
+                        CommandRepairStage::DiagnosticRequired
+                            if !command_repair_diagnostic(
+                                &repair.code,
+                                &tc.function.name,
+                                &args,
+                                &classified_kind,
+                            ) => Some(
+                                "Command repair denied: run one related bounded diagnostic before retrying."
+                                    .to_string(),
+                            ),
+                        CommandRepairStage::CorrectedAttemptRequired
+                            if tc.function.name == "bash"
+                                && command_attempt_matches_failure(
+                                    repair,
+                                    &classified_command,
+                                    &args,
+                                    &cwd,
+                                ) =>
+                        {
+                            Some(
+                                "Command repair denied: the unchanged failed command cannot run again without new evidence."
+                                    .to_string(),
+                            )
+                        }
+                        _ => None,
+                    };
+                    if let Some(content) = rejection {
+                        let metadata = serde_json::json!({
+                            "code": repair.code,
+                            "recoverable": true,
+                            "system_owned": true,
+                            "command_repair_required": true,
+                            "stage": match repair.stage {
+                                CommandRepairStage::DiagnosticRequired => "diagnostic_required",
+                                CommandRepairStage::CorrectedAttemptRequired => "corrected_attempt_required",
+                            },
+                        });
+                        persistence
+                            .record_tool_call_outcome(tc, "denied", None, Some(&content), 0)
+                            .await?;
+                        persistence.record_tool_call_metadata(tc, &metadata).await?;
+                        events.emit(crate::types::StreamEvent::ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            content: content.clone(),
+                            is_error: true,
+                            status: "denied".into(),
+                            metadata: Some(metadata),
+                        });
+                        result_messages.push(crate::types::ChatMessage {
+                            role: "tool".into(),
+                            content: crate::types::MessageContent::Text(content),
+                            tool_calls: None,
+                            tool_call_id: Some(tc.id.clone()),
+                            name: Some(tc.function.name.clone()),
+                            reasoning_content: None,
+                        });
+                        result_messages.extend(
+                            cancel_tool_suffix_for_replan(
+                                persistence.as_ref(),
+                                events.as_ref(),
+                                &tool_calls[tool_index + 1..],
+                            )
+                            .await?,
+                        );
+                        command_repair_interrupted_batch = true;
+                        break;
+                    }
+                }
                 let reusable_verification_key = crate::policy::reusable_local_verification_key(
                     &classified_command,
                     &classified_kind,
@@ -1844,7 +2173,7 @@ pub async fn run_agent_loop(
                     execution.await
                 };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
-                let output = match exec_result {
+                let mut output = match exec_result {
                     Ok(result) => result,
                     Err(error) => {
                         let error_text = error.to_string();
@@ -1882,6 +2211,89 @@ pub async fn run_agent_loop(
                         }));
                     }
                 };
+                let typed_command_failure = command_repair_code(&output).map(str::to_owned);
+                if let Some(code) = typed_command_failure.as_deref() {
+                    let metadata = output.metadata.as_ref();
+                    command_repair = Some(CommandRepairState {
+                        code: code.to_string(),
+                        failed_command: normalized_command(&output.command),
+                        failed_fingerprint: metadata
+                            .and_then(|metadata| metadata.get("command_fingerprint"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        effective_timeout_sec: metadata
+                            .and_then(|metadata| metadata.get("effective_timeout_sec"))
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(300),
+                        stage: CommandRepairStage::DiagnosticRequired,
+                    });
+                } else if command_repair_diagnostic_completed(&output) {
+                    if let Some(repair) = command_repair.as_mut() {
+                        match repair.stage {
+                            CommandRepairStage::DiagnosticRequired
+                                if command_repair_diagnostic(
+                                    &repair.code,
+                                    &tc.function.name,
+                                    &args,
+                                    &classified_kind,
+                                ) =>
+                            {
+                                repair.stage = CommandRepairStage::CorrectedAttemptRequired;
+                                let metadata = output
+                                    .metadata
+                                    .get_or_insert_with(|| serde_json::json!({}));
+                                if let Some(fields) = metadata.as_object_mut() {
+                                    fields.insert(
+                                        "code".into(),
+                                        serde_json::Value::String(repair.code.clone()),
+                                    );
+                                    fields.insert(
+                                        "recoverable".into(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                    fields.insert(
+                                        "system_owned".into(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                    fields.insert(
+                                        "command_repair_required".into(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                    fields.insert(
+                                        "stage".into(),
+                                        serde_json::Value::String(
+                                            "corrected_attempt_required".into(),
+                                        ),
+                                    );
+                                    if let Some(fingerprint) = repair.failed_fingerprint.as_ref() {
+                                        fields.insert(
+                                            "command_fingerprint".into(),
+                                            serde_json::Value::String(fingerprint.clone()),
+                                        );
+                                    }
+                                    fields.insert(
+                                        "effective_timeout_sec".into(),
+                                        serde_json::Value::Number(
+                                            repair.effective_timeout_sec.into(),
+                                        ),
+                                    );
+                                }
+                            }
+                            CommandRepairStage::CorrectedAttemptRequired
+                                if tc.function.name == "bash"
+                                    && !command_attempt_matches_failure(
+                                        repair,
+                                        &output.command,
+                                        &args,
+                                        &cwd,
+                                    ) =>
+                            {
+                                command_repair = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let mut system_owned_tool_wait_reason = None;
                 if matches!(
                     output.status,
@@ -2076,6 +2488,18 @@ pub async fn run_agent_loop(
                     name: Some(tc.function.name.clone()),
                     reasoning_content: None,
                 });
+                if typed_command_failure.is_some() {
+                    result_messages.extend(
+                        cancel_tool_suffix_for_replan(
+                            persistence.as_ref(),
+                            events.as_ref(),
+                            &tool_calls[tool_index + 1..],
+                        )
+                        .await?,
+                    );
+                    command_repair_interrupted_batch = true;
+                    break;
+                }
             }
 
             // The round (and its tool batch) is done — let the surface close it
@@ -2100,6 +2524,38 @@ pub async fn run_agent_loop(
                 reasoning_content: reasoning,
             });
             messages.extend(result_messages);
+            if let Some(repair) = command_repair.as_ref() {
+                require_tool_next = true;
+                let prompt = command_repair_prompt(repair);
+                persistence
+                    .persist_gate_message(&prompt, "command_recovery")
+                    .await?;
+                messages.push(crate::types::ChatMessage {
+                    role: "user".into(),
+                    content: crate::types::MessageContent::Text(prompt),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                });
+                publish_turn_activity(
+                    persistence.as_ref(),
+                    events.as_ref(),
+                    root_turn_id.as_deref(),
+                    "recovering",
+                    "active",
+                    "command_recovery",
+                    "命令执行失败，正在检查正确调用方式",
+                    Some(if command_repair_interrupted_batch {
+                        "已取消失败后尚未开始的旧计划"
+                    } else {
+                        "正在核对 Skill 路径和命令用法"
+                    }),
+                    None,
+                )
+                .await?;
+                continue;
+            }
             if blocker_terminal_reason.as_deref().is_some_and(|reason| {
                 matches!(reason, "permission_timed_out" | "permission_channel_closed")
             }) && !blocked_tool_result
@@ -2719,6 +3175,7 @@ mod tests {
     struct ScriptedTransport {
         responses: Mutex<VecDeque<Result<ModelResponse, TransportError>>>,
         calls: Mutex<Vec<usize>>,
+        require_tool: Mutex<Vec<bool>>,
         requests: Mutex<Vec<Vec<ChatMessage>>>,
         advertised_tools: Mutex<Vec<Vec<ToolDefinition>>>,
     }
@@ -2728,6 +3185,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into_iter().map(Ok).collect()),
                 calls: Mutex::new(Vec::new()),
+                require_tool: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
                 advertised_tools: Mutex::new(Vec::new()),
             }
@@ -2750,10 +3208,15 @@ mod tests {
             self.requests.lock().expect("requests").clone()
         }
 
+        fn require_tool_flags(&self) -> Vec<bool> {
+            self.require_tool.lock().expect("require tool").clone()
+        }
+
         fn from_results(responses: Vec<Result<ModelResponse, TransportError>>) -> Self {
             Self {
                 responses: Mutex::new(responses.into()),
                 calls: Mutex::new(Vec::new()),
+                require_tool: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
                 advertised_tools: Mutex::new(Vec::new()),
             }
@@ -2766,9 +3229,13 @@ mod tests {
             &self,
             messages: &[ChatMessage],
             tools: &[ToolDefinition],
-            _opts: &RoundOptions,
+            opts: &RoundOptions,
         ) -> Result<ModelResponse, TransportError> {
             self.calls.lock().expect("calls").push(tools.len());
+            self.require_tool
+                .lock()
+                .expect("require tool")
+                .push(opts.require_tool);
             self.advertised_tools
                 .lock()
                 .expect("tools")
@@ -2959,6 +3426,81 @@ mod tests {
                 } else {
                     String::new()
                 },
+                stderr: String::new(),
+                error: None,
+                metadata: None,
+                next_working_directory: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct CommandRecoveryTools {
+        executed: Mutex<Vec<String>>,
+    }
+
+    impl CommandRecoveryTools {
+        fn executed(&self) -> Vec<String> {
+            self.executed.lock().expect("executed").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolBackend for CommandRecoveryTools {
+        async fn list_schemas(&self) -> Vec<ToolDefinition> {
+            vec![tool_definition()]
+        }
+
+        async fn execute(
+            &self,
+            call: &ToolCall,
+            args: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolInvocationResult, ToolError> {
+            let command = args
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| call.function.name.clone());
+            self.executed
+                .lock()
+                .expect("executed")
+                .push(command.clone());
+            if command == "old-skill-cli run" {
+                return Ok(ToolInvocationResult {
+                    content: "zsh: command not found: old-skill-cli".into(),
+                    is_error: true,
+                    status: crate::tool::ToolExecutionStatus::Error,
+                    command,
+                    kind: ToolKind::ReadOnly,
+                    return_code: Some(127),
+                    stdout: String::new(),
+                    stderr: "zsh: command not found: old-skill-cli".into(),
+                    error: Some("zsh: command not found: old-skill-cli".into()),
+                    metadata: Some(serde_json::json!({
+                        "code": "command_not_found",
+                        "recoverable": true,
+                        "system_owned": true,
+                        "command_repair_required": true,
+                        "command_fingerprint": "old-fingerprint"
+                    })),
+                    next_working_directory: None,
+                    duration_ms: 1,
+                });
+            }
+            Ok(ToolInvocationResult {
+                content: if call.function.name == "read_file" {
+                    "usage: correct-skill-cli run".into()
+                } else {
+                    "SKILL_RECOVERY_OK".into()
+                },
+                is_error: false,
+                status: crate::tool::ToolExecutionStatus::Done,
+                command,
+                kind: ToolKind::ReadOnly,
+                return_code: Some(0),
+                stdout: "SKILL_RECOVERY_OK".into(),
                 stderr: String::new(),
                 error: None,
                 metadata: None,
@@ -4177,6 +4719,314 @@ mod tests {
                 ..
             } if status == "blocked" && reason == "tool_error"
         )));
+    }
+
+    #[tokio::test]
+    async fn typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "尝试旧命令",
+                vec![
+                    call(
+                        "wrong-command",
+                        "bash",
+                        serde_json::json!({"command": "old-skill-cli run"}),
+                    ),
+                    call(
+                        "stale-batch-read",
+                        "read_file",
+                        serde_json::json!({"path": "unrelated.md"}),
+                    ),
+                ],
+                0,
+            ),
+            response(
+                "原样重试旧命令",
+                vec![call(
+                    "unchanged-retry",
+                    "bash",
+                    serde_json::json!({"command": "old-skill-cli run"}),
+                )],
+                1,
+            ),
+            response(
+                "读取无关状态",
+                vec![call(
+                    "unrelated-diagnostic",
+                    "read_file",
+                    serde_json::json!({"path": "unrelated.md"}),
+                )],
+                2,
+            ),
+            response(
+                "核对 skill 文档",
+                vec![call(
+                    "diagnostic",
+                    "read_file",
+                    serde_json::json!({"path": "/installed/skill/SKILL.md"}),
+                )],
+                3,
+            ),
+            response(
+                "使用文档确认的命令",
+                vec![call(
+                    "corrected-command",
+                    "bash",
+                    serde_json::json!({"command": "correct-skill-cli run"}),
+                )],
+                4,
+            ),
+            response("Skill 已执行成功。", vec![], 5),
+        ]));
+        let tools = Arc::new(CommandRecoveryTools::default());
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut cfg = config();
+        cfg.max_iterations = 8;
+        let mut svc = services(transport.clone(), persistence, events.clone());
+        svc.tools = tools.clone();
+
+        let outcome = run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("command repair remains inside the turn");
+
+        assert_eq!(
+            transport.require_tool_flags(),
+            vec![false, true, true, true, true, false],
+            "diagnostic and changed retry must both be tool-required rounds",
+        );
+        assert_eq!(
+            tools.executed(),
+            vec![
+                "old-skill-cli run",
+                "read_file",
+                "correct-skill-cli run"
+            ],
+            "the stale suffix of the failed batch must not execute",
+        );
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolResult { tool_call_id, status, .. }
+                if tool_call_id == "stale-batch-read" && status == "cancelled"
+        )));
+        for rejected in ["unchanged-retry", "unrelated-diagnostic"] {
+            assert!(events.events().iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolResult { tool_call_id, status, .. }
+                    if tool_call_id == rejected && status == "denied"
+            )));
+        }
+        assert!(events.events().iter().any(|event| matches!(
+            event,
+            StreamEvent::TurnActivityUpdated { recent_activity_kind, .. }
+                if recent_activity_kind == "command_recovery"
+        )));
+        assert_eq!(outcome.final_text, "Skill 已执行成功。");
+    }
+
+    #[tokio::test]
+    async fn corrected_skill_command_closes_requested_observable_without_repeat_probes() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "先执行旧命令",
+                vec![call(
+                    "observable-failure",
+                    "bash",
+                    serde_json::json!({"command": "old-skill-cli run"}),
+                )],
+                0,
+            ),
+            response(
+                "读取 Skill 用法",
+                vec![call(
+                    "observable-diagnostic",
+                    "read_file",
+                    serde_json::json!({"path": "/installed/skill/SKILL.md"}),
+                )],
+                1,
+            ),
+            response(
+                "运行更正命令",
+                vec![call(
+                    "observable-corrected",
+                    "bash",
+                    serde_json::json!({"command": "correct-skill-cli run"}),
+                )],
+                2,
+            ),
+            response("SKILL_RECOVERY_OK", vec![], 3),
+        ]));
+        let tools = Arc::new(CommandRecoveryTools::default());
+        let mut marker_inputs = inputs();
+        marker_inputs.completion_instruction =
+            "执行技能，最终只在真实输出包含 SKILL_RECOVERY_OK 后告诉我".into();
+        let mut cfg = config();
+        cfg.max_iterations = 6;
+        let mut svc = services(
+            transport.clone(),
+            Arc::new(RecordingPersistence::default()),
+            Arc::new(CollectingEventSink::new()),
+        );
+        svc.tools = tools.clone();
+
+        let outcome = run_agent_loop(marker_inputs, cfg, svc)
+            .await
+            .expect("corrected Skill command should settle normally");
+
+        assert_eq!(outcome.stop_reason, StopReason::Finished);
+        assert!(outcome.completion_evidence.completed);
+        assert_eq!(outcome.final_text, "SKILL_RECOVERY_OK");
+        assert_eq!(
+            tools.executed(),
+            vec![
+                "old-skill-cli run",
+                "read_file",
+                "correct-skill-cli run"
+            ],
+            "the corrected command must be the final probe; no duplicate verification",
+        );
+        assert_eq!(transport.require_tool_flags(), vec![false, true, true, false]);
+    }
+
+    #[test]
+    fn waiting_tool_result_is_not_completed_command_diagnostic() {
+        let mut result = ToolInvocationResult {
+            content: "外部状态待核对".into(),
+            is_error: false,
+            status: crate::tool::ToolExecutionStatus::Waiting,
+            command: "opaque-skill-cli --help".into(),
+            kind: ToolKind::ReadOnly,
+            return_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+            metadata: Some(serde_json::json!({
+                "code": "external_state_uncertain",
+                "system_owned": true
+            })),
+            next_working_directory: None,
+            duration_ms: 1,
+        };
+
+        assert!(
+            !command_repair_diagnostic_completed(&result),
+            "Waiting is not evidence that the diagnostic executed",
+        );
+        result.status = crate::tool::ToolExecutionStatus::Done;
+        assert!(command_repair_diagnostic_completed(&result));
+    }
+
+    #[test]
+    fn mutating_help_command_cannot_satisfy_the_diagnostic_stage() {
+        let args = serde_json::json!({
+            "command": "opaque-skill-cli --help && touch changed.txt"
+        });
+        assert!(!command_repair_diagnostic(
+            "invalid_invocation",
+            "bash",
+            &args,
+            &ToolKind::Mutation,
+        ));
+        assert!(command_repair_diagnostic(
+            "invalid_invocation",
+            "bash",
+            &serde_json::json!({"command": "opaque-skill-cli --help"}),
+            &ToolKind::ReadOnly,
+        ));
+    }
+
+    #[test]
+    fn evidence_based_timeout_change_is_not_an_unchanged_retry() {
+        let cwd = std::path::Path::new("/tmp/codefactory-command-recovery");
+        let command = "slow-skill-cli verify";
+        let repair = CommandRepairState {
+            code: "command_timeout".into(),
+            failed_command: normalized_command(command),
+            failed_fingerprint: Some(codefactory_agent_core::command_fingerprint(
+                command,
+                &cwd.to_string_lossy(),
+                300,
+            )),
+            effective_timeout_sec: 300,
+            stage: CommandRepairStage::CorrectedAttemptRequired,
+        };
+
+        assert!(command_attempt_matches_failure(
+            &repair,
+            command,
+            &serde_json::json!({"command": command, "timeout_sec": 300}),
+            cwd,
+        ));
+        assert!(!command_attempt_matches_failure(
+            &repair,
+            command,
+            &serde_json::json!({"command": command, "timeout_sec": 600}),
+            cwd,
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_command_repair_envelope_forces_diagnosis_after_restart() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "恢复后先读 Skill 文档",
+                vec![call(
+                    "restart-diagnostic",
+                    "read_file",
+                    serde_json::json!({"path": "/installed/skill/SKILL.md"}),
+                )],
+                0,
+            ),
+            response(
+                "执行更正命令",
+                vec![call(
+                    "restart-corrected",
+                    "bash",
+                    serde_json::json!({"command": "correct-skill-cli run"}),
+                )],
+                1,
+            ),
+            response("重启后恢复完成。", vec![], 2),
+        ]));
+        let tools = Arc::new(CommandRecoveryTools::default());
+        let mut replay_inputs = inputs();
+        let prompt = command_repair_replay_prompt(&serde_json::json!({
+            "code": "command_not_found",
+            "recoverable": true,
+            "system_owned": true,
+            "command_repair_required": true,
+            "command_fingerprint": "persisted-digest",
+            "effective_timeout_sec": 300,
+            "stage": "diagnostic_required"
+        }))
+        .expect("persisted repair prompt");
+        replay_inputs.messages.push(ChatMessage {
+            role: "user".into(),
+            content: MessageContent::Text(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        });
+        let mut cfg = config();
+        cfg.max_iterations = 6;
+        let mut svc = services(
+            transport.clone(),
+            Arc::new(RecordingPersistence::default()),
+            Arc::new(CollectingEventSink::new()),
+        );
+        svc.tools = tools.clone();
+
+        let outcome = run_agent_loop(replay_inputs, cfg, svc)
+            .await
+            .expect("restart recovery remains model-visible");
+
+        assert_eq!(transport.require_tool_flags(), vec![true, true, false]);
+        assert_eq!(
+            tools.executed(),
+            vec!["read_file", "correct-skill-cli run"]
+        );
+        assert_eq!(outcome.final_text, "重启后恢复完成。");
     }
 
     #[tokio::test]

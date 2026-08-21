@@ -501,6 +501,100 @@ pub enum ToolKind {
     FunctionalProbe { bounded: bool },
 }
 
+/// A narrow, model-actionable failure class for shell invocations. This is
+/// deliberately orthogonal to [`ToolKind`]: an opaque CLI may be read-only,
+/// but `command not found` still requires repair before the turn can finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandFailureKind {
+    CommandNotFound,
+    ResourceNotFound,
+    InvalidInvocation,
+    CommandTimeout,
+    ShellUnavailable,
+}
+
+impl CommandFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandNotFound => "command_not_found",
+            Self::ResourceNotFound => "resource_not_found",
+            Self::InvalidInvocation => "invalid_invocation",
+            Self::CommandTimeout => "command_timeout",
+            Self::ShellUnavailable => "shell_unavailable",
+        }
+    }
+}
+
+/// Classify only failure shapes where checking the executable, resource, or
+/// invocation can change the next attempt. A generic nonzero exit (including
+/// grep/rg no-match) stays untyped so ordinary read-only exploration does not
+/// create a false recovery obligation.
+pub fn classify_command_failure(
+    return_code: Option<i32>,
+    output: &str,
+) -> Option<CommandFailureKind> {
+    let lower = output.to_ascii_lowercase();
+    if return_code == Some(127)
+        || lower.contains("command not found")
+        || lower.contains("not recognized as an internal or external command")
+        || (lower.contains("the term '") && lower.contains("is not recognized"))
+    {
+        return Some(CommandFailureKind::CommandNotFound);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "no such file or directory",
+            "can't open file",
+            "cannot open file",
+            "the system cannot find the path specified",
+            "cannot find path",
+        ],
+    ) {
+        return Some(CommandFailureKind::ResourceNotFound);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "unexpected argument",
+            "unrecognized argument",
+            "unknown argument",
+            "invalid argument",
+            "unrecognized option",
+            "unknown option",
+            "invalid option",
+        ],
+    ) {
+        return Some(CommandFailureKind::InvalidInvocation);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "failed to execute shell",
+            "could not start shell",
+            "shell executable was not found",
+        ],
+    ) {
+        return Some(CommandFailureKind::ShellUnavailable);
+    }
+    None
+}
+
+/// Privacy-safe identity for comparing command attempts across provider and
+/// process boundaries. The raw command remains in its existing tool-call
+/// audit surface; recovery metadata stores only this digest.
+pub fn command_fingerprint(command: &str, cwd: &str, timeout_secs: u64) -> String {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    hasher.update([0]);
+    hasher.update(cwd.as_bytes());
+    hasher.update([0]);
+    hasher.update(timeout_secs.to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn is_long_running_observation_command(lower: &str) -> bool {
     contains_any(
         lower,
@@ -6009,6 +6103,37 @@ mod tests {
         gate.record(&noisy_read);
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    #[test]
+    fn classifies_only_actionable_command_failures() {
+        let cases = [
+            (
+                Some(127),
+                "zsh: command not found: old-skill-cli",
+                Some(CommandFailureKind::CommandNotFound),
+            ),
+            (
+                Some(1),
+                "python3: can't open file 'scripts/run.py': No such file or directory",
+                Some(CommandFailureKind::ResourceNotFound),
+            ),
+            (
+                Some(2),
+                "error: unexpected argument '--verison' found",
+                Some(CommandFailureKind::InvalidInvocation),
+            ),
+            (Some(1), "grep: no matches", None),
+            (Some(1), "business check returned false", None),
+        ];
+
+        for (return_code, text, expected) in cases {
+            assert_eq!(
+                classify_command_failure(return_code, text),
+                expected,
+                "unexpected classification for {text:?}",
+            );
+        }
     }
 
     #[test]
