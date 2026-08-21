@@ -23,6 +23,10 @@ fn encode_repo(repo: &str) -> String {
     repo.replace('/', "%2F")
 }
 
+fn merge_request_payload(expected_head_sha: &str) -> Value {
+    json!({"sha": expected_head_sha})
+}
+
 fn parse_issue(v: &Value) -> RemoteIssue {
     let labels: Vec<String> = v
         .get("labels")
@@ -185,13 +189,30 @@ pub async fn merge_pr(
     repo: &str,
     number: u64,
     _method: &str,
+    expected_head_sha: &str,
 ) -> Result<(), String> {
     let path = format!(
         "/projects/{}/merge_requests/{}/merge",
         encode_repo(repo),
         number
     );
-    client.put(&path, json!({})).await.map(|_| ())
+    client
+        .put(&path, merge_request_payload(expected_head_sha))
+        .await
+        .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_request_payload;
+
+    #[test]
+    fn merge_payload_carries_the_exact_expected_head_cas() {
+        assert_eq!(
+            merge_request_payload("deadbeef"),
+            serde_json::json!({"sha": "deadbeef"})
+        );
+    }
 }
 
 pub async fn list_repos(client: &RemoteGitClient) -> Result<Vec<RemoteRepo>, String> {

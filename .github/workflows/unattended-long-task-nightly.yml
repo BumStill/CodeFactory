@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   historical-scenario-matrix:
-    name: Historical scenario matrix (HLT-001 HLT-002 HLT-003 HLT-004 CXD-001 CXD-002)
+    name: Historical scenario matrix (HLT-001 HLT-002 HLT-003 HLT-004 HLT-005 CXD-001 CXD-002 E2E-011)
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -36,7 +36,7 @@ jobs:
           workspaces: src-tauri
 
       - name: Validate synthetic historical scenario catalog
-        run: node --test scripts/unattended-long-task-contract.test.mjs scripts/history-session-smoke-contract.test.mjs
+        run: node --test scripts/unattended-long-task-contract.test.mjs scripts/history-session-smoke-contract.test.mjs scripts/delivery-recovery-smoke-contract.test.mjs
 
       # Full workspace coverage is intentional here. Required PR CI splits
       # workspace members for readable verdicts; nightly proves the aggregate
@@ -74,6 +74,38 @@ jobs:
         with:
           name: unattended-long-task-nightly-${{ github.run_id }}
           path: ${{ runner.temp }}/unattended-long-task-nightly.json
+          if-no-files-found: error
+
+      - name: Delivery recovery hard-kill and bounded-park smoke
+        id: delivery_recovery_smoke
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "delivery-recovery-nightly.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --delivery-recovery-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Delivery recovery nightly smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if (-not $smoke.ok) { throw "Delivery recovery nightly smoke did not report ok" }
+          if ($smoke.scenario_id -ne "E2E-011") { throw "Nightly ran the wrong delivery scenario" }
+          if (-not $smoke.post_commit_owner_hard_killed) { throw "Nightly did not inject the commit-window hard kill" }
+          if (-not $smoke.pre_ref_owner_hard_killed) { throw "Nightly did not inject the intent-before-ref hard kill" }
+          if (-not $smoke.exact_receipted_head_reconciled) { throw "Nightly did not reconcile the receipted head" }
+          if (-not $smoke.canonical_parent_reconciled) { throw "Nightly did not reconcile the canonical PR parent" }
+          if ($smoke.canonical_parent_mutation_count -ne 0) { throw "Nightly canonical-parent observation issued a mutation" }
+          if (-not $smoke.foreign_identity_parked) { throw "Nightly did not park foreign identity drift" }
+          if (-not $smoke.claim_epoch_plateau) { throw "Nightly delivery claim epoch did not plateau" }
+          if ($smoke.duplicate_remote_write_count -ne 0) { throw "Nightly duplicated a remote mutation" }
+          if ($smoke.user_message_count -ne 1) { throw "Nightly manufactured or lost user input" }
+          if ($smoke.human_prompt_count -ne 0) { throw "Nightly requested human participation" }
+          if (-not $smoke.cleanup_ok) { throw "Nightly delivery recovery leaked isolated state" }
+          Get-Content $receipt
+
+      - name: Upload delivery recovery receipt
+        if: ${{ !cancelled() && steps.delivery_recovery_smoke.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-recovery-nightly-${{ github.run_id }}
+          path: ${{ runner.temp }}/delivery-recovery-nightly.json
           if-no-files-found: error
 
       - name: Historical session restart smoke

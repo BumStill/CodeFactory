@@ -992,6 +992,14 @@ pub fn decision_for_run_outcome_with_reason(
                 RecoveryDomain::Browser,
             )
         }
+        StopReason::PlatformIncident
+            if terminal_reason.is_some_and(|reason| reason.starts_with("delivery_")) =>
+        {
+            (
+                terminal_reason.expect("matched typed delivery recovery outcome"),
+                RecoveryDomain::Delivery,
+            )
+        }
         StopReason::PlatformIncident => (
             terminal_reason.unwrap_or("platform_incident"),
             RecoveryDomain::Tool,
@@ -1018,7 +1026,10 @@ pub fn decision_for_run_outcome_with_reason(
             next_observation_at: Utc::now().timestamp_millis() + 5_000,
             resume_cursor: if matches!(
                 domain,
-                RecoveryDomain::Context | RecoveryDomain::Browser | RecoveryDomain::Tool
+                RecoveryDomain::Context
+                    | RecoveryDomain::Browser
+                    | RecoveryDomain::Delivery
+                    | RecoveryDomain::Tool
             ) {
                 objective
                     .resume_cursor
@@ -1065,6 +1076,15 @@ struct DeliveryTakeoverSettlement {
     binding_id: String,
     resource_generation: i64,
     action_signature: String,
+}
+
+#[derive(Debug, Clone)]
+struct DeliveryIdentityParkPermit {
+    run_id: String,
+    claim_epoch: i64,
+    lease_owner: String,
+    failure_signature: String,
+    attempt_index: i64,
 }
 
 fn delivery_ceiling_rank(value: &str) -> Option<i64> {
@@ -2750,7 +2770,7 @@ impl ObjectiveStore {
         expected_revision: i64,
         decision: DecisionEnvelope,
     ) -> anyhow::Result<ObjectiveSnapshot> {
-        self.apply_decision_inner(expected_revision, decision, None, None)
+        self.apply_decision_inner(expected_revision, decision, None, None, None)
             .await
     }
 
@@ -2764,8 +2784,74 @@ impl ObjectiveStore {
         decision: DecisionEnvelope,
         permit: &codefactory_agent_loop::tool::MutationPermit,
     ) -> anyhow::Result<ObjectiveSnapshot> {
-        self.apply_decision_inner(expected_revision, decision, Some(permit), None)
+        self.apply_decision_inner(expected_revision, decision, Some(permit), None, None)
             .await
+    }
+
+    /// Park a repeated local Delivery identity conflict only while the exact
+    /// DeliveryRun owner+claim epoch is still live. The Objective, linked run,
+    /// chat turn and run controls converge in the same SQLite transaction.
+    pub async fn park_delivery_identity_incident_after_takeover(
+        &self,
+        objective_id: &str,
+        run_id: &str,
+        process: &crate::agent::delivery_run::ProcessIdentity,
+        claim_epoch: i64,
+        failure_signature: &str,
+        attempt_index: i64,
+    ) -> anyhow::Result<ObjectiveSnapshot> {
+        let current = self
+            .get(objective_id)
+            .await?
+            .ok_or_else(|| anyhow!("objective not found"))?;
+        if current.status == ObjectiveStatus::WaitingSystem
+            && current.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
+            && current.recovery_owner.as_deref() == Some(OBJECTIVE_INCIDENT_CONTROLLER)
+            && current.remediation_id.is_none()
+            && current.next_observation_at.is_none()
+            && !current.requires_user_action
+        {
+            return Ok(current);
+        }
+        let mut decision = DecisionRouter::route(
+            &current,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Delivery,
+                failure_code: "delivery_identity_conflict".into(),
+                failure_signature: failure_signature.into(),
+                next_observation_at: Utc::now().timestamp_millis(),
+                resume_cursor: current
+                    .resume_cursor
+                    .clone()
+                    .or_else(|| current.root_turn_id.clone())
+                    .or_else(|| current.task_id.clone()),
+            },
+        )?;
+        decision.decision_type = DecisionType::FailedInternal;
+        decision.status = ObjectiveStatus::WaitingSystem;
+        decision.failure_code = Some(TECHNICAL_RECOVERY_EXHAUSTED.into());
+        decision.failure_signature = Some(failure_signature.into());
+        decision.recovery_owner = Some(OBJECTIVE_INCIDENT_CONTROLLER.into());
+        decision.remediation_id = None;
+        decision.next_observation_at = None;
+        decision.next_action_authorized = false;
+        decision.requires_user_action = false;
+        decision.request_key = None;
+        decision.attention_request = None;
+        self.apply_decision_inner(
+            current.revision,
+            decision,
+            None,
+            None,
+            Some(DeliveryIdentityParkPermit {
+                run_id: run_id.into(),
+                claim_epoch,
+                lease_owner: process.instance_id.clone(),
+                failure_signature: failure_signature.into(),
+                attempt_index,
+            }),
+        )
+        .await
     }
 
     /// Combine newly-observed evidence with the typed durable evidence already
@@ -3092,6 +3178,7 @@ impl ObjectiveStore {
                 resource_generation,
                 action_signature,
             }),
+            None,
         )
         .await
     }
@@ -3197,6 +3284,7 @@ impl ObjectiveStore {
         decision: DecisionEnvelope,
         permit: Option<&codefactory_agent_loop::tool::MutationPermit>,
         delivery_takeover: Option<DeliveryTakeoverSettlement>,
+        delivery_identity_park: Option<DeliveryIdentityParkPermit>,
     ) -> anyhow::Result<ObjectiveSnapshot> {
         let current = self
             .get(&decision.objective_id)
@@ -4044,6 +4132,113 @@ impl ObjectiveStore {
             // Exhaustion is one state transition, not an Objective write
             // followed by best-effort projections. Otherwise a crash can leave
             // a chat turn recovering forever or a pending task redispatchable.
+            let has_delivery_runs: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='delivery_runs'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_delivery_runs == 1 {
+                let parked_delivery = if let Some(park) = delivery_identity_park.as_ref() {
+                    let parked = sqlx::query(
+                        "UPDATE delivery_runs
+                         SET status='platform_incident',
+                             wait_class='delivery_identity_conflict',
+                             next_action='await_system_capability_change',
+                             next_action_authorized=0,
+                             lease_owner=NULL, lease_expires_at=NULL,
+                             failure_code='delivery_identity_conflict',
+                             failure_class='platform_incident',
+                             failure_signature=?, stage_attempt=?,
+                             last_observed_at=?, updated_at=?
+                         WHERE id=? AND objective_id=?
+                           AND id=(SELECT delivery_run_id FROM objectives WHERE id=?)
+                           AND lease_owner=? AND claim_epoch=? AND lease_expires_at>?
+                           AND status NOT IN ('completed','failed','cancelled','rejected')
+                         RETURNING id, stage, wait_class",
+                    )
+                    .bind(&park.failure_signature)
+                    .bind(park.attempt_index)
+                    .bind(now)
+                    .bind(now)
+                    .bind(&park.run_id)
+                    .bind(&decision.objective_id)
+                    .bind(&decision.objective_id)
+                    .bind(&park.lease_owner)
+                    .bind(park.claim_epoch)
+                    .bind(now)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if parked.is_none() {
+                        bail!("delivery identity park permit expired or no longer matches the authoritative run");
+                    }
+                    parked
+                } else {
+                    sqlx::query(
+                        "UPDATE delivery_runs
+                     SET status='platform_incident',
+                         wait_class=CASE
+                           WHEN stage='takeover_reconciliation'
+                            AND wait_class='external_state_uncertain'
+                           THEN 'delivery_identity_conflict'
+                           ELSE wait_class END,
+                         next_action='await_system_capability_change',
+                         next_action_authorized=0,
+                         lease_owner=NULL, lease_expires_at=NULL,
+                         failure_code=COALESCE(failure_code, 'delivery_identity_conflict'),
+                         failure_class=COALESCE(failure_class, 'platform_incident'),
+                         last_observed_at=?, updated_at=?
+                     WHERE objective_id=?
+                       AND id=(SELECT delivery_run_id FROM objectives WHERE id=?)
+                       AND status NOT IN ('completed','failed','cancelled','rejected')
+                     RETURNING id, stage, wait_class",
+                    )
+                    .bind(now)
+                    .bind(now)
+                    .bind(&decision.objective_id)
+                    .bind(&decision.objective_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                };
+                if let Some(run) = parked_delivery {
+                    let has_delivery_events: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE type='table' AND name='delivery_run_events'",
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if has_delivery_events == 1 {
+                        let run_id: String = run.try_get("id")?;
+                        let stage: String = run.try_get("stage")?;
+                        let wait_class: Option<String> = run.try_get("wait_class")?;
+                        sqlx::query(
+                            "INSERT INTO delivery_run_events
+                             (id, run_id, event_kind, stage, status, wait_class,
+                              detail_json, process_instance, created_at)
+                             VALUES (?, ?, 'objective_incident_parked', ?,
+                                     'platform_incident', ?, ?, ?, ?)",
+                        )
+                        .bind(Uuid::new_v4().to_string())
+                        .bind(run_id)
+                        .bind(stage)
+                        .bind(wait_class)
+                        .bind(
+                            serde_json::json!({
+                                "reason": "linked_objective_recovery_exhausted",
+                                "next_action": "await_system_capability_change",
+                                "failure_signature": delivery_identity_park.as_ref().map(|park| &park.failure_signature),
+                                "stage_attempt": delivery_identity_park.as_ref().map(|park| park.attempt_index),
+                                "claim_epoch": delivery_identity_park.as_ref().map(|park| park.claim_epoch),
+                            })
+                            .to_string(),
+                        )
+                        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+                        .bind(now)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
             let turn_projection_columns: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM pragma_table_info('chat_turn_state')
                  WHERE name IN ('revision','phase','status','recent_activity_kind',
@@ -7892,6 +8087,43 @@ mod tests {
     }
 
     #[test]
+    fn typed_delivery_transport_outcomes_keep_the_delivery_recovery_domain() {
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-delivery-interruption",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "validated_change",
+        );
+        objective.root_turn_id = Some("turn-delivery-anchor".into());
+        objective.resume_cursor = Some("turn-delivery-active".into());
+        let outcome = RunOutcome {
+            final_text: String::new(),
+            final_message_id: None,
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::PlatformIncident,
+        };
+
+        for reason in [
+            "delivery_identity_conflict",
+            "delivery_external_state_uncertain",
+            "delivery_mutation_receipt_unknown",
+        ] {
+            let decision =
+                decision_for_run_outcome_with_reason(&objective, &outcome, Some(reason)).unwrap();
+            assert_eq!(decision.domain, RecoveryDomain::Delivery);
+            assert_eq!(decision.status, ObjectiveStatus::WaitingSystem);
+            assert_eq!(decision.failure_code.as_deref(), Some(reason));
+            assert_eq!(
+                decision.resume_cursor.as_deref(),
+                Some("turn-delivery-active")
+            );
+            assert!(!decision.requires_user_action);
+        }
+    }
+
+    #[test]
     fn typed_tool_transport_outcomes_preserve_the_exact_recovery_reason() {
         let mut objective = ObjectiveSnapshot::new(
             "objective-tool-interruption",
@@ -8259,8 +8491,52 @@ mod tests {
     #[tokio::test]
     async fn repeated_failure_signature_parks_a_system_owned_incident() {
         let pool = pool().await;
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
         let store = ObjectiveStore::new(pool.clone());
         let mut current = recovery_ceiling_objective(&pool, "objective-recovery-ceiling").await;
+        let delivery_process = crate::agent::delivery_run::ProcessIdentity::new(
+            "process-recovery-ceiling-delivery",
+            "test",
+            "test",
+        );
+        let delivery = crate::agent::delivery_run::NewDeliveryRun {
+            id: "delivery-recovery-ceiling".into(),
+            objective_id: current.id.clone(),
+            run_kind: "deliver_changes".into(),
+            session_id: current.session_id.clone(),
+            root_turn_id: current.root_turn_id.clone(),
+            task_segment_id: Some("segment-recovery-ceiling".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:recovery-ceiling".into(),
+            repo_identity: "repo:recovery-ceiling".into(),
+            base_branch: "main".into(),
+            head_branch: "feature/recovery-ceiling".into(),
+            change_set_digest: "sha256:recovery-ceiling".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: Some(411),
+            canonical_pr_url: Some("https://example.invalid/pull/411".into()),
+            canonical_head_sha: Some("abc".into()),
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "pr_open".into(),
+            stage: "takeover_reconciliation".into(),
+            status: "platform_incident".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("observe_only_reconcile".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        crate::agent::delivery_run::create_delivery_run(
+            &pool,
+            &delivery,
+            &delivery_process,
+            Utc::now().timestamp_millis(),
+            90_000,
+        )
+        .await
+        .unwrap();
         sqlx::query(
             "CREATE TABLE messages (
                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
@@ -8388,6 +8664,26 @@ mod tests {
             claimable_remediations(&pool, &current.id).await,
             0,
             "the supervisor must have nothing left to claim"
+        );
+        let delivery_projection: (String, Option<String>, i64, Option<String>, Option<i64>) =
+            sqlx::query_as(
+                "SELECT status, wait_class, next_action_authorized,
+                        lease_owner, lease_expires_at
+                 FROM delivery_runs WHERE id='delivery-recovery-ceiling'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery_projection,
+            (
+                "platform_incident".into(),
+                Some("delivery_identity_conflict".into()),
+                0,
+                None,
+                None,
+            ),
+            "Objective recovery exhaustion must atomically fence its linked DeliveryRun"
         );
         let projection: (
             String,

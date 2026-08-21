@@ -40,8 +40,8 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/crates/agent-loop/src/*.rs", "src-tauri/src/agent/mod.rs", "src-tauri/src/commands/skills.rs", "src-tauri/src/tools/bash.rs", "src-tauri/src/trajectory.rs"],
-      "automated_by": ["rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:persisted_command_repair_envelope_forces_diagnosis_after_restart", "rust:structured_tool_metadata_is_persisted_separately_from_result_text", "rust:command_failure_envelope_survives_file_sqlite_restart", "binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"],
+      "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/crates/agent-loop/src/*.rs", "src-tauri/src/agent/mod.rs", "src-tauri/src/commands/skills.rs", "src-tauri/src/tools/bash.rs", "src-tauri/src/trajectory.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs"],
+      "automated_by": ["rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:persisted_command_repair_envelope_forces_diagnosis_after_restart", "rust:structured_tool_metadata_is_persisted_separately_from_result_text", "rust:command_failure_envelope_survives_file_sqlite_restart", "binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke"],
       "required_evidence": ["L1", "L2", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -51,8 +51,8 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs"],
-      "automated_by": ["rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling", "rust:repeated_failure_signature_parks_a_system_owned_incident"],
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs"],
+      "automated_by": ["rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "binary:--delivery-recovery-smoke"],
       "required_evidence": ["L0", "L1", "L2"],
       "gates": ["pull_request", "nightly"]
     },
@@ -84,8 +84,8 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/tool_backend.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/commands/session.rs", "src/stores/chat.ts", "src/stores/chatEvents.ts", "src/lib/turnOwnership.ts", "src/components/MessageList.tsx", "src/pages/Workspace/WorkspacePage.tsx", "src/acceptance/turn-handback.tsx", "scripts/verify-turn-handback-headless.mjs"],
-      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/pages/Workspace/WorkspacePage.systemStop.test.tsx", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke"],
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/tool_backend.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/commands/session.rs", "src/stores/chat.ts", "src/stores/chatEvents.ts", "src/lib/turnOwnership.ts", "src/components/MessageList.tsx", "src/pages/Workspace/WorkspacePage.tsx", "src/acceptance/turn-handback.tsx", "scripts/verify-turn-handback-headless.mjs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs"],
+      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/pages/Workspace/WorkspacePage.systemStop.test.tsx", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke"],
       "required_evidence": ["L0", "L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -106,10 +106,10 @@
       "category": "conversation_delivery",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/delivery*.rs", ".github/workflows/release.yml"],
-      "automated_by": ["rust:receipt_backed_delivery_completion_atomically_completes_run_and_objective", "workflow:Verify Windows release executable unattended long task"],
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs", ".github/workflows/release.yml"],
+      "automated_by": ["rust:receipt_backed_delivery_completion_atomically_completes_run_and_objective", "rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "binary:--delivery-recovery-smoke", "workflow:Verify Windows release executable DeliveryRun recovery"],
       "required_evidence": ["L1", "L2", "L4"],
-      "gates": ["nightly", "release_artifact"]
+      "gates": ["pull_request", "nightly", "release_artifact"]
     },
     {
       "id": "UI-001",
@@ -544,6 +544,33 @@
       "automation_status": "partially_implemented",
       "automated_by": ["rust:local_directory_install_survives_source_cleanup_with_nested_resources", "rust:symlinked_skill_payload_fails_closed_without_replacing_existing_install", "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:evidence_based_timeout_change_is_not_an_unchanged_retry", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:command_failure_envelope_survives_file_sqlite_restart"],
       "remaining_gaps": ["L2 独立二进制 hard-kill smoke 尚未接入 nightly", "L4 exact release 安装版单消息 canary 待本次 release 执行"]
+    },
+    {
+      "id": "E2E-011",
+      "name": "DeliveryRun 本地提交掉线续接与外来身份有界停泊",
+      "priority": "P0",
+      "covers": ["HLT-001", "HLT-002", "HLT-005", "CXD-002"],
+      "must_remain_unattended": true,
+      "fixture": {"synthetic": true, "shape": "真实 Git worktree、bare remote、生产 SQLite、同一 DeliveryRun 的本地 commit write-ahead receipt 与另一个无 receipt 外来 commit"},
+      "steps": [
+        "一次授权后由正式 executable 复制真实 index 到隔离 index，计算 scoped target tree 与精确 child SHA，先持久化 local-commit intent，再以带 owner token 的 Git index.lock 准备目标 index，并在 branch ref CAS 前注入 hard kill",
+        "替代进程必须以 receipt 中预先记录的 exact child SHA 加 parent/tree/message/repo/worktree 原子修订同一 run；身份修订后再次 hard kill，下一 owner 仍能从 durable revision 读取 canonical parent allowance",
+        "第三个 owner 走生产 resume 入口，只 push 一次并复用 canonical PR #1；下一 claim 经 Completion Arbiter 同时完成 Objective、DeliveryRun 和 pending deliver_changes tool call",
+        "创建第二个 run 后注入无 receipt 外来提交，跨两个 owner/lease expiry 重复相同 takeover failure",
+        "确认第二次失败形成单一 parked incident，此后 claim epoch/event 稳定且 bare remote 不变"
+      ],
+      "fault_injection": ["post-intent pre-ref-CAS hard kill", "post-ref pre-identity-revision unit crash window", "post-identity-revision pre-push second hard kill", "canonical PR remains at receipted parent", "lease expiry across three process owners", "same parent/tree/message but foreign child SHA", "unreceipted foreign commit", "repeated identical takeover signature", "third startup recovery poll"],
+      "oracles": {
+        "ui": ["技术恢复不要求用户继续；稳定停泊后不得呈现 spinner、Stop 或进行中进度"],
+        "durable_state": ["同一 objective/delivery run", "user message 总数为 1", "human prompt 总数为 0", "identity revision 恰好 1", "Completion Arbiter 将 Objective、DeliveryRun、pending tool 一致完成", "foreign incident stage_attempt=2 且 Objective/DeliveryRun mutation authority/lease 同事务清空", "第三次 poll 后 claim_epoch plateau"],
+        "process": ["seed owner 与 identity-rebind owner 都被 hard kill，最终 replacement PID 不同", "夹具进程与目录全部回收"],
+        "side_effects": ["只接受 receipt 中 exact child SHA", "第二次 lease loss 后 canonical parent allowance 仍可持久恢复", "同一 branch 只 push 一次且 canonical PR number 恒为 1", "foreign run mutation intent 总数为 0", "human prompt 总数为 0"],
+        "delivery": ["PR、nightly、exact release executable 和安装后正式 binary 使用同一 receipt schema，并绑定 build SHA"]
+      },
+      "execution": {"pull_request": "exact executable real Git/SQLite smoke", "nightly": "Windows hard-kill and bounded-park matrix", "release_artifact": "exact Windows executable; installed macOS recovery and visible UI remain release canaries"},
+      "automation_status": "partially_implemented",
+      "automated_by": ["rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke", "workflow:Verify Windows release executable DeliveryRun recovery"],
+      "remaining_gaps": ["L3 正式桌面会话内尚未把本场景 synthetic DeliveryRun 绑定到可见 spinner/Stop/停泊文案自动验收", "macOS 公开安装包中的 --delivery-recovery-smoke 仍需在 release canary 执行并绑定 exact tag SHA"]
     }
   ]
 }

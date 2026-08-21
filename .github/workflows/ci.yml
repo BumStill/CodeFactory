@@ -102,6 +102,10 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:history-session-contract
 
+      - name: Delivery recovery scenario contract
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:delivery-recovery-contract
+
       - name: Shared cargo wrapper contract
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:cargo-shared
@@ -299,6 +303,38 @@ jobs:
           if ($smoke.provider_request_count -lt 5) { throw "The deterministic provider trajectory was incomplete" }
           if (-not $smoke.artifact_verified) { throw "The recovered workspace was not verified" }
           if (-not $smoke.cleanup_ok) { throw "The unattended smoke leaked isolated state" }
+          Get-Content $receipt
+
+      # E2E-011: a real Git commit crosses a hard process kill before the
+      # DeliveryRun head revision is persisted. The replacement process must
+      # adopt the exact write-ahead receipt once, while foreign identity drift
+      # remains mutation-free and reaches a bounded parked incident.
+      - name: Delivery recovery cross-process smoke
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "delivery-recovery-smoke.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --delivery-recovery-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Delivery recovery smoke exited $LASTEXITCODE" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if (-not $smoke.ok) { throw "Delivery recovery smoke did not report ok" }
+          if ($smoke.scenario_id -ne "E2E-011") { throw "Delivery recovery smoke ran the wrong scenario" }
+          if (-not $smoke.process_restart_observed) { throw "Replacement process was not observed" }
+          if (-not $smoke.post_commit_owner_hard_killed) { throw "Post-commit owner was not hard-killed" }
+          if (-not $smoke.pre_ref_owner_hard_killed) { throw "Owner was not hard-killed after intent and before ref CAS" }
+          if (-not $smoke.same_delivery_run) { throw "Recovery changed DeliveryRun identity" }
+          if (-not $smoke.exact_receipted_head_reconciled) { throw "Receipted local head was not reconciled" }
+          if ($smoke.identity_revision_count -ne 1) { throw "Local head revision was not exactly once" }
+          if (-not $smoke.canonical_parent_reconciled) { throw "Receipted child could not observe its canonical PR parent" }
+          if ($smoke.canonical_parent_mutation_count -ne 0) { throw "Canonical-parent observation issued a mutation" }
+          if (-not $smoke.foreign_identity_parked) { throw "Foreign identity did not park" }
+          if (-not $smoke.claim_epoch_plateau) { throw "Delivery claims did not plateau" }
+          if ($smoke.recovery_parked_event_count -ne 1) { throw "Parked incident was not singular" }
+          if ($smoke.duplicate_remote_write_count -ne 0) { throw "Recovery duplicated a remote mutation" }
+          if (-not $smoke.remote_head_unchanged) { throw "Foreign recovery changed the remote head" }
+          if ($smoke.user_message_count -ne 1) { throw "Delivery recovery manufactured or lost user input" }
+          if ($smoke.human_prompt_count -ne 0) { throw "Delivery recovery requested human input" }
+          if (-not $smoke.cleanup_ok) { throw "Delivery recovery smoke leaked isolated state" }
           Get-Content $receipt
 
       # E2E-002/E2E-003/E2E-007: use production SQLite admission, cancellation

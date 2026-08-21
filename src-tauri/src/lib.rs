@@ -132,6 +132,80 @@ pub fn run_history_session_smoke_cli() -> bool {
     }
 }
 
+/// Execute the real Git/SQLite DeliveryRun crash-recovery contract before
+/// Tauri initializes. Parent and workers are the exact same executable.
+#[cfg(not(test))]
+pub fn run_delivery_recovery_smoke_cli() -> bool {
+    let args = std::env::args().collect::<Vec<_>>();
+    let Some(flag) = args.get(1).map(String::as_str) else {
+        return false;
+    };
+    if !matches!(
+        flag,
+        "--delivery-recovery-smoke" | "--delivery-recovery-worker"
+    ) {
+        return false;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Delivery recovery smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    match flag {
+        "--delivery-recovery-smoke" => {
+            if args.len() != 3 {
+                eprintln!("usage: CodeFactory --delivery-recovery-smoke <receipt.json>");
+                std::process::exit(2);
+            }
+            let output = std::path::PathBuf::from(&args[2]);
+            match runtime.block_on(agent::delivery_recovery_smoke::run_parent()) {
+                Ok(receipt) => {
+                    let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+                    if let Err(error) = std::fs::write(&output, rendered.as_bytes()) {
+                        eprintln!(
+                            "Delivery recovery smoke could not write {}: {error}",
+                            output.display()
+                        );
+                        std::process::exit(1);
+                    }
+                    println!("{rendered}");
+                    true
+                }
+                Err(error) => {
+                    let receipt = serde_json::json!({
+                        "ok": false,
+                        "scenario_id": "E2E-011",
+                        "error": error.to_string(),
+                    });
+                    let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+                    let _ = std::fs::write(&output, rendered.as_bytes());
+                    eprintln!("Delivery recovery smoke failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "--delivery-recovery-worker" => {
+            if args.len() != 4 {
+                eprintln!(
+                    "usage: CodeFactory --delivery-recovery-worker <state-dir> <seed|rebind|push|recover>"
+                );
+                std::process::exit(2);
+            }
+            let state_dir = std::path::PathBuf::from(&args[2]);
+            if let Err(error) = runtime.block_on(agent::delivery_recovery_smoke::run_worker(
+                &state_dir, &args[3],
+            )) {
+                eprintln!("Delivery recovery worker failed: {error}");
+                std::process::exit(1);
+            }
+            true
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Execute the network-hermetic, cross-process long-task contract before
 /// Tauri initializes. Both the parent and its internal workers are copies of
 /// this exact formal executable, so release CI never substitutes a test EXE.

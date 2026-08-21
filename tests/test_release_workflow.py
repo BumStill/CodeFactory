@@ -349,7 +349,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertGreaterEqual(workflow.count("ref: ${{ inputs.tag }}"), 5)
+        self.assertEqual(workflow.count("ref: ${{ inputs.tag }}"), 1)
+        self.assertGreaterEqual(
+            workflow.count("ref: ${{ needs.prepare-release.outputs.tag_sha }}"), 4
+        )
         self.assertIn(
             "CODEFACTORY_BUILD_GIT_SHA: "
             "${{ needs.prepare-release.outputs.tag_sha }}",
@@ -357,6 +360,42 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("github.ref_name", workflow)
         self.assertNotIn("GITHUB_REF_NAME", workflow)
+
+    def test_release_freezes_one_authorized_tag_sha_for_every_build_and_mutation(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        expected_input = workflow.split("expected_head_sha:", 1)[1].split(
+            "concurrency:", 1
+        )[0]
+        self.assertIn("required: false", expected_input)
+        self.assertIn('default: ""', expected_input)
+        self.assertIn(
+            "authorized_tag_sha: ${{ steps.authorize.outputs.authorized_tag_sha }}",
+            workflow,
+        )
+        self.assertIn(
+            'echo "authorized_tag_sha=$AUTHORIZED_TAG_SHA" >> "$GITHUB_OUTPUT"',
+            workflow,
+        )
+        self.assertGreaterEqual(
+            workflow.count("ref: ${{ needs.prepare-release.outputs.tag_sha }}"),
+            4,
+            "prepare/build/finalize/published verification must checkout the frozen commit, not a mutable tag",
+        )
+        self.assertNotIn("ref: ${{ inputs.tag }}", workflow.split("prepare-release:", 1)[1])
+        self.assertGreaterEqual(
+            workflow.count("Require remote release tag to remain authorized"),
+            4,
+            "draft creation, both build uploads, and final publication must all recheck tag identity",
+        )
+        self.assertIn(
+            'REMOTE_TAG_SHA="$(git rev-parse "${TAG}^{commit}")"', workflow
+        )
+        self.assertIn(
+            'if [ "$REMOTE_TAG_SHA" != "$AUTHORIZED_TAG_SHA" ]; then', workflow
+        )
 
     def test_latest_manifest_carries_the_binary_build_identity(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
@@ -436,7 +475,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
         self.assertIn("verify-published-macos:", workflow)
         job = workflow.split("verify-published-macos:", 1)[1]
-        self.assertIn("needs: finalize", job)
+        self.assertIn("needs: [finalize, prepare-release]", job)
         self.assertIn("runs-on: macos-latest", job)
         self.assertNotIn("GH_TOKEN:", job)
         self.assertIn("env -u GH_TOKEN curl", job)

@@ -14,6 +14,7 @@ use crate::errors::Result;
 
 const NON_TERMINAL_PREDICATE: &str =
     "status NOT IN ('completed', 'failed', 'cancelled', 'rejected')";
+pub(crate) const MAX_IDENTICAL_TAKEOVER_FAILURES: i64 = 2;
 const STABLE_IDENTITY_PREDICATE: &str = "(
     objective_id IS NOT NULL AND objective_id <> ''
     AND ((session_id IS NOT NULL AND session_id <> '' AND root_turn_id IS NOT NULL AND root_turn_id <> '')
@@ -233,6 +234,75 @@ fn monotonic_reached_ceiling(previous: &str, observed: &str) -> String {
         (Some(_), None) => previous.to_string(),
         _ => observed.to_string(),
     }
+}
+
+async fn latest_failure_claim_epoch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    run_id: &str,
+    signature: &str,
+) -> Result<Option<i64>> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT CAST(json_extract(detail_json, '$.claim_epoch') AS INTEGER)
+         FROM delivery_run_events
+         WHERE run_id=?
+           AND CASE WHEN json_valid(detail_json)
+                    THEN json_extract(detail_json, '$.failure_signature')=?
+                    ELSE 0 END
+           AND CASE WHEN json_valid(detail_json)
+                    THEN json_type(detail_json, '$.claim_epoch')='integer'
+                    ELSE 0 END
+         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .bind(run_id)
+    .bind(signature)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+pub async fn next_delivery_failure_attempt(
+    pool: &SqlitePool,
+    run_id: &str,
+    process: &ProcessIdentity,
+    claim_epoch: i64,
+    signature: &str,
+    now: i64,
+) -> Result<i64> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT failure_signature, stage_attempt, lease_expires_at
+         FROM delivery_runs WHERE id=? AND lease_owner=? AND claim_epoch=?",
+    )
+    .bind(run_id)
+    .bind(&process.instance_id)
+    .bind(claim_epoch)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        crate::errors::AppError::Other(
+            "delivery failure attempt rejected because this process does not own the lease".into(),
+        )
+    })?;
+    if !row
+        .try_get::<Option<i64>, _>("lease_expires_at")?
+        .is_some_and(|expires_at| expires_at > now)
+    {
+        return Err(crate::errors::AppError::Other(
+            "delivery failure attempt rejected because the owned lease has expired".into(),
+        ));
+    }
+    let previous_signature = row.try_get::<Option<String>, _>("failure_signature")?;
+    let previous_attempt = row.try_get::<i64, _>("stage_attempt")?;
+    let last_claim_epoch = latest_failure_claim_epoch(&mut tx, run_id, signature).await?;
+    let attempt = if previous_signature.as_deref() != Some(signature) {
+        1
+    } else if last_claim_epoch == Some(claim_epoch) {
+        previous_attempt
+    } else {
+        previous_attempt.saturating_add(1)
+    };
+    tx.commit().await?;
+    Ok(attempt.max(1))
 }
 
 async fn ensure_delivery_run_column(pool: &SqlitePool, name: &str, definition: &str) -> Result<()> {
@@ -877,6 +947,7 @@ fn validated_positive_mutation_reconciliation_evidence(
             .is_some_and(|value| !value.trim().is_empty())
     };
     let positive = match confirmation {
+        "local_commit_matches" => non_empty("head_sha") && non_empty("tree_sha"),
         "remote_head_matches" => non_empty("remote_head_sha"),
         "open_pr_matches" => {
             observation
@@ -908,6 +979,9 @@ fn validated_positive_mutation_reconciliation_evidence(
                 && non_empty("head_sha")
         }
         "release_observed" => non_empty("head_sha") && non_empty("detail_digest"),
+        "committed_result_receipt" => {
+            intent.status == "committed" && non_empty("result_digest")
+        }
         _ => false,
     };
     if !positive {
@@ -1111,7 +1185,7 @@ pub async fn list_unresolved_delivery_mutation_intents(
         "SELECT intent_id, run_id, claim_epoch, rung, operation_key, status,
                 process_instance, evidence_json, started_at, updated_at
          FROM delivery_mutation_intents
-         WHERE run_id=? AND status IN ('started', 'unknown')
+         WHERE run_id=? AND status IN ('started', 'unknown', 'committed')
          ORDER BY started_at, intent_id",
     )
     .bind(run_id)
@@ -1288,7 +1362,7 @@ pub async fn mark_delivery_mutation_intent_reconciled_committed(
     let updated = sqlx::query(
         "UPDATE delivery_mutation_intents
          SET status='reconciled_committed', evidence_json=?, updated_at=?
-         WHERE intent_id=? AND status IN ('started', 'unknown')
+         WHERE intent_id=? AND status IN ('started', 'unknown', 'committed')
            AND EXISTS (
              SELECT 1 FROM delivery_runs
              WHERE delivery_runs.id=delivery_mutation_intents.run_id
@@ -1398,6 +1472,223 @@ pub async fn verify_delivery_mutation_permit(
     Ok(permitted == 1)
 }
 
+/// Hold the SQLite writer fence while completing the exact local ref CAS
+/// covered by an older owner's unresolved `git_local_commit` intent. Unlike a
+/// normal mutation permit this purpose-specific recovery permit intentionally
+/// allows that one unresolved intent, but nothing else. Cancellation, parking,
+/// lease expiry, or a newer owner must win before the Git ref can move.
+pub async fn with_receipted_local_commit_cas<T, F>(
+    pool: &SqlitePool,
+    run_id: &str,
+    process: &ProcessIdentity,
+    claim_epoch: i64,
+    intent_id: &str,
+    operation_key: &str,
+    now: i64,
+    action: F,
+) -> Result<T>
+where
+    F: FnOnce() -> std::result::Result<T, String>,
+{
+    let mut tx = pool.begin().await?;
+    let commit_boundary_now = if now >= 1_000_000_000_000 {
+        chrono::Utc::now().timestamp_millis()
+    } else {
+        now
+    };
+    let has_objectives: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objectives'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_objectives == 0 {
+        tx.rollback().await?;
+        return Err(crate::errors::AppError::Other(
+            "receipted local commit CAS requires the authoritative Objective schema".into(),
+        ));
+    }
+    let authority_sql =
+        "UPDATE delivery_runs SET last_observed_at=last_observed_at
+         WHERE id=? AND lease_owner=? AND claim_epoch=? AND lease_expires_at>?
+           AND next_action_authorized=1
+           AND status IN ('running','waiting','platform_incident','agent_action_required',
+                          'failed_internal','awaiting_completion_arbitration')
+           AND EXISTS (
+             SELECT 1 FROM objectives
+             WHERE objectives.id=delivery_runs.objective_id
+               AND objectives.delivery_run_id=delivery_runs.id
+               AND objectives.status IN ('active','waiting_system')
+               AND NOT (
+                 objectives.status='waiting_system'
+                 AND objectives.failure_code='technical_recovery_exhausted'
+                 AND objectives.next_observation_at IS NULL
+               )
+           )";
+    let authorized = sqlx::query(authority_sql)
+        .bind(run_id)
+        .bind(&process.instance_id)
+        .bind(claim_epoch)
+        .bind(commit_boundary_now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if authorized != 1 {
+        tx.rollback().await?;
+        return Err(crate::errors::AppError::Other(
+            "receipted local commit CAS rejected a stale, expired, cancelled, or parked owner"
+                .into(),
+        ));
+    }
+    let exact_intent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_mutation_intents
+         WHERE intent_id=? AND run_id=? AND rung='git_local_commit'
+           AND operation_key=? AND status IN ('started','unknown')",
+    )
+    .bind(intent_id)
+    .bind(run_id)
+    .bind(operation_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    if exact_intent != 1 {
+        tx.rollback().await?;
+        return Err(crate::errors::AppError::Other(
+            "receipted local commit CAS lacks its exact unresolved intent".into(),
+        ));
+    }
+
+    let result = match action() {
+        Ok(result) => result,
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(crate::errors::AppError::Other(error));
+        }
+    };
+    sqlx::query(
+        "INSERT INTO delivery_run_events
+         (id, run_id, event_kind, stage, status, detail_json, process_instance, created_at)
+         VALUES (?, ?, 'local_commit_ref_materialized', 'local_commit_reconciliation',
+                 'running', ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(
+        serde_json::json!({
+            "intent_id": intent_id,
+            "operation_key": operation_key,
+            "claim_epoch": claim_epoch,
+        })
+        .to_string(),
+    )
+    .bind(&process.instance_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// Hold the durable writer fence while a replacement owner binds the local
+/// branch to the exact head produced by a previously committed provider branch
+/// update. The immutable old->new receipt is the only exception to the normal
+/// takeover identity equality rule.
+pub async fn with_receipted_branch_update_cas<T, F>(
+    pool: &SqlitePool,
+    run_id: &str,
+    process: &ProcessIdentity,
+    claim_epoch: i64,
+    intent_id: &str,
+    operation_key: &str,
+    now: i64,
+    action: F,
+) -> Result<T>
+where
+    F: FnOnce() -> std::result::Result<T, String>,
+{
+    let mut tx = pool.begin().await?;
+    let commit_boundary_now = if now >= 1_000_000_000_000 {
+        chrono::Utc::now().timestamp_millis()
+    } else {
+        now
+    };
+    let authorized = sqlx::query(
+        "UPDATE delivery_runs SET last_observed_at=last_observed_at
+         WHERE id=? AND lease_owner=? AND claim_epoch=? AND lease_expires_at>?
+           AND next_action_authorized=1
+           AND status IN ('running','waiting','platform_incident','agent_action_required',
+                          'failed_internal','awaiting_completion_arbitration')
+           AND EXISTS (
+             SELECT 1 FROM objectives
+             WHERE objectives.id=delivery_runs.objective_id
+               AND objectives.delivery_run_id=delivery_runs.id
+               AND objectives.status IN ('active','waiting_system')
+               AND NOT (
+                 objectives.status='waiting_system'
+                 AND objectives.failure_code='technical_recovery_exhausted'
+                 AND objectives.next_observation_at IS NULL
+               )
+           )",
+    )
+    .bind(run_id)
+    .bind(&process.instance_id)
+    .bind(claim_epoch)
+    .bind(commit_boundary_now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if authorized != 1 {
+        tx.rollback().await?;
+        return Err(crate::errors::AppError::Other(
+            "receipted branch-update CAS rejected a stale, expired, cancelled, or parked owner"
+                .into(),
+        ));
+    }
+    let exact_intent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_mutation_intents
+         WHERE intent_id=? AND run_id=? AND rung='provider_pr_branch_update'
+           AND operation_key=? AND status IN ('committed','reconciled_committed')",
+    )
+    .bind(intent_id)
+    .bind(run_id)
+    .bind(operation_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    if exact_intent != 1 {
+        tx.rollback().await?;
+        return Err(crate::errors::AppError::Other(
+            "receipted branch-update CAS lacks its exact committed intent".into(),
+        ));
+    }
+    let result = match action() {
+        Ok(result) => result,
+        Err(error) => {
+            tx.rollback().await?;
+            return Err(crate::errors::AppError::Other(error));
+        }
+    };
+    sqlx::query(
+        "INSERT INTO delivery_run_events
+         (id, run_id, event_kind, stage, status, detail_json, process_instance, created_at)
+         VALUES (?, ?, 'branch_update_head_materialized', 'branch_update_reconciliation',
+                 'running', ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(
+        serde_json::json!({
+            "intent_id": intent_id,
+            "operation_key": operation_key,
+            "claim_epoch": claim_epoch,
+        })
+        .to_string(),
+    )
+    .bind(&process.instance_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
 /// Promote an observe-only takeover claim into a mutation-capable claim after
 /// the caller has reconciled local and remote state without issuing a write.
 /// Replays are idempotent; a stale owner or epoch can never reconcile a newer
@@ -1504,7 +1795,7 @@ pub async fn record_delivery_observation(
         "SELECT objective_id, repo_identity, worktree_identity, head_branch,
                 change_set_digest, stage, status, reached_ceiling, expected_head_sha,
                 canonical_pr_number, canonical_pr_url, canonical_head_sha, progress_revision,
-                lease_expires_at
+                lease_expires_at, failure_signature, stage_attempt
          FROM delivery_runs WHERE id=? AND lease_owner=? AND claim_epoch=?",
     )
     .bind(run_id)
@@ -1683,6 +1974,25 @@ pub async fn record_delivery_observation(
         .canonical_head_sha
         .clone()
         .or(previous.try_get::<Option<String>, _>("canonical_head_sha")?);
+    let previous_failure_signature = previous.try_get::<Option<String>, _>("failure_signature")?;
+    let previous_stage_attempt = previous.try_get::<i64, _>("stage_attempt")?;
+    let current_failure_claim_epoch = match observation.failure_signature.as_deref() {
+        Some(signature) => latest_failure_claim_epoch(&mut tx, run_id, signature).await?,
+        None => None,
+    };
+    let next_stage_attempt = match observation.failure_signature.as_deref() {
+        None => 0,
+        Some(signature)
+            if previous_failure_signature.as_deref() == Some(signature)
+                && current_failure_claim_epoch == Some(claim_epoch) =>
+        {
+            previous_stage_attempt
+        }
+        Some(signature) if previous_failure_signature.as_deref() == Some(signature) => {
+            previous_stage_attempt.saturating_add(1)
+        }
+        Some(_) => 1,
+    };
     let progressed = previous.try_get::<String, _>("stage")? != observation.stage
         || previous.try_get::<String, _>("status")? != observation.status
         || previous_reached != reached_ceiling
@@ -1700,10 +2010,7 @@ pub async fn record_delivery_observation(
          SET head_branch=?, stage=?, status=?, wait_class=?, next_action=?, reached_ceiling=?,
              expected_head_sha=?, change_set_digest=?,
              canonical_pr_number=?, canonical_pr_url=?, canonical_head_sha=?,
-             failure_signature=?, stage_attempt=CASE
-               WHEN ? IS NULL THEN 0
-               WHEN failure_signature = ? THEN stage_attempt
-               ELSE 1 END,
+             failure_signature=?, stage_attempt=?,
              core_input_request_key=CASE WHEN ? THEN ? ELSE core_input_request_key END,
              core_inputs_json=CASE WHEN ? THEN ? ELSE core_inputs_json END,
              core_input_attempts_json=CASE WHEN ? THEN ? ELSE core_input_attempts_json END,
@@ -1733,8 +2040,7 @@ pub async fn record_delivery_observation(
     .bind(&canonical_pr_url)
     .bind(&canonical_head_sha)
     .bind(&observation.failure_signature)
-    .bind(&observation.failure_signature)
-    .bind(&observation.failure_signature)
+    .bind(next_stage_attempt)
     .bind(has_core_input)
     .bind(core_input.map(|value| &value.request_key))
     .bind(has_core_input)
@@ -1780,7 +2086,11 @@ pub async fn record_delivery_observation(
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(run_id)
-    .bind(if progressed { "progressed" } else { "observed" })
+    .bind(if progressed {
+        "progressed"
+    } else {
+        "observed"
+    })
     .bind(&observation.stage)
     .bind(&observation.status)
     .bind(&observation.wait_class)
@@ -1791,6 +2101,9 @@ pub async fn record_delivery_observation(
             "identity_revision_receipt_id": observation.identity_revision.as_ref().map(|value| &value.receipt_id),
             "observed_reached_ceiling": observation.reached_ceiling,
             "persisted_reached_ceiling": reached_ceiling,
+            "stage_attempt": next_stage_attempt,
+            "claim_epoch": claim_epoch,
+            "parked": false,
         })
         .to_string(),
     )
@@ -1800,6 +2113,88 @@ pub async fn record_delivery_observation(
     .await?;
     tx.commit().await?;
     Ok(progressed)
+}
+
+async fn park_delivery_runs_linked_to_exhausted_objectives(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    process: &ProcessIdentity,
+    now: i64,
+) -> Result<()> {
+    let has_objectives: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objectives'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_objectives == 0 {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT run.id, run.stage
+         FROM delivery_runs AS run
+         JOIN objectives AS objective ON objective.delivery_run_id=run.id
+         WHERE objective.status='waiting_system'
+           AND objective.failure_code='technical_recovery_exhausted'
+           AND objective.recovery_owner='objective-incident-controller'
+           AND objective.remediation_id IS NULL
+           AND objective.next_observation_at IS NULL
+           AND objective.requires_user_action=0
+           AND run.status NOT IN ('completed','failed','cancelled','rejected')
+           AND (run.next_action_authorized<>0 OR run.lease_owner IS NOT NULL
+                OR run.lease_expires_at IS NOT NULL)",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let run_id: String = row.try_get("id")?;
+        let stage: String = row.try_get("stage")?;
+        let changed = sqlx::query(
+            "UPDATE delivery_runs
+             SET status='platform_incident',
+                 wait_class=CASE
+                   WHEN stage='takeover_reconciliation'
+                    AND wait_class='external_state_uncertain'
+                   THEN 'delivery_identity_conflict'
+                   ELSE wait_class END,
+                 next_action='await_system_capability_change',
+                 next_action_authorized=0,
+                 lease_owner=NULL, lease_expires_at=NULL,
+                 failure_code=COALESCE(failure_code, 'delivery_identity_conflict'),
+                 failure_class=COALESCE(failure_class, 'platform_incident'),
+                 last_observed_at=?, updated_at=?
+             WHERE id=? AND status NOT IN ('completed','failed','cancelled','rejected')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(&run_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO delivery_run_events
+             (id, run_id, event_kind, stage, status, wait_class, detail_json,
+              process_instance, created_at)
+             VALUES (?, ?, 'objective_incident_parked', ?, 'platform_incident',
+                     'delivery_identity_conflict', ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&run_id)
+        .bind(stage)
+        .bind(
+            serde_json::json!({
+                "reason": "linked_objective_recovery_exhausted",
+                "next_action": "await_system_capability_change",
+            })
+            .to_string(),
+        )
+        .bind(&process.instance_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Atomically claims expired, identified, non-terminal runs for observation.
@@ -1814,6 +2209,7 @@ pub async fn plan_startup_recovery(
     lease_ttl: i64,
 ) -> Result<StartupRecoveryPlan> {
     let mut tx = pool.begin().await?;
+    park_delivery_runs_linked_to_exhausted_objectives(&mut tx, process, now).await?;
 
     let missing_sql = format!(
         "SELECT id FROM delivery_runs
@@ -1850,6 +2246,9 @@ pub async fn plan_startup_recovery(
                 claim_epoch
          FROM delivery_runs
          WHERE {NON_TERMINAL_PREDICATE}
+           AND next_action_authorized=1
+           AND status IN ('running','waiting','platform_incident','agent_action_required',
+                          'failed_internal','awaiting_completion_arbitration')
            AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
            AND {STABLE_IDENTITY_PREDICATE}
          ORDER BY created_at, id"
@@ -1970,7 +2369,7 @@ mod tests {
             "expired",
             Some("session"),
             Some("turn"),
-            "delivering",
+            "waiting",
             99,
         )
         .await;
@@ -1979,7 +2378,7 @@ mod tests {
             "live",
             Some("session"),
             Some("turn"),
-            "delivering",
+            "waiting",
             101,
         )
         .await;
@@ -1992,7 +2391,15 @@ mod tests {
             99,
         )
         .await;
-        insert_recovery_fixture(&pool, "identity-missing", None, None, "delivering", 99).await;
+        insert_recovery_fixture(&pool, "identity-missing", None, None, "waiting", 99).await;
+        sqlx::query(
+            "UPDATE delivery_runs
+             SET next_action_authorized=1
+             WHERE id IN ('expired', 'live')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let plan = plan_startup_recovery(
             &pool,
@@ -3083,7 +3490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn technical_failures_remain_system_owned_and_generic_needs_user_is_rejected() {
+    async fn unauthorized_system_incidents_are_not_reclaimed_and_generic_needs_user_is_rejected() {
         let pool = pool().await;
         insert_recovery_fixture(
             &pool,
@@ -3103,7 +3510,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(plan.claimed[0].run_id, "internal");
+        assert!(
+            plan.claimed.is_empty(),
+            "a system-owned incident without an authorized next action must stay parked instead of churning its claim epoch"
+        );
 
         let rejected = sqlx::query(
             "INSERT INTO delivery_runs (
@@ -3121,6 +3531,199 @@ mod tests {
             rejected.is_err(),
             "generic needs_user must not enter durable state"
         );
+    }
+
+    #[tokio::test]
+    async fn identical_failure_budget_counts_distinct_claim_epochs_not_callbacks() {
+        let pool = pool().await;
+        let process = ProcessIdentity::new("process", "1.81.24", "18124");
+        let run = NewDeliveryRun {
+            id: "bounded-takeover-run".into(),
+            objective_id: "objective-opaque-bounded-takeover".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:bounded".into(),
+            repo_identity: "repo:bounded".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest-before".into(),
+            expected_head_sha: "head-before".into(),
+            canonical_pr_number: Some(41),
+            canonical_pr_url: Some("https://example.invalid/pr/41".into()),
+            canonical_head_sha: Some("head-before".into()),
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "pr_open".into(),
+            stage: "takeover_reconciliation".into(),
+            status: "platform_incident".into(),
+            wait_class: Some("delivery_identity_conflict".into()),
+            next_action: Some("observe_only_reconcile".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let epoch = create_delivery_run(&pool, &run, &process, 100, 100)
+            .await
+            .unwrap();
+        let failure = DeliveryObservation {
+            head_branch: run.head_branch.clone(),
+            stage: run.stage.clone(),
+            status: run.status.clone(),
+            wait_class: run.wait_class.clone(),
+            next_action: run.next_action.clone(),
+            reached_ceiling: run.reached_ceiling.clone(),
+            expected_head_sha: run.expected_head_sha.clone(),
+            canonical_pr_number: run.canonical_pr_number,
+            canonical_pr_url: run.canonical_pr_url.clone(),
+            canonical_head_sha: run.canonical_head_sha.clone(),
+            failure_signature: Some("delivery_identity_conflict:same-fingerprint".into()),
+            core_input: None,
+            identity_revision: None,
+        };
+
+        record_delivery_observation(&pool, &run.id, &process, epoch, &failure, 110, 100)
+            .await
+            .unwrap();
+        for index in 0..9 {
+            sqlx::query(
+                "INSERT INTO delivery_run_events
+                 (id, run_id, event_kind, stage, status, detail_json, process_instance, created_at)
+                 VALUES (?, ?, 'diagnostic', 'takeover_reconciliation', 'platform_incident',
+                         ?, ?, ?)",
+            )
+            .bind(format!("noise-{index}"))
+            .bind(&run.id)
+            .bind(serde_json::json!({"noise": index}).to_string())
+            .bind(&process.instance_id)
+            .bind(111 + index)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        record_delivery_observation(&pool, &run.id, &process, epoch, &failure, 120, 100)
+            .await
+            .unwrap();
+
+        let first_epoch: (i64, i64, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT stage_attempt, next_action_authorized, lease_owner, lease_expires_at
+             FROM delivery_runs WHERE id=?",
+        )
+        .bind(&run.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first_epoch.0, 1);
+        assert_eq!(first_epoch.1, 1);
+        assert_eq!(first_epoch.2.as_deref(), Some("process"));
+        assert!(first_epoch.3.is_some());
+
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=130 WHERE id=?")
+            .bind(&run.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let next_process = ProcessIdentity::new("next-process", "1.81.24", "18124");
+        let plan = plan_startup_recovery(&pool, &next_process, 200, 100)
+            .await
+            .unwrap();
+        assert_eq!(plan.claimed.len(), 1);
+        let next_epoch = plan.claimed[0].claim_epoch;
+        assert_eq!(next_epoch, epoch + 1);
+        record_delivery_observation(
+            &pool,
+            &run.id,
+            &next_process,
+            next_epoch,
+            &failure,
+            210,
+            100,
+        )
+        .await
+        .unwrap();
+
+        let second_epoch: (i64, i64, Option<String>) = sqlx::query_as(
+            "SELECT stage_attempt, next_action_authorized, lease_owner
+             FROM delivery_runs WHERE id=?",
+        )
+        .bind(&run.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(second_epoch.0, 2);
+        assert_eq!(second_epoch.1, 1);
+        assert_eq!(second_epoch.2.as_deref(), Some("next-process"));
+    }
+
+    #[tokio::test]
+    async fn parked_objective_makes_its_linked_delivery_run_unclaimable() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                delivery_run_id TEXT,
+                status TEXT NOT NULL,
+                failure_code TEXT,
+                recovery_owner TEXT,
+                remediation_id TEXT,
+                next_observation_at INTEGER,
+                requires_user_action INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_recovery_fixture(
+            &pool,
+            "linked-parked-run",
+            Some("session"),
+            Some("turn"),
+            "platform_incident",
+            10,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE delivery_runs
+             SET next_action_authorized=1,
+                 wait_class='external_state_uncertain',
+                 next_action='observe_only_reconcile'
+             WHERE id='linked-parked-run'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives (
+                id, delivery_run_id, status, failure_code, recovery_owner,
+                remediation_id, next_observation_at, requires_user_action
+             ) VALUES (
+                'objective-opaque-linked-parked-run', 'linked-parked-run',
+                'waiting_system', 'technical_recovery_exhausted',
+                'objective-incident-controller', NULL, NULL, 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let plan = plan_startup_recovery(
+            &pool,
+            &ProcessIdentity::new("new-process", "1.81.24", "18124"),
+            100,
+            30,
+        )
+        .await
+        .unwrap();
+        assert!(plan.claimed.is_empty());
+        let state: (i64, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT next_action_authorized, lease_owner, lease_expires_at
+             FROM delivery_runs WHERE id='linked-parked-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, (0, None, None));
     }
 
     #[tokio::test]
@@ -3197,7 +3800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_input_gate_requires_one_batched_request_and_keeps_run_recoverable() {
+    async fn core_input_gate_requires_one_batched_request_without_background_reclaim() {
         let pool = pool().await;
         insert_recovery_fixture(
             &pool,
@@ -3211,6 +3814,7 @@ mod tests {
         sqlx::query(
             "UPDATE delivery_runs
              SET status='core_input_required', core_input_request_key='production-identity',
+                 next_action_authorized=1,
                  core_inputs_json='[\"production_account\"]',
                  core_input_attempts_json='[\"managed_identity\",\"refresh\"]',
                  core_input_resume_stage='release', core_input_request_count=1
@@ -3219,6 +3823,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        let claim_epoch_before: i64 =
+            sqlx::query_scalar("SELECT claim_epoch FROM delivery_runs WHERE id='core-input'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         let plan = plan_startup_recovery(
             &pool,
@@ -3228,8 +3837,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(plan.claimed[0].run_id, "core-input");
-        assert_eq!(plan.claimed[0].status, "core_input_required");
+        assert!(
+            plan.claimed.is_empty(),
+            "a typed core-input gate remains durable but must not churn a system recovery lease"
+        );
+        let claim_epoch_after: i64 =
+            sqlx::query_scalar("SELECT claim_epoch FROM delivery_runs WHERE id='core-input'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(claim_epoch_after, claim_epoch_before);
 
         let fragmented = sqlx::query(
             "UPDATE delivery_runs SET core_input_request_count=2 WHERE id='core-input'",
@@ -3256,6 +3873,10 @@ mod tests {
         .await;
         let owner = ProcessIdentity::new("process-old", "1.79.2", "17902");
         let competitor = ProcessIdentity::new("process-new", "1.79.2", "17902");
+        sqlx::query("UPDATE delivery_runs SET next_action_authorized=1 WHERE id='heartbeat-run'")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         assert!(
             !renew_delivery_lease(&pool, "heartbeat-run", &owner, 0, 120, 30)
@@ -3803,6 +4424,104 @@ mod tests {
                 .status,
             "started"
         );
+    }
+
+    #[tokio::test]
+    async fn receipted_local_commit_cas_rejects_stale_and_cancelled_owners_before_effect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pool = pool().await;
+        let owner = ProcessIdentity::new("pre-ref-owner", "1.81.24", "18124");
+        let epoch = create_mutation_test_run(&pool, "pre-ref-fence-run", &owner, 100, 30).await;
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                delivery_run_id TEXT,
+                status TEXT NOT NULL,
+                failure_code TEXT,
+                recovery_owner TEXT,
+                remediation_id TEXT,
+                next_observation_at INTEGER,
+                requires_user_action INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives
+             (id, delivery_run_id, status)
+             VALUES ('objective-opaque-pre-ref-fence-run', 'pre-ref-fence-run', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(begin_delivery_mutation_intent(
+            &pool,
+            "pre-ref-intent",
+            "pre-ref-fence-run",
+            &owner,
+            epoch,
+            "git_local_commit",
+            "sha256:exact-local-commit",
+            Some("{\"expected_head_sha\":\"def\"}"),
+            105,
+        )
+        .await
+        .unwrap());
+        let replacement = ProcessIdentity::new("pre-ref-replacement", "1.81.24", "18124");
+        let claim = plan_startup_recovery(&pool, &replacement, 131, 30)
+            .await
+            .unwrap()
+            .claimed
+            .into_iter()
+            .next()
+            .expect("the replacement owns the expired run");
+
+        let stale_effect = AtomicBool::new(false);
+        assert!(with_receipted_local_commit_cas(
+            &pool,
+            "pre-ref-fence-run",
+            &owner,
+            epoch,
+            "pre-ref-intent",
+            "sha256:exact-local-commit",
+            132,
+            || {
+                stale_effect.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .is_err());
+        assert!(!stale_effect.load(Ordering::SeqCst));
+
+        sqlx::query(
+            "UPDATE delivery_runs
+             SET status='cancelled', next_action_authorized=0,
+                 lease_owner=NULL, lease_expires_at=NULL
+             WHERE id='pre-ref-fence-run'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cancelled_effect = AtomicBool::new(false);
+        assert!(with_receipted_local_commit_cas(
+            &pool,
+            "pre-ref-fence-run",
+            &replacement,
+            claim.claim_epoch,
+            "pre-ref-intent",
+            "sha256:exact-local-commit",
+            133,
+            || {
+                cancelled_effect.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .is_err());
+        assert!(!cancelled_effect.load(Ordering::SeqCst));
     }
 
     async fn create_mutation_test_run(
