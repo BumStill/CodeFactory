@@ -388,6 +388,80 @@ fn is_skill_dir(d: &Path) -> bool {
     d.join("SKILL.md").exists() || d.join("manifest.json").exists()
 }
 
+const MAX_SKILL_PAYLOAD_FILES: usize = 2_048;
+const MAX_SKILL_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SKILL_PAYLOAD_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SKILL_PAYLOAD_DEPTH: usize = 16;
+const MAX_SKILL_PAYLOAD_ENTRIES: usize = 4_096;
+
+/// Copy the static bundle a Skill was authored with. Installation never
+/// executes payload files and never follows links; `.git` is source-control
+/// state, not part of the runnable Skill.
+fn copy_skill_payload(src: &Path, dest: &Path) -> Result<(), String> {
+    if src.canonicalize().ok().as_ref() == dest.canonicalize().ok().as_ref() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dest).map_err(|error| error.to_string())?;
+    let mut file_count = 0_usize;
+    let mut total_bytes = 0_u64;
+    let mut entry_count = 0_usize;
+    let walker = walkdir::WalkDir::new(src).follow_links(false);
+    for entry in walker
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != ".git")
+    {
+        let entry = entry.map_err(|error| format!("遍历 Skill payload 失败: {error}"))?;
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > MAX_SKILL_PAYLOAD_ENTRIES || entry.depth() > MAX_SKILL_PAYLOAD_DEPTH {
+            return Err("Skill payload 超过安全目录深度或条目数上限".into());
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(src)
+            .map_err(|error| format!("Skill payload 路径越界: {error}"))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            return Err(format!(
+                "Skill payload 含不支持的符号链接: {}",
+                relative.display()
+            ));
+        }
+        let target = dest.join(relative);
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(format!(
+                "Skill payload 含不支持的特殊文件: {}",
+                relative.display()
+            ));
+        }
+        file_count = file_count.saturating_add(1);
+        let bytes = entry.metadata().map_err(|error| error.to_string())?.len();
+        total_bytes = total_bytes.saturating_add(bytes);
+        if file_count > MAX_SKILL_PAYLOAD_FILES
+            || bytes > MAX_SKILL_PAYLOAD_FILE_BYTES
+            || total_bytes > MAX_SKILL_PAYLOAD_BYTES
+        {
+            return Err("Skill payload 超过安全复制上限".into());
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::copy(entry.path(), &target).map_err(|error| {
+            format!(
+                "复制 Skill payload {} 失败: {error}",
+                relative.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Walk `dir` (bounded depth) collecting every skill directory — one holding a
 /// SKILL.md or manifest.json. A skill dir is a leaf (we don't descend into it),
 /// so a single skill, a `skills/<name>/` collection, or a whole repo all work.
@@ -416,6 +490,14 @@ fn collect_skill_dirs(dir: &Path, depth: u8, out: &mut Vec<PathBuf>) {
 
 /// Import one skill directory into the user skills folder. Returns its manifest.
 fn import_one_skill_dir(src: &Path, enabled: bool) -> Result<SkillManifest, String> {
+    import_one_skill_dir_into(src, enabled, &user_skills_dir())
+}
+
+fn import_one_skill_dir_into(
+    src: &Path,
+    enabled: bool,
+    skills_root: &Path,
+) -> Result<SkillManifest, String> {
     let (id_raw, name, description, version, author, tags, body): (
         String,
         String,
@@ -448,8 +530,9 @@ fn import_one_skill_dir(src: &Path, enabled: bool) -> Result<SkillManifest, Stri
         slugify(&dir_name)
     };
 
-    let dest = user_skills_dir().join(&id);
-    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(skills_root).map_err(|error| error.to_string())?;
+    let dest = skills_root.join(&id);
+    let staging = skills_root.join(format!(".{id}.import-{}", uuid::Uuid::new_v4()));
 
     let manifest = SkillManifest {
         id: id.clone(),
@@ -462,19 +545,38 @@ fn import_one_skill_dir(src: &Path, enabled: bool) -> Result<SkillManifest, Stri
         path: dest.to_string_lossy().to_string(),
         source: "user".to_string(),
     };
-    write_manifest(&manifest.path, &manifest)?;
-
-    // system_prompt.md: SKILL.md body wins; else copy an existing one if present.
-    if let Some(body) = body {
-        std::fs::write(dest.join("system_prompt.md"), body).map_err(|e| e.to_string())?;
-    } else if src.join("system_prompt.md").exists() {
-        let _ = std::fs::copy(src.join("system_prompt.md"), dest.join("system_prompt.md"));
-    }
-    // Carry across the optional extras CodeFactory understands.
-    for f in ["slash_commands.json", "tool_policy.json"] {
-        if src.join(f).exists() {
-            let _ = std::fs::copy(src.join(f), dest.join(f));
+    let prepared = (|| -> Result<(), String> {
+        copy_skill_payload(src, &staging)?;
+        write_manifest(&staging.to_string_lossy(), &manifest)?;
+        // system_prompt.md: SKILL.md body wins; else the copied existing file
+        // is retained and normalized in place.
+        if let Some(body) = body {
+            std::fs::write(staging.join("system_prompt.md"), body)
+                .map_err(|error| error.to_string())?;
         }
+        Ok(())
+    })();
+    if let Err(error) = prepared {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let backup = skills_root.join(format!(".{id}.backup-{}", uuid::Uuid::new_v4()));
+    let had_existing = dest.exists();
+    if had_existing {
+        if let Err(error) = std::fs::rename(&dest, &backup) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error.to_string());
+        }
+    }
+    if let Err(error) = std::fs::rename(&staging, &dest) {
+        if had_existing {
+            let _ = std::fs::rename(&backup, &dest);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("提交 Skill 安装目录失败: {error}"));
+    }
+    if had_existing {
+        let _ = std::fs::remove_dir_all(&backup);
     }
     Ok(manifest)
 }
@@ -738,13 +840,26 @@ pub async fn delete_skill(id: String, app: AppHandle) -> Result<(), String> {
 /// Assemble enabled-skill system prompts from a single skills directory —
 /// no `AppHandle` needed. The headless agent loop uses this (user skills
 /// only); the UI path merges builtin + user via [`enabled_skill_prompts`].
+fn render_enabled_skill_context(skill: &SkillManifest) -> Option<String> {
+    let root = PathBuf::from(&skill.path).canonicalize().ok()?;
+    let body = std::fs::read_to_string(root.join("system_prompt.md")).ok()?;
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<enabled_skill>\nskill_id: {}\nskill_root: {}\nResolve scripts/, references/, and assets/ relative to skill_root; do not resolve them from the project working directory.\n{}\n</enabled_skill>",
+        skill.id,
+        root.display(),
+        body,
+    ))
+}
+
 pub fn prompts_from_skill_dir(dir: &Path) -> Vec<String> {
     scan_skill_dir(&dir.to_path_buf(), "user")
         .iter()
         .filter(|s| s.enabled)
-        .filter_map(|s| std::fs::read_to_string(PathBuf::from(&s.path).join("system_prompt.md")).ok())
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
+        .filter_map(render_enabled_skill_context)
         .collect()
 }
 
@@ -761,12 +876,7 @@ pub async fn enabled_skill_prompts(app: &AppHandle) -> Vec<String> {
     skills
         .iter()
         .filter(|s| s.enabled)
-        .filter_map(|s| {
-            let path = PathBuf::from(&s.path).join("system_prompt.md");
-            std::fs::read_to_string(path).ok()
-        })
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
+        .filter_map(render_enabled_skill_context)
         .collect()
 }
 
@@ -1422,11 +1532,152 @@ mod tests {
         std::fs::write(off.join("system_prompt.md"), "DISABLED PROMPT").unwrap();
 
         let prompts = prompts_from_skill_dir(&dir);
-        assert_eq!(prompts, vec!["ENABLED PROMPT BODY".to_string()]);
+        assert_eq!(prompts.len(), 1);
+        let installed_root = on.canonicalize().unwrap();
+        assert!(prompts[0].starts_with("<enabled_skill>"));
+        assert!(prompts[0].contains("skill_id: on"));
+        assert!(prompts[0].contains(&format!("skill_root: {}", installed_root.display())));
+        assert!(prompts[0].contains(
+            "Resolve scripts/, references/, and assets/ relative to skill_root"
+        ));
+        assert!(prompts[0].ends_with("ENABLED PROMPT BODY\n</enabled_skill>"));
 
         // Missing dir → empty, never a panic.
         assert!(prompts_from_skill_dir(std::path::Path::new("/definitely/not/here")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_bundle_copy_preserves_nested_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("installed");
+        std::fs::create_dir_all(source.join("scripts/nested")).unwrap();
+        std::fs::create_dir_all(source.join("references")).unwrap();
+        std::fs::create_dir_all(source.join("assets")).unwrap();
+        std::fs::create_dir_all(source.join(".git/objects")).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Fixture\nbody").unwrap();
+        std::fs::write(source.join("scripts/nested/run.sh"), "#!/bin/sh\necho SKILL_OK\n")
+            .unwrap();
+        std::fs::write(source.join("references/usage.md"), "usage").unwrap();
+        std::fs::write(source.join("assets/payload.txt"), "asset").unwrap();
+        std::fs::write(source.join(".git/objects/secret"), "git internals").unwrap();
+        copy_skill_payload(&source, &destination).expect("safe bundle copy");
+        std::fs::remove_dir_all(&source).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("scripts/nested/run.sh")).unwrap(),
+            "#!/bin/sh\necho SKILL_OK\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("references/usage.md")).unwrap(),
+            "usage"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("assets/payload.txt")).unwrap(),
+            "asset"
+        );
+        assert!(!destination.join(".git").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_skill_payload_fails_closed_without_replacing_existing_install() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let installed = root.path().join("installed-skills");
+        let existing = installed.join("linked-skill");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("manifest.json"), "existing-manifest").unwrap();
+        std::fs::create_dir_all(source.join("assets")).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: Linked Skill\ndescription: fixture\n---\n\nbody",
+        )
+        .unwrap();
+        symlink("/etc/passwd", source.join("assets/escape")).unwrap();
+
+        let error = import_one_skill_dir_into(&source, true, &installed).unwrap_err();
+
+        assert!(error.contains("符号链接"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(existing.join("manifest.json")).unwrap(),
+            "existing-manifest"
+        );
+    }
+
+    #[test]
+    fn local_directory_install_survives_source_cleanup_with_nested_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("cloned-source/portable-skill");
+        let installed = root.path().join("installed-skills");
+        std::fs::create_dir_all(source.join("scripts")).unwrap();
+        std::fs::create_dir_all(source.join("references")).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: Portable Skill\ndescription: fixture\n---\n\nUse scripts/run.sh.",
+        )
+        .unwrap();
+        std::fs::write(source.join("scripts/run.sh"), "#!/bin/sh\necho SKILL_OK\n").unwrap();
+        std::fs::write(source.join("references/usage.md"), "run usage").unwrap();
+
+        let manifest = import_one_skill_dir_into(&source, true, &installed).unwrap();
+        std::fs::remove_dir_all(root.path().join("cloned-source")).unwrap();
+
+        let installed_root = PathBuf::from(&manifest.path);
+        assert!(manifest.enabled);
+        assert_eq!(
+            std::fs::read_to_string(installed_root.join("scripts/run.sh")).unwrap(),
+            "#!/bin/sh\necho SKILL_OK\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(installed_root.join("references/usage.md")).unwrap(),
+            "run usage"
+        );
+        let context = render_enabled_skill_context(&manifest).unwrap();
+        assert!(context.contains(&format!(
+            "skill_root: {}",
+            installed_root.canonicalize().unwrap().display()
+        )));
+        assert!(!context.contains("cloned-source"));
+    }
+
+    #[test]
+    fn over_limit_bundle_fails_closed_without_replacing_existing_install() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let installed = root.path().join("installed-skills");
+        let existing = installed.join("too-deep");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("manifest.json"), "existing-manifest").unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: Too Deep\ndescription: fixture\n---\n\nbody",
+        )
+        .unwrap();
+        let mut deep = source.clone();
+        for index in 0..=MAX_SKILL_PAYLOAD_DEPTH {
+            deep = deep.join(format!("d{index}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("payload.txt"), "too deep").unwrap();
+
+        let error = import_one_skill_dir_into(&source, true, &installed).unwrap_err();
+
+        assert!(error.contains("安全目录深度"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(existing.join("manifest.json")).unwrap(),
+            "existing-manifest"
+        );
+        let names: Vec<_> = std::fs::read_dir(&installed)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["too-deep"]);
     }
 
     #[test]

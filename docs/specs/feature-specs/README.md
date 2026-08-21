@@ -37,6 +37,8 @@
 - `on-demand-embedded-browser-pane.md`: 当前会话按需创建的内置右侧浏览器分屏、控制权、安全隔离与自动回收规格。
 - `browser-access-zero-touch-provisioning.md`: 浏览器扩展零手工配对、受管浏览器下载在 Windows 权限受限时的自愈与回退规格。
 - `scenario-test-governance.md`: 统一场景注册表、PR 影响声明、证据等级，以及基于匿名历史形状的复杂真实端到端测试治理规格。
+- `skill-lifecycle-system.md`: Skill package、安装事务、审核/激活、按需运行时与证据合同的领域主规格。
+- `skill-command-recovery.md`: 上述主规格的 P0 修复切片，限定 Skill payload 保留、稳定 skill root、命令错误/超时诊断、变化后重试与 system-owned 恢复。
 
 ## 模板
 - `requirements-traceability-template.md`

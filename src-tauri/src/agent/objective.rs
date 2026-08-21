@@ -868,13 +868,28 @@ pub fn decision_for_run_outcome_with_reason(
                         observed_at: now,
                         reached_acceptance: objective.requested_acceptance.clone(),
                     });
-                }
-                if let Some(sequence) = validation {
+                    if let Some(sequence) = validation {
+                        evidence.push(ObjectiveEvidence {
+                            id: Uuid::new_v4().to_string(),
+                            kind: EvidenceKind::PostChangeValidation,
+                            scope: scope.clone(),
+                            digest: digest(&format!("validation:{sequence}")),
+                            evidence_ref: evidence_ref.clone(),
+                            observed_at: now,
+                            reached_acceptance: objective.requested_acceptance.clone(),
+                        });
+                    }
+                } else if let Some(sequence) = validation {
+                    // An implementation-capable turn may discover that no
+                    // workspace mutation is needed (for example a corrected
+                    // installed-Skill command).  A real successful probe is
+                    // typed current-state acceptance; prose alone still emits
+                    // no evidence and remains non-terminal.
                     evidence.push(ObjectiveEvidence {
                         id: Uuid::new_v4().to_string(),
-                        kind: EvidenceKind::PostChangeValidation,
+                        kind: EvidenceKind::CurrentStateAcceptance,
                         scope: scope.clone(),
-                        digest: digest(&format!("validation:{sequence}")),
+                        digest: digest(&format!("current-state-validation:{sequence}")),
                         evidence_ref: evidence_ref.clone(),
                         observed_at: now,
                         reached_acceptance: objective.requested_acceptance.clone(),
@@ -3765,7 +3780,13 @@ impl ObjectiveStore {
                              ON exact_link.receipt_id=receipt.id
                            WHERE receipt.objective_id=tool.objective_id
                              AND receipt.binding_id=?
-                             AND receipt.status IN ('committed','reconciled')
+                             AND (
+                               receipt.status IN ('committed','reconciled')
+                               OR (
+                                 receipt.status='cancelled'
+                                 AND tool.status IN ('error','cancelled','denied')
+                               )
+                             )
                              AND (
                                exact_link.tool_call_id=tool.id
                                OR (
@@ -5413,6 +5434,51 @@ mod tests {
                 .unwrap();
             assert_eq!(completed.status, ObjectiveStatus::Completed, "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn completion_accepts_cancelled_receipt_only_for_a_failed_tool_call() {
+        let fixture = generic_receipt_completion_fixture("cancelled-rejected-command").await;
+        sqlx::query("UPDATE tool_calls SET status='error' WHERE objective_id=?")
+            .bind(&fixture.objective.id)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        insert_generic_receipt(
+            &fixture,
+            "receipt-cancelled-rejected-command",
+            &fixture.objective.id,
+            &fixture.current_binding_id,
+            CURRENT_ACTION_SIGNATURE,
+            "cancelled",
+        )
+        .await;
+
+        let completed = fixture
+            .store
+            .apply_decision(fixture.objective.revision, completion_decision(&fixture))
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+
+        let done_fixture = generic_receipt_completion_fixture("cancelled-done-command").await;
+        insert_generic_receipt(
+            &done_fixture,
+            "receipt-cancelled-done-command",
+            &done_fixture.objective.id,
+            &done_fixture.current_binding_id,
+            CURRENT_ACTION_SIGNATURE,
+            "cancelled",
+        )
+        .await;
+        assert!(done_fixture
+            .store
+            .apply_decision(
+                done_fixture.objective.revision,
+                completion_decision(&done_fixture),
+            )
+            .await
+            .is_err());
     }
 
     async fn persist_delivery_completion_candidate(
@@ -7644,6 +7710,32 @@ mod tests {
         let prose_only = decision_for_run_outcome(&local, &answer).unwrap();
         assert_eq!(prose_only.status, ObjectiveStatus::WaitingSystem);
         assert!(!prose_only.requires_user_action);
+
+        let verified_current_state = RunOutcome {
+            final_text: "SKILL_RECOVERY_OK".into(),
+            final_message_id: Some("assistant-skill-recovery".into()),
+            completion_evidence: CompletionEvidence {
+                outcome_count: 3,
+                last_successful_verification_sequence: Some(3),
+                last_bounded_probe_sequence: Some(3),
+                completed: true,
+                ..Default::default()
+            },
+            input_tokens: 12,
+            output_tokens: 3,
+            stop_reason: StopReason::Finished,
+        };
+        let no_change_complete = decision_for_run_outcome(&local, &verified_current_state).unwrap();
+        assert_eq!(no_change_complete.status, ObjectiveStatus::Completed);
+        assert_eq!(no_change_complete.decision_type, DecisionType::Complete);
+        assert_eq!(
+            no_change_complete.evidence.as_ref().map(|item| item.kind),
+            Some(EvidenceKind::CurrentStateAcceptance),
+        );
+        assert_eq!(
+            no_change_complete.visible_final_message_id.as_deref(),
+            Some("assistant-skill-recovery"),
+        );
     }
 
     #[test]

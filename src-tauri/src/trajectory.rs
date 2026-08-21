@@ -310,16 +310,42 @@ pub(crate) async fn record_tool_call_metadata(
         compact.insert("truncated".into(), Value::Bool(true));
         Value::Object(compact).to_string()
     };
+    let mut transaction = pool.begin().await?;
     let updated = sqlx::query("UPDATE tool_calls SET metadata = ? WHERE id = ?")
-        .bind(metadata)
+        .bind(&metadata)
         .bind(&id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
     if updated.rows_affected() != 1 {
         return Err(AppError::Other(format!(
             "normalized tool call missing for metadata: {id}"
         )));
     }
+    // Keep the provider-replay message self-contained. On restart the desktop
+    // rebuilds history from `messages`, not from an in-memory ToolOutput, so a
+    // typed command-repair obligation must travel with the exact tool result.
+    let replay_message_id = format!("{id}:result");
+    if let Some(content) = sqlx::query_scalar::<_, String>(
+        "SELECT content FROM messages WHERE id = ?",
+    )
+    .bind(&replay_message_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    {
+        if let Ok(mut envelope) = serde_json::from_str::<Value>(&content) {
+            if let Some(fields) = envelope.as_object_mut() {
+                let replay_metadata = serde_json::from_str::<Value>(&metadata)
+                    .unwrap_or_else(|_| Value::Object(Default::default()));
+                fields.insert("metadata".into(), replay_metadata);
+                sqlx::query("UPDATE messages SET content = ? WHERE id = ?")
+                    .bind(envelope.to_string())
+                    .bind(&replay_message_id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+        }
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -374,6 +400,18 @@ mod tests {
     #[tokio::test]
     async fn structured_tool_metadata_is_persisted_separately_from_result_text() {
         let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         record_tool_call_started(
             &pool,
             "session-1",
@@ -384,7 +422,21 @@ mod tests {
         )
         .await
         .unwrap();
+        record_terminal_tool_outcome(
+            &pool,
+            "session-1",
+            "call-delivery",
+            "error",
+            None,
+            Some("command failed"),
+            5,
+        )
+        .await
+        .unwrap();
         let metadata = json!({
+            "code": "command_not_found",
+            "command_repair_required": true,
+            "command_fingerprint": "digest",
             "requested_ceiling": "through_release",
             "effective_ceiling": "through_merge",
             "reached_state": "merged",
@@ -401,6 +453,15 @@ mod tests {
         .unwrap();
         let stored: Value = serde_json::from_str(&stored).unwrap();
         assert_eq!(stored, metadata);
+        let replay: String = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE id = 'session-1:call-delivery:result'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let replay: Value = serde_json::from_str(&replay).unwrap();
+        assert_eq!(replay["content"], "command failed");
+        assert_eq!(replay["metadata"], metadata);
 
         let oversized = json!({
             "status": "blocked",
@@ -557,7 +618,7 @@ mod tests {
     async fn cancelled_tool_is_terminal_and_replayable() {
         let pool = test_pool().await;
         sqlx::query(
-            "CREATE TABLE messages (
+            "CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
@@ -655,7 +716,7 @@ mod tests {
     async fn terminal_outcomes_always_persist_one_redacted_replay_message() {
         let pool = test_pool().await;
         sqlx::query(
-            "CREATE TABLE messages (
+            "CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,

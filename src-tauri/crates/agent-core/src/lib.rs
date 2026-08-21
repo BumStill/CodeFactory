@@ -501,6 +501,100 @@ pub enum ToolKind {
     FunctionalProbe { bounded: bool },
 }
 
+/// A narrow, model-actionable failure class for shell invocations. This is
+/// deliberately orthogonal to [`ToolKind`]: an opaque CLI may be read-only,
+/// but `command not found` still requires repair before the turn can finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandFailureKind {
+    CommandNotFound,
+    ResourceNotFound,
+    InvalidInvocation,
+    CommandTimeout,
+    ShellUnavailable,
+}
+
+impl CommandFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandNotFound => "command_not_found",
+            Self::ResourceNotFound => "resource_not_found",
+            Self::InvalidInvocation => "invalid_invocation",
+            Self::CommandTimeout => "command_timeout",
+            Self::ShellUnavailable => "shell_unavailable",
+        }
+    }
+}
+
+/// Classify only failure shapes where checking the executable, resource, or
+/// invocation can change the next attempt. A generic nonzero exit (including
+/// grep/rg no-match) stays untyped so ordinary read-only exploration does not
+/// create a false recovery obligation.
+pub fn classify_command_failure(
+    return_code: Option<i32>,
+    output: &str,
+) -> Option<CommandFailureKind> {
+    let lower = output.to_ascii_lowercase();
+    if return_code == Some(127)
+        || lower.contains("command not found")
+        || lower.contains("not recognized as an internal or external command")
+        || (lower.contains("the term '") && lower.contains("is not recognized"))
+    {
+        return Some(CommandFailureKind::CommandNotFound);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "no such file or directory",
+            "can't open file",
+            "cannot open file",
+            "the system cannot find the path specified",
+            "cannot find path",
+        ],
+    ) {
+        return Some(CommandFailureKind::ResourceNotFound);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "unexpected argument",
+            "unrecognized argument",
+            "unknown argument",
+            "invalid argument",
+            "unrecognized option",
+            "unknown option",
+            "invalid option",
+        ],
+    ) {
+        return Some(CommandFailureKind::InvalidInvocation);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "failed to execute shell",
+            "could not start shell",
+            "shell executable was not found",
+        ],
+    ) {
+        return Some(CommandFailureKind::ShellUnavailable);
+    }
+    None
+}
+
+/// Privacy-safe identity for comparing command attempts across provider and
+/// process boundaries. The raw command remains in its existing tool-call
+/// audit surface; recovery metadata stores only this digest.
+pub fn command_fingerprint(command: &str, cwd: &str, timeout_secs: u64) -> String {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    hasher.update([0]);
+    hasher.update(cwd.as_bytes());
+    hasher.update([0]);
+    hasher.update(timeout_secs.to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn is_long_running_observation_command(lower: &str) -> bool {
     contains_any(
         lower,
@@ -623,6 +717,7 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     }
     let shell_test_command = has_shell_test_command(&lower);
     let structured_shell_assertion = has_structured_shell_assertion(&lower);
+    let case_assertion = has_case_assertion(&lower);
     // Read-only gh queries against the authoritative remote (run/PR/check
     // state) are verification — the third allowlist expansion (pnpm test →
     // vitest/tsc → gh). Mutating gh subcommands (merge, workflow run,
@@ -643,6 +738,7 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
 
     if shell_test_command
         || structured_shell_assertion
+        || case_assertion
         || contains_any(
             &lower,
             &[
@@ -1376,6 +1472,7 @@ fn has_machine_checked_assertion(command: &str) -> bool {
     let contains_machine_check = is_project_test_command(&lower)
         || is_dedicated_verifier_command(&lower)
         || has_structured_shell_assertion(&lower)
+        || has_case_assertion(&lower)
         || has_shell_test_command(&lower)
         || contains_machine_check_marker(&lower);
     contains_machine_check && !masks_assertion_failure && machine_check_controls_exit_status(&lower)
@@ -1400,7 +1497,7 @@ fn contains_machine_check_marker(command: &str) -> bool {
 }
 
 fn machine_check_controls_exit_status(command: &str) -> bool {
-    if has_structured_shell_assertion(command) {
+    if has_structured_shell_assertion(command) || has_case_assertion(command) {
         return true;
     }
 
@@ -1428,6 +1525,13 @@ fn machine_check_controls_exit_status(command: &str) -> bool {
                 || has_shell_test_command(tail)
                 || contains_machine_check_marker(tail)
         })
+}
+
+fn has_case_assertion(command: &str) -> bool {
+    command.contains("case ")
+        && command.contains(" in ")
+        && command.contains("esac")
+        && has_nonzero_exit_or_return(command)
 }
 
 fn has_nonzero_exit_or_return(command: &str) -> bool {
@@ -5948,6 +6052,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_nonzero_case_fallback_is_a_machine_checked_probe() {
+        let asserted = "output=$(./tool --version) && case \"$output\" in 'version=1.0.0') exit 0 ;; *) printf 'unexpected: %s\\n' \"$output\" >&2; exit 1 ;; esac";
+        assert!(has_machine_checked_assertion(asserted));
+        assert_eq!(classify_command(asserted, 300_000), ToolKind::Verification);
+        assert!(!has_machine_checked_assertion(
+            "output=$(./tool --version); case \"$output\" in 'version=1.0.0') echo ok ;; *) echo mismatch ;; esac"
+        ));
+    }
+
+    #[test]
     fn dedicated_verifier_can_machine_check_explicit_behavior() {
         let mut gate = CompletionGate::new_for_instruction(
             true,
@@ -6009,6 +6123,37 @@ mod tests {
         gate.record(&noisy_read);
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    #[test]
+    fn classifies_only_actionable_command_failures() {
+        let cases = [
+            (
+                Some(127),
+                "zsh: command not found: old-skill-cli",
+                Some(CommandFailureKind::CommandNotFound),
+            ),
+            (
+                Some(1),
+                "python3: can't open file 'scripts/run.py': No such file or directory",
+                Some(CommandFailureKind::ResourceNotFound),
+            ),
+            (
+                Some(2),
+                "error: unexpected argument '--verison' found",
+                Some(CommandFailureKind::InvalidInvocation),
+            ),
+            (Some(1), "grep: no matches", None),
+            (Some(1), "business check returned false", None),
+        ];
+
+        for (return_code, text, expected) in cases {
+            assert_eq!(
+                classify_command_failure(return_code, text),
+                expected,
+                "unexpected classification for {text:?}",
+            );
+        }
     }
 
     #[test]
@@ -6252,11 +6397,8 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(
             PathBuf::from(
-                verification_scope(
-                    "cd web && pnpm test",
-                    Some(r"C:\workspace\CaseSensitive"),
-                )
-                .working_directory
+                verification_scope("cd web && pnpm test", Some(r"C:\workspace\CaseSensitive"),)
+                    .working_directory
             ),
             PathBuf::from(r"C:\workspace\CaseSensitive\web"),
             "Windows drive and backslash input must preserve case while resolving cd"
