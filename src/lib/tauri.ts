@@ -18,6 +18,29 @@ export function onSessionUpdated(
   return listen<Session>(`session_updated:${sessionId}`, (e) => handler(e.payload));
 }
 
+export interface ExecutionWorkspaceView {
+  objective_id: string;
+  worktree_path: string;
+  branch_name: string;
+  base_ref: string;
+  base_sha: string;
+  state: "allocating" | "active" | "delivering" | "cleanup_pending" | "closed" | "incident";
+  failure_code?: string | null;
+  failure_detail?: string | null;
+}
+
+export function onExecutionWorkspace(
+  sessionId: string,
+  handler: (workspace: ExecutionWorkspaceView) => void,
+): Promise<UnlistenFn> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    return Promise.resolve(() => {});
+  }
+  return listen<ExecutionWorkspaceView>(`execution_workspace:${sessionId}`, (event) =>
+    handler(event.payload),
+  );
+}
+
 /// Progress while the app-managed Chromium is downloaded.
 export interface ChromiumProgress {
   stage: "resolving" | "downloading" | "extracting" | "done";

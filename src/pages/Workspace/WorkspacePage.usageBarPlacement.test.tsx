@@ -82,7 +82,9 @@ vi.mock("../../components/PermissionModePicker", () => ({
   ),
 }));
 vi.mock("../../components/GitStatusBar", () => ({
-  GitStatusBar: () => <button aria-label="Git 状态">Git</button>,
+  GitStatusBar: ({ cwd }: { cwd: string | null }) => (
+    <button aria-label="Git 状态" data-cwd={cwd ?? ""}>Git</button>
+  ),
 }));
 vi.mock("../../components/CheckpointsPanel", () => ({ CheckpointsPanel: () => null }));
 vi.mock("../../components/WorkspaceDeliveryStatus", () => ({ WorkspaceDeliveryStatus: () => null }));
@@ -196,5 +198,47 @@ describe("composer runtime control ownership", () => {
     expect(screen.getAllByRole("button", { name: "选择下一回合模型" })).toHaveLength(1);
     expect(screen.queryByRole("combobox", { name: "下一回合思考强度" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("combobox", { name: "会话权限" })).toHaveLength(1);
+  });
+
+  it("shows and uses the Objective managed worktree instead of the source checkout", async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === "get_session_execution_workspace") {
+        return Promise.resolve({
+          objective_id: "objective-1",
+          worktree_path: "/Users/x/managed/objective-1",
+          branch_name: "codefactory/objective-abc",
+          base_ref: "origin/main",
+          base_sha: "abc123",
+          state: "active",
+          failure_code: null,
+          failure_detail: null,
+        });
+      }
+      if (command === "list_browser_sessions" || command === "get_turn_timing_profile") {
+        return new Promise(() => {});
+      }
+      return Promise.resolve(undefined);
+    });
+    const { WorkspacePage } = await import("./WorkspacePage");
+
+    render(
+      <WorkspacePage
+        sessionId="s1"
+        onNewConversation={() => {}}
+        onOpenSettings={() => {}}
+        onOpenSession={() => {}}
+      />,
+    );
+
+    expect(await screen.findByTestId("execution-workspace-badge")).toHaveTextContent(
+      "受管 worktree",
+    );
+    expect(screen.getByRole("button", { name: "Git 状态" })).toHaveAttribute(
+      "data-cwd",
+      "/Users/x/managed/objective-1",
+    );
+    expect(screen.getByText(/codefactory\/objective-abc/)).toHaveTextContent(
+      "/Users/x/managed/objective-1",
+    );
   });
 });

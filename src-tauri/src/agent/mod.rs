@@ -13,6 +13,7 @@ pub mod delivery;
 pub mod delivery_run;
 pub mod dispatch;
 pub mod events;
+pub(crate) mod execution_workspace;
 mod fact_checker;
 pub mod failover;
 #[cfg(not(test))]

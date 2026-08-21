@@ -1459,10 +1459,24 @@ pub fn capture_delivery_identity(repo: &RepoContext) -> Result<DeliveryIdentityS
         .and_then(|head| head.target().map(|oid| oid.to_string()))
         .ok_or_else(|| "cannot establish the delivery worktree HEAD".to_string())?;
 
-    let repo_source = repo
-        .remote_url
-        .as_deref()
-        .unwrap_or_else(|| repo.root.to_str().unwrap_or("local-repository"));
+    let local_repo_identity_source;
+    let repo_source = if let Some(remote_url) = repo.remote_url.as_deref() {
+        remote_url
+    } else {
+        let common_dir = git(&repo.root, &["rev-parse", "--git-common-dir"])?;
+        let common_dir = PathBuf::from(common_dir);
+        let common_dir = if common_dir.is_absolute() {
+            common_dir
+        } else {
+            repo.root.join(common_dir)
+        };
+        local_repo_identity_source = common_dir
+            .canonicalize()
+            .map_err(|error| format!("cannot canonicalize local repository identity: {error}"))?
+            .to_string_lossy()
+            .into_owned();
+        &local_repo_identity_source
+    };
     let repo_identity = format!("sha256:{:x}", Sha256::digest(repo_source.as_bytes()));
 
     let admin_path = repository
@@ -2495,6 +2509,37 @@ pub async fn deliver<R: DeliveryRemote>(
                 "交付目标在持久化预检后发生变化；系统已在首次 git/远端副作用前拒绝本次执行。",
             ));
         }
+    }
+
+    // `deliver_changes` intentionally owns its native sync gate instead of
+    // trusting the repository hook: the commit path uses `--no-verify`, and a
+    // process can run with hooks disabled or missing. Fetch is read-only with
+    // respect to the remote and happens before stage/commit/push/PR effects.
+    if let Err(error) = git(
+        &repo.root,
+        &["fetch", "--prune", &repo.remote, &repo.default_branch],
+    ) {
+        return outcome.blocked_at(StepResult::blocked(
+            "base_sync",
+            format!(
+                "无法在交付副作用前刷新 {}/{}: {error}",
+                repo.remote, repo.default_branch
+            ),
+        ));
+    }
+    let remote_base = format!("{}/{}", repo.remote, repo.default_branch);
+    if git(
+        &repo.root,
+        &["merge-base", "--is-ancestor", &remote_base, "HEAD"],
+    )
+    .is_err()
+    {
+        return outcome.blocked_at(StepResult::blocked(
+            "base_sync",
+            format!(
+                "当前受管分支不包含最新 {remote_base}；系统未执行 stage、commit、push 或 PR 动作。请在同一受管 worktree 合并最新基线并重新验证。"
+            ),
+        ));
     }
 
     // ── Commit (noise-safe) ─────────────────────────────────────────────────
@@ -8456,6 +8501,63 @@ else:
         assert!(body.contains("README-Update: reviewed"));
         assert!(body.contains("README-Update-Reason:"));
         assert!(!body.contains("README-Update-Reason: <"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_feature_branch_is_blocked_before_stage_commit_push_or_pr() {
+        let root = feature_branch_repo("stale-native-base");
+        let updater = root.parent().unwrap().join("upstream-main");
+        git(
+            &root,
+            &["worktree", "add", "-q", updater.to_str().unwrap(), "main"],
+        )
+        .unwrap();
+        git(&updater, &["config", "user.name", "CodeFactory Test"]).unwrap();
+        git(
+            &updater,
+            &["config", "user.email", "test@codefactory.invalid"],
+        )
+        .unwrap();
+        std::fs::write(updater.join("upstream.txt"), "new main\n").unwrap();
+        git(&updater, &["add", "upstream.txt"]).unwrap();
+        git(&updater, &["commit", "-q", "-m", "advance main"]).unwrap();
+        git(&updater, &["push", "-q", "origin", "main"]).unwrap();
+
+        let head_before = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let status_before = git(&root, &["status", "--porcelain=v1"]).unwrap();
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert_eq!(out.stage, "base_sync");
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), head_before);
+        assert_eq!(
+            git(&root, &["status", "--porcelain=v1"]).unwrap(),
+            status_before
+        );
+        assert!(git(&root, &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

@@ -541,6 +541,21 @@ fn native_requires_mutation_receipt(
     }
 }
 
+fn requires_managed_git_workspace(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "bash"
+            | "write_file"
+            | "edit_file"
+            | "write_pptx"
+            | "edit_pptx"
+            | "format_pptx"
+            | "write_docx"
+            | "edit_xlsx"
+            | "deliver_changes"
+    )
+}
+
 /// `click` and `press` can submit forms, publish content, place orders or
 /// delete data. A DOM ref and a successful CDP send do not make either action
 /// observable after a crash, so require the caller to name a deterministic
@@ -893,6 +908,43 @@ impl DesktopToolBackend {
                 "objective_identity_missing",
             )));
         };
+
+        // Primary code Objectives must already own one durable workspace
+        // before any repository-local mutation reaches the receipt/dispatch
+        // boundary. This second fence also covers a ReviewOnly turn that was
+        // steered to Implement after the AgentLoop had already started.
+        if !is_task
+            && requires_managed_git_workspace(&call.function.name)
+            && super::execution_workspace::is_git_repository(&ctx.working_directory)
+        {
+            let objective_id = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT objective_id FROM chat_turn_state WHERE root_turn_id=?",
+            )
+            .bind(resource_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("resolve managed workspace Objective: {error}"),
+            })?
+            .flatten();
+            let workspace_ready = match objective_id.as_deref() {
+                Some(objective_id) => super::execution_workspace::verify_objective_workspace(
+                    &self.db,
+                    objective_id,
+                    &ctx.working_directory,
+                )
+                .await
+                .is_ok(),
+                None => false,
+            };
+            if !workspace_ready {
+                return Ok(MutationAdmission::Waiting(waiting_result(
+                    command,
+                    kind,
+                    "managed_workspace_identity_required",
+                )));
+            }
+        }
 
         let mut tx = self.db.begin().await.map_err(|error| ToolError {
             message: format!("begin mutation preflight: {error}"),
@@ -2226,6 +2278,100 @@ mod tests {
         .execute(&backend.db)
         .await
         .unwrap();
+    }
+
+    fn init_local_git_repo(path: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .no_window()
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q", "--initial-branch=main"]);
+        run(&["config", "user.name", "CodeFactory Test"]);
+        run(&["config", "user.email", "test@codefactory.invalid"]);
+        std::fs::write(path.join("base.txt"), "base\n").unwrap();
+        run(&["add", "base.txt"]);
+        run(&["commit", "-qm", "base"]);
+    }
+
+    #[tokio::test]
+    async fn primary_git_mutation_without_managed_workspace_is_fenced_before_receipt() {
+        let backend = objective_backend(false).await;
+        let repo = tempfile::tempdir().unwrap();
+        init_local_git_repo(repo.path());
+        let args = serde_json::json!({"path": "blocked.txt", "content": "must not exist\n"});
+        let call = call_with_args("workspace-required", "write_file", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(repo.path()),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+        let MutationAdmission::Waiting(result) = admission else {
+            panic!("a primary Git mutation without an Objective workspace must wait");
+        };
+        assert_eq!(
+            result.metadata.as_ref().and_then(|value| value["code"].as_str()),
+            Some("managed_workspace_identity_required")
+        );
+        assert!(!repo.path().join("blocked.txt").exists());
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn primary_git_mutation_dispatches_only_inside_its_managed_workspace() {
+        let backend = objective_backend(false).await;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        init_local_git_repo(&source);
+        let workspace = super::super::execution_workspace::allocate_or_attach(
+            &backend.db,
+            super::super::execution_workspace::ExecutionWorkspaceRequest {
+                objective_id: TEST_OBJECTIVE_ID.into(),
+                session_id: Some(TEST_SESSION_ID.into()),
+                source_cwd: source.clone(),
+                workspace_container: temp.path().join("managed"),
+                process_instance: "test-process".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let args = serde_json::json!({"path": "managed.txt", "content": "isolated\n"});
+        let call = call_with_args("workspace-ready", "write_file", &args);
+        register_tool_call(&backend, &call, &args).await;
+
+        let result = backend
+            .execute(&call, &args, &objective_ctx(&workspace.worktree_path))
+            .await
+            .unwrap();
+        assert_eq!(result.status, ToolExecutionStatus::Done);
+        assert_eq!(
+            std::fs::read_to_string(workspace.worktree_path.join("managed.txt")).unwrap(),
+            "isolated\n"
+        );
+        assert!(!source.join("managed.txt").exists());
     }
 
     async fn prime_file_receipt_without_dispatch(
