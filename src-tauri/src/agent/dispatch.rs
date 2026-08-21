@@ -186,6 +186,9 @@ const DIRECT_EXEC_CJK: &[&str] = &[
     "删掉",
     "删除",
     "实现",
+    "只创建",
+    "创建文件",
+    "新建文件",
     "加上",
     "开始搞",
     "开始做",
@@ -466,9 +469,30 @@ fn is_explicit_planning_request(user_msg: &str) -> bool {
     if explicitly_leaves_review {
         return false;
     }
-    let toks = tokens(&m);
-    PLAN_ONLY_CJK.iter().any(|cue| m.contains(cue))
-        || PLAN_ONLY_EN_PHRASES.iter().any(|cue| m.contains(cue))
+    // A requested write may carry a narrow boundary such as "不要修改其他文件".
+    // That limits the requested mutation; it does not revoke the mutation itself.
+    // Remove only explicit "other files" scopes before looking for a global
+    // read-only directive. The unscoped forms ("不要修改 / don't change") stay
+    // fail-closed and continue to select ReviewOnly.
+    let review_text = [
+        "不要修改其他文件",
+        "别修改其他文件",
+        "不要改其他文件",
+        "别改其他文件",
+        "不要动其他文件",
+        "别动其他文件",
+        "do not modify other files",
+        "don't modify other files",
+        "do not change other files",
+        "don't change other files",
+    ]
+    .iter()
+    .fold(m.clone(), |text, scope| text.replace(scope, ""));
+    let toks = tokens(&review_text);
+    PLAN_ONLY_CJK.iter().any(|cue| review_text.contains(cue))
+        || PLAN_ONLY_EN_PHRASES
+            .iter()
+            .any(|cue| review_text.contains(cue))
         || toks.iter().any(|token| PLAN_ONLY_EN_WORDS.contains(token))
 }
 
@@ -489,7 +513,7 @@ fn is_direct_execution_request(user_msg: &str) -> bool {
 
 fn is_delivery_request(user_msg: &str) -> bool {
     let m = user_msg.trim().to_lowercase();
-    if m.is_empty() || is_explicit_planning_request(&m) {
+    if m.is_empty() || is_explicit_planning_request(&m) || is_delivery_revocation(&m) {
         return false;
     }
     let toks = tokens(&m);
@@ -1223,6 +1247,20 @@ mod tests {
                 "{message:?}"
             );
         }
+    }
+
+    #[test]
+    fn scoped_file_and_delivery_constraints_do_not_turn_a_mutation_order_read_only() {
+        let message = "请只创建 managed-proof.txt，内容为 managed workspace live proof，确认文件存在后结束。不要提交、推送、开 PR，也不要修改其他文件。";
+
+        let contract = decide_chat_contract(None, message);
+
+        assert_eq!(contract.mode, AgentMode::Execute);
+        assert_eq!(contract.capability, TurnCapability::Implement);
+        assert!(
+            !contract.grants.explicit_read_only,
+            "a scope boundary for an explicitly requested write is not a global mutation ban"
+        );
     }
 
     #[test]
