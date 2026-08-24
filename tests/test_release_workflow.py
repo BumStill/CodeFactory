@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +14,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def _workflow_bash() -> str:
+        """Use the same Bash implementation selected by Actions' `shell: bash`."""
+        if os.name != "nt":
+            return "bash"
+        git_executable = shutil.which("git")
+        if git_executable is None:
+            raise RuntimeError("Git for Windows is required for release workflow tests")
+        git_bash = Path(git_executable).resolve().parent.parent / "bin" / "bash.exe"
+        if not git_bash.is_file():
+            raise RuntimeError(f"Git Bash was not found beside {git_executable}")
+        return str(git_bash)
+
     def _git(self, repo: Path, *args: str) -> None:
         subprocess.run(
             ["git", "-C", str(repo), *args],
@@ -463,13 +478,26 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def _guard(self, repo: Path, tag: str, authorized: str, context: str,
                mutation_log: Path | None = None) -> subprocess.CompletedProcess[str]:
         """Run the guard, optionally chaining a stand-in mutation behind it."""
-        guard = str(REPO_ROOT / "tools/release/require_authorized_tag.sh")
-        command = f'"$1" "$2" "$3" "$4"'
+        # The command is executed by Git Bash on Windows. A native
+        # ``D:\\...`` path is parsed as a shell command with escape characters,
+        # while the forward-slash spelling is accepted by both Git Bash and
+        # POSIX shells.
+        guard = (REPO_ROOT / "tools/release/require_authorized_tag.sh").as_posix()
+        command = 'bash "$1" "$2" "$3" "$4"'
         if mutation_log is not None:
             command += f' && echo mutated >> "$5"'
-        args = ["bash", "-c", command, "guard", guard, tag, authorized, context]
+        args = [
+            self._workflow_bash(),
+            "-c",
+            command,
+            "guard",
+            guard,
+            tag,
+            authorized,
+            context,
+        ]
         if mutation_log is not None:
-            args.append(str(mutation_log))
+            args.append(mutation_log.as_posix())
         return subprocess.run(args, cwd=repo, capture_output=True, text=True)
 
     def test_a_tag_moved_mid_build_blocks_the_mutation_that_follows_it(self) -> None:
@@ -477,7 +505,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         log = runner / "mutations.log"
 
         allowed = self._guard(runner, "v9.9.9", authorized_sha, "upload assets", log)
-        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(
+            allowed.returncode,
+            0,
+            f"stdout:\n{allowed.stdout}\nstderr:\n{allowed.stderr}",
+        )
         self.assertEqual(
             log.read_text(encoding="utf-8").count("mutated"),
             1,
