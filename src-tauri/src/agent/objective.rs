@@ -91,6 +91,32 @@ pub const UPDATE_SAFE_POINT_PENDING: &str = "update_safe_point_pending";
 /// exhaustion starts another independently bounded generation.
 pub const MAX_SIGNATURE_RECOVERY_ATTEMPTS: i64 = 5;
 
+/// A repeating failure signature must not spend the whole recovery budget in
+/// seconds. Scheduling every repeat at a flat five seconds means five identical
+/// errors — a condition lasting well under a minute — permanently park the
+/// Objective. Each repeat now pushes the next observation further out, so a
+/// transient condition has room to clear before the ceiling is reached, while a
+/// genuinely stuck one still exhausts.
+const RECOVERY_BACKOFF_BASE_MS: i64 = 5_000;
+const RECOVERY_BACKOFF_FACTOR: i64 = 4;
+const RECOVERY_BACKOFF_CAP_MS: i64 = 5 * 60 * 1_000;
+
+/// Attempts older than this no longer count toward the signature ceiling. The
+/// budget is meant to detect "not making progress right now", not to remember
+/// that the same error happened once a day for a week.
+const SIGNATURE_RECOVERY_WINDOW_MS: i64 = 30 * 60 * 1_000;
+
+fn recovery_backoff_ms(prior_attempts: i64) -> i64 {
+    let mut delay = RECOVERY_BACKOFF_BASE_MS;
+    for _ in 0..prior_attempts.clamp(0, 8) {
+        delay = delay.saturating_mul(RECOVERY_BACKOFF_FACTOR);
+        if delay >= RECOVERY_BACKOFF_CAP_MS {
+            return RECOVERY_BACKOFF_CAP_MS;
+        }
+    }
+    delay.min(RECOVERY_BACKOFF_CAP_MS)
+}
+
 /// Backstop for signatures that never repeat. Some routes embed varying error
 /// text in the signature (task recovery hashes the message), which would
 /// otherwise leave every per-signature tally at 1 forever. This bounds one
@@ -2335,11 +2361,13 @@ impl ObjectiveStore {
                        AND remediation.recovery_generation=(
                          SELECT recovery_generation FROM objectives WHERE id=?
                        )
+                       AND remediation.created_at>=?
                        AND COALESCE(decision.decision_type, 'waiting')<>'apply_recommended'",
                 )
                 .bind(&failure_signature)
                 .bind(&objective_id)
                 .bind(&objective_id)
+                .bind(now - SIGNATURE_RECOVERY_WINDOW_MS)
                 .fetch_one(&mut *tx)
                 .await?;
                 if signature_attempts >= MAX_SIGNATURE_RECOVERY_ATTEMPTS
@@ -3243,11 +3271,13 @@ impl ObjectiveStore {
                AND remediation.recovery_generation=(
                  SELECT recovery_generation FROM objectives WHERE id=?
                )
+               AND remediation.created_at>=?
                AND COALESCE(decision.decision_type, 'waiting')<>'apply_recommended'",
         )
         .bind(&signature)
         .bind(&decision.objective_id)
         .bind(&decision.objective_id)
+        .bind(Utc::now().timestamp_millis() - SIGNATURE_RECOVERY_WINDOW_MS)
         .fetch_one(&self.pool)
         .await?;
         if signature_attempts < MAX_SIGNATURE_RECOVERY_ATTEMPTS
@@ -4681,6 +4711,39 @@ impl ObjectiveStore {
             } else {
                 "reconcile_then_resume"
             };
+            // Push a repeating signature further out. Without this every repeat
+            // is scheduled at the caller's flat +5s, so five identical errors —
+            // under a minute of a transient condition — exhaust the budget and
+            // park the Objective for good.
+            let repeat_signature = decision
+                .failure_signature
+                .as_deref()
+                .ok_or_else(|| anyhow!("waiting_system failure signature missing"))?;
+            let prior_attempts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM objective_remediations
+                 WHERE objective_id=? AND failure_signature=?
+                   AND recovery_generation=(
+                     SELECT recovery_generation FROM objectives WHERE id=?
+                   )
+                   AND created_at>=?",
+            )
+            .bind(&decision.objective_id)
+            .bind(repeat_signature)
+            .bind(&decision.objective_id)
+            .bind(now - SIGNATURE_RECOVERY_WINDOW_MS)
+            .fetch_one(&mut *tx)
+            .await?;
+            let requested_observation = decision
+                .next_observation_at
+                .ok_or_else(|| anyhow!("waiting_system next observation missing"))?;
+            // Only a *repeat* backs off. The first occurrence keeps whatever the
+            // caller asked for, so ordinary recovery stays as responsive as it
+            // was and nothing that observes immediately is delayed.
+            let scheduled_observation = if prior_attempts > 0 {
+                requested_observation.max(now + recovery_backoff_ms(prior_attempts))
+            } else {
+                requested_observation
+            };
             sqlx::query(
                 "INSERT INTO objective_remediations
                  (id, objective_id, binding_id, domain, status, failure_code, failure_signature,
@@ -4713,11 +4776,7 @@ impl ObjectiveStore {
             .bind(strategy)
             .bind(&decision.objective_id)
             .bind(&decision.resume_cursor)
-            .bind(
-                decision
-                    .next_observation_at
-                    .ok_or_else(|| anyhow!("waiting_system next observation missing"))?,
-            )
+            .bind(scheduled_observation)
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
@@ -8561,6 +8620,19 @@ mod tests {
         if waiting.status == ObjectiveStatus::WaitingSystem
             && waiting.failure_code.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED)
         {
+            // A repeating signature is now scheduled with a growing backoff, so
+            // driving several rounds in a test has to stand in for the wait the
+            // supervisor would really sit through. Pull the observation time
+            // forward — the ceiling itself is left exactly as strict as before.
+            sqlx::query(
+                "UPDATE objective_remediations SET next_observation_at=?
+                 WHERE objective_id=? AND status IN ('queued','waiting')",
+            )
+            .bind(Utc::now().timestamp_millis() - 1)
+            .bind(&waiting.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
             let claims = store
                 .claim_due_remediations("recovery-ceiling-test", 1, 30_000)
                 .await
@@ -8600,6 +8672,94 @@ mod tests {
     /// The 2026-08-13 incident: a completion-evidence rejection re-queued a
     /// durable remediation every ~13s forever, each round paying for a real
     /// model call that returned the very same answer.
+    #[tokio::test]
+    async fn failures_older_than_the_window_do_not_count_toward_the_ceiling() {
+        // The ceiling is meant to detect "not making progress right now". Without
+        // a window it also remembers that the same error happened once days ago,
+        // so an Objective can be condemned by history it already recovered from.
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-window").await;
+        let signature = "sha256:one-error-spread-over-days";
+
+        for _ in 0..(MAX_SIGNATURE_RECOVERY_ATTEMPTS - 1) {
+            current = route_technical_failure(&store, &current, "adapter_error", signature).await;
+        }
+        assert_ne!(
+            current.failure_code.as_deref(),
+            Some(TECHNICAL_RECOVERY_EXHAUSTED),
+            "the ceiling must not have been reached yet"
+        );
+
+        // Age every attempt so far well past the window, as if they happened on
+        // previous days, then drive several more rounds.
+        sqlx::query(
+            "UPDATE objective_remediations SET created_at=? WHERE objective_id=?",
+        )
+        .bind(Utc::now().timestamp_millis() - (SIGNATURE_RECOVERY_WINDOW_MS * 4))
+        .bind(&current.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for _ in 0..(MAX_SIGNATURE_RECOVERY_ATTEMPTS - 1) {
+            current = route_technical_failure(&store, &current, "adapter_error", signature).await;
+        }
+        assert_ne!(
+            current.failure_code.as_deref(),
+            Some(TECHNICAL_RECOVERY_EXHAUSTED),
+            "attempts older than the window must not condemn the Objective"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeating_failure_backs_off_instead_of_burning_the_budget_in_seconds() {
+        // Every repeat of the same signature is scheduled at a flat now+5s, so
+        // the whole five-attempt budget is spent in well under a minute. A
+        // transient condition that would clear on its own never gets the
+        // chance, and the objective parks permanently.
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-backoff").await;
+
+        let mut delays = Vec::new();
+        for _ in 0..4 {
+            let issued = Utc::now().timestamp_millis();
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::TechnicalFailure {
+                    domain: RecoveryDomain::Chat,
+                    failure_code: "agent_loop_error".into(),
+                    failure_signature: "sha256:the-same-error-every-time".into(),
+                    next_observation_at: issued + 5_000,
+                    resume_cursor: current.resume_cursor.clone(),
+                },
+            )
+            .unwrap();
+            current = store.apply_decision(current.revision, decision).await.unwrap();
+            let next: i64 = sqlx::query_scalar(
+                "SELECT next_observation_at FROM objective_remediations
+                 WHERE objective_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            )
+            .bind(&current.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            delays.push(next - issued);
+        }
+
+        for window in delays.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "a repeating signature must back off, got delays {delays:?}",
+            );
+        }
+        assert!(
+            *delays.last().unwrap() >= 30_000,
+            "by the fourth repeat the retry must be minutes away, got {delays:?}",
+        );
+    }
+
     #[tokio::test]
     async fn repeated_failure_signature_parks_a_system_owned_incident() {
         let pool = pool().await;
