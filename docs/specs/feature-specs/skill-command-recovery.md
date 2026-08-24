@@ -91,6 +91,12 @@ AgentLoop 在收到 typed failure 后：
 失败上限和 Objective remediation 上限继续充当总兜底，不能因普通模型轮次、进程重启
 或相同错误文本清零。
 
+若 repair round 的 provider 请求已被接纳但在零输出、零工具意图时发生 transport failure，
+系统只能在 chat-run owner 已退休、无 checkpoint、无未结算 receipt，且历史工具副作用均有
+terminal receipt 时把该 `unknown` 尝试收敛为 `failed_replayable`，然后在消耗 remediation
+上限前续接同一 `active` 或 `waiting_system` Objective。存在部分输出、未结算 receipt、
+活跃 owner 或其他 Objective 状态时仍保持 observe-only。
+
 ### 4. Operational 与 fatal 边界
 
 命令不存在、路径错误、参数不兼容和 timeout 都是 operational failure，必须作为模型
