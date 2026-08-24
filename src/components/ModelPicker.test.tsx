@@ -253,6 +253,75 @@ describe("ModelPicker", () => {
     }
   });
 
+  it("keeps the portal above the whole composer card instead of covering the input row", async () => {
+    const user = userEvent.setup();
+    mocks.loadModels.mockResolvedValue(undefined);
+    const originalWidth = window.innerWidth;
+    const originalHeight = window.innerHeight;
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        if (this.getAttribute("role") === "dialog") {
+          return {
+            x: 0,
+            y: 0,
+            top: 0,
+            right: 288,
+            bottom: 300,
+            left: 0,
+            width: 288,
+            height: 300,
+            toJSON: () => ({}),
+          };
+        }
+        if (this.dataset.testid === "message-input-control-row") {
+          return {
+            x: 160,
+            y: 500,
+            top: 500,
+            right: 872,
+            bottom: 660,
+            left: 160,
+            width: 712,
+            height: 160,
+            toJSON: () => ({}),
+          };
+        }
+        return {
+          x: 600,
+          y: 620,
+          top: 620,
+          right: 820,
+          bottom: 652,
+          left: 600,
+          width: 220,
+          height: 32,
+          toJSON: () => ({}),
+        };
+      });
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1044 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 720 });
+
+    try {
+      render(
+        <div data-testid="message-input-control-row">
+          <ModelPicker portal />
+        </div>,
+      );
+      await user.click(screen.getByRole("button", { name: /选择下一回合模型/ }));
+
+      await waitFor(() => {
+        const portal = screen.getByTestId("model-picker-portal-menu");
+        const menuBottom = Number.parseFloat(portal.style.top) + 300;
+        expect(menuBottom).toBeLessThanOrEqual(496);
+      });
+    } finally {
+      rectSpy.mockRestore();
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: originalWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: originalHeight });
+    }
+  });
+
   it("opens below a trigger near the viewport top instead of crushing the menu above it", async () => {
     const user = userEvent.setup();
     mocks.loadModels.mockResolvedValue(undefined);
