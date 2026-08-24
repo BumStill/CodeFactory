@@ -903,7 +903,9 @@ impl ProviderRecoveryStore {
         attempt_id: &str,
         failure_class: &str,
         failure_code: &str,
-        replayable: bool,
+        // Retained for API/back-compat: retry-safety is now decided from the
+        // durable no-effect proof below, not the transport's admission hint.
+        _replayable: bool,
         now: i64,
     ) -> Result<ProviderMutation<OverloadBudgetDecision>> {
         validate_identifier("failure_class", failure_class)?;
@@ -926,8 +928,17 @@ impl ProviderRecoveryStore {
         ) {
             bail!("provider failure cannot settle status {:?}", attempt.status);
         }
-        let replay_is_proven =
-            replayable && !attempt.output_started && !attempt.side_effect_started;
+        // A provider POST has no external mutation semantics of its own. A
+        // request that produced no bytes, latched no tool intent, and carries
+        // no unresolved side-effect receipt has no external effect to protect,
+        // so it is safe to replay even when it was already admitted
+        // (post_admitted). This mirrors the startup reconcile
+        // (`reconcile_stale_effect_free_in_flight`), which already treats
+        // exactly this state as retry-safe; only partial output or an
+        // uncertain receipt keeps the attempt fenced and observation-only.
+        let replay_is_proven = !attempt.output_started
+            && !attempt.side_effect_started
+            && attempt.side_effect_receipt_id.is_none();
         let status = if replay_is_proven {
             "failed_replayable"
         } else {
