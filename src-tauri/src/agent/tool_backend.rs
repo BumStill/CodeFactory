@@ -1507,19 +1507,29 @@ impl DesktopToolBackend {
                             "external_state_uncertain",
                         )));
                     };
-                    if state == "observed_unchanged" && dispatch_claim_epoch == permit.claim_epoch {
+                    // `<=`, not `==`: the observation proves the effect never
+                    // landed, and that proof does not expire when the claim does.
+                    // Pinning to one epoch meant a restart or a new recovery
+                    // generation could never admit the retry the reconciler had
+                    // just authorised, so the receipt stayed `unknown` and its
+                    // `uncertain > 0` fence blocked every later mutation. The
+                    // file observer already admits from any later epoch
+                    // (`last_dispatch_epoch<?`); this is the same rule.
+                    if state == "observed_unchanged" && dispatch_claim_epoch <= permit.claim_epoch {
                         let now = chrono::Utc::now().timestamp_millis();
                         let admitted = sqlx::query(
                             "UPDATE tool_recovery_contracts
                              SET state='dispatching', dispatch_generation=dispatch_generation+1,
+                                 dispatch_owner=?, dispatch_claim_epoch=?,
                                  dispatch_started_at=?, updated_at=?
                              WHERE receipt_id=? AND state='observed_unchanged'
-                               AND dispatch_owner=? AND dispatch_claim_epoch=?",
+                               AND dispatch_claim_epoch<=?",
                         )
+                        .bind(&permit.owner)
+                        .bind(permit.claim_epoch)
                         .bind(now)
                         .bind(now)
                         .bind(&existing_receipt_id)
-                        .bind(&permit.owner)
                         .bind(permit.claim_epoch)
                         .execute(&mut *tx)
                         .await
@@ -3280,6 +3290,74 @@ mod tests {
         assert_eq!(kind, "user_skills");
         assert_eq!(locator, "{}");
         assert!(!locator.contains("workspace-maintenance"));
+    }
+
+    #[tokio::test]
+    async fn a_proven_unchanged_generic_receipt_is_retryable_under_a_later_claim_epoch() {
+        // The file observer admits a proven-not-applied retry from any *later*
+        // epoch (`last_dispatch_epoch<?`), but the generic contract required the
+        // epoch to match exactly. After a restart or a new recovery generation
+        // the epoch always differs, so the receipt stayed `unknown` forever and
+        // its `uncertain > 0` fence blocked every later mutation on the
+        // Objective — observed in production as receipts stuck for 3-6 days
+        // while the reconciler kept answering "retry".
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        sqlx::query("UPDATE sessions SET cwd=? WHERE id=?")
+            .bind(dir.path().to_string_lossy().as_ref())
+            .bind(TEST_SESSION_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        let args = serde_json::json!({"path": "report.docx", "blocks": []});
+        let call = call_with_args("docx-before-restart", "write_docx", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+        let first = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind.clone(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first, MutationAdmission::Dispatch { .. }));
+
+        claim_file_recovery(&backend, 2).await;
+        let claim = claimed_tool_recovery(&backend, 2).await;
+        let recovery = super::super::tool_recovery::ToolRecoveryStore::new(backend.db.clone());
+        assert_eq!(
+            recovery
+                .reconcile_claimed(&claim, &current_permit(2))
+                .await
+                .unwrap(),
+            super::super::tool_recovery::ToolRecoveryDisposition::RetryExact
+        );
+
+        // The process restarts and the same remediation is re-claimed under a
+        // later epoch — exactly what a new recovery generation looks like.
+        sqlx::query(
+            "UPDATE objective_remediations SET attempt_index=3
+             WHERE id='remediation-tool-fencing'",
+        )
+        .execute(&backend.db)
+        .await
+        .unwrap();
+        let retry = call_with_args("docx-after-restart", "write_docx", &args);
+        register_tool_call(&backend, &retry, &args).await;
+        let mut retry_ctx = objective_ctx(dir.path());
+        retry_ctx.mutation_permit = Some(current_permit(3));
+        let admitted = backend
+            .mutation_preflight(&retry, &args, &retry_ctx, &command, kind, false)
+            .await
+            .unwrap();
+        assert!(
+            matches!(admitted, MutationAdmission::Dispatch { .. }),
+            "a proven-unchanged receipt must not fence the retry a later claim was told to make",
+        );
     }
 
     #[tokio::test]
