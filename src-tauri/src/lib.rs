@@ -132,6 +132,96 @@ pub fn run_history_session_smoke_cli() -> bool {
     }
 }
 
+/// Execute the real Git/SQLite DeliveryRun crash-recovery contract before
+/// Tauri initializes. Parent and workers are the exact same executable.
+#[cfg(not(test))]
+pub fn run_delivery_recovery_smoke_cli() -> bool {
+    let args = std::env::args().collect::<Vec<_>>();
+    let Some(flag) = args.get(1).map(String::as_str) else {
+        return false;
+    };
+    if !matches!(
+        flag,
+        "--delivery-recovery-smoke" | "--delivery-recovery-worker"
+    ) {
+        return false;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        // The recovery path intentionally drives the full production DeliveryRun
+        // state machine. Windows executables have a much smaller main-thread
+        // stack than our Unix CI hosts, so poll that future on a Tokio worker
+        // with an explicit stack instead of directly inside `block_on`.
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Delivery recovery smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    match flag {
+        "--delivery-recovery-smoke" => {
+            if args.len() != 3 {
+                eprintln!("usage: CodeFactory --delivery-recovery-smoke <receipt.json>");
+                std::process::exit(2);
+            }
+            let output = std::path::PathBuf::from(&args[2]);
+            let result = runtime.block_on(async {
+                tokio::spawn(agent::delivery_recovery_smoke::run_parent())
+                    .await
+                    .map_err(|error| anyhow::anyhow!("delivery recovery parent task failed: {error}"))?
+            });
+            match result {
+                Ok(receipt) => {
+                    let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+                    if let Err(error) = std::fs::write(&output, rendered.as_bytes()) {
+                        eprintln!(
+                            "Delivery recovery smoke could not write {}: {error}",
+                            output.display()
+                        );
+                        std::process::exit(1);
+                    }
+                    println!("{rendered}");
+                    true
+                }
+                Err(error) => {
+                    let receipt = serde_json::json!({
+                        "ok": false,
+                        "scenario_id": "E2E-011",
+                        "error": error.to_string(),
+                    });
+                    let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+                    let _ = std::fs::write(&output, rendered.as_bytes());
+                    eprintln!("Delivery recovery smoke failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "--delivery-recovery-worker" => {
+            if args.len() != 4 {
+                eprintln!(
+                    "usage: CodeFactory --delivery-recovery-worker <state-dir> <seed|rebind|push|recover>"
+                );
+                std::process::exit(2);
+            }
+            let state_dir = std::path::PathBuf::from(&args[2]);
+            let phase = args[3].clone();
+            let result = runtime.block_on(async move {
+                tokio::spawn(async move {
+                    agent::delivery_recovery_smoke::run_worker(&state_dir, &phase).await
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("delivery recovery worker task failed: {error}"))?
+            });
+            if let Err(error) = result {
+                eprintln!("Delivery recovery worker failed: {error}");
+                std::process::exit(1);
+            }
+            true
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Execute the network-hermetic, cross-process long-task contract before
 /// Tauri initializes. Both the parent and its internal workers are copies of
 /// this exact formal executable, so release CI never substitutes a test EXE.

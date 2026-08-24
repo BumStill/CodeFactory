@@ -10,6 +10,8 @@ pub mod context_budget;
 mod context_policy;
 pub(crate) mod context_recovery;
 pub mod delivery;
+#[cfg(not(test))]
+pub(crate) mod delivery_recovery_smoke;
 pub mod delivery_run;
 pub mod dispatch;
 pub mod events;

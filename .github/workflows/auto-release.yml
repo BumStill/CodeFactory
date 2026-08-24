@@ -28,6 +28,11 @@ name: Auto Release
 on:
   workflow_dispatch:
     inputs:
+      expected_head_sha:
+        description: "Exact main commit authorized to start this release batch"
+        type: string
+        required: false
+        default: ""
       force:
         description: "Cut a release even with no feat/fix since the last tag"
         type: boolean
@@ -50,7 +55,21 @@ concurrency:
 jobs:
   release-token-preflight:
     runs-on: ubuntu-latest
+    outputs:
+      authorized_head_sha: ${{ steps.authorize.outputs.authorized_head_sha }}
     steps:
+      - name: Require exact dispatched main head
+        id: authorize
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          DISPATCHED_HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ -n "$EXPECTED_HEAD_SHA" ] && [ "$DISPATCHED_HEAD_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::error::release dispatch expected $EXPECTED_HEAD_SHA but GitHub bound the run to $DISPATCHED_HEAD_SHA; no release mutation was allowed"
+            exit 1
+          fi
+          echo "authorized_head_sha=$DISPATCHED_HEAD_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Require release automation PAT
         env:
           RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
@@ -66,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.release-token-preflight.outputs.authorized_head_sha }}
           fetch-depth: 0
           # RELEASE_PAT may create/update the version PR and therefore trigger
           # its required checks. It has no ruleset bypass and cannot push main.
@@ -76,6 +95,18 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Refuse a batch whose main branch advanced after dispatch
+        env:
+          AUTHORIZED_HEAD_SHA: ${{ needs.release-token-preflight.outputs.authorized_head_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$AUTHORIZED_HEAD_SHA"
+          test "$(git rev-parse origin/main)" = "$AUTHORIZED_HEAD_SHA" || {
+            echo "::error::main advanced after release authorization; re-dispatch from the new exact head before any release mutation"
+            exit 1
+          }
 
       - name: Quiesce open version PR
         env:
@@ -262,8 +293,10 @@ jobs:
           fi
 
           if [ "$TAG_CREATED" = true ] || [ "$RELEASE_STATE" != "published" ]; then
+            TAG_SHA=$(git rev-parse "$TAG^{commit}")
             GH_TOKEN="$ACTIONS_TOKEN" gh workflow run release.yml \
-              --repo "$GITHUB_REPOSITORY" --ref main -f tag="$TAG"
+              --repo "$GITHUB_REPOSITORY" --ref main -f tag="$TAG" \
+              -f expected_head_sha="$TAG_SHA"
             echo "Recovered missing Release dispatch for $TAG"
             echo "recovered=true" >> "$GITHUB_OUTPUT"
           fi
@@ -536,5 +569,6 @@ jobs:
             echo "push of $TAG failed (attempt $n); retrying in $((n * 10))s"
             sleep $((n * 10))
           done
-          gh workflow run release.yml --ref main -f tag="$TAG"
+          gh workflow run release.yml --ref main -f tag="$TAG" \
+            -f expected_head_sha="$MERGE_SHA"
           echo "Dispatched Release for $TAG from guarded merge $MERGE_SHA"

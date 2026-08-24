@@ -5,6 +5,9 @@ fn main() {
     if codefactory_lib::run_history_session_smoke_cli() {
         return;
     }
+    if codefactory_lib::run_delivery_recovery_smoke_cli() {
+        return;
+    }
     if codefactory_lib::run_unattended_long_task_smoke_cli() {
         return;
     }

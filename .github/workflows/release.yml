@@ -9,6 +9,11 @@ on:
         description: "Existing vX.Y.Z tag to build and publish"
         required: true
         type: string
+      expected_head_sha:
+        description: "Exact commit the release tag must resolve to"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: release-${{ inputs.tag }}
@@ -26,11 +31,28 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       content: ${{ steps.cliff.outputs.content }}
+      authorized_tag_sha: ${{ steps.authorize.outputs.authorized_tag_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
+
+      - name: Require exact release tag head
+        id: authorize
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          ACTUAL_HEAD_SHA=$(git rev-parse HEAD)
+          ACTUAL_TAG_SHA=$(git rev-parse "${TAG}^{commit}")
+          AUTHORIZED_TAG_SHA="${EXPECTED_HEAD_SHA:-$ACTUAL_TAG_SHA}"
+          if [ "$ACTUAL_HEAD_SHA" != "$AUTHORIZED_TAG_SHA" ] || [ "$ACTUAL_TAG_SHA" != "$AUTHORIZED_TAG_SHA" ]; then
+            echo "::error::release tag resolved to $ACTUAL_HEAD_SHA, expected $EXPECTED_HEAD_SHA; build and publish were blocked"
+            exit 1
+          fi
+          echo "authorized_tag_sha=$AUTHORIZED_TAG_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
@@ -67,8 +89,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.changelog.outputs.authorized_tag_sha }}
           fetch-depth: 0
+
+      - name: Require remote release tag to remain authorized
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.changelog.outputs.authorized_tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "create the draft release"
 
       - name: Validate tag and prepare draft release
         id: prepare
@@ -78,6 +106,7 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
           NOTES: ${{ needs.changelog.outputs.content }}
+          AUTHORIZED_TAG_SHA: ${{ needs.changelog.outputs.authorized_tag_sha }}
         run: |
           set -euo pipefail
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -85,9 +114,9 @@ jobs:
             exit 1
           fi
 
-          TAG_SHA="$(git rev-parse "${TAG}^{commit}")"
-          if [ "$(git rev-parse HEAD)" != "$TAG_SHA" ]; then
-            echo "::error::checkout HEAD does not match $TAG"
+          TAG_SHA="$AUTHORIZED_TAG_SHA"
+          if [ "$(git rev-parse HEAD)" != "$TAG_SHA" ] || [ "$(git rev-parse "${TAG}^{commit}")" != "$TAG_SHA" ]; then
+            echo "::error::checkout/tag does not match the frozen authorized release SHA"
             exit 1
           fi
           echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
@@ -129,7 +158,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.prepare-release.outputs.tag_sha }}
+
+      - name: Require remote release tag to remain authorized
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "start the Windows build"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -189,6 +225,13 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Recheck release tag immediately before uploading assets
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "upload release assets"
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -225,6 +268,13 @@ jobs:
           # Both platforms would otherwise race to delete and re-upload the
           # same latest.json. Finalize creates the authoritative merged file.
           includeUpdaterJson: false
+
+      - name: Recheck release tag immediately after uploading assets
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "keep uploaded assets on the authorized tag"
 
       - name: Verify Windows release executable Evolution closed loop
         shell: pwsh
@@ -278,6 +328,37 @@ jobs:
           if (-not $smoke.cleanup_ok) { throw "Release smoke leaked isolated state" }
           Get-Content $receipt
 
+      - name: Verify Windows release executable DeliveryRun recovery
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "src-tauri/target/release" -Filter "codefactory.exe" -File | Select-Object -First 1
+          if (-not $exe) { throw "Windows release executable was not produced" }
+          $receipt = Join-Path $env:RUNNER_TEMP "delivery-recovery-release-smoke.json"
+          $process = Start-Process -FilePath $exe.FullName `
+            -ArgumentList @("--delivery-recovery-smoke", $receipt) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Delivery recovery release smoke exited $($process.ExitCode)" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if (-not $smoke.ok) { throw "Delivery recovery release smoke did not report ok" }
+          if ($smoke.scenario_id -ne "E2E-011") { throw "Release ran the wrong delivery recovery scenario" }
+          if ($smoke.build_git_sha -ne "${{ needs.prepare-release.outputs.tag_sha }}") { throw "Delivery recovery smoke was not built from the release commit" }
+          if (-not $smoke.process_restart_observed) { throw "Release smoke did not observe the replacement process" }
+          if (-not $smoke.post_commit_owner_hard_killed) { throw "Release smoke did not inject the commit-window hard kill" }
+          if (-not $smoke.pre_ref_owner_hard_killed) { throw "Release smoke did not inject the intent-before-ref hard kill" }
+          if (-not $smoke.same_delivery_run) { throw "Release recovery changed DeliveryRun identity" }
+          if (-not $smoke.exact_receipted_head_reconciled) { throw "Release did not reconcile the exact receipted head" }
+          if ($smoke.identity_revision_count -ne 1) { throw "Release revised delivery identity more than once" }
+          if (-not $smoke.canonical_parent_reconciled) { throw "Release could not reconcile the canonical PR parent" }
+          if ($smoke.canonical_parent_mutation_count -ne 0) { throw "Release canonical-parent observation issued a mutation" }
+          if (-not $smoke.foreign_identity_parked) { throw "Release did not park foreign identity drift" }
+          if (-not $smoke.claim_epoch_plateau) { throw "Release delivery claim epoch did not plateau" }
+          if ($smoke.recovery_parked_event_count -ne 1) { throw "Release emitted duplicate parked incidents" }
+          if ($smoke.duplicate_remote_write_count -ne 0) { throw "Release recovery duplicated a remote mutation" }
+          if (-not $smoke.remote_head_unchanged) { throw "Release foreign recovery changed the remote" }
+          if ($smoke.user_message_count -ne 1) { throw "Release recovery manufactured or lost user input" }
+          if ($smoke.human_prompt_count -ne 0) { throw "Release recovery requested human input" }
+          if (-not $smoke.cleanup_ok) { throw "Release delivery recovery leaked isolated state" }
+          Get-Content $receipt
+
       - name: Verify Windows release executable historical session restart
         shell: pwsh
         run: |
@@ -316,7 +397,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.prepare-release.outputs.tag_sha }}
+
+      - name: Require remote release tag to remain authorized
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "start the macOS build"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -363,6 +451,13 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Recheck release tag immediately before uploading assets
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "upload release assets"
+
       - name: Build Tauri app (macOS compatibility channel)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -388,6 +483,13 @@ jobs:
           # bundle.targets in tauri.conf.json is ["nsis"] (Windows); nsis is not
           # a macOS bundle, so override to the mac bundles for this build only.
           args: --target aarch64-apple-darwin --bundles app,dmg
+
+      - name: Recheck release tag immediately after uploading assets
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "keep uploaded assets on the authorized tag"
 
       - name: Verify installed macOS release artifact
         shell: bash
@@ -431,6 +533,17 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag_sha }}
+          fetch-depth: 0
+
+      - name: Require remote release tag to remain authorized
+        env:
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+        run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "publish the release"
+
       - name: Assemble latest.json (windows + darwin) and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -438,6 +551,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           NOTES: ${{ needs.changelog.outputs.content }}
           BUILD_GIT_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
+          AUTHORIZED_TAG_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
@@ -480,6 +594,12 @@ jobs:
              }}' > latest.json
           echo "---- latest.json ----"; cat latest.json
 
+          # Everything above — asset discovery, signature downloads, manifest
+          # assembly — is slow enough for a tag to move underneath it, and the
+          # two mutations that follow cannot be undone. Recheck immediately
+          # before them, not just at the top of the job.
+          "$GITHUB_WORKSPACE/tools/release/require_authorized_tag.sh" "$TAG" "$AUTHORIZED_TAG_SHA" "publish the release"
+
           gh release upload "$TAG" --repo "$REPO" latest.json --clobber
           # Re-assert the notes (the macOS build job may touch the release) and
           # publish — the single point where the draft flag is flipped off.
@@ -490,13 +610,13 @@ jobs:
   # irrelevant and build-directory artifacts cannot satisfy the gate.
   verify-published-macos:
     runs-on: macos-latest
-    needs: finalize
+    needs: [finalize, prepare-release]
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.prepare-release.outputs.tag_sha }}
 
       - name: Download published macOS DMG
         shell: bash
