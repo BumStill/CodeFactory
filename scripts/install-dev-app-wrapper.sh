@@ -170,6 +170,43 @@ shim_reads_pointer() {
     [ -f "$shim" ] && grep -q '^CF_POINTER_FILE=' "$shim"
 }
 
+# Whether the RUNNING GUI process still carries the bundle identity is the
+# one thing an agent cannot infer from the filesystem, and getting it wrong
+# costs hours: a process that lost its identity looks exactly like a
+# mis-computed click coordinate. Answer it explicitly.
+running_identity_of() {
+    lsappinfo info -only bundleid "$1" 2>/dev/null \
+        | sed -n 's/.*"CFBundleIdentifier"="\([^"]*\)".*/\1/p'
+}
+
+show_running_identity() {
+    local pids pid bundleid
+    pids="$(pgrep -f "$DISPLAY_NAME\.app/Contents/MacOS/$DISPLAY_NAME" 2>/dev/null || true)
+$(pgrep -f 'target/debug/codefactory$' 2>/dev/null || true)"
+    pids="$(printf '%s\n' "$pids" | sed '/^$/d')"
+
+    if [ -z "$pids" ]; then
+        echo "running app:   not running"
+        return 0
+    fi
+
+    for pid in $pids; do
+        bundleid="$(running_identity_of "$pid")"
+        if [ "$bundleid" = "$BUNDLE_ID" ]; then
+            echo "running app:   pid $pid — identity OK ($bundleid)"
+            echo "               computer-use clicks should be accepted."
+        else
+            echo "running app:   pid $pid — ⚠️  ANONYMOUS (bundle id: ${bundleid:-none})"
+            echo "               computer-use will reject EVERY click on this window"
+            echo "               with a misleading \"lands on the desktop shell\" error"
+            echo "               while screenshots keep working. It is NOT a coordinate"
+            echo "               bug. Cause: the app was rebuilt and re-run outside its"
+            echo "               bundle. Fix: reinstall this wrapper (so tauri dev runs"
+            echo "               through scripts/dev-app-bundle-runner.sh) and relaunch."
+        fi
+    done
+}
+
 show_state() {
     local pointer_value fallback effective source
     pointer_value="$(read_pointer)"
@@ -210,6 +247,8 @@ show_state() {
     else
         echo "→ launches:    NOTHING — no candidate is a valid checkout"
     fi
+    echo ""
+    show_running_identity
 }
 
 # ── Argument parsing ─────────────────────────────────────────────────
@@ -438,6 +477,39 @@ cd "$CF_TARGET"
 echo "target checkout: $CF_TARGET  [via $CF_TARGET_SOURCE]"
 echo "commit:          $(git -C "$CF_TARGET" rev-parse --short HEAD 2>/dev/null || echo unknown) \
 $(git -C "$CF_TARGET" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+
+# Keep a stable macOS bundle identity across hot restarts.
+#
+# `tauri dev` launches the app with `cargo run`, and cargo re-runs it as a
+# NEW process after every rebuild. Only the FIRST of those can absorb the
+# LaunchServices launch record that opening this bundle created, so from the
+# first rebuild onward the GUI process is anonymous: computer-use rejects
+# every click ("would land on the desktop shell") while screenshots keep
+# working, which reads as a coordinate bug and is not one.
+#
+# The cargo runner sidesteps the race by exec'ing each build from inside a
+# generated .app, which confers identity without any LaunchServices record.
+# It is read from the TARGET checkout, so it tracks the code being verified;
+# if that checkout predates the runner we say so instead of failing to boot.
+CF_RUNNER="$CF_TARGET/scripts/dev-app-bundle-runner.sh"
+if [ -x "$CF_RUNNER" ]; then
+  CF_HOST_TRIPLE="$(rustc -vV 2>/dev/null | awk '/^host:/ {print $2}')"
+  if [ -z "$CF_HOST_TRIPLE" ]; then
+    case "$(uname -m)" in
+      arm64|aarch64) CF_HOST_TRIPLE="aarch64-apple-darwin" ;;
+      *)             CF_HOST_TRIPLE="x86_64-apple-darwin" ;;
+    esac
+  fi
+  CF_RUNNER_VAR="CARGO_TARGET_$(printf '%s' "$CF_HOST_TRIPLE" | tr '[:lower:]' '[:upper:]' | tr '-' '_')_RUNNER"
+  export "$CF_RUNNER_VAR=$CF_RUNNER"
+  echo "bundle identity: $CF_RUNNER_VAR -> $CF_RUNNER"
+else
+  echo "warn: $CF_RUNNER is missing, so this checkout cannot keep its bundle"
+  echo "      identity. The app will go anonymous on the FIRST rebuild and"
+  echo "      computer-use will reject every click with a misleading"
+  echo "      \"lands on the desktop shell\" error. Recover by relaunching"
+  echo "      through: open -a $CF_DISPLAY_NAME"
+fi
 
 # Pin the main window to a known origin on the primary display. Capturing
 # a window on a secondary display has been seen to fail outright

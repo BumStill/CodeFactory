@@ -141,6 +141,29 @@ close out 之后就消失的目录，等于把用户的 wrapper 弄坏。指针�
 主 checkout。`--target` 对旧版 bundle 会直接报错（旧 shim 不读指针，写了也
 只会拿错 checkout 的证据），按提示从主 checkout 重装一次即可。
 
+**热重启后点击全被拒 = 身份丢了，不是坐标算错。**
+`tauri dev` 用 `cargo run` 起 GUI，改了 `src-tauri/` 后 cargo 会以**新进程**重跑。
+Tauri 嵌进 dev 二进制的 `__info_plist` 只有 `CFBundleName` 和版本号，**没有
+`CFBundleIdentifier`**，所以裸的 `target/debug/codefactory` 本身没有身份；能用是因为
+`open -a CodeFactoryDev` open 了一条 LaunchServices 启动记录，被**第一个**注册的 GUI
+子进程认领。那条记录只能认领一次，所以**第一次重建落地后**进程就变匿名。
+
+症状极具误导性：screenshot 一切正常、窗口就在眼前，但每一次点击都被 frontmost 门禁拒绝，
+报 `The click would land on the desktop shell (Dock, Spotlight, desktop icons...)`
+或「落在"通知中心"上」。看起来像坐标错，实际是身份没了。
+
+- 根治：`scripts/dev-app-bundle-runner.sh` 作为 cargo runner 挂在
+  `CARGO_TARGET_<triple>_RUNNER` 上（wrapper shim 自动导出），把每次构建出的二进制
+  硬链接进 `target/debug/CodeFactoryDev.app` 再 exec。**直接 exec 一个 bundle 里的可执行
+  文件**就足以拿到身份，不需要 `open`，也不需要 `lsregister`，因此和启动记录竞态无关。
+- 自查：`scripts/install-dev-app-wrapper.sh --show` 会打印 `running app:` 一行——
+  `identity OK` 表示点击可用，`⚠️ ANONYMOUS` 表示这一轮取证不可能点得动。**调坐标前先看这行。**
+- 应急（wrapper 是旧版、或 runner 缺失时）：杀掉整棵树再经 wrapper 重启，
+  **必须连 Vite 一起杀**，否则 1420 端口占着、`beforeDevCommand` 失败、App 起不来
+  （有 menu bar 无窗口）：
+  `pkill -f "tauri dev"; pkill -f "target/debug/codefactory"; pkill -f "CodeFactoryDev.app/Contents/MacOS"`，
+  确认 `lsof -ti :1420` 为空后再 `open -a CodeFactoryDev`。
+
 **窗口落在副屏会截不到图。** 已实测 `computer-use` 对副屏窗口截图可能直接
 失败（SCContentFilter 返回 nil）。wrapper 默认在启动时把主窗口钉在主屏
 `60,60`（`CODEFACTORY_DEV_WINDOW_ORIGIN="x,y"` 改坐标，`off` 交还 Tauri）。

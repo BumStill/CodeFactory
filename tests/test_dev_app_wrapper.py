@@ -92,6 +92,54 @@ class DevAppWrapperTests(unittest.TestCase):
         self.assertIn("CF_BASE_CONF", self.wrapper)
         self.assertIn('[ "$CF_WINDOW_ORIGIN" != "off" ] || return 1', self.wrapper)
 
+    def test_shim_wires_the_bundle_identity_runner(self) -> None:
+        """Identity has to survive `cargo run` restarting the app after a rebuild.
+
+        `tauri dev` runs the GUI through `cargo run`, and only the first of
+        those processes can absorb the LaunchServices record that launching
+        this bundle creates.  Wiring a cargo runner makes every build exec
+        from inside a .app instead, which needs no such record.
+        """
+        self.assertIn("CARGO_TARGET_", self.wrapper)
+        self.assertIn("_RUNNER", self.wrapper)
+        self.assertIn("dev-app-bundle-runner.sh", self.wrapper)
+        self.assertTrue(
+            (REPO_ROOT / "scripts" / "dev-app-bundle-runner.sh").is_file(),
+            "the shim points at a runner that must exist in the repo",
+        )
+
+    def test_runner_is_read_from_the_target_checkout(self) -> None:
+        """It must track the code under verification, like the checkout does.
+
+        Baking the runner path at install time would keep running the main
+        checkout's copy while the agent verifies a worktree.
+        """
+        self.assertIn('CF_RUNNER="$CF_TARGET/scripts/dev-app-bundle-runner.sh"', self.wrapper)
+        self.assertNotIn('CF_RUNNER="$CF_FALLBACK_ROOT', self.wrapper)
+
+    def test_missing_runner_degrades_instead_of_breaking_the_launch(self) -> None:
+        """Pointing at a checkout that predates the runner must still boot.
+
+        An unconditional export would hand cargo a runner path that does not
+        exist, and `cargo run` would fail outright — turning a lost-automation
+        problem into an app that will not start at all.
+        """
+        self.assertIn('if [ -x "$CF_RUNNER" ]; then', self.wrapper)
+
+    def test_show_reports_whether_the_running_app_kept_its_identity(self) -> None:
+        """An anonymous process is indistinguishable from a bad click coordinate.
+
+        Screenshots keep working while every click is refused, so --show has to
+        answer this directly rather than leaving an agent to guess.
+        """
+        self.assertIn("show_running_identity", self.wrapper)
+        self.assertIn("lsappinfo", self.wrapper)
+        self.assertIn("ANONYMOUS", self.wrapper)
+        # show_state is the one entry point every mode prints, so the report
+        # cannot be missed.
+        show_state = self.wrapper.split("show_state() {", 1)[1]
+        self.assertIn("show_running_identity", show_state.split("\n}", 1)[0])
+
 
 if __name__ == "__main__":
     unittest.main()
