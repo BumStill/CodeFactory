@@ -16,7 +16,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = Command::new("git").current_dir(cwd).args(args).output()?;
+    let output = Command::new("git")
+        .no_window()
+        .current_dir(cwd)
+        .args(args)
+        .output()?;
     if !output.status.success() {
         bail!(
             "git {:?} failed: {}",

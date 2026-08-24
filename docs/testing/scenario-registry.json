@@ -603,7 +603,7 @@
       },
       "execution": {"pull_request": "exact executable real Git/SQLite smoke", "nightly": "Windows hard-kill and bounded-park matrix", "release_artifact": "exact Windows executable; installed macOS recovery and visible UI remain release canaries"},
       "automation_status": "partially_implemented",
-      "automated_by": ["rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke", "workflow:Verify Windows release executable DeliveryRun recovery"],
+      "automated_by": ["rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:committed_branch_update_recovers_from_merged_pr_ref_after_head_branch_deletion_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke", "workflow:Verify Windows release executable DeliveryRun recovery"],
       "remaining_gaps": ["L3 正式桌面会话内尚未把本场景 synthetic DeliveryRun 绑定到可见 spinner/Stop/停泊文案自动验收", "macOS 公开安装包中的 --delivery-recovery-smoke 仍需在 release canary 执行并绑定 exact tag SHA"]
     }
   ]

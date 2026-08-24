@@ -458,7 +458,10 @@ impl BranchUpdateMaterialization {
     pub fn operation_key(&self) -> String {
         external_operation_key(
             "provider_pr_branch_update",
-            &[&self.pr_number.to_string(), &self.previous_identity.head_sha],
+            &[
+                &self.pr_number.to_string(),
+                &self.previous_identity.head_sha,
+            ],
         )
     }
 }
@@ -507,7 +510,6 @@ impl DeliveryMutationPermit {
             .mark_external_mutation_unknown(intent, detail)
             .await
     }
-
 
     async fn materialize_local_commit(
         &self,
@@ -668,9 +670,7 @@ fn committed_pr_projection(
         .get("pr_url")
         .and_then(serde_json::Value::as_str)
         .filter(|url| !url.is_empty());
-    if result_number.is_some()
-        && observed_number.is_some()
-        && result_number != observed_number
+    if result_number.is_some() && observed_number.is_some() && result_number != observed_number
         || result_url.is_some() && observed_url.is_some() && result_url != observed_url
     {
         return Err(
@@ -726,18 +726,10 @@ fn committed_merge_projection(
         }
         _ => {
             let result = committed_receipt_result(receipt)?;
-            if result
-                .get("queued")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
+            if result.get("queued").and_then(serde_json::Value::as_bool) == Some(true) {
                 return Ok(MergeRequestResult::Queued);
             }
-            if result
-                .get("merged")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-            {
+            if result.get("merged").and_then(serde_json::Value::as_bool) == Some(true) {
                 return Ok(MergeRequestResult::Merged {
                     merge_sha: result
                         .get("merge_sha")
@@ -869,11 +861,15 @@ fn observed_committed_merge_projection(
     let committed = committed_merge_projection(receipt)?;
     match (committed, observation) {
         (
-            MergeRequestResult::Merged { merge_sha: committed },
-            MergeObservation::Merged { merge_sha: observed },
-        ) if committed.is_empty() || committed == observed => {
-            Ok(MergeRequestResult::Merged { merge_sha: observed })
-        }
+            MergeRequestResult::Merged {
+                merge_sha: committed,
+            },
+            MergeObservation::Merged {
+                merge_sha: observed,
+            },
+        ) if committed.is_empty() || committed == observed => Ok(MergeRequestResult::Merged {
+            merge_sha: observed,
+        }),
         (MergeRequestResult::Queued, MergeObservation::Merged { merge_sha }) => {
             Ok(MergeRequestResult::Merged { merge_sha })
         }
@@ -1826,7 +1822,9 @@ pub(crate) fn materialize_fetched_branch_update(
     }
     let fetched = git(&repo.root, &["rev-parse", &request.fetched_ref])?;
     if fetched != request.next_head_sha {
-        return Err("operation-owned branch-update ref no longer matches the exact new head".into());
+        return Err(
+            "operation-owned branch-update ref no longer matches the exact new head".into(),
+        );
     }
     let repository = git2::Repository::open(&repo.root)
         .map_err(|error| format!("cannot inspect fetched branch-update graph: {error}"))?;
@@ -2282,7 +2280,10 @@ fn verify_receipted_commit_object(
     persisted_identity: &DeliveryIdentitySnapshot,
     evidence: &LocalCommitIntentEvidence,
 ) -> Result<(), String> {
-    let parent = git(root, &["rev-parse", &format!("{}^", evidence.expected_head_sha)])?;
+    let parent = git(
+        root,
+        &["rev-parse", &format!("{}^", evidence.expected_head_sha)],
+    )?;
     if parent != persisted_identity.head_sha {
         return Err(
             "receipted local commit object is not the exact child of the persisted delivery head"
@@ -2291,10 +2292,15 @@ fn verify_receipted_commit_object(
     }
     let tree = git(
         root,
-        &["rev-parse", &format!("{}^{{tree}}", evidence.expected_head_sha)],
+        &[
+            "rev-parse",
+            &format!("{}^{{tree}}", evidence.expected_head_sha),
+        ],
     )?;
     if tree != evidence.staged_tree_sha {
-        return Err("receipted local commit object tree does not match its write-ahead receipt".into());
+        return Err(
+            "receipted local commit object tree does not match its write-ahead receipt".into(),
+        );
     }
     let message = git(
         root,
@@ -2338,12 +2344,7 @@ pub(crate) fn materialize_receipted_local_commit_with_fault_marker(
 ) -> Result<DeliveryIdentitySnapshot, String> {
     let (repo, _) = resolve_delivery_repo(cwd, default_branch_hint, Some(expected_branch))?;
     let current = capture_delivery_identity(&repo)?;
-    verify_local_commit_receipt_binding(
-        &current,
-        expected_branch,
-        persisted_identity,
-        evidence,
-    )?;
+    verify_local_commit_receipt_binding(&current, expected_branch, persisted_identity, evidence)?;
     if !evidence.original_index_digest.is_empty() && !evidence.target_index_digest.is_empty() {
         if current.head_sha != persisted_identity.head_sha
             && current.head_sha != evidence.expected_head_sha
@@ -2398,9 +2399,7 @@ pub(crate) fn materialize_receipted_local_commit_with_fault_marker(
                     );
                 }
             }
-            Err(error) => {
-                return Err(format!("cannot prepare owned Git index lock: {error}"))
-            }
+            Err(error) => return Err(format!("cannot prepare owned Git index lock: {error}")),
         }
 
         let mut lock_owned = match std::fs::hard_link(&owned_lock_path, &lock_path) {
@@ -2462,7 +2461,9 @@ pub(crate) fn materialize_receipted_local_commit_with_fault_marker(
             if locked_head != persisted_identity.head_sha
                 && locked_head != evidence.expected_head_sha
             {
-                return Err("branch HEAD changed during the receipted Git index transaction".into());
+                return Err(
+                    "branch HEAD changed during the receipted Git index transaction".into(),
+                );
             }
             if locked_head == persisted_identity.head_sha {
                 let branch_ref = format!("refs/heads/{expected_branch}");
@@ -2508,15 +2509,12 @@ pub(crate) fn materialize_receipted_local_commit_with_fault_marker(
         );
     }
     if current.head_sha != persisted_identity.head_sha {
-        return Err(
-            "pre-ref local commit recovery found an unreceipted HEAD drift".into(),
-        );
+        return Err("pre-ref local commit recovery found an unreceipted HEAD drift".into());
     }
     if evidence.original_index_tree_sha.is_empty() || evidence.source_manifest_digest.is_empty() {
         if current.change_set_digest != evidence.staged_change_set_digest {
             return Err(
-                "legacy pre-ref local commit recovery found an unreceipted change-set drift"
-                    .into(),
+                "legacy pre-ref local commit recovery found an unreceipted change-set drift".into(),
             );
         }
         if git(&repo.root, &["write-tree"])? != evidence.staged_tree_sha {
@@ -2524,9 +2522,7 @@ pub(crate) fn materialize_receipted_local_commit_with_fault_marker(
         }
     } else {
         if worktree_source_manifest_digest(&repo.root)? != evidence.source_manifest_digest {
-            return Err(
-                "pre-ref local commit recovery found source content or path drift".into(),
-            );
+            return Err("pre-ref local commit recovery found source content or path drift".into());
         }
         let current_index_tree = git(&repo.root, &["write-tree"])?;
         if current_index_tree != evidence.original_index_tree_sha
@@ -2538,7 +2534,9 @@ pub(crate) fn materialize_receipted_local_commit_with_fault_marker(
             git(&repo.root, &["read-tree", &evidence.staged_tree_sha])?;
         }
         if git(&repo.root, &["write-tree"])? != evidence.staged_tree_sha {
-            return Err("pre-ref local commit recovery could not restore the exact target index".into());
+            return Err(
+                "pre-ref local commit recovery could not restore the exact target index".into(),
+            );
         }
     }
     if let Some(marker) = pause_before_ref_marker {
@@ -2591,12 +2589,7 @@ pub fn observe_receipted_local_commit(
 ) -> Result<DeliveryIdentitySnapshot, String> {
     let (repo, _) = resolve_delivery_repo(cwd, default_branch_hint, Some(expected_branch))?;
     let current = capture_delivery_identity(&repo)?;
-    verify_local_commit_receipt_binding(
-        &current,
-        expected_branch,
-        persisted_identity,
-        evidence,
-    )?;
+    verify_local_commit_receipt_binding(&current, expected_branch, persisted_identity, evidence)?;
     if current.head_sha == persisted_identity.head_sha {
         return Err("local commit receipt has no materialized child commit to reconcile".into());
     }
@@ -2615,10 +2608,14 @@ pub fn observe_receipted_local_commit(
         }
     } else {
         if worktree_source_manifest_digest(&repo.root)? != evidence.source_manifest_digest {
-            return Err("local commit receipt cannot absorb source edits made after the commit".into());
+            return Err(
+                "local commit receipt cannot absorb source edits made after the commit".into(),
+            );
         }
         if git(&repo.root, &["write-tree"])? != evidence.staged_tree_sha {
-            return Err("local commit receipt found an index outside the exact committed tree".into());
+            return Err(
+                "local commit receipt found an index outside the exact committed tree".into(),
+            );
         }
     }
     Ok(current)
@@ -3058,8 +3055,7 @@ fn canonical_index_bytes_for_tree(root: &Path, tree_sha: &str) -> Result<Vec<u8>
     let _ = std::fs::remove_file(&path);
     let result = (|| {
         git_with_index(root, &path, &["read-tree", tree_sha])?;
-        std::fs::read(&path)
-            .map_err(|error| format!("cannot read canonical target index: {error}"))
+        std::fs::read(&path).map_err(|error| format!("cannot read canonical target index: {error}"))
     })();
     let _ = std::fs::remove_file(&path);
     result
@@ -3881,14 +3877,10 @@ pub async fn deliver<R: DeliveryRemote>(
             ),
             opts.release_urgency,
         );
-        let persisted_identity = opts
-            .expected_identity
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| {
-                capture_delivery_identity(&repo)
-                    .expect("delivery identity was captured during preflight")
-            });
+        let persisted_identity = opts.expected_identity.as_ref().cloned().unwrap_or_else(|| {
+            capture_delivery_identity(&repo)
+                .expect("delivery identity was captured during preflight")
+        });
         let fresh_identity = match capture_delivery_identity(&repo) {
             Ok(identity) => identity,
             Err(error) => {
@@ -3976,7 +3968,9 @@ pub async fn deliver<R: DeliveryRemote>(
             Err(error) => {
                 return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                     "mutation_intent",
-                    format!("真实 index 变更前无法持久化本地 Git 写入意图: {error}。未执行 stage/commit。"),
+                    format!(
+                    "真实 index 变更前无法持久化本地 Git 写入意图: {error}。未执行 stage/commit。"
+                ),
                 ))
             }
         };
@@ -3993,16 +3987,16 @@ pub async fn deliver<R: DeliveryRemote>(
         {
             Ok(identity) => identity,
             Err(error) => {
-            let error = fail_external_mutation(
-                opts.mutation_permit.as_ref(),
-                commit_intent.as_ref(),
+                let error = fail_external_mutation(
+                    opts.mutation_permit.as_ref(),
+                    commit_intent.as_ref(),
                     format!("receipted local commit CAS failed: {error}"),
-            )
-            .await;
-            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
-                "commit",
-                format!("提交结果不确定: {error}"),
-            ));
+                )
+                .await;
+                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                    "commit",
+                    format!("提交结果不确定: {error}"),
+                ));
             }
         };
         let committed_head = committed_identity.head_sha;
@@ -4136,12 +4130,12 @@ pub async fn deliver<R: DeliveryRemote>(
         // The durable result was positively observed above. Continue to the
         // next rung without replaying `git push`.
     } else {
-    match git(&repo.root, &["push", "-u", &repo.remote, &repo.branch]) {
-        Ok(_) => {
-            match observe_remote_branch_head(&repo) {
-                Ok(Some(observed_head)) if observed_head == push_sha => {}
-                Ok(observed) => {
-                    let error = fail_external_mutation(
+        match git(&repo.root, &["push", "-u", &repo.remote, &repo.branch]) {
+            Ok(_) => {
+                match observe_remote_branch_head(&repo) {
+                    Ok(Some(observed_head)) if observed_head == push_sha => {}
+                    Ok(observed) => {
+                        let error = fail_external_mutation(
                         opts.mutation_permit.as_ref(),
                         push_intent.as_ref(),
                         format!(
@@ -4149,15 +4143,15 @@ pub async fn deliver<R: DeliveryRemote>(
                         ),
                     )
                     .await;
-                    return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                        return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                         "push",
                         format!(
                             "git push 返回成功，但远端分支未精确停在授权提交；{error}。禁止创建 PR 或重放 push。"
                         ),
                     ));
-                }
-                Err(observe_error) => {
-                    let error = fail_external_mutation(
+                    }
+                    Err(observe_error) => {
+                        let error = fail_external_mutation(
                         opts.mutation_permit.as_ref(),
                         push_intent.as_ref(),
                         format!(
@@ -4165,48 +4159,48 @@ pub async fn deliver<R: DeliveryRemote>(
                         ),
                     )
                     .await;
-                    return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                        return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                         "push",
                         format!(
                             "git push 返回成功，但无法只读确认远端精确 SHA；{error}。禁止创建 PR 或重放 push。"
                         ),
                     ));
+                    }
                 }
-            }
-            if let Err(error) = commit_external_mutation(
-                opts.mutation_permit.as_ref(),
-                push_intent.as_ref(),
-                &push_evidence,
-            )
-            .await
-            {
-                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                if let Err(error) = commit_external_mutation(
+                    opts.mutation_permit.as_ref(),
+                    push_intent.as_ref(),
+                    &push_evidence,
+                )
+                .await
+                {
+                    return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                     "push",
                     format!(
                         "git push 已返回成功，但持久化结果对账失败: {error}。系统将只读核对远端，禁止重放。"
                     ),
                 ));
+                }
+                outcome.steps.push(StepResult::ok(
+                    "push",
+                    format!("推送 {} 到 {}", repo.branch, repo.remote),
+                ));
             }
-            outcome.steps.push(StepResult::ok(
-                "push",
-                format!("推送 {} 到 {}", repo.branch, repo.remote),
-            ));
-        }
-        Err(e) => {
-            let error = fail_external_mutation(
-                opts.mutation_permit.as_ref(),
-                push_intent.as_ref(),
-                format!("git push returned an indeterminate failure: {e}"),
-            )
-            .await;
-            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+            Err(e) => {
+                let error = fail_external_mutation(
+                    opts.mutation_permit.as_ref(),
+                    push_intent.as_ref(),
+                    format!("git push returned an indeterminate failure: {e}"),
+                )
+                .await;
+                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
                 "push",
                 format!(
                     "推送结果不确定: {error}。系统将只读核对远端，不会直接重放或要求用户再次说继续。"
                 ),
             ));
+            }
         }
-    }
     }
 
     let Some(remote) = remote else {
@@ -5642,7 +5636,8 @@ impl DeliveryRemote for HookRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         let rung = "provider_pr_open_or_get";
-        let operation_key = external_operation_key(rung, &[title, body, head, base, expected_head_sha]);
+        let operation_key =
+            external_operation_key(rung, &[title, body, head, base, expected_head_sha]);
         let evidence = json!({
             "head": head,
             "base": base,
@@ -5735,12 +5730,13 @@ impl DeliveryRemote for HookRemote {
             "head": head,
             "base": base,
         }))?;
-        let response: HookOpenPrObservationResponse = serde_json::from_value(value).map_err(|e| {
-            format!(
-                "delivery provider hook '{}' open-PR observation response invalid: {e}",
-                self.id
-            )
-        })?;
+        let response: HookOpenPrObservationResponse =
+            serde_json::from_value(value).map_err(|e| {
+                format!(
+                    "delivery provider hook '{}' open-PR observation response invalid: {e}",
+                    self.id
+                )
+            })?;
         match response.status.as_str() {
             "absent" => Ok(OpenPrObservation::Absent),
             "unsupported" => Ok(OpenPrObservation::Unsupported),
@@ -5748,15 +5744,20 @@ impl DeliveryRemote for HookRemote {
                 let number = response
                     .number
                     .filter(|number| *number > 0)
-                    .ok_or_else(|| "provider hook open-PR observation omitted number".to_string())?;
+                    .ok_or_else(|| {
+                        "provider hook open-PR observation omitted number".to_string()
+                    })?;
                 let url = response
                     .url
                     .filter(|url| !url.is_empty())
                     .ok_or_else(|| "provider hook open-PR observation omitted URL".to_string())?;
-                let head_sha = response
-                    .head_sha
-                    .filter(|sha| !sha.is_empty())
-                    .ok_or_else(|| "provider hook open-PR observation omitted head SHA".to_string())?;
+                let head_sha =
+                    response
+                        .head_sha
+                        .filter(|sha| !sha.is_empty())
+                        .ok_or_else(|| {
+                            "provider hook open-PR observation omitted head SHA".to_string()
+                        })?;
                 Ok(OpenPrObservation::Open(OpenPrState {
                     pr: DeliveryPr {
                         number,
@@ -5793,10 +5794,8 @@ impl DeliveryRemote for HookRemote {
         .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
         let rung = "provider_pr_body_update";
         let number_text = number.to_string();
-        let operation_key = external_operation_key(
-            rung,
-            &[&number_text, body, head, base, expected_head_sha],
-        );
+        let operation_key =
+            external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
         let evidence = json!({
             "pr_number": number,
             "head": head,
@@ -6038,12 +6037,13 @@ impl DeliveryRemote for HookRemote {
             "number": number,
             "expected_head": expected_head,
         }))?;
-        let response: HookMergeObservationResponse = serde_json::from_value(value).map_err(|e| {
-            format!(
-                "delivery provider hook '{}' merge observation response invalid: {e}",
-                self.id
-            )
-        })?;
+        let response: HookMergeObservationResponse =
+            serde_json::from_value(value).map_err(|e| {
+                format!(
+                    "delivery provider hook '{}' merge observation response invalid: {e}",
+                    self.id
+                )
+            })?;
         if response
             .head_sha
             .as_deref()
@@ -6546,11 +6546,7 @@ fn gh_pr_merge_args(
     args
 }
 
-fn gh_workflow_run_args(
-    workflow: &str,
-    git_ref: &str,
-    expected_head_sha: &str,
-) -> Vec<String> {
+fn gh_workflow_run_args(workflow: &str, git_ref: &str, expected_head_sha: &str) -> Vec<String> {
     vec![
         "workflow".into(),
         "run".into(),
@@ -6898,7 +6894,8 @@ impl DeliveryRemote for GhCliRemote {
             return Ok(pr);
         }
         let rung = "provider_pr_create";
-        let operation_key = external_operation_key(rung, &[title, body, head, base, expected_head_sha]);
+        let operation_key =
+            external_operation_key(rung, &[title, body, head, base, expected_head_sha]);
         let evidence = json!({
             "head": head,
             "base": base,
@@ -7025,10 +7022,8 @@ impl DeliveryRemote for GhCliRemote {
         .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
         let rung = "provider_pr_body_update";
         let number_text = number.to_string();
-        let operation_key = external_operation_key(
-            rung,
-            &[&number_text, body, head, base, expected_head_sha],
-        );
+        let operation_key =
+            external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
         let evidence = json!({
             "pr_number": number,
             "head": head,
@@ -8169,7 +8164,8 @@ impl DeliveryRemote for GitlabRemote {
             return Ok(pr);
         }
         let rung = "provider_pr_create";
-        let operation_key = external_operation_key(rung, &[title, body, head, base, expected_head_sha]);
+        let operation_key =
+            external_operation_key(rung, &[title, body, head, base, expected_head_sha]);
         let evidence = json!({
             "head": head,
             "base": base,
@@ -8264,10 +8260,7 @@ impl DeliveryRemote for GitlabRemote {
         let encoded = self.repo.replace('/', "%2F");
         let detail = self
             .client
-            .get(&format!(
-                "/projects/{encoded}/merge_requests/{}",
-                mr.number
-            ))
+            .get(&format!("/projects/{encoded}/merge_requests/{}", mr.number))
             .await?;
         let head_sha = detail
             .get("sha")
@@ -8310,10 +8303,8 @@ impl DeliveryRemote for GitlabRemote {
         .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
         let rung = "provider_pr_body_update";
         let number_text = number.to_string();
-        let operation_key = external_operation_key(
-            rung,
-            &[&number_text, body, head, base, expected_head_sha],
-        );
+        let operation_key =
+            external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
         let evidence = json!({
             "pr_number": number,
             "head": head,
@@ -8469,9 +8460,7 @@ impl DeliveryRemote for GitlabRemote {
         let encoded = self.repo.replace('/', "%2F");
         let value = self
             .client
-            .get(&format!(
-                "/projects/{encoded}/merge_requests/{number}"
-            ))
+            .get(&format!("/projects/{encoded}/merge_requests/{number}"))
             .await?;
         let actual_head = value
             .get("sha")
@@ -8549,7 +8538,8 @@ impl DeliveryRemote for GithubRemote {
             return Ok(pr);
         }
         let rung = "provider_pr_create";
-        let operation_key = external_operation_key(rung, &[title, body, head, base, expected_head_sha]);
+        let operation_key =
+            external_operation_key(rung, &[title, body, head, base, expected_head_sha]);
         let evidence = json!({
             "head": head,
             "base": base,
@@ -8701,10 +8691,8 @@ impl DeliveryRemote for GithubRemote {
         .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
         let rung = "provider_pr_body_update";
         let number_text = number.to_string();
-        let operation_key = external_operation_key(
-            rung,
-            &[&number_text, body, head, base, expected_head_sha],
-        );
+        let operation_key =
+            external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
         let evidence = json!({
             "pr_number": number,
             "head": head,
@@ -10301,20 +10289,38 @@ Release-Urgency: hold"
         std::fs::write(
             &hook,
             r#"#!/usr/bin/env python3
-import json, os, sys
+import json, os, pathlib, sys
 req=json.load(sys.stdin)
 action=req.get('action')
+state_path=pathlib.Path('provider-state.json')
 if action == 'open_or_get_pr':
+    state_path.write_text(json.dumps(req))
     print(json.dumps({
         'number': 42,
         'url': 'https://git.corp.example/platform/app/-/merge_requests/42',
         'title': req.get('title', ''),
         'body': req.get('body', ''),
     }))
+elif action == 'observe_open_pr':
+    state=json.loads(state_path.read_text())
+    print(json.dumps({
+        'status': 'open',
+        'number': 42,
+        'url': 'https://git.corp.example/platform/app/-/merge_requests/42',
+        'title': state.get('title', ''),
+        'body': state.get('body', ''),
+        'head_sha': os.popen('git rev-parse HEAD').read().strip(),
+    }))
 elif action == 'ci_status':
     print(json.dumps({'status': 'success'}))
 elif action == 'merge_pr':
     print(json.dumps({'ok': True}))
+elif action == 'observe_merge':
+    print(json.dumps({
+        'status': 'merged',
+        'head_sha': req.get('expected_head'),
+        'merge_sha': 'merge-sha',
+    }))
 elif action == 'trigger_release':
     print(json.dumps({'detail': 'corp release dispatched'}))
 elif action == 'deployment_status':
@@ -10420,7 +10426,12 @@ else:
         .unwrap();
         let remote = HookRemote::new(
             "test-hook".into(),
-            format!("python3 {} {} {}", hook.display(), mutation_log.display(), head),
+            format!(
+                "python3 {} {} {}",
+                hook.display(),
+                mutation_log.display(),
+                head
+            ),
             root.clone(),
         );
         let permit = committed_only_permit(&[
@@ -10498,7 +10509,12 @@ else:
         .unwrap();
         let remote = HookRemote::new(
             "test-hook".into(),
-            format!("python3 {} {} {}", hook.display(), mutation_log.display(), head),
+            format!(
+                "python3 {} {} {}",
+                hook.display(),
+                mutation_log.display(),
+                head
+            ),
             root.clone(),
         );
         let permit = committed_only_permit(&[
@@ -10555,20 +10571,40 @@ else:
         std::fs::write(
             &hook,
             r#"#!/usr/bin/env python3
-import json, sys
+import json, pathlib, sys
 req=json.load(sys.stdin)
 action=req.get('action')
+state_path=pathlib.Path('provider-state.json')
 if action == 'open_or_get_pr':
+    state_path.write_text(json.dumps(req))
     print(json.dumps({
         'number': 77,
         'url': 'https://git.corp.example/platform/app/-/merge_requests/77',
         'title': req.get('title', ''),
         'body': req.get('body', ''),
     }))
+elif action == 'observe_open_pr':
+    state=json.loads(state_path.read_text())
+    print(json.dumps({
+        'status': 'open',
+        'number': 77,
+        'url': 'https://git.corp.example/platform/app/-/merge_requests/77',
+        'title': state.get('title', ''),
+        'body': state.get('body', ''),
+        'head_sha': __import__('subprocess').check_output(
+            ['git', 'rev-parse', 'HEAD'], text=True
+        ).strip(),
+    }))
 elif action == 'ci_status':
     print(json.dumps({'status': 'success'}))
 elif action == 'merge_pr':
     print(json.dumps({'ok': True}))
+elif action == 'observe_merge':
+    print(json.dumps({
+        'status': 'merged',
+        'head_sha': req.get('expected_head'),
+        'merge_sha': 'merge-sha',
+    }))
 elif action == 'trigger_release':
     print(json.dumps({'detail': 'corp release dispatched'}))
 elif action == 'deployment_status':
@@ -10728,10 +10764,7 @@ else:
             intent: &DeliveryMutationIntentToken,
             _detail: &str,
         ) -> Result<(), String> {
-            self.unknown_rungs
-                .lock()
-                .unwrap()
-                .push(intent.rung.clone());
+            self.unknown_rungs.lock().unwrap().push(intent.rung.clone());
             Ok(())
         }
     }
@@ -10849,6 +10882,8 @@ else:
         ci_sequence: Mutex<VecDeque<CiStatus>>,
         merge_readiness: Mutex<Option<MergeReadiness>>,
         release_observation: Mutex<Option<ReleaseDispatchObservation>>,
+        created_pr: Mutex<Option<DeliveryPr>>,
+        branch_update_repo: Mutex<Option<PathBuf>>,
     }
 
     fn stub_calls() -> Arc<StubCalls> {
@@ -10879,9 +10914,19 @@ else:
             expected_head_sha: &str,
             mutation_permit: Option<&DeliveryMutationPermit>,
         ) -> Result<DeliveryPr, String> {
+            *self.calls.last_ci_sha.lock().unwrap() = Some(expected_head_sha.to_string());
+            if let Some(pr) = exact_open_pr_projection(
+                self.observe_open_pr(h, base).await?,
+                None,
+                expected_head_sha,
+            )? {
+                return Ok(pr);
+            }
             let rung = "provider_pr_open_or_get";
             let operation_key = external_operation_key(rung, &[t, b, h, base, expected_head_sha]);
-            let evidence = json!({ "head": h, "base": base, "expected_head_sha": expected_head_sha }).to_string();
+            let evidence =
+                json!({ "head": h, "base": base, "expected_head_sha": expected_head_sha })
+                    .to_string();
             let intent = match begin_or_reuse_external_mutation(
                 mutation_permit,
                 rung,
@@ -10915,13 +10960,22 @@ else:
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| (t.to_string(), b.to_string()));
-            let pr = DeliveryPr {
+            let dispatched_pr = DeliveryPr {
                 number,
                 url,
                 title,
                 body,
             };
-            *self.calls.last_ci_sha.lock().unwrap() = Some(expected_head_sha.to_string());
+            *self.calls.created_pr.lock().unwrap() = Some(dispatched_pr.clone());
+            let pr = exact_created_pr_projection(
+                &dispatched_pr,
+                self.observe_open_pr(h, base).await?,
+                t,
+                b,
+                h,
+                base,
+                expected_head_sha,
+            )?;
             commit_external_mutation(
                 mutation_permit,
                 intent.as_ref(),
@@ -10935,7 +10989,12 @@ else:
             head: &str,
             base: &str,
         ) -> Result<OpenPrObservation, String> {
-            let Some((number, url)) = self.existing_pr.clone() else {
+            let created = self.calls.created_pr.lock().unwrap().clone();
+            let Some((number, url)) = self
+                .existing_pr
+                .clone()
+                .or_else(|| created.as_ref().map(|pr| (pr.number, pr.url.clone())))
+            else {
                 return Ok(OpenPrObservation::Absent);
             };
             let (title, body) = self
@@ -10944,6 +11003,7 @@ else:
                 .lock()
                 .unwrap()
                 .clone()
+                .or_else(|| created.map(|pr| (pr.title, pr.body)))
                 .unwrap_or_else(|| ("fix: existing PR".into(), String::new()));
             Ok(OpenPrObservation::Open(OpenPrState {
                 pr: DeliveryPr {
@@ -10974,10 +11034,8 @@ else:
             .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
             let rung = "provider_pr_body_update";
             let number_text = number.to_string();
-            let operation_key = external_operation_key(
-                rung,
-                &[&number_text, body, head, base, expected_head_sha],
-            );
+            let operation_key =
+                external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
             let evidence = json!({
                 "pr_number": number,
                 "head": head,
@@ -10995,10 +11053,21 @@ else:
             {
                 DeliveryMutationBegin::Dispatch(intent) => intent,
                 DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                    return Err(format!(
-                        "committed PR-body receipt {} was followed by live body drift; no update was replayed",
-                        receipt.intent_id
-                    ));
+                    exact_updated_pr_projection(
+                        self.observe_open_pr(head, base).await?,
+                        number,
+                        body,
+                        head,
+                        base,
+                        expected_head_sha,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "committed PR-body receipt {} no longer matches live state: {error}; no update was replayed",
+                            receipt.intent_id
+                        )
+                    })?;
+                    return Ok(());
                 }
             };
             self.calls.update_pr_body.fetch_add(1, Ordering::SeqCst);
@@ -11008,6 +11077,15 @@ else:
                 .map(|(title, _)| title.clone())
                 .unwrap_or_else(|| "fix: existing PR".into());
             *remote = Some((title, body.to_string()));
+            drop(remote);
+            exact_updated_pr_projection(
+                self.observe_open_pr(head, base).await?,
+                number,
+                body,
+                head,
+                base,
+                expected_head_sha,
+            )?;
             commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await
         }
         async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
@@ -11161,14 +11239,42 @@ else:
                 }
             };
             self.calls.update_branch.fetch_add(1, Ordering::SeqCst);
-            let head = self
-                .calls
-                .last_ci_sha
-                .lock()
-                .unwrap()
-                .clone()
-                .ok_or_else(|| "stub has not observed a head".to_string())?;
-            commit_external_mutation(mutation_permit, intent.as_ref(), &evidence).await?;
+            let head = if let Some(root) = self.calls.branch_update_repo.lock().unwrap().clone() {
+                let tree_ref = format!("{expected_head}^{{tree}}");
+                let tree = git(&root, &["rev-parse", &tree_ref])?;
+                let next = git(
+                    &root,
+                    &[
+                        "commit-tree",
+                        &tree,
+                        "-p",
+                        expected_head,
+                        "-m",
+                        "synthetic provider branch update",
+                    ],
+                )?;
+                let refspec = format!("+{next}:refs/heads/feat/x");
+                git(&root, &["push", "-q", "origin", &refspec])?;
+                next
+            } else {
+                self.calls
+                    .last_ci_sha
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| "stub has not observed a head".to_string())?
+            };
+            commit_external_mutation(
+                mutation_permit,
+                intent.as_ref(),
+                &json!({
+                    "pr_number": number,
+                    "previous_head": expected_head,
+                    "head": head,
+                })
+                .to_string(),
+            )
+            .await?;
             Ok(head)
         }
         fn release_dispatch_target(&self, head_sha: &str) -> Option<ReleaseDispatchTarget> {
@@ -11326,8 +11432,11 @@ else:
         assert!(error.contains(&receipted_head), "{error}");
 
         // A rejected attempt may not leave the temporary observation ref behind.
-        let leaked = git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/"])
-            .unwrap();
+        let leaked = git(
+            &root,
+            &["for-each-ref", "--format=%(refname)", "refs/codefactory/"],
+        )
+        .unwrap();
         assert!(leaked.is_empty(), "leaked observation ref: {leaked}");
     }
 
@@ -11403,14 +11512,12 @@ else:
         );
         assert_ne!(out.final_state, "delivered", "{:?}", out.steps);
         assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
-        assert!(
-            !recorder
-                .committed_rungs
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|rung| rung == "git_push")
-        );
+        assert!(!recorder
+            .committed_rungs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|rung| rung == "git_push"));
         assert!(recorder
             .unknown_rungs
             .lock()
@@ -11460,15 +11567,16 @@ else:
             .await
             .expect_err("a create response is not a receipt until the exact PR head is observed");
 
-        assert!(error.contains("foreign head") || error.contains("exact"), "{error}");
         assert!(
-            !recorder
-                .committed_rungs
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|rung| rung == "provider_pr_open_or_get")
+            error.contains("foreign head") || error.contains("exact"),
+            "{error}"
         );
+        assert!(!recorder
+            .committed_rungs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|rung| rung == "provider_pr_open_or_get"));
         assert!(recorder
             .unknown_rungs
             .lock()
@@ -11507,7 +11615,12 @@ else:
         let expected_head = git(&root, &["rev-parse", "HEAD"]).unwrap();
         let remote = HookRemote::new(
             "post-observe".into(),
-            format!("python3 {} {} {}", hook.display(), counter.display(), expected_head),
+            format!(
+                "python3 {} {} {}",
+                hook.display(),
+                counter.display(),
+                expected_head
+            ),
             root.clone(),
         );
         let recorder = Arc::new(RecordingMutationPermit::default());
@@ -11525,15 +11638,16 @@ else:
             .await
             .expect_err("a body response is not a receipt until the updated exact PR is observed");
 
-        assert!(error.contains("foreign") || error.contains("exact"), "{error}");
         assert!(
-            !recorder
-                .committed_rungs
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|rung| rung == "provider_pr_body_update")
+            error.contains("foreign") || error.contains("exact"),
+            "{error}"
         );
+        assert!(!recorder
+            .committed_rungs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|rung| rung == "provider_pr_body_update"));
         assert!(recorder
             .unknown_rungs
             .lock()
@@ -11572,25 +11686,17 @@ else:
         let permit = DeliveryMutationPermit::new(recorder.clone());
 
         let error = remote
-            .merge_pr(
-                42,
-                MergeMethod::Squash,
-                None,
-                &expected_head,
-                Some(&permit),
-            )
+            .merge_pr(42, MergeMethod::Squash, None, &expected_head, Some(&permit))
             .await
             .expect_err("provider ok is not a merge receipt without a positive observation");
 
         assert!(error.contains("merge") || error.contains("open"), "{error}");
-        assert!(
-            !recorder
-                .committed_rungs
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|rung| rung == "provider_pr_merge")
-        );
+        assert!(!recorder
+            .committed_rungs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|rung| rung == "provider_pr_merge"));
         assert!(recorder
             .unknown_rungs
             .lock()
@@ -12322,7 +12428,7 @@ Release-Urgency: hold"
     }
 
     #[test]
-    fn pre_intent_isolated_stage_leaves_real_git_state_bit_identical() {
+    fn pre_intent_isolated_stage_normal_return_keeps_user_visible_git_state_unchanged() {
         let root = feature_branch_repo("pre-intent-isolated-stage");
         std::fs::write(root.join("already-staged.txt"), "keep staged\n").unwrap();
         git(&root, &["add", "already-staged.txt"]).unwrap();
@@ -12343,7 +12449,10 @@ Release-Urgency: hold"
             before_branch_ref
         );
         assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
-        assert_eq!(std::fs::read(root.join("feature.rs")).unwrap(), before_feature);
+        assert_eq!(
+            std::fs::read(root.join("feature.rs")).unwrap(),
+            before_feature
+        );
         assert_eq!(
             std::fs::read(root.join("already-staged.txt")).unwrap(),
             before_staged
@@ -12389,7 +12498,8 @@ Release-Urgency: hold"
         let repository = git2::Repository::open(&root).unwrap();
         let index_path = repository.index().unwrap().path().unwrap().to_path_buf();
         let lock_path = index_path.with_extension("lock");
-        let exact_foreign_bytes = canonical_index_bytes_for_tree(&root, &plan.target_tree_sha).unwrap();
+        let exact_foreign_bytes =
+            canonical_index_bytes_for_tree(&root, &plan.target_tree_sha).unwrap();
         let operation_key = evidence.operation_key();
         let suffix = operation_key.strip_prefix("sha256:").unwrap();
         let owned_lock_path = index_path.with_file_name(format!(
@@ -12413,7 +12523,10 @@ Release-Urgency: hold"
 
         assert!(error.contains("unrecognized writer"), "{error}");
         assert_eq!(std::fs::read(&lock_path).unwrap(), foreign_lock_bytes);
-        assert_eq!(std::fs::read(&owned_lock_path).unwrap(), exact_foreign_bytes);
+        assert_eq!(
+            std::fs::read(&owned_lock_path).unwrap(),
+            exact_foreign_bytes
+        );
         assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
         assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before_head);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
@@ -12678,7 +12791,7 @@ Release-Urgency: hold"
             outcome.recovery_class,
             RecoveryClass::ExternalStateUncertain
         );
-        assert_eq!(outcome.stage, "mutation_permit");
+        assert_eq!(outcome.stage, "mutation_intent");
         assert!(
             git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
             "a stale owner must not push after losing its epoch"
@@ -12862,6 +12975,7 @@ Release-Urgency: hold"
         let root = feature_branch_repo("merge-queued-behind");
         let calls = stub_calls();
         *calls.merge_readiness.lock().unwrap() = Some(MergeReadiness::Behind);
+        *calls.branch_update_repo.lock().unwrap() = Some(root.clone());
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
@@ -12883,7 +12997,7 @@ Release-Urgency: hold"
         .await;
 
         assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
-        assert_eq!(out.code, "delivery_branch_updated");
+        assert_eq!(out.code, "delivery_branch_updated", "{:?}", out.steps);
         assert!(out.recoverable);
         assert_eq!(calls.update_branch.load(Ordering::SeqCst), 1);
         assert!(out

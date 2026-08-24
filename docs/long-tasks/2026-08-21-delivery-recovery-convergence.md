@@ -1,9 +1,27 @@
 # DeliveryRun 中断恢复收敛
 
+## Basics
+
 - 日期：2026-08-21
-- 状态：实现与本地验收中
+- 状态：本地验收通过，准备 PR/CI/发布
 - 目标：一次授权的交付任务在本地 Git 提交窗口掉线后自动续接；无法证明归属的分叉安全且有界停泊，不要求用户发送“继续”
 - Primary User Path：用户授权修改、测试与发布 → CodeFactory 在同一 Objective/DeliveryRun/PR 上推进 → 进程或 App 中断 → 系统自行完成或形成稳定 system incident → 不出现无限 claim、重复远端写或假运行 UI
+
+## Completion Standard
+
+- 相同失败只能在不同 durable `claim_epoch` 内消耗有限预算，随后 Objective/DeliveryRun 同时停泊且不再被认领。
+- 所有本地 Git 与远端 provider 副作用必须由 exact write-ahead/committed receipt 约束；进程中断后只能精确观察、单次续接或安全停泊。
+- 四进程 exact-executable smoke、全量相关测试、治理门禁、PR required checks、公开 release artifact 与安装版主路径均通过。
+
+## Current State
+
+- 已完成实现与失败测试修补，Delivery Rust 定点测试 204/204、合并最新 `origin/main` 后根包 1219/1219 与 Windows/provider integration 30/30 通过。
+- 已完成 release tag/SHA 冻结与 mutation 邻近复核；workflow、构建、前端、Python、三个独立 Rust crate 与治理门禁均通过。
+- 四进程 exact-executable smoke 已在最新 `v1.81.27` 基线通过；当前进入 PR/required checks，公开 release artifact 与安装版验证仍未完成。
+
+## Completed Items
+
+- 下述“现场根因”“为什么原有测试没有拦住”“需求与不变量”以及 2026-08-21 交接快照记录了从失败测试到实现收敛的完整证据链。
 
 ## 现场根因
 
@@ -45,6 +63,8 @@
 
 ## 2026-08-21 交接快照
 
+> 以下“仍是 P0”与执行顺序是 2026-08-21 当时的历史快照；其中 release mutation 邻近 tag 复核与 merged/deleted branch 恢复现已实现。当前未完成项以本文末尾为准。
+
 - 工作树：`/Users/leo/Projects/CodeFactory/.claude/worktrees/codex-fix-delivery-recovery-convergence`
 - 分支：`codex/fix-delivery-recovery-convergence`
 - 基线：`255b054c`；当前仍未 fetch/merge 最新 `origin/main`，提交前必须执行同步门禁并解决冲突。
@@ -71,13 +91,13 @@
 - `node --test scripts/delivery-recovery-smoke-contract.test.mjs`：3/3。
 - `python3 -m unittest tests.test_release_workflow tests.test_github_main_gate`：35/35。
 - `git diff --check`：通过。
-- 之前的 exact executable `--delivery-recovery-smoke` 在三进程版本通过；扩展为四进程后尚未重新运行正式 binary，不能引用旧结果作为当前证明。
+- 最新 exact executable `--delivery-recovery-smoke` 四进程版本通过：identity revision=1、single push receipt=1、canonical PR=1、duplicate remote write=0、foreign parked event=1、claim epoch=3 且 plateau、user message=1、human prompt=0、cleanup=true。
 
 ### 仍是 P0 / 不得开 PR 或发布
 
 1. `release.yml` 的 build-windows/build-macos 只在 job 开始复核 tag，随后长时间编译，`tauri-action` 上传前没有相邻复核。tag 若在编译期间移动，冻结 SHA 构建的资产仍可能上传到已移动的 tag 名下。应拆分 build/upload，或在上传动作紧前与紧后精确复核 remote tag；post-check 失败时 draft 必须保持不发布。prepare 的 `gh release create`、finalize 的 upload/edit 也应把复核紧贴每个 mutation。新增可执行/结构 contract 模拟 `authorized=A, tag_at_upload=B`，断言 publish/tag/build/upload count 为 0（已产生 draft 时只能保留为 incident）。
 2. branch-update committed 后 canonical PR 已 merged 且 provider 自动删除 feature branch 时，当前恢复 fetch 仍依赖 `repo.branch`；需要从 provider PR ref 或 exact SHA 可寻址 ref 获取 receipted `next_head`。先写 production-connected 测试：merged+deleted head branch、observer count=1、intent=`reconciled_committed`、第二次恢复 observer count 不增长、update actuator=0、继续 merge/release/completion。
-3. `pre_intent_isolated_stage_leaves_real_git_state_bit_identical` 只是同进程正常返回，不是 SIGKILL。新增子进程 hard-kill：HEAD/ref、真实 index bytes/staged set、worktree bytes/status、mutation intents、remote writes 不变；明确临时 index/unreachable objects 的允许与 GC 契约。目前测试名比证据强。
+3. 已收窄 pre-intent 证据名称与契约：`pre_intent_isolated_stage_normal_return_keeps_user_visible_git_state_unchanged` 只证明正常返回时 HEAD/ref、真实 index、worktree 内容不变，不再声称整个 `.git` 字节级不变或已覆盖 SIGKILL。正式跨进程 smoke 的 hard-kill 边界从 durable local-commit intent 已落盘后开始；intent 前隔离规划若进程死亡，允许遗留不可达 Git object/临时隔离 index，由 Git GC/临时文件清理回收，但不得移动真实 index、branch ref 或产生远端写。
 
 ### 接管执行顺序
 
@@ -89,3 +109,29 @@
 6. PR body 声明 `Scenario-Test: HLT-001, HLT-002, HLT-005, CXD-002` 与 `Complex-E2E: E2E-011`；等待五项 required checks，squash merge。
 7. 扫描 `<latest-tag>..main` 无 hold/非法 urgency 后 exact-head dispatch Auto Release；预期 patch 为 v1.81.24（以届时最新 tag 为准）。核验公开 6 类资产、`latest.json` 与 tag SHA。
 8. 匿名下载公开 DMG，安装后用 exact installed executable 重跑 DeliveryRun recovery smoke，并在正式 App 验证旧会话 claim/event plateau、无假 spinner/Stop、真正 active root 仍可停止。通过前只能报 `released_not_live_verified`。
+
+## Remaining Items
+
+1. 提交 PR 并等待全部 required checks；处理任何真实 review/CI 回归。
+2. squash merge 后按完整批次门禁切 patch release，验证公开资产、安装包与正式 App 受影响路径。
+
+## Blockers
+
+- 当前无已知外部 blocker；若完整批次出现 `Release-Urgency: hold`、required check 失败或公开安装版 smoke 失败，则在对应门禁处停止并保留可接管证据。
+
+## Evidence
+
+- 代码级证据：exact local/remote mutation receipt、claim-epoch budget、linked Objective 生命周期、provider post-observe 与 release tag/SHA guard。
+- 自动化证据：根包 1219/1219、Windows/provider integration 30/30、独立 Rust crate 267/267、Vitest 723/723、Python 187/187（2 skip）、release/workflow 38/38、smoke contract 3/3、四进程 exact smoke 与场景/治理门禁均通过。
+- 尚待本轮生成：PR checks、release run、公开资产、安装版主路径证据。
+
+## AI Collaboration
+
+- 上下文范围：正式库只读诊断、隔离 worktree 实现、独立 QA 反例审查、release 运维核查。
+- 关键假设：只有 exact receipt 和当前 lease/Objective authority 能授权续接；无法证明归属必须有界停泊。
+- 复审点：每个 Git/provider/release crash window 都要求“精确继续一次或零副作用停泊”，不接受 mock/结构绿灯替代生产路径。
+- 验证结果：已关闭已知 P0；当前继续跑完整交付链，最终结果以实时门禁和公开安装版为准。
+
+## Stop Boundary
+
+- 仅在目标完整发布并通过安装版主路径后标记完成；或在 PR/CI/release/live verification 出现无法在授权范围内消除的真实 blocker 时，记录精确状态、剩余命令与接管入口后停止。
