@@ -91,6 +91,12 @@ AgentLoop 在收到 typed failure 后：
 失败上限和 Objective remediation 上限继续充当总兜底，不能因普通模型轮次、进程重启
 或相同错误文本清零。
 
+若 repair round 的 provider 请求已被接纳但在零输出、零工具意图时发生 transport failure，
+系统只能在 chat-run owner 已退休、无 checkpoint、无未结算 receipt，且历史工具副作用均有
+terminal receipt 时把该 `unknown` 尝试收敛为 `failed_replayable`，然后在消耗 remediation
+上限前续接同一 `active` 或 `waiting_system` Objective。存在部分输出、未结算 receipt、
+活跃 owner 或其他 Objective 状态时仍保持 observe-only。
+
 ### 4. Operational 与 fatal 边界
 
 命令不存在、路径错误、参数不兼容和 timeout 都是 operational failure，必须作为模型
@@ -163,6 +169,7 @@ turn 并保留 Objective 为 system-owned incident；不显示业务完成或人
 | Objective no-change | corrected bounded probe → final | `CurrentStateAcceptance`、单一 completed revision、无重复 final message；纯文本答复仍不能完成 LocalMutation |
 | AgentLoop negative | wrong command → unchanged retry | 第二次 dispatch 被拒绝；要求诊断；无副作用 |
 | AgentLoop batch | failed first + queued second | 第二个调用记 cancelled，下一轮基于真实错误重新生成 |
+| Provider recovery | command repair 后 provider 零输出 transport failure | terminal receipt + retired owner 允许同一 `waiting_system` Objective 续接；partial/unresolved 仍锁定 |
 | SQLite receipt | invalid invocation + unchanged/changed workspace | 未变化时 receipt/contract 为 `cancelled` 且失败工具可终结；有变化时仍为 `unknown/observed_changed`；成功工具不能用 cancelled 绕过证据 |
 | SQLite restart | typed error 后进程重启 | tool result/code/identity 重放；同 Objective；零新增 user message |
 | CodeFactoryDev | synthetic Skill 成功与 timeout 边界 | 工具卡、恢复状态、最终结果和进程回收均符合规格 |
