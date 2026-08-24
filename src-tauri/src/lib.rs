@@ -147,6 +147,11 @@ pub fn run_delivery_recovery_smoke_cli() -> bool {
         return false;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        // The recovery path intentionally drives the full production DeliveryRun
+        // state machine. Windows executables have a much smaller main-thread
+        // stack than our Unix CI hosts, so poll that future on a Tokio worker
+        // with an explicit stack instead of directly inside `block_on`.
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .unwrap_or_else(|error| {
@@ -160,7 +165,12 @@ pub fn run_delivery_recovery_smoke_cli() -> bool {
                 std::process::exit(2);
             }
             let output = std::path::PathBuf::from(&args[2]);
-            match runtime.block_on(agent::delivery_recovery_smoke::run_parent()) {
+            let result = runtime.block_on(async {
+                tokio::spawn(agent::delivery_recovery_smoke::run_parent())
+                    .await
+                    .map_err(|error| anyhow::anyhow!("delivery recovery parent task failed: {error}"))?
+            });
+            match result {
                 Ok(receipt) => {
                     let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
                     if let Err(error) = std::fs::write(&output, rendered.as_bytes()) {
@@ -194,9 +204,15 @@ pub fn run_delivery_recovery_smoke_cli() -> bool {
                 std::process::exit(2);
             }
             let state_dir = std::path::PathBuf::from(&args[2]);
-            if let Err(error) = runtime.block_on(agent::delivery_recovery_smoke::run_worker(
-                &state_dir, &args[3],
-            )) {
+            let phase = args[3].clone();
+            let result = runtime.block_on(async move {
+                tokio::spawn(async move {
+                    agent::delivery_recovery_smoke::run_worker(&state_dir, &phase).await
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("delivery recovery worker task failed: {error}"))?
+            });
+            if let Err(error) = result {
                 eprintln!("Delivery recovery worker failed: {error}");
                 std::process::exit(1);
             }
