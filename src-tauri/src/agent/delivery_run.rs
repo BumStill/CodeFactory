@@ -766,6 +766,141 @@ pub async fn create_delivery_run(
     Ok(claim_epoch)
 }
 
+/// Reconciles a durable DeliveryRun whose expected git head and change-set
+/// advanced legitimately (for example the branch was merged-forward to pick up
+/// a newer baseline while resolving a BEHIND PR).
+///
+/// This records a receipt-backed identity revision and rewrites the run's
+/// `change_set_digest`/`expected_head_sha` so that a subsequent
+/// [`create_delivery_run`] re-admission renews the lease instead of tripping
+/// the identity-collision guard. Only a genuine forward advance of the expected
+/// head is allowed: every other identity field (objective, repo, worktree,
+/// branch, workspace, ceiling) must be unchanged, otherwise this is a real
+/// conflict and is rejected before any side effect. The caller is responsible
+/// for proving the head actually advanced (ancestry check) before invoking
+/// this; the receipt and field alignment are re-validated here.
+pub async fn reconcile_delivery_run_identity(
+    pool: &SqlitePool,
+    run: &NewDeliveryRun,
+    process: &ProcessIdentity,
+    now: i64,
+    revision: &DeliveryIdentityRevision,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let existing = sqlx::query(
+        "SELECT objective_id, run_kind, session_id, task_id, workspace_path,
+                worktree_identity, repo_identity, base_branch, head_branch,
+                change_set_digest, expected_head_sha, requested_ceiling, status
+         FROM delivery_runs WHERE id=?",
+    )
+    .bind(&run.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| {
+        crate::errors::AppError::Other(format!(
+            "delivery run {} missing for identity reconciliation",
+            run.id
+        ))
+    })?;
+
+    let status: String = existing.try_get("status")?;
+    if matches!(
+        status.as_str(),
+        "completed" | "failed" | "cancelled" | "rejected"
+    ) {
+        return Err(crate::errors::AppError::Other(
+            "cannot reconcile a terminal durable delivery run".into(),
+        ));
+    }
+
+    // A legitimate advance only moves expected-head/change-set; every other
+    // identity field must be unchanged, otherwise this is a genuine conflict.
+    if existing.try_get::<String, _>("objective_id")? != run.objective_id
+        || existing.try_get::<String, _>("run_kind")? != run.run_kind
+        || existing.try_get::<Option<String>, _>("session_id")? != run.session_id
+        || existing.try_get::<Option<String>, _>("task_id")? != run.task_id
+        || existing.try_get::<String, _>("workspace_path")? != run.workspace_path
+        || existing.try_get::<String, _>("worktree_identity")? != run.worktree_identity
+        || existing.try_get::<String, _>("repo_identity")? != run.repo_identity
+        || existing.try_get::<String, _>("base_branch")? != run.base_branch
+        || existing.try_get::<String, _>("head_branch")? != run.head_branch
+        || existing.try_get::<String, _>("requested_ceiling")? != run.requested_ceiling
+    {
+        return Err(crate::errors::AppError::Other(
+            "delivery run identity collision: objective/worktree/change-set changed; refused before side effects"
+                .into(),
+        ));
+    }
+
+    let previous_head: String = existing.try_get("expected_head_sha")?;
+    let previous_digest: String = existing.try_get("change_set_digest")?;
+    if previous_head == run.expected_head_sha && previous_digest == run.change_set_digest {
+        // Already reconciled; idempotent no-op.
+        return Ok(());
+    }
+    if previous_head == run.expected_head_sha {
+        return Err(crate::errors::AppError::Other(
+            "delivery identity revision must move the expected head".into(),
+        ));
+    }
+
+    if revision.receipt_id != delivery_identity_revision_receipt_id(&run.id, revision)
+        || revision.objective_id != run.objective_id
+        || revision.repo_identity != run.repo_identity
+        || revision.worktree_identity != run.worktree_identity
+        || revision.previous_expected_head_sha != previous_head
+        || revision.previous_change_set_digest != previous_digest
+        || revision.next_expected_head_sha != run.expected_head_sha
+        || revision.next_change_set_digest != run.change_set_digest
+    {
+        return Err(crate::errors::AppError::Other(
+            "delivery identity revision receipt does not match objective/repo/worktree/change-set"
+                .into(),
+        ));
+    }
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO delivery_identity_revisions (
+            receipt_id, run_id, objective_id, repo_identity, worktree_identity,
+            previous_expected_head_sha, previous_change_set_digest,
+            next_expected_head_sha, next_change_set_digest,
+            process_instance, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&revision.receipt_id)
+    .bind(&run.id)
+    .bind(&revision.objective_id)
+    .bind(&revision.repo_identity)
+    .bind(&revision.worktree_identity)
+    .bind(&revision.previous_expected_head_sha)
+    .bind(&revision.previous_change_set_digest)
+    .bind(&revision.next_expected_head_sha)
+    .bind(&revision.next_change_set_digest)
+    .bind(&process.instance_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    let updated = sqlx::query(
+        "UPDATE delivery_runs
+         SET change_set_digest=?, expected_head_sha=?, updated_at=?
+         WHERE id=? AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')",
+    )
+    .bind(&run.change_set_digest)
+    .bind(&run.expected_head_sha)
+    .bind(now)
+    .bind(&run.id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(crate::errors::AppError::Other(
+            "delivery run identity reconciliation lost its row".into(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Extend a live DeliveryRun lease without changing business progress. The
 /// owner and non-expired predicates form the CAS: a former or competing owner
 /// cannot revive or steal a run through the heartbeat path.
@@ -2346,6 +2481,203 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(epochs, (1, 1, 140));
+    }
+
+    #[tokio::test]
+    async fn reconcile_advances_expected_head_for_a_legitimate_forward_merge() {
+        let pool = pool().await;
+        let process = ProcessIdentity::new("process", "1.80.1", "18001");
+        let original = NewDeliveryRun {
+            id: "reconcile-forward".into(),
+            objective_id: "objective-opaque-reconcile".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:reconcile".into(),
+            repo_identity: "example.invalid/repo".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest-a".into(),
+            expected_head_sha: "aaa".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        create_delivery_run(&pool, &original, &process, 100, 30)
+            .await
+            .unwrap();
+
+        let mut advanced = original.clone();
+        advanced.expected_head_sha = "bbb".into();
+        advanced.change_set_digest = "digest-b".into();
+        let mut revision = DeliveryIdentityRevision {
+            receipt_id: String::new(),
+            objective_id: advanced.objective_id.clone(),
+            repo_identity: advanced.repo_identity.clone(),
+            worktree_identity: advanced.worktree_identity.clone(),
+            previous_expected_head_sha: "aaa".into(),
+            previous_change_set_digest: "digest-a".into(),
+            next_expected_head_sha: "bbb".into(),
+            next_change_set_digest: "digest-b".into(),
+        };
+        revision.receipt_id = delivery_identity_revision_receipt_id(&advanced.id, &revision);
+        reconcile_delivery_run_identity(&pool, &advanced, &process, 200, &revision)
+            .await
+            .unwrap();
+
+        let (head, digest): (String, String) = sqlx::query_as(
+            "SELECT expected_head_sha, change_set_digest FROM delivery_runs WHERE id='reconcile-forward'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(head, "bbb");
+        assert_eq!(digest, "digest-b");
+        let revision_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_identity_revisions WHERE run_id='reconcile-forward'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(revision_count, 1);
+
+        // Re-admission with the reconciled identity renews instead of colliding.
+        let epoch = create_delivery_run(&pool, &advanced, &process, 300, 30)
+            .await
+            .unwrap();
+        assert!(epoch >= 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_a_genuine_identity_conflict() {
+        let pool = pool().await;
+        let process = ProcessIdentity::new("process", "1.80.2", "18002");
+        let original = NewDeliveryRun {
+            id: "reconcile-conflict".into(),
+            objective_id: "objective-opaque-reconcile-conflict".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:reconcile-conflict".into(),
+            repo_identity: "example.invalid/repo".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest-a".into(),
+            expected_head_sha: "aaa".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        create_delivery_run(&pool, &original, &process, 100, 30)
+            .await
+            .unwrap();
+
+        let mut conflicting = original.clone();
+        conflicting.workspace_path = "/workspace-other".into();
+        conflicting.head_branch = "feature-other".into();
+        conflicting.expected_head_sha = "bbb".into();
+        conflicting.change_set_digest = "digest-b".into();
+        let mut revision = DeliveryIdentityRevision {
+            receipt_id: String::new(),
+            objective_id: conflicting.objective_id.clone(),
+            repo_identity: conflicting.repo_identity.clone(),
+            worktree_identity: conflicting.worktree_identity.clone(),
+            previous_expected_head_sha: "aaa".into(),
+            previous_change_set_digest: "digest-a".into(),
+            next_expected_head_sha: "bbb".into(),
+            next_change_set_digest: "digest-b".into(),
+        };
+        revision.receipt_id = delivery_identity_revision_receipt_id(&conflicting.id, &revision);
+        let error = reconcile_delivery_run_identity(&pool, &conflicting, &process, 200, &revision)
+            .await
+            .expect_err("a changed workspace/branch is a genuine identity conflict");
+        assert!(error.to_string().contains("identity collision"));
+
+        // The run identity is unchanged.
+        let (head, digest): (String, String) = sqlx::query_as(
+            "SELECT expected_head_sha, change_set_digest FROM delivery_runs WHERE id='reconcile-conflict'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(head, "aaa");
+        assert_eq!(digest, "digest-a");
+    }
+
+    #[tokio::test]
+    async fn reconcile_requires_the_expected_head_to_actually_move() {
+        let pool = pool().await;
+        let process = ProcessIdentity::new("process", "1.80.3", "18003");
+        let original = NewDeliveryRun {
+            id: "reconcile-no-move".into(),
+            objective_id: "objective-opaque-reconcile-no-move".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:reconcile-no-move".into(),
+            repo_identity: "example.invalid/repo".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest-a".into(),
+            expected_head_sha: "aaa".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        create_delivery_run(&pool, &original, &process, 100, 30)
+            .await
+            .unwrap();
+
+        let mut not_moved = original.clone();
+        not_moved.change_set_digest = "digest-b".into();
+        let mut revision = DeliveryIdentityRevision {
+            receipt_id: String::new(),
+            objective_id: not_moved.objective_id.clone(),
+            repo_identity: not_moved.repo_identity.clone(),
+            worktree_identity: not_moved.worktree_identity.clone(),
+            previous_expected_head_sha: "aaa".into(),
+            previous_change_set_digest: "digest-a".into(),
+            next_expected_head_sha: "aaa".into(),
+            next_change_set_digest: "digest-b".into(),
+        };
+        revision.receipt_id = delivery_identity_revision_receipt_id(&not_moved.id, &revision);
+        let error = reconcile_delivery_run_identity(&pool, &not_moved, &process, 200, &revision)
+            .await
+            .expect_err("an identity revision must move the expected head");
+        assert!(error.to_string().contains("must move the expected head"));
     }
 
     #[tokio::test]
