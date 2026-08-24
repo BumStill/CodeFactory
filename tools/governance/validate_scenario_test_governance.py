@@ -87,9 +87,20 @@ def _automation_exists(target: str, repo_root: Path) -> bool:
     if kind == "path":
         return (repo_root / marker).is_file()
     if kind == "rust":
+        # Must be a real test function, not just the name appearing somewhere.
+        # Substring matching would keep a declaration "valid" after its test was
+        # renamed or deleted, as long as the name survived in a comment, a
+        # string literal, or a failure code — which is precisely how a scenario
+        # goes on reporting coverage it no longer has.
         roots = [repo_root / "src-tauri" / "src", repo_root / "src-tauri" / "crates"]
-        files = [file for root in roots if root.exists() for file in _files_with_suffix(root, ".rs")]
-    elif kind == "workflow":
+        pattern = re.compile(r"\bfn\s+" + re.escape(marker) + r"\s*\(")
+        return any(
+            pattern.search(file.read_text(encoding="utf-8", errors="ignore"))
+            for root in roots
+            if root.exists()
+            for file in _files_with_suffix(root, ".rs")
+        )
+    if kind == "workflow":
         files = _files_with_suffix(repo_root / ".github" / "workflows", ".yml")
     elif kind == "binary":
         files = _files_with_suffix(repo_root / "src-tauri", ".rs")
@@ -244,6 +255,40 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
             errors.append(f"{case_id} has invalid execution gates")
         if case.get("automation_status") not in ALLOWED_AUTOMATION_STATUS:
             errors.append(f"{case_id} has invalid automation_status")
+        # `automation_status` must match what the case actually automates.
+        # Forcing every case to declare automation would just invite fake
+        # declarations; the honest bar is that a case may not *claim* more than
+        # it runs, and an incomplete case must say what is still missing so the
+        # hole is visible in review instead of reading as coverage.
+        automated = case.get("automated_by")
+        automated = automated if isinstance(automated, list) else []
+        for target in automated:
+            if not _automation_exists(target, repo_root):
+                errors.append(f"{case_id} points at missing automation: {target}")
+        gaps = case.get("remaining_gaps")
+        gaps = gaps if isinstance(gaps, list) else []
+        status = case.get("automation_status")
+        if status == "implemented":
+            if not automated:
+                errors.append(f"{case_id} must name at least one automation target")
+            if gaps:
+                errors.append(
+                    f"{case_id} is implemented but still records remaining_gaps"
+                )
+        elif status == "partially_implemented":
+            if not automated:
+                errors.append(f"{case_id} must name at least one automation target")
+            if not gaps:
+                errors.append(
+                    f"{case_id} is partially_implemented and must record remaining_gaps"
+                )
+        elif status == "designed":
+            if automated:
+                errors.append(
+                    f"{case_id} is only designed but already names automation"
+                )
+            if not gaps:
+                errors.append(f"{case_id} is designed and must record remaining_gaps")
         if case.get("must_remain_unattended") is True:
             serialized = json.dumps(oracles, ensure_ascii=False)
             for marker in ("user message 总数为 1", "human prompt 总数为 0"):

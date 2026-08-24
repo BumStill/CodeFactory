@@ -346,7 +346,9 @@
         "delivery": ["完成前必须具备最新机器验证和约定的 canonical delivery evidence"]
       },
       "execution": {"pull_request": "deterministic Windows process smoke", "nightly": "fault matrix", "release_artifact": "exact Windows executable"},
-      "automation_status": "partially_implemented"
+      "automation_status": "partially_implemented",
+      "automated_by": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"],
+      "remaining_gaps": ["L2 PR 门禁只跑 Windows 进程 smoke，macOS 侧同一路径未自动化", "L3 真实桌面会话内的无人值守完成尚未自动化，现仅覆盖 headless worker", "L4 exact release artifact 的 macOS 安装版 canary 尚未接入"]
     },
     {
       "id": "E2E-002",
@@ -422,7 +424,8 @@
         "delivery": ["测试、PR、required CI、merge、artifact identity 缺一不可 completed"]
       },
       "execution": {"nightly": "local fake-forge end-to-end", "manual_canary": "real governed delivery without external mutation by default"},
-      "automation_status": "designed"
+      "automation_status": "designed",
+      "remaining_gaps": ["尚无任何自动化：nightly 的 local fake-forge 端到端与 manual_canary 均未实现", "追加约束后的完整交付链（PR→CI→merge→release）未自动验证", "L3/L4 证据全缺"]
     },
     {
       "id": "E2E-005",
@@ -446,7 +449,8 @@
         "delivery": ["receipt 同时记录 snapshot、failure detection 和 cleanup"]
       },
       "execution": {"pull_request": "real process lifecycle smoke", "nightly": "failure/retry matrix", "release_artifact": "exact binary smoke"},
-      "automation_status": "partially_implemented"
+      "automation_status": "designed",
+      "remaining_gaps": ["尚无任何自动化：PR 的 real process lifecycle smoke、nightly 的 failure/retry matrix、release 的 exact binary smoke 均未实现", "浏览器逻辑失败后的回收与任务续接未自动验证", "既有 browser smoke 覆盖的是会话建立，不覆盖本场景的失败回收路径，因此不作声明"]
     },
     {
       "id": "E2E-006",
@@ -470,7 +474,8 @@
         "delivery": ["manifest、安装包、运行中 build SHA 与目标 tag 完全一致"]
       },
       "execution": {"nightly": "Windows install-upgrade fixture", "release_artifact": "exact previous-to-current upgrade gate"},
-      "automation_status": "designed"
+      "automation_status": "designed",
+      "remaining_gaps": ["尚无任何自动化：nightly 的 Windows install-upgrade fixture 与 release 的 previous-to-current upgrade gate 均未实现", "历史卡住任务存在时的更新放行未自动验证"]
     },
     {
       "id": "E2E-007",
@@ -550,8 +555,8 @@
         "delivery": ["新分支不含 terminal PR 的旧提交", "canonical PR/CI/merge 与 workspace head 一致", "仅 clean merged workspace 自动 closeout"]
       },
       "execution": {"pull_request": "real Git plus SQLite integration", "nightly": "cross-process fake-forge lifecycle", "release_artifact": "exact installed App CodeFactoryDev-equivalent canary"},
-      "automation_status": "partially_implemented",
-      "remaining_gaps": ["L2 hard-kill reservation reconciliation", "L3 真实 CodeFactoryDev 双会话并发", "L4 exact release artifact closeout canary"]
+      "automation_status": "designed",
+      "remaining_gaps": ["尚无任何自动化：PR 的 real Git + SQLite integration 未实现", "L2 hard-kill reservation reconciliation", "L3 真实 CodeFactoryDev 双会话并发", "L4 exact release artifact closeout canary"]
     },
     {
       "id": "E2E-010",

@@ -54,6 +54,83 @@ class ScenarioRegistryTests(unittest.TestCase):
         errors = validate_registry(broken, REPO_ROOT)
         self.assertTrue(any("durable_state" in error for error in errors))
 
+    def test_complex_e2e_must_name_automation_that_exists(self) -> None:
+        # A complex E2E is gated exactly like a scenario, so it must be held to
+        # the same bar: claiming a gate while automating nothing is how a
+        # "covered" case silently stops covering anything.
+        registry = load_registry(REGISTRY_PATH)
+        case = registry["complex_e2e_cases"][0]
+
+        case["automated_by"] = []
+        errors = validate_registry(registry, REPO_ROOT)
+        self.assertTrue(
+            any("must name at least one automation target" in error for error in errors),
+            errors,
+        )
+
+        case["automated_by"] = ["rust:this_test_does_not_exist_anywhere"]
+        errors = validate_registry(registry, REPO_ROOT)
+        self.assertTrue(
+            any("points at missing automation" in error for error in errors),
+            errors,
+        )
+
+    def test_automation_status_may_not_claim_more_than_it_runs(self) -> None:
+        # Guards the exact rot found on 2026-08-24: cases carried
+        # pull_request/nightly/release gates and a "partially_implemented"
+        # status with zero automated_by entries and no recorded gaps, so the
+        # registry read as coverage while nothing ran and nothing said so.
+        registry = load_registry(REGISTRY_PATH)
+        case = registry["complex_e2e_cases"][0]
+
+        case["automation_status"] = "partially_implemented"
+        case["automated_by"] = []
+        errors = validate_registry(registry, REPO_ROOT)
+        self.assertTrue(
+            any("must name at least one automation target" in e for e in errors), errors
+        )
+
+        case["automated_by"] = ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool"]
+        case["remaining_gaps"] = []
+        errors = validate_registry(registry, REPO_ROOT)
+        self.assertTrue(
+            any("must record remaining_gaps" in e for e in errors), errors
+        )
+
+        case["automation_status"] = "implemented"
+        case["remaining_gaps"] = ["still missing something"]
+        errors = validate_registry(registry, REPO_ROOT)
+        self.assertTrue(
+            any("implemented but still records remaining_gaps" in e for e in errors),
+            errors,
+        )
+
+        case["automation_status"] = "designed"
+        errors = validate_registry(registry, REPO_ROOT)
+        self.assertTrue(
+            any("only designed but already names automation" in e for e in errors),
+            errors,
+        )
+
+    def test_a_rust_target_must_be_a_real_test_function(self) -> None:
+        # Substring matching lets a declaration survive the test being renamed
+        # or deleted, as long as the name still appears anywhere in any .rs
+        # file — a comment, a string literal, a failure code. That is exactly
+        # how a scenario keeps reporting coverage after its test is gone.
+        from tools.governance.validate_scenario_test_governance import _automation_exists
+
+        # A real failure-code literal that appears in .rs sources but is not a test.
+        self.assertFalse(
+            _automation_exists("rust:provider_external_state_uncertain", REPO_ROOT)
+        )
+        # A genuine test function still resolves.
+        self.assertTrue(
+            _automation_exists(
+                "rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool",
+                REPO_ROOT,
+            )
+        )
+
     def test_registry_loader_reports_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "registry.json"
