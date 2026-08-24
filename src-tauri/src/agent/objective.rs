@@ -3898,6 +3898,17 @@ impl ObjectiveStore {
         if result.rows_affected() != 1 {
             bail!("objective revision changed while applying decision");
         }
+        if matches!(
+            decision.status,
+            ObjectiveStatus::Completed | ObjectiveStatus::Cancelled
+        ) {
+            crate::agent::execution_workspace::mark_objective_terminal_in_tx(
+                &mut tx,
+                &decision.objective_id,
+                now,
+            )
+            .await?;
+        }
 
         if decision.status == ObjectiveStatus::Completed {
             let terminal_projection_columns: i64 = sqlx::query_scalar(
@@ -8094,19 +8105,42 @@ mod tests {
         crate::agent::delivery_run::ensure_schema(&pool)
             .await
             .unwrap();
-        let store = ObjectiveStore::new(pool);
+        crate::agent::execution_workspace::ensure_schema(&pool)
+            .await
+            .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
         let objective = store
             .create(CreateObjective {
                 id: "objective-terminal-monotonic".into(),
-                kind: ObjectiveKind::Informational,
+                kind: ObjectiveKind::LocalMutation,
                 session_id: None,
                 root_turn_id: None,
                 domain: RecoveryDomain::Chat,
-                requested_acceptance: "informational_answer".into(),
+                requested_acceptance: "validated_change".into(),
                 created_surface: "test".into(),
             })
             .await
             .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO execution_workspaces
+             (id, objective_id, repo_identity, repo_root, git_common_dir,
+              worktree_path, worktree_identity, branch_name, base_ref, base_sha,
+              head_sha, state, lease_owner, lease_expires_at, created_at, updated_at)
+             VALUES ('workspace-terminal-monotonic', ?, 'repo-terminal-monotonic',
+                     '/tmp/source-terminal-monotonic', '/tmp/common-terminal-monotonic',
+                     '/tmp/worktree-terminal-monotonic', 'gitdir-terminal-monotonic',
+                     'codefactory/objective-terminal-monotonic', 'origin/main',
+                     'base-terminal-monotonic', 'head-terminal-monotonic', 'active',
+                     'process-terminal-monotonic', ?, ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now + 120_000)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
         let cancelled = DecisionRouter::route(
             &objective,
             RouteSignal::Cancelled {
@@ -8119,6 +8153,15 @@ mod tests {
             .apply_decision(objective.revision, cancelled)
             .await
             .unwrap();
+        let workspace_terminal: (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT state, lease_owner, lease_expires_at
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workspace_terminal, ("cleanup_pending".into(), None, None));
 
         let late = RunOutcome {
             final_text: "late answer".into(),
@@ -8152,6 +8195,75 @@ mod tests {
             store.get(&cancelled.id).await.unwrap().unwrap().status,
             ObjectiveStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn completed_objective_releases_managed_workspace_lease_atomically() {
+        let pool = pool().await;
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        crate::agent::execution_workspace::ensure_schema(&pool)
+            .await
+            .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-completed-workspace".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: None,
+                root_turn_id: None,
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "informational_answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO execution_workspaces
+             (id, objective_id, repo_identity, repo_root, git_common_dir,
+              worktree_path, worktree_identity, branch_name, base_ref, base_sha,
+              head_sha, state, lease_owner, lease_expires_at, created_at, updated_at)
+             VALUES ('workspace-completed', ?, 'repo-completed', '/tmp/source-completed',
+                     '/tmp/common-completed', '/tmp/worktree-completed',
+                     'gitdir-completed', 'codefactory/objective-completed', 'origin/main',
+                     'base-completed', 'head-completed', 'active', 'process-completed',
+                     ?, ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now + 120_000)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let evidence = ObjectiveEvidence {
+            id: "evidence-completed-workspace".into(),
+            kind: EvidenceKind::InformationalAnswer,
+            scope: "objective-completed-workspace".into(),
+            digest: "sha256:completed-workspace".into(),
+            evidence_ref: "db:test/completed-workspace".into(),
+            observed_at: now,
+            reached_acceptance: "informational_answer".into(),
+        };
+        let completed = CompletionArbiter::decide(&objective, &[evidence]).unwrap();
+
+        let completed = store
+            .apply_decision(objective.revision, completed)
+            .await
+            .unwrap();
+
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+        let workspace_terminal: (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT state, lease_owner, lease_expires_at
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workspace_terminal, ("cleanup_pending".into(), None, None));
     }
 
     async fn recovery_ceiling_objective(pool: &SqlitePool, id: &str) -> ObjectiveSnapshot {

@@ -6,7 +6,7 @@ use chrono::Utc;
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, Row, SqlitePool};
+use sqlx::{FromRow, Row, Sqlite, SqlitePool, Transaction};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -14,7 +14,7 @@ use crate::util::no_window::NoWindow;
 
 static ALLOCATION_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
-const ACTIVE_STATES: &[&str] = &["allocating", "active", "delivering", "cleanup_pending"];
+const ATTACHABLE_STATES: &[&str] = &["allocating", "active", "delivering"];
 
 #[derive(Debug, Clone)]
 pub struct ExecutionWorkspaceRequest {
@@ -315,7 +315,66 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await
     .context("ensure managed execution workspace schema")?;
+    let objective_columns = sqlx::query("PRAGMA table_info(objectives)")
+        .fetch_all(pool)
+        .await?;
+    let has_objective_status = objective_columns.iter().any(|column| {
+        column
+            .try_get::<String, _>("name")
+            .is_ok_and(|name| name == "status")
+    });
+    if has_objective_status {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET state='cleanup_pending', lease_owner=NULL, lease_expires_at=NULL,
+                 updated_at=?
+             WHERE (state IN ('allocating', 'active', 'delivering')
+                    OR (state='cleanup_pending'
+                        AND (lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL)))
+               AND EXISTS (
+                 SELECT 1 FROM objectives
+                 WHERE objectives.id=execution_workspaces.objective_id
+                   AND objectives.status IN ('completed', 'cancelled')
+               )",
+        )
+        .bind(now)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
+}
+
+/// Atomically hand a terminal Objective's workspace from execution ownership
+/// to the asynchronous closeout lifecycle. Files and refs remain untouched;
+/// the cleanup owner later decides whether a clean merged workspace is safe to
+/// remove or whether dirty/unmerged evidence must be preserved.
+pub(crate) async fn mark_objective_terminal_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    objective_id: &str,
+    now: i64,
+) -> Result<u64> {
+    let has_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='execution_workspaces'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_table == 0 {
+        return Ok(0);
+    }
+    Ok(sqlx::query(
+        "UPDATE execution_workspaces
+         SET state='cleanup_pending', lease_owner=NULL, lease_expires_at=NULL,
+             updated_at=?
+         WHERE objective_id=?
+           AND state IN ('allocating', 'active', 'delivering', 'cleanup_pending')",
+    )
+    .bind(now)
+    .bind(objective_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected())
 }
 
 async fn acquire_repo_allocation_lock(
@@ -518,7 +577,7 @@ async fn reattach_inner(
     row: WorkspaceRow,
     process_instance: &str,
 ) -> Result<ExecutionWorkspace> {
-    if !ACTIVE_STATES.contains(&row.state.as_str()) {
+    if !ATTACHABLE_STATES.contains(&row.state.as_str()) {
         bail!("managed workspace is not attachable in state {}", row.state);
     }
     let path = PathBuf::from(&row.worktree_path);
@@ -1017,6 +1076,86 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_pending_workspace_cannot_be_reattached_as_active_execution() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET state='cleanup_pending', lease_owner=NULL, lease_expires_at=NULL
+             WHERE objective_id=?",
+        )
+        .bind("objective-dirty-root")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = attach_existing(&pool, "objective-dirty-root", "process-b")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("not attachable"));
+        let terminal: (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT state, lease_owner, lease_expires_at
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind("objective-dirty-root")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(terminal, ("cleanup_pending".into(), None, None));
+    }
+
+    #[tokio::test]
+    async fn schema_upgrade_reconciles_terminal_objective_workspace_lease() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE objectives (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO objectives(id, status) VALUES ('objective-terminal', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO execution_workspaces
+             (id, objective_id, repo_identity, repo_root, git_common_dir,
+              worktree_path, worktree_identity, branch_name, base_ref, base_sha,
+              head_sha, state, lease_owner, lease_expires_at, created_at, updated_at)
+             VALUES ('workspace-terminal', 'objective-terminal', 'repo-terminal',
+                     '/tmp/source-terminal', '/tmp/common-terminal',
+                     '/tmp/worktree-terminal', 'gitdir-terminal',
+                     'codefactory/objective-terminal', 'origin/main', 'base-terminal',
+                     'head-terminal', 'active', 'old-process', ?, ?, ?)",
+        )
+        .bind(now + 120_000)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE objectives SET status='cancelled' WHERE id='objective-terminal'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+
+        let terminal: (String, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT state, lease_owner, lease_expires_at
+             FROM execution_workspaces WHERE objective_id='objective-terminal'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(terminal, ("cleanup_pending".into(), None, None));
     }
 
     #[tokio::test]
