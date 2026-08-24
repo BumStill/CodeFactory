@@ -106,6 +106,39 @@ const RECOVERY_BACKOFF_CAP_MS: i64 = 5 * 60 * 1_000;
 /// that the same error happened once a day for a week.
 const SIGNATURE_RECOVERY_WINDOW_MS: i64 = 30 * 60 * 1_000;
 
+/// Advance a session's activity time so the sidebar — which orders by
+/// `sessions.updated_at` and renders a relative time from it — does not bury a
+/// session the recovery ceiling just wrote a visible notice into. Measured on a
+/// real user's database: sessions written to at 14:40 still sorted as three days
+/// old, because settling an incident wrote the message and nothing else.
+///
+/// Best-effort and schema-tolerant by design: it runs inside the settlement
+/// transaction (the pool may allow a single connection, so it cannot open its
+/// own), several test pools carry no `sessions` table at all, and a sidebar row
+/// one update stale is a far smaller problem than failing the settlement.
+async fn touch_session_in_settlement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    now: i64,
+) {
+    let has_sessions: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .ok()
+    .flatten();
+    if has_sessions.is_none() {
+        return;
+    }
+    let _ = sqlx::query("UPDATE sessions SET updated_at=? WHERE id=? AND updated_at<?")
+        .bind(now)
+        .bind(session_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await;
+}
+
 fn recovery_backoff_ms(prior_attempts: i64) -> i64 {
     let mut delay = RECOVERY_BACKOFF_BASE_MS;
     for _ in 0..prior_attempts.clamp(0, 8) {
@@ -2243,6 +2276,7 @@ impl ObjectiveStore {
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
+                touch_session_in_settlement(&mut tx, session_id, now).await;
             }
             sqlx::query(
                 "UPDATE chat_turn_state SET revision=revision+1,
@@ -4353,6 +4387,7 @@ impl ObjectiveStore {
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
+                touch_session_in_settlement(&mut tx, session_id, now).await;
                 let projected = sqlx::query(
                     "UPDATE chat_turn_state
                      SET revision=revision+1, phase='waiting', status='waiting_system',
@@ -8828,6 +8863,20 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // The sidebar orders by sessions.updated_at, so a session the recovery
+        // ceiling just wrote a visible notice into must not keep sorting as if
+        // nothing happened. Seed it deliberately stale.
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale_session_updated_at = Utc::now().timestamp_millis() - 3 * 24 * 60 * 60 * 1000;
+        sqlx::query("INSERT INTO sessions(id, updated_at) VALUES (?, ?)")
+            .bind(current.session_id.as_deref().unwrap())
+            .bind(stale_session_updated_at)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "CREATE TABLE chat_turn_state (
                root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
@@ -8936,6 +8985,16 @@ mod tests {
             claimable_remediations(&pool, &current.id).await,
             0,
             "the supervisor must have nothing left to claim"
+        );
+        let session_touched: i64 = sqlx::query_scalar("SELECT updated_at FROM sessions WHERE id=?")
+            .bind(current.session_id.as_deref().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            session_touched > stale_session_updated_at,
+            "writing the incident notice must advance sessions.updated_at so the sidebar \
+             does not bury a session it just wrote to",
         );
         let delivery_projection: (String, Option<String>, i64, Option<String>, Option<i64>) =
             sqlx::query_as(
