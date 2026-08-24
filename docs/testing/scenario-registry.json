@@ -576,7 +576,7 @@
       },
       "execution": {"pull_request": "Rust integration plus isolated CodeFactoryDev canary", "nightly": "two-process SQLite restart smoke", "release_artifact": "exact installed App Skill import and command-recovery canary"},
       "automation_status": "partially_implemented",
-      "automated_by": ["rust:local_directory_install_survives_source_cleanup_with_nested_resources", "rust:symlinked_skill_payload_fails_closed_without_replacing_existing_install", "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:evidence_based_timeout_change_is_not_an_unchanged_retry", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:command_failure_envelope_survives_file_sqlite_restart"],
+      "automated_by": ["rust:local_directory_install_survives_source_cleanup_with_nested_resources", "rust:symlinked_skill_payload_fails_closed_without_replacing_existing_install", "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:evidence_based_timeout_change_is_not_an_unchanged_retry", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:command_failure_envelope_survives_file_sqlite_restart", "rust:effect_free_unknown_provider_transport_resumes_before_exhaustion_and_after_restart"],
       "remaining_gaps": ["L2 独立二进制 hard-kill smoke 尚未接入 nightly", "L4 exact release 安装版单消息 canary 待本次 release 执行"]
     }
   ]

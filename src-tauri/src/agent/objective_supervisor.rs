@@ -949,8 +949,18 @@ pub(crate) async fn require_provider_resume_evidence(
         }
     }
 
-    let disposition = super::provider_recovery::ProviderRecoveryStore::new(pool.clone())
-        .observe(objective_id)
+    let provider = super::provider_recovery::ProviderRecoveryStore::new(pool.clone());
+    let now = chrono::Utc::now().timestamp_millis();
+    provider
+        .reconcile_stale_effect_free_attempt_for_objective(objective_id, now)
+        .await
+        .map_err(|error| {
+            crate::errors::AppError::Other(format!(
+                "provider recovery reconciliation failed: {error}"
+            ))
+        })?;
+    let disposition = provider
+        .observe_at(objective_id, now)
         .await
         .map_err(|error| {
             crate::errors::AppError::Other(format!("provider recovery observation failed: {error}"))
@@ -2849,7 +2859,7 @@ mod tests {
     /// bytes or tool intent were observed. Historical turn latches must not
     /// make that latest effect-free request permanently unrecoverable.
     #[tokio::test]
-    async fn startup_effect_free_provider_request_after_committed_tool_is_retry_safe() {
+    async fn effect_free_unknown_provider_transport_resumes_before_exhaustion_and_after_restart() {
         use crate::agent::provider_recovery::{
             ProviderAttemptSpec, ProviderEpisodeSpec, ProviderOwnerPermit,
             ProviderRecoveryDisposition, ProviderRecoveryStore,
@@ -3007,6 +3017,19 @@ mod tests {
             .mark_in_flight(&permit, "attempt-provider-crash-left", now + 6)
             .await
             .unwrap();
+        // The transport layer settles an admitted request with no bytes or
+        // tool intent as unknown. That must remain fenced while a prior tool
+        // receipt is unresolved, but it becomes replay-safe once that exact
+        // receipt is terminal and the run owner has retired.
+        sqlx::query(
+            "UPDATE provider_route_attempts
+             SET status='unknown', failure_class='provider_transport',
+                 failure_code='provider_external_state_uncertain'
+             WHERE id='attempt-provider-crash-left'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE chat_run_controls SET status='completed', settled_at=?, updated_at=?
              WHERE run_instance_id='run-provider-restart-safe'",
@@ -3034,7 +3057,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(status, "in_flight");
+        assert_eq!(status, "unknown");
         sqlx::query(
             "UPDATE side_effect_receipts
              SET status='committed', observed_at=?
@@ -3044,6 +3067,20 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+
+        sqlx::query("UPDATE objectives SET status='waiting_system' WHERE id=?")
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        require_provider_resume_evidence(&pool, &objective.id, false)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET status='active' WHERE id=?")
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         assert_eq!(
             reconcile_provider_recovery_on_startup(&pool).await.unwrap(),
