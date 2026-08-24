@@ -1522,16 +1522,38 @@ impl ProviderRecoveryStore {
     }
 
     /// A provider POST has no external mutation semantics of its own. After
-    /// its chat-run owner is durably retired, a latest in-flight attempt with
-    /// no observed bytes, no tool intent, and no unresolved tool receipt may
-    /// be replayed at least once. Any partial output or uncertain receipt keeps
-    /// the attempt fenced and observation-only.
+    /// its chat-run owner is durably retired, a latest in-flight or transport-
+    /// unknown attempt with no observed bytes, no tool intent, and no
+    /// unresolved tool receipt may be replayed at least once. Any partial
+    /// output or uncertain receipt keeps the attempt fenced and observation-only.
     pub async fn reconcile_stale_effect_free_in_flight(&self, now: i64) -> Result<u64> {
+        self.reconcile_stale_effect_free_attempts(None, now).await
+    }
+
+    /// Apply the same fail-closed reconciliation at a live supervisor boundary
+    /// without changing unrelated Objectives that may be owned elsewhere.
+    pub async fn reconcile_stale_effect_free_attempt_for_objective(
+        &self,
+        objective_id: &str,
+        now: i64,
+    ) -> Result<u64> {
+        self.reconcile_stale_effect_free_attempts(Some(objective_id), now)
+            .await
+    }
+
+    async fn reconcile_stale_effect_free_attempts(
+        &self,
+        objective_id: Option<&str>,
+        now: i64,
+    ) -> Result<u64> {
         let updated = sqlx::query(
             "UPDATE provider_route_attempts
              SET status='failed_replayable',
-                 failure_class='process_restart',
-                 failure_code='provider_process_restarted_before_output',
+                 failure_class=CASE WHEN status='unknown'
+                     THEN 'provider_transport' ELSE 'process_restart' END,
+                 failure_code=CASE WHEN status='unknown'
+                     THEN 'provider_transport_failed_before_output'
+                     ELSE 'provider_process_restarted_before_output' END,
                  observed_at=?, completed_at=?
              WHERE id IN (
                  SELECT attempt.id
@@ -1541,11 +1563,12 @@ impl ProviderRecoveryStore {
                  JOIN objective_bindings binding
                    ON binding.id=attempt.binding_id
                   AND binding.objective_id=attempt.objective_id
-                 WHERE attempt.status='in_flight'
+                 WHERE attempt.status IN ('in_flight', 'unknown')
                    AND attempt.output_started=0
                    AND attempt.side_effect_started=0
                    AND attempt.side_effect_receipt_id IS NULL
-                   AND objective.status='active'
+                   AND objective.status IN ('active', 'waiting_system')
+                   AND (? IS NULL OR objective.id=?)
                    AND attempt.id=(
                        SELECT latest.id FROM provider_route_attempts latest
                        WHERE latest.episode_id=attempt.episode_id
@@ -1573,6 +1596,8 @@ impl ProviderRecoveryStore {
         )
         .bind(now)
         .bind(now)
+        .bind(objective_id)
+        .bind(objective_id)
         .execute(&self.pool)
         .await?;
         Ok(updated.rows_affected())
