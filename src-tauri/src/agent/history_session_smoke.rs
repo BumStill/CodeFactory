@@ -240,6 +240,19 @@ async fn seed_incident_session(pool: &SqlitePool) -> anyhow::Result<()> {
             break;
         }
         if current.status.as_str() == "waiting_system" {
+            // A repeating signature is scheduled with a growing backoff, so the
+            // real supervisor would sit out minutes between these rounds. This
+            // smoke is asserting convergence semantics, not wall-clock
+            // scheduling, so stand in for that wait rather than weakening the
+            // "claims exactly once per round" invariant below.
+            sqlx::query(
+                "UPDATE objective_remediations SET next_observation_at=?
+                 WHERE objective_id=? AND status IN ('queued','waiting')",
+            )
+            .bind(chrono::Utc::now().timestamp_millis() - 1)
+            .bind(&current.id)
+            .execute(pool)
+            .await?;
             let claims = store
                 .claim_due_remediations("history-incident-worker", 1, 30_000)
                 .await?;
