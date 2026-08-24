@@ -273,7 +273,7 @@
       "priority": "P0",
       "source_kind": "incident_shape",
       "change_patterns": ["src-tauri/src/agent/execution_workspace.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/migrations/*execution_workspace*.sql"],
-      "automated_by": ["rust:dirty_root_gets_isolated_before_agent_execution", "rust:restart_reattaches_the_exact_objective_workspace", "rust:delivery_rejects_a_different_workspace_before_git_side_effects"],
+      "automated_by": ["rust:dirty_root_gets_isolated_before_agent_execution", "rust:restart_reattaches_the_exact_objective_workspace", "rust:delivery_rejects_a_different_workspace_before_git_side_effects", "rust:terminal_objective_rejects_late_finished_and_technical_failure_decisions", "rust:completed_objective_releases_managed_workspace_lease_atomically", "rust:cleanup_pending_workspace_cannot_be_reattached_as_active_execution", "rust:schema_upgrade_reconciles_terminal_objective_workspace_lease"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
