@@ -169,6 +169,7 @@ turn 并保留 Objective 为 system-owned incident；不显示业务完成或人
 | Objective no-change | corrected bounded probe → final | `CurrentStateAcceptance`、单一 completed revision、无重复 final message；纯文本答复仍不能完成 LocalMutation |
 | AgentLoop negative | wrong command → unchanged retry | 第二次 dispatch 被拒绝；要求诊断；无副作用 |
 | AgentLoop batch | failed first + queued second | 第二个调用记 cancelled，下一轮基于真实错误重新生成 |
+| Provider recovery | command repair 后 provider 零输出 transport failure | terminal receipt + retired owner 允许同一 `waiting_system` Objective 续接；partial/unresolved 仍锁定 |
 | SQLite receipt | invalid invocation + unchanged/changed workspace | 未变化时 receipt/contract 为 `cancelled` 且失败工具可终结；有变化时仍为 `unknown/observed_changed`；成功工具不能用 cancelled 绕过证据 |
 | SQLite restart | typed error 后进程重启 | tool result/code/identity 重放；同 Objective；零新增 user message |
 | CodeFactoryDev | synthetic Skill 成功与 timeout 边界 | 工具卡、恢复状态、最终结果和进程回收均符合规格 |
