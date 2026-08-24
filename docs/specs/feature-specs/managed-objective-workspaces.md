@@ -20,7 +20,7 @@
 | CF-MOW-R6 | `deliver_changes` 必须把 cwd/repo/worktree/branch 与 Objective 的受管工作区逐字段比对；缺失或冲突时在 stage/commit/push 前 fail closed | delivery zero-side-effect tests |
 | CF-MOW-R7 | 即使内部提交继续使用 `--no-verify`，交付前也必须原生证明 base 包含当前已观察的远端默认分支 SHA | stale-base tests |
 | CF-MOW-R8 | restart recovery 只重附着受管 worktree，不得 `switch/reset/cherry-pick` 用户根 checkout | cross-process fixture + root reflog oracle |
-| CF-MOW-R9 | squash merge 后仅在 Objective 终态、worktree clean、canonical PR 已合并时自动 closeout；dirty、未合并、关闭未合并一律保留 | cleanup matrix |
+| CF-MOW-R9 | Objective 进入 `completed/cancelled` 时必须在同一事务把 workspace 转为 `cleanup_pending` 并清执行租约；此后不得重新 attach 为活动执行。仅在 worktree clean、canonical PR 已合并时自动 closeout；dirty、未合并、关闭未合并一律保留 | terminal settlement + restart fence + cleanup matrix |
 | CF-MOW-R10 | UI 分开显示“本地受管工作区”“远端 PR/CI/合并”“清理状态”，不得用一个红点或 spinner 混合表达 | reducer/component + real App |
 
 ## Primary User Path
