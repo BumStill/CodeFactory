@@ -789,6 +789,62 @@ async fn durable_overload_wait_reopens_only_after_its_observation_deadline() {
     );
 }
 
+/// A provider POST that was admitted (post_admitted) but then failed before
+/// emitting any bytes, latching any tool intent, or leaving an unresolved
+/// side-effect receipt has no external effect to protect. It must be treated
+/// as retry-safe — not `provider_external_state_uncertain` — so a transient
+/// connection drop does not park the objective after the signature recovery
+/// cap. This mirrors `reconcile_stale_effect_free_in_flight`, which already
+/// reclassifies exactly this state as replay-safe at startup.
+#[tokio::test]
+async fn admitted_no_output_failure_is_replay_safe_not_external_state_uncertain() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool);
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(
+            &permit,
+            &attempt("attempt-no-output", "episode-1", "chatgpt"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "attempt-no-output", NOW + 2)
+        .await
+        .unwrap();
+
+    // `replayable=false` models a request that was already admitted and then
+    // failed at the transport layer before any output arrived.
+    let ProviderMutation::Applied(decision) = store
+        .record_failure(
+            &permit,
+            "attempt-no-output",
+            "provider_transport",
+            "provider_external_state_uncertain",
+            false,
+            NOW + 3,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("live owner must settle its transport attempt");
+    };
+    assert!(
+        matches!(decision, OverloadBudgetDecision::RetryAfter { .. }),
+        "a no-output admitted transport failure must retry, not park"
+    );
+    assert_eq!(
+        store.observe("objective-opaque").await.unwrap(),
+        ProviderRecoveryDisposition::RetrySafe {
+            episode_id: "episode-1".into(),
+            attempt_id: "attempt-no-output".into(),
+        },
+        "a no-output admitted failure is replay-safe, not external-state-uncertain"
+    );
+}
+
 #[tokio::test]
 async fn startup_keychain_ready_observation_is_receipted_without_secrets() {
     let pool = pool().await;
