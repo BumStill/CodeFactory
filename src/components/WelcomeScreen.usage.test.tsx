@@ -131,15 +131,16 @@ describe("new-session token usage summary", () => {
 });
 
 describe("welcome screen layout", () => {
-  it("keeps a scrollable body that can shrink below its content", () => {
-  // `flex-1` alone keeps `min-height: auto`, so the welcome body could not
-  // shrink under its own content. In a short window it pushed the composer —
-  // a `shrink-0` sibling — out of the column, and the "继续之前的会话" rows
-  // ended up covering the input. MessageList already carries `min-h-0` for
-  // exactly this reason, which is why the chat view never showed the bug.
+  it("leaves height and scrolling to its caller", () => {
+    // MessageList renders this inside an `absolute inset-0 overflow-y-auto` box
+    // that owns the height. A scroll container here would nest scrollbars, and
+    // height classes would let the content grow past the column and cover the
+    // composer. The geometry itself is checked in a real browser by
+    // scripts/verify-composer-overlap-headless.mjs — jsdom computes no layout.
     const { container } = render(<WelcomeScreen />);
-    const body = container.querySelector(".overflow-y-auto");
-    expect(body).not.toBeNull();
-    expect(body?.className).toContain("min-h-0");
+    const root = container.firstElementChild as HTMLElement | null;
+    expect(root).not.toBeNull();
+    expect(root!.className).toBe("");
+    expect(container.querySelector(".overflow-y-auto")).toBeNull();
   });
 });

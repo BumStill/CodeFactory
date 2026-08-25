@@ -339,6 +339,17 @@
       "automated_by": ["path:src/pages/Skills/SkillsPage.lifecycle.test.tsx", "path:src/stores/skills.lifecycle.test.ts", "rust:skill_fetch_receipt_targets_exact_installed_ids_for_review", "path:src/components/ToolCallCard.test.tsx", "path:src/App.resources.test.tsx", "path:src/pages/Resources/ResourcesPage.test.tsx"],
       "required_evidence": ["L0", "L1", "L3"],
       "gates": ["pull_request"]
+    },
+    {
+      "id": "UI-014",
+      "name": "新会话页输入框不被欢迎内容压盖",
+      "category": "workspace_session",
+      "priority": "P0",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/components/MessageList.tsx", "src/components/WelcomeScreen.tsx", "src/pages/Workspace/WorkspacePage.tsx"],
+      "automated_by": ["workflow:New-session composer overlap headless gate", "path:src/acceptance/composer-overlap.tsx", "path:src/components/MessageList.welcomeContainment.test.tsx"],
+      "required_evidence": ["L0", "L3"],
+      "gates": ["pull_request"]
     }
   ],
   "complex_e2e_cases": [
