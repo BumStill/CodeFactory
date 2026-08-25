@@ -1,6 +1,23 @@
 #!/usr/bin/env sh
 set -eu
 
+# Git supplies one line per ref on stdin. A deletion has an all-zero local
+# object ID; it cannot introduce code and therefore has no candidate tree for
+# the product scenario gate to judge. Mixed delete/update pushes still gate.
+zero_oid="0000000000000000000000000000000000000000"
+saw_ref=0
+has_update=0
+while IFS=' ' read -r _local_ref local_oid _remote_ref _remote_oid; do
+  [ -n "${local_oid:-}" ] || continue
+  saw_ref=1
+  if [ "$local_oid" != "$zero_oid" ]; then
+    has_update=1
+  fi
+done
+if [ "$saw_ref" -eq 1 ] && [ "$has_update" -eq 0 ]; then
+  exit 0
+fi
+
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
