@@ -932,6 +932,30 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("LoopbackNetworkAllowedForUrls", artifact_smoke)
         self.assertIn('"chrome-extension://*"', artifact_smoke)
         self.assertIn("RTE003_POLICY_INSTALLED", artifact_smoke)
+        self.assertIn('sudo -n /bin/test -e "$policy_file"', artifact_smoke)
+        self.assertNotIn("sudo -n /usr/bin/test", artifact_smoke)
+        self.assertIn(
+            'sudo -n /usr/bin/plutil -create xml1 "$policy_file"',
+            artifact_smoke,
+        )
+        self.assertIn(
+            'sudo -n /usr/bin/plutil -insert LocalNetworkAccessAllowedForUrls',
+            artifact_smoke,
+        )
+        self.assertIn(
+            'sudo -n /usr/bin/plutil -insert LoopbackNetworkAllowedForUrls',
+            artifact_smoke,
+        )
+        self.assertIn(
+            'sudo -n /usr/bin/plutil -extract "$policy_key" json',
+            artifact_smoke,
+        )
+        self.assertNotIn("/usr/bin/defaults write", artifact_smoke)
+        self.assertIn('"phase":"policy_setup"', artifact_smoke)
+        self.assertLess(
+            artifact_smoke.index('"phase":"policy_setup"'),
+            artifact_smoke.index("if ! sudo -n true"),
+        )
         self.assertIn('sudo -n /bin/rm -f "$policy_file"', artifact_smoke)
         self.assertNotIn("/Applications/Google Chrome.app", artifact_smoke)
         for field in (
