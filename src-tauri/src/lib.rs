@@ -467,6 +467,43 @@ pub fn run_browser_session_smoke_cli() -> bool {
                 }};
             }
 
+            let objective_pool = match sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect("sqlite::memory:")
+                .await
+            {
+                Ok(pool) => pool,
+                Err(error) => give_up!("objective_setup", &error.to_string(), 0),
+            };
+            if let Err(error) = agent::objective::ensure_schema(&objective_pool).await {
+                give_up!("objective_schema", &error.to_string(), 0);
+            }
+            let objective_store = agent::objective::ObjectiveStore::new(objective_pool.clone());
+            let objective_id = format!("browser-objective-{}", uuid::Uuid::new_v4());
+            let objective = match objective_store
+                .create(agent::objective::CreateObjective {
+                    id: objective_id.clone(),
+                    kind: agent::objective::ObjectiveKind::Informational,
+                    session_id: Some(owner_session_id.clone()),
+                    root_turn_id: None,
+                    domain: agent::objective::RecoveryDomain::Browser,
+                    requested_acceptance: "informational_answer".into(),
+                    created_surface: "browser_session_smoke".into(),
+                })
+                .await
+            {
+                Ok(objective) => objective,
+                Err(error) => give_up!("objective_create", &error.to_string(), 0),
+            };
+            if let Err(error) = sqlx::query("UPDATE objectives SET task_id=? WHERE id=?")
+                .bind(format!("browser-task-{}", uuid::Uuid::new_v4()))
+                .bind(&objective_id)
+                .execute(&objective_pool)
+                .await
+            {
+                give_up!("objective_task_binding", &error.to_string(), 0);
+            }
+
             // Retried, and only here: a runner too busy to start Chrome inside
             // the launch budget is the environment failing, not this project.
             // Everything below the loop is asserted exactly once.
@@ -534,12 +571,260 @@ pub fn run_browser_session_smoke_cli() -> bool {
                 .iter()
                 .any(|session| session.session_id == session_id);
 
+            let now = chrono::Utc::now().timestamp_millis();
+            let binding_id = format!("browser-binding-{}", uuid::Uuid::new_v4());
+            if let Err(error) = sqlx::query(
+                "INSERT INTO objective_bindings
+                 (id, objective_id, domain, resource_kind, resource_id,
+                  resource_generation, identity_digest, created_at, updated_at)
+                 VALUES (?, ?, 'browser', 'browser_session', ?, 1,
+                         'sha256:browser-session-smoke', ?, ?)",
+            )
+            .bind(&binding_id)
+            .bind(&objective_id)
+            .bind(&session_id)
+            .bind(now)
+            .bind(now)
+            .execute(&objective_pool)
+            .await
+            {
+                give_up!("objective_browser_binding", &error.to_string(), attempts);
+            }
+            let waiting = match agent::objective::DecisionRouter::route(
+                &objective,
+                agent::objective::RouteSignal::TechnicalFailure {
+                    domain: agent::objective::RecoveryDomain::Browser,
+                    failure_code: "browser_logical_action_failed".into(),
+                    failure_signature: "sha256:browser-session-smoke-failure".into(),
+                    next_observation_at: now - 1,
+                    resume_cursor: Some(session_id.clone()),
+                },
+            ) {
+                Ok(waiting) => waiting,
+                Err(error) => give_up!("objective_route", &error.to_string(), attempts),
+            };
+            let waiting = match objective_store
+                .apply_decision(objective.revision, waiting)
+                .await
+            {
+                Ok(waiting) => waiting,
+                Err(error) => give_up!("objective_wait", &error.to_string(), attempts),
+            };
+            if let Err(error) = sqlx::query(
+                "UPDATE objective_remediations SET binding_id=?
+                 WHERE objective_id=? AND id=?",
+            )
+            .bind(&binding_id)
+            .bind(&objective_id)
+            .bind(waiting.remediation_id.as_deref().unwrap_or_default())
+            .execute(&objective_pool)
+            .await
+            {
+                give_up!("objective_remediation_binding", &error.to_string(), attempts);
+            }
+
+            let mut first_claims = match objective_store
+                .claim_due_remediations("browser-smoke-crashed-owner", 1, 30_000)
+                .await
+            {
+                Ok(claims) => claims,
+                Err(error) => give_up!("objective_first_claim", &error.to_string(), attempts),
+            };
+            let Some(first_claim) = first_claims.pop() else {
+                give_up!(
+                    "objective_first_claim",
+                    "browser recovery did not claim exactly once",
+                    attempts
+                );
+            };
+            if let Err(error) = sqlx::query(
+                "UPDATE objective_remediations SET lease_expires_at=? WHERE id=?",
+            )
+            .bind(now - 1)
+            .bind(&first_claim.remediation_id)
+            .execute(&objective_pool)
+            .await
+            {
+                give_up!("objective_expire_remediation", &error.to_string(), attempts);
+            }
+            if let Err(error) =
+                sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
+                    .bind(now - 1)
+                    .bind(&objective_id)
+                    .execute(&objective_pool)
+                    .await
+            {
+                give_up!("objective_expire_lease", &error.to_string(), attempts);
+            }
+            let mut replacement_claims = match objective_store
+                .claim_due_remediations("browser-smoke-replacement-owner", 1, 30_000)
+                .await
+            {
+                Ok(claims) => claims,
+                Err(error) => give_up!("objective_reclaim", &error.to_string(), attempts),
+            };
+            let Some(replacement_claim) = replacement_claims.pop() else {
+                give_up!(
+                    "objective_reclaim",
+                    "replacement owner did not reclaim browser recovery",
+                    attempts
+                );
+            };
+            let stale_permit = codefactory_agent_loop::tool::MutationPermit {
+                objective_id: first_claim.objective.id.clone(),
+                remediation_id: first_claim.remediation_id.clone(),
+                owner: "browser-smoke-crashed-owner".into(),
+                claim_epoch: first_claim.claim_epoch,
+                binding_id: first_claim.binding_id.clone(),
+                resource_generation: first_claim.resource_generation,
+            };
+            let recovery_lease_reclaimed = replacement_claim.claim_epoch > first_claim.claim_epoch
+                && matches!(objective_store.claim_is_current(&stale_permit).await, Ok(false));
+            let attempts_before_execute: i64 = match sqlx::query_scalar(
+                "SELECT execution_attempt_index FROM objective_remediations WHERE id=?",
+            )
+            .bind(&replacement_claim.remediation_id)
+            .fetch_one(&objective_pool)
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => give_up!("objective_budget_read", &error.to_string(), attempts),
+            };
+
+            let replacement_opened = match tools::browser_session::execute(
+                serde_json::json!({"action":"open","url":"https://example.com"}),
+                &ctx,
+            )
+            .await
+            {
+                Ok(opened) if !opened.is_error => opened,
+                Ok(opened) => give_up!("replacement_open", &opened.content, attempts),
+                Err(error) => give_up!("replacement_open", &error.to_string(), attempts),
+            };
+            let Some(replacement_session_id) = replacement_opened
+                .content
+                .lines()
+                .find_map(|line| line.strip_prefix("Managed browser session: "))
+                .map(str::to_owned)
+            else {
+                give_up!(
+                    "replacement_session_id",
+                    "replacement open did not report a session id",
+                    attempts
+                );
+            };
+            let replacement_snapshot = match tools::browser_session::execute(
+                serde_json::json!({"action":"snapshot","session_id":replacement_session_id}),
+                &ctx,
+            )
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => give_up!("replacement_snapshot", &error.to_string(), attempts),
+            };
+            let replacement_session_is_new = replacement_session_id != session_id
+                && !replacement_snapshot.is_error;
+
+            let permit = codefactory_agent_loop::tool::MutationPermit {
+                objective_id: replacement_claim.objective.id.clone(),
+                remediation_id: replacement_claim.remediation_id.clone(),
+                owner: "browser-smoke-replacement-owner".into(),
+                claim_epoch: replacement_claim.claim_epoch,
+                binding_id: replacement_claim.binding_id.clone(),
+                resource_generation: replacement_claim.resource_generation,
+            };
+            let charged = match objective_store
+                .charge_claimed_remediation_attempt(
+                    &replacement_claim.objective.id,
+                    &replacement_claim.remediation_id,
+                    &permit.owner,
+                    permit.claim_epoch,
+                )
+                .await
+            {
+                Ok(charged) => charged,
+                Err(error) => give_up!("objective_budget_charge", &error.to_string(), attempts),
+            };
+            if !charged {
+                give_up!(
+                    "objective_budget_charge",
+                    "replacement owner lost its exact execution permit",
+                    attempts
+                );
+            }
+            let recovery_budget_attempts: i64 = match sqlx::query_scalar(
+                "SELECT execution_attempt_index FROM objective_remediations WHERE id=?",
+            )
+            .bind(&replacement_claim.remediation_id)
+            .fetch_one(&objective_pool)
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => give_up!("objective_budget_verify", &error.to_string(), attempts),
+            };
+            let completion = match agent::objective::CompletionArbiter::decide(
+                &replacement_claim.objective,
+                &[agent::objective::ObjectiveEvidence {
+                    id: format!("browser-evidence-{}", uuid::Uuid::new_v4()),
+                    kind: agent::objective::EvidenceKind::InformationalAnswer,
+                    scope: replacement_session_id.clone(),
+                    digest: "sha256:browser-safe-continuation".into(),
+                    evidence_ref: "smoke:browser-safe-continuation".into(),
+                    observed_at: chrono::Utc::now().timestamp_millis(),
+                    reached_acceptance: "informational_answer".into(),
+                }],
+            ) {
+                Ok(completion) => completion,
+                Err(error) => give_up!("objective_completion", &error.to_string(), attempts),
+            };
+            let completed = match objective_store
+                .apply_claimed_decision(
+                    replacement_claim.objective.revision,
+                    completion,
+                    &permit,
+                )
+                .await
+            {
+                Ok(completed) => completed,
+                Err(error) => give_up!("objective_settle", &error.to_string(), attempts),
+            };
+            let replacement_closed = match tools::browser_session::execute(
+                serde_json::json!({"action":"close","session_id":replacement_session_id}),
+                &ctx,
+            )
+            .await
+            {
+                Ok(closed) => closed,
+                Err(error) => give_up!("replacement_close", &error.to_string(), attempts),
+            };
+            let replacement_session_reclaimed = !replacement_closed.is_error
+                && !tools::browser_session::list_managed_sessions()
+                    .iter()
+                    .any(|session| session.session_id == replacement_session_id);
+
+            let continuation = browser::smoke::ContinuationEvidence {
+                objective_id: &objective_id,
+                replacement_session_id: &replacement_session_id,
+                same_objective: completed.id == objective_id,
+                replacement_session_is_new,
+                replacement_session_reclaimed,
+                recovery_lease_reclaimed,
+                recovery_budget_attempts: if attempts_before_execute == 0 {
+                    recovery_budget_attempts
+                } else {
+                    -1
+                },
+                objective_completed: completed.status
+                    == agent::objective::ObjectiveStatus::Completed,
+            };
+
             let receipt = browser::smoke::receipt(
                 &session_id,
                 !snapshot.is_error,
                 failed_action.is_error,
                 lease_gone,
                 attempts,
+                &continuation,
             );
             tools::browser_session::close_for_session(&owner_session_id).await;
             if receipt["status"] == "passed" {
@@ -878,6 +1163,17 @@ pub fn run() {
                 tracing::info!(
                     count = reclassified_technical_handbacks,
                     "startup: reclassified synthetic technical handbacks as system-owned incidents"
+                );
+            }
+            tauri::async_runtime::block_on(objective_store.sync_recovery_capabilities())?;
+            let reactivated_incidents = tauri::async_runtime::block_on(
+                objective_store.reactivate_eligible_incidents(32),
+            )?;
+            if !reactivated_incidents.is_empty() {
+                tracing::info!(
+                    count = reactivated_incidents.len(),
+                    capability_revision = agent::objective::RECOVERY_CAPABILITY_REVISION,
+                    "startup: newer recovery contract reactivated parked system incidents"
                 );
             }
             let provider_recoveries = tauri::async_runtime::block_on(

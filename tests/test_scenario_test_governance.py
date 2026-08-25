@@ -400,14 +400,41 @@ class ImpactedExecutionTests(unittest.TestCase):
         self.assertTrue(any("E2E-X" in error for error in errors), errors)
 
     def test_partially_automated_impacted_case_fails_even_when_one_target_runs(self) -> None:
+        registry = {
+            "scenarios": [
+                {
+                    "id": "X-001",
+                    "change_patterns": ["src/thing.ts"],
+                    "gates": ["pull_request"],
+                    "automated_by": ["pnpm:test:startup-session:headless"],
+                }
+            ],
+            "complex_e2e_cases": [
+                {
+                    "id": "E2E-X",
+                    "covers": ["X-001"],
+                    "change_patterns": ["src/thing.ts"],
+                    "execution": {"pull_request": "partially automated"},
+                    "automation_status": "partially_implemented",
+                    "automated_by": ["pnpm:test:startup-session:headless"],
+                    "remaining_gaps": ["release artifact not automated"],
+                    "pull_request_gate": {
+                        "status": "partially_implemented",
+                        "required_targets": ["pnpm:test:startup-session:headless"],
+                        "remaining_gaps": ["one PR oracle is still missing"],
+                    },
+                }
+            ],
+            "gate_policy": self.registry["gate_policy"],
+        }
         errors = validate_impacted_execution(
-            self.registry,
-            ["src-tauri/src/commands/chat.rs"],
+            registry,
+            ["src/thing.ts"],
             "pull_request",
             REPO_ROOT,
         )
         self.assertTrue(
-            any("E2E-002" in error and "not implemented" in error for error in errors),
+            any("E2E-X" in error and "not implemented" in error for error in errors),
             errors,
         )
 
@@ -420,17 +447,14 @@ class ImpactedExecutionTests(unittest.TestCase):
         )
         self.assertEqual(errors, [])
 
-    def test_browser_lifecycle_change_is_blocked_until_its_direct_e2e_is_automated(self) -> None:
+    def test_completed_browser_lifecycle_slice_passes_when_all_direct_targets_run(self) -> None:
         errors = validate_impacted_execution(
             self.registry,
             ["src-tauri/src/tools/browser_session.rs"],
             "pull_request",
             REPO_ROOT,
         )
-        self.assertTrue(
-            any("E2E-005" in error and "not implemented" in error for error in errors),
-            errors,
-        )
+        self.assertEqual(errors, [])
 
     def test_implemented_case_requires_every_declared_pr_target_to_run(self) -> None:
         registry = {

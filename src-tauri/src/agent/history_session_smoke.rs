@@ -259,6 +259,18 @@ async fn seed_incident_session(pool: &SqlitePool) -> anyhow::Result<()> {
             if claims.len() != 1 {
                 bail!("incident recovery round did not claim exactly once");
             }
+            let claim = &claims[0];
+            if !store
+                .charge_claimed_remediation_attempt(
+                    &claim.objective.id,
+                    &claim.remediation_id,
+                    "history-incident-worker",
+                    claim.claim_epoch,
+                )
+                .await?
+            {
+                bail!("incident recovery round lost its execution permit");
+            }
             current = store
                 .get(&current.id)
                 .await?

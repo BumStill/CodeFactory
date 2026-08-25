@@ -78,6 +78,34 @@ string_enum!(ObjectiveStatus {
 pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
 pub const OBJECTIVE_INCIDENT_CONTROLLER: &str = "objective-incident-controller";
 
+/// Version of the durable Chat recovery contract, not the application build.
+/// Bump only when Chat can safely resume a class of incidents that the previous
+/// contract had to park. Other domains own independent revisions below.
+/// Merely restarting or installing an unrelated build must never buy another
+/// recovery budget.
+pub const RECOVERY_CAPABILITY_REVISION: i64 = 1;
+
+fn recovery_capability_contract(domain: RecoveryDomain) -> (i64, bool, &'static str) {
+    match domain {
+        RecoveryDomain::Chat => (
+            RECOVERY_CAPABILITY_REVISION,
+            true,
+            "chat-v1:exact-root-binding:reconcile-side-effects:resume-same-objective",
+        ),
+        RecoveryDomain::Context => (1, false, "context-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Tool => (1, false, "tool-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Permission => (1, false, "permission-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Task => (1, false, "task-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Provider => (1, false, "provider-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Auth => (1, false, "auth-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Browser => (1, false, "browser-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Terminal => (1, false, "terminal-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Delivery => (1, false, "delivery-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Release => (1, false, "release-v1:parked-reactivation-disabled"),
+        RecoveryDomain::Update => (1, false, "update-v1:parked-reactivation-disabled"),
+    }
+}
+
 /// A typed durable wait for another local execution owner to release the App.
 /// Observing the same unsafe restart point is expected state, not a failed
 /// recovery attempt, so it must never consume the technical recovery budget.
@@ -1278,6 +1306,341 @@ impl ObjectiveStore {
         Self { pool }
     }
 
+    /// Persist the executable recovery contract shipped by this binary. The
+    /// digest is deliberately derived from the stable domain/revision contract,
+    /// not a version string, so unrelated releases cannot wake parked work.
+    pub async fn sync_recovery_capabilities(&self) -> anyhow::Result<()> {
+        let now = Utc::now().timestamp_millis();
+        for domain in RecoveryDomain::ALL {
+            // Revision 1 proves only the historical Chat incident path covered
+            // by HLT-001. Other domains retain their ordinary remediation
+            // adapters, but parked-incident reactivation stays disabled until
+            // that domain ships its own safety/identity scenario and revision.
+            let (revision, executable, contract) = recovery_capability_contract(domain);
+            let digest = format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    format!(
+                        "recovery-contract\0{}\0{}\0{}\0{}",
+                        domain.as_str(),
+                        revision,
+                        i64::from(executable),
+                        contract
+                    )
+                    .as_bytes()
+                )
+            );
+            let existing: Option<(i64, String)> = sqlx::query_as(
+                "SELECT revision, contract_digest FROM recovery_capabilities WHERE domain=?",
+            )
+            .bind(domain.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some((stored_revision, stored_digest)) = existing.as_ref() {
+                if *stored_revision > revision {
+                    bail!(
+                        "recovery contract for {} would downgrade capability revision {} to {}",
+                        domain.as_str(), stored_revision, revision
+                    );
+                }
+                if *stored_revision == revision && stored_digest != &digest {
+                    bail!(
+                        "recovery contract for {} changed without a capability revision bump",
+                        domain.as_str()
+                    );
+                }
+            }
+            let synced = sqlx::query(
+                "INSERT INTO recovery_capabilities
+                 (domain, revision, contract_digest, executable, updated_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(domain) DO UPDATE SET
+                   revision=excluded.revision,
+                   contract_digest=excluded.contract_digest,
+                   executable=excluded.executable,
+                   updated_at=excluded.updated_at
+                 WHERE recovery_capabilities.revision<=excluded.revision",
+            )
+            .bind(domain.as_str())
+            .bind(revision)
+            .bind(digest)
+            .bind(i64::from(executable))
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+            if synced.rows_affected() != 1 {
+                bail!(
+                    "recovery contract for {} changed concurrently to a newer revision",
+                    domain.as_str()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically convert parked incidents into ordinary due remediations only
+    /// when a newer executable contract exists and replay safety is proven.
+    /// The incident row is the compare-and-swap admission ledger, so concurrent
+    /// processes cannot create two active remediations for one capability bump.
+    pub async fn reactivate_eligible_incidents(
+        &self,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ObjectiveSnapshot>> {
+        let candidates = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                i64,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+            ),
+        >(
+            "SELECT incident.objective_id, incident.domain, capability.revision,
+                    objective.failure_signature, objective.session_id,
+                    COALESCE(incident.resume_cursor, objective.resume_cursor,
+                             objective.root_turn_id),
+                    binding.id, binding.resource_generation
+             FROM objective_incidents incident
+             JOIN objectives objective ON objective.id=incident.objective_id
+             JOIN recovery_capabilities capability ON capability.domain=incident.domain
+             LEFT JOIN objective_bindings binding
+               ON binding.objective_id=objective.id
+              AND binding.domain=incident.domain
+              AND incident.domain='chat'
+              AND binding.resource_kind='chat_root_turn'
+              AND binding.resource_id=COALESCE(incident.resume_cursor,
+                                                objective.resume_cursor,
+                                                objective.root_turn_id)
+             WHERE incident.status='open'
+               AND objective.status='waiting_system'
+               AND objective.failure_code=?
+               AND objective.recovery_owner=?
+               AND objective.remediation_id IS NULL
+               AND capability.executable=1
+               AND capability.revision>incident.blocked_capability_revision
+             ORDER BY incident.updated_at, incident.objective_id
+             LIMIT ?",
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut reactivated = Vec::new();
+        for (
+            objective_id,
+            domain_value,
+            capability_revision,
+            prior_signature,
+            session_id,
+            resume_cursor,
+            binding_id,
+            resource_generation,
+        ) in candidates
+        {
+            let domain = RecoveryDomain::parse(&domain_value)?;
+            let now = Utc::now().timestamp_millis();
+            let mut tx = self.pool.begin().await?;
+            let unsafe_side_effects: i64 = sqlx::query_scalar(
+                "SELECT
+                   (SELECT COUNT(*) FROM side_effect_receipts receipt
+                      WHERE receipt.objective_id=objective.id
+                        AND receipt.status IN ('started','unknown'))
+                   + CASE
+                       WHEN objective.side_effect_started=1
+                        AND NOT EXISTS (
+                          SELECT 1 FROM side_effect_receipts settled
+                          WHERE settled.objective_id=objective.id
+                            AND settled.status IN ('committed','reconciled','cancelled')
+                        )
+                       THEN 1 ELSE 0 END
+                 FROM objectives objective WHERE objective.id=?",
+            )
+            .bind(&objective_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if unsafe_side_effects > 0 {
+                sqlx::query(
+                    "UPDATE objective_incidents
+                     SET reactivation_status='blocked_safety', updated_at=?
+                     WHERE objective_id=? AND status='open'
+                       AND blocked_capability_revision<?",
+                )
+                .bind(now)
+                .bind(&objective_id)
+                .bind(capability_revision)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                continue;
+            }
+            if domain == RecoveryDomain::Chat
+                && (session_id.is_none()
+                    || resume_cursor.is_none()
+                    || binding_id.is_none()
+                    || resource_generation.is_none())
+            {
+                sqlx::query(
+                    "UPDATE objective_incidents
+                     SET reactivation_status='blocked_identity', updated_at=?
+                     WHERE objective_id=? AND status='open'",
+                )
+                .bind(now)
+                .bind(&objective_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                continue;
+            }
+
+            let admitted = sqlx::query(
+                "UPDATE objective_incidents
+                 SET status='resolved', reactivation_status='admitted',
+                     reactivation_count=reactivation_count+1,
+                     last_reactivated_revision=?, resolved_at=?, updated_at=?
+                 WHERE objective_id=? AND status='open'
+                   AND blocked_capability_revision<?",
+            )
+            .bind(capability_revision)
+            .bind(now)
+            .bind(now)
+            .bind(&objective_id)
+            .bind(capability_revision)
+            .execute(&mut *tx)
+            .await?;
+            if admitted.rows_affected() != 1 {
+                tx.rollback().await?;
+                continue;
+            }
+
+            let remediation_id = Uuid::new_v4().to_string();
+            let failure_code = "recovery_capability_reactivated";
+            let failure_signature = format!(
+                "{}:capability:{}:{}",
+                prior_signature.unwrap_or_else(|| "legacy-incident".into()),
+                domain_value,
+                capability_revision
+            );
+            let objective = sqlx::query(
+                "UPDATE objectives SET revision=revision+1,
+                   status='waiting_system', decision_type='waiting', domain=?,
+                   requires_user_action=0, request_key=NULL, decision_key=NULL,
+                   attention_request_json=NULL, failure_code=?, failure_signature=?,
+                   recovery_owner=?, remediation_id=?, resume_cursor=?,
+                   next_observation_at=?, lease_owner=NULL, lease_expires_at=NULL,
+                   completed_at=NULL, last_progress_at=?, updated_at=?
+                 WHERE id=? AND status='waiting_system' AND failure_code=?
+                   AND recovery_owner=? AND remediation_id IS NULL",
+            )
+            .bind(domain.as_str())
+            .bind(failure_code)
+            .bind(&failure_signature)
+            .bind(format!("objective-supervisor:{}", domain.as_str()))
+            .bind(&remediation_id)
+            .bind(&resume_cursor)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .bind(&objective_id)
+            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+            .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+            .execute(&mut *tx)
+            .await?;
+            if objective.rows_affected() != 1 {
+                tx.rollback().await?;
+                continue;
+            }
+            let recovery_generation: i64 =
+                sqlx::query_scalar("SELECT recovery_generation FROM objectives WHERE id=?")
+                    .bind(&objective_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            sqlx::query(
+                "INSERT INTO objective_remediations
+                 (id, objective_id, domain, status, failure_code,
+                  failure_signature, strategy, approach_index, attempt_index,
+                  execution_attempt_index, recovery_generation, resume_cursor,
+                  binding_id, next_observation_at, created_at, updated_at)
+                 VALUES (?, ?, ?, 'queued', ?, ?, 'reconcile_then_resume',
+                         0, 0, 0, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&remediation_id)
+            .bind(&objective_id)
+            .bind(domain.as_str())
+            .bind(failure_code)
+            .bind(&failure_signature)
+            .bind(recovery_generation)
+            .bind(&resume_cursor)
+            .bind(&binding_id)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            let has_chat_turn_state: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='chat_turn_state'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_chat_turn_state == 1 {
+                if let Some(root_turn_id) = resume_cursor.as_deref() {
+                    sqlx::query(
+                        "UPDATE chat_turn_state SET revision=revision+1,
+                       phase='recovering', status='waiting_system',
+                       recent_activity_kind='system_recovery',
+                       recent_activity_label='系统恢复能力已更新，正在自动续接',
+                       waiting_reason=?, updated_at=?, completed_at=NULL,
+                       terminal_reason=NULL, objective_revision=(
+                         SELECT revision FROM objectives WHERE id=?
+                       ), turn_settled_at=NULL, stream_closed_at=NULL,
+                       terminal_revision=NULL, visible_final_message_id=NULL,
+                       visible_final_kind=NULL, next_action='resume_automatically'
+                     WHERE objective_id=? AND root_turn_id=?",
+                    )
+                    .bind(failure_code)
+                    .bind(now)
+                    .bind(&objective_id)
+                    .bind(&objective_id)
+                    .bind(root_turn_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            sqlx::query(
+                "INSERT INTO objective_events
+                 (id, objective_id, revision, event_type, status, decision_type,
+                  domain, failure_code, recovery_owner, detail_json, created_at)
+                 SELECT ?, id, revision, 'incident_capability_reactivated',
+                        status, decision_type, domain, failure_code, recovery_owner,
+                        ?, ? FROM objectives WHERE id=?",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(
+                serde_json::json!({
+                    "capability_revision": capability_revision,
+                    "reactivation": "system_owned",
+                })
+                .to_string(),
+            )
+            .bind(now)
+            .bind(&objective_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            if let Some(snapshot) = self.get(&objective_id).await? {
+                reactivated.push(snapshot);
+            }
+        }
+        Ok(reactivated)
+    }
+
     pub async fn create(&self, create: CreateObjective) -> anyhow::Result<ObjectiveSnapshot> {
         let now = Utc::now().timestamp_millis();
         let process_instance = current_process_instance();
@@ -2412,8 +2775,8 @@ impl ObjectiveStore {
                 let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
                     "SELECT
                        COALESCE(SUM(CASE WHEN remediation.failure_signature=?
-                                         THEN remediation.attempt_index ELSE 0 END), 0),
-                       COALESCE(SUM(remediation.attempt_index), 0)
+                                         THEN remediation.execution_attempt_index ELSE 0 END), 0),
+                       COALESCE(SUM(remediation.execution_attempt_index), 0)
                      FROM objective_remediations remediation
                      LEFT JOIN objective_decisions decision
                        ON decision.remediation_id=remediation.id
@@ -2619,6 +2982,37 @@ impl ObjectiveStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Charge the bounded recovery budget only after an executable adapter has
+    /// passed observation/reconciliation and still owns the exact claim. Lease
+    /// acquisition, takeover and observe-only polling are coordination events,
+    /// not failed recovery attempts.
+    pub async fn charge_claimed_remediation_attempt(
+        &self,
+        objective_id: &str,
+        remediation_id: &str,
+        owner: &str,
+        claim_epoch: i64,
+    ) -> anyhow::Result<bool> {
+        let now = Utc::now().timestamp_millis();
+        let updated = sqlx::query(
+            "UPDATE objective_remediations
+             SET execution_attempt_index=execution_attempt_index+1,
+                 last_progress_at=?, updated_at=?
+             WHERE id=? AND objective_id=? AND status='claimed'
+               AND lease_owner=? AND attempt_index=? AND lease_expires_at>?",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(remediation_id)
+        .bind(objective_id)
+        .bind(owner)
+        .bind(claim_epoch)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     /// Extend both halves of a claimed remediation lease atomically. Returning
@@ -3276,7 +3670,7 @@ impl ObjectiveStore {
     /// Bound system-owned recovery so it can never spin forever.
     ///
     /// Recovery may insert a new remediation or defer and reclaim the same row
-    /// after an adapter failure. `attempt_index` records real claims, so its
+    /// after an adapter failure. `execution_attempt_index` records real executions, so its
     /// sum across the current durable recovery generation bounds both shapes
     /// of retry while older generations stay queryable as audit history.
     ///
@@ -3322,8 +3716,8 @@ impl ObjectiveStore {
         let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
             "SELECT
                COALESCE(SUM(CASE WHEN remediation.failure_signature=?
-                                 THEN remediation.attempt_index ELSE 0 END), 0),
-               COALESCE(SUM(remediation.attempt_index), 0)
+                                 THEN remediation.execution_attempt_index ELSE 0 END), 0),
+               COALESCE(SUM(remediation.execution_attempt_index), 0)
              FROM objective_remediations remediation
              LEFT JOIN objective_decisions decision
                ON decision.remediation_id=remediation.id
@@ -4515,12 +4909,18 @@ impl ObjectiveStore {
             sqlx::query(
                 "INSERT INTO objective_incidents
                  (id, objective_id, status, failure_code, failure_signature,
-                  owner, resume_cursor, opened_at, updated_at)
-                 VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?)
+                  owner, resume_cursor, opened_at, updated_at, domain,
+                  blocked_capability_revision, reactivation_status)
+                 VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?,
+                         COALESCE((SELECT revision FROM recovery_capabilities WHERE domain=?), ?),
+                         'waiting_capability')
                  ON CONFLICT(objective_id) DO UPDATE SET
                    status='open', failure_code=excluded.failure_code,
                    failure_signature=excluded.failure_signature,
                    owner=excluded.owner, resume_cursor=excluded.resume_cursor,
+                   domain=excluded.domain,
+                   blocked_capability_revision=excluded.blocked_capability_revision,
+                   reactivation_status='waiting_capability',
                    updated_at=excluded.updated_at, resolved_at=NULL",
             )
             .bind(Uuid::new_v4().to_string())
@@ -4531,6 +4931,9 @@ impl ObjectiveStore {
             .bind(&decision.resume_cursor)
             .bind(now)
             .bind(now)
+            .bind(decision.domain.as_str())
+            .bind(decision.domain.as_str())
+            .bind(0_i64)
             .execute(&mut *tx)
             .await?;
         }
@@ -4953,6 +5356,66 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_objective_incidents_status
            ON objective_incidents(status, updated_at);",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS recovery_capabilities (
+           domain TEXT PRIMARY KEY,
+           revision INTEGER NOT NULL CHECK(revision >= 1),
+           contract_digest TEXT NOT NULL,
+           executable INTEGER NOT NULL CHECK(executable IN (0, 1)),
+           updated_at INTEGER NOT NULL
+         );",
+    )
+    .execute(pool)
+    .await?;
+    ensure_column(
+        pool,
+        "objective_incidents",
+        "domain",
+        "TEXT NOT NULL DEFAULT 'chat'",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "objective_incidents",
+        "blocked_capability_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "objective_incidents",
+        "reactivation_status",
+        "TEXT NOT NULL DEFAULT 'waiting_capability'",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "objective_incidents",
+        "reactivation_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "objective_incidents",
+        "last_reactivated_revision",
+        "INTEGER",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "objective_remediations",
+        "execution_attempt_index",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_objective_incidents_reactivation
+         ON objective_incidents(status, reactivation_status, domain,
+                                blocked_capability_revision, updated_at)",
     )
     .execute(pool)
     .await?;
@@ -7693,6 +8156,17 @@ mod tests {
             .unwrap();
         assert_eq!(reclaimed.len(), 1);
         assert!(reclaimed[0].claim_epoch > first[0].claim_epoch);
+        let attempt_index: i64 = sqlx::query_scalar(
+            "SELECT execution_attempt_index FROM objective_remediations WHERE id=?",
+        )
+        .bind(&first[0].remediation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attempt_index, 0,
+            "lease acquisition and takeover must not consume recovery budget"
+        );
         assert!(!store
             .renew_claimed_remediation(
                 &first[0].objective.id,
@@ -8636,6 +9110,231 @@ mod tests {
             .unwrap()
     }
 
+    async fn seed_legacy_parked_chat_incident(pool: &SqlitePool, id: &str) -> ObjectiveSnapshot {
+        let objective = recovery_ceiling_objective(pool, id).await;
+        let now = Utc::now().timestamp_millis();
+        let root_turn_id = objective.root_turn_id.as_deref().unwrap();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, created_at, updated_at)
+             VALUES (?, ?, 'chat', 'chat_root_turn', ?, 1, ?, ?, ?)",
+        )
+        .bind(format!("binding-{id}"))
+        .bind(&objective.id)
+        .bind(root_turn_id)
+        .bind(objective_binding_digest(
+            &objective.id,
+            "chat_root_turn",
+            root_turn_id,
+        ))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE objectives SET revision=revision+1, status='waiting_system',
+               decision_type='failed_internal', failure_code=?,
+               failure_signature='sha256:legacy-exhausted',
+               recovery_owner=?, remediation_id=NULL, next_observation_at=NULL,
+               lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE id=?",
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind(now)
+        .bind(&objective.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_incidents
+             (id, objective_id, status, failure_code, failure_signature,
+              owner, resume_cursor, opened_at, updated_at)
+             VALUES (?, ?, 'open', ?, 'sha256:legacy-exhausted', ?, ?, ?, ?)",
+        )
+        .bind(format!("incident-{id}"))
+        .bind(&objective.id)
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind(&objective.root_turn_id)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        ObjectiveStore::new(pool.clone())
+            .get(&objective.id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capability_revision_reactivates_a_legacy_incident_without_user_reprompt() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let parked = seed_legacy_parked_chat_incident(&pool, "objective-capability-rearm").await;
+
+        store.sync_recovery_capabilities().await.unwrap();
+        let reactivated = store
+            .reactivate_eligible_incidents(8)
+            .await
+            .unwrap();
+
+        assert_eq!(reactivated.len(), 1);
+        assert_eq!(reactivated[0].id, parked.id);
+        assert_eq!(reactivated[0].status, ObjectiveStatus::WaitingSystem);
+        assert_ne!(
+            reactivated[0].recovery_owner.as_deref(),
+            Some(OBJECTIVE_INCIDENT_CONTROLLER)
+        );
+        assert!(reactivated[0].remediation_id.is_some());
+        assert!(reactivated[0].next_observation_at.is_some());
+        assert_eq!(
+            reactivated[0].recovery_generation,
+            parked.recovery_generation
+        );
+
+        let incident: (String, String, i64) = sqlx::query_as(
+            "SELECT status, reactivation_status, reactivation_count
+             FROM objective_incidents WHERE objective_id=?",
+        )
+        .bind(&parked.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(incident, ("resolved".into(), "admitted".into(), 1));
+
+        let second = store
+            .reactivate_eligible_incidents(8)
+            .await
+            .unwrap();
+        assert!(
+            second.is_empty(),
+            "one capability revision may rearm only once"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_capability_revision_does_not_reactivate_a_new_incident() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let parked = seed_legacy_parked_chat_incident(&pool, "objective-current-capability").await;
+        store.sync_recovery_capabilities().await.unwrap();
+        sqlx::query(
+            "UPDATE objective_incidents
+             SET blocked_capability_revision=? WHERE objective_id=?",
+        )
+        .bind(RECOVERY_CAPABILITY_REVISION)
+        .bind(&parked.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reactivated = store
+            .reactivate_eligible_incidents(8)
+            .await
+            .unwrap();
+        assert!(
+            reactivated.is_empty(),
+            "restart under the same recovery contract must not buy another budget"
+        );
+        assert_parked_system_incident(&store.get(&parked.id).await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn capability_registry_is_domain_scoped_and_requires_a_revision_bump() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        store.sync_recovery_capabilities().await.unwrap();
+        let capabilities: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT domain, executable FROM recovery_capabilities
+             WHERE executable=1 ORDER BY domain",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(capabilities, vec![("chat".into(), 1)]);
+
+        sqlx::query(
+            "UPDATE recovery_capabilities SET contract_digest='sha256:drift'
+             WHERE domain='chat'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = store
+            .sync_recovery_capabilities()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("revision bump"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn capability_registry_fails_closed_on_binary_downgrade() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        store.sync_recovery_capabilities().await.unwrap();
+        sqlx::query(
+            "UPDATE recovery_capabilities
+             SET revision=?, contract_digest='sha256:newer-contract'
+             WHERE domain='chat'",
+        )
+        .bind(RECOVERY_CAPABILITY_REVISION + 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = store
+            .sync_recovery_capabilities()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("downgrade capability revision"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unresolved_side_effect_fences_legacy_incident_reactivation() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let parked = seed_legacy_parked_chat_incident(&pool, "objective-unsafe-rearm").await;
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, revision, action_fingerprint, idempotency_key,
+              status, created_at, observed_at)
+             VALUES ('unsafe-rearm-receipt', ?, 1, 'sha256:action', 'sha256:key',
+                     'unknown', ?, ?)",
+        )
+        .bind(&parked.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        store.sync_recovery_capabilities().await.unwrap();
+        let reactivated = store
+            .reactivate_eligible_incidents(8)
+            .await
+            .unwrap();
+        assert!(reactivated.is_empty());
+
+        let current = store.get(&parked.id).await.unwrap().unwrap();
+        assert_parked_system_incident(&current);
+        let incident: (String, String) = sqlx::query_as(
+            "SELECT status, reactivation_status FROM objective_incidents WHERE objective_id=?",
+        )
+        .bind(&parked.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(incident, ("open".into(), "blocked_safety".into()));
+    }
+
     async fn claimable_remediations(pool: &SqlitePool, objective_id: &str) -> i64 {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM objective_remediations
@@ -8702,6 +9401,15 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(claims.len(), 1, "one queued recovery round must be claimed");
+            assert!(store
+                .charge_claimed_remediation_attempt(
+                    &claims[0].objective.id,
+                    &claims[0].remediation_id,
+                    "recovery-ceiling-test",
+                    claims[0].claim_epoch,
+                )
+                .await
+                .unwrap());
         }
         store.get(&waiting.id).await.unwrap().unwrap()
     }
@@ -9313,7 +10021,7 @@ mod tests {
         assert_eq!(current_generation.recovery_generation, 1);
         assert_eq!(claimable_remediations(&pool, &reopened.id).await, 0);
         let attempts_by_generation: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT recovery_generation, SUM(attempt_index)
+            "SELECT recovery_generation, SUM(execution_attempt_index)
              FROM objective_remediations WHERE objective_id=?
              GROUP BY recovery_generation ORDER BY recovery_generation",
         )
@@ -9562,6 +10270,15 @@ mod tests {
                 .unwrap();
             assert_eq!(claim.len(), 1);
             assert_eq!(claim[0].claim_epoch, expected_claim + 1);
+            assert!(store
+                .charge_claimed_remediation_attempt(
+                    &waiting.id,
+                    &remediation_id,
+                    "recovery-ceiling-test",
+                    claim[0].claim_epoch,
+                )
+                .await
+                .unwrap());
         }
 
         store
@@ -9723,6 +10440,15 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(claims.len(), 1);
+                assert!(store
+                    .charge_claimed_remediation_attempt(
+                        &claims[0].objective.id,
+                        &claims[0].remediation_id,
+                        "evidence-gate-test",
+                        claims[0].claim_epoch,
+                    )
+                    .await
+                    .unwrap());
                 current = store.get(&current.id).await.unwrap().unwrap();
             }
             rounds += 1;
