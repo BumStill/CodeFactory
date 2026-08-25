@@ -251,8 +251,9 @@ for policy_file in "${RTE003_POLICY_FILES[@]}"; do
     -json '["chrome-extension://*"]' "$policy_file"
   sudo -n /bin/chmod 0644 "$policy_file"
   for policy_key in LocalNetworkAccessAllowedForUrls LoopbackNetworkAllowedForUrls; do
-    policy_json="$(sudo -n /usr/bin/plutil -extract "$policy_key" json -o - "$policy_file" | /usr/bin/tr -d '[:space:]')"
-    if [[ "$policy_json" != '["chrome-extension://*"]' ]]; then
+    policy_count="$(sudo -n /usr/bin/plutil -extract "$policy_key" raw -expect array "$policy_file")"
+    policy_value="$(sudo -n /usr/bin/plutil -extract "$policy_key.0" raw -expect string "$policy_file")"
+    if [[ "$policy_count" != "1" || "$policy_value" != "chrome-extension://*" ]]; then
       echo "macOS release artifact smoke failed: temporary Chrome policy '$policy_key' was not written exactly" >&2
       exit 1
     fi

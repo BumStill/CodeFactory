@@ -947,6 +947,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
             artifact_smoke,
         )
         self.assertIn(
+            'sudo -n /usr/bin/plutil -extract "$policy_key" raw -expect array',
+            artifact_smoke,
+        )
+        self.assertIn(
+            'sudo -n /usr/bin/plutil -extract "$policy_key.0" raw -expect string',
+            artifact_smoke,
+        )
+        self.assertNotIn(
             'sudo -n /usr/bin/plutil -extract "$policy_key" json',
             artifact_smoke,
         )
