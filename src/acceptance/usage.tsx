@@ -141,7 +141,7 @@ function AcceptancePage() {
         <button type="button" onClick={() => setSurface("settings")} className="rounded border border-border px-3 py-1.5 text-label">设置 / 用量与预算</button>
       </nav>
       {surface === "welcome" ? (
-        <div className="mx-auto flex min-h-[calc(100vh-72px)] max-w-6xl">
+        <div className="mx-auto min-h-[calc(100vh-72px)] max-w-6xl">
           <WelcomeScreen onOpenUsage={() => setSurface("settings")} />
         </div>
       ) : (
