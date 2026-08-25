@@ -227,26 +227,37 @@ fi
 # worker can dial loopback, but a headless release fixture has no user to answer
 # the prompt. Use Chrome's documented managed allowlist only for the isolated
 # Chrome for Testing process, then remove it in cleanup.
+CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT="${CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT:-$INSTALL_DIR/browser-chrome-attach-smoke.json}"
+mkdir -p "$(dirname "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT")" "$INSTALL_DIR/browser-attach-home"
+printf '%s\n' \
+  '{"scenario_id":"RTE-003","status":"failed","evidence_level":"exact_release_artifact","phase":"policy_setup"}' \
+  > "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT"
 if ! sudo -n true; then
   echo "macOS release artifact smoke failed: RTE-003 requires passwordless sudo for its temporary Chrome policy" >&2
   exit 1
 fi
 for policy_file in "${RTE003_POLICY_FILES[@]}"; do
-  if sudo -n /usr/bin/test -e "$policy_file"; then
+  if sudo -n /bin/test -e "$policy_file"; then
     echo "macOS release artifact smoke failed: refusing to overwrite existing Chrome policy $policy_file" >&2
     exit 1
   fi
 done
 RTE003_POLICY_INSTALLED=1
-for policy_domain in com.google.Chrome com.google.chrome.for.testing; do
-  sudo -n /usr/bin/defaults write "/Library/Managed Preferences/$policy_domain" \
-    LocalNetworkAccessAllowedForUrls -array "chrome-extension://*"
-  sudo -n /usr/bin/defaults write "/Library/Managed Preferences/$policy_domain" \
-    LoopbackNetworkAllowedForUrls -array "chrome-extension://*"
-  sudo -n /bin/chmod 0644 "/Library/Managed Preferences/$policy_domain.plist"
+for policy_file in "${RTE003_POLICY_FILES[@]}"; do
+  sudo -n /usr/bin/plutil -create xml1 "$policy_file"
+  sudo -n /usr/bin/plutil -insert LocalNetworkAccessAllowedForUrls \
+    -json '["chrome-extension://*"]' "$policy_file"
+  sudo -n /usr/bin/plutil -insert LoopbackNetworkAllowedForUrls \
+    -json '["chrome-extension://*"]' "$policy_file"
+  sudo -n /bin/chmod 0644 "$policy_file"
+  for policy_key in LocalNetworkAccessAllowedForUrls LoopbackNetworkAllowedForUrls; do
+    policy_json="$(sudo -n /usr/bin/plutil -extract "$policy_key" json -o - "$policy_file" | /usr/bin/tr -d '[:space:]')"
+    if [[ "$policy_json" != '["chrome-extension://*"]' ]]; then
+      echo "macOS release artifact smoke failed: temporary Chrome policy '$policy_key' was not written exactly" >&2
+      exit 1
+    fi
+  done
 done
-CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT="${CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT:-$INSTALL_DIR/browser-chrome-attach-smoke.json}"
-mkdir -p "$(dirname "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT")" "$INSTALL_DIR/browser-attach-home"
 HOME="$INSTALL_DIR/browser-attach-home" \
 CODEFACTORY_BROWSER_CHROME_FIXTURE="managed" \
   "$EXECUTABLE_PATH" --browser-chrome-attach-smoke "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT"
