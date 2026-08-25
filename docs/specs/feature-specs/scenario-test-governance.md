@@ -185,7 +185,7 @@ Scenario-Test: HLT-003, HLT-004
 
 - PR：所有 active Scenario 都有明确 `pull_request` 绑定；唯一场景治理 required context 是 trusted `scenario-gate-pr`，并与其绑定的 Rust/frontend/真实 App checks 共同构成门禁。只计算 diff 直接命中的 Scenario 与 Complex E2E；其中任一 `pull_request_gate` 为 `designed`/`partially_implemented`、仍有 PR gap 或 required target 未真实执行时冻结。无关目录的测试债务不阻断该 PR。
 - Nightly：运行旧 schema、故障矩阵、真实 App restart 和 fake-forge 组合场景。
-- Release：`scenario-gate-release` 在创建/复用 draft 前解析上一 tag，按批次产品差异计算影响集，并验证受影响 exact-artifact target 已绑定到 release workflow；真正的 target 随 Windows/macOS build job 执行，任一失败都会使 `finalize` 不可达。无关历史缺口保留在 registry，但不冻结本批次。
+- Release：`scenario-gate-release` 在创建/复用 draft 前解析上一已发布 release tag，以 default-branch dispatch SHA 的独立 trusted checkout 驱动候选 tag，按完整未发布批次的产品差异计算影响集，并验证受影响 exact-artifact target 已绑定到 release workflow；真正的 target 随 Windows/macOS build job 执行，任一失败都会使 `finalize` 不可达。无关历史缺口和失败未发布 tag 不得截断影响窗口，也不冻结无关批次。
 - Manual canary：只能补充自动化 hard gate，不能是 active Scenario 的唯一门禁。
 
 ### 信任边界与工具传播
@@ -193,7 +193,7 @@ Scenario-Test: HLT-003, HLT-004
 - `docs/testing/scenario-registry.json`、统一 runner 和 GitHub ruleset 是机器权威；Codex、Claude、IDE 与人工得到同一结论；
 - `AGENTS.md` 与 `CLAUDE.md` 只负责告诉执行者提前运行同一命令；`.githooks/pre-commit`/`pre-push` 提供快速反馈，但允许被本地跳过；
 - 最终权威是 GitHub required checks。`scenario-gate-pr` 自身使用 `pull_request_target` 从 default branch 加载 runner，以只读、无凭据方式检查 candidate checkout，candidate 代码永不执行；不再需要第二个 `scenario-gate-policy` context；
-- 默认分支 policy 逐字比对 ruleset、两个 scenario workflow、runner、validator，以及提供 7 个 required contexts / release gate 的 `ci.yml`、`governance-baseline.yml`、`lock-independent-desktop-acceptance.yml`、`release.yml` 共九个 trust-root 文件；普通 PR 不允许自修改这些文件。后续治理升级必须走明确的 external governance bootstrap，再重新启用并对账 required contexts；
+- 默认分支 policy 逐字比对 ruleset、单一 scenario workflow、runner、validator，以及提供 6 个 required contexts / release gate 的 `ci.yml`、`governance-baseline.yml`、`lock-independent-desktop-acceptance.yml`、`release.yml` 等 trust-root 文件；普通 PR 不允许用 candidate 修改后的 validator 自证。后续治理升级必须走明确的 external governance bootstrap，再重新启用并对账 required contexts；
 - 个人仓库管理员仍可在 GitHub 控制面修改规则集。组织级 required workflow 或独立 GitHub App 是更高一级的外部信任根；仓库内门禁不虚假声称能约束仓库所有者凭据。
 
 ## Applicable Harnesses
@@ -209,7 +209,7 @@ Scenario-Test: HLT-003, HLT-004
 
 1. 已完成：统一 26 个场景和 11 个复杂 E2E，schema v2 将全部自动化 target 绑定到明确 gate；
 2. 已完成：新增 trusted policy + PR aggregate required contexts、本地统一 hooks、全优先级 change contract 与 fail-closed base SHA；
-3. 当前 gate debt：按每个 Complex E2E 的 `pull_request_gate` 分别记录；产品 PR 只需清零本 diff 直接命中的 PR slice，release 仍执行目录级 L4 readiness。不得把受影响缺口改写成 waiver，也不得要求无关 PR 先清全目录债务；
+3. 当前 gate debt：按每个 Complex E2E 的 `pull_request_gate` 分别记录；产品 PR 和 release 都只需清零本批次 diff 直接命中的 slice，其中 release 还必须真实执行受影响 L4 exact-artifact target。不得把受影响缺口改写成 waiver，也不得要求无关 PR 先清全目录债务；
 4. 逐项补齐真实 Supervisor wake、跨进程 SQLite、并发 finalization、真实 WebView、浏览器 lifecycle、fake-forge 和 exact artifact receipts，并把 case 提升为 `implemented`；
 5. 全部清零后保持 PR 与 release gate 常开，nightly 只扩展故障矩阵，不再替代 required gate。
 
@@ -221,7 +221,7 @@ Scenario-Test: HLT-003, HLT-004
 - 原历史场景目录不再维护第二份场景数据，只保留 canonical registry 指针；
 - 26 个现有场景和 11 个复杂 E2E 可由机器读取，所有 target 都能解析到明确 hard gate；
 - E2E-001 明确保证无人参与执行；
-- 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`。PR 额外使用 `pull_request_gate` 区分该阶段是否完整：受影响且未完成时失败，无关 case 不参与该 PR 结论；release 仍按全目录 readiness 失败。
+- 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`。PR 额外使用 `pull_request_gate` 区分该阶段是否完整：受影响且未完成时失败，无关 case 不参与该 PR 结论；release 对受影响场景执行同样的增量 fail-closed 规则，并要求 L4 exact-artifact receipt。
 
 ## 风险与边界
 

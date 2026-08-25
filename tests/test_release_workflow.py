@@ -276,6 +276,61 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "unknown must exit before any duplicate release dispatch",
         )
 
+    def test_failed_unpublished_tag_advances_when_main_contains_a_release_fix(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/auto-release.yml").read_text(
+            encoding="utf-8"
+        )
+        reconcile = workflow.split(
+            "- name: Reconcile interrupted version release", 1
+        )[1].split("- name: Determine version slot", 1)[0]
+
+        self.assertIn('if [ "$RUN_CONCLUSION" = "failure" ]', reconcile)
+        self.assertIn('tools/release/plan_release.py', reconcile)
+        self.assertIn('--range "$TAG..HEAD"', reconcile)
+        self.assertIn('abandoned_tag=$TAG', reconcile)
+        self.assertIn('recovered=false', reconcile)
+        self.assertIn('continuing with a new immutable patch tag', reconcile)
+        self.assertLess(
+            reconcile.index('abandoned_tag=$TAG'),
+            reconcile.rindex('gh workflow run release.yml'),
+            "a failed immutable tag with a subsequent fix must advance before the retry path",
+        )
+
+    def test_release_scenario_gate_uses_trusted_main_policy_and_published_base(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        prepare = workflow.split("\n  prepare-release:\n", 1)[1].split(
+            "\n  build-windows:\n", 1
+        )[0]
+
+        self.assertIn("path: policy", prepare)
+        self.assertIn("persist-credentials: false", prepare)
+        self.assertIn("ref: ${{ github.sha }}", prepare)
+        self.assertIn(
+            "python3 policy/tools/governance/run_scenario_harness_gate.py",
+            prepare,
+        )
+        self.assertIn("--policy-repo policy", prepare)
+        self.assertNotIn("--policy-repo .", prepare)
+        self.assertIn("gh release list", prepare)
+        self.assertIn("isDraft,isPrerelease,publishedAt,tagName", prepare)
+        self.assertIn("previous published release tag", prepare)
+        self.assertNotIn('git describe --tags --abbrev=0 "${TAG}^"', prepare)
+
+    def test_release_notes_span_the_previous_published_release_not_a_tombstone(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        changelog = workflow.split("\n  changelog:\n", 1)[1].split(
+            "\n  prepare-release:\n", 1
+        )[0]
+
+        self.assertIn("Resolve previous published release for notes", changelog)
+        self.assertIn("gh release list", changelog)
+        self.assertIn('git-cliff "$BASE_TAG..$TAG"', changelog)
+        self.assertNotIn("git-cliff --latest", changelog)
+
     # 2026-08-05: a preflight job was added to auto-release.yml demanding five
     # APPLE_* secrets before any version mutation. release.yml references
     # APPLE_* exactly zero times — the build has never done Apple codesigning,
