@@ -16,7 +16,7 @@
       "rust": {"workflow": ".github/workflows/ci.yml", "job": "check-rust", "command": "cargo test", "stages": ["pull_request"]},
       "path": {"workflow": ".github/workflows/ci.yml", "job": "check-frontend", "command": "pnpm test", "stages": ["pull_request"]},
       "pnpm": {"workflow": ".github/workflows/ci.yml", "job": "check-frontend", "command_from_target": true, "stages": ["pull_request"]},
-      "binary": {"workflows": [".github/workflows/ci.yml", ".github/workflows/release.yml"], "command_from_target": true, "workflow_stages": {".github/workflows/ci.yml": ["pull_request"], ".github/workflows/release.yml": ["release_artifact"]}},
+      "binary": {"workflows": [".github/workflows/ci.yml", ".github/workflows/release.yml"], "command_from_target": true, "delegated_scripts": {".github/workflows/release.yml": ["scripts/verify-macos-release-artifact.sh"]}, "workflow_stages": {".github/workflows/ci.yml": ["pull_request"], ".github/workflows/release.yml": ["release_artifact"]}},
       "workflow": {"workflows": [".github/workflows/ci.yml", ".github/workflows/unattended-long-task-nightly.yml", ".github/workflows/release.yml"], "step_name_from_target": true, "workflow_stages": {".github/workflows/ci.yml": ["pull_request"], ".github/workflows/unattended-long-task-nightly.yml": ["nightly"], ".github/workflows/release.yml": ["release_artifact"]}}
     }
   },
@@ -280,7 +280,7 @@
       "category": "runtime_lifecycle",
       "priority": "P0",
       "source_kind": "incident_shape",
-      "change_patterns": ["src-tauri/src/tools/browser_session.rs", "src-tauri/src/commands/browser_sessions.rs", "src-tauri/src/agent/objective*.rs"],
+      "change_patterns": ["src-tauri/src/tools/browser_session.rs", "src-tauri/src/commands/browser_sessions.rs", "src-tauri/src/agent/objective*.rs", "src-tauri/src/lib.rs", "scripts/verify-macos-release-artifact.sh", ".github/workflows/release.yml"],
       "automated_by": ["rust:a_transient_extension_command_error_preserves_the_attached_session", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "binary:--browser-chrome-attach-smoke"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "release_artifact"]

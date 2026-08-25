@@ -16,6 +16,7 @@ from tools.governance.run_scenario_harness_gate import (
     validate_trust_root_immutability,
 )
 from tools.governance.validate_scenario_test_governance import (
+    _automation_gate_stages,
     _changed_files,
     _impacted_scenarios,
     _is_version_manifest_only_patch,
@@ -32,6 +33,59 @@ REGISTRY_PATH = REPO_ROOT / "docs" / "testing" / "scenario-registry.json"
 
 
 class ScenarioRegistryTests(unittest.TestCase):
+    def test_delegated_binary_binding_requires_the_whole_explicit_call_chain(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = root / ".github/workflows/release.yml"
+            verifier = root / "scripts/verify-release.sh"
+            workflow.parent.mkdir(parents=True)
+            verifier.parent.mkdir(parents=True)
+            policy = {
+                "target_bindings": {
+                    "binary": {
+                        "workflows": [".github/workflows/release.yml"],
+                        "workflow_stages": {
+                            ".github/workflows/release.yml": ["release_artifact"]
+                        },
+                        "delegated_scripts": {
+                            ".github/workflows/release.yml": [
+                                "scripts/verify-release.sh"
+                            ]
+                        },
+                    }
+                }
+            }
+            workflow.write_text("run: scripts/verify-release.sh\n", encoding="utf-8")
+            verifier.write_text(
+                '"$EXECUTABLE" --browser-chrome-attach-smoke "$RECEIPT"\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _automation_gate_stages(
+                    "binary:--browser-chrome-attach-smoke", policy, root
+                ),
+                {"release_artifact"},
+            )
+
+            workflow.write_text("run: scripts/another-verifier.sh\n", encoding="utf-8")
+            self.assertEqual(
+                _automation_gate_stages(
+                    "binary:--browser-chrome-attach-smoke", policy, root
+                ),
+                set(),
+            )
+            workflow.write_text("run: scripts/verify-release.sh\n", encoding="utf-8")
+            verifier.write_text("echo no exact binary gate\n", encoding="utf-8")
+            self.assertEqual(
+                _automation_gate_stages(
+                    "binary:--browser-chrome-attach-smoke", policy, root
+                ),
+                set(),
+            )
+
     def test_repository_registry_is_valid_and_unifies_existing_surfaces(self) -> None:
         registry = load_registry(REGISTRY_PATH)
         self.assertEqual(validate_registry(registry, REPO_ROOT), [])

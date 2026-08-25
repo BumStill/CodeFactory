@@ -618,6 +618,7 @@ jobs:
         shell: bash
         env:
           CODEFACTORY_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/codefactory-release-evidence
+          CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT: ${{ runner.temp }}/codefactory-release-evidence/browser-chrome-attach-smoke.json
           CODEFACTORY_GUI_PROOF_TIER: released-artifact-gui
           RELEASE_TAG: ${{ inputs.tag }}
           EXPECTED_BUILD_SHA: ${{ needs.prepare-release.outputs.tag_sha }}
@@ -636,19 +637,6 @@ jobs:
           UPDATER_ARCHIVE="$(find "$UPDATER_DIR" -type f -name '*.app.tar.gz' -print -quit)"
           scripts/verify-macos-release-artifact.sh \
             "$DMG_PATH" "${RELEASE_TAG#v}" "$EXPECTED_BUILD_SHA" "$UPDATER_ARCHIVE"
-
-      # RTE-003 exact-artifact gate. The release remains a draft if an
-      # existing-Chrome fixture is unavailable or attachment/recovery fails.
-      - name: Verify installed macOS release can attach to existing Chrome
-        shell: bash
-        run: |
-          set -euo pipefail
-          APP_BINARY="$(find /Applications -path '*/CodeFactory.app/Contents/MacOS/codefactory' -type f -print -quit)"
-          test -n "$APP_BINARY" || {
-            echo "::error::installed CodeFactory binary was not found for --browser-chrome-attach-smoke"
-            exit 1
-          }
-          "$APP_BINARY" --browser-chrome-attach-smoke "$RUNNER_TEMP/browser-chrome-attach-smoke.json"
 
       - name: Upload installed release GUI evidence
         if: always()

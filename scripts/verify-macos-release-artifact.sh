@@ -206,6 +206,31 @@ if [[ -n "$UPDATER_ARCHIVE" ]]; then
   echo "macOS release artifact executable match: sha256=$DMG_EXECUTABLE_SHA256"
 fi
 
+# RTE-003 exact-artifact gate. The candidate binary starts its native
+# extension bridge, materializes the extension embedded in that binary, and
+# attaches to a real synthetic Chrome fixture. Closing the CodeFactory session
+# must release its lease without terminating that already-running browser.
+CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT="${CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT:-$INSTALL_DIR/browser-chrome-attach-smoke.json}"
+mkdir -p "$(dirname "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT")" "$INSTALL_DIR/browser-attach-home"
+HOME="$INSTALL_DIR/browser-attach-home" \
+CODEFACTORY_BROWSER_CHROME_FIXTURE="managed" \
+  "$EXECUTABLE_PATH" --browser-chrome-attach-smoke "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT"
+if [[ "$(/usr/bin/plutil -extract status raw "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT")" != "passed" ]]; then
+  echo "macOS release artifact smoke failed: Chrome attachment status was not passed" >&2
+  exit 1
+fi
+if [[ "$(/usr/bin/plutil -extract connection_kind raw "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT")" != "attached_chrome" ]]; then
+  echo "macOS release artifact smoke failed: Chrome fixture did not use the attached browser path" >&2
+  exit 1
+fi
+for field in tab_observation_ok detached_without_managed_close lease_reclaimed_after_detach browser_process_alive_after_detach; do
+  if [[ "$(/usr/bin/plutil -extract "$field" raw "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT")" != "true" ]]; then
+    echo "macOS release artifact smoke failed: Chrome attachment receipt field '$field' was not true" >&2
+    exit 1
+  fi
+done
+cat "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT"
+
 EVOLUTION_RECEIPT="$INSTALL_DIR/evolution-release-smoke.json"
 "$EXECUTABLE_PATH" --evolution-smoke "$EVOLUTION_RECEIPT"
 if [[ "$(/usr/bin/plutil -extract status raw "$EVOLUTION_RECEIPT")" != "pass" ]]; then

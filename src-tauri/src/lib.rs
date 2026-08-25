@@ -951,6 +951,75 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .to_path_buf();
+        let browser_fixture = std::env::var_os("CODEFACTORY_BROWSER_CHROME_FIXTURE")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                errors::AppError::Other(
+                    "CODEFACTORY_BROWSER_CHROME_FIXTURE must be 'managed' or name the Chrome for Testing executable used by the release smoke"
+                        .into(),
+                )
+            })?;
+        let browser_binary = if browser_fixture == std::ffi::OsStr::new("managed") {
+            browser::download::ensure_installed(&|_| {}).await?.binary
+        } else {
+            std::path::PathBuf::from(browser_fixture)
+        };
+        let bridge = std::sync::Arc::clone(&tools::browser_session::BRIDGE);
+        let pairing = bridge.start().await?;
+        let extension_dir = browser::extension_package::prepare(pairing.port, &pairing.token)
+            .map_err(errors::AppError::Other)?;
+        let browser_profile = tempfile::Builder::new()
+            .prefix("browser-chrome-attach-profile-")
+            .tempdir_in(&cwd)?;
+        let fixture_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let fixture_port = fixture_listener.local_addr()?.port();
+        let fixture_server = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            while let Ok((mut stream, _)) = fixture_listener.accept().await {
+                let body = b"<!doctype html><title>CodeFactory attachment fixture</title><h1>Attachment fixture</h1>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+        let mut browser_process = tokio::process::Command::new(&browser_binary);
+        browser_process
+            .arg(format!(
+                "--user-data-dir={}",
+                browser_profile.path().display()
+            ))
+            .arg(format!("--load-extension={}", extension_dir.display()))
+            .arg(format!(
+                "--disable-extensions-except={}",
+                extension_dir.display()
+            ))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--no-sandbox")
+            .arg("--disable-background-networking")
+            .arg("--disable-component-update")
+            .arg("--disable-sync")
+            .arg("--window-position=-10000,-10000")
+            .arg("--window-size=800,600")
+            .arg(format!("http://127.0.0.1:{fixture_port}/"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut browser_process = browser_process.spawn().map_err(|error| {
+            errors::AppError::Other(format!("could not start the Chrome fixture: {error}"))
+        })?;
+        if !bridge
+            .wait_until_connected(std::time::Duration::from_secs(40))
+            .await
+        {
+            return Err(errors::AppError::Other(
+                "Chrome fixture did not connect to the exact-artifact extension bridge within 40 seconds"
+                    .into(),
+            ));
+        }
         let owner_session_id = format!("browser-attach-smoke-{}", uuid::Uuid::new_v4());
         let ctx = tools::ExecCtx {
             cwd,
@@ -986,11 +1055,21 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             .find(|session| session.session_id == session_id)
             .map(|session| session.kind.as_str())
             == Some("attached_chrome");
-        let tabs = tools::browser_session::execute(
-            serde_json::json!({"action":"tabs","session_id":session_id}),
-            &ctx,
-        )
-        .await?;
+        let tabs_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let tab_observation_ok = loop {
+            let tabs = tools::browser_session::execute(
+                serde_json::json!({"action":"tabs","session_id":session_id}),
+                &ctx,
+            )
+            .await?;
+            let observed = !tabs.is_error
+                && tabs.status == tools::ToolExecutionStatus::Done
+                && !tabs.content.contains("No readable tabs are open");
+            if observed || tokio::time::Instant::now() >= tabs_deadline {
+                break observed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        };
         let closed = tools::browser_session::execute(
             serde_json::json!({"action":"close","session_id":session_id}),
             &ctx,
@@ -999,24 +1078,37 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
         let lease_gone = !tools::browser_session::list_managed_sessions()
             .iter()
             .any(|session| session.session_id == session_id);
+        let browser_process_alive_after_detach = browser_process.try_wait()?.is_none();
         let receipt = serde_json::json!({
-            "status": if attached_kind && !tabs.is_error && !closed.is_error && lease_gone {
+            "status": if attached_kind
+                && tab_observation_ok
+                && !closed.is_error
+                && lease_gone
+                && browser_process_alive_after_detach
+            {
                 "passed"
             } else {
                 "failed"
             },
             "native_tool": "browser_session",
             "connection_kind": "attached_chrome",
-            "tab_observation_ok": !tabs.is_error,
+            "tab_observation_ok": tab_observation_ok,
             "detached_without_managed_close": closed.content.contains("Chrome was left open"),
             "lease_reclaimed_after_detach": lease_gone,
+            "browser_process_alive_after_detach": browser_process_alive_after_detach,
         });
         std::fs::write(
             &output_path,
             serde_json::to_vec_pretty(&receipt).unwrap_or_default(),
         )?;
         tools::browser_session::close_for_session(&owner_session_id).await;
-        if receipt["status"] == "passed" && receipt["detached_without_managed_close"] == true {
+        let _ = browser_process.start_kill();
+        let _ = browser_process.wait().await;
+        fixture_server.abort();
+        if receipt["status"] == "passed"
+            && receipt["detached_without_managed_close"] == true
+            && receipt["browser_process_alive_after_detach"] == true
+        {
             Ok(receipt)
         } else {
             Err(errors::AppError::Other(receipt.to_string()))

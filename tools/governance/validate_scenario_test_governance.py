@@ -262,9 +262,30 @@ def _automation_gate_stages(
     if kind in {"binary", "workflow"}:
         stages: set[str] = set()
         workflow_stages = binding.get("workflow_stages") or {}
+        delegated_scripts = binding.get("delegated_scripts") or {}
         for relative, text in workflow_texts.items():
             if marker in text:
                 stages.update(workflow_stages.get(relative) or [])
+                continue
+            scripts = delegated_scripts.get(relative) or []
+            for script in scripts:
+                script_relative = Path(script) if isinstance(script, str) else None
+                if (
+                    script_relative is None
+                    or script_relative.is_absolute()
+                    or ".." in script_relative.parts
+                    or not script.startswith("scripts/")
+                ):
+                    continue
+                script_path = repo_root / script
+                if (
+                    script in text
+                    and script_path.is_file()
+                    and not script_path.is_symlink()
+                    and marker
+                    in script_path.read_text(encoding="utf-8", errors="ignore")
+                ):
+                    stages.update(workflow_stages.get(relative) or [])
         return stages
     command = binding.get("command")
     job = binding.get("job")
@@ -333,6 +354,37 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
             workflow_stages = {}
         for stages in workflow_stages.values():
             declared_stages.update(stages or [])
+        delegated_scripts = binding.get("delegated_scripts") or {}
+        if not isinstance(delegated_scripts, dict):
+            errors.append(
+                f"gate_policy.target_bindings.{kind}.delegated_scripts must be an object"
+            )
+        else:
+            configured_workflows = set(binding.get("workflows") or [])
+            workflow = binding.get("workflow")
+            if isinstance(workflow, str):
+                configured_workflows.add(workflow)
+            for workflow_path, scripts in delegated_scripts.items():
+                if workflow_path not in configured_workflows:
+                    errors.append(
+                        f"gate_policy.target_bindings.{kind}.delegated_scripts names an unconfigured workflow: {workflow_path}"
+                    )
+                if not isinstance(scripts, list) or not scripts:
+                    errors.append(
+                        f"gate_policy.target_bindings.{kind}.delegated_scripts.{workflow_path} must be a non-empty list"
+                    )
+                    continue
+                for script in scripts:
+                    script_path = Path(script) if isinstance(script, str) else None
+                    if (
+                        script_path is None
+                        or script_path.is_absolute()
+                        or ".." in script_path.parts
+                        or not script.startswith("scripts/")
+                    ):
+                        errors.append(
+                            f"gate_policy.target_bindings.{kind}.delegated_scripts contains an unsafe path: {script}"
+                        )
         unknown_stages = sorted(declared_stages - ALLOWED_GATES)
         if unknown_stages:
             errors.append(
