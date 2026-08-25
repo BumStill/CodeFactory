@@ -643,9 +643,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          APP_BINARY="$(find /Applications -path '*/CodeFactory.app/Contents/MacOS/codefactory' -type f -print -quit)"
-          test -n "$APP_BINARY" || {
-            echo "::error::installed CodeFactory binary was not found for --browser-chrome-attach-smoke"
+          # This step used to search /Applications for an install nothing had
+          # performed: verify-macos-release-artifact.sh copies the app into a
+          # mktemp INSTALL_DIR and deletes it in its cleanup trap, so the find
+          # could only ever come back empty. v1.81.36 was the first release to
+          # reach this step — v1.81.35's build never got here — and it failed
+          # with "installed CodeFactory binary was not found". Install the exact
+          # DMG here, so the smoke runs against the artifact users receive.
+          DMG_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg"
+          DMG_PATH="$(find "$DMG_DIR" -type f -name '*.dmg' -print -quit)"
+          test -n "$DMG_PATH" || {
+            echo "::error::no macOS DMG to install for --browser-chrome-attach-smoke"
+            exit 1
+          }
+          MOUNT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codefactory-attach-dmg.XXXXXX")"
+          cleanup() { hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true; }
+          trap cleanup EXIT
+          hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_DIR" -quiet
+          test -d "$MOUNT_DIR/CodeFactory.app" || {
+            echo "::error::CodeFactory.app missing from the DMG root"
+            exit 1
+          }
+          rm -rf /Applications/CodeFactory.app
+          ditto "$MOUNT_DIR/CodeFactory.app" /Applications/CodeFactory.app
+          hdiutil detach "$MOUNT_DIR" -quiet
+          trap - EXIT
+
+          APP_BINARY="/Applications/CodeFactory.app/Contents/MacOS/codefactory"
+          test -x "$APP_BINARY" || {
+            echo "::error::installed CodeFactory binary missing after installing $DMG_PATH"
             exit 1
           }
           "$APP_BINARY" --browser-chrome-attach-smoke "$RUNNER_TEMP/browser-chrome-attach-smoke.json"
