@@ -43,6 +43,21 @@ test("required Windows CI executes the cross-process contract", async () => {
   }
 });
 
+test("the formal smoke owns the capability-reactivation oracle", async () => {
+  const smoke = await source("src-tauri/src/agent/unattended_smoke.rs");
+  for (const required of [
+    "sync_recovery_capabilities",
+    "reactivate_eligible_incidents",
+    "legacy_incident_parked",
+    "incident_reactivated",
+    "incident_reactivation_count",
+    "capability_revision",
+    "executed_recovery_attempts",
+  ]) {
+    assert.ok(smoke.includes(required), `formal smoke is missing ${required}`);
+  }
+});
+
 test("nightly repeats every historical scenario on a real Windows process", async () => {
   const nightly = await source(
     ".github/workflows/unattended-long-task-nightly.yml",
