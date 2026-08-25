@@ -18,6 +18,18 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+#[derive(Clone, Debug)]
+pub struct ContinuationEvidence<'a> {
+    pub objective_id: &'a str,
+    pub replacement_session_id: &'a str,
+    pub same_objective: bool,
+    pub replacement_session_is_new: bool,
+    pub replacement_session_reclaimed: bool,
+    pub recovery_lease_reclaimed: bool,
+    pub recovery_budget_attempts: i64,
+    pub objective_completed: bool,
+}
+
 /// How many times the smoke will try to get a browser open before giving up.
 ///
 /// Three attempts, not "until it works": a runner that genuinely cannot start
@@ -54,9 +66,16 @@ pub fn receipt(
     failure_detected: bool,
     lease_reclaimed: bool,
     launch_attempts: u32,
+    continuation: &ContinuationEvidence<'_>,
 ) -> Value {
+    let continuation_ok = continuation.same_objective
+        && continuation.replacement_session_is_new
+        && continuation.replacement_session_reclaimed
+        && continuation.recovery_lease_reclaimed
+        && continuation.recovery_budget_attempts == 1
+        && continuation.objective_completed;
     json!({
-        "status": if snapshot_ok && failure_detected && lease_reclaimed {
+        "status": if snapshot_ok && failure_detected && lease_reclaimed && continuation_ok {
             "passed"
         } else {
             "failed"
@@ -67,6 +86,14 @@ pub fn receipt(
         "failure_detected": failure_detected,
         "lease_reclaimed_after_failure": lease_reclaimed,
         "launch_attempts": launch_attempts,
+        "objective_id": continuation.objective_id,
+        "replacement_session": continuation.replacement_session_id,
+        "same_objective": continuation.same_objective,
+        "replacement_session_is_new": continuation.replacement_session_is_new,
+        "replacement_session_reclaimed": continuation.replacement_session_reclaimed,
+        "recovery_lease_reclaimed": continuation.recovery_lease_reclaimed,
+        "recovery_budget_attempts": continuation.recovery_budget_attempts,
+        "objective_completed": continuation.objective_completed,
     })
 }
 
@@ -90,12 +117,31 @@ pub fn failure_receipt(stage: &str, error: &str, launch_attempts: u32) -> Value 
         "failure_detected": false,
         "lease_reclaimed_after_failure": false,
         "launch_attempts": launch_attempts,
+        "same_objective": false,
+        "replacement_session_is_new": false,
+        "replacement_session_reclaimed": false,
+        "recovery_lease_reclaimed": false,
+        "recovery_budget_attempts": 0,
+        "objective_completed": false,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn continuation() -> ContinuationEvidence<'static> {
+        ContinuationEvidence {
+            objective_id: "objective-browser-smoke",
+            replacement_session_id: "codefactory-2",
+            same_objective: true,
+            replacement_session_is_new: true,
+            replacement_session_reclaimed: true,
+            recovery_lease_reclaimed: true,
+            recovery_budget_attempts: 1,
+            objective_completed: true,
+        }
+    }
 
     /// The message shape a runner that cannot start Chrome actually produces.
     fn launch_failure_message() -> String {
@@ -145,7 +191,14 @@ mod tests {
             (false, false, false, "nothing working at all"),
         ];
         for (snapshot_ok, failure_detected, lease_reclaimed, what) in cases {
-            let receipt = receipt("codefactory-1", snapshot_ok, failure_detected, lease_reclaimed, 1);
+            let receipt = receipt(
+                "codefactory-1",
+                snapshot_ok,
+                failure_detected,
+                lease_reclaimed,
+                1,
+                &continuation(),
+            );
             assert_eq!(
                 receipt["status"], "failed",
                 "{what} must not report as passed"
@@ -155,13 +208,41 @@ mod tests {
 
     #[test]
     fn a_clean_run_passes_and_reports_its_attempts() {
-        let receipt = receipt("codefactory-1", true, true, true, 2);
+        let receipt = receipt("codefactory-1", true, true, true, 2, &continuation());
         assert_eq!(receipt["status"], "passed");
         assert_eq!(receipt["opened_session"], "codefactory-1");
         assert_eq!(
             receipt["launch_attempts"], 2,
             "a run that needed a retry has to say so, or the flake stays invisible"
         );
+    }
+
+    #[test]
+    fn every_continuation_failure_produces_a_red_receipt() {
+        for field in [
+            "same_objective",
+            "replacement_session_is_new",
+            "replacement_session_reclaimed",
+            "recovery_lease_reclaimed",
+            "recovery_budget_attempts",
+            "objective_completed",
+        ] {
+            let mut evidence = continuation();
+            match field {
+                "same_objective" => evidence.same_objective = false,
+                "replacement_session_is_new" => evidence.replacement_session_is_new = false,
+                "replacement_session_reclaimed" => evidence.replacement_session_reclaimed = false,
+                "recovery_lease_reclaimed" => evidence.recovery_lease_reclaimed = false,
+                "recovery_budget_attempts" => evidence.recovery_budget_attempts = 2,
+                "objective_completed" => evidence.objective_completed = false,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                receipt("codefactory-1", true, true, true, 1, &evidence)["status"],
+                "failed",
+                "{field} must be part of the binary verdict"
+            );
+        }
     }
 
     #[test]

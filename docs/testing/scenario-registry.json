@@ -477,9 +477,10 @@
         "delivery": ["receipt 同时记录 snapshot、failure detection 和 cleanup"]
       },
       "execution": {"pull_request": "real process lifecycle smoke", "nightly": "failure/retry matrix", "release_artifact": "exact binary smoke"},
-      "automation_status": "designed",
-      "pull_request_gate": {"status": "designed", "required_targets": [], "remaining_gaps": ["real process lifecycle smoke 尚未实现"]},
-      "remaining_gaps": ["尚无任何自动化：PR 的 real process lifecycle smoke、nightly 的 failure/retry matrix、release 的 exact binary smoke 均未实现", "浏览器逻辑失败后的回收与任务续接未自动验证", "既有 browser smoke 覆盖的是会话建立，不覆盖本场景的失败回收路径，因此不作声明"]
+      "automation_status": "partially_implemented",
+      "automated_by": ["rust:browser_lease_reclaim_does_not_spend_budget_and_safe_continuation_settles", "binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:browser_lease_reclaim_does_not_spend_budget_and_safe_continuation_settles", "binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke"], "remaining_gaps": []},
+      "remaining_gaps": ["nightly 的 failure/retry matrix 尚未实现", "release 的 exact binary smoke 尚未实现"]
     },
     {
       "id": "E2E-006",
