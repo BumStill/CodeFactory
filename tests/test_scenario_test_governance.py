@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
+import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
+
+from tools.governance import validate_scenario_test_governance as scenario_governance
 
 from tools.governance.run_scenario_harness_gate import (
     TRUST_ROOT_FILES,
@@ -284,6 +290,90 @@ class ScenarioChangeContractTests(unittest.TestCase):
         files, error = _changed_files(REPO_ROOT, "")
         self.assertEqual(files, [])
         self.assertIn("base SHA", error or "")
+
+    def test_push_event_validates_registry_without_requiring_a_pr_body(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            event_path = Path(directory) / "event.json"
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "ref": "refs/heads/main",
+                        "before": "base-sha",
+                        "after": "head-sha",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch("sys.argv", ["validate_scenario_test_governance.py", "--ci"]),
+                patch.dict(
+                    os.environ,
+                    {
+                        "SCENARIO_TEST_EVENT_PATH": str(event_path),
+                        "SCENARIO_TEST_BASE_SHA": "base-sha",
+                    },
+                    clear=False,
+                ),
+                patch.object(
+                    scenario_governance,
+                    "_changed_files",
+                    return_value=(["src-tauri/src/commands/session.rs"], None),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(scenario_governance.main(), 0)
+
+    def test_pull_request_event_still_requires_the_scenario_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            event_path = Path(directory) / "event.json"
+            event_path.write_text(
+                json.dumps(
+                    {
+                        "pull_request": {
+                            "title": "fix: change session behavior",
+                            "body": "",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            with (
+                patch("sys.argv", ["validate_scenario_test_governance.py", "--ci"]),
+                patch.dict(
+                    os.environ,
+                    {
+                        "SCENARIO_TEST_EVENT_PATH": str(event_path),
+                        "SCENARIO_TEST_BASE_SHA": "base-sha",
+                    },
+                    clear=False,
+                ),
+                patch.object(
+                    scenario_governance,
+                    "_changed_files",
+                    return_value=(["src-tauri/src/commands/session.rs"], None),
+                ),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(scenario_governance.main(), 1)
+            self.assertIn("Scenario-Test", output.getvalue())
+
+    def test_unrecognized_ci_event_still_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            event_path = Path(directory) / "event.json"
+            event_path.write_text(json.dumps({"workflow_run": {}}), encoding="utf-8")
+            output = io.StringIO()
+            with (
+                patch("sys.argv", ["validate_scenario_test_governance.py", "--ci"]),
+                patch.dict(
+                    os.environ,
+                    {"SCENARIO_TEST_EVENT_PATH": str(event_path)},
+                    clear=False,
+                ),
+                redirect_stdout(output),
+            ):
+                self.assertEqual(scenario_governance.main(), 1)
+            self.assertIn("could not determine CI event type", output.getvalue())
 
 
 class ScenarioHardGateTests(unittest.TestCase):
