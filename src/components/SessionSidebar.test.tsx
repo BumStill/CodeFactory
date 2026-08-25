@@ -8,7 +8,7 @@
 // jsdom — no real Tauri backend, so the chat store is mocked.
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 const mocks = vi.hoisted(() => ({
@@ -110,8 +110,79 @@ describe("SessionSidebar", () => {
         <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
       );
       expect(screen.getByLabelText("等待批准")).toBeInTheDocument();
+      expect(screen.queryByLabelText("运行中")).not.toBeInTheDocument();
     } finally {
       fakeChatState.runtime = {};
+    }
+  });
+
+  it("restores the running indicator from durable session activity after reload", () => {
+    const previousSessions = fakeChatState.sessions;
+    fakeChatState.sessions = fakeChatState.sessions.map((session) =>
+      session.id === "q1" ? { ...session, is_running: true } : session,
+    );
+    try {
+      render(
+        <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+      );
+
+      expect(screen.getByLabelText("运行中")).toBeInTheDocument();
+    } finally {
+      fakeChatState.sessions = previousSessions;
+    }
+  });
+
+  it("surfaces running activity when its project is collapsed", () => {
+    const previousSessions = fakeChatState.sessions;
+    fakeChatState.sessions = fakeChatState.sessions.map((session) =>
+      session.id === "p1a" ? { ...session, is_running: true } : session,
+    );
+    try {
+      render(
+        <SessionSidebar currentSessionId="q1" onOpenSession={noop} onNewConversation={noop} />,
+      );
+
+      expect(screen.getByLabelText("项目内有会话运行中")).toBeInTheDocument();
+    } finally {
+      fakeChatState.sessions = previousSessions;
+    }
+  });
+
+  it("clears durable running activity without remounting the sidebar", () => {
+    const previousSessions = fakeChatState.sessions;
+    fakeChatState.sessions = fakeChatState.sessions.map((session) =>
+      session.id === "q1" ? { ...session, is_running: true } : session,
+    );
+    const sidebar = () => (
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />
+    );
+    try {
+      const { rerender } = render(sidebar());
+      expect(screen.getByLabelText("运行中")).toBeInTheDocument();
+
+      fakeChatState.sessions = fakeChatState.sessions.map((session) =>
+        session.id === "q1" ? { ...session, is_running: false } : session,
+      );
+      rerender(sidebar());
+
+      expect(screen.queryByLabelText("运行中")).not.toBeInTheDocument();
+    } finally {
+      fakeChatState.sessions = previousSessions;
+    }
+  });
+
+  it("refreshes durable session activity while the sidebar is visible", () => {
+    vi.useFakeTimers();
+    const { unmount } = render(
+      <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+    );
+    try {
+      expect(mocks.loadSessions).toHaveBeenCalledTimes(1);
+      act(() => vi.advanceTimersByTime(2_000));
+      expect(mocks.loadSessions).toHaveBeenCalledTimes(2);
+    } finally {
+      unmount();
+      vi.useRealTimers();
     }
   });
 

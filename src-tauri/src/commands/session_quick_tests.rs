@@ -15,6 +15,19 @@ mod tests {
     const LIST_SESSIONS_SQL: &str = "SELECT id FROM sessions \
          WHERE parent_session_id IS NULL \
          ORDER BY updated_at DESC LIMIT 200";
+    const LIST_SESSION_ACTIVITY_SQL: &str = "SELECT session.id,
+                CASE WHEN running.session_id IS NULL THEN 0 ELSE 1 END AS is_running
+         FROM sessions session
+         LEFT JOIN (
+             SELECT DISTINCT objective.session_id
+             FROM objectives objective
+             WHERE objective.root_turn_id IS NOT NULL
+               AND objective.status IN ('active','waiting_system')
+               AND NOT (objective.status='waiting_system'
+                        AND objective.failure_code='technical_recovery_exhausted')
+         ) running ON running.session_id=session.id
+         WHERE session.parent_session_id IS NULL
+         ORDER BY session.updated_at DESC LIMIT 200";
 
     async fn fresh_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -35,6 +48,18 @@ mod tests {
                 total_output_tokens INTEGER NOT NULL DEFAULT 0,
                 parent_session_id TEXT,
                 kind TEXT NOT NULL DEFAULT 'project'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                root_turn_id TEXT,
+                status TEXT NOT NULL,
+                failure_code TEXT
             )",
         )
         .execute(&pool)
@@ -107,5 +132,56 @@ mod tests {
         // kind: nothing is ever written, so the list stays empty.
         let pool = fresh_pool().await;
         assert!(listed_ids(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_activity_only_marks_system_owned_work_as_running() {
+        let pool = fresh_pool().await;
+        for (index, id) in ["active", "retry", "exhausted", "user", "done"]
+            .into_iter()
+            .enumerate()
+        {
+            insert_session(&pool, id, "project", None, 500 - index as i64).await;
+        }
+        for (id, status, failure_code) in [
+            ("active", "active", None),
+            ("retry", "waiting_system", Some("provider_timeout")),
+            (
+                "exhausted",
+                "waiting_system",
+                Some("technical_recovery_exhausted"),
+            ),
+            ("user", "waiting_authorization", None),
+            ("done", "completed", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO objectives
+                 (id, session_id, root_turn_id, status, failure_code)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(format!("objective-{id}"))
+            .bind(id)
+            .bind(format!("turn-{id}"))
+            .bind(status)
+            .bind(failure_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let rows: Vec<(String, bool)> = sqlx::query_as(LIST_SESSION_ACTIVITY_SQL)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("active".into(), true),
+                ("retry".into(), true),
+                ("exhausted".into(), false),
+                ("user".into(), false),
+                ("done".into(), false),
+            ]
+        );
     }
 }
