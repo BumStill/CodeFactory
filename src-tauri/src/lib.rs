@@ -1079,6 +1079,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             )));
         }
         let browser_version = tokio::process::Command::new(&browser_binary)
+            .no_window()
             .arg("--version")
             .output()
             .await?;
