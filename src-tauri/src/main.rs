@@ -17,6 +17,9 @@ fn main() {
     if codefactory_lib::run_browser_session_smoke_cli() {
         return;
     }
+    if codefactory_lib::run_update_upgrade_smoke_cli() {
+        return;
+    }
     if codefactory_lib::run_browser_chrome_attach_smoke_cli() {
         return;
     }

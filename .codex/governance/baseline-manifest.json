@@ -29,7 +29,6 @@
     ".codex/governance/baseline-manifest.json",
     ".github/workflows/governance-baseline.yml",
     ".github/workflows/scenario-gate.yml",
-    ".github/workflows/scenario-gate-policy.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/release.yml",
     ".github/workflows/auto-release.yml",
@@ -64,7 +63,6 @@
       "Observation Harness",
       "scenario-registry.json",
       "Scenario-Test:",
-      "scenario-gate-policy",
       "scenario-gate-pr",
       "run_scenario_harness_gate.py",
       "long tasks",
@@ -118,19 +116,13 @@
     ],
     ".github/workflows/scenario-gate.yml": [
       "scenario-gate-pr",
-      "pull_request",
+      "pull_request_target",
       "edited",
+      "persist-credentials: false",
       "run_scenario_harness_gate.py",
       "--stage pull_request"
     ],
-    ".github/workflows/scenario-gate-policy.yml": [
-      "scenario-gate-policy",
-      "pull_request_target",
-      "persist-credentials: false",
-      "--policy-repo"
-    ],
     ".github/rulesets/main.json": [
-      "scenario-gate-policy",
       "scenario-gate-pr",
       "strict_required_status_checks_policy"
     ],

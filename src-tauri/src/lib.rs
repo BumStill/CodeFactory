@@ -855,6 +855,67 @@ pub fn run_browser_session_smoke_cli() -> bool {
     }
 }
 
+/// Exact-release executable gate for a previous-to-current updater restart.
+/// The previous identity is supplied from the prior public `latest.json`; the
+/// current identity is compiled into this candidate binary.
+#[cfg(not(test))]
+pub fn run_update_upgrade_smoke_cli() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) != Some("--update-upgrade-smoke") {
+        return false;
+    }
+    if args.len() != 5 {
+        eprintln!(
+            "usage: CodeFactory --update-upgrade-smoke <receipt.json> <previous-version> <previous-build-sha>"
+        );
+        std::process::exit(2);
+    }
+    let output = std::path::PathBuf::from(&args[2]);
+    let state_path = output.with_extension("sqlite");
+    let current_build = option_env!("CODEFACTORY_BUILD_GIT_SHA").unwrap_or_default();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Update upgrade smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    match runtime.block_on(commands::update_safety::run_update_upgrade_smoke_fixture(
+        &state_path,
+        &args[3],
+        &args[4],
+        env!("CARGO_PKG_VERSION"),
+        current_build,
+    )) {
+        Ok(receipt) => {
+            let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+            if let Err(error) = std::fs::write(&output, rendered.as_bytes()) {
+                eprintln!("Update upgrade smoke could not write receipt: {error}");
+                std::process::exit(1);
+            }
+            let _ = std::fs::remove_file(&state_path);
+            if receipt.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+                eprintln!("Update upgrade smoke receipt did not pass: {rendered}");
+                std::process::exit(1);
+            }
+            println!("{rendered}");
+            true
+        }
+        Err(error) => {
+            let receipt = serde_json::json!({
+                "scenario_id": "E2E-006",
+                "status": "fail",
+                "error": error.to_string(),
+            });
+            let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+            let _ = std::fs::write(&output, rendered.as_bytes());
+            let _ = std::fs::remove_file(&state_path);
+            eprintln!("Update upgrade smoke failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Release/runtime smoke for the existing-Chrome attachment path. It exercises
 /// the native tool (never a naked Playwright process), verifies signed-in
 /// Chrome can be observed, and proves cleanup detaches without closing Chrome.

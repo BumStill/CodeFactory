@@ -9,7 +9,6 @@
       "check-rust",
       "governance-baseline",
       "remote-real-app-gui",
-      "scenario-gate-policy",
       "scenario-gate-pr"
     ],
     "release_required_job": "scenario-gate-release",
@@ -61,7 +60,7 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/crates/agent-loop/src/*.rs", "src-tauri/src/agent/mod.rs", "src-tauri/src/commands/skills.rs", "src-tauri/src/tools/bash.rs", "src-tauri/src/trajectory.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs"],
+      "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/crates/agent-loop/src/*.rs", "src-tauri/src/agent/mod.rs", "src-tauri/src/commands/skills.rs", "src-tauri/src/tools/bash.rs", "src-tauri/src/trajectory.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"],
       "automated_by": ["rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:timed_out_skill_install_allows_two_complementary_windows_diagnostics_then_correction", "rust:powershell_skill_location_and_executable_checks_are_timeout_diagnostics", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:persisted_command_repair_envelope_forces_diagnosis_after_restart", "rust:structured_tool_metadata_is_persisted_separately_from_result_text", "rust:command_failure_envelope_survives_file_sqlite_restart", "binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke"],
       "required_evidence": ["L1", "L2", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
@@ -94,7 +93,7 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
+      "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"],
       "automated_by": ["rust:a_user_stop_reaches_every_live_objective_the_session_still_owns", "rust:crash_left_session_stop_fences_claim_and_is_consumed_on_restart", "rust:durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled", "binary:--history-session-smoke"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
@@ -182,7 +181,7 @@
       "category": "workspace_session",
       "priority": "P1",
       "source_kind": "product_contract",
-      "change_patterns": ["src/App.tsx", "src/stores/chat.ts", "src/pages/Workspace/*.tsx"],
+      "change_patterns": ["src/App.tsx", "src/stores/chat.ts", "src/pages/Workspace/*.tsx", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"],
       "automated_by": ["pnpm:test:startup-session:headless", "path:src/acceptance/startup-session.tsx"],
       "required_evidence": ["L1", "L3", "L4"],
       "gates": ["pull_request", "manual_canary"]
@@ -478,16 +477,16 @@
       },
       "execution": {"pull_request": "real process lifecycle smoke", "nightly": "failure/retry matrix", "release_artifact": "exact binary smoke"},
       "automation_status": "partially_implemented",
-      "automated_by": ["rust:browser_lease_reclaim_does_not_spend_budget_and_safe_continuation_settles", "binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke"],
+      "automated_by": ["rust:browser_lease_reclaim_does_not_spend_budget_and_safe_continuation_settles", "binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke", "workflow:Verify Windows release executable browser session lifecycle"],
       "pull_request_gate": {"status": "implemented", "required_targets": ["rust:browser_lease_reclaim_does_not_spend_budget_and_safe_continuation_settles", "binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke"], "remaining_gaps": []},
-      "remaining_gaps": ["nightly 的 failure/retry matrix 尚未实现", "release 的 exact binary smoke 尚未实现"]
+      "remaining_gaps": ["nightly 的 failure/retry matrix 尚未实现"]
     },
     {
       "id": "E2E-006",
       "name": "历史卡住任务存在时仍可完成应用更新",
       "priority": "P0",
       "covers": ["HLT-001", "HLT-004", "UI-005"],
-      "change_patterns": ["src-tauri/src/commands/update*.rs", "src-tauri/src/agent/update*.rs", "src-tauri/migrations/*.sql", ".github/workflows/release.yml"],
+      "change_patterns": ["src-tauri/src/commands/update*.rs", "src-tauri/src/agent/update*.rs", "src-tauri/migrations/*.sql", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"],
       "fixture": {"synthetic": true, "shape": "旧版本安装、持久 waiting_system objective、可控 updater manifest 和新版本安装包"},
       "steps": [
         "旧版本创建可恢复但尚未完成的历史 objective",
@@ -504,9 +503,11 @@
         "side_effects": ["安装和 schema migration 均幂等，不重复创建 session/objective"],
         "delivery": ["manifest、安装包、运行中 build SHA 与目标 tag 完全一致"]
       },
-      "execution": {"nightly": "Windows install-upgrade fixture", "release_artifact": "exact previous-to-current upgrade gate"},
-      "automation_status": "designed",
-      "remaining_gaps": ["尚无任何自动化：nightly 的 Windows install-upgrade fixture 与 release 的 previous-to-current upgrade gate 均未实现", "历史卡住任务存在时的更新放行未自动验证"]
+      "execution": {"pull_request": "file-backed previous/current identity reconciliation", "nightly": "Windows install-upgrade fixture", "release_artifact": "previous public manifest plus exact candidate executable"},
+      "automation_status": "partially_implemented",
+      "automated_by": ["rust:previous_to_current_fixture_reconciles_once_with_historical_stuck_objective", "binary:--update-upgrade-smoke", "workflow:Verify Windows release executable previous-to-current update reconciliation"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:previous_to_current_fixture_reconciles_once_with_historical_stuck_objective"], "remaining_gaps": []},
+      "remaining_gaps": ["nightly 的真实 Windows 旧安装包到新安装包切换尚未实现", "真实桌面 UI 中历史 session 与版本投影仍待自动化"]
     },
     {
       "id": "E2E-007",
