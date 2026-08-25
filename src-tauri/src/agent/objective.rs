@@ -8636,6 +8636,129 @@ mod tests {
             .unwrap()
     }
 
+    async fn seed_legacy_parked_chat_incident(
+        pool: &SqlitePool,
+        id: &str,
+    ) -> ObjectiveSnapshot {
+        let objective = recovery_ceiling_objective(pool, id).await;
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE objectives SET revision=revision+1, status='waiting_system',
+               decision_type='failed_internal', failure_code=?,
+               failure_signature='sha256:legacy-exhausted',
+               recovery_owner=?, remediation_id=NULL, next_observation_at=NULL,
+               lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE id=?",
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind(now)
+        .bind(&objective.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_incidents
+             (id, objective_id, status, failure_code, failure_signature,
+              owner, resume_cursor, opened_at, updated_at)
+             VALUES (?, ?, 'open', ?, 'sha256:legacy-exhausted', ?, ?, ?, ?)",
+        )
+        .bind(format!("incident-{id}"))
+        .bind(&objective.id)
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind(&objective.root_turn_id)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        ObjectiveStore::new(pool.clone())
+            .get(&objective.id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capability_revision_reactivates_a_legacy_incident_without_user_reprompt() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let parked = seed_legacy_parked_chat_incident(&pool, "objective-capability-rearm").await;
+
+        store.sync_recovery_capabilities().await.unwrap();
+        let reactivated = store
+            .reactivate_eligible_incidents("capability-reactivator-a", 8, 30_000)
+            .await
+            .unwrap();
+
+        assert_eq!(reactivated.len(), 1);
+        assert_eq!(reactivated[0].id, parked.id);
+        assert_eq!(reactivated[0].status, ObjectiveStatus::WaitingSystem);
+        assert_ne!(
+            reactivated[0].recovery_owner.as_deref(),
+            Some(OBJECTIVE_INCIDENT_CONTROLLER)
+        );
+        assert!(reactivated[0].remediation_id.is_some());
+        assert!(reactivated[0].next_observation_at.is_some());
+        assert_eq!(reactivated[0].recovery_generation, parked.recovery_generation);
+
+        let incident: (String, String, i64) = sqlx::query_as(
+            "SELECT status, reactivation_status, reactivation_count
+             FROM objective_incidents WHERE objective_id=?",
+        )
+        .bind(&parked.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(incident, ("resolved".into(), "admitted".into(), 1));
+
+        let second = store
+            .reactivate_eligible_incidents("capability-reactivator-b", 8, 30_000)
+            .await
+            .unwrap();
+        assert!(second.is_empty(), "one capability revision may rearm only once");
+    }
+
+    #[tokio::test]
+    async fn unresolved_side_effect_fences_legacy_incident_reactivation() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let parked = seed_legacy_parked_chat_incident(&pool, "objective-unsafe-rearm").await;
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO side_effect_receipts
+             (id, objective_id, revision, action_fingerprint, idempotency_key,
+              status, created_at, observed_at)
+             VALUES ('unsafe-rearm-receipt', ?, 1, 'sha256:action', 'sha256:key',
+                     'unknown', ?, ?)",
+        )
+        .bind(&parked.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        store.sync_recovery_capabilities().await.unwrap();
+        let reactivated = store
+            .reactivate_eligible_incidents("capability-reactivator", 8, 30_000)
+            .await
+            .unwrap();
+        assert!(reactivated.is_empty());
+
+        let current = store.get(&parked.id).await.unwrap().unwrap();
+        assert_parked_system_incident(&current);
+        let incident: (String, String) = sqlx::query_as(
+            "SELECT status, reactivation_status FROM objective_incidents WHERE objective_id=?",
+        )
+        .bind(&parked.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(incident, ("open".into(), "blocked_safety".into()));
+    }
+
     async fn claimable_remediations(pool: &SqlitePool, objective_id: &str) -> i64 {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM objective_remediations
