@@ -396,8 +396,8 @@
       },
       "execution": {"pull_request": "SQLite plus native UI integration", "nightly": "old-schema matrix", "release_artifact": "installed historical-session canary"},
       "automation_status": "partially_implemented",
-      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
-      "pull_request_gate": {"status": "partially_implemented", "required_targets": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke"], "remaining_gaps": ["真实 WebView 中选择历史 session、发送继续并观察即时 stream projection 尚未自动化"]},
+      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "pnpm:test:startup-session:headless", "workflow:Verify Windows release executable historical session restart"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "pnpm:test:startup-session:headless"], "remaining_gaps": []},
       "remaining_gaps": ["L3 真实桌面 WebView 中选择历史 session、发送继续并观察即时 stream projection", "旧 schema fixture 迁移矩阵仍需扩展"]
     },
     {

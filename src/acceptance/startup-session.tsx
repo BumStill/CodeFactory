@@ -9,9 +9,14 @@ import { useChatStore } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
 import type { MessagePage, Session, Settings } from "../lib/tauri";
 
-type Scenario = "with-history" | "empty";
+type Scenario = "with-history" | "history-continue" | "empty";
 
-const scenario: Scenario = new URLSearchParams(location.search).get("scenario") === "empty" ? "empty" : "with-history";
+const requestedScenario = new URLSearchParams(location.search).get("scenario");
+const scenario: Scenario = requestedScenario === "empty"
+  ? "empty"
+  : requestedScenario === "history-continue"
+    ? "history-continue"
+    : "with-history";
 
 const latestSession: Session = {
   id: "latest-session",
@@ -67,20 +72,28 @@ const emptyPage: MessagePage = {
 };
 
 function installTauriMock() {
-  const sessions = scenario === "with-history" ? [latestSession, olderSession] : [];
+  const sessions = scenario === "empty" ? [] : [latestSession, olderSession];
+  (window as typeof window & { __HISTORY_CONTINUE_ADMISSIONS__?: unknown[] })
+    .__HISTORY_CONTINUE_ADMISSIONS__ = [];
   (window as typeof window & { __TAURI_EVENT_PLUGIN_INTERNALS__?: unknown }).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
     unregisterListener: () => {},
   };
   (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
-    invoke: async (_cmd: string, args?: { message?: { cmd?: string; payload?: Record<string, unknown> } }) => {
+    invoke: async (
+      _cmd: string,
+      args?: Record<string, unknown> & {
+        message?: { cmd?: string; payload?: Record<string, unknown> };
+      },
+    ) => {
       const cmd = args?.message?.cmd ?? _cmd;
-      const payload = args?.message?.payload ?? {};
+      const payload = args?.message?.payload ?? args ?? {};
+      const sessionId = payload.sessionId ?? payload.session_id;
       switch (cmd) {
         case "plugin:event|listen": return 1;
         case "plugin:event|unlisten": return null;
         case "get_settings": return settings;
         case "list_sessions": return sessions;
-        case "get_session": return sessions.find((session) => session.id === payload.sessionId) ?? latestSession;
+        case "get_session": return sessions.find((session) => session.id === sessionId) ?? latestSession;
         case "get_message_page": return emptyPage;
         case "is_chat_running": return false;
         case "list_models": return [{ id: "test-model", name: "Test Model" }];
@@ -89,6 +102,19 @@ function installTauriMock() {
         case "get_git_status": return null;
         case "list_tasks": return [];
         case "subscribe_tasks": return null;
+        case "send_message": {
+          const admission = {
+            sessionId,
+            content: payload.content,
+            rootTurnId: payload.rootTurnId,
+            objectiveId: sessionId === olderSession.id
+              ? "objective-history-open"
+              : null,
+          };
+          (window as typeof window & { __HISTORY_CONTINUE_ADMISSIONS__?: unknown[] })
+            .__HISTORY_CONTINUE_ADMISSIONS__?.push(admission);
+          return null;
+        }
         default: return null;
       }
     },
@@ -118,10 +144,17 @@ function Probe() {
   const open = useChatStore((state) => state.draftSession?.id ?? state.activeSession?.id ?? "none");
   const activeTitle = useChatStore((state) => state.activeSession?.title ?? "");
   const draft = useChatStore((state) => state.draftSession != null);
+  const streaming = useChatStore((state) => open !== "none" && state.runtime[open]?.streaming === true);
   return (
     <>
       <App />
-      <div aria-label="Startup session probe" data-open-session={open} data-active-title={activeTitle} data-draft={String(draft)} />
+      <div
+        aria-label="Startup session probe"
+        data-open-session={open}
+        data-active-title={activeTitle}
+        data-draft={String(draft)}
+        data-streaming={String(streaming)}
+      />
     </>
   );
 }
