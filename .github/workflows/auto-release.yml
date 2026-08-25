@@ -478,7 +478,7 @@ jobs:
             fi
 
             SUCCESSES=0
-            for CHECK in governance-baseline agent-bridge-linux check-frontend check-rust remote-real-app-gui scenario-gate-policy scenario-gate-pr; do
+            for CHECK in governance-baseline agent-bridge-linux check-frontend check-rust remote-real-app-gui scenario-gate-pr; do
               CONCLUSIONS=$(jq -r --arg check "$CHECK" \
                 '.statusCheckRollup[]? | select(.name == $check) | .conclusion' <<< "$DATA")
               if grep -Eq '^(FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED)$' \
@@ -500,14 +500,14 @@ jobs:
               echo "::error::Version PR #$PR is behind main; refusing to expand an already planned release batch. Rerun Auto Release to replan from latest main."
               exit 1
             fi
-            if [ "$SUCCESSES" -eq 7 ]; then
+            if [ "$SUCCESSES" -eq 6 ]; then
               gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash \
                 --auto --match-head-commit "$EXPECTED_HEAD"
               echo "All required checks passed; submitted guarded merge for version PR #$PR"
               sleep 5
               continue
             fi
-            echo "Version PR #$PR waiting ($attempt/180, state=$MERGE_STATE, required=$SUCCESSES/7)"
+            echo "Version PR #$PR waiting ($attempt/180, state=$MERGE_STATE, required=$SUCCESSES/6)"
             sleep 20
           done
           echo "::error::Version PR #$PR did not merge within 60 minutes"

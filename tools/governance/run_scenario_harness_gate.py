@@ -22,7 +22,6 @@ from tools.governance.validate_scenario_test_governance import (
     load_registry,
     scenario_impact_files,
     validate_change_contract,
-    validate_gate_readiness,
     validate_impacted_execution,
     validate_registry,
 )
@@ -33,7 +32,6 @@ TRUST_ROOT_FILES = (
     ".github/workflows/governance-baseline.yml",
     ".github/workflows/lock-independent-desktop-acceptance.yml",
     ".github/workflows/release.yml",
-    ".github/workflows/scenario-gate-policy.yml",
     ".github/workflows/scenario-gate.yml",
     "tools/governance/run_scenario_harness_gate.py",
     "tools/governance/validate_scenario_test_governance.py",
@@ -98,35 +96,33 @@ def validate_gate_surfaces(repo_root: Path, registry: dict) -> list[str]:
     pr_gate = _read(repo_root / ".github/workflows/scenario-gate.yml")
     for marker in (
         "name: scenario-gate-pr",
+        "pull_request_target:",
         "types: [opened, synchronize, reopened, edited]",
         "--stage pull_request",
         "--policy-repo",
+        "path: policy",
+        "path: candidate",
+        "persist-credentials: false",
     ):
         if marker not in pr_gate:
             errors.append(f"scenario-gate.yml is missing required marker: {marker}")
     if "continue-on-error" in pr_gate:
         errors.append("scenario-gate.yml must not use continue-on-error")
 
-    trusted = _read(repo_root / ".github/workflows/scenario-gate-policy.yml")
-    for marker in (
-        "pull_request_target:",
-        "name: scenario-gate-policy",
-        "contents: read",
-        "persist-credentials: false",
-        "--policy-repo",
-    ):
-        if marker not in trusted:
-            errors.append(f"scenario-gate-policy.yml is missing required marker: {marker}")
-    if "continue-on-error" in trusted:
-        errors.append("scenario-gate-policy.yml must not use continue-on-error")
-
     governance = _read(repo_root / ".github/workflows/governance-baseline.yml")
     if "types: [opened, synchronize, reopened, edited]" not in governance:
         errors.append("governance-baseline must rerun on pull_request.edited")
 
     release = _read(repo_root / ".github/workflows/release.yml")
-    if "scenario-gate-release" not in release or "--stage release_artifact" not in release:
-        errors.append("release workflow is missing scenario-gate-release before publication")
+    if (
+        "scenario-gate-release" not in release
+        or "--stage release_artifact" not in release
+        or "--base-ref" not in release
+        or "Resolve previous released tag for scenario impact" not in release
+    ):
+        errors.append(
+            "release workflow is missing the batch-scoped scenario gate before publication"
+        )
     if (
         "Verify installed macOS release can attach to existing Chrome" not in release
         or "--browser-chrome-attach-smoke" not in release
@@ -180,31 +176,6 @@ def _resolve_local_base(repo_root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def is_initial_trust_bootstrap(repo_root: Path, base_ref: str) -> bool:
-    """Allow the one PR that installs a gate absent from its trusted base.
-
-    Once the policy workflow exists on the base branch this can never return
-    true again. The base-owned pull_request_target gate then byte-compares the
-    complete trust root before considering candidate results.
-    """
-
-    if not base_ref or not all((repo_root / relative).is_file() for relative in TRUST_ROOT_FILES):
-        return False
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "cat-file",
-            "-e",
-            f"{base_ref}:.github/workflows/scenario-gate-policy.yml",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode != 0
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("local", "pull_request", "release_artifact"), required=True)
@@ -233,19 +204,33 @@ def main() -> int:
         errors.extend(validate_gate_surfaces(repo_root, registry))
     errors.extend(validate_trust_root_immutability(repo_root, policy_root))
 
-    if args.stage == "release_artifact":
-        if registry:
-            errors.extend(validate_gate_readiness(registry, "release_artifact"))
-    else:
-        base_ref = args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip()
-        if args.stage == "local" and not base_ref:
-            base_ref = _resolve_local_base(repo_root)
-        files, diff_error = _changed_files(repo_root, base_ref)
-        if diff_error:
-            errors.append(f"scenario gate failed closed: {diff_error}")
-        elif registry:
-            impact_files = scenario_impact_files(repo_root, base_ref, files)
-            product_files = [path for path in impact_files if _is_product_file(path)]
+    base_ref = args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip()
+    if args.stage == "local" and not base_ref:
+        base_ref = _resolve_local_base(repo_root)
+    files, diff_error = _changed_files(repo_root, base_ref)
+    if diff_error:
+        errors.append(f"scenario gate failed closed: {diff_error}")
+    elif registry:
+        impact_files = scenario_impact_files(repo_root, base_ref, files)
+        product_files = [path for path in impact_files if _is_product_file(path)]
+        if args.stage == "release_artifact":
+            if product_files:
+                # A release validates the product surface changed since the
+                # previous released tag. Historical catalog debt stays visible
+                # but cannot freeze an unrelated batch. Global PR surfaces are
+                # not expanded to every scenario here: each release-facing file
+                # must have an explicit registry mapping instead.
+                errors.extend(
+                    validate_impacted_execution(
+                        registry,
+                        impact_files,
+                        "release_artifact",
+                        repo_root,
+                        expand_global_files=False,
+                        fail_on_unmapped=True,
+                    )
+                )
+        else:
             if args.stage == "pull_request":
                 if args.body_file:
                     body = Path(args.body_file).read_text(encoding="utf-8")
@@ -259,17 +244,11 @@ def main() -> int:
                 errors.extend(
                     validate_change_contract(title, body, impact_files, registry)
                 )
-            initial_bootstrap = (
-                repo_root == policy_root
-                and is_initial_trust_bootstrap(repo_root, base_ref)
-            )
-            if product_files and not initial_bootstrap:
+            if product_files:
                 # Per-change enforcement: what this change touches must be
-                # covered by automation that really runs. The catalog-wide
-                # readiness sweep stays on release_artifact, where unpaid L4
-                # debt genuinely must block the artifact — running it here
-                # would instead demand every catalog gap be closed before any
-                # product change could land at all.
+                # covered by automation that really runs. Unrelated catalog
+                # debt is audited separately and never turns this PR into an
+                # accidental cleanup project.
                 errors.extend(
                     validate_impacted_execution(
                         registry, impact_files, "pull_request", repo_root

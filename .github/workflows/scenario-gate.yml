@@ -1,7 +1,7 @@
 name: scenario-gate
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, edited]
 permissions:
@@ -13,21 +13,32 @@ jobs:
     name: scenario-gate-pr
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout trusted base policy
+        uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Checkout untrusted candidate without credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Compile and enforce the repository scenario harness
+      - name: Validate candidate with trusted base runner
         env:
-          SCENARIO_TEST_EVENT_PATH: ${{ github.event_path }}
-          SCENARIO_TEST_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: >-
-          python tools/governance/run_scenario_harness_gate.py
-          --stage pull_request
-          --repo .
-          --policy-repo .
-          --base-ref "$SCENARIO_TEST_BASE_SHA"
-          --event-path "$SCENARIO_TEST_EVENT_PATH"
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          cd policy
+          python tools/governance/run_scenario_harness_gate.py \
+            --stage pull_request \
+            --repo ../candidate \
+            --policy-repo . \
+            --base-ref "$BASE_SHA" \
+            --event-path "$EVENT_PATH"

@@ -737,6 +737,125 @@ pub(crate) async fn observe_latest_update_install(
     update_receipt_view(&row, state).map(Some)
 }
 
+/// Synthetic previous-install state consumed by the exact release executable.
+///
+/// The fixture is deliberately file-backed and reopened before observation so
+/// an in-memory happy path cannot stand in for the updater restart boundary.
+/// The previous version/build comes from the prior public release manifest in
+/// the release workflow; the current identity comes from the candidate binary.
+pub(crate) async fn run_update_upgrade_smoke_fixture(
+    state_path: &std::path::Path,
+    previous_version: &str,
+    previous_build: &str,
+    current_version: &str,
+    current_build: &str,
+) -> Result<serde_json::Value, AppError> {
+    validate_update_identity(previous_version, previous_build)?;
+    validate_update_identity(current_version, current_build)?;
+    if previous_version == current_version || previous_build == current_build {
+        return Err(AppError::Other(
+            "update upgrade smoke requires distinct previous and current identities".into(),
+        ));
+    }
+
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(state_path)
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options.clone())
+        .await?;
+    crate::agent::objective::ensure_schema(&pool).await?;
+    let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+    let fixture_key = uuid::Uuid::new_v4().to_string();
+    let historical_id = format!("upgrade-history-{fixture_key}");
+    store
+        .create(crate::agent::objective::CreateObjective {
+            id: historical_id.clone(),
+            kind: crate::agent::objective::ObjectiveKind::LocalMutation,
+            session_id: Some(format!("upgrade-session-{fixture_key}")),
+            root_turn_id: None,
+            domain: crate::agent::objective::RecoveryDomain::Chat,
+            requested_acceptance: "historical_work_remains_durable".into(),
+            created_surface: "update_upgrade_smoke".into(),
+        })
+        .await
+        .map_err(|error| AppError::Other(format!("create upgrade fixture objective: {error}")))?;
+    let update_objective_id =
+        ensure_update_objective(&pool, current_version, current_build).await?;
+    ensure_update_receipt_schema(&pool).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let receipt_id = format!("upgrade-receipt-{fixture_key}");
+    sqlx::query(
+        "INSERT INTO update_install_receipts
+         (id, objective_id, target_version, target_build,
+          pre_install_version, pre_install_build, recovery_replay_count,
+          status, created_at, observed_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, 'install_started', ?, ?)",
+    )
+    .bind(&receipt_id)
+    .bind(&update_objective_id)
+    .bind(current_version)
+    .bind(current_build)
+    .bind(previous_version)
+    .bind(previous_build)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+    pool.close().await;
+
+    let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await?;
+    crate::agent::objective::ensure_schema(&reopened).await?;
+    let first = observe_latest_update_install(&reopened, current_version, current_build, now + 1)
+        .await?
+        .ok_or_else(|| AppError::Other("upgrade receipt disappeared after restart".into()))?;
+    let second = observe_latest_update_install(&reopened, current_version, current_build, now + 2)
+        .await?
+        .ok_or_else(|| AppError::Other("upgrade receipt disappeared on second restart".into()))?;
+    let update_receipt_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM update_install_receipts WHERE id=?")
+            .bind(&receipt_id)
+            .fetch_one(&reopened)
+            .await?;
+    let historical_objective_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives WHERE id=? AND status NOT IN ('completed','failed','cancelled')",
+    )
+    .bind(&historical_id)
+    .fetch_one(&reopened)
+    .await?;
+    let persisted_objective: Option<String> =
+        sqlx::query_scalar("SELECT objective_id FROM update_install_receipts WHERE id=?")
+            .bind(&receipt_id)
+            .fetch_optional(&reopened)
+            .await?
+            .flatten();
+    reopened.close().await;
+
+    Ok(serde_json::json!({
+        "scenario_id": "E2E-006",
+        "status": if first.state == UpdateInstallState::Applied
+            && second.state == UpdateInstallState::Applied
+            && update_receipt_count == 1
+            && historical_objective_count == 1
+            && persisted_objective.as_deref() == Some(update_objective_id.as_str())
+        { "pass" } else { "fail" },
+        "previous_version": previous_version,
+        "previous_build": previous_build,
+        "current_version": current_version,
+        "current_build": current_build,
+        "first_observation": first.state,
+        "second_observation": second.state,
+        "update_receipt_count": update_receipt_count,
+        "historical_objective_count": historical_objective_count,
+        "same_update_objective": persisted_objective.as_deref() == Some(update_objective_id.as_str()),
+        "database_reopened": true,
+    }))
+}
+
 pub(crate) async fn mark_update_install_unknown(
     pool: &sqlx::SqlitePool,
     receipt_id: &str,
@@ -1233,8 +1352,8 @@ mod tests {
     use super::{
         admit_update_install, count_active_delivery_leases, count_nonterminal_objectives,
         ensure_update_objective, load_objective_blockers, observe_latest_update_install,
-        update_target_resource_id, UpdateClaimPermit, UpdateInstallAdmission, UpdateInstallState,
-        UpdateSafetyStatus,
+        run_update_upgrade_smoke_fixture, update_target_resource_id, UpdateClaimPermit,
+        UpdateInstallAdmission, UpdateInstallState, UpdateSafetyStatus,
     };
     use crate::agent::objective::{ObjectiveStatus, ObjectiveStore, TECHNICAL_RECOVERY_EXHAUSTED};
 
@@ -1242,6 +1361,28 @@ mod tests {
     const CURRENT_BUILD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TARGET_VERSION: &str = "1.80.0";
     const TARGET_BUILD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn previous_to_current_fixture_reconciles_once_with_historical_stuck_objective() {
+        let fixture = tempfile::tempdir().unwrap();
+        let evidence = run_update_upgrade_smoke_fixture(
+            &fixture.path().join("upgrade.db"),
+            CURRENT_VERSION,
+            CURRENT_BUILD,
+            TARGET_VERSION,
+            TARGET_BUILD,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(evidence["scenario_id"], "E2E-006");
+        assert_eq!(evidence["status"], "pass");
+        assert_eq!(evidence["update_receipt_count"], 1);
+        assert_eq!(evidence["historical_objective_count"], 1);
+        assert_eq!(evidence["first_observation"], "applied");
+        assert_eq!(evidence["second_observation"], "applied");
+        assert_eq!(evidence["same_update_objective"], true);
+    }
 
     async fn claimed_update_permit(
         pool: &sqlx::SqlitePool,

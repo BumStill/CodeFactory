@@ -17,6 +17,7 @@ from tools.governance.run_scenario_harness_gate import (
 )
 from tools.governance.validate_scenario_test_governance import (
     _changed_files,
+    _impacted_scenarios,
     _is_version_manifest_only_patch,
     load_registry,
     validate_change_contract,
@@ -505,6 +506,118 @@ class ImpactedExecutionTests(unittest.TestCase):
         )
         for case_id in ("E2E-002", "E2E-003"):
             self.assertNotIn(case_id, reported)
+
+    def test_release_batch_does_not_expand_a_release_workflow_change_to_the_catalog(self) -> None:
+        impacted = _impacted_scenarios(
+            [".github/workflows/release.yml"],
+            self.registry,
+        )
+        explicitly_mapped = {
+            scenario["id"]
+            for scenario in self.registry["scenarios"]
+            if ".github/workflows/release.yml" in scenario.get("change_patterns", [])
+        }
+        self.assertEqual(impacted, explicitly_mapped)
+        self.assertNotEqual(
+            impacted,
+            {scenario["id"] for scenario in self.registry["scenarios"]},
+        )
+
+    def test_auto_release_workflow_has_an_explicit_scenario_mapping(self) -> None:
+        impacted = _impacted_scenarios(
+            [".github/workflows/auto-release.yml"],
+            self.registry,
+        )
+        self.assertEqual(impacted, {"HLT-001", "HLT-004", "UI-005"})
+
+    def test_unrelated_release_e2e_debt_does_not_block_the_affected_release_slice(self) -> None:
+        registry = {
+            "scenarios": [
+                {
+                    "id": "X-001",
+                    "change_patterns": ["src/a.ts"],
+                    "gates": ["release_artifact"],
+                    "automated_by": ["binary:--history-session-smoke"],
+                },
+                {
+                    "id": "Y-001",
+                    "change_patterns": ["src/b.ts"],
+                    "gates": ["release_artifact"],
+                    "automated_by": [],
+                },
+            ],
+            "complex_e2e_cases": [
+                {
+                    "id": "E2E-A",
+                    "covers": ["X-001"],
+                    "change_patterns": ["src/a.ts"],
+                    "execution": {"release_artifact": "exact release executable"},
+                    "automated_by": ["binary:--history-session-smoke"],
+                },
+                {
+                    "id": "E2E-B",
+                    "covers": ["Y-001"],
+                    "change_patterns": ["src/b.ts"],
+                    "execution": {"release_artifact": "missing exact artifact test"},
+                    "automated_by": [],
+                },
+            ],
+            "gate_policy": self.registry["gate_policy"],
+        }
+        errors = validate_impacted_execution(
+            registry,
+            ["src/a.ts"],
+            "release_artifact",
+            REPO_ROOT,
+            expand_global_files=False,
+        )
+        self.assertEqual(errors, [])
+
+    def test_affected_release_case_without_a_bound_exact_artifact_target_fails(self) -> None:
+        registry = {
+            "scenarios": [
+                {
+                    "id": "X-001",
+                    "change_patterns": ["src/a.ts"],
+                    "gates": ["release_artifact"],
+                    "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool"],
+                }
+            ],
+            "complex_e2e_cases": [
+                {
+                    "id": "E2E-X",
+                    "covers": ["X-001"],
+                    "change_patterns": ["src/a.ts"],
+                    "execution": {"release_artifact": "exact release executable"},
+                    "automated_by": [
+                        "rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool"
+                    ],
+                }
+            ],
+            "gate_policy": self.registry["gate_policy"],
+        }
+        errors = validate_impacted_execution(
+            registry,
+            ["src/a.ts"],
+            "release_artifact",
+            REPO_ROOT,
+            expand_global_files=False,
+        )
+        self.assertTrue(
+            any("E2E-X" in error and "release_artifact" in error for error in errors),
+            errors,
+        )
+
+    def test_unmapped_release_product_file_fails_closed(self) -> None:
+        errors = validate_impacted_execution(
+            self.registry,
+            ["src-tauri/src/unmapped_release_surface.rs"],
+            "release_artifact",
+            REPO_ROOT,
+            expand_global_files=False,
+            fail_on_unmapped=True,
+        )
+        self.assertTrue(any("coverage gap" in error for error in errors), errors)
 
     def test_a_case_covering_an_impacted_scenario_without_running_automation_fails(self) -> None:
         registry = {
