@@ -5,15 +5,21 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from tools.governance import validate_scenario_test_governance as scenario_governance
+from tools.governance import scenario_execution
 
 from tools.governance.run_scenario_harness_gate import (
     TRUST_ROOT_FILES,
     validate_trust_root_immutability,
+)
+from tools.governance.scenario_execution import (
+    build_execution_plan,
+    validate_aggregate_receipt,
 )
 from tools.governance.validate_scenario_test_governance import (
     _automation_gate_stages,
@@ -833,3 +839,158 @@ class TrustRootScopeTests(unittest.TestCase):
             self.assertTrue(
                 any("run_scenario_harness_gate.py" in error for error in errors), errors
             )
+
+
+class AffectedScenarioExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.registry = load_registry(REGISTRY_PATH)
+
+    def test_only_impacted_scenarios_and_e2e_targets_enter_the_plan(self) -> None:
+        plan = build_execution_plan(
+            self.registry,
+            ["src-tauri/src/tools/browser_session.rs"],
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+        )
+
+        self.assertIn("RTE-003", plan["scenario_ids"])
+        self.assertIn("E2E-008", plan["e2e_ids"])
+        self.assertIn(
+            "binary:--browser-chrome-attach-smoke", plan["required_targets"]
+        )
+        self.assertIn("macos-14", plan["runners"])
+        self.assertIn("windows-latest", plan["runners"])
+        self.assertNotIn("E2E-011", plan["e2e_ids"])
+
+    def test_unrelated_change_has_no_execution_runner(self) -> None:
+        plan = build_execution_plan(
+            self.registry,
+            ["docs/notes.md"],
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+        )
+
+        self.assertEqual(plan["scenario_ids"], [])
+        self.assertEqual(plan["e2e_ids"], [])
+        self.assertEqual(plan["required_targets"], [])
+        self.assertEqual(plan["runners"], {})
+
+    def test_receipt_must_match_both_shas_and_every_required_target(self) -> None:
+        plan = {
+            "schema_version": 1,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "required_targets": ["rust:first", "binary:--real-smoke"],
+        }
+        valid = {
+            "schema_version": 1,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "targets": [
+                {"target": "rust:first", "outcome": "passed"},
+                {"target": "binary:--real-smoke", "outcome": "passed"},
+            ],
+        }
+        self.assertEqual(validate_aggregate_receipt(plan, valid), [])
+
+        missing = json.loads(json.dumps(valid))
+        missing["targets"].pop()
+        self.assertTrue(
+            any("missing successful execution receipt" in error for error in validate_aggregate_receipt(plan, missing))
+        )
+
+        wrong_head = json.loads(json.dumps(valid))
+        wrong_head["head_sha"] = "c" * 40
+        self.assertTrue(
+            any("head SHA" in error for error in validate_aggregate_receipt(plan, wrong_head))
+        )
+
+    def test_execution_and_receipt_surfaces_are_part_of_the_trust_root(self) -> None:
+        self.assertIn(".github/workflows/scenario-execution.yml", TRUST_ROOT_FILES)
+        self.assertIn("tools/governance/scenario_execution.py", TRUST_ROOT_FILES)
+
+    def test_one_trusted_context_aggregates_an_unprivileged_execution_workflow(self) -> None:
+        execution = (REPO_ROOT / ".github/workflows/scenario-execution.yml").read_text(
+            encoding="utf-8"
+        )
+        gate = (REPO_ROOT / ".github/workflows/scenario-gate.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("  pull_request:\n", execution)
+        self.assertNotIn("pull_request_target:", execution)
+        self.assertIn("permissions:\n  contents: read", execution)
+        self.assertIn("needs.plan.outputs.run_windows == 'true'", execution)
+        self.assertIn("needs.plan.outputs.run_macos == 'true'", execution)
+        self.assertIn("actions: read", gate)
+        self.assertIn("scenario_execution.py await-github", gate)
+        self.assertNotIn("scenario-gate-policy", execution + gate)
+
+    @patch("tools.governance.scenario_execution._github_bytes")
+    @patch("tools.governance.scenario_execution._github_json")
+    def test_trusted_gate_accepts_only_the_exact_head_workflow_artifact(
+        self, github_json, github_bytes
+    ) -> None:
+        plan = {
+            "schema_version": 1,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "required_targets": ["rust:first"],
+            "blockers": [],
+        }
+        github_json.side_effect = [
+            {
+                "workflow_runs": [
+                    {
+                        "id": 1,
+                        "event": "pull_request",
+                        "head_sha": "c" * 40,
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "id": 2,
+                        "run_attempt": 1,
+                        "event": "pull_request",
+                        "head_sha": "b" * 40,
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ]
+            },
+            {
+                "artifacts": [
+                    {
+                        "name": "affected-scenario-receipt-" + "b" * 40,
+                        "expired": False,
+                        "archive_download_url": "https://api.github.test/artifact",
+                    }
+                ]
+            },
+        ]
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr(
+                "scenario-execution-receipt.json",
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "base_sha": "a" * 40,
+                        "head_sha": "b" * 40,
+                        "targets": [{"target": "rust:first", "outcome": "passed"}],
+                    }
+                ),
+            )
+        github_bytes.return_value = archive.getvalue()
+
+        self.assertEqual(
+            scenario_execution.await_github_receipt(
+                plan,
+                repository="owner/repo",
+                workflow="scenario-execution.yml",
+                token="test-token",
+                timeout_seconds=1,
+            ),
+            [],
+        )
+        self.assertIn("/actions/runs/2/artifacts", github_json.call_args_list[1].args[0])

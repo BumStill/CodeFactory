@@ -5,6 +5,7 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, edited]
 permissions:
+  actions: read
   contents: read
   pull-requests: read
 
@@ -42,3 +43,17 @@ jobs:
             --policy-repo . \
             --base-ref "$BASE_SHA" \
             --event-path "$EVENT_PATH"
+      - name: Verify exact-head affected-scenario execution receipt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python policy/tools/governance/scenario_execution.py await-github \
+            --registry policy/docs/testing/scenario-registry.json \
+            --repo candidate \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --repository "$REPOSITORY" \
+            --workflow scenario-execution.yml
