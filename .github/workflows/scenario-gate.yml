@@ -1,4 +1,5 @@
 name: scenario-gate
+# Live canary: an ordinary candidate must not be allowed to alter this file.
 
 on:
   pull_request:
