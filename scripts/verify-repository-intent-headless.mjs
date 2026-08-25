@@ -69,7 +69,7 @@ async function stopServer(child) {
 }
 
 async function assertWorkspace(page, tag) {
-  await page.goto(baseUrl, { waitUntil: "networkidle" });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   const conversation = page.getByRole("main", { name: "会话窗口" });
   await conversation.waitFor({ timeout: 10_000 });
   const header = page.getByRole("banner", { name: "会话工具栏" });
@@ -78,21 +78,16 @@ async function assertWorkspace(page, tag) {
   await sidebar.waitFor();
   assert((await header.getByRole("button", { name: "新建空白会话" }).count()) === 0, `[${tag}] duplicate header new-session action remains`);
   assert((await page.getByRole("button", { name: "新建会话", exact: true }).count()) === 1, `[${tag}] workspace must expose exactly one new-session menu`);
-  assert((await header.getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] collapse control missing`);
+  assert((await sidebar.getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] collapse control missing`);
   assert((await conversation.getByText("会话执行详情", { exact: true }).count()) === 0, `[${tag}] fixed execution detail remains in conversation`);
   assert((await conversation.getByText("在会话内执行仓库需求", { exact: true }).count()) === 0, `[${tag}] delegated task leaked into conversation`);
   assert((await page.getByText("执行流", { exact: true }).count()) === 0, `[${tag}] execution stream should stay hidden in project sessions`);
-  const localGit = header.getByRole("button", { name: "本地工作树" });
+  const localGit = header.getByRole("button", { name: /本地 Git；分支 codex\/repo-owned-specs；已同步；无本地变更/ });
   await localGit.waitFor();
-  assert(await localGit.getByText("codex/repo-owned-specs", { exact: true }).isVisible(), `[${tag}] current local branch missing`);
-  assert(await localGit.getByText("已同步", { exact: true }).isVisible(), `[${tag}] upstream sync state missing`);
-  const delivery = header.getByRole("button", { name: "会话交付状态" });
+  const delivery = header.getByRole("button", { name: /会话交付状态；PR #175；CI 通过.*已合并.*v1\.63\.0.*未验证上线/ });
   await delivery.waitFor();
-  for (const text of ["PR #175", "CI 通过", "已合并", "v1.63.0 已创建"]) {
-    assert(await delivery.getByText(text, { exact: true }).isVisible(), `[${tag}] delivery summary missing: ${text}`);
-  }
   await delivery.click();
-  const deliveryDrawer = page.getByRole("dialog", { name: "交付详情" });
+  const deliveryDrawer = page.locator('[data-testid="workspace-auxiliary-pane"][data-pane-kind="delivery"]');
   await deliveryDrawer.waitFor();
   assert(await deliveryDrawer.getByText("feat/workspace-ui → main", { exact: true }).isVisible(), `[${tag}] PR branch relation missing`);
   assert(await deliveryDrawer.getByText("3373a69", { exact: true }).isVisible(), `[${tag}] PR head SHA missing from CI step`);
@@ -100,26 +95,23 @@ async function assertWorkspace(page, tag) {
   assert(await deliveryDrawer.getByText(/真实上线还需要 deliver_changes 的部署观察或 live verifier 通过/).isVisible(), `[${tag}] live verifier explanation missing`);
   await deliveryDrawer.getByRole("button", { name: "关闭交付详情" }).click();
   await deliveryDrawer.waitFor({ state: "detached" });
-  assert((await header.getByRole("button", { name: /检查点|恢复/ }).count()) === 0, `[${tag}] checkpoint counter must not remain in header`);
+  assert((await header.getByRole("button", { name: /检查点/ }).count()) === 0, `[${tag}] checkpoint counter must not remain in header`);
   const taskActivity = header.getByRole("button", { name: "打开任务活动" });
   await taskActivity.waitFor();
   const activityHeight = await taskActivity.evaluate((element) => element.getBoundingClientRect().height);
-  assert(activityHeight <= 30, `[${tag}] task activity control too tall: ${activityHeight}`);
+  assert(activityHeight <= 44, `[${tag}] task activity control exceeds the compact/touch target: ${activityHeight}`);
   await taskActivity.click();
-  const taskDrawer = page.getByRole("dialog", { name: "任务活动" });
+  const taskDrawer = page.locator('[data-testid="workspace-auxiliary-pane"][data-pane-kind="tasks"]');
   await taskDrawer.waitFor();
   assert(await taskDrawer.getByText("在会话内执行仓库需求", { exact: true }).isVisible(), `[${tag}] delegated task missing from drawer`);
   assert(await taskDrawer.getByText("模型配置 6", { exact: true }).isVisible(), `[${tag}] provider blocker count is not actionable`);
-  assert(await taskDrawer.getByText("先处理失败项，再继续剩余 2 项。", { exact: true }).isVisible(), `[${tag}] mixed failed/pending state has no clear explanation`);
+  assert(await taskDrawer.getByText("系统正在处理失败项，并会自动续接剩余 2 项。", { exact: true }).isVisible(), `[${tag}] mixed failed/pending state has no system-owned recovery explanation`);
   assert((await taskDrawer.getByRole("button", { name: /继续执行/ }).count()) === 0, `[${tag}] generic continue action bypasses a failure blocker`);
   const settingsAction = taskDrawer.getByRole("button", { name: "打开模型设置" });
-  const retryAction = taskDrawer.getByRole("button", { name: "已修复，重试 6 项" });
   await settingsAction.waitFor();
-  await retryAction.waitFor();
-  for (const action of [settingsAction, retryAction]) {
-    const box = await action.boundingBox();
-    assert(box && box.x >= 0 && box.x + box.width <= page.viewportSize().width, `[${tag}] blocker action overflows drawer: ${JSON.stringify(box)}`);
-  }
+  assert((await taskDrawer.getByRole("button", { name: /已修复.*重试|继续执行/ }).count()) === 0, `[${tag}] technical recovery requires a manual continuation`);
+  const settingsBox = await settingsAction.boundingBox();
+  assert(settingsBox && settingsBox.x >= 0 && settingsBox.x + settingsBox.width <= page.viewportSize().width, `[${tag}] blocker action overflows drawer: ${JSON.stringify(settingsBox)}`);
   await settingsAction.click();
   assert(await page.evaluate(() => window.__settingsTab) === "endpoints", `[${tag}] provider action did not target endpoint/API-key settings`);
   await page.getByText("API 端点", { exact: true }).waitFor();
@@ -127,27 +119,18 @@ async function assertWorkspace(page, tag) {
   await page.locator("header button").first().click();
   await taskActivity.waitFor();
   await taskActivity.click();
-  const reopenedTaskDrawer = page.getByRole("dialog", { name: "任务活动" });
+  const reopenedTaskDrawer = page.locator('[data-testid="workspace-auxiliary-pane"][data-pane-kind="tasks"]');
   await reopenedTaskDrawer.waitFor();
-  await reopenedTaskDrawer.getByRole("button", { name: "已修复，重试 6 项" }).click();
-  await page.waitForFunction(() => window.__implementationStarted === true);
-  const retryArgs = await page.evaluate(() => window.__lastRetry);
-  assert(retryArgs?.sessionId === "repository-intent-session", `[${tag}] retry used the wrong session`);
-  assert(Array.isArray(retryArgs?.taskIds) && retryArgs.taskIds.length === 6, `[${tag}] retry did not select all six provider blockers`);
+  assert((await reopenedTaskDrawer.getByRole("button", { name: /已修复.*重试|继续执行/ }).count()) === 0, `[${tag}] reopened task activity exposes manual technical recovery`);
   await reopenedTaskDrawer.getByRole("button", { name: "关闭任务活动" }).click();
   await reopenedTaskDrawer.waitFor({ state: "detached" });
 
   const sessionRows = sidebar.locator("[data-session-row]");
   assert((await sessionRows.count()) >= 10, `[${tag}] sidebar does not expose at least 10 sessions in the fixture`);
   const rowHeights = await sessionRows.evaluateAll((rows) => rows.map((row) => row.getBoundingClientRect().height));
-  assert(rowHeights.every((height) => height <= 46), `[${tag}] sidebar row exceeds 46px: ${JSON.stringify(rowHeights)}`);
+  assert(rowHeights.every((height) => height <= 50), `[${tag}] sidebar row exceeds the 50px density contract: ${JSON.stringify(rowHeights)}`);
 
-  const completedGroup = conversation.getByRole("button", { name: "查看 3 个已完成操作" });
-  await completedGroup.waitFor();
-  const groupHeight = await completedGroup.evaluate((element) => element.getBoundingClientRect().height);
-  assert(groupHeight <= 30, `[${tag}] completed tool group too tall: ${groupHeight}`);
   assert(await conversation.getByText("check failed", { exact: true }).isVisible(), `[${tag}] failed command reason is hidden`);
-  await completedGroup.click();
   const compactCommand = conversation.getByRole("button", { name: /命令.*npm test/ });
   await compactCommand.waitFor();
   const commandHeight = await compactCommand.evaluate((element) => element.getBoundingClientRect().height);
@@ -161,7 +144,7 @@ async function assertWorkspace(page, tag) {
   assert((await page.getByText("拆任务", { exact: true }).count()) === 0, `[${tag}] decomposition UI remains`);
 
   const expandedWidth = await conversation.evaluate((element) => element.getBoundingClientRect().width);
-  await header.getByRole("button", { name: "收起会话侧栏" }).click();
+  await sidebar.getByRole("button", { name: "收起会话侧栏" }).click();
   await sidebar.waitFor({ state: "detached" });
   assert((await header.getByRole("button", { name: "展开会话侧栏" }).count()) === 1, `[${tag}] restore control missing after collapse`);
   const collapsedWidth = await conversation.evaluate((element) => element.getBoundingClientRect().width);
@@ -170,15 +153,15 @@ async function assertWorkspace(page, tag) {
   assert(collapsedOverflow.scrollWidth <= collapsedOverflow.width, `[${tag}] collapsed workspace horizontal overflow: ${JSON.stringify(collapsedOverflow)}`);
   await page.screenshot({ path: path.join(artifactDir, `${tag}-collapsed.png`), fullPage: true });
 
-  await page.reload({ waitUntil: "networkidle" });
+  await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("main", { name: "会话窗口" }).waitFor({ timeout: 10_000 });
   assert((await page.getByRole("complementary", { name: "会话列表" }).count()) === 0, `[${tag}] collapsed state did not persist across reload`);
   await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "展开会话侧栏" }).click();
   await page.getByRole("complementary", { name: "会话列表" }).waitFor();
   assert((await page.getByRole("button", { name: "新建会话", exact: true }).count()) === 1, `[${tag}] restored sidebar changed the single new-session entry contract`);
-  await page.reload({ waitUntil: "networkidle" });
+  await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("complementary", { name: "会话列表" }).waitFor({ timeout: 10_000 });
-  assert((await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] expanded state did not persist across reload`);
+  assert((await page.getByRole("complementary", { name: "会话列表" }).getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] expanded state did not persist across reload`);
   await page.screenshot({ path: path.join(artifactDir, `${tag}.png`), fullPage: true });
 }
 
@@ -202,7 +185,7 @@ async function run() {
     page.on("pageerror", (error) => pageErrors.push(error.stack ?? String(error)));
 
     await assertWorkspace(page, "wide-workspace");
-    await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "本地工作树" }).click();
+    await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: /本地 Git；分支 codex\/repo-owned-specs/ }).click();
     const localGitDrawer = page.getByText("本地 Git", { exact: true });
     await localGitDrawer.waitFor();
     assert((await page.getByRole("button", { name: /恢复 \d+/ }).count()) === 0, "unchanged checkpoints should not create a recovery action");

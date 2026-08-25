@@ -96,8 +96,14 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
   ]);
   const parsed = JSON.parse(catalog);
   const legacy = JSON.parse(redirect);
-  assert.equal(parsed.schema_version, 1);
+  assert.equal(parsed.schema_version, 2);
   assert.equal(parsed.source_policy, "aggregate-shapes-only");
+  assert.equal(parsed.gate_policy.mode, "all-registered-targets-hard-gated");
+  assert.deepEqual(parsed.gate_policy.target_bindings.rust.stages, ["pull_request"]);
+  assert.deepEqual(
+    parsed.gate_policy.target_bindings.binary.workflow_stages[".github/workflows/release.yml"],
+    ["release_artifact"],
+  );
   assert.equal(legacy.status, "redirect");
   assert.equal(legacy.canonical_registry, "scenario-registry.json");
   assert.ok(parsed.scenarios.some((item) => item.id === "HLT-001"));

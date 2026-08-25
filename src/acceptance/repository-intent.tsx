@@ -171,6 +171,30 @@ mockIPC(
       case "get_monthly_cost":
       case "get_session_cost":
         return { input_tokens: 0, output_tokens: 0, cost_usd: 0 };
+      case "get_usage_dashboard":
+        return {
+          summary: {
+            input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cached_tokens: 0,
+            requests: 0,
+            actual_cost_usd: null,
+            estimated_cost_usd: null,
+            cost_source: "subscription",
+          },
+        };
+      case "get_session_usage":
+        return {
+          input_tokens: 0,
+          output_tokens: 0,
+          reasoning_tokens: 0,
+          cached_tokens: 0,
+          requests: 0,
+          actual_cost_usd: null,
+          estimated_cost_usd: null,
+          cost_source: "subscription",
+        };
       default: return null;
     }
   },

@@ -1,9 +1,10 @@
 {
   "generator": "codex-delivery-governance",
-  "version": "2026-05-11",
-  "governance_version": "2026-05-11",
+  "version": "2026-08-25",
+  "governance_version": "2026-08-25",
   "required_files": [
     "AGENTS.md",
+    "CLAUDE.md",
     "docs/repo-quick-profile.md",
     "docs/planning-agent.md",
     "docs/development-agent.md",
@@ -27,12 +28,24 @@
     "docs/long-tasks/task-record-template.md",
     ".codex/governance/baseline-manifest.json",
     ".github/workflows/governance-baseline.yml",
+    ".github/workflows/scenario-gate.yml",
+    ".github/workflows/scenario-gate-policy.yml",
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/auto-release.yml",
+    ".github/rulesets/main.json",
+    ".githooks/pre-commit",
+    ".githooks/pre-push",
     ".github/workflows/governed-delivery.yml",
     "tools/governance/validate_repo_governance_baseline.py",
     "tools/governance/check_repo_governance.ps1",
     "tools/governance/diagnose_release_latency.py",
     "tools/governance/validate_long_task_record.py",
-    "tools/governance/validate_scenario_test_governance.py"
+    "tools/governance/validate_scenario_test_governance.py",
+    "tools/governance/run_scenario_harness_gate.py",
+    "tools/governance/manage_main_branch_ruleset.py",
+    "docs/governance/rules.yml",
+    "docs/governance/agent-conformance.md"
   ],
   "required_markers": {
     "AGENTS.md": [
@@ -51,8 +64,16 @@
       "Observation Harness",
       "scenario-registry.json",
       "Scenario-Test:",
+      "scenario-gate-policy",
+      "scenario-gate-pr",
+      "run_scenario_harness_gate.py",
       "long tasks",
       "governed CI/CD"
+    ],
+    "CLAUDE.md": [
+      "@AGENTS.md",
+      "governance_version: `2026-08-25`",
+      "canonical_digest:"
     ],
     "docs/repo-quick-profile.md": [
       "Task Entry",
@@ -95,12 +116,43 @@
       "pull_request",
       "push"
     ],
+    ".github/workflows/scenario-gate.yml": [
+      "scenario-gate-pr",
+      "pull_request",
+      "edited",
+      "run_scenario_harness_gate.py",
+      "--stage pull_request"
+    ],
+    ".github/workflows/scenario-gate-policy.yml": [
+      "scenario-gate-policy",
+      "pull_request_target",
+      "persist-credentials: false",
+      "--policy-repo"
+    ],
+    ".github/rulesets/main.json": [
+      "scenario-gate-policy",
+      "scenario-gate-pr",
+      "strict_required_status_checks_policy"
+    ],
     "docs/specs/feature-specs/scenario-test-governance.md": [
       "Requirements Traceability",
       "Primary User Path",
       "Scenario-Test:",
       "E2E-001",
+      "schema v2",
+      "信任边界与工具传播",
       "Applicable Harnesses"
+    ],
+    "docs/testing/scenario-registry.json": [
+      "all-registered-targets-hard-gated",
+      "pull_request_required_checks",
+      "scenario-gate-release",
+      "target_bindings"
+    ],
+    "docs/governance/rules.yml": [
+      "scenario-test-governance",
+      "run_scenario_harness_gate.py",
+      "level: error"
     ],
     ".github/workflows/governed-delivery.yml": [
       "validate_repo_governance_baseline.py",

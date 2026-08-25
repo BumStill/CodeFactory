@@ -62,7 +62,9 @@
 ### 场景测试统一治理（硬规则）
 
 - `docs/testing/scenario-registry.json` 是业务场景、UI acceptance、运行时 smoke、复杂 E2E、证据等级和 gate 的唯一机器权威源；PR/nightly/release 对同一逻辑场景的执行不得重复计数。
-- 修改产品代码的 `feat` / `fix` PR 必须在 PR body 声明 `Scenario-Test: <IDs>`；命中 P0 `change_patterns` 时必须覆盖全部受影响 P0 ID，CI 通过 `tools/governance/validate_scenario_test_governance.py --ci` 阻断漏报。
+- 任何标题、任何工具产生的产品变更都必须在 PR body 声明 `Scenario-Test: <IDs>`；命中任意优先级 `change_patterns` 时必须覆盖全部受影响 ID，未映射产品文件与缺 base SHA 一律 fail closed。
+- 本地统一入口是 `python tools/governance/run_scenario_harness_gate.py --stage local --repo . --policy-repo .`；Codex、Claude、IDE 和人工不得另造旁路命令。pre-commit/pre-push 只提供提前反馈，最终权威是 GitHub ruleset 中 strict、无 bypass 的 `scenario-gate-policy` 与 `scenario-gate-pr` required checks。
+- 所有 active Scenario 都必须有 `pull_request` hard gate；`manual_canary` 只能补充。Complex E2E 为 `designed`/`partially_implemented` 或仍有 `remaining_gaps` 时，不得计为通过，并阻断相应产品变更与 release。
 - 复杂真实 E2E 必须使用 synthetic fixture，并同时断言 UI、持久状态、真实进程、幂等副作用和交付证据；jsdom、mock AppHandle、窗口打开或 HTTP 200 不能替代完整主路径。
 - 历史 session 只能提取匿名聚合形状，不得写入原始消息、真实 session/objective ID、本机路径、凭据或生产工具参数。
 - 长任务无人参与基线是 `E2E-001`：用户消息总数为 1、human prompt 总数为 0，进程/应用重启后必须自动完成或进入真实不可恢复终态，不能等待用户发送“继续”。
@@ -194,6 +196,9 @@ Repository: `CodeFactory`
 
 Generated preview. Promote edits through OpenClaw AI Coding OS proposals.
 
+- governance_version: `2026-08-25`
+- canonical_digest: `d630d5ed23690c5b8e40b76fd1375a8d8e080cbeb94c232fc95cfe278c0e1f36`
+
 ## Project
 
 - id: `codefactory`
@@ -213,4 +218,7 @@ Generated preview. Promote edits through OpenClaw AI Coding OS proposals.
 - Keep user changes untouched unless explicitly asked to modify or revert them.
 - Record durable lessons as AI Coding OS proposals with evidence.
 - Separate business/product reasoning from implementation detail when reporting back.
+- Use the repository canonical scenario harness command; do not create Codex-specific or Claude-specific test paths.
+- Treat strict GitHub scenario required checks and the release scenario gate as the completion boundary; local hooks are only early feedback.
+- Do not count designed, partially implemented, manual-only, missing-receipt, or wrong-artifact scenario evidence as green.
 <!-- AI-CODING-OS:END project-codefactory-agents -->

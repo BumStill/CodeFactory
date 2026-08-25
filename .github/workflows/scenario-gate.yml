@@ -1,0 +1,33 @@
+name: scenario-gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  scenario-gate-pr:
+    name: scenario-gate-pr
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile and enforce the repository scenario harness
+        env:
+          SCENARIO_TEST_EVENT_PATH: ${{ github.event_path }}
+          SCENARIO_TEST_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: >-
+          python tools/governance/run_scenario_harness_gate.py
+          --stage pull_request
+          --repo .
+          --policy-repo .
+          --base-ref "$SCENARIO_TEST_BASE_SHA"
+          --event-path "$SCENARIO_TEST_EVENT_PATH"

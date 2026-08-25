@@ -70,7 +70,7 @@ async function stopServer(child) {
 
 async function verifyViewport(page, viewport) {
   await page.setViewportSize(viewport);
-  await page.goto(baseUrl, { waitUntil: "networkidle" });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   const main = page.getByRole("main", { name: "Streaming Markdown acceptance" });
   await main.waitFor({ timeout: 10_000 });
   await page.getByRole("button", { name: "模拟工具与后续文本" }).click();

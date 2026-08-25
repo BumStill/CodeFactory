@@ -31,7 +31,7 @@ runs identically whether the PR came from Claude, Codex, or a person. Docs
 ②  Agent convention files  AGENTS.md (Codex) · CLAUDE.md/memory (Claude) · …
         │  each POINTS to ①, never re-states it (no drift)   [SOFT: guidance]
         ▼
-③  CI conformance gate     governance-baseline → validators       [HARD: blocks]
+③  CI conformance gate     trusted policy + scenario gate + validators [HARD: blocks]
            required status check on the branch → "not green, not merged"
 ```
 
@@ -41,6 +41,14 @@ runs identically whether the PR came from Claude, Codex, or a person. Docs
   actually guarantees cross-agent consistency.
 
 ①② without ③ is an honor system. ③ is the load-bearing layer.
+
+For scenario governance, the hard layer has two stable required contexts:
+`scenario-gate-policy` loads the runner from the default branch and validates
+the candidate tree without credentials; `scenario-gate-pr` compiles the
+candidate registry and its target bindings. The protected ruleset requires
+both with strict latest-base enforcement. This prevents Codex, Claude, an IDE,
+or a plain Git client from choosing a weaker path, and prevents a PR from
+weakening its own validator to self-attest.
 
 ## The machine-readable manifest: `docs/governance/rules.yml`
 
@@ -109,3 +117,15 @@ ramp because there's nothing for an agent to violate.
 harness by copying them, pointing its `AGENTS.md`/`CLAUDE.md` at `rules.yml`,
 and marking the gate required. Same rules, same enforcement, every repo, every
 agent.
+
+Local hooks are intentionally only a fast feedback mirror. The canonical
+command is:
+
+```text
+python tools/governance/run_scenario_harness_gate.py --stage local --repo . --policy-repo .
+```
+
+Skipping or not installing the hook does not bypass the protected server-side
+contexts. A repository owner can still alter the GitHub ruleset itself; an
+organization required workflow or independent GitHub App is the external
+trust-root option when owner credentials must also be constrained.

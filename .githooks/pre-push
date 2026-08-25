@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 tools/governance/run_scenario_harness_gate.py \
+    --stage local --repo . --policy-repo .
+fi
+
+if command -v python >/dev/null 2>&1; then
+  exec python tools/governance/run_scenario_harness_gate.py \
+    --stage local --repo . --policy-repo .
+fi
+
+if command -v py >/dev/null 2>&1; then
+  exec py -3 tools/governance/run_scenario_harness_gate.py \
+    --stage local --repo . --policy-repo .
+fi
+
+echo "scenario-gate: Python 3 is required" >&2
+exit 1

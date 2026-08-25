@@ -87,7 +87,7 @@ async function main() {
     const executablePath = await firstBrowser();
     browser = await chromium.launch({ executablePath, headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "networkidle" });
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.getByRole("main", { name: "Reconnect banner acceptance" }).waitFor({ timeout: 10_000 });
 
     const toolPanel = page.locator("section", { hasText: "Tool command is still running" });
@@ -104,7 +104,7 @@ async function main() {
       "tool-running panel must not blame model instability while a command is still running",
     );
     assert(
-      await toolPanel.getByText(/运行中/).isVisible(),
+      await toolPanel.locator('[data-tool-status="running"]').isVisible(),
       "tool-running panel should visibly contain a running tool state",
     );
     assert(

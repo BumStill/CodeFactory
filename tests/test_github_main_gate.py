@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,11 @@ from tools.governance.manage_main_branch_ruleset import (
     gh_api,
     validate_policy,
 )
+from tools.governance.run_scenario_harness_gate import (
+    TRUST_ROOT_FILES,
+    is_initial_trust_bootstrap,
+    validate_trust_root_immutability,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +31,8 @@ EXPECTED_CHECKS = {
     "check-rust",
     "governance-baseline",
     "remote-real-app-gui",
+    "scenario-gate-policy",
+    "scenario-gate-pr",
 }
 GITHUB_ACTIONS_APP_ID = 15368
 
@@ -139,13 +147,90 @@ class GitHubMainGateTests(unittest.TestCase):
             'gh workflow run release.yml --ref main -f tag="$TAG"',
             auto_release,
         )
-        self.assertIn("pull_request:\n    branches: [main]", governance)
+        self.assertIn("types: [opened, synchronize, reopened, edited]", governance)
         self.assertIn("push:\n    branches: [main]", governance)
+
+        trusted_policy = (
+            REPO_ROOT / ".github/workflows/scenario-gate-policy.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pull_request_target:", trusted_policy)
+        self.assertIn("name: scenario-gate-policy", trusted_policy)
+        self.assertIn("persist-credentials: false", trusted_policy)
+        self.assertIn("--policy-repo", trusted_policy)
+        self.assertNotIn("pull_request.head.sha }}\n          path: policy", trusted_policy)
+
+        pr_gate = (REPO_ROOT / ".github/workflows/scenario-gate.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("name: scenario-gate-pr", pr_gate)
+        self.assertIn("--stage pull_request", pr_gate)
+
+    def test_local_hooks_call_the_same_repository_scenario_gate(self) -> None:
+        pre_commit = (REPO_ROOT / ".githooks/pre-commit").read_text(encoding="utf-8")
+        pre_push = (REPO_ROOT / ".githooks/pre-push").read_text(encoding="utf-8")
+        for hook in (pre_commit, pre_push):
+            self.assertIn("run_scenario_harness_gate.py", hook)
+            self.assertIn("--stage local", hook)
+
+    def test_trusted_policy_files_are_covered_by_the_ruleset(self) -> None:
+        policy = self._policy()
+        contexts = {
+            item["context"]
+            for rule in policy["ruleset"]["rules"]
+            if rule["type"] == "required_status_checks"
+            for item in rule["parameters"]["required_status_checks"]
+        }
+        self.assertIn("scenario-gate-policy", contexts)
+        self.assertIn("scenario-gate-pr", contexts)
+        for required_provider in (
+            ".github/workflows/ci.yml",
+            ".github/workflows/governance-baseline.yml",
+            ".github/workflows/lock-independent-desktop-acceptance.yml",
+            ".github/workflows/release.yml",
+        ):
+            self.assertIn(required_provider, TRUST_ROOT_FILES)
+
+    def test_candidate_cannot_weaken_the_trust_root_that_judges_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = root / "policy"
+            candidate = root / "candidate"
+            for relative in TRUST_ROOT_FILES:
+                for checkout in (policy, candidate):
+                    path = checkout / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("trusted\n", encoding="utf-8")
+
+            self.assertEqual(validate_trust_root_immutability(candidate, policy), [])
+            changed = candidate / TRUST_ROOT_FILES[0]
+            changed.write_text("weakened\n", encoding="utf-8")
+            errors = validate_trust_root_immutability(candidate, policy)
+            self.assertTrue(any(TRUST_ROOT_FILES[0] in error for error in errors), errors)
 
         release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn("run-name: Release ${{ inputs.tag }}", release)
+
+    @patch("tools.governance.run_scenario_harness_gate.subprocess.run")
+    def test_only_a_repository_without_the_trusted_base_gate_can_bootstrap(self, run) -> None:
+        run.return_value = subprocess.CompletedProcess([], 1, "", "missing")
+        self.assertTrue(is_initial_trust_bootstrap(REPO_ROOT, "origin/main"))
+        run.assert_called_once_with(
+            [
+                "git",
+                "-C",
+                str(REPO_ROOT),
+                "cat-file",
+                "-e",
+                "origin/main:.github/workflows/scenario-gate-policy.yml",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        self.assertFalse(is_initial_trust_bootstrap(REPO_ROOT, "origin/main"))
 
     def test_policy_cannot_exclude_default_branch_or_add_unknown_rules(self) -> None:
         excluded = copy.deepcopy(self._policy())

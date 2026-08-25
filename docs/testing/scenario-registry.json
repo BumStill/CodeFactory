@@ -1,6 +1,26 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "source_policy": "aggregate-shapes-only",
+  "gate_policy": {
+    "mode": "all-registered-targets-hard-gated",
+    "pull_request_required_checks": [
+      "agent-bridge-linux",
+      "check-frontend",
+      "check-rust",
+      "governance-baseline",
+      "remote-real-app-gui",
+      "scenario-gate-policy",
+      "scenario-gate-pr"
+    ],
+    "release_required_job": "scenario-gate-release",
+    "target_bindings": {
+      "rust": {"workflow": ".github/workflows/ci.yml", "job": "check-rust", "command": "cargo test", "stages": ["pull_request"]},
+      "path": {"workflow": ".github/workflows/ci.yml", "job": "check-frontend", "command": "pnpm test", "stages": ["pull_request"]},
+      "pnpm": {"workflow": ".github/workflows/ci.yml", "job": "check-frontend", "command_from_target": true, "stages": ["pull_request"]},
+      "binary": {"workflows": [".github/workflows/ci.yml", ".github/workflows/release.yml"], "command_from_target": true, "workflow_stages": {".github/workflows/ci.yml": ["pull_request"], ".github/workflows/release.yml": ["release_artifact"]}},
+      "workflow": {"workflows": [".github/workflows/ci.yml", ".github/workflows/unattended-long-task-nightly.yml", ".github/workflows/release.yml"], "step_name_from_target": true, "workflow_stages": {".github/workflows/ci.yml": ["pull_request"], ".github/workflows/unattended-long-task-nightly.yml": ["nightly"], ".github/workflows/release.yml": ["release_artifact"]}}
+    }
+  },
   "privacy": {
     "allowed": [
       "aggregate counts",
@@ -132,7 +152,7 @@
       "change_patterns": ["src/pages/Workspace/*.tsx"],
       "automated_by": ["pnpm:test:repository-intent:headless", "path:src/acceptance/repository-intent.tsx"],
       "required_evidence": ["L0", "L3"],
-      "gates": ["manual_canary"]
+      "gates": ["pull_request", "manual_canary"]
     },
     {
       "id": "UI-003",
@@ -154,7 +174,7 @@
       "change_patterns": ["src/pages/Workspace/*.tsx", "src/stores/chat.ts"],
       "automated_by": ["pnpm:test:reconnect-banner:headless", "path:src/acceptance/reconnect-banner.tsx"],
       "required_evidence": ["L0", "L3"],
-      "gates": ["manual_canary"]
+      "gates": ["pull_request", "manual_canary"]
     },
     {
       "id": "UI-005",
@@ -165,7 +185,7 @@
       "change_patterns": ["src/App.tsx", "src/stores/chat.ts", "src/pages/Workspace/*.tsx"],
       "automated_by": ["pnpm:test:startup-session:headless", "path:src/acceptance/startup-session.tsx"],
       "required_evidence": ["L1", "L3", "L4"],
-      "gates": ["manual_canary"]
+      "gates": ["pull_request", "manual_canary"]
     },
     {
       "id": "UI-006",
@@ -176,7 +196,7 @@
       "change_patterns": ["src/components/Sidebar*.tsx", "src/pages/Workspace/*.tsx"],
       "automated_by": ["pnpm:test:sidebar-expansion:headless", "path:src/acceptance/sidebar-expansion.tsx"],
       "required_evidence": ["L0", "L3"],
-      "gates": ["manual_canary"]
+      "gates": ["pull_request", "manual_canary"]
     },
     {
       "id": "UI-007",
@@ -187,7 +207,7 @@
       "change_patterns": ["src/components/*Image*.tsx", "src/components/*Attachment*.tsx"],
       "automated_by": ["pnpm:test:image-preview:headless", "path:src/acceptance/image-preview.tsx"],
       "required_evidence": ["L0", "L3"],
-      "gates": ["manual_canary"]
+      "gates": ["pull_request", "manual_canary"]
     },
     {
       "id": "UI-008",
@@ -198,7 +218,7 @@
       "change_patterns": ["src/components/Message*.tsx", "src/components/*Markdown*.tsx", "src/stores/chat.ts"],
       "automated_by": ["pnpm:test:streaming-markdown:headless", "path:src/acceptance/streaming-markdown.tsx"],
       "required_evidence": ["L0", "L3"],
-      "gates": ["manual_canary"]
+      "gates": ["pull_request", "manual_canary"]
     },
     {
       "id": "UI-009",
@@ -209,7 +229,7 @@
       "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs"],
       "automated_by": ["pnpm:test:permission-mode:headless", "path:src/acceptance/permission-mode.tsx"],
       "required_evidence": ["L1", "L3"],
-      "gates": ["manual_canary"]
+      "gates": ["pull_request", "manual_canary"]
     },
     {
       "id": "UI-010",
@@ -231,7 +251,7 @@
       "change_patterns": ["src/components/*Usage*.tsx", "src/pages/*Usage*.tsx", "src/stores/usage*.ts"],
       "automated_by": ["pnpm:test:usage:headless", "path:src/acceptance/usage.tsx"],
       "required_evidence": ["L0", "L3"],
-      "gates": ["manual_canary"]
+      "gates": ["pull_request", "manual_canary"]
     },
     {
       "id": "RTE-001",
@@ -264,7 +284,7 @@
       "change_patterns": ["src-tauri/src/tools/browser_session.rs", "src-tauri/src/commands/browser_sessions.rs", "src-tauri/src/agent/objective*.rs"],
       "automated_by": ["rust:a_transient_extension_command_error_preserves_the_attached_session", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "binary:--browser-chrome-attach-smoke"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
-      "gates": ["pull_request"]
+      "gates": ["pull_request", "release_artifact"]
     },
     {
       "id": "RTE-004",

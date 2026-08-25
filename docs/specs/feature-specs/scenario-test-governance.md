@@ -2,7 +2,7 @@
 
 > 状态：Active governance contract  
 > 权威机器源：`docs/testing/scenario-registry.json`  
-> 适用范围：CodeFactory 所有用户可见 `feat` / `fix`、主路径回归、nightly 与 release artifact 验收
+> 适用范围：CodeFactory 所有产品变更（不依赖 PR 标题或开发工具）、主路径回归、nightly 与 release artifact 验收
 
 ## 问题
 
@@ -24,8 +24,8 @@ CodeFactory 现有测试数量很多，但场景分散在 Rust 测试、Vitest�
 | CF-STG-R2 | 分类、优先级、变更路径、自动化入口、证据等级和 gate 必须统一登记 | registry validator |
 | CF-STG-R3 | PR/nightly/release 对同一逻辑场景的重复执行不得重复计数 | `required_evidence` + `gates` |
 | CF-STG-R4 | 生产历史只能抽取匿名聚合形状，不得保存原文、真实 ID、路径、凭据或工具参数 | registry privacy contract |
-| CF-STG-R5 | `feat/fix` 修改产品代码必须声明 `Scenario-Test:` | CI change contract |
-| CF-STG-R6 | 修改命中 P0 场景关键路径时，声明必须覆盖全部受影响 P0 ID | `validate_change_contract` |
+| CF-STG-R5 | 任何标题的产品变更都必须声明 `Scenario-Test:`；`not-applicable` 只适用于机器判定的非产品变更 | CI change contract |
+| CF-STG-R6 | 修改命中 P0/P1/P2 场景路径时，声明必须覆盖全部受影响 ID；产品文件无映射时 fail closed | `validate_change_contract` |
 | CF-STG-R7 | 复杂 E2E 必须同时包含 UI、持久状态、进程、副作用和交付 oracle | registry validator |
 | CF-STG-R8 | “真实桌面”不得由 jsdom、mock AppHandle 或静态页面替代 | L3 evidence contract |
 | CF-STG-R9 | “跨重启”必须使用独立进程和同一 SQLite，不能只重建内存对象 | L2 evidence contract |
@@ -38,6 +38,9 @@ CodeFactory 现有测试数量很多，但场景分散在 Rust 测试、Vitest�
 | CF-STG-R16 | 自动更新必须覆盖历史卡住 objective、旧进程锁和首次启动 reconciliation | `E2E-006` |
 | CF-STG-R17 | 浏览器扩展稳定性必须覆盖 MV3 idle、connection generation、迟到 close/reply、heartbeat ACK、半开失活关闭与多 profile 稳定 winner/standby 接管，不得用单次连接 happy path 代替 | `RTE-002` + `E2E-008` |
 | CF-STG-R18 | attached session 瞬断恢复必须保持 objective、lease、selected tab，并在有界窗口内只重放一次只读调用，不能依赖模型或人工 continue | `RTE-003` + `E2E-008` |
+| CF-STG-R19 | 每个登记的自动化 target 必须绑定到明确的 `pull_request`、`nightly` 或 `release_artifact` 阶段，且该阶段必须被场景自身声明；不能只证明文件/函数存在 | registry v2 `gate_policy.target_bindings` + stage validator |
+| CF-STG-R20 | PR 不得使用候选分支修改后的 validator 自证；可信 policy gate 必须使用默认分支 runner 只读检查候选树 | `scenario-gate-policy` |
+| CF-STG-R21 | base SHA、required run 或 live ruleset 状态无法读取时必须失败，不能 warning 后继续 | fail-closed runner + ruleset verifier |
 
 ## Primary User Path
 
@@ -65,7 +68,7 @@ Scenario 是稳定的产品风险/用户行为单元，不等同于一个测试�
 - `required_evidence`：最低证据层；
 - `gates`：PR、nightly、release 或 manual canary。
 
-`gates` 只记录当前已经接入 workflow 的真实阻断层，不能填写计划状态。目标层级写在 Complex E2E Case 的 `execution`；尚未自动化的目标必须保持 `designed`。当前 UI acceptance 中只有 draft/compact composer、resume journal 和 Evolution 已进入 PR workflow，其余虽然有可执行脚本，仍登记为 `manual_canary`。
+Schema v2 的 `gate_policy` 把每一种 target 绑定到具体 workflow、job/command 和 required context。`gates` 只记录真实阻断层；所有 active Scenario 至少包含 `pull_request`，`manual_canary` 只能作为补充。函数、脚本或文件“存在”但未绑定到 protected check 时，registry 编译失败。
 
 ### Complex E2E Case
 
@@ -91,7 +94,7 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 | 能力演进与用量 | 2 | Evolution、token/cost |
 | 运行时资源生命周期 | 3 | 浏览器进程/租约回收、扩展健康、attached session 续接 |
 
-当前统一注册表共有 22 个逻辑 Scenario。任何新增主路径能力必须在合并实现前新增或扩展一个 Scenario。
+当前统一注册表共有 26 个逻辑 Scenario、11 个 Complex E2E。任何新增主路径能力必须在合并实现前新增或扩展一个 Scenario。
 
 ## 证据等级
 
@@ -107,7 +110,7 @@ P0 场景不能只依赖 L0。涉及重启至少要求 L2，涉及用户按钮�
 
 ## PR 变更门禁
 
-所有修改产品代码的 `feat` / `fix` PR 必须在 PR body 放置：
+所有产品变更，无论标题是 `feat`、`fix`、`chore`、`refactor` 或由什么工具生成，都必须在 PR body 放置：
 
 ```text
 Scenario-Test: HLT-003, HLT-004
@@ -116,10 +119,12 @@ Scenario-Test: HLT-003, HLT-004
 规则：
 
 1. ID 必须存在于统一注册表；
-2. 代码路径命中 P0 场景时，必须声明全部受影响 P0 ID；
-3. 没有命中已登记场景时，可以使用 `Scenario-Test: not-applicable - <具体原因>`，但不能用于绕过 P0；
+2. 代码路径命中任意优先级场景时，必须声明全部受影响 ID；
+3. 产品文件没有命中场景时属于 registry coverage gap，直接失败；产品变更不能使用 `not-applicable`；
 4. 声明不是完成证据。PR 仍必须执行 ID 对应的自动化和证据层；
-5. 新功能若无法选择任何 Scenario，说明注册表缺场景，必须先补登记。
+5. 新功能若无法选择任何 Scenario，说明注册表缺场景，必须先补登记；
+6. 缺 base SHA、事件正文或 diff 失败时 fail closed；PR body 的 `edited` 事件必须重跑；
+7. `Scenario-Test: ALL` 只用于机器生成且确实影响全部场景的全局运行时/版本批次，不是 waiver。
 
 ## 复杂真实 E2E 组合
 
@@ -174,10 +179,18 @@ Scenario-Test: HLT-003, HLT-004
 
 ## Gate 策略
 
-- PR：运行确定性、20 分钟内的 P0 L0-L2；涉及 UI 的变更追加目标 L3 acceptance。
+- PR：所有 active Scenario 都有明确 `pull_request` 绑定；required checks 是 `scenario-gate-policy`、`scenario-gate-pr` 及其绑定的 Rust/frontend/真实 App checks。产品变更遇到任一 `designed`/`partially_implemented` Complex E2E 时冻结，不能把测试债务计作绿色。
 - Nightly：运行旧 schema、故障矩阵、真实 App restart 和 fake-forge 组合场景。
-- Release：对 exact Windows executable、安装/更新路径和 build SHA 执行 L4；同一场景不因重复执行而增加计数。
-- Manual canary：只用于尚无法安全自动化的真实外部边界，必须写明缺口，不能冒充自动化通过。
+- Release：`scenario-gate-release` 在创建/复用 draft 前检查所有 exact-artifact case；任一 L4 缺口阻止公开产物。
+- Manual canary：只能补充自动化 hard gate，不能是 active Scenario 的唯一门禁。
+
+### 信任边界与工具传播
+
+- `docs/testing/scenario-registry.json`、统一 runner 和 GitHub ruleset 是机器权威；Codex、Claude、IDE 与人工得到同一结论；
+- `AGENTS.md` 与 `CLAUDE.md` 只负责告诉执行者提前运行同一命令；`.githooks/pre-commit`/`pre-push` 提供快速反馈，但允许被本地跳过；
+- 最终权威是 GitHub required checks。`scenario-gate-policy` 使用 `pull_request_target` 从 default branch 加载 runner，以只读、无凭据方式检查 candidate checkout，candidate 代码永不执行；
+- 默认分支 policy 逐字比对 ruleset、两个 scenario workflow、runner、validator，以及提供 7 个 required contexts / release gate 的 `ci.yml`、`governance-baseline.yml`、`lock-independent-desktop-acceptance.yml`、`release.yml` 共九个 trust-root 文件；普通 PR 不允许自修改这些文件。后续治理升级必须走明确的 external governance bootstrap，再重新启用并对账 required contexts；
+- 个人仓库管理员仍可在 GitHub 控制面修改规则集。组织级 required workflow 或独立 GitHub App 是更高一级的外部信任根；仓库内门禁不虚假声称能约束仓库所有者凭据。
 
 ## Applicable Harnesses
 
@@ -190,28 +203,25 @@ Scenario-Test: HLT-003, HLT-004
 
 ## 实施顺序
 
-1. 已完成：统一 22 个场景，加入 validator、PR 声明门和 8 个复杂 E2E 设计；
-2. 已完成第一阶段：E2E-003、E2E-002 使用同一正式二进制和真实 SQLite，在 required Windows CI、nightly、release exact executable 覆盖分页历史、无内存控制、hard kill、session 全量取消和两次重启；当前状态为 `partially_implemented`；
-3. 把现有 unattended smoke 和 browser smoke 扩展成 E2E-001/E2E-005 完整 oracle；
-4. 建立 fake-forge，自动化 E2E-004；
-5. 在 Windows release runner 建前一版本升级 fixture，自动化 E2E-006；
-6. 补齐 E2E-002/E2E-003 的真实 WebView L3、旧 schema 迁移矩阵和部分投影失败并发，再提升为 `implemented`；
-7. 建立 E2E-008 原生扩展 lifecycle smoke，覆盖 120 秒 idle、generation 交错、断 socket、App restart 与同 lease/tab 续接；
-8. 当 8 个 case 均达到声明层级后，将 P0 release gate 从设计状态提升为硬阻断。
+1. 已完成：统一 26 个场景和 11 个复杂 E2E，schema v2 将全部自动化 target 绑定到明确 gate；
+2. 已完成：新增 trusted policy + PR aggregate required contexts、本地统一 hooks、全优先级 change contract 与 fail-closed base SHA；
+3. 当前 gate debt：11 个 Complex E2E 均未达到 `implemented`；在债务清零前，普通产品变更和 release 被明确冻结，债务清理必须作为一个使 active PR debt 全部归零的原子批次，不得把缺口改写成 waiver；
+4. 逐项补齐真实 Supervisor wake、跨进程 SQLite、并发 finalization、真实 WebView、浏览器 lifecycle、fake-forge 和 exact artifact receipts，并把 case 提升为 `implemented`；
+5. 全部清零后保持 PR 与 release gate 常开，nightly 只扩展故障矩阵，不再替代 required gate。
 
 ## 验收标准
 
 - registry validator 拒绝重复 ID、未知分类、失效自动化入口和缺失 oracle；
-- change contract 拒绝未声明或漏声明受影响 P0 场景的产品 `feat/fix`；
+- change contract 拒绝任意标题下未声明、漏声明 P0/P1/P2 或未映射的产品变更；
 - CI 同时运行 validator 的单元测试和仓库真实注册表验证；
 - 原历史场景目录不再维护第二份场景数据，只保留 canonical registry 指针；
-- 22 个现有场景和 8 个复杂 E2E 设计可由机器读取；
+- 26 个现有场景和 11 个复杂 E2E 可由机器读取，所有 target 都能解析到明确 hard gate；
 - E2E-001 明确保证无人参与执行；
-- 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`，不得报告为全覆盖。
+- 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`，且 required gate 对产品变更/发布返回失败。
 
 ## 风险与边界
 
-- 路径映射过宽会制造无关声明；通过只对 P0 强制全覆盖、持续细化 `change_patterns` 控制噪音。
+- 路径映射过宽会制造无关声明；通过持续细化 `change_patterns` 控制噪音，不以降低优先级或 waiver 绕过。
 - 声明可能变成形式主义；因此声明只负责 traceability，执行仍由自动化 target 和证据层负责。
 - 复杂 E2E 成本高；PR 只跑确定性关键切片，故障矩阵进入 nightly，exact artifact 进入 release。
-- 本规格建立治理与可执行设计，不等于 6 个复杂 E2E 已全部实现。`automation_status` 是当前真实边界。
+- 本规格建立治理与可执行设计，不等于 11 个复杂 E2E 已全部实现。`automation_status` 是当前真实边界。

@@ -78,7 +78,7 @@ async function main() {
     await waitForServer(vite);
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "networkidle" });
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.getByRole("main", { name: "Permission mode acceptance" }).waitFor({ timeout: 10_000 });
 
     const modeTrigger = page.getByRole("button", { name: /会话权限：标准/ });
@@ -98,8 +98,8 @@ async function main() {
     await page.getByRole("button", { name: /会话权限：信任/ }).waitFor();
 
     await page.getByRole("button", { name: "打开设置" }).click();
-    await page.getByRole("button", { name: "端点", exact: true }).waitFor();
-    assert((await page.getByRole("button", { name: "权限" }).count()) === 0, "global permissions tab should be hidden");
+    await page.getByRole("tab", { name: "端点", exact: true }).waitFor();
+    assert((await page.getByRole("tab", { name: "权限" }).count()) === 0, "global permissions tab should be hidden");
     assert((await page.getByText("工具权限").count()) === 0, "global tool-list editor should be hidden");
 
     await page.screenshot({ path: path.join(artifactDir, "permission-mode.png"), fullPage: true });
