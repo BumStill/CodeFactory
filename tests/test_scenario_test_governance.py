@@ -5,11 +5,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tools.governance.run_scenario_harness_gate import (
+    JUDGE_ROOT_FILES,
+    TRUST_ROOT_FILES,
+    validate_trust_root_immutability,
+)
 from tools.governance.validate_scenario_test_governance import (
     _changed_files,
     load_registry,
     validate_change_contract,
     validate_gate_readiness,
+    validate_impacted_execution,
     validate_registry,
 )
 
@@ -327,3 +333,96 @@ class ScenarioHardGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ImpactedExecutionTests(unittest.TestCase):
+    """The PR gate enforces what a change can reach, not the whole catalog."""
+
+    def setUp(self) -> None:
+        self.registry = load_registry(REGISTRY_PATH)
+
+    def test_non_product_change_is_not_gated(self) -> None:
+        self.assertEqual(
+            validate_impacted_execution(
+                self.registry, ["docs/testing/scenario-registry.json"], "pull_request", REPO_ROOT
+            ),
+            [],
+        )
+
+    def test_impacted_cases_with_running_automation_pass(self) -> None:
+        errors = validate_impacted_execution(
+            self.registry, ["src/components/MessageList.tsx"], "pull_request", REPO_ROOT
+        )
+        self.assertEqual(errors, [])
+
+    def test_unrelated_catalog_debt_does_not_block_a_change_that_cannot_reach_it(self) -> None:
+        # validate_gate_readiness reports the whole catalog; running that on every
+        # product PR made the repository unmergeable. The per-change gate must not
+        # inherit it.
+        catalog = validate_gate_readiness(self.registry, "pull_request")
+        self.assertTrue(catalog, "expected the catalog sweep to still report debt")
+        reported = " ".join(
+            validate_impacted_execution(
+                self.registry, ["src/components/MessageList.tsx"], "pull_request", REPO_ROOT
+            )
+        )
+        for case_id in ("E2E-002", "E2E-003"):
+            self.assertNotIn(case_id, reported)
+
+    def test_a_case_covering_an_impacted_scenario_without_running_automation_fails(self) -> None:
+        registry = {
+            "scenarios": [
+                {
+                    "id": "X-001",
+                    "change_patterns": ["src/thing.ts"],
+                    "gates": ["pull_request"],
+                    "automated_by": ["path:src/thing.test.ts"],
+                }
+            ],
+            "complex_e2e_cases": [
+                {
+                    "id": "E2E-X",
+                    "covers": ["X-001"],
+                    "execution": {"pull_request": "designed only"},
+                    "automation_status": "designed",
+                    "automated_by": [],
+                    "remaining_gaps": ["no automation at all"],
+                }
+            ],
+            "gate_policy": self.registry["gate_policy"],
+        }
+        errors = validate_impacted_execution(registry, ["src/thing.ts"], "pull_request", REPO_ROOT)
+        self.assertTrue(any("E2E-X" in error for error in errors), errors)
+
+
+class TrustRootScopeTests(unittest.TestCase):
+    """A PR may not redefine its judge; it may still amend the CI it runs."""
+
+    def test_judge_root_is_a_subset_that_excludes_read_only_workflows(self) -> None:
+        self.assertTrue(set(JUDGE_ROOT_FILES) <= set(TRUST_ROOT_FILES))
+        self.assertNotIn(".github/workflows/ci.yml", JUDGE_ROOT_FILES)
+        self.assertIn("tools/governance/run_scenario_harness_gate.py", JUDGE_ROOT_FILES)
+
+    def _tree(self, root: Path) -> None:
+        for relative in TRUST_ROOT_FILES:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("original\n", encoding="utf-8")
+
+    def test_amending_ci_is_allowed_but_amending_the_runner_is_not(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            policy, candidate = base / "policy", base / "candidate"
+            self._tree(policy)
+            self._tree(candidate)
+
+            (candidate / ".github/workflows/ci.yml").write_text("changed\n", encoding="utf-8")
+            self.assertEqual(validate_trust_root_immutability(candidate, policy), [])
+
+            (candidate / "tools/governance/run_scenario_harness_gate.py").write_text(
+                "changed\n", encoding="utf-8"
+            )
+            errors = validate_trust_root_immutability(candidate, policy)
+            self.assertTrue(
+                any("run_scenario_harness_gate.py" in error for error in errors), errors
+            )

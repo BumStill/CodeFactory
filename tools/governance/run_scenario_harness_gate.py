@@ -22,6 +22,7 @@ from tools.governance.validate_scenario_test_governance import (
     load_registry,
     validate_change_contract,
     validate_gate_readiness,
+    validate_impacted_execution,
     validate_registry,
 )
 
@@ -31,6 +32,24 @@ TRUST_ROOT_FILES = (
     ".github/workflows/governance-baseline.yml",
     ".github/workflows/lock-independent-desktop-acceptance.yml",
     ".github/workflows/release.yml",
+    ".github/workflows/scenario-gate-policy.yml",
+    ".github/workflows/scenario-gate.yml",
+    "tools/governance/run_scenario_harness_gate.py",
+    "tools/governance/validate_scenario_test_governance.py",
+)
+
+# The subset that decides the candidate's verdict: the policy workflow, the
+# runner and validator it executes, and the ruleset naming the required checks.
+# A PR must not redefine these, because they are what judges it.
+#
+# The rest of TRUST_ROOT_FILES are workflows the gate merely *reads* to resolve
+# where a declared target runs. Byte-freezing those buys no protection that
+# base-branch execution does not already provide, and it makes CI permanently
+# unchangeable: with scenario-gate-policy.yml on the default branch,
+# is_initial_trust_bootstrap can never return true again, so there is no path
+# left to amend ci.yml or release.yml at all.
+JUDGE_ROOT_FILES = (
+    ".github/rulesets/main.json",
     ".github/workflows/scenario-gate-policy.yml",
     ".github/workflows/scenario-gate.yml",
     "tools/governance/run_scenario_harness_gate.py",
@@ -140,12 +159,18 @@ def validate_gate_surfaces(repo_root: Path, registry: dict) -> list[str]:
 
 
 def validate_trust_root_immutability(repo_root: Path, policy_root: Path) -> list[str]:
-    """Prevent an ordinary PR from redefining the gate that judges that PR."""
+    """Prevent an ordinary PR from redefining the gate that judges that PR.
+
+    Scoped to JUDGE_ROOT_FILES. The candidate's own copies of the workflows the
+    gate reads for evidence may differ from base — that is how a PR adds a new
+    hard gate at all — but nothing it ships can change the verdict logic
+    applied to it, which runs from the trusted base checkout.
+    """
 
     if repo_root == policy_root:
         return []
     errors: list[str] = []
-    for relative in TRUST_ROOT_FILES:
+    for relative in JUDGE_ROOT_FILES:
         candidate = repo_root / relative
         trusted = policy_root / relative
         try:
@@ -254,7 +279,17 @@ def main() -> int:
                 and is_initial_trust_bootstrap(repo_root, base_ref)
             )
             if product_files and not initial_bootstrap:
-                errors.extend(validate_gate_readiness(registry, "pull_request"))
+                # Per-change enforcement: what this change touches must be
+                # covered by automation that really runs. The catalog-wide
+                # readiness sweep stays on release_artifact, where unpaid L4
+                # debt genuinely must block the artifact — running it here
+                # would instead demand every catalog gap be closed before any
+                # product change could land at all.
+                errors.extend(
+                    validate_impacted_execution(
+                        registry, files, "pull_request", repo_root
+                    )
+                )
 
     if errors:
         print(f"scenario-harness-gate: {len(errors)} error(s)")

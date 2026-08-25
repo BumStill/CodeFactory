@@ -41,6 +41,8 @@ CodeFactory 现有测试数量很多，但场景分散在 Rust 测试、Vitest�
 | CF-STG-R19 | 每个登记的自动化 target 必须绑定到明确的 `pull_request`、`nightly` 或 `release_artifact` 阶段，且该阶段必须被场景自身声明；不能只证明文件/函数存在 | registry v2 `gate_policy.target_bindings` + stage validator |
 | CF-STG-R20 | PR 不得使用候选分支修改后的 validator 自证；可信 policy gate 必须使用默认分支 runner 只读检查候选树 | `scenario-gate-policy` |
 | CF-STG-R21 | base SHA、required run 或 live ruleset 状态无法读取时必须失败，不能 warning 后继续 | fail-closed runner + ruleset verifier |
+| CF-STG-R22 | PR 阶段只对**受影响**的场景与复杂用例强制「声明的自动化必须在该阶段真实执行」；目录级 readiness 扫描仅在 `release_artifact` 生效 | `validate_impacted_execution` + `validate_gate_readiness` |
+| CF-STG-R23 | 逐字节 trust root 只覆盖**审判该 PR 的文件**（policy workflow、runner、validator、ruleset）；被读取取证的 workflow 可由普通 PR 修改 | `JUDGE_ROOT_FILES` |
 
 ## Primary User Path
 

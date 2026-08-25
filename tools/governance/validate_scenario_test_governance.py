@@ -498,6 +498,77 @@ def validate_gate_readiness(registry: dict[str, Any], stage: str) -> list[str]:
     return errors
 
 
+def validate_impacted_execution(
+    registry: dict[str, Any],
+    files: list[str],
+    stage: str,
+    repo_root: Path,
+) -> list[str]:
+    """Require the scenarios a change touches to be covered by automation that
+    really runs at *stage*.
+
+    This is the per-change gate. It deliberately does not audit the whole
+    catalog: unrelated test debt stays visible in ``remaining_gaps`` without
+    blocking work that cannot re-break it. What it will not tolerate is a
+    change landing next to a scenario whose declared automation never
+    executes — declaring a target and never running it is what let fixed
+    scenarios quietly regress. ``_automation_gate_stages`` resolves each
+    target against the workflow files, so a declaration alone is not enough.
+
+    The catalog-wide readiness sweep still applies at ``release_artifact``,
+    where L4 debt genuinely must be paid before an artifact ships.
+    """
+
+    product_files = [path for path in files if _is_product_file(path)]
+    if not product_files:
+        return []
+    impacted = _impacted_scenarios(product_files, registry)
+    if not impacted:
+        # validate_change_contract already fails closed on unmapped product
+        # files; do not report the same gap twice.
+        return []
+
+    gate_policy = registry.get("gate_policy") or {}
+    errors: list[str] = []
+
+    for scenario in registry.get("scenarios", []):
+        if scenario.get("id") not in impacted:
+            continue
+        if stage not in set(scenario.get("gates") or []):
+            continue
+        running = [
+            target
+            for target in scenario.get("automated_by") or []
+            if stage in _automation_gate_stages(target, gate_policy, repo_root)
+        ]
+        if not running:
+            errors.append(
+                f"{scenario.get('id')} is impacted by this change but no declared "
+                f"target actually runs at {stage}"
+            )
+
+    for case in registry.get("complex_e2e_cases", []):
+        if stage not in (case.get("execution") or {}):
+            continue
+        if not (set(case.get("covers") or []) & impacted):
+            continue
+        running = [
+            target
+            for target in case.get("automated_by") or []
+            if stage in _automation_gate_stages(target, gate_policy, repo_root)
+        ]
+        if not running:
+            covered = ", ".join(sorted(set(case.get("covers") or []) & impacted))
+            errors.append(
+                f"{case.get('id')} covers impacted scenario(s) {covered} but no "
+                f"declared target actually runs at {stage} "
+                f"(status={case.get('automation_status')}, "
+                f"remaining_gaps={len(case.get('remaining_gaps') or [])})"
+            )
+
+    return errors
+
+
 def _is_product_file(path: str) -> bool:
     if path in GLOBAL_PRODUCT_FILES:
         return True
