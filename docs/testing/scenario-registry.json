@@ -348,6 +348,7 @@
       "name": "用户离开后长任务跨进程自动完成",
       "priority": "P0",
       "covers": ["HLT-001", "HLT-002", "CXD-002"],
+      "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/unattended_smoke.rs", "src-tauri/crates/agent-loop/src/*.rs", "src-tauri/src/commands/chat.rs"],
       "must_remain_unattended": true,
       "fixture": {"synthetic": true, "shape": "多文件仓库、失败测试、一次幂等写入、确定性 provider 轨迹"},
       "steps": [
@@ -368,6 +369,7 @@
       "execution": {"pull_request": "deterministic Windows process smoke", "nightly": "fault matrix", "release_artifact": "exact Windows executable"},
       "automation_status": "partially_implemented",
       "automated_by": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"], "remaining_gaps": []},
       "remaining_gaps": ["L2 PR 门禁只跑 Windows 进程 smoke，macOS 侧同一路径未自动化", "L3 真实桌面会话内的无人值守完成尚未自动化，现仅覆盖 headless worker", "L4 exact release artifact 的 macOS 安装版 canary 尚未接入"]
     },
     {
@@ -375,6 +377,7 @@
       "name": "历史 session 简短继续精确续接",
       "priority": "P0",
       "covers": ["HLT-003", "CXD-001", "UI-003", "UI-005"],
+      "change_patterns": ["src-tauri/src/commands/chat.rs", "src-tauri/src/commands/session.rs", "src-tauri/src/agent/history_session_smoke.rs", "src/stores/chat.ts", "src/stores/chatEvents.ts", "src/pages/Workspace/WorkspacePage.tsx"],
       "fixture": {"synthetic": true, "shape": "旧版本 SQLite、分页历史消息、唯一开放 objective、无内存 run control"},
       "steps": [
         "由旧 schema fixture 启动真实 App",
@@ -393,7 +396,8 @@
       },
       "execution": {"pull_request": "SQLite plus native UI integration", "nightly": "old-schema matrix", "release_artifact": "installed historical-session canary"},
       "automation_status": "partially_implemented",
-      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
+      "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "pnpm:test:startup-session:headless", "workflow:Verify Windows release executable historical session restart"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "pnpm:test:startup-session:headless"], "remaining_gaps": []},
       "remaining_gaps": ["L3 真实桌面 WebView 中选择历史 session、发送继续并观察即时 stream projection", "旧 schema fixture 迁移矩阵仍需扩展"]
     },
     {
@@ -401,6 +405,7 @@
       "name": "显式停止清除整个 session 并跨重启保持",
       "priority": "P0",
       "covers": ["HLT-004", "UI-003", "UI-005"],
+      "change_patterns": ["src-tauri/src/commands/chat.rs", "src-tauri/src/agent/objective.rs", "src-tauri/src/agent/history_session_smoke.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
       "fixture": {"synthetic": true, "shape": "一个 session 拥有多个不同页上的非终态 objectives"},
       "steps": [
         "启动真实 App 并打开历史 session",
@@ -420,6 +425,7 @@
       "execution": {"pull_request": "race-focused integration", "nightly": "real App restart", "release_artifact": "Windows installed/manual canary until automated"},
       "automation_status": "partially_implemented",
       "automated_by": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke", "workflow:Verify Windows release executable historical session restart"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke"], "remaining_gaps": []},
       "remaining_gaps": ["L3 真实桌面 WebView 中点击停止、失败态和 persisted cancelled projection", "partial projection failure 与真实 UI listener 并发仍需桌面自动化"]
     },
     {
@@ -427,6 +433,7 @@
       "name": "长任务中追加约束并完成完整交付链",
       "priority": "P1",
       "covers": ["CXD-001", "CXD-002", "HLT-001"],
+      "change_patterns": ["src-tauri/src/agent/delivery*.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/src/commands/chat.rs"],
       "fixture": {"synthetic": true, "shape": "有预存用户改动的 Git 仓库、失败测试、可控 CI 和 artifact receipt"},
       "steps": [
         "用户授权实现并发布一个多文件改动",
@@ -452,6 +459,7 @@
       "name": "浏览器逻辑失败后回收并可继续任务",
       "priority": "P0",
       "covers": ["RTE-001", "HLT-001"],
+      "change_patterns": ["src-tauri/src/browser/*.rs", "src-tauri/src/tools/browser*.rs", "src-tauri/src/agent/objective_supervisor.rs"],
       "fixture": {"synthetic": true, "shape": "受管浏览器任务、故意返回逻辑失败的 CLI、后续非浏览器验证步骤"},
       "steps": [
         "长任务租用唯一受管浏览器 session",
@@ -469,14 +477,17 @@
         "delivery": ["receipt 同时记录 snapshot、failure detection 和 cleanup"]
       },
       "execution": {"pull_request": "real process lifecycle smoke", "nightly": "failure/retry matrix", "release_artifact": "exact binary smoke"},
-      "automation_status": "designed",
-      "remaining_gaps": ["尚无任何自动化：PR 的 real process lifecycle smoke、nightly 的 failure/retry matrix、release 的 exact binary smoke 均未实现", "浏览器逻辑失败后的回收与任务续接未自动验证", "既有 browser smoke 覆盖的是会话建立，不覆盖本场景的失败回收路径，因此不作声明"]
+      "automation_status": "partially_implemented",
+      "automated_by": ["rust:browser_lease_reclaim_does_not_spend_budget_and_safe_continuation_settles", "binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:browser_lease_reclaim_does_not_spend_budget_and_safe_continuation_settles", "binary:--browser-session-smoke", "workflow:Browser session lifecycle smoke"], "remaining_gaps": []},
+      "remaining_gaps": ["nightly 的 failure/retry matrix 尚未实现", "release 的 exact binary smoke 尚未实现"]
     },
     {
       "id": "E2E-006",
       "name": "历史卡住任务存在时仍可完成应用更新",
       "priority": "P0",
       "covers": ["HLT-001", "HLT-004", "UI-005"],
+      "change_patterns": ["src-tauri/src/commands/update*.rs", "src-tauri/src/agent/update*.rs", "src-tauri/migrations/*.sql", ".github/workflows/release.yml"],
       "fixture": {"synthetic": true, "shape": "旧版本安装、持久 waiting_system objective、可控 updater manifest 和新版本安装包"},
       "steps": [
         "旧版本创建可恢复但尚未完成的历史 objective",
@@ -502,6 +513,7 @@
       "name": "计划拒绝与只读误判后恢复耗尽一致收敛",
       "priority": "P0",
       "covers": ["HLT-002", "HLT-005", "UI-003", "UI-005"],
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/tool_backend.rs", "src-tauri/src/agent/history_session_smoke.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/commands/session.rs", "src/stores/chat.ts", "src/stores/chatEvents.ts", "src/lib/turnOwnership.ts", "src/components/MessageList.tsx", "src/acceptance/turn-handback.tsx"],
       "fixture": {"synthetic": true, "shape": "已有计划、缺 change_reason 的更新、strict-mode 只读审计、同一 root 的多 assistant segment 与 steer、waiting/running tool、unknown 历史 receipt 及随后 active 新 root"},
       "steps": [
         "真实 ToolBackend 拒绝无 change_reason 的结构变化且不创建外部 receipt",
@@ -523,6 +535,7 @@
       "execution": {"pull_request": "ToolBackend/SQLite/browser integration", "nightly": "cross-process restart", "release_artifact": "exact Windows executable plus installed desktop canary"},
       "automation_status": "partially_implemented",
       "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:committed_terminal_projection_rejects_an_advanced_objective", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/lib/turnOwnership.test.ts", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:committed_terminal_projection_rejects_an_advanced_objective", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/lib/turnOwnership.test.ts", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "workflow:Historical session continue/stop/incident cross-process smoke"], "remaining_gaps": []},
       "remaining_gaps": ["L3 真实桌面 WebView 中以正式 session 数据走完整 provider recovery exhaustion", "macOS 安装版仍需绑定 exact release SHA 的人工 canary"]
     },
     {
@@ -530,6 +543,7 @@
       "name": "浏览器扩展空闲、瞬断与多连接交错后同一会话自动续接",
       "priority": "P0",
       "covers": ["RTE-002", "RTE-003", "UI-012"],
+      "change_patterns": ["src-tauri/src/browser/bridge.rs", "src-tauri/src/browser/extension.rs", "src-tauri/src/tools/browser_session.rs", "extension/background.js", "extension/options.js", "src/lib/browserExtension.test.ts", "src/pages/Settings/SettingsPage.browser.test.tsx"],
       "fixture": {"synthetic": true, "shape": "受管 Chrome profile、真实 MV3 扩展、本地可读页面、持久 attached lease 与可编排 loopback bridge"},
       "steps": [
         "真实扩展仅靠 pairing 文件完成鉴权并以同一 session attach、选择合成页面 tab",
@@ -549,6 +563,7 @@
       "execution": {"pull_request": "deterministic loopback generation and fake-clock heartbeat", "nightly": "native managed-profile extension lifecycle smoke", "release_artifact": "exact installed App plus existing extension upgrade/restart canary"},
       "automation_status": "partially_implemented",
       "automated_by": ["rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:a_command_timeout_evicts_the_half_open_connection", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "path:src/lib/browserExtension.test.ts", "path:src/pages/Settings/SettingsPage.browser.test.tsx"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:a_command_timeout_evicts_the_half_open_connection", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "path:src/lib/browserExtension.test.ts", "path:src/pages/Settings/SettingsPage.browser.test.tsx"], "remaining_gaps": []},
       "remaining_gaps": ["L2 --browser-extension-lifecycle-smoke 尚未实现", "L3 真实 CodeFactoryDev 会话内断线续接尚未自动化", "L4 exact release artifact 的扩展升级与重启 canary 尚未接入"]
     },
     {
@@ -556,6 +571,7 @@
       "name": "dirty 旧分支根目录上的新代码任务全程隔离并安全交付",
       "priority": "P0",
       "covers": ["RTE-004", "CXD-002", "HLT-001"],
+      "change_patterns": ["src-tauri/src/agent/execution_workspace.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/migrations/*execution_workspace*.sql"],
       "must_remain_unattended": true,
       "fixture": {"synthetic": true, "shape": "根 checkout 停在已有 terminal PR 的旧分支并有未提交文件，远端默认分支更新，两个并发代码 Objective"},
       "steps": [
@@ -576,6 +592,7 @@
       },
       "execution": {"pull_request": "real Git plus SQLite integration", "nightly": "cross-process fake-forge lifecycle", "release_artifact": "exact installed App CodeFactoryDev-equivalent canary"},
       "automation_status": "designed",
+      "pull_request_gate": {"status": "designed", "required_targets": [], "remaining_gaps": ["real Git plus SQLite integration 尚未实现"]},
       "remaining_gaps": ["尚无任何自动化：PR 的 real Git + SQLite integration 未实现", "L2 hard-kill reservation reconciliation", "L3 真实 CodeFactoryDev 双会话并发", "L4 exact release artifact closeout canary"]
     },
     {
@@ -583,6 +600,7 @@
       "name": "同机 Skill 命令失败后自主诊断、修正并完成",
       "priority": "P0",
       "covers": ["HLT-001", "HLT-005"],
+      "change_patterns": ["src-tauri/src/commands/skills.rs", "src-tauri/src/commands/skill_fs.rs", "src-tauri/src/tools/skill_mgmt.rs", "src-tauri/src/agent/tool_backend.rs", "src-tauri/src/agent/mod.rs", "src-tauri/crates/agent-loop/src/*.rs"],
       "fixture": {"synthetic": true, "shape": "同机安装的外部 Skill，包含 scripts、references、assets；首次命令使用错误参数或在 Windows 超时，随后暴露安装目录、真实可执行文件、help 与确定性 version 输出"},
       "steps": [
         "从本地目录或 Git 形状安装 Skill，删除导入临时源后确认嵌套资源仍在稳定 skill_root",
@@ -602,6 +620,7 @@
       "execution": {"pull_request": "Rust integration plus isolated CodeFactoryDev canary", "nightly": "two-process SQLite restart smoke", "release_artifact": "exact installed App Skill import and command-recovery canary"},
       "automation_status": "partially_implemented",
       "automated_by": ["rust:local_directory_install_survives_source_cleanup_with_nested_resources", "rust:symlinked_skill_payload_fails_closed_without_replacing_existing_install", "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:timed_out_skill_install_allows_two_complementary_windows_diagnostics_then_correction", "rust:powershell_skill_location_and_executable_checks_are_timeout_diagnostics", "rust:evidence_based_timeout_change_is_not_an_unchanged_retry", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:command_failure_envelope_survives_file_sqlite_restart", "rust:effect_free_unknown_provider_transport_resumes_before_exhaustion_and_after_restart"],
+      "pull_request_gate": {"status": "partially_implemented", "required_targets": ["rust:local_directory_install_survives_source_cleanup_with_nested_resources", "rust:symlinked_skill_payload_fails_closed_without_replacing_existing_install", "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:timed_out_skill_install_allows_two_complementary_windows_diagnostics_then_correction", "rust:powershell_skill_location_and_executable_checks_are_timeout_diagnostics", "rust:evidence_based_timeout_change_is_not_an_unchanged_retry", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:command_failure_envelope_survives_file_sqlite_restart", "rust:effect_free_unknown_provider_transport_resumes_before_exhaustion_and_after_restart"], "remaining_gaps": ["isolated CodeFactoryDev canary 尚未绑定到 PR required check"]},
       "remaining_gaps": ["L2 独立二进制 hard-kill smoke 尚未接入 nightly", "L4 exact release 安装版单消息 canary 待本次 release 执行"]
     },
     {
@@ -609,6 +628,7 @@
       "name": "DeliveryRun 本地提交掉线续接与外来身份有界停泊",
       "priority": "P0",
       "covers": ["HLT-001", "HLT-002", "HLT-005", "CXD-002"],
+      "change_patterns": ["src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/src/agent/objective.rs"],
       "must_remain_unattended": true,
       "fixture": {"synthetic": true, "shape": "真实 Git worktree、bare remote、生产 SQLite、同一 DeliveryRun 的本地 commit write-ahead receipt 与另一个无 receipt 外来 commit"},
       "steps": [
@@ -629,6 +649,7 @@
       "execution": {"pull_request": "exact executable real Git/SQLite smoke", "nightly": "Windows hard-kill and bounded-park matrix", "release_artifact": "exact Windows executable; installed macOS recovery and visible UI remain release canaries"},
       "automation_status": "partially_implemented",
       "automated_by": ["rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:committed_branch_update_recovers_from_merged_pr_ref_after_head_branch_deletion_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke", "workflow:Verify Windows release executable DeliveryRun recovery"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:committed_branch_update_recovers_from_merged_pr_ref_after_head_branch_deletion_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke"], "remaining_gaps": []},
       "remaining_gaps": ["L3 正式桌面会话内尚未把本场景 synthetic DeliveryRun 绑定到可见 spinner/Stop/停泊文案自动验收", "macOS 公开安装包中的 --delivery-recovery-smoke 仍需在 release canary 执行并绑定 exact tag SHA"]
     }
   ]

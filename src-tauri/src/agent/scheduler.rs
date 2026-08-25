@@ -1888,6 +1888,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(claims.len(), 1, "each handoff must buy one real task retry");
+            assert!(
+                ObjectiveStore::new(pool.clone())
+                    .charge_claimed_remediation_attempt(
+                        &objective.id,
+                        &claims[0].remediation_id,
+                        "task-ceiling-test",
+                        claims[0].claim_epoch,
+                    )
+                    .await
+                    .unwrap(),
+                "the executable retry must still own the exact claim"
+            );
             ObjectiveStore::new(pool.clone())
                 .defer_claimed_remediation(
                     &objective.id,

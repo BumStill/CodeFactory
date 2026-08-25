@@ -501,6 +501,26 @@ where
             adapter.domain().as_str()
         )));
     }
+    let charged = store
+        .charge_claimed_remediation_attempt(
+            &claim.objective.id,
+            &claim.remediation_id,
+            &permit.owner,
+            permit.claim_epoch,
+        )
+        .await
+        .map_err(|error| {
+            crate::errors::AppError::Other(format!(
+                "{} adapter could not charge its exact recovery attempt: {error}",
+                adapter.domain().as_str()
+            ))
+        })?;
+    if !charged {
+        return Err(crate::errors::AppError::Other(format!(
+            "{} adapter claim changed before execution; fenced",
+            adapter.domain().as_str()
+        )));
+    }
 
     execute(executor).await
 }
@@ -1190,8 +1210,9 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
 mod tests {
     use super::*;
     use crate::agent::objective::{
-        CreateObjective, DecisionRouter, ObjectiveKind, ObjectiveSnapshot, ObjectiveStatus,
-        RecoveryDomain, RouteSignal, MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+        CompletionArbiter, CreateObjective, DecisionRouter, EvidenceKind, ObjectiveEvidence,
+        ObjectiveKind, ObjectiveSnapshot, ObjectiveStatus, RecoveryDomain, RouteSignal,
+        MAX_SIGNATURE_RECOVERY_ATTEMPTS,
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::{
@@ -2050,6 +2071,144 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn browser_lease_reclaim_does_not_spend_budget_and_safe_continuation_settles() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-browser-reclaim".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("session-browser-reclaim".into()),
+                root_turn_id: None,
+                domain: RecoveryDomain::Browser,
+                requested_acceptance: "informational_answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("UPDATE objectives SET task_id='task-browser-reclaim' WHERE id=?")
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, created_at, updated_at)
+             VALUES ('binding-browser-reclaim', ?, 'browser', 'browser_session',
+                     'browser-session-reclaimed', 1, 'sha256:browser-reclaim', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Browser,
+                failure_code: "browser_external_state_uncertain".into(),
+                failure_signature: "sha256:browser-reclaim".into(),
+                next_observation_at: now - 1,
+                resume_cursor: Some("browser-session-reclaimed".into()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE objective_remediations SET binding_id='binding-browser-reclaim'
+             WHERE objective_id=?",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let first_claim = store
+            .claim_due_remediations("browser-owner-old", 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        sqlx::query(
+            "UPDATE objective_remediations SET lease_expires_at=? WHERE id=?",
+        )
+        .bind(now - 1)
+        .bind(&first_claim.remediation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let replacement = store
+            .claim_due_remediations("browser-owner-new", 1, 30_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(replacement.claim_epoch > first_claim.claim_epoch);
+        let attempts_before_execute: i64 = sqlx::query_scalar(
+            "SELECT execution_attempt_index FROM objective_remediations WHERE id=?",
+        )
+        .bind(&replacement.remediation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts_before_execute, 0, "lease takeover is not execution");
+
+        let adapter = DEFAULT_ADAPTER_REGISTRY
+            .adapter_for(RecoveryDomain::Browser)
+            .unwrap();
+        let permit = mutation_permit(&replacement, "browser-owner-new");
+        drive_adapter(adapter, &store, &replacement, &permit, |executor| async move {
+            assert_eq!(executor, AdapterExecutor::Browser);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let attempts_after_execute: i64 = sqlx::query_scalar(
+            "SELECT execution_attempt_index FROM objective_remediations WHERE id=?",
+        )
+        .bind(&replacement.remediation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts_after_execute, 1);
+
+        let completion = CompletionArbiter::decide(
+            &replacement.objective,
+            &[ObjectiveEvidence {
+                id: "evidence-browser-safe-continuation".into(),
+                kind: EvidenceKind::InformationalAnswer,
+                scope: "browser-session-reclaimed".into(),
+                digest: "sha256:browser-safe-continuation".into(),
+                evidence_ref: "smoke:browser-safe-continuation".into(),
+                observed_at: chrono::Utc::now().timestamp_millis(),
+                reached_acceptance: "informational_answer".into(),
+            }],
+        )
+        .unwrap();
+        let completed = store
+            .apply_claimed_decision(replacement.objective.revision, completion, &permit)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ObjectiveStatus::Completed);
+    }
+
     #[test]
     fn context_recovery_is_an_executable_registered_capability() {
         assert!(domain_has_executable_adapter(RecoveryDomain::Context));
@@ -2296,7 +2455,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp_millis();
         sqlx::query(
             "UPDATE objective_remediations
-             SET status='waiting', attempt_index=?, next_observation_at=?,
+             SET status='waiting', execution_attempt_index=?, next_observation_at=?,
                  lease_owner=NULL, lease_expires_at=NULL
              WHERE id=?",
         )
