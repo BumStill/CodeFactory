@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Scenario impact gate live canary: E2E-005 must block this unverified change.
 //! CodeFactory-owned browser sessions.
 //!
 //! A browser is an owned task resource, not an incidental side effect of a
