@@ -37,6 +37,8 @@ import { formatRelativeTime } from "../lib/time";
 import { buildSessionRail } from "../lib/projects";
 import type { Session } from "../lib/tauri";
 
+const SESSION_ACTIVITY_REFRESH_MS = 2_000;
+
 interface SessionSidebarProps {
   /** The conversation currently open in the workspace (highlighted). */
   currentSessionId: string;
@@ -58,6 +60,7 @@ export function SessionSidebar({
   collapseLabel = "收起会话侧栏",
 }: SessionSidebarProps) {
   const sessions = useChatStore((s) => s.sessions);
+  const runtime = useChatStore((s) => s.runtime);
   const draftSession = useChatStore((s) => s.draftSession);
   const loadSessions = useChatStore((s) => s.loadSessions);
   const deleteSession = useChatStore((s) => s.deleteSession);
@@ -65,8 +68,13 @@ export function SessionSidebar({
 
   // Load the (single, unified) session list when the sidebar first mounts.
   useEffect(() => {
-    void loadSessions();
-  }, []);
+    const refresh = () => {
+      if (document.visibilityState !== "hidden") void loadSessions();
+    };
+    refresh();
+    const timer = window.setInterval(refresh, SESSION_ACTIVITY_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [loadSessions]);
 
   const [query, setQuery] = useState("");
   const filteredSessions = useMemo(() => {
@@ -186,6 +194,13 @@ export function SessionSidebar({
                   cwd={entry.project.cwd}
                   count={entry.project.sessions.length}
                   expanded={isExpanded(entry.project.cwd)}
+                  running={entry.project.sessions.some(
+                    (session) =>
+                      runtime[session.id]?.streaming === true || session.is_running === true,
+                  )}
+                  waitingPermission={entry.project.sessions.some(
+                    (session) => runtime[session.id]?.pendingPermission != null,
+                  )}
                   onToggle={() => toggleProject(entry.project.cwd)}
                   onNewConversation={() => {
                     setExpandedProjects((prev) => ({ ...prev, [entry.project.cwd]: true }));
@@ -230,6 +245,8 @@ function ProjectRow({
   cwd,
   count,
   expanded,
+  running,
+  waitingPermission,
   onToggle,
   onNewConversation,
   children,
@@ -238,6 +255,8 @@ function ProjectRow({
   cwd: string;
   count: number;
   expanded: boolean;
+  running: boolean;
+  waitingPermission: boolean;
   onToggle: () => void;
   onNewConversation: () => void;
   children: React.ReactNode;
@@ -261,6 +280,19 @@ function ProjectRow({
           <span className="min-w-0 flex-1 truncate text-note font-medium text-gray-200">
             {name}
           </span>
+          {!expanded && waitingPermission ? (
+            <ShieldQuestion
+              size={14}
+              className="shrink-0 text-status-warning"
+              aria-label="项目内有会话等待批准"
+            />
+          ) : !expanded && running ? (
+            <Loader2
+              size={14}
+              className="shrink-0 animate-spin text-status-progress motion-reduce:animate-none"
+              aria-label="项目内有会话运行中"
+            />
+          ) : null}
           <span className="shrink-0 text-caption tabular-nums text-gray-600">{count}</span>
         </button>
         <button
@@ -299,6 +331,7 @@ function SessionRow({
   // Per-session streaming indicator: with concurrent sessions, any row may be
   // mid-stream even when it's not the foreground one.
   const streaming = useChatStore((s) => s.runtime?.[session.id]?.streaming ?? false);
+  const running = streaming || session.is_running === true;
   const waitingPermission = useChatStore(
     (s) => s.runtime?.[session.id]?.pendingPermission != null,
   );
@@ -332,7 +365,7 @@ function SessionRow({
   const title = session.title || "未命名会话";
   const statusIndicator = waitingPermission ? (
     <ShieldQuestion size={14} className="shrink-0 text-status-warning" aria-label="等待批准" />
-  ) : streaming ? (
+  ) : running ? (
     <Loader2
       size={14}
       className="shrink-0 animate-spin text-status-progress motion-reduce:animate-none"

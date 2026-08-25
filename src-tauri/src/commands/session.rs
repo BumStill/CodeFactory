@@ -12,6 +12,16 @@ use crate::session_title::{
 use crate::storage::{Message, Session};
 use crate::AppState;
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct SessionListItem {
+    #[serde(flatten)]
+    #[sqlx(flatten)]
+    session: Session,
+    /// Durable activity survives a WebView/App reload, unlike the frontend's
+    /// per-session streaming bucket.
+    is_running: bool,
+}
+
 fn validate_model_policy(policy: &str) -> Result<(), AppError> {
     if matches!(policy, "fixed" | "prefer" | "auto") {
         Ok(())
@@ -199,15 +209,40 @@ pub async fn materialize_draft_session(
 /// Subagent-spawned children stay excluded — those are machinery, not sessions
 /// the user opened.
 #[tauri::command]
-pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<Session>, AppError> {
+pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionListItem>, AppError> {
+    // Match `is_chat_running`: a foreground run may exist briefly before (or
+    // while settling after) its durable objective projection. Snapshot the
+    // in-memory owners without holding their lock across the SQLite query.
+    let foreground_running = state
+        .chat_cancels
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
     let pool = state.db.read().await;
-    let sessions = sqlx::query_as::<_, Session>(
-        "SELECT * FROM sessions \
-         WHERE parent_session_id IS NULL \
-         ORDER BY updated_at DESC LIMIT 200",
+    let mut sessions = sqlx::query_as::<_, SessionListItem>(
+        "SELECT session.*,
+                CASE WHEN running.session_id IS NULL THEN 0 ELSE 1 END AS is_running
+         FROM sessions session
+         LEFT JOIN (
+             SELECT DISTINCT objective.session_id
+             FROM objectives objective
+             WHERE objective.root_turn_id IS NOT NULL
+               AND objective.status IN ('active','waiting_system')
+               AND NOT (objective.status='waiting_system'
+                        AND objective.failure_code='technical_recovery_exhausted')
+         ) running ON running.session_id=session.id
+         WHERE session.parent_session_id IS NULL
+         ORDER BY session.updated_at DESC LIMIT 200",
     )
     .fetch_all(&*pool)
     .await?;
+    for session in &mut sessions {
+        if foreground_running.contains(&session.session.id) {
+            session.is_running = true;
+        }
+    }
     Ok(sessions)
 }
 

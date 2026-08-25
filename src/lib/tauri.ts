@@ -208,6 +208,8 @@ export interface Session {
   permission_mode?: PermissionMode;
   /** Per-session reasoning effort override; null/undefined → global default. */
   reasoning_effort?: ReasoningEffort | null;
+  /** SQLite-authoritative activity used to restore sidebar state after reload. */
+  is_running?: boolean;
 }
 
 export interface Message {
