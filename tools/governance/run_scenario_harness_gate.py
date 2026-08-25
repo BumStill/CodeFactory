@@ -22,6 +22,7 @@ from tools.governance.validate_scenario_test_governance import (
     load_registry,
     validate_change_contract,
     validate_gate_readiness,
+    validate_impacted_execution,
     validate_registry,
 )
 
@@ -36,7 +37,6 @@ TRUST_ROOT_FILES = (
     "tools/governance/run_scenario_harness_gate.py",
     "tools/governance/validate_scenario_test_governance.py",
 )
-
 
 def _read(path: Path) -> str:
     try:
@@ -140,7 +140,13 @@ def validate_gate_surfaces(repo_root: Path, registry: dict) -> list[str]:
 
 
 def validate_trust_root_immutability(repo_root: Path, policy_root: Path) -> list[str]:
-    """Prevent an ordinary PR from redefining the gate that judges that PR."""
+    """Prevent an ordinary PR from redefining its judge or required execution.
+
+    The protected CI/release workflows are part of the trust root because their
+    required contexts are the proof that declared targets actually ran. Letting
+    a candidate rewrite those workflows would let it leave target names in
+    comments or skipped steps and self-attest green.
+    """
 
     if repo_root == policy_root:
         return []
@@ -254,7 +260,17 @@ def main() -> int:
                 and is_initial_trust_bootstrap(repo_root, base_ref)
             )
             if product_files and not initial_bootstrap:
-                errors.extend(validate_gate_readiness(registry, "pull_request"))
+                # Per-change enforcement: what this change touches must be
+                # covered by automation that really runs. The catalog-wide
+                # readiness sweep stays on release_artifact, where unpaid L4
+                # debt genuinely must block the artifact — running it here
+                # would instead demand every catalog gap be closed before any
+                # product change could land at all.
+                errors.extend(
+                    validate_impacted_execution(
+                        registry, files, "pull_request", repo_root
+                    )
+                )
 
     if errors:
         print(f"scenario-harness-gate: {len(errors)} error(s)")

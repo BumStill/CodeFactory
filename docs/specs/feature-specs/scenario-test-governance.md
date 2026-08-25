@@ -41,6 +41,8 @@ CodeFactory 现有测试数量很多，但场景分散在 Rust 测试、Vitest�
 | CF-STG-R19 | 每个登记的自动化 target 必须绑定到明确的 `pull_request`、`nightly` 或 `release_artifact` 阶段，且该阶段必须被场景自身声明；不能只证明文件/函数存在 | registry v2 `gate_policy.target_bindings` + stage validator |
 | CF-STG-R20 | PR 不得使用候选分支修改后的 validator 自证；可信 policy gate 必须使用默认分支 runner 只读检查候选树 | `scenario-gate-policy` |
 | CF-STG-R21 | base SHA、required run 或 live ruleset 状态无法读取时必须失败，不能 warning 后继续 | fail-closed runner + ruleset verifier |
+| CF-STG-R22 | PR 阶段只对**受影响**的场景与复杂用例强制「PR slice 已实现、无 PR gap、全部 required targets 在该阶段真实执行」；目录级 readiness 扫描仅在 `release_artifact` 生效 | `pull_request_gate` + `validate_impacted_execution` |
+| CF-STG-R23 | 逐字节 trust root 同时覆盖审判逻辑和提供执行证据的 required workflow；普通候选 PR 不得把测试改成空跑后自证 | `TRUST_ROOT_FILES` + external governance bootstrap |
 
 ## Primary User Path
 
@@ -179,7 +181,7 @@ Scenario-Test: HLT-003, HLT-004
 
 ## Gate 策略
 
-- PR：所有 active Scenario 都有明确 `pull_request` 绑定；required checks 是 `scenario-gate-policy`、`scenario-gate-pr` 及其绑定的 Rust/frontend/真实 App checks。产品变更遇到任一 `designed`/`partially_implemented` Complex E2E 时冻结，不能把测试债务计作绿色。
+- PR：所有 active Scenario 都有明确 `pull_request` 绑定；required checks 是 `scenario-gate-policy`、`scenario-gate-pr` 及其绑定的 Rust/frontend/真实 App checks。只计算 diff 直接命中的 Scenario 与 Complex E2E；其中任一 `pull_request_gate` 为 `designed`/`partially_implemented`、仍有 PR gap 或 required target 未真实执行时冻结。无关目录的测试债务不阻断该 PR。
 - Nightly：运行旧 schema、故障矩阵、真实 App restart 和 fake-forge 组合场景。
 - Release：`scenario-gate-release` 在创建/复用 draft 前检查所有 exact-artifact case；任一 L4 缺口阻止公开产物。
 - Manual canary：只能补充自动化 hard gate，不能是 active Scenario 的唯一门禁。
@@ -205,7 +207,7 @@ Scenario-Test: HLT-003, HLT-004
 
 1. 已完成：统一 26 个场景和 11 个复杂 E2E，schema v2 将全部自动化 target 绑定到明确 gate；
 2. 已完成：新增 trusted policy + PR aggregate required contexts、本地统一 hooks、全优先级 change contract 与 fail-closed base SHA；
-3. 当前 gate debt：11 个 Complex E2E 均未达到 `implemented`；在债务清零前，普通产品变更和 release 被明确冻结，债务清理必须作为一个使 active PR debt 全部归零的原子批次，不得把缺口改写成 waiver；
+3. 当前 gate debt：按每个 Complex E2E 的 `pull_request_gate` 分别记录；产品 PR 只需清零本 diff 直接命中的 PR slice，release 仍执行目录级 L4 readiness。不得把受影响缺口改写成 waiver，也不得要求无关 PR 先清全目录债务；
 4. 逐项补齐真实 Supervisor wake、跨进程 SQLite、并发 finalization、真实 WebView、浏览器 lifecycle、fake-forge 和 exact artifact receipts，并把 case 提升为 `implemented`；
 5. 全部清零后保持 PR 与 release gate 常开，nightly 只扩展故障矩阵，不再替代 required gate。
 
@@ -217,7 +219,7 @@ Scenario-Test: HLT-003, HLT-004
 - 原历史场景目录不再维护第二份场景数据，只保留 canonical registry 指针；
 - 26 个现有场景和 11 个复杂 E2E 可由机器读取，所有 target 都能解析到明确 hard gate；
 - E2E-001 明确保证无人参与执行；
-- 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`，且 required gate 对产品变更/发布返回失败。
+- 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`。PR 额外使用 `pull_request_gate` 区分该阶段是否完整：受影响且未完成时失败，无关 case 不参与该 PR 结论；release 仍按全目录 readiness 失败。
 
 ## 风险与边界
 
