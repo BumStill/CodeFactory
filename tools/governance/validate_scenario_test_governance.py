@@ -559,17 +559,36 @@ def validate_change_contract(
     return errors
 
 
-def _event_body_and_title(path: str | None) -> tuple[str, str]:
+def _event_change_contract_context(
+    path: str | None,
+) -> tuple[bool | None, str, str]:
     if not path or not Path(path).exists():
-        return "", ""
+        return None, "", ""
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return "", ""
+        return None, "", ""
     pull_request = payload.get("pull_request")
-    if not isinstance(pull_request, dict):
-        return "", ""
-    return pull_request.get("body") or "", pull_request.get("title") or ""
+    if isinstance(pull_request, dict):
+        return (
+            True,
+            pull_request.get("body") or "",
+            pull_request.get("title") or "",
+        )
+    # A protected-branch push has no PR body. Its exact candidate already ran
+    # the change contract as a required PR check; the post-merge workflow must
+    # still validate the registry itself without inventing a missing body.
+    if isinstance(payload.get("ref"), str) and (
+        "before" in payload or "after" in payload
+    ):
+        return False, "", ""
+    return None, "", ""
+
+
+def _event_body_and_title(path: str | None) -> tuple[str, str]:
+    """Compatibility helper for the PR-only scenario harness runner."""
+    _, body, title = _event_change_contract_context(path)
+    return body, title
 
 
 def _changed_files(repo_root: Path, base_sha: str) -> tuple[list[str], str | None]:
@@ -607,21 +626,26 @@ def main() -> int:
     errors = validate_registry(registry, repo_root)
 
     if args.ci:
+        requires_change_contract: bool | None
         if args.body_file:
             body = Path(args.body_file).read_text(encoding="utf-8")
             title = args.title or ""
+            requires_change_contract = True
         else:
-            body, title = _event_body_and_title(
+            requires_change_contract, body, title = _event_change_contract_context(
                 os.environ.get("SCENARIO_TEST_EVENT_PATH") or os.environ.get("GITHUB_EVENT_PATH")
             )
-        files, diff_error = _changed_files(
-            repo_root,
-            args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip(),
-        )
-        if diff_error:
-            errors.append(f"scenario change contract failed closed: {diff_error}")
-        else:
-            errors.extend(validate_change_contract(title, body, files, registry))
+        if requires_change_contract is None:
+            errors.append("scenario change contract could not determine CI event type")
+        elif requires_change_contract:
+            files, diff_error = _changed_files(
+                repo_root,
+                args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip(),
+            )
+            if diff_error:
+                errors.append(f"scenario change contract failed closed: {diff_error}")
+            else:
+                errors.extend(validate_change_contract(title, body, files, registry))
 
     if args.enforce_ready:
         if not args.stage:
