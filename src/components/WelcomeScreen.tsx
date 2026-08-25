@@ -93,8 +93,13 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
     if (dir) onPickProject?.(dir as string);
   };
 
+  // `min-h-0` below is load-bearing: without it `flex-1` keeps
+  // `min-height: auto`, so this body cannot shrink under its own content and
+  // pushes the `shrink-0` composer out of the column — the "继续之前的会话"
+  // rows then cover the input. MessageList carries the same class for exactly
+  // this reason, which is why the chat view never showed the bug.
   return (
-    <div className="flex-1 overflow-y-auto">
+    <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-3xl space-y-4 px-4 py-5 sm:px-6 sm:py-6">
         {/* Hero */}
         <section role="region" aria-label="CodeFactory 欢迎" className="flex flex-wrap items-center gap-3">

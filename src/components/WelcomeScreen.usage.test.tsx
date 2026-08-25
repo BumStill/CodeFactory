@@ -129,3 +129,17 @@ describe("new-session token usage summary", () => {
     expect(within(region).queryByRole("grid", { name: "过去 4 周 Token 趋势" })).not.toBeInTheDocument();
   });
 });
+
+describe("welcome screen layout", () => {
+  it("keeps a scrollable body that can shrink below its content", () => {
+  // `flex-1` alone keeps `min-height: auto`, so the welcome body could not
+  // shrink under its own content. In a short window it pushed the composer —
+  // a `shrink-0` sibling — out of the column, and the "继续之前的会话" rows
+  // ended up covering the input. MessageList already carries `min-h-0` for
+  // exactly this reason, which is why the chat view never showed the bug.
+    const { container } = render(<WelcomeScreen />);
+    const body = container.querySelector(".overflow-y-auto");
+    expect(body).not.toBeNull();
+    expect(body?.className).toContain("min-h-0");
+  });
+});
