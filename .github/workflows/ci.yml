@@ -222,6 +222,20 @@ jobs:
       - name: Usage headless gate
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:usage:headless
+      - name: New-session composer overlap headless gate
+        id: composer_overlap_gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: node scripts/verify-composer-overlap-headless.mjs
+        env:
+          CODEFACTORY_COMPOSER_OVERLAP_ARTIFACT_DIR: ${{ runner.temp }}/codefactory-composer-overlap-headless
+
+      - name: Upload composer overlap evidence
+        if: ${{ !cancelled() && steps.composer_overlap_gate.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: composer-overlap-headless-${{ runner.os }}
+          path: ${{ runner.temp }}/codefactory-composer-overlap-headless
+          if-no-files-found: error
 
 
       # Run the Rust test suite. New regressions like the v0.3.7

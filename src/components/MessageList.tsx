@@ -407,12 +407,19 @@ export function MessageList({
   if (messages.length === 0) {
     return (
       <div className="relative flex-1 min-h-0">
-        <WelcomeScreen
-          onUsePrompt={onUsePrompt}
-          onOpenUsage={onOpenUsage}
-          onOpenSession={onOpenSession}
-          onPickProject={onPickProject}
-        />
+        {/* Same containment as the message branch below: the wrapper owns the
+            height and an `absolute inset-0` child scrolls inside it. A plain
+            block child here sizes to its own content instead, spills past the
+            wrapper, and — because the wrapper is positioned and the composer is
+            not — paints on top of the composer, burying the input. */}
+        <div className="absolute inset-0 overflow-y-auto">
+          <WelcomeScreen
+            onUsePrompt={onUsePrompt}
+            onOpenUsage={onOpenUsage}
+            onOpenSession={onOpenSession}
+            onPickProject={onPickProject}
+          />
+        </div>
         {turnActive && (
           <div className="absolute bottom-3 left-1/2 w-[calc(100%-2rem)] max-w-[var(--reading-column)] -translate-x-1/2">
             <InlineTurnStatus
