@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::{oneshot, Mutex, RwLock};
+use util::no_window::NoWindow;
 
 pub type PendingPermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
@@ -985,7 +986,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
                 let _ = stream.write_all(body).await;
             }
         });
-        let mut browser_process = tokio::process::Command::new(&browser_binary);
+        let mut browser_process = tokio::process::Command::new(&browser_binary).no_window();
         browser_process
             .arg(format!(
                 "--user-data-dir={}",
