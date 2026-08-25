@@ -118,6 +118,7 @@ def validate_gate_surfaces(repo_root: Path, registry: dict) -> list[str]:
     for marker in (
         "name: scenario-execution",
         "pull_request:",
+        "Require trusted base execution planner",
         "Select affected scenarios and targets",
         "scenario_execution.py execute",
         "Aggregate exact-head execution receipts",

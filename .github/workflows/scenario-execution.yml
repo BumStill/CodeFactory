@@ -33,6 +33,13 @@ jobs:
           path: candidate
           fetch-depth: 0
           persist-credentials: false
+      - name: Require trusted base execution planner
+        shell: bash
+        run: |
+          if [[ ! -f policy/tools/governance/scenario_execution.py ]]; then
+            echo "::error::Trusted base does not contain scenario_execution.py; this trust-root upgrade requires the documented external governance bootstrap"
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
