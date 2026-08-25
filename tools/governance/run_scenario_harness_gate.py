@@ -38,25 +38,6 @@ TRUST_ROOT_FILES = (
     "tools/governance/validate_scenario_test_governance.py",
 )
 
-# The subset that decides the candidate's verdict: the policy workflow, the
-# runner and validator it executes, and the ruleset naming the required checks.
-# A PR must not redefine these, because they are what judges it.
-#
-# The rest of TRUST_ROOT_FILES are workflows the gate merely *reads* to resolve
-# where a declared target runs. Byte-freezing those buys no protection that
-# base-branch execution does not already provide, and it makes CI permanently
-# unchangeable: with scenario-gate-policy.yml on the default branch,
-# is_initial_trust_bootstrap can never return true again, so there is no path
-# left to amend ci.yml or release.yml at all.
-JUDGE_ROOT_FILES = (
-    ".github/rulesets/main.json",
-    ".github/workflows/scenario-gate-policy.yml",
-    ".github/workflows/scenario-gate.yml",
-    "tools/governance/run_scenario_harness_gate.py",
-    "tools/governance/validate_scenario_test_governance.py",
-)
-
-
 def _read(path: Path) -> str:
     try:
         if path.is_symlink():
@@ -159,18 +140,18 @@ def validate_gate_surfaces(repo_root: Path, registry: dict) -> list[str]:
 
 
 def validate_trust_root_immutability(repo_root: Path, policy_root: Path) -> list[str]:
-    """Prevent an ordinary PR from redefining the gate that judges that PR.
+    """Prevent an ordinary PR from redefining its judge or required execution.
 
-    Scoped to JUDGE_ROOT_FILES. The candidate's own copies of the workflows the
-    gate reads for evidence may differ from base — that is how a PR adds a new
-    hard gate at all — but nothing it ships can change the verdict logic
-    applied to it, which runs from the trusted base checkout.
+    The protected CI/release workflows are part of the trust root because their
+    required contexts are the proof that declared targets actually ran. Letting
+    a candidate rewrite those workflows would let it leave target names in
+    comments or skipped steps and self-attest green.
     """
 
     if repo_root == policy_root:
         return []
     errors: list[str] = []
-    for relative in JUDGE_ROOT_FILES:
+    for relative in TRUST_ROOT_FILES:
         candidate = repo_root / relative
         trusted = policy_root / relative
         try:

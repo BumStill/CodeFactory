@@ -21,6 +21,7 @@ ALLOWED_PRIORITIES = {"P0", "P1", "P2"}
 ALLOWED_GATES = {"pull_request", "nightly", "release_artifact", "manual_canary"}
 ALLOWED_SOURCE_KINDS = {"anonymized_history_shape", "product_contract", "incident_shape"}
 ALLOWED_AUTOMATION_STATUS = {"designed", "partially_implemented", "implemented"}
+ALLOWED_PR_GATE_STATUS = {"designed", "partially_implemented", "implemented"}
 REQUIRED_ORACLES = {"ui", "durable_state", "process", "side_effects", "delivery"}
 FORBIDDEN_DATA_KEYS = {
     "session_id",
@@ -374,6 +375,11 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
             unknown = sorted(set(covers) - known_scenarios)
             if unknown:
                 errors.append(f"{case_id} covers unknown scenarios: {', '.join(unknown)}")
+        case_patterns = case.get("change_patterns")
+        if not isinstance(case_patterns, list) or not case_patterns or not all(
+            isinstance(item, str) and item.strip() for item in case_patterns
+        ):
+            errors.append(f"{case_id} must define non-empty change_patterns")
         fixture = case.get("fixture")
         if not isinstance(fixture, dict) or fixture.get("synthetic") is not True:
             errors.append(f"{case_id} fixture must be synthetic")
@@ -441,6 +447,59 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
                 )
             if not gaps:
                 errors.append(f"{case_id} is designed and must record remaining_gaps")
+
+        pr_gate = case.get("pull_request_gate")
+        has_pr_execution = "pull_request" in (execution or {})
+        if has_pr_execution and not isinstance(pr_gate, dict):
+            errors.append(f"{case_id} pull_request execution requires pull_request_gate")
+        elif not has_pr_execution and pr_gate is not None:
+            errors.append(f"{case_id} has pull_request_gate without pull_request execution")
+        elif isinstance(pr_gate, dict):
+            pr_status = pr_gate.get("status")
+            pr_targets = pr_gate.get("required_targets")
+            pr_gaps = pr_gate.get("remaining_gaps")
+            if pr_status not in ALLOWED_PR_GATE_STATUS:
+                errors.append(f"{case_id} has invalid pull_request_gate status: {pr_status}")
+            if not isinstance(pr_targets, list) or not all(
+                isinstance(item, str) and item.strip() for item in pr_targets
+            ):
+                errors.append(f"{case_id} pull_request_gate required_targets must be a list")
+                pr_targets = []
+            if not isinstance(pr_gaps, list) or not all(
+                isinstance(item, str) and item.strip() for item in pr_gaps
+            ):
+                errors.append(f"{case_id} pull_request_gate remaining_gaps must be a list")
+                pr_gaps = []
+            if pr_status == "implemented":
+                if not pr_targets:
+                    errors.append(
+                        f"{case_id} implemented pull_request_gate must name required_targets"
+                    )
+                if pr_gaps:
+                    errors.append(
+                        f"{case_id} implemented pull_request_gate still has PR gaps"
+                    )
+            elif pr_status in {"designed", "partially_implemented"} and not pr_gaps:
+                errors.append(
+                    f"{case_id} incomplete pull_request_gate must record PR gaps"
+                )
+            unknown_targets = sorted(set(pr_targets) - set(automated))
+            if unknown_targets:
+                errors.append(
+                    f"{case_id} pull_request_gate requires undeclared automation: "
+                    + ", ".join(unknown_targets)
+                )
+            for target in pr_targets:
+                if not _automation_exists(target, repo_root):
+                    errors.append(
+                        f"{case_id} pull_request_gate points at missing automation: {target}"
+                    )
+                elif "pull_request" not in _automation_gate_stages(
+                    target, gate_policy, repo_root
+                ):
+                    errors.append(
+                        f"{case_id} pull_request_gate target does not run at pull_request: {target}"
+                    )
         if case.get("must_remain_unattended") is True:
             serialized = json.dumps(oracles, ensure_ascii=False)
             for marker in ("user message 总数为 1", "human prompt 总数为 0"):
@@ -550,20 +609,42 @@ def validate_impacted_execution(
     for case in registry.get("complex_e2e_cases", []):
         if stage not in (case.get("execution") or {}):
             continue
-        if not (set(case.get("covers") or []) & impacted):
+        patterns = case.get("change_patterns") or []
+        directly_impacted = any(
+            fnmatch.fnmatch(path, pattern)
+            for path in product_files
+            for pattern in patterns
+        ) or any(path in GLOBAL_PRODUCT_FILES for path in product_files)
+        if not directly_impacted:
             continue
-        running = [
+        if stage == "pull_request":
+            pr_gate = case.get("pull_request_gate") or {}
+            status = pr_gate.get("status")
+            gaps = pr_gate.get("remaining_gaps") or []
+            if status != "implemented" or gaps:
+                errors.append(
+                    f"{case.get('id')} is impacted by this change but its pull_request "
+                    f"E2E slice is not implemented (status={status}, "
+                    f"remaining_gaps={len(gaps)})"
+                )
+                continue
+            required_targets = pr_gate.get("required_targets") or []
+        else:
+            required_targets = case.get("automated_by") or []
+        missing_targets = [
             target
-            for target in case.get("automated_by") or []
-            if stage in _automation_gate_stages(target, gate_policy, repo_root)
+            for target in required_targets
+            if not _automation_exists(target, repo_root)
+            or stage not in _automation_gate_stages(target, gate_policy, repo_root)
         ]
-        if not running:
-            covered = ", ".join(sorted(set(case.get("covers") or []) & impacted))
+        if not required_targets:
             errors.append(
-                f"{case.get('id')} covers impacted scenario(s) {covered} but no "
-                f"declared target actually runs at {stage} "
-                f"(status={case.get('automation_status')}, "
-                f"remaining_gaps={len(case.get('remaining_gaps') or [])})"
+                f"{case.get('id')} is impacted but declares no required targets at {stage}"
+            )
+        elif missing_targets:
+            errors.append(
+                f"{case.get('id')} impacted E2E targets do not actually run at {stage}: "
+                + ", ".join(missing_targets)
             )
 
     return errors

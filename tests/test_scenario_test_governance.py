@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 
 from tools.governance.run_scenario_harness_gate import (
-    JUDGE_ROOT_FILES,
     TRUST_ROOT_FILES,
     validate_trust_root_immutability,
 )
@@ -349,9 +348,9 @@ class ImpactedExecutionTests(unittest.TestCase):
             [],
         )
 
-    def test_impacted_cases_with_running_automation_pass(self) -> None:
+    def test_impacted_scenario_without_a_complex_e2e_case_passes(self) -> None:
         errors = validate_impacted_execution(
-            self.registry, ["src/components/MessageList.tsx"], "pull_request", REPO_ROOT
+            self.registry, ["src/components/MessageInput.tsx"], "pull_request", REPO_ROOT
         )
         self.assertEqual(errors, [])
 
@@ -363,7 +362,7 @@ class ImpactedExecutionTests(unittest.TestCase):
         self.assertTrue(catalog, "expected the catalog sweep to still report debt")
         reported = " ".join(
             validate_impacted_execution(
-                self.registry, ["src/components/MessageList.tsx"], "pull_request", REPO_ROOT
+                self.registry, ["src/components/MessageInput.tsx"], "pull_request", REPO_ROOT
             )
         )
         for case_id in ("E2E-002", "E2E-003"):
@@ -383,10 +382,16 @@ class ImpactedExecutionTests(unittest.TestCase):
                 {
                     "id": "E2E-X",
                     "covers": ["X-001"],
+                    "change_patterns": ["src/thing.ts"],
                     "execution": {"pull_request": "designed only"},
                     "automation_status": "designed",
                     "automated_by": [],
                     "remaining_gaps": ["no automation at all"],
+                    "pull_request_gate": {
+                        "status": "designed",
+                        "required_targets": [],
+                        "remaining_gaps": ["no automation at all"],
+                    },
                 }
             ],
             "gate_policy": self.registry["gate_policy"],
@@ -394,14 +399,85 @@ class ImpactedExecutionTests(unittest.TestCase):
         errors = validate_impacted_execution(registry, ["src/thing.ts"], "pull_request", REPO_ROOT)
         self.assertTrue(any("E2E-X" in error for error in errors), errors)
 
+    def test_partially_automated_impacted_case_fails_even_when_one_target_runs(self) -> None:
+        errors = validate_impacted_execution(
+            self.registry,
+            ["src-tauri/src/commands/chat.rs"],
+            "pull_request",
+            REPO_ROOT,
+        )
+        self.assertTrue(
+            any("E2E-002" in error and "not implemented" in error for error in errors),
+            errors,
+        )
+
+    def test_recovery_control_change_is_not_blocked_by_workspace_or_browser_e2e_debt(self) -> None:
+        errors = validate_impacted_execution(
+            self.registry,
+            ["src-tauri/src/agent/objective.rs"],
+            "pull_request",
+            REPO_ROOT,
+        )
+        self.assertEqual(errors, [])
+
+    def test_browser_lifecycle_change_is_blocked_until_its_direct_e2e_is_automated(self) -> None:
+        errors = validate_impacted_execution(
+            self.registry,
+            ["src-tauri/src/tools/browser_session.rs"],
+            "pull_request",
+            REPO_ROOT,
+        )
+        self.assertTrue(
+            any("E2E-005" in error and "not implemented" in error for error in errors),
+            errors,
+        )
+
+    def test_implemented_case_requires_every_declared_pr_target_to_run(self) -> None:
+        registry = {
+            "scenarios": [
+                {
+                    "id": "X-001",
+                    "change_patterns": ["src/thing.ts"],
+                    "gates": ["pull_request"],
+                    "automated_by": ["path:src/thing.test.ts"],
+                }
+            ],
+            "complex_e2e_cases": [
+                {
+                    "id": "E2E-X",
+                    "covers": ["X-001"],
+                    "change_patterns": ["src/thing.ts"],
+                    "execution": {"pull_request": "real process smoke"},
+                    "automation_status": "partially_implemented",
+                    "automated_by": ["path:src/thing.test.ts"],
+                    "remaining_gaps": ["release artifact not automated"],
+                    "pull_request_gate": {
+                        "status": "implemented",
+                        "required_targets": [
+                            "path:src/thing.test.ts",
+                            "binary:--missing-real-process-smoke",
+                        ],
+                        "remaining_gaps": [],
+                    },
+                }
+            ],
+            "gate_policy": self.registry["gate_policy"],
+        }
+        errors = validate_impacted_execution(
+            registry, ["src/thing.ts"], "pull_request", REPO_ROOT
+        )
+        self.assertTrue(
+            any("--missing-real-process-smoke" in error for error in errors), errors
+        )
+
 
 class TrustRootScopeTests(unittest.TestCase):
-    """A PR may not redefine its judge; it may still amend the CI it runs."""
+    """A PR may not redefine either its judge or the workflow proving execution."""
 
-    def test_judge_root_is_a_subset_that_excludes_read_only_workflows(self) -> None:
-        self.assertTrue(set(JUDGE_ROOT_FILES) <= set(TRUST_ROOT_FILES))
-        self.assertNotIn(".github/workflows/ci.yml", JUDGE_ROOT_FILES)
-        self.assertIn("tools/governance/run_scenario_harness_gate.py", JUDGE_ROOT_FILES)
+    def test_required_execution_workflows_remain_in_the_trust_root(self) -> None:
+        self.assertIn(".github/workflows/ci.yml", TRUST_ROOT_FILES)
+        self.assertIn(".github/workflows/release.yml", TRUST_ROOT_FILES)
+        self.assertIn("tools/governance/run_scenario_harness_gate.py", TRUST_ROOT_FILES)
 
     def _tree(self, root: Path) -> None:
         for relative in TRUST_ROOT_FILES:
@@ -409,7 +485,7 @@ class TrustRootScopeTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("original\n", encoding="utf-8")
 
-    def test_amending_ci_is_allowed_but_amending_the_runner_is_not(self) -> None:
+    def test_amending_ci_or_the_runner_requires_external_governance_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)
             policy, candidate = base / "policy", base / "candidate"
@@ -417,8 +493,10 @@ class TrustRootScopeTests(unittest.TestCase):
             self._tree(candidate)
 
             (candidate / ".github/workflows/ci.yml").write_text("changed\n", encoding="utf-8")
-            self.assertEqual(validate_trust_root_immutability(candidate, policy), [])
+            errors = validate_trust_root_immutability(candidate, policy)
+            self.assertTrue(any("ci.yml" in error for error in errors), errors)
 
+            (candidate / ".github/workflows/ci.yml").write_text("original\n", encoding="utf-8")
             (candidate / "tools/governance/run_scenario_harness_gate.py").write_text(
                 "changed\n", encoding="utf-8"
             )
