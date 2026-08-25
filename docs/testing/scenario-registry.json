@@ -42,7 +42,7 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/agent/objective*.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/crates/agent-loop/src/*.rs", "src-tauri/src/agent/mod.rs", "src-tauri/src/commands/skills.rs", "src-tauri/src/tools/bash.rs", "src-tauri/src/trajectory.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs"],
-      "automated_by": ["rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:persisted_command_repair_envelope_forces_diagnosis_after_restart", "rust:structured_tool_metadata_is_persisted_separately_from_result_text", "rust:command_failure_envelope_survives_file_sqlite_restart", "binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke"],
+      "automated_by": ["rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:timed_out_skill_install_allows_two_complementary_windows_diagnostics_then_correction", "rust:powershell_skill_location_and_executable_checks_are_timeout_diagnostics", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:persisted_command_repair_envelope_forces_diagnosis_after_restart", "rust:structured_tool_metadata_is_persisted_separately_from_result_text", "rust:command_failure_envelope_survives_file_sqlite_restart", "binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke"],
       "required_evidence": ["L1", "L2", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -563,15 +563,15 @@
       "name": "同机 Skill 命令失败后自主诊断、修正并完成",
       "priority": "P0",
       "covers": ["HLT-001", "HLT-005"],
-      "fixture": {"synthetic": true, "shape": "同机安装的外部 Skill，包含 scripts、references、assets；验收脚本首次使用错误参数，随后暴露 help 与确定性 version 输出"},
+      "fixture": {"synthetic": true, "shape": "同机安装的外部 Skill，包含 scripts、references、assets；首次命令使用错误参数或在 Windows 超时，随后暴露安装目录、真实可执行文件、help 与确定性 version 输出"},
       "steps": [
         "从本地目录或 Git 形状安装 Skill，删除导入临时源后确认嵌套资源仍在稳定 skill_root",
         "用户只发送一条验收消息，Skill 首次执行带错误参数的真实脚本",
-        "系统把 typed invalid_invocation 回送同一 Objective，并先执行有界 help 或资源存在性诊断",
+        "系统把 typed invalid_invocation/command_timeout 回送同一 Objective，并先执行有界 help、资源存在性或安装目录诊断；Windows 安装位置与可执行文件均未确认时允许第二项互补的 Get-Command 诊断",
         "模型改用正确参数执行同一脚本，取得确定性成功输出后直接结束，不重复探测",
         "独立进程重开同一 SQLite，确认失败 metadata、cancelled receipt 和 completed Objective 不复活"
       ],
-      "fault_injection": ["Git 临时目录删除", "invalid CLI argument", "foreground mutation receipt preflight", "process restart after typed failure", "provider attempts premature final response"],
+      "fault_injection": ["Git 临时目录删除", "invalid CLI argument", "300s command timeout", "Windows install-directory and executable-path split diagnosis", "foreground mutation receipt preflight", "process restart after typed failure", "provider attempts premature final response"],
       "oracles": {
         "ui": ["同一 turn 依次显示错误、诊断与修正成功，最终 composer 可发送且无继续 CTA、停止按钮或重复验证"],
         "durable_state": ["user message count=1，失败工具 metadata 保留 typed code，未变工作区对应 receipt/contract 为 cancelled，Objective completed 且 turn/stream settled"],
@@ -581,7 +581,7 @@
       },
       "execution": {"pull_request": "Rust integration plus isolated CodeFactoryDev canary", "nightly": "two-process SQLite restart smoke", "release_artifact": "exact installed App Skill import and command-recovery canary"},
       "automation_status": "partially_implemented",
-      "automated_by": ["rust:local_directory_install_survives_source_cleanup_with_nested_resources", "rust:symlinked_skill_payload_fails_closed_without_replacing_existing_install", "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:evidence_based_timeout_change_is_not_an_unchanged_retry", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:command_failure_envelope_survives_file_sqlite_restart", "rust:effect_free_unknown_provider_transport_resumes_before_exhaustion_and_after_restart"],
+      "automated_by": ["rust:local_directory_install_survives_source_cleanup_with_nested_resources", "rust:symlinked_skill_payload_fails_closed_without_replacing_existing_install", "rust:typed_command_failure_requires_diagnosis_then_changed_retry_in_same_turn", "rust:timed_out_skill_install_allows_two_complementary_windows_diagnostics_then_correction", "rust:powershell_skill_location_and_executable_checks_are_timeout_diagnostics", "rust:evidence_based_timeout_change_is_not_an_unchanged_retry", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:command_failure_envelope_survives_file_sqlite_restart", "rust:effect_free_unknown_provider_transport_resumes_before_exhaustion_and_after_restart"],
       "remaining_gaps": ["L2 独立二进制 hard-kill smoke 尚未接入 nightly", "L4 exact release 安装版单消息 canary 待本次 release 执行"]
     },
     {
