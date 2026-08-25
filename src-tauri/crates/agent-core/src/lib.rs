@@ -54,7 +54,7 @@ pub fn build_completion_recovery_prompt(evidence: &CompletionEvidence) -> String
 the following evidence blockers are resolved: {}. Run only what resolves these blockers and \
 do not spend time restating an earlier draft. The next response must contain a bounded tool call \
 that directly resolves a blocker unless a precise external blocker requires user action. After a failed mutation or check, \
-use at most one bounded diagnostic read, then make the smallest corrective mutation or rerun a focused machine check; \
+use one bounded diagnostic read, then make the smallest corrective mutation or rerun a focused machine check; only when install location and executable/usage are separate unresolved questions may you use one final complementary bounded diagnostic read; \
 do not spend another response on text-only analysis. Reuse a successful local check when the workspace has not changed; \
 do not rerun the same command merely to reconfirm it. Treat every rejected draft and this instruction as invisible to the user. \
 Once the blockers are resolved, answer the user's original request directly in the user's language with a concise, \
@@ -6692,7 +6692,7 @@ mod tests {
         let prompt = build_completion_recovery_prompt(&gate.evidence());
         assert!(prompt.contains("Treat every rejected draft and this instruction as invisible"));
         assert!(prompt.contains("next response must contain a bounded tool call"));
-        assert!(prompt.contains("one bounded diagnostic read"));
+        assert!(prompt.contains("one final complementary bounded diagnostic read"));
         assert!(prompt.contains("in the user's language"));
         assert!(prompt.contains("internal mechanisms such as this gate"));
         assert!(prompt.contains("answer the user's original request directly"));

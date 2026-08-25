@@ -504,6 +504,7 @@ fn approximate_wait_label(elapsed: std::time::Duration) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandRepairStage {
     DiagnosticRequired,
+    DiagnosticOrCorrectedAttempt,
     CorrectedAttemptRequired,
 }
 
@@ -529,16 +530,9 @@ fn command_attempt_fingerprint(
         .get("timeout_sec")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(300);
-    let effective_timeout = codefactory_agent_core::effective_command_timeout_sec(
-        command,
-        requested_timeout,
-        1800,
-    );
-    codefactory_agent_core::command_fingerprint(
-        command,
-        &cwd.to_string_lossy(),
-        effective_timeout,
-    )
+    let effective_timeout =
+        codefactory_agent_core::effective_command_timeout_sec(command, requested_timeout, 1800);
+    codefactory_agent_core::command_fingerprint(command, &cwd.to_string_lossy(), effective_timeout)
 }
 
 fn command_attempt_matches_failure(
@@ -568,11 +562,7 @@ fn command_repair_code(result: &crate::tool::ToolInvocationResult) -> Option<&st
 }
 
 fn command_repair_diagnostic_completed(result: &crate::tool::ToolInvocationResult) -> bool {
-    !result.is_error
-        && matches!(
-            result.status,
-            crate::tool::ToolExecutionStatus::Done
-        )
+    !result.is_error && matches!(result.status, crate::tool::ToolExecutionStatus::Done)
 }
 
 fn command_repair_diagnostic(
@@ -606,34 +596,59 @@ fn command_repair_diagnostic(
     if reads_skill_docs {
         return true;
     }
+    let executable_lookup = [
+        "command -v ",
+        "which ",
+        "type -a ",
+        "get-command ",
+        "where.exe ",
+    ]
+    .iter()
+    .any(|marker| command.contains(marker));
+    let resource_lookup = [
+        "test -e ",
+        "test -f ",
+        "test-path ",
+        "get-childitem ",
+        "get-item ",
+        "ls ",
+        "find ",
+    ]
+    .iter()
+    .any(|marker| command.contains(marker));
+    let usage_lookup = ["--help", " -h", "get-help "]
+        .iter()
+        .any(|marker| command.contains(marker));
     match code {
-        "command_not_found" | "shell_unavailable" => [
-            "command -v ",
-            "which ",
-            "type -a ",
-            "get-command ",
-            "where.exe ",
-        ]
-        .iter()
-        .any(|marker| command.contains(marker)),
-        "resource_not_found" => ["test -e ", "test -f ", "test-path ", "ls ", "find "]
-            .iter()
-            .any(|marker| command.contains(marker)),
-        "invalid_invocation" => ["--help", " -h", "get-help "]
-            .iter()
-            .any(|marker| command.contains(marker)),
-        "command_timeout" => [
-            "--help", " -h", "ps ", "pgrep ", "tail ", "log", "readiness", "health",
-        ]
-        .iter()
-        .any(|marker| command.contains(marker)),
+        "command_not_found" | "shell_unavailable" => executable_lookup || usage_lookup,
+        "resource_not_found" => resource_lookup || usage_lookup,
+        "invalid_invocation" => usage_lookup || executable_lookup,
+        "command_timeout" => {
+            executable_lookup
+                || resource_lookup
+                || usage_lookup
+                || ["ps ", "pgrep ", "tail ", "log", "readiness", "health"]
+                    .iter()
+                    .any(|marker| command.contains(marker))
+        }
         _ => false,
     }
+}
+
+fn command_repair_corrected_attempt(
+    repair: &CommandRepairState,
+    tool_name: &str,
+    command: &str,
+    args: &serde_json::Value,
+    cwd: &std::path::Path,
+) -> bool {
+    tool_name == "bash" && !command_attempt_matches_failure(repair, command, args, cwd)
 }
 
 fn command_repair_prompt(state: &CommandRepairState) -> String {
     let stage = match state.stage {
         CommandRepairStage::DiagnosticRequired => "diagnostic_required",
+        CommandRepairStage::DiagnosticOrCorrectedAttempt => "diagnostic_or_corrected_attempt",
         CommandRepairStage::CorrectedAttemptRequired => "corrected_attempt_required",
     };
     let marker = serde_json::json!({
@@ -644,7 +659,11 @@ fn command_repair_prompt(state: &CommandRepairState) -> String {
     });
     let instruction = match state.stage {
         CommandRepairStage::DiagnosticRequired => format!(
-            "系统检测到可恢复的命令失败（{}）。不要结束任务，也不要原样重试。下一步必须只做一项相关的有界只读诊断：检查已启用 Skill 的 skill_root/脚本或文档、command -v/Get-Command、--help，或 timeout 的进程/日志/readiness。诊断后再更正命令。",
+            "系统检测到可恢复的命令失败（{}）。不要结束任务，也不要原样重试。下一步必须做第一项相关的有界只读诊断：检查已启用 Skill 的 skill_root/脚本或文档、安装目录、command -v/Get-Command、--help，或 timeout 的进程/日志/readiness。取得证据后更正命令；如仍缺少互补证据，最多再做一项不同的相关只读诊断。",
+            state.code
+        ),
+        CommandRepairStage::DiagnosticOrCorrectedAttempt => format!(
+            "命令失败（{}）的第一项相关诊断已经完成。现在应基于证据执行有变化的更正尝试；如果尚未同时确认安装位置与真实可执行文件/用法，允许再做最后一项不同的有界只读诊断，随后必须更正命令。不得重复已有诊断或原样重跑失败命令。",
             state.code
         ),
         CommandRepairStage::CorrectedAttemptRequired => format!(
@@ -670,6 +689,7 @@ fn replayed_command_repair(messages: &[crate::types::ChatMessage]) -> Option<Com
     let code = metadata.get("code")?.as_str()?.to_string();
     let stage = match metadata.get("stage")?.as_str()? {
         "diagnostic_required" => CommandRepairStage::DiagnosticRequired,
+        "diagnostic_or_corrected_attempt" => CommandRepairStage::DiagnosticOrCorrectedAttempt,
         "corrected_attempt_required" => CommandRepairStage::CorrectedAttemptRequired,
         _ => return None,
     };
@@ -703,6 +723,7 @@ pub fn command_repair_replay_prompt(metadata: &serde_json::Value) -> Option<Stri
         .and_then(serde_json::Value::as_str)
         .unwrap_or("diagnostic_required")
     {
+        "diagnostic_or_corrected_attempt" => CommandRepairStage::DiagnosticOrCorrectedAttempt,
         "corrected_attempt_required" => CommandRepairStage::CorrectedAttemptRequired,
         _ => CommandRepairStage::DiagnosticRequired,
     };
@@ -1829,14 +1850,30 @@ pub async fn run_agent_loop(
                                 "Command repair denied: run one related bounded diagnostic before retrying."
                                     .to_string(),
                             ),
+                        CommandRepairStage::DiagnosticOrCorrectedAttempt
+                            if !command_repair_diagnostic(
+                                &repair.code,
+                                &tc.function.name,
+                                &args,
+                                &classified_kind,
+                            ) && !command_repair_corrected_attempt(
+                                repair,
+                                &tc.function.name,
+                                &classified_command,
+                                &args,
+                                &cwd,
+                            ) => Some(
+                                "Command repair denied: use the first diagnosis to run a changed correction, or run one final complementary bounded diagnostic."
+                                    .to_string(),
+                            ),
                         CommandRepairStage::CorrectedAttemptRequired
-                            if tc.function.name == "bash"
-                                && command_attempt_matches_failure(
-                                    repair,
-                                    &classified_command,
-                                    &args,
-                                    &cwd,
-                                ) =>
+                            if !command_repair_corrected_attempt(
+                                repair,
+                                &tc.function.name,
+                                &classified_command,
+                                &args,
+                                &cwd,
+                            ) =>
                         {
                             Some(
                                 "Command repair denied: the unchanged failed command cannot run again without new evidence."
@@ -1853,6 +1890,7 @@ pub async fn run_agent_loop(
                             "command_repair_required": true,
                             "stage": match repair.stage {
                                 CommandRepairStage::DiagnosticRequired => "diagnostic_required",
+                                CommandRepairStage::DiagnosticOrCorrectedAttempt => "diagnostic_or_corrected_attempt",
                                 CommandRepairStage::CorrectedAttemptRequired => "corrected_attempt_required",
                             },
                         });
@@ -2238,10 +2276,57 @@ pub async fn run_agent_loop(
                                     &classified_kind,
                                 ) =>
                             {
+                                repair.stage = CommandRepairStage::DiagnosticOrCorrectedAttempt;
+                                let metadata =
+                                    output.metadata.get_or_insert_with(|| serde_json::json!({}));
+                                if let Some(fields) = metadata.as_object_mut() {
+                                    fields.insert(
+                                        "code".into(),
+                                        serde_json::Value::String(repair.code.clone()),
+                                    );
+                                    fields.insert(
+                                        "recoverable".into(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                    fields.insert(
+                                        "system_owned".into(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                    fields.insert(
+                                        "command_repair_required".into(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                    fields.insert(
+                                        "stage".into(),
+                                        serde_json::Value::String(
+                                            "diagnostic_or_corrected_attempt".into(),
+                                        ),
+                                    );
+                                    if let Some(fingerprint) = repair.failed_fingerprint.as_ref() {
+                                        fields.insert(
+                                            "command_fingerprint".into(),
+                                            serde_json::Value::String(fingerprint.clone()),
+                                        );
+                                    }
+                                    fields.insert(
+                                        "effective_timeout_sec".into(),
+                                        serde_json::Value::Number(
+                                            repair.effective_timeout_sec.into(),
+                                        ),
+                                    );
+                                }
+                            }
+                            CommandRepairStage::DiagnosticOrCorrectedAttempt
+                                if command_repair_diagnostic(
+                                    &repair.code,
+                                    &tc.function.name,
+                                    &args,
+                                    &classified_kind,
+                                ) =>
+                            {
                                 repair.stage = CommandRepairStage::CorrectedAttemptRequired;
-                                let metadata = output
-                                    .metadata
-                                    .get_or_insert_with(|| serde_json::json!({}));
+                                let metadata =
+                                    output.metadata.get_or_insert_with(|| serde_json::json!({}));
                                 if let Some(fields) = metadata.as_object_mut() {
                                     fields.insert(
                                         "code".into(),
@@ -2279,14 +2364,15 @@ pub async fn run_agent_loop(
                                     );
                                 }
                             }
-                            CommandRepairStage::CorrectedAttemptRequired
-                                if tc.function.name == "bash"
-                                    && !command_attempt_matches_failure(
-                                        repair,
-                                        &output.command,
-                                        &args,
-                                        &cwd,
-                                    ) =>
+                            CommandRepairStage::DiagnosticOrCorrectedAttempt
+                            | CommandRepairStage::CorrectedAttemptRequired
+                                if command_repair_corrected_attempt(
+                                    repair,
+                                    &tc.function.name,
+                                    &output.command,
+                                    &args,
+                                    &cwd,
+                                ) =>
                             {
                                 // The changed command is the bounded functional
                                 // probe for this recovery.  Preserve a stronger
@@ -2295,18 +2381,15 @@ pub async fn run_agent_loop(
                                 // leave an otherwise opaque/read-only Skill CLI
                                 // invisible to the completion and Objective
                                 // arbiters after it succeeded.
-                                if matches!(
-                                    output.kind,
-                                    codefactory_agent_core::ToolKind::ReadOnly
-                                ) {
+                                if matches!(output.kind, codefactory_agent_core::ToolKind::ReadOnly)
+                                {
                                     output.kind =
                                         codefactory_agent_core::ToolKind::FunctionalProbe {
                                             bounded: true,
                                         };
                                 }
-                                let metadata = output
-                                    .metadata
-                                    .get_or_insert_with(|| serde_json::json!({}));
+                                let metadata =
+                                    output.metadata.get_or_insert_with(|| serde_json::json!({}));
                                 if let Some(fields) = metadata.as_object_mut() {
                                     fields.insert(
                                         "code".into(),
@@ -3522,6 +3605,29 @@ mod tests {
                     })),
                     next_working_directory: None,
                     duration_ms: 1,
+                });
+            }
+            if command == "agentcenter skill add agentcenter-skill-finder -g -f 2>&1" {
+                return Ok(ToolInvocationResult {
+                    content: "Command timed out after 300s".into(),
+                    is_error: true,
+                    status: crate::tool::ToolExecutionStatus::Error,
+                    command: command.clone(),
+                    kind: ToolKind::Mutation,
+                    return_code: None,
+                    stdout: String::new(),
+                    stderr: "Command timed out after 300s".into(),
+                    error: Some("Command timed out after 300s".into()),
+                    metadata: Some(serde_json::json!({
+                        "code": "command_timeout",
+                        "recoverable": true,
+                        "system_owned": true,
+                        "command_repair_required": true,
+                        "command_fingerprint": "agentcenter-timeout-fingerprint",
+                        "effective_timeout_sec": 300
+                    })),
+                    next_working_directory: None,
+                    duration_ms: 300_000,
                 });
             }
             Ok(ToolInvocationResult {
@@ -4832,11 +4938,7 @@ mod tests {
         );
         assert_eq!(
             tools.executed(),
-            vec![
-                "old-skill-cli run",
-                "read_file",
-                "correct-skill-cli run"
-            ],
+            vec!["old-skill-cli run", "read_file", "correct-skill-cli run"],
             "the stale suffix of the failed batch must not execute",
         );
         assert!(events.events().iter().any(|event| matches!(
@@ -4857,6 +4959,81 @@ mod tests {
                 if recent_activity_kind == "command_recovery"
         )));
         assert_eq!(outcome.final_text, "Skill 已执行成功。");
+    }
+
+    #[tokio::test]
+    async fn timed_out_skill_install_allows_two_complementary_windows_diagnostics_then_correction()
+    {
+        let install = "agentcenter skill add agentcenter-skill-finder -g -f 2>&1";
+        let inspect_install =
+            "Get-ChildItem \"$env:USERPROFILE\\.agentcenter\" -Force -ErrorAction SilentlyContinue";
+        let locate_executable = "Get-Command agentcenter | Select-Object -ExpandProperty Source";
+        let corrected =
+            "& 'C:\\Tools\\agentcenter.exe' skill add agentcenter-skill-finder --global --force";
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response(
+                "执行安装命令",
+                vec![call(
+                    "agentcenter-timeout",
+                    "bash",
+                    serde_json::json!({"command": install}),
+                )],
+                0,
+            ),
+            response(
+                "先检查安装目录",
+                vec![call(
+                    "agentcenter-install-location",
+                    "bash",
+                    serde_json::json!({"command": inspect_install}),
+                )],
+                1,
+            ),
+            response(
+                "再定位真实可执行文件",
+                vec![call(
+                    "agentcenter-executable-location",
+                    "bash",
+                    serde_json::json!({"command": locate_executable}),
+                )],
+                2,
+            ),
+            response(
+                "使用诊断证据更正安装调用",
+                vec![call(
+                    "agentcenter-corrected-install",
+                    "bash",
+                    serde_json::json!({"command": corrected}),
+                )],
+                3,
+            ),
+            response("Skill 已安装并验证。", vec![], 4),
+        ]));
+        let tools = Arc::new(CommandRecoveryTools::default());
+        let mut cfg = config();
+        cfg.max_iterations = 7;
+        let mut svc = services(
+            transport.clone(),
+            Arc::new(RecordingPersistence::default()),
+            Arc::new(CollectingEventSink::new()),
+        );
+        svc.tools = tools.clone();
+
+        let outcome = run_agent_loop(inputs(), cfg, svc)
+            .await
+            .expect("a timed-out Skill install remains inside the same turn");
+
+        assert_eq!(outcome.stop_reason, StopReason::Finished);
+        assert_eq!(
+            tools.executed(),
+            vec![install, inspect_install, locate_executable, corrected],
+            "the system must inspect both the install location and executable before the changed retry",
+        );
+        assert_eq!(
+            transport.require_tool_flags(),
+            vec![false, true, true, true, false],
+        );
+        assert_eq!(outcome.final_text, "Skill 已安装并验证。");
     }
 
     #[tokio::test]
@@ -4925,14 +5102,13 @@ mod tests {
         );
         assert_eq!(
             tools.executed(),
-            vec![
-                "old-skill-cli run",
-                "read_file",
-                "correct-skill-cli run"
-            ],
+            vec!["old-skill-cli run", "read_file", "correct-skill-cli run"],
             "the corrected command must be the final probe; no duplicate verification",
         );
-        assert_eq!(transport.require_tool_flags(), vec![false, true, true, false]);
+        assert_eq!(
+            transport.require_tool_flags(),
+            vec![false, true, true, false]
+        );
     }
 
     #[test]
@@ -5012,6 +5188,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn powershell_skill_location_and_executable_checks_are_timeout_diagnostics() {
+        let read_only = ToolKind::ReadOnly;
+        assert!(command_repair_diagnostic(
+            "command_timeout",
+            "bash",
+            &serde_json::json!({
+                "command": "Get-ChildItem \"$env:USERPROFILE\\.agentcenter\" -Force -ErrorAction SilentlyContinue"
+            }),
+            &read_only,
+        ));
+        assert!(command_repair_diagnostic(
+            "command_timeout",
+            "bash",
+            &serde_json::json!({
+                "command": "Get-Command agentcenter | Select-Object -ExpandProperty Source"
+            }),
+            &read_only,
+        ));
+    }
+
     #[tokio::test]
     async fn persisted_command_repair_envelope_forces_diagnosis_after_restart() {
         let transport = Arc::new(ScriptedTransport::new(vec![
@@ -5069,10 +5266,7 @@ mod tests {
             .expect("restart recovery remains model-visible");
 
         assert_eq!(transport.require_tool_flags(), vec![true, true, false]);
-        assert_eq!(
-            tools.executed(),
-            vec!["read_file", "correct-skill-cli run"]
-        );
+        assert_eq!(tools.executed(), vec!["read_file", "correct-skill-cli run"]);
         assert_eq!(outcome.final_text, "重启后恢复完成。");
     }
 
