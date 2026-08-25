@@ -6,8 +6,10 @@ import unittest
 from pathlib import Path
 
 from tools.governance.validate_scenario_test_governance import (
+    _changed_files,
     load_registry,
     validate_change_contract,
+    validate_gate_readiness,
     validate_registry,
 )
 
@@ -138,6 +140,16 @@ class ScenarioRegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid scenario registry JSON"):
                 load_registry(path)
 
+    def test_registry_loader_rejects_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "actual.json"
+            target.write_text("{}", encoding="utf-8")
+            link = root / "scenario-registry.json"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                load_registry(link)
+
     def test_raw_production_identity_fields_are_rejected(self) -> None:
         registry = load_registry(REGISTRY_PATH)
         broken = json.loads(json.dumps(registry))
@@ -151,6 +163,22 @@ class ScenarioRegistryTests(unittest.TestCase):
         broken["scenarios"][0]["required_evidence"].remove("L4")
         errors = validate_registry(broken, REPO_ROOT)
         self.assertTrue(any("release_artifact gate requires L4" in error for error in errors))
+
+    def test_every_automation_target_is_bound_to_a_declared_gate_stage(self) -> None:
+        registry = load_registry(REGISTRY_PATH)
+        broken = json.loads(json.dumps(registry))
+        rte = next(item for item in broken["scenarios"] if item["id"] == "RTE-003")
+        rte["gates"] = ["pull_request"]
+        errors = validate_registry(broken, REPO_ROOT)
+        self.assertTrue(
+            any(
+                "RTE-003" in error
+                and "--browser-chrome-attach-smoke" in error
+                and "declared hard-gate stage" in error
+                for error in errors
+            ),
+            errors,
+        )
 
 
 class ScenarioChangeContractTests(unittest.TestCase):
@@ -170,7 +198,7 @@ class ScenarioChangeContractTests(unittest.TestCase):
         self.assertEqual(
             validate_change_contract(
                 title="fix(chat): keep historical sessions resumable",
-                body="Scenario-Test: RTE-004, HLT-003, HLT-004, HLT-005",
+                body="Scenario-Test: RTE-004, HLT-003, HLT-004, HLT-005, CXD-001",
                 files=["src-tauri/src/commands/chat.rs"],
                 registry=self.registry,
             ),
@@ -196,6 +224,105 @@ class ScenarioChangeContractTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_test_harness_repairs_do_not_masquerade_as_product_changes(self) -> None:
+        self.assertEqual(
+            validate_change_contract(
+                title="test: repair the usage acceptance oracle",
+                body="",
+                files=[
+                    "scripts/verify-token-usage-headless.mjs",
+                    "src/acceptance/usage.tsx",
+                ],
+                registry=self.registry,
+            ),
+            [],
+        )
+
+    def test_release_workflow_is_a_product_surface_and_fails_closed(self) -> None:
+        errors = validate_change_contract(
+            title="ci: alter artifact publication",
+            body="",
+            files=[".github/workflows/release.yml"],
+            registry=self.registry,
+        )
+        self.assertTrue(any("Scenario-Test" in error for error in errors), errors)
+
+    def test_product_change_cannot_bypass_contract_with_a_chore_title(self) -> None:
+        errors = validate_change_contract(
+            title="chore: quietly change recovery semantics",
+            body="Scenario-Test: not-applicable - maintenance only",
+            files=["src-tauri/src/agent/objective.rs"],
+            registry=self.registry,
+        )
+        self.assertTrue(any("not-applicable" in error for error in errors), errors)
+
+    def test_p1_product_change_is_a_hard_gate_too(self) -> None:
+        errors = validate_change_contract(
+            title="refactor workspace behavior",
+            body="Scenario-Test: not-applicable - refactor only",
+            files=["src/components/MessageInput.tsx"],
+            registry=self.registry,
+        )
+        self.assertTrue(any("UI-001" in error for error in errors), errors)
+
+    def test_unmapped_product_file_fails_closed(self) -> None:
+        errors = validate_change_contract(
+            title="fix runtime configuration",
+            body="Scenario-Test: HLT-001",
+            files=["src-tauri/src/new_runtime_surface.rs"],
+            registry=self.registry,
+        )
+        self.assertTrue(any("coverage gap" in error for error in errors), errors)
+
+    def test_missing_base_sha_is_an_error_not_a_warning(self) -> None:
+        files, error = _changed_files(REPO_ROOT, "")
+        self.assertEqual(files, [])
+        self.assertIn("base SHA", error or "")
+
+
+class ScenarioHardGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.registry = load_registry(REGISTRY_PATH)
+
+    def test_every_active_scenario_has_a_pull_request_gate(self) -> None:
+        errors = validate_gate_readiness(self.registry, "pull_request")
+        self.assertFalse(
+            any("manual_canary is not a hard gate" in error for error in errors),
+            errors,
+        )
+
+    def test_partial_or_designed_complex_e2e_freezes_the_gate(self) -> None:
+        errors = validate_gate_readiness(self.registry, "pull_request")
+        self.assertTrue(any("E2E-001" in error and "not gate-ready" in error for error in errors), errors)
+        self.assertTrue(any("E2E-009" in error and "not gate-ready" in error for error in errors), errors)
+
+    def test_release_gate_rejects_unimplemented_exact_artifact_cases(self) -> None:
+        errors = validate_gate_readiness(self.registry, "release_artifact")
+        self.assertTrue(any("release_artifact" in error for error in errors), errors)
+
+    def test_promoted_headless_gates_do_not_wait_for_network_idle(self) -> None:
+        # Vite/WebSocket/polling pages may never become network-idle. A hard
+        # gate must navigate to DOM readiness and then wait on its real UI
+        # oracle, otherwise an unrelated long-lived connection creates a
+        # deterministic 30-second false failure.
+        promoted = (
+            "verify-repository-intent-headless.mjs",
+            "verify-reconnect-banner-headless.mjs",
+            "verify-startup-session-headless.mjs",
+            "verify-sidebar-expansion-headless.mjs",
+            "verify-image-preview-headless.mjs",
+            "verify-streaming-markdown-headless.mjs",
+            "verify-permission-mode-headless.mjs",
+            "verify-token-usage-headless.mjs",
+        )
+        offenders = [
+            name
+            for name in promoted
+            if 'waitUntil: "networkidle"'
+            in (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
+        ]
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":

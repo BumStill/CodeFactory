@@ -188,6 +188,41 @@ jobs:
           path: ${{ runner.temp }}/codefactory-compact-composer-headless
           if-no-files-found: error
 
+      # Registry v2 makes every registered scenario target an explicit PR
+      # gate. These commands used to be manual canaries even though their
+      # deterministic harnesses already existed.
+      - name: Repository intent headless gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:repository-intent:headless
+
+      - name: Reconnect banner headless gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:reconnect-banner:headless
+
+      - name: Startup session headless gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:startup-session:headless
+
+      - name: Sidebar expansion headless gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:sidebar-expansion:headless
+
+      - name: Image preview headless gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:image-preview:headless
+
+      - name: Streaming markdown headless gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:streaming-markdown:headless
+
+      - name: Permission mode headless gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:permission-mode:headless
+
+      - name: Usage headless gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: pnpm test:usage:headless
+
 
       # Run the Rust test suite. New regressions like the v0.3.7
       # "old sessions won't open" bug land here as failing tests so we

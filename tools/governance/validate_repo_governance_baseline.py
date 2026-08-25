@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-BASELINE_VERSION = "2026-05-11"
+BASELINE_VERSION = "2026-08-25"
 EXPECTED_BASELINE_ENTRIES = ['docs/long-tasks/README.md', 'docs/long-tasks/task-record-template.md', '.github/workflows/governed-delivery.yml', 'tools/governance/diagnose_release_latency.py', 'tools/governance/validate_long_task_record.py']
 DEFAULT_REPO_PROFILE_MARKERS = ['Adopted Governance Version', 'Global Governance Sources', 'Propagation Policy', 'Surface ID', 'Path ID', 'Role Gate']
 

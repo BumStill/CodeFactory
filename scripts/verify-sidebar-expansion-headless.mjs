@@ -57,7 +57,7 @@ async function main() {
     await waitForServer(vite);
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox"] });
     const page = await browser.newPage({ viewport: { width: 420, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "networkidle" });
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.getByRole("main", { name: "Sidebar expansion acceptance" }).waitFor({ timeout: 10_000 });
 
     assert((await page.getByText("CodeFactory 主线", { exact: true }).count()) === 0, "project should start collapsed when quick session is active");

@@ -3,6 +3,7 @@ name: governance-baseline
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 

@@ -147,11 +147,15 @@ jobs:
           CONC=$(gh run list --workflow governance-baseline --branch main --limit 30 \
                    --json headSha,conclusion \
                    -q "[.[] | select(.headSha==\"$HEAD_SHA\")][0].conclusion" 2>/dev/null || echo "")
-          if [ -n "$CONC" ] && [ "$CONC" != "success" ]; then
+          if [ -z "$CONC" ]; then
+            echo "::error::governance-baseline for $HEAD_SHA was not found — refusing to infer green."
+            exit 1
+          fi
+          if [ "$CONC" != "success" ]; then
             echo "::error::governance-baseline for $HEAD_SHA is '$CONC' — refusing to release on red."
             exit 1
           fi
-          echo "governance-baseline for $HEAD_SHA: ${CONC:-not found, proceeding}"
+          echo "governance-baseline for $HEAD_SHA: $CONC"
 
       - name: Reconcile interrupted version release
         id: reconcile
@@ -424,7 +428,7 @@ jobs:
 
           PR=$(gh pr list --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
                  --state open --json number --jq '.[0].number // empty')
-          PR_BODY=$'Automated version bump for '"$TAG"$'. This PR must pass the same required checks as every other main change.\n\nREADME-Update: reviewed\nREADME-Update-Reason: Version manifest only; the evergreen README keeps version-neutral latest-release links.'
+          PR_BODY=$'Automated version bump for '"$TAG"$'. This PR must pass the same required checks as every other main change.\n\nScenario-Test: ALL\nREADME-Update: reviewed\nREADME-Update-Reason: Version manifest only; the evergreen README keeps version-neutral latest-release links.'
           if [ -z "$PR" ]; then
             PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
               --title "chore: bump version to $NEW" \
@@ -474,7 +478,7 @@ jobs:
             fi
 
             SUCCESSES=0
-            for CHECK in governance-baseline agent-bridge-linux check-frontend check-rust remote-real-app-gui; do
+            for CHECK in governance-baseline agent-bridge-linux check-frontend check-rust remote-real-app-gui scenario-gate-policy scenario-gate-pr; do
               CONCLUSIONS=$(jq -r --arg check "$CHECK" \
                 '.statusCheckRollup[]? | select(.name == $check) | .conclusion' <<< "$DATA")
               if grep -Eq '^(FAILURE|CANCELLED|TIMED_OUT|ACTION_REQUIRED)$' \
@@ -496,14 +500,14 @@ jobs:
               echo "::error::Version PR #$PR is behind main; refusing to expand an already planned release batch. Rerun Auto Release to replan from latest main."
               exit 1
             fi
-            if [ "$SUCCESSES" -eq 5 ]; then
+            if [ "$SUCCESSES" -eq 7 ]; then
               gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash \
                 --auto --match-head-commit "$EXPECTED_HEAD"
               echo "All required checks passed; submitted guarded merge for version PR #$PR"
               sleep 5
               continue
             fi
-            echo "Version PR #$PR waiting ($attempt/180, state=$MERGE_STATE, required=$SUCCESSES/4)"
+            echo "Version PR #$PR waiting ($attempt/180, state=$MERGE_STATE, required=$SUCCESSES/7)"
             sleep 20
           done
           echo "::error::Version PR #$PR did not merge within 60 minutes"

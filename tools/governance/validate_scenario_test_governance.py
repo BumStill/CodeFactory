@@ -31,7 +31,6 @@ FORBIDDEN_DATA_KEYS = {
     "tool_arguments",
     "raw_tool_arguments",
 }
-ENFORCED_TYPES = re.compile(r"^(feat|fix)(\([^)]*\))?!?:", re.IGNORECASE)
 DECLARATION = re.compile(
     r"^[ \t]*Scenario-Test:[ \t]*(.+?)[ \t]*$", re.IGNORECASE | re.MULTILINE
 )
@@ -40,13 +39,48 @@ PRODUCT_PREFIXES = (
     "src/",
     "src-tauri/src/",
     "src-tauri/crates/",
+    "src-tauri/migrations/",
+    "extension/",
     "tools/agent/",
     "scripts/",
 )
 NON_PRODUCT_MARKERS = (".test.", ".spec.", "/tests/", "src/acceptance/")
+REQUIRED_SCENARIO_CHECKS = {
+    "scenario-gate-policy",
+    "scenario-gate-pr",
+}
+TARGET_CHECKS = {
+    "binary": "check-rust",
+    "pnpm": "check-frontend",
+    "path": "check-frontend",
+    "rust": "check-rust",
+    "workflow": "check-rust",
+}
+GLOBAL_PRODUCT_FILES = {
+    ".github/workflows/auto-release.yml",
+    ".github/workflows/release.yml",
+    "package.json",
+    "pnpm-lock.yaml",
+    "src-tauri/Cargo.lock",
+    "src-tauri/Cargo.toml",
+    "src-tauri/tauri.conf.json",
+}
+
+
+def _is_test_harness_file(path: str) -> bool:
+    return (
+        path.startswith("src/acceptance/")
+        or (
+            path.startswith("scripts/verify-")
+            and path.endswith("-headless.mjs")
+        )
+        or any(marker in path for marker in NON_PRODUCT_MARKERS)
+    )
 
 
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError(f"scenario registry must not be a symlink: {path}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -69,7 +103,11 @@ def _duplicates(values: list[str]) -> set[str]:
 
 
 def _files_with_suffix(root: Path, suffix: str) -> list[Path]:
-    return [path for path in root.rglob(f"*{suffix}") if path.is_file()]
+    return [
+        path
+        for path in root.rglob(f"*{suffix}")
+        if path.is_file() and not path.is_symlink()
+    ]
 
 
 def _automation_exists(target: str, repo_root: Path) -> bool:
@@ -85,7 +123,8 @@ def _automation_exists(target: str, repo_root: Path) -> bool:
             return False
         return marker in package.get("scripts", {})
     if kind == "path":
-        return (repo_root / marker).is_file()
+        path = repo_root / marker
+        return path.is_file() and not path.is_symlink()
     if kind == "rust":
         # Must be a real test function, not just the name appearing somewhere.
         # Substring matching would keep a declaration "valid" after its test was
@@ -93,7 +132,13 @@ def _automation_exists(target: str, repo_root: Path) -> bool:
         # string literal, or a failure code — which is precisely how a scenario
         # goes on reporting coverage it no longer has.
         roots = [repo_root / "src-tauri" / "src", repo_root / "src-tauri" / "crates"]
-        pattern = re.compile(r"\bfn\s+" + re.escape(marker) + r"\s*\(")
+        pattern = re.compile(
+            r"#\[(?:tokio::)?test(?:\([^\]]*\))?\]"
+            r"(?:\s*#\[[^\]]+\])*\s*(?:async\s+)?fn\s+"
+            + re.escape(marker)
+            + r"\s*\(",
+            re.MULTILINE,
+        )
         return any(
             pattern.search(file.read_text(encoding="utf-8", errors="ignore"))
             for root in roots
@@ -107,6 +152,55 @@ def _automation_exists(target: str, repo_root: Path) -> bool:
     else:
         return False
     return any(marker in path.read_text(encoding="utf-8", errors="ignore") for path in files)
+
+
+def _automation_gate_stages(
+    target: str, gate_policy: dict[str, Any], repo_root: Path
+) -> set[str]:
+    if ":" not in target:
+        return set()
+    kind, marker = target.split(":", 1)
+    binding = (gate_policy.get("target_bindings") or {}).get(kind)
+    if not isinstance(binding, dict):
+        return set()
+    configured_paths: list[str] = []
+    if isinstance(binding.get("workflow"), str):
+        configured_paths.append(binding["workflow"])
+    if isinstance(binding.get("workflows"), list):
+        configured_paths.extend(binding["workflows"])
+    workflow_texts: dict[str, str] = {}
+    for relative in configured_paths:
+        path = repo_root / relative
+        if path.is_file():
+            workflow_texts[relative] = path.read_text(encoding="utf-8", errors="ignore")
+    if not workflow_texts:
+        return set()
+    if kind == "pnpm":
+        if any(f"pnpm {marker}" in text for text in workflow_texts.values()):
+            return set(binding.get("stages") or [])
+        return set()
+    if kind in {"binary", "workflow"}:
+        stages: set[str] = set()
+        workflow_stages = binding.get("workflow_stages") or {}
+        for relative, text in workflow_texts.items():
+            if marker in text:
+                stages.update(workflow_stages.get(relative) or [])
+        return stages
+    command = binding.get("command")
+    job = binding.get("job")
+    if bool(
+        isinstance(command, str)
+        and isinstance(job, str)
+        and any(command in text and f"  {job}:" in text for text in workflow_texts.values())
+    ):
+        return set(binding.get("stages") or [])
+    return set()
+
+
+def _automation_is_hard_gated(
+    target: str, gate_policy: dict[str, Any], repo_root: Path
+) -> bool:
+    return bool(_automation_gate_stages(target, gate_policy, repo_root))
 
 
 def _forbidden_keys(value: Any, location: str = "registry") -> list[str]:
@@ -125,10 +219,46 @@ def _forbidden_keys(value: Any, location: str = "registry") -> list[str]:
 
 def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> list[str]:
     errors: list[str] = []
-    if registry.get("schema_version") != 1:
-        errors.append("schema_version must be 1")
+    if registry.get("schema_version") != 2:
+        errors.append("schema_version must be 2")
     if registry.get("source_policy") != "aggregate-shapes-only":
         errors.append("source_policy must be aggregate-shapes-only")
+    gate_policy = registry.get("gate_policy")
+    if not isinstance(gate_policy, dict):
+        errors.append("gate_policy must be an object")
+        gate_policy = {}
+    if gate_policy.get("mode") != "all-registered-targets-hard-gated":
+        errors.append("gate_policy.mode must be all-registered-targets-hard-gated")
+    required_checks = set(gate_policy.get("pull_request_required_checks") or [])
+    if not REQUIRED_SCENARIO_CHECKS.issubset(required_checks):
+        errors.append(
+            "gate_policy.pull_request_required_checks must include "
+            + ", ".join(sorted(REQUIRED_SCENARIO_CHECKS))
+        )
+    if gate_policy.get("release_required_job") != "scenario-gate-release":
+        errors.append("gate_policy.release_required_job must be scenario-gate-release")
+    if set((gate_policy.get("target_bindings") or {}).keys()) != set(TARGET_CHECKS):
+        errors.append(
+            "gate_policy.target_bindings must cover exactly: "
+            + ", ".join(sorted(TARGET_CHECKS))
+        )
+    for kind, binding in (gate_policy.get("target_bindings") or {}).items():
+        if not isinstance(binding, dict):
+            errors.append(f"gate_policy.target_bindings.{kind} must be an object")
+            continue
+        declared_stages = set(binding.get("stages") or [])
+        workflow_stages = binding.get("workflow_stages") or {}
+        if not isinstance(workflow_stages, dict):
+            errors.append(f"gate_policy.target_bindings.{kind}.workflow_stages must be an object")
+            workflow_stages = {}
+        for stages in workflow_stages.values():
+            declared_stages.update(stages or [])
+        unknown_stages = sorted(declared_stages - ALLOWED_GATES)
+        if unknown_stages:
+            errors.append(
+                f"gate_policy.target_bindings.{kind} has unknown stages: "
+                + ", ".join(unknown_stages)
+            )
 
     categories = registry.get("categories")
     if not isinstance(categories, list) or not categories:
@@ -188,12 +318,21 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
         ):
             errors.append(f"{scenario_id} must define non-empty change_patterns")
         automation = scenario.get("automated_by")
+        scenario_gates = set(scenario.get("gates") or [])
         if not isinstance(automation, list) or not automation:
             errors.append(f"{scenario_id} must name at least one automation target")
         else:
             for target in automation:
                 if not isinstance(target, str) or not _automation_exists(target, repo_root):
                     errors.append(f"{scenario_id} points at missing automation: {target}")
+                elif not _automation_is_hard_gated(target, gate_policy, repo_root):
+                    errors.append(
+                        f"{scenario_id} automation is not bound to a hard gate: {target}"
+                    )
+                elif not (_automation_gate_stages(target, gate_policy, repo_root) & scenario_gates):
+                    errors.append(
+                        f"{scenario_id} automation has no declared hard-gate stage: {target}"
+                    )
         required_evidence = scenario.get("required_evidence")
         if not isinstance(required_evidence, list) or not required_evidence:
             errors.append(f"{scenario_id} must define required_evidence")
@@ -210,6 +349,8 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
                 errors.append(f"{scenario_id} has unknown gates: {', '.join(unknown_gates)}")
             if "release_artifact" in gates and "L4" not in set(required_evidence or []):
                 errors.append(f"{scenario_id} release_artifact gate requires L4 evidence")
+            if "pull_request" not in gates:
+                errors.append(f"{scenario_id} must include pull_request hard gate")
 
     cases = registry.get("complex_e2e_cases")
     if not isinstance(cases, list) or not cases:
@@ -265,6 +406,17 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
         for target in automated:
             if not _automation_exists(target, repo_root):
                 errors.append(f"{case_id} points at missing automation: {target}")
+            elif not _automation_is_hard_gated(target, gate_policy, repo_root):
+                errors.append(
+                    f"{case_id} automation is not bound to a hard gate: {target}"
+                )
+            elif not (
+                _automation_gate_stages(target, gate_policy, repo_root)
+                & set(execution or {})
+            ):
+                errors.append(
+                    f"{case_id} automation has no declared hard-gate stage: {target}"
+                )
         gaps = case.get("remaining_gaps")
         gaps = gaps if isinstance(gaps, list) else []
         status = case.get("automation_status")
@@ -302,53 +454,108 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
     return errors
 
 
+def validate_gate_readiness(registry: dict[str, Any], stage: str) -> list[str]:
+    """Reject catalog entries that cannot act as a real hard gate at *stage*.
+
+    The base registry validator intentionally permits honest test debt to be
+    recorded. This stricter compiler is what a required PR/release gate calls:
+    debt remains visible, but it cannot be counted as a passing gate.
+    """
+
+    if stage not in {"pull_request", "release_artifact"}:
+        return [f"unknown scenario gate stage: {stage}"]
+
+    errors: list[str] = []
+    for scenario in registry.get("scenarios", []):
+        scenario_id = scenario.get("id", "unknown")
+        gates = set(scenario.get("gates") or [])
+        if stage == "pull_request" and "pull_request" not in gates:
+            if gates == {"manual_canary"}:
+                errors.append(
+                    f"{scenario_id} manual_canary is not a hard gate; add pull_request"
+                )
+            else:
+                errors.append(f"{scenario_id} is missing pull_request hard gate")
+        if stage == "release_artifact" and "release_artifact" in gates:
+            evidence = set(scenario.get("required_evidence") or [])
+            if "L4" not in evidence:
+                errors.append(
+                    f"{scenario_id} release_artifact gate is missing L4 evidence"
+                )
+
+    for case in registry.get("complex_e2e_cases", []):
+        execution = case.get("execution") or {}
+        if stage not in execution:
+            continue
+        case_id = case.get("id", "unknown")
+        status = case.get("automation_status")
+        gaps = case.get("remaining_gaps") or []
+        if status != "implemented" or gaps:
+            errors.append(
+                f"{case_id} is not gate-ready for {stage}: "
+                f"status={status}, remaining_gaps={len(gaps)}"
+            )
+    return errors
+
+
 def _is_product_file(path: str) -> bool:
-    return path.startswith(PRODUCT_PREFIXES) and not any(marker in path for marker in NON_PRODUCT_MARKERS)
+    if path in GLOBAL_PRODUCT_FILES:
+        return True
+    return path.startswith(PRODUCT_PREFIXES) and not _is_test_harness_file(path)
 
 
-def _impacted_p0_scenarios(files: list[str], registry: dict[str, Any]) -> set[str]:
+def _impacted_scenarios(files: list[str], registry: dict[str, Any]) -> set[str]:
     impacted: set[str] = set()
     for scenario in registry.get("scenarios", []):
-        if scenario.get("priority") != "P0":
-            continue
         patterns = scenario.get("change_patterns", [])
         if any(fnmatch.fnmatch(path, pattern) for path in files for pattern in patterns):
             impacted.add(scenario["id"])
+    if any(path in GLOBAL_PRODUCT_FILES for path in files):
+        impacted.update(
+            scenario["id"] for scenario in registry.get("scenarios", [])
+        )
     return impacted
 
 
 def validate_change_contract(
     title: str, body: str, files: list[str], registry: dict[str, Any]
 ) -> list[str]:
-    if not ENFORCED_TYPES.match(title.strip()) or not any(_is_product_file(path) for path in files):
+    product_files = [path for path in files if _is_product_file(path)]
+    if not product_files:
         return []
 
     errors: list[str] = []
     match = DECLARATION.search(FENCED.sub("", body))
-    impacted = _impacted_p0_scenarios(files, registry)
+    impacted = _impacted_scenarios(product_files, registry)
+    if not impacted:
+        errors.append(
+            "scenario registry coverage gap for product files: "
+            + ", ".join(sorted(product_files))
+        )
     if not match:
-        suffix = f" Impacted P0 scenarios: {', '.join(sorted(impacted))}." if impacted else ""
-        return ["product feat/fix is missing 'Scenario-Test: <IDs>' declaration." + suffix]
+        suffix = f" Impacted scenarios: {', '.join(sorted(impacted))}." if impacted else ""
+        errors.append("product change is missing 'Scenario-Test: <IDs>' declaration." + suffix)
+        return errors
 
     declaration = match.group(1).strip()
     if declaration.lower().startswith("not-applicable"):
-        if impacted:
-            return [
-                "Scenario-Test cannot be not-applicable for impacted P0 scenarios: "
-                + ", ".join(sorted(impacted))
-            ]
-        if "-" not in declaration or len(declaration.split("-", 1)[1].strip()) < 12:
-            return ["Scenario-Test not-applicable requires a specific reason"]
-        return []
+        errors.append(
+            "Scenario-Test cannot be not-applicable for product changes"
+            + (": " + ", ".join(sorted(impacted)) if impacted else "")
+        )
+        return errors
 
-    declared = {item.strip().upper() for item in re.split(r"[,\s]+", declaration) if item.strip()}
     known = {scenario["id"] for scenario in registry.get("scenarios", [])}
+    if declaration.upper() == "ALL":
+        declared = known
+    else:
+        declared = {item.strip().upper() for item in re.split(r"[,\s]+", declaration) if item.strip()}
     unknown = sorted(declared - known)
     if unknown:
         errors.append("Scenario-Test declares unknown scenario IDs: " + ", ".join(unknown))
     missing = sorted(impacted - declared)
     if missing:
-        errors.append("Scenario-Test must include impacted P0 scenarios: " + ", ".join(missing))
+        errors.append("Scenario-Test must include impacted scenarios: " + ", ".join(missing))
     return errors
 
 
@@ -385,6 +592,10 @@ def main() -> int:
     parser.add_argument("--base-ref")
     parser.add_argument("--title")
     parser.add_argument("--body-file")
+    parser.add_argument(
+        "--stage", choices=("pull_request", "release_artifact")
+    )
+    parser.add_argument("--enforce-ready", action="store_true")
     args = parser.parse_args()
 
     repo_root = Path(args.repo).resolve() if args.repo else REPO_ROOT
@@ -408,9 +619,15 @@ def main() -> int:
             args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip(),
         )
         if diff_error:
-            print(f"::warning::scenario change contract skipped: {diff_error}")
+            errors.append(f"scenario change contract failed closed: {diff_error}")
         else:
             errors.extend(validate_change_contract(title, body, files, registry))
+
+    if args.enforce_ready:
+        if not args.stage:
+            errors.append("--enforce-ready requires --stage")
+        else:
+            errors.extend(validate_gate_readiness(registry, args.stage))
 
     if errors:
         print(f"scenario-test-governance: {len(errors)} error(s)")

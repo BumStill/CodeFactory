@@ -63,6 +63,14 @@
             {
               "context": "remote-real-app-gui",
               "integration_id": 15368
+            },
+            {
+              "context": "scenario-gate-policy",
+              "integration_id": 15368
+            },
+            {
+              "context": "scenario-gate-pr",
+              "integration_id": 15368
             }
           ],
           "strict_required_status_checks_policy": true

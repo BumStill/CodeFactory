@@ -14,7 +14,7 @@
 #   enforcer    artifact that makes/keeps the rule true (must exist)
 #   level       warn | error   (only for enforcement: check)
 
-version: "2026-08-18"
+version: "2026-08-25"
 
 rules:
   - id: release-cadence
@@ -55,10 +55,11 @@ rules:
     enforcer: AGENTS.md
 
   - id: scenario-test-governance
-    statement: "Every product feat/fix maps to registered scenarios, and complex E2E evidence spans UI, durable state, process, idempotent side effects, and delivery."
+    statement: "Every product change from every tool maps to hard-gated scenarios; incomplete complex E2E debt cannot count as green or publish a release."
     doc: docs/specs/feature-specs/scenario-test-governance.md
-    enforcement: structural
-    enforcer: tools/governance/validate_scenario_test_governance.py
+    enforcement: check
+    enforcer: tools/governance/run_scenario_harness_gate.py
+    level: error
 
   - id: objective-non-interruption-contract
     statement: "System-owned technical states remain durably owned and must not require a manual continue, retry, resend, or chat handoff; only typed core input, irreversible business decisions, explicit deny, or cancel may interrupt the user path."

@@ -68,7 +68,7 @@ async function main() {
     await waitForServer(vite);
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox"] });
     const page = await browser.newPage({ viewport: { width: 960, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "networkidle" });
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await page.getByRole("main", { name: "Image preview acceptance" }).waitFor({ timeout: 10_000 });
 
     const transcriptImage = page.getByRole("img", { name: "IMG_6190.png" }).first();

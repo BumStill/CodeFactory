@@ -1,7 +1,7 @@
 # CodeFactory Repo Governance Profile
 
 ## Governance Sync Metadata
-- Adopted Governance Version: `2026-05-11`
+- Adopted Governance Version: `2026-08-25`
 - Global Governance Sources:
   - `codex-delivery-governance`
   - `harness-taxonomy.md`
@@ -9,7 +9,7 @@
   - `governance-change-control.md`
   - `governance-propagation.md`
 - Propagation Policy: `profile-review`
-- Last Governance Review Date: `2026-05-13`
+- Last Governance Review Date: `2026-08-25`
 - Local Governance Owner: `CodeFactory maintainers`
 
 ## Repository Basics
