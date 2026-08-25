@@ -19,11 +19,15 @@ jobs:
           python-version: "3.11"
       - run: pip install pyyaml
       - run: python tools/governance/validate_repo_governance_baseline.py
-      - name: Validate scenario test governance
+      - name: Validate scenario test governance for pull requests
+        if: github.event_name == 'pull_request'
         env:
           SCENARIO_TEST_EVENT_PATH: ${{ github.event_path }}
-          SCENARIO_TEST_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          SCENARIO_TEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python tools/governance/validate_scenario_test_governance.py --ci
+      - name: Validate scenario registry after merge
+        if: github.event_name == 'push'
+        run: python tools/governance/validate_scenario_test_governance.py
       - name: Enforce governance rules manifest (docs/governance/rules.yml)
         env:
           GOVERNANCE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}

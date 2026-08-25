@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -284,6 +285,30 @@ class ScenarioChangeContractTests(unittest.TestCase):
         files, error = _changed_files(REPO_ROOT, "")
         self.assertEqual(files, [])
         self.assertIn("base SHA", error or "")
+
+    def test_governance_workflow_only_requires_pr_metadata_on_pr_events(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "governance-baseline.yml"
+        ).read_text(encoding="utf-8")
+        pr_step = re.search(
+            r"- name: Validate scenario test governance for pull requests\n"
+            r"(?P<body>.*?)(?=\n      - name:|\Z)",
+            workflow,
+            re.DOTALL,
+        )
+        push_step = re.search(
+            r"- name: Validate scenario registry after merge\n"
+            r"(?P<body>.*?)(?=\n      - name:|\Z)",
+            workflow,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(pr_step, "pull_request validation step must be explicit")
+        self.assertIsNotNone(push_step, "push validation step must be explicit")
+        assert pr_step is not None and push_step is not None
+        self.assertIn("github.event_name == 'pull_request'", pr_step.group("body"))
+        self.assertIn("--ci", pr_step.group("body"))
+        self.assertIn("github.event_name == 'push'", push_step.group("body"))
+        self.assertNotIn("--ci", push_step.group("body"))
 
 
 class ScenarioHardGateTests(unittest.TestCase):
