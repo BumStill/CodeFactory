@@ -296,6 +296,20 @@ jobs:
             exit 1
           fi
 
+          # A tag is immutable. If its release failed and main now contains a
+          # new releasable fix, retrying the old source can never exercise that
+          # fix. Keep the failed tag as an auditable tombstone and let the
+          # normal planner cut the next patch from the current exact main.
+          if [ "$RUN_CONCLUSION" = "failure" ]; then
+            FIX_PLAN=$(python3 tools/release/plan_release.py --range "$TAG..HEAD")
+            if [ "$(jq -r '.skip' <<< "$FIX_PLAN")" = "false" ]; then
+              echo "Release $TAG failed and main contains a releasable fix; continuing with a new immutable patch tag"
+              echo "abandoned_tag=$TAG" >> "$GITHUB_OUTPUT"
+              echo "recovered=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           if [ "$TAG_CREATED" = true ] || [ "$RELEASE_STATE" != "published" ]; then
             TAG_SHA=$(git rev-parse "$TAG^{commit}")
             GH_TOKEN="$ACTIONS_TOKEN" gh workflow run release.yml \

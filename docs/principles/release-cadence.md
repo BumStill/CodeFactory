@@ -172,6 +172,14 @@ go-ahead.
    smoke actually failed and needs repair.
 8. **The pipeline is resilient.** Transient infra failures (push 500s, registry
    download drops) retry rather than abort. See the repo's release workflows.
+9. **Failed unpublished tags are immutable tombstones, not retry loops.** If a
+   release run failed and main has no releasable change after that tag, bounded
+   recovery may retry the same source. Once main contains a `feat`/`fix`, the
+   controller must preserve the failed tag for audit and cut the next version;
+   it must never move or rebuild the old tag while claiming the fix is present.
+   Release impact is always measured from the previous **published** release,
+   so a tombstone cannot hide unshipped product changes from scenario gates or
+   release notes.
 
 ## How to apply it in a new repo
 

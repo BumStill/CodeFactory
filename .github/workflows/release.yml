@@ -54,6 +54,30 @@ jobs:
           fi
           echo "authorized_tag_sha=$AUTHORIZED_TAG_SHA" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve previous published release for notes
+        id: notes_base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ steps.authorize.outputs.authorized_tag_sha }}
+        run: |
+          set -euo pipefail
+          RELEASES=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json isDraft,isPrerelease,publishedAt,tagName)
+          BASE_TAG=$(jq -r --arg tag "$TAG" \
+            '[.[] | select(.isDraft == false and .isPrerelease == false and .tagName != $tag)] | sort_by(.publishedAt) | last | .tagName // empty' \
+            <<< "$RELEASES")
+          test -n "$BASE_TAG" || {
+            echo "::error::release notes could not resolve the previous published release tag"
+            exit 1
+          }
+          BASE_SHA=$(git rev-parse "${BASE_TAG}^{commit}")
+          git merge-base --is-ancestor "$BASE_SHA" "$AUTHORIZED_TAG_SHA" || {
+            echo "::error::previous published release tag $BASE_TAG is not an ancestor of $TAG"
+            exit 1
+          }
+          echo "base_tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
         with:
@@ -62,8 +86,11 @@ jobs:
       - name: Generate release notes
         id: cliff
         shell: bash
+        env:
+          BASE_TAG: ${{ steps.notes_base.outputs.base_tag }}
+          TAG: ${{ inputs.tag }}
         run: |
-          git-cliff --latest --strip all -o RELEASE_NOTES.md
+          git-cliff "$BASE_TAG..$TAG" --strip all -o RELEASE_NOTES.md
           {
             echo 'content<<RELEASE_NOTES_EOF'
             cat RELEASE_NOTES.md
@@ -93,6 +120,14 @@ jobs:
           ref: ${{ needs.changelog.outputs.authorized_tag_sha }}
           fetch-depth: 0
 
+      - name: Checkout trusted default-branch scenario policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: policy
+          persist-credentials: false
+          fetch-depth: 0
+
       - name: Require remote release tag to remain authorized
         env:
           TAG: ${{ inputs.tag }}
@@ -103,17 +138,27 @@ jobs:
         id: scenario_base
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
+          AUTHORIZED_TAG_SHA: ${{ needs.changelog.outputs.authorized_tag_sha }}
         run: |
           set -euo pipefail
-          BASE_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          RELEASES=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json isDraft,isPrerelease,publishedAt,tagName)
+          BASE_TAG=$(jq -r --arg tag "$TAG" \
+            '[.[] | select(.isDraft == false and .isPrerelease == false and .tagName != $tag)] | sort_by(.publishedAt) | last | .tagName // empty' \
+            <<< "$RELEASES")
           if [ -z "$BASE_TAG" ]; then
-            echo "::error::scenario release gate could not resolve the previous tag"
+            echo "::error::scenario release gate could not resolve the previous published release tag"
             exit 1
           fi
           BASE_SHA="$(git rev-parse "${BASE_TAG}^{commit}")"
           test -n "$BASE_SHA" || {
-            echo "::error::scenario release gate could not resolve the previous tag SHA"
+            echo "::error::scenario release gate could not resolve the previous published release tag SHA"
+            exit 1
+          }
+          git merge-base --is-ancestor "$BASE_SHA" "$AUTHORIZED_TAG_SHA" || {
+            echo "::error::previous published release tag $BASE_TAG is not an ancestor of $TAG"
             exit 1
           }
           echo "base_tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
@@ -121,10 +166,10 @@ jobs:
 
       - name: scenario-gate-release
         run: >-
-          python3 tools/governance/run_scenario_harness_gate.py
+          python3 policy/tools/governance/run_scenario_harness_gate.py
           --stage release_artifact
           --repo .
-          --policy-repo .
+          --policy-repo policy
           --base-ref ${{ steps.scenario_base.outputs.base_sha }}
 
       - name: Validate tag and prepare draft release
