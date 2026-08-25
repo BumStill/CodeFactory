@@ -17,6 +17,7 @@ from tools.governance.run_scenario_harness_gate import (
 )
 from tools.governance.validate_scenario_test_governance import (
     _changed_files,
+    _is_version_manifest_only_patch,
     load_registry,
     validate_change_contract,
     validate_gate_readiness,
@@ -418,6 +419,53 @@ class ScenarioHardGateTests(unittest.TestCase):
             in (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
         ]
         self.assertEqual(offenders, [])
+
+
+class VersionManifestImpactTests(unittest.TestCase):
+    files = [
+        "package.json",
+        "src-tauri/Cargo.lock",
+        "src-tauri/Cargo.toml",
+        "src-tauri/tauri.conf.json",
+    ]
+
+    @staticmethod
+    def patch(new_version: str = "1.81.35") -> str:
+        sections = []
+        for path in VersionManifestImpactTests.files:
+            key = '  "version": ' if path.endswith(".json") else "version = "
+            old = f'{key}"1.81.34"'
+            new = f'{key}"{new_version}"'
+            sections.append(
+                f"diff --git a/{path} b/{path}\n"
+                f"--- a/{path}\n"
+                f"+++ b/{path}\n"
+                "@@ -1 +1 @@\n"
+                f"-{old}\n+{new}\n"
+            )
+        return "".join(sections)
+
+    def test_exact_synchronized_version_bump_has_no_scenario_impact(self) -> None:
+        self.assertTrue(_is_version_manifest_only_patch(self.files, self.patch()))
+
+    def test_manifest_change_with_a_script_edit_remains_a_global_change(self) -> None:
+        patch = self.patch() + (
+            "diff --git a/package.json b/package.json\n"
+            "--- a/package.json\n+++ b/package.json\n@@ -9 +9 @@\n"
+            '-    "test": "old"\n+    "test": "new"\n'
+        )
+        self.assertFalse(_is_version_manifest_only_patch(self.files, patch))
+
+    def test_mismatched_target_versions_fail_closed(self) -> None:
+        patch = self.patch().replace(
+            '+version = "1.81.35"', '+version = "1.81.36"', 1
+        )
+        self.assertFalse(_is_version_manifest_only_patch(self.files, patch))
+
+    def test_partial_manifest_set_is_not_exempt(self) -> None:
+        self.assertFalse(
+            _is_version_manifest_only_patch(self.files[:-1], self.patch())
+        )
 
 
 if __name__ == "__main__":

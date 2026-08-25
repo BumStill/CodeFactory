@@ -43,6 +43,7 @@ CodeFactory 现有测试数量很多，但场景分散在 Rust 测试、Vitest�
 | CF-STG-R21 | base SHA、required run 或 live ruleset 状态无法读取时必须失败，不能 warning 后继续 | fail-closed runner + ruleset verifier |
 | CF-STG-R22 | PR 阶段只对**受影响**的场景与复杂用例强制「PR slice 已实现、无 PR gap、全部 required targets 在该阶段真实执行」；目录级 readiness 扫描仅在 `release_artifact` 生效 | `pull_request_gate` + `validate_impacted_execution` |
 | CF-STG-R23 | 逐字节 trust root 同时覆盖审判逻辑和提供执行证据的 required workflow；普通候选 PR 不得把测试改成空跑后自证 | `TRUST_ROOT_FILES` + external governance bootstrap |
+| CF-STG-R24 | 纯版本 bump 只有在四个 manifest 的字段级 diff 同时证明为同一旧版本到同一新版本、且无其他字段变化时才不产生 PR 场景影响；依赖、脚本、Cargo 或 Tauri 配置的其他变化仍按全局产品变更 fail closed | `scenario_impact_files` + version manifest negative fixtures |
 
 ## Primary User Path
 

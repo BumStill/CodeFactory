@@ -20,6 +20,7 @@ from tools.governance.validate_scenario_test_governance import (
     _event_body_and_title,
     _is_product_file,
     load_registry,
+    scenario_impact_files,
     validate_change_contract,
     validate_gate_readiness,
     validate_impacted_execution,
@@ -243,7 +244,8 @@ def main() -> int:
         if diff_error:
             errors.append(f"scenario gate failed closed: {diff_error}")
         elif registry:
-            product_files = [path for path in files if _is_product_file(path)]
+            impact_files = scenario_impact_files(repo_root, base_ref, files)
+            product_files = [path for path in impact_files if _is_product_file(path)]
             if args.stage == "pull_request":
                 if args.body_file:
                     body = Path(args.body_file).read_text(encoding="utf-8")
@@ -254,7 +256,9 @@ def main() -> int:
                         or os.environ.get("SCENARIO_TEST_EVENT_PATH")
                         or os.environ.get("GITHUB_EVENT_PATH")
                     )
-                errors.extend(validate_change_contract(title, body, files, registry))
+                errors.extend(
+                    validate_change_contract(title, body, impact_files, registry)
+                )
             initial_bootstrap = (
                 repo_root == policy_root
                 and is_initial_trust_bootstrap(repo_root, base_ref)
@@ -268,7 +272,7 @@ def main() -> int:
                 # product change could land at all.
                 errors.extend(
                     validate_impacted_execution(
-                        registry, files, "pull_request", repo_root
+                        registry, impact_files, "pull_request", repo_root
                     )
                 )
 

@@ -66,6 +66,21 @@ GLOBAL_PRODUCT_FILES = {
     "src-tauri/Cargo.toml",
     "src-tauri/tauri.conf.json",
 }
+VERSION_MANIFEST_FILES = {
+    "package.json",
+    "src-tauri/Cargo.lock",
+    "src-tauri/Cargo.toml",
+    "src-tauri/tauri.conf.json",
+}
+SEMVER = r"([0-9]+\.[0-9]+\.[0-9]+)"
+VERSION_LINE_PATTERNS = {
+    "package.json": re.compile(rf'^\s*"version"\s*:\s*"{SEMVER}"[,]?\s*$'),
+    "src-tauri/Cargo.lock": re.compile(rf'^\s*version\s*=\s*"{SEMVER}"\s*$'),
+    "src-tauri/Cargo.toml": re.compile(rf'^\s*version\s*=\s*"{SEMVER}"\s*$'),
+    "src-tauri/tauri.conf.json": re.compile(
+        rf'^\s*"version"\s*:\s*"{SEMVER}"[,]?\s*$'
+    ),
+}
 
 
 def _is_test_harness_file(path: str) -> bool:
@@ -77,6 +92,69 @@ def _is_test_harness_file(path: str) -> bool:
         )
         or any(marker in path for marker in NON_PRODUCT_MARKERS)
     )
+
+
+def _is_version_manifest_only_patch(files: list[str], patch: str) -> bool:
+    """Accept only the release bot's synchronized four-file version bump.
+
+    Paths alone are insufficient: dependency, script, Cargo, and Tauri config
+    changes are global product changes.  The exemption applies only when every
+    changed line is the same semantic-version transition in all four manifests.
+    """
+
+    if set(files) != VERSION_MANIFEST_FILES or len(files) != len(VERSION_MANIFEST_FILES):
+        return False
+
+    removed: dict[str, list[str]] = {path: [] for path in VERSION_MANIFEST_FILES}
+    added: dict[str, list[str]] = {path: [] for path in VERSION_MANIFEST_FILES}
+    current: str | None = None
+    for line in patch.splitlines():
+        if line.startswith("diff --git a/"):
+            parts = line.split(" ")
+            current = parts[2][2:] if len(parts) >= 4 else None
+            if current not in VERSION_MANIFEST_FILES:
+                return False
+            continue
+        if current is None or line.startswith(("--- ", "+++ ")):
+            continue
+        if not line.startswith(("-", "+")):
+            continue
+        pattern = VERSION_LINE_PATTERNS[current]
+        match = pattern.fullmatch(line[1:])
+        if not match:
+            return False
+        target = removed if line.startswith("-") else added
+        target[current].append(match.group(1))
+
+    if any(len(removed[path]) != 1 or len(added[path]) != 1 for path in VERSION_MANIFEST_FILES):
+        return False
+    old_versions = {values[0] for values in removed.values()}
+    new_versions = {values[0] for values in added.values()}
+    return len(old_versions) == 1 and len(new_versions) == 1 and old_versions != new_versions
+
+
+def scenario_impact_files(repo_root: Path, base_ref: str, files: list[str]) -> list[str]:
+    """Return files that may affect scenarios, exempting an exact version bump."""
+
+    if set(files) != VERSION_MANIFEST_FILES:
+        return files
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--unified=0",
+            f"{base_ref}...HEAD",
+            "--",
+            *sorted(VERSION_MANIFEST_FILES),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return files
+    return [] if _is_version_manifest_only_patch(files, result.stdout) else files
 
 
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, Any]:
