@@ -891,6 +891,63 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("scripts/verify-macos-release-artifact.sh", published_job)
         self.assertIn("macos-published-release-gui-evidence", published_job)
 
+    def test_macos_chrome_attach_gate_uses_the_exact_installed_artifact(self) -> None:
+        """RTE-003 must run before the temporary DMG install is removed.
+
+        Run 32843403103 verified a temporary install, removed it, and then a
+        separate workflow step searched /Applications for an app that had
+        never been copied there.  That shape can never exercise the candidate
+        artifact and must not return.
+        """
+        release = (REPO_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        artifact_smoke = (
+            REPO_ROOT / "scripts/verify-macos-release-artifact.sh"
+        ).read_text(encoding="utf-8")
+        attach_cli = (REPO_ROOT / "src-tauri/src/lib.rs").read_text(encoding="utf-8")
+
+        build_job = release.split("\n  build-macos:\n", 1)[1].split(
+            "\n  finalize:\n", 1
+        )[0]
+        self.assertNotIn("find /Applications -path '*/CodeFactory.app", build_job)
+        self.assertNotIn(
+            "- name: Verify installed macOS release can attach to existing Chrome",
+            build_job,
+        )
+        self.assertIn("CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT", build_job)
+
+        exact_binary_call = (
+            '"$EXECUTABLE_PATH" --browser-chrome-attach-smoke '
+            '"$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT"'
+        )
+        self.assertIn(exact_binary_call, artifact_smoke)
+        self.assertGreater(
+            artifact_smoke.index(exact_binary_call),
+            artifact_smoke.index('verify_app_bundle "$INSTALLED_APP" "DMG"'),
+        )
+        self.assertIn("CODEFACTORY_BROWSER_CHROME_FIXTURE", artifact_smoke)
+        self.assertIn('CODEFACTORY_BROWSER_CHROME_FIXTURE="managed"', artifact_smoke)
+        self.assertNotIn("/Applications/Google Chrome.app", artifact_smoke)
+        for field in (
+            "connection_kind",
+            "tab_observation_ok",
+            "detached_without_managed_close",
+            "lease_reclaimed_after_detach",
+            "browser_process_alive_after_detach",
+        ):
+            self.assertIn(field, artifact_smoke)
+
+        # The exact binary owns the native bridge and a synthetic, paired
+        # browser fixture.  Merely moving the old invocation into the script
+        # would still fail because the CLI previously started no bridge.
+        self.assertIn("let pairing = bridge.start().await", attach_cli)
+        self.assertIn("extension_package::prepare", attach_cli)
+        self.assertIn("browser::download::ensure_installed", attach_cli)
+        self.assertIn("CODEFACTORY_BROWSER_CHROME_FIXTURE", attach_cli)
+        self.assertIn("browser_process_alive_after_detach", attach_cli)
+        self.assertNotIn('.arg("--headless=new")', attach_cli)
+
     def test_ci_runs_agent_bridge_and_evaluation_tests_on_linux(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"

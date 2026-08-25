@@ -123,9 +123,11 @@ def validate_gate_surfaces(repo_root: Path, registry: dict) -> list[str]:
         errors.append(
             "release workflow is missing the batch-scoped scenario gate before publication"
         )
+    macos_artifact_verifier = _read(repo_root / "scripts/verify-macos-release-artifact.sh")
     if (
-        "Verify installed macOS release can attach to existing Chrome" not in release
-        or "--browser-chrome-attach-smoke" not in release
+        "scripts/verify-macos-release-artifact.sh" not in release
+        or "--browser-chrome-attach-smoke" not in macos_artifact_verifier
+        or "CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT" not in release
     ):
         errors.append("release workflow is missing the RTE-003 exact-artifact gate")
 
