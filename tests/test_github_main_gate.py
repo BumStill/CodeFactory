@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -171,6 +172,37 @@ class GitHubMainGateTests(unittest.TestCase):
         for hook in (pre_commit, pre_push):
             self.assertIn("run_scenario_harness_gate.py", hook)
             self.assertIn("--stage local", hook)
+
+    def test_pre_push_allows_a_pure_remote_ref_deletion(self) -> None:
+        hook = REPO_ROOT / ".githooks/pre-push"
+        result = subprocess.run(
+            [str(hook)],
+            cwd=REPO_ROOT,
+            input=(
+                "(delete) " + "0" * 40 + " "
+                "refs/heads/disposable " + "1" * 40 + "\n"
+            ),
+            text=True,
+            capture_output=True,
+            env={**os.environ, "SCENARIO_TEST_BASE_SHA": "definitely-missing-base"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_pre_push_still_gates_a_mixed_delete_and_update(self) -> None:
+        hook = REPO_ROOT / ".githooks/pre-push"
+        result = subprocess.run(
+            [str(hook)],
+            cwd=REPO_ROOT,
+            input=(
+                "(delete) " + "0" * 40 + " refs/heads/disposable " + "1" * 40 + "\n"
+                "refs/heads/main " + "2" * 40 + " refs/heads/main " + "1" * 40 + "\n"
+            ),
+            text=True,
+            capture_output=True,
+            env={**os.environ, "SCENARIO_TEST_BASE_SHA": "definitely-missing-base"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("scenario gate failed closed", result.stdout + result.stderr)
 
     def test_trusted_policy_files_are_covered_by_the_ruleset(self) -> None:
         policy = self._policy()
