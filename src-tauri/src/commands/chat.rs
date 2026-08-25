@@ -1431,9 +1431,21 @@ async fn settle_chat_objective_from_error(
             resume_cursor: Some(root_turn_id.to_string()),
         }
     } else {
+        // Separate "this endpoint is answering unavailable" from the generic
+        // loop error. The generic class earns the growing transient ladder;
+        // this one cannot improve on its own, so it converges fast to a settled
+        // state the user can act on instead of showing "等待中" for minutes.
+        let failure_code = if matches!(
+            crate::agent::failover::classify_provider_failure(error_text),
+            crate::agent::failover::ProviderFailureClass::EndpointUnavailable
+        ) {
+            crate::agent::objective::PROVIDER_ENDPOINT_UNAVAILABLE
+        } else {
+            "agent_loop_error"
+        };
         RouteSignal::TechnicalFailure {
             domain: RecoveryDomain::Chat,
-            failure_code: "agent_loop_error".into(),
+            failure_code: failure_code.into(),
             failure_signature: format!("sha256:{:x}", Sha256::digest(error_text.as_bytes())),
             next_observation_at: Utc::now().timestamp_millis() + 5_000,
             resume_cursor: Some(root_turn_id.to_string()),

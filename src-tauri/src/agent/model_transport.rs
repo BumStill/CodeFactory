@@ -76,8 +76,8 @@ pub(super) struct RoutedDesktopModelTransport {
     pub(super) session_id: String,
     pub(super) route_state: ActiveRouteState,
     pub(super) cancel: Option<Arc<AtomicBool>>,
-    pub(super) turn_output_started: Arc<AtomicBool>,
-    pub(super) turn_side_effect_started: Arc<AtomicBool>,
+    pub(super) turn_uncommitted_output: Arc<AtomicBool>,
+    pub(super) turn_uncommitted_side_effect: Arc<AtomicBool>,
     pub(super) db: SqlitePool,
     pub(super) root_turn_id: Option<String>,
     pub(super) mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
@@ -106,8 +106,8 @@ enum ProviderFailureAction {
 struct TrackingEventSink {
     delegate: Arc<dyn EventSink>,
     output_started: Arc<AtomicBool>,
-    turn_output_started: Arc<AtomicBool>,
-    turn_side_effect_started: Arc<AtomicBool>,
+    turn_uncommitted_output: Arc<AtomicBool>,
+    turn_uncommitted_side_effect: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -120,12 +120,12 @@ impl EventSink for TrackingEventSink {
                 | StreamEvent::ToolResult { .. }
         ) {
             self.output_started.store(true, Ordering::SeqCst);
-            self.turn_output_started.store(true, Ordering::SeqCst);
+            self.turn_uncommitted_output.store(true, Ordering::SeqCst);
             if matches!(
                 event,
                 StreamEvent::ToolCallStart { .. } | StreamEvent::ToolResult { .. }
             ) {
-                self.turn_side_effect_started.store(true, Ordering::SeqCst);
+                self.turn_uncommitted_side_effect.store(true, Ordering::SeqCst);
             }
         }
         self.delegate.emit(event);
@@ -505,12 +505,12 @@ impl RoutedDesktopModelTransport {
         if latches.get::<i64, _>("output_started") != 0
             || latches.get::<i64, _>("objective_output_started") != 0
         {
-            self.turn_output_started.store(true, Ordering::SeqCst);
+            self.turn_uncommitted_output.store(true, Ordering::SeqCst);
         }
         if latches.get::<i64, _>("side_effect_started") != 0
             || latches.get::<i64, _>("objective_side_effect_started") != 0
         {
-            self.turn_side_effect_started.store(true, Ordering::SeqCst);
+            self.turn_uncommitted_side_effect.store(true, Ordering::SeqCst);
         }
         let root_turn_id = self.root_turn_id.as_deref().ok_or_else(|| {
             TransportError::Fatal("PROVIDER_DURABLE_IDENTITY_MISSING: root turn missing".into())
@@ -644,8 +644,8 @@ impl RoutedDesktopModelTransport {
             events: Arc::new(TrackingEventSink {
                 delegate: self.events.clone(),
                 output_started,
-                turn_output_started: self.turn_output_started.clone(),
-                turn_side_effect_started: self.turn_side_effect_started.clone(),
+                turn_uncommitted_output: self.turn_uncommitted_output.clone(),
+                turn_uncommitted_side_effect: self.turn_uncommitted_side_effect.clone(),
             }),
             model_id: route.model_id.clone(),
             session_id: self.session_id.clone(),
@@ -1557,8 +1557,8 @@ impl ModelTransport for RoutedDesktopModelTransport {
                             "PROVIDER_RECOVERY_WAITING: provider overloaded".into(),
                         ));
                     }
-                    if self.turn_output_started.load(Ordering::SeqCst)
-                        || self.turn_side_effect_started.load(Ordering::SeqCst)
+                    if self.turn_uncommitted_output.load(Ordering::SeqCst)
+                        || self.turn_uncommitted_side_effect.load(Ordering::SeqCst)
                     {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
@@ -1574,6 +1574,13 @@ impl ModelTransport for RoutedDesktopModelTransport {
             };
             match transport.complete(messages, tools, opts).await {
                 Ok(mut response) => {
+                    // This round's output is now part of the conversation the
+                    // next round is built from, so it is no longer "uncommitted".
+                    // Keeping these latched for the whole turn is what stripped a
+                    // multi-round agent turn of its configured fallbacks after
+                    // round one, even for a later round that emitted nothing.
+                    self.turn_uncommitted_output.store(false, Ordering::SeqCst);
+                    self.turn_uncommitted_side_effect.store(false, Ordering::SeqCst);
                     if let Some(attempt) = provider_attempt.as_ref() {
                         attempt.commit_response(&response).await?;
                     }
@@ -1628,8 +1635,8 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     // on another model would mix answers and can duplicate tool
                     // intent, so fail visibly without switching.
                     if output_started.load(Ordering::SeqCst)
-                        || self.turn_output_started.load(Ordering::SeqCst)
-                        || self.turn_side_effect_started.load(Ordering::SeqCst)
+                        || self.turn_uncommitted_output.load(Ordering::SeqCst)
+                        || self.turn_uncommitted_side_effect.load(Ordering::SeqCst)
                     {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
@@ -2442,8 +2449,8 @@ mod tests {
                 ),
             ),
             cancel: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
             db: pool,
             root_turn_id: Some("context-transport-current".into()),
             mutation_permit: Some(permit),
@@ -2491,8 +2498,8 @@ mod tests {
                 ),
             ),
             cancel: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
             db: unused_provider_db(),
             root_turn_id: None,
             mutation_permit: None,
@@ -2561,8 +2568,8 @@ mod tests {
                 ),
             ),
             cancel: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
             db: unused_provider_db(),
             root_turn_id: None,
             mutation_permit: None,
@@ -2617,8 +2624,8 @@ mod tests {
                 ),
             ),
             cancel: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
             db: pool.clone(),
             root_turn_id: objective.root_turn_id.clone(),
             mutation_permit: None,
@@ -2742,8 +2749,8 @@ mod tests {
                 ),
             ),
             cancel: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
             db: pool.clone(),
             root_turn_id: Some("durable-partial-root".into()),
             mutation_permit: None,
@@ -2820,8 +2827,8 @@ mod tests {
                 ),
             ),
             cancel: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
             db: pool,
             root_turn_id: Some("durable-partial-root".into()),
             mutation_permit: Some(mutation_permit),
@@ -2837,7 +2844,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routed_transport_does_not_switch_in_a_later_round_after_turn_output_started() {
+    async fn a_committed_round_lets_a_later_empty_round_use_its_fallback() {
+        // Refined deliberately. The rule this replaces was "a turn that ever
+        // emitted output may not move endpoints", which read every later round
+        // as a replay of the root turn. Round one's answer is durably committed
+        // and already part of the history the next round is built from, so a
+        // later round that emitted nothing of its own is a continuation, not a
+        // replay — and refusing to move cost a real user twelve minutes on a
+        // dead endpoint with a configured fallback sitting unused.
+        //
+        // What still must not move is an *uncommitted* round: partial SSE and a
+        // prior unsettled tool side effect keep their own tests, both unchanged.
         const DOWN: (&str, &str, &str) = (
             "503 Service Unavailable",
             "application/json",
@@ -2860,7 +2877,7 @@ mod tests {
             primary_url,
         ));
         plan.push_fallback(openai_candidate(
-            "must-not-run-after-output",
+            "turn-fallback",
             "b",
             fallback_url,
         ));
@@ -2875,8 +2892,8 @@ mod tests {
                 ),
             ),
             cancel: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
             db: unused_provider_db(),
             root_turn_id: None,
             mutation_permit: None,
@@ -2889,17 +2906,24 @@ mod tests {
             .complete(&[], &[], &RoundOptions::default())
             .await
             .expect("first round emits visible output");
-        let error = transport
+        transport
             .complete(&[], &[], &RoundOptions::default())
             .await
-            .expect_err("later round must not replay the root turn elsewhere");
+            .expect("a committed round must not strip the later round of its fallback");
 
-        assert!(matches!(error, TransportError::Retryable(_)));
-        assert_eq!(primary_hits.load(Ordering::SeqCst), 4);
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            4,
+            "the primary answers round one, then exhausts its own retries on round two",
+        );
+        assert_eq!(
+            fallback_hits.load(Ordering::SeqCst),
+            1,
+            "the configured fallback must actually carry the later round",
+        );
         assert_eq!(
             transport.route_state.current().endpoint_name,
-            "turn-primary"
+            "turn-fallback"
         );
     }
 
@@ -2934,8 +2958,8 @@ mod tests {
                 ),
             ),
             cancel: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(true)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(true)),
             db: unused_provider_db(),
             root_turn_id: None,
             mutation_permit: None,

@@ -540,10 +540,10 @@ pub struct AgentLoop {
     /// Root-turn safety latch shared by every provider round in this run.
     /// Once visible text or any tool activity starts, replaying the turn on a
     /// different endpoint is no longer safe.
-    turn_output_started: Arc<AtomicBool>,
+    turn_uncommitted_output: Arc<AtomicBool>,
     /// Separate audit bit for tool activity; all tool activity also trips the
     /// broader replay-safety latch above.
-    turn_side_effect_started: Arc<AtomicBool>,
+    turn_uncommitted_side_effect: Arc<AtomicBool>,
 }
 
 fn resolve_chatgpt_reasoning_effort(
@@ -838,8 +838,8 @@ impl AgentLoop {
             anonymous: false,
             cancel: None,
             steer: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -926,8 +926,8 @@ impl AgentLoop {
             anonymous: false,
             cancel: None,
             steer: None,
-            turn_output_started: Arc::new(AtomicBool::new(false)),
-            turn_side_effect_started: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1174,8 +1174,8 @@ impl AgentLoop {
                     root_turn_id,
                     &policy,
                     &attempts,
-                    self.turn_output_started.load(Ordering::SeqCst),
-                    self.turn_side_effect_started.load(Ordering::SeqCst),
+                    self.turn_uncommitted_output.load(Ordering::SeqCst),
+                    self.turn_uncommitted_side_effect.load(Ordering::SeqCst),
                 )
                 .await
                 {
@@ -1541,8 +1541,8 @@ impl AgentLoop {
             session_id: self.session_id.clone(),
             route_state: self.route_state.clone(),
             cancel: self.cancel.clone(),
-            turn_output_started: self.turn_output_started.clone(),
-            turn_side_effect_started: self.turn_side_effect_started.clone(),
+            turn_uncommitted_output: self.turn_uncommitted_output.clone(),
+            turn_uncommitted_side_effect: self.turn_uncommitted_side_effect.clone(),
             db: self.db.clone(),
             root_turn_id,
             mutation_permit,
