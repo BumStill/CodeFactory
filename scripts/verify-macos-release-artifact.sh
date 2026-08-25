@@ -67,6 +67,11 @@ MOUNT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codefactory-dmg.XXXXXX")"
 INSTALL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codefactory-install.XXXXXX")"
 UPDATER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codefactory-updater.XXXXXX")"
 MOUNTED=0
+RTE003_POLICY_INSTALLED=0
+RTE003_POLICY_FILES=(
+  "/Library/Managed Preferences/com.google.Chrome.plist"
+  "/Library/Managed Preferences/com.google.chrome.for.testing.plist"
+)
 
 cleanup() {
   local status=$?
@@ -76,6 +81,14 @@ cleanup() {
       echo "macOS release artifact smoke failed: could not detach $MOUNT_DIR" >&2
       status=1
     fi
+  fi
+  if [[ "$RTE003_POLICY_INSTALLED" -eq 1 ]]; then
+    for policy_file in "${RTE003_POLICY_FILES[@]}"; do
+      if ! sudo -n /bin/rm -f "$policy_file"; then
+        echo "macOS release artifact smoke failed: could not remove temporary Chrome policy $policy_file" >&2
+        status=1
+      fi
+    done
   fi
   if ! rm -rf "$MOUNT_DIR" "$INSTALL_DIR" "$UPDATER_DIR"; then
     echo "macOS release artifact smoke failed: could not remove temporary directories" >&2
@@ -210,6 +223,28 @@ fi
 # extension bridge, materializes the extension embedded in that binary, and
 # attaches to a real synthetic Chrome fixture. Closing the CodeFactory session
 # must release its lease without terminating that already-running browser.
+# Chrome 142+ requires a prior Local Network Access grant before a service
+# worker can dial loopback, but a headless release fixture has no user to answer
+# the prompt. Use Chrome's documented managed allowlist only for the isolated
+# Chrome for Testing process, then remove it in cleanup.
+if ! sudo -n true; then
+  echo "macOS release artifact smoke failed: RTE-003 requires passwordless sudo for its temporary Chrome policy" >&2
+  exit 1
+fi
+for policy_file in "${RTE003_POLICY_FILES[@]}"; do
+  if sudo -n /usr/bin/test -e "$policy_file"; then
+    echo "macOS release artifact smoke failed: refusing to overwrite existing Chrome policy $policy_file" >&2
+    exit 1
+  fi
+done
+RTE003_POLICY_INSTALLED=1
+for policy_domain in com.google.Chrome com.google.chrome.for.testing; do
+  sudo -n /usr/bin/defaults write "/Library/Managed Preferences/$policy_domain" \
+    LocalNetworkAccessAllowedForUrls -array "chrome-extension://*"
+  sudo -n /usr/bin/defaults write "/Library/Managed Preferences/$policy_domain" \
+    LoopbackNetworkAllowedForUrls -array "chrome-extension://*"
+  sudo -n /bin/chmod 0644 "/Library/Managed Preferences/$policy_domain.plist"
+done
 CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT="${CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT:-$INSTALL_DIR/browser-chrome-attach-smoke.json}"
 mkdir -p "$(dirname "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT")" "$INSTALL_DIR/browser-attach-home"
 HOME="$INSTALL_DIR/browser-attach-home" \

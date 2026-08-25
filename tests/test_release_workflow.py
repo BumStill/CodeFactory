@@ -928,6 +928,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         self.assertIn("CODEFACTORY_BROWSER_CHROME_FIXTURE", artifact_smoke)
         self.assertIn('CODEFACTORY_BROWSER_CHROME_FIXTURE="managed"', artifact_smoke)
+        self.assertIn("LocalNetworkAccessAllowedForUrls", artifact_smoke)
+        self.assertIn("LoopbackNetworkAllowedForUrls", artifact_smoke)
+        self.assertIn('"chrome-extension://*"', artifact_smoke)
+        self.assertIn("RTE003_POLICY_INSTALLED", artifact_smoke)
+        self.assertIn('sudo -n /bin/rm -f "$policy_file"', artifact_smoke)
         self.assertNotIn("/Applications/Google Chrome.app", artifact_smoke)
         for field in (
             "connection_kind",
@@ -942,10 +947,23 @@ class ReleaseWorkflowTests(unittest.TestCase):
         # browser fixture.  Merely moving the old invocation into the script
         # would still fail because the CLI previously started no bridge.
         self.assertIn("let pairing = bridge.start().await", attach_cli)
-        self.assertIn("extension_package::prepare", attach_cli)
         self.assertIn("browser::download::ensure_installed", attach_cli)
         self.assertIn("CODEFACTORY_BROWSER_CHROME_FIXTURE", attach_cli)
         self.assertIn("browser_process_alive_after_detach", attach_cli)
+        # The exact-artifact smoke must not rewrite or reuse the user's stable
+        # extension package. A fresh package and Chrome profile isolate this
+        # bridge from any installed CodeFactory/Chrome instance on the runner.
+        self.assertNotIn("extension_package::prepare", attach_cli)
+        self.assertIn('prefix("browser-extension-fixture-")', attach_cli)
+        self.assertIn("extension_package::materialize", attach_cli)
+        self.assertIn("extension_package::write_pairing", attach_cli)
+        self.assertNotIn('format!("--load-extension=', attach_cli)
+        self.assertIn('"--enable-unsafe-extension-debugging"', attach_cli)
+        self.assertIn('"--remote-debugging-port=0"', attach_cli)
+        self.assertIn("Extensions.loadUnpacked", attach_cli)
+        self.assertIn('"browser_fixture_version"', attach_cli)
+        self.assertIn('"scenario_id": "RTE-003"', attach_cli)
+        self.assertIn('"status": "failed"', attach_cli)
         self.assertNotIn('.arg("--headless=new")', attach_cli)
 
     def test_ci_runs_agent_bridge_and_evaluation_tests_on_linux(self) -> None:

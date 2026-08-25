@@ -921,6 +921,113 @@ pub fn run_update_upgrade_smoke_cli() -> bool {
 /// the native tool (never a naked Playwright process), verifies signed-in
 /// Chrome can be observed, and proves cleanup detaches without closing Chrome.
 #[cfg(not(test))]
+async fn load_chrome_attachment_fixture_extension(
+    profile_dir: &std::path::Path,
+    extension_dir: &std::path::Path,
+) -> errors::Result<()> {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let active_port_file = profile_dir.join("DevToolsActivePort");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (port, websocket_url) = loop {
+        if let Ok(contents) = tokio::fs::read_to_string(&active_port_file).await {
+            let mut lines = contents.lines();
+            if let (Some(port), Some(path)) = (
+                lines.next().and_then(|line| line.parse::<u16>().ok()),
+                lines
+                    .next()
+                    .filter(|path| path.starts_with("/devtools/browser/")),
+            ) {
+                break (port, format!("ws://127.0.0.1:{port}{path}"));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(errors::AppError::Other(
+                "Chrome fixture did not publish its DevTools endpoint within 10 seconds".into(),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|error| {
+            errors::AppError::Other(format!(
+                "could not connect to the Chrome fixture DevTools endpoint: {error}"
+            ))
+        })?;
+    let request = websocket_url.into_client_request().map_err(|error| {
+        errors::AppError::Other(format!(
+            "could not create the Chrome fixture DevTools request: {error}"
+        ))
+    })?;
+    let (mut socket, _) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .map_err(|error| {
+            errors::AppError::Other(format!(
+                "could not connect to the Chrome fixture DevTools endpoint: {error}"
+            ))
+        })?;
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "id": 1,
+                "method": "Extensions.loadUnpacked",
+                "params": {"path": extension_dir.canonicalize()?},
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .map_err(|error| {
+            errors::AppError::Other(format!("could not request extension installation: {error}"))
+        })?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = tokio::time::timeout(remaining, socket.next())
+            .await
+            .map_err(|_| {
+                errors::AppError::Other("Chrome fixture extension installation timed out".into())
+            })?
+            .ok_or_else(|| {
+                errors::AppError::Other(
+                    "Chrome fixture closed DevTools during extension installation".into(),
+                )
+            })?
+            .map_err(|error| {
+                errors::AppError::Other(format!(
+                    "Chrome fixture DevTools failed during extension installation: {error}"
+                ))
+            })?;
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+            continue;
+        };
+        let response: serde_json::Value = serde_json::from_str(&text)?;
+        if response.get("id").and_then(serde_json::Value::as_u64) != Some(1) {
+            continue;
+        }
+        if let Some(error) = response.get("error") {
+            return Err(errors::AppError::Other(format!(
+                "Chrome fixture could not install the extension: {error}"
+            )));
+        }
+        if response
+            .pointer("/result/id")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            return Err(errors::AppError::Other(
+                "Chrome fixture did not return the installed extension id".into(),
+            ));
+        }
+        return Ok(());
+    }
+}
+
+#[cfg(not(test))]
 pub fn run_browser_chrome_attach_smoke_cli() -> bool {
     let mut args = std::env::args();
     let _program = args.next();
@@ -965,10 +1072,43 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
         } else {
             std::path::PathBuf::from(browser_fixture)
         };
+        if !browser_binary.is_file() {
+            return Err(errors::AppError::Other(format!(
+                "Chrome fixture executable does not exist: {}",
+                browser_binary.display()
+            )));
+        }
+        let browser_version = tokio::process::Command::new(&browser_binary)
+            .no_window()
+            .arg("--version")
+            .output()
+            .await?;
+        if !browser_version.status.success() {
+            return Err(errors::AppError::Other(
+                "Chrome fixture did not report a version".into(),
+            ));
+        }
+        let browser_fixture_version =
+            String::from_utf8_lossy(&browser_version.stdout).trim().to_string();
+        if !browser_fixture_version.starts_with("Google Chrome for Testing ") {
+            return Err(errors::AppError::Other(format!(
+                "browser fixture must be Chrome for Testing, got {browser_fixture_version}"
+            )));
+        }
         let bridge = std::sync::Arc::clone(&tools::browser_session::BRIDGE);
         let pairing = bridge.start().await?;
-        let extension_dir = browser::extension_package::prepare(pairing.port, &pairing.token)
+        let extension_fixture = tempfile::Builder::new()
+            .prefix("browser-extension-fixture-")
+            .tempdir_in(&cwd)?;
+        browser::extension_package::materialize(extension_fixture.path())
             .map_err(errors::AppError::Other)?;
+        browser::extension_package::write_pairing(
+            extension_fixture.path(),
+            pairing.port,
+            &pairing.token,
+        )
+        .map_err(errors::AppError::Other)?;
+        let extension_dir = extension_fixture.path();
         let browser_profile = tempfile::Builder::new()
             .prefix("browser-chrome-attach-profile-")
             .tempdir_in(&cwd)?;
@@ -992,11 +1132,9 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
                 "--user-data-dir={}",
                 browser_profile.path().display()
             ))
-            .arg(format!("--load-extension={}", extension_dir.display()))
-            .arg(format!(
-                "--disable-extensions-except={}",
-                extension_dir.display()
-            ))
+            .arg("--enable-unsafe-extension-debugging")
+            .arg("--remote-debugging-address=127.0.0.1")
+            .arg("--remote-debugging-port=0")
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--no-sandbox")
@@ -1012,6 +1150,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
         let mut browser_process = browser_process.spawn().map_err(|error| {
             errors::AppError::Other(format!("could not start the Chrome fixture: {error}"))
         })?;
+        load_chrome_attachment_fixture_extension(browser_profile.path(), extension_dir).await?;
         if !bridge
             .wait_until_connected(std::time::Duration::from_secs(40))
             .await
@@ -1081,6 +1220,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             .any(|session| session.session_id == session_id);
         let browser_process_alive_after_detach = browser_process.try_wait()?.is_none();
         let receipt = serde_json::json!({
+            "scenario_id": "RTE-003",
             "status": if attached_kind
                 && tab_observation_ok
                 && !closed.is_error
@@ -1091,8 +1231,11 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             } else {
                 "failed"
             },
+            "evidence_level": "exact_release_artifact",
             "native_tool": "browser_session",
             "connection_kind": "attached_chrome",
+            "browser_fixture_version": browser_fixture_version,
+            "extension_installation_fixture": "cdp_unpacked",
             "tab_observation_ok": tab_observation_ok,
             "detached_without_managed_close": closed.content.contains("Chrome was left open"),
             "lease_reclaimed_after_detach": lease_gone,
@@ -1125,6 +1268,16 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             true
         }
         Err(error) => {
+            let receipt = serde_json::json!({
+                "scenario_id": "RTE-003",
+                "status": "failed",
+                "evidence_level": "exact_release_artifact",
+                "error": error.to_string(),
+            });
+            let _ = std::fs::write(
+                &output_path,
+                serde_json::to_vec_pretty(&receipt).unwrap_or_default(),
+            );
             eprintln!("Chrome-attachment smoke failed: {error}");
             std::process::exit(1);
         }
