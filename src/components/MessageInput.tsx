@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Scenario impact gate live canary: no Complex E2E is directly mapped here.
 import { useRef, useState, useEffect, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent, type ReactNode } from "react";
 import { recallHistory, pushHistory } from "./messageHistory";
 import { Send, Square, Paperclip, X, Loader2, Check } from "lucide-react";
