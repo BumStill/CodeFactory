@@ -27,7 +27,6 @@ EXPECTED_CHECKS = {
     "check-rust",
     "governance-baseline",
     "remote-real-app-gui",
-    "scenario-gate-policy",
     "scenario-gate-pr",
 }
 

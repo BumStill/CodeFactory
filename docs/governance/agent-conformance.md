@@ -42,13 +42,13 @@ runs identically whether the PR came from Claude, Codex, or a person. Docs
 
 ①② without ③ is an honor system. ③ is the load-bearing layer.
 
-For scenario governance, the hard layer has two stable required contexts:
-`scenario-gate-policy` loads the runner from the default branch and validates
-the candidate tree without credentials; `scenario-gate-pr` compiles the
-candidate registry and its target bindings. The protected ruleset requires
-both with strict latest-base enforcement. This prevents Codex, Claude, an IDE,
-or a plain Git client from choosing a weaker path, and prevents a PR from
-weakening its own validator to self-attest.
+For scenario governance, the hard layer has one stable required context:
+`scenario-gate-pr`. It is itself a `pull_request_target` workflow that loads
+the runner from the default branch and validates the candidate tree without
+credentials, including the candidate registry and target bindings. The
+protected ruleset requires it with strict latest-base enforcement. This
+prevents Codex, Claude, an IDE, or a plain Git client from choosing a weaker
+path, and prevents a PR from weakening its own validator to self-attest.
 
 ## The machine-readable manifest: `docs/governance/rules.yml`
 

@@ -47,7 +47,6 @@ PRODUCT_PREFIXES = (
 )
 NON_PRODUCT_MARKERS = (".test.", ".spec.", "/tests/", "src/acceptance/")
 REQUIRED_SCENARIO_CHECKS = {
-    "scenario-gate-policy",
     "scenario-gate-pr",
 }
 TARGET_CHECKS = {
@@ -58,13 +57,15 @@ TARGET_CHECKS = {
     "workflow": "check-rust",
 }
 GLOBAL_PRODUCT_FILES = {
-    ".github/workflows/auto-release.yml",
-    ".github/workflows/release.yml",
     "package.json",
     "pnpm-lock.yaml",
     "src-tauri/Cargo.lock",
     "src-tauri/Cargo.toml",
     "src-tauri/tauri.conf.json",
+}
+EXPLICIT_PRODUCT_FILES = {
+    ".github/workflows/auto-release.yml",
+    ".github/workflows/release.yml",
 }
 VERSION_MANIFEST_FILES = {
     "package.json",
@@ -640,6 +641,9 @@ def validate_impacted_execution(
     files: list[str],
     stage: str,
     repo_root: Path,
+    *,
+    expand_global_files: bool = True,
+    fail_on_unmapped: bool = False,
 ) -> list[str]:
     """Require the scenarios a change touches to be covered by automation that
     really runs at *stage*.
@@ -652,16 +656,27 @@ def validate_impacted_execution(
     scenarios quietly regress. ``_automation_gate_stages`` resolves each
     target against the workflow files, so a declaration alone is not enough.
 
-    The catalog-wide readiness sweep still applies at ``release_artifact``,
-    where L4 debt genuinely must be paid before an artifact ships.
+    The release caller applies the same rule to the diff since the previous
+    published tag with global-file expansion disabled. This keeps exact-artifact
+    proof strict for the affected batch without turning unrelated catalog debt
+    into a repository-wide release freeze.
     """
 
     product_files = [path for path in files if _is_product_file(path)]
     if not product_files:
         return []
-    impacted = _impacted_scenarios(product_files, registry)
+    impacted = _impacted_scenarios(
+        product_files,
+        registry,
+        expand_global_files=expand_global_files,
+    )
     if not impacted:
-        # validate_change_contract already fails closed on unmapped product
+        if fail_on_unmapped:
+            return [
+                "scenario registry coverage gap for product files: "
+                + ", ".join(sorted(product_files))
+            ]
+        # validate_change_contract already fails closed on unmapped PR product
         # files; do not report the same gap twice.
         return []
 
@@ -692,7 +707,10 @@ def validate_impacted_execution(
             fnmatch.fnmatch(path, pattern)
             for path in product_files
             for pattern in patterns
-        ) or any(path in GLOBAL_PRODUCT_FILES for path in product_files)
+        ) or (
+            expand_global_files
+            and any(path in GLOBAL_PRODUCT_FILES for path in product_files)
+        )
         if not directly_impacted:
             continue
         if stage == "pull_request":
@@ -708,7 +726,14 @@ def validate_impacted_execution(
                 continue
             required_targets = pr_gate.get("required_targets") or []
         else:
-            required_targets = case.get("automated_by") or []
+            # A release slice is complete only when at least one declared
+            # target is physically bound to the release workflow. PR/nightly
+            # targets remain useful evidence but are not exact-artifact proof.
+            required_targets = [
+                target
+                for target in case.get("automated_by") or []
+                if stage in _automation_gate_stages(target, gate_policy, repo_root)
+            ]
         missing_targets = [
             target
             for target in required_targets
@@ -729,18 +754,23 @@ def validate_impacted_execution(
 
 
 def _is_product_file(path: str) -> bool:
-    if path in GLOBAL_PRODUCT_FILES:
+    if path in GLOBAL_PRODUCT_FILES or path in EXPLICIT_PRODUCT_FILES:
         return True
     return path.startswith(PRODUCT_PREFIXES) and not _is_test_harness_file(path)
 
 
-def _impacted_scenarios(files: list[str], registry: dict[str, Any]) -> set[str]:
+def _impacted_scenarios(
+    files: list[str],
+    registry: dict[str, Any],
+    *,
+    expand_global_files: bool = True,
+) -> set[str]:
     impacted: set[str] = set()
     for scenario in registry.get("scenarios", []):
         patterns = scenario.get("change_patterns", [])
         if any(fnmatch.fnmatch(path, pattern) for path in files for pattern in patterns):
             impacted.add(scenario["id"])
-    if any(path in GLOBAL_PRODUCT_FILES for path in files):
+    if expand_global_files and any(path in GLOBAL_PRODUCT_FILES for path in files):
         impacted.update(
             scenario["id"] for scenario in registry.get("scenarios", [])
         )

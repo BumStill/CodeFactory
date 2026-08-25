@@ -84,6 +84,7 @@ jobs:
     needs: changelog
     outputs:
       tag_sha: ${{ steps.prepare.outputs.tag_sha }}
+      scenario_base_tag: ${{ steps.scenario_base.outputs.base_tag }}
     permissions:
       contents: write
     steps:
@@ -98,12 +99,33 @@ jobs:
           AUTHORIZED_TAG_SHA: ${{ needs.changelog.outputs.authorized_tag_sha }}
         run: tools/release/require_authorized_tag.sh "$TAG" "$AUTHORIZED_TAG_SHA" "create the draft release"
 
+      - name: Resolve previous released tag for scenario impact
+        id: scenario_base
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          BASE_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          if [ -z "$BASE_TAG" ]; then
+            echo "::error::scenario release gate could not resolve the previous tag"
+            exit 1
+          fi
+          BASE_SHA="$(git rev-parse "${BASE_TAG}^{commit}")"
+          test -n "$BASE_SHA" || {
+            echo "::error::scenario release gate could not resolve the previous tag SHA"
+            exit 1
+          }
+          echo "base_tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+
       - name: scenario-gate-release
         run: >-
           python3 tools/governance/run_scenario_harness_gate.py
           --stage release_artifact
           --repo .
           --policy-repo .
+          --base-ref ${{ steps.scenario_base.outputs.base_sha }}
 
       - name: Validate tag and prepare draft release
         id: prepare
@@ -333,6 +355,55 @@ jobs:
           if ($smoke.provider_request_count -lt 5) { throw "Release provider trajectory was incomplete" }
           if (-not $smoke.artifact_verified) { throw "Release smoke did not verify the workspace" }
           if (-not $smoke.cleanup_ok) { throw "Release smoke leaked isolated state" }
+          Get-Content $receipt
+
+      - name: Verify Windows release executable browser session lifecycle
+        shell: pwsh
+        env:
+          CODEFACTORY_BROWSER_HEADLESS: "1"
+        run: |
+          $exe = Get-ChildItem "src-tauri/target/release" -Filter "codefactory.exe" -File | Select-Object -First 1
+          if (-not $exe) { throw "Windows release executable was not produced" }
+          $receipt = Join-Path $env:RUNNER_TEMP "browser-session-release-smoke.json"
+          $process = Start-Process -FilePath $exe.FullName `
+            -ArgumentList @("--browser-session-smoke", $receipt) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Browser session release smoke exited $($process.ExitCode)" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if ($smoke.status -ne "passed") { throw "Browser session release smoke did not pass" }
+          if (-not $smoke.snapshot_ok) { throw "Release browser session did not capture a snapshot" }
+          if (-not $smoke.failure_detected) { throw "Release browser session did not observe the injected failure" }
+          if (-not $smoke.lease_reclaimed_after_failure) { throw "Release browser lease survived failure" }
+          if (-not $smoke.same_objective -or -not $smoke.replacement_session_is_new) { throw "Release browser recovery changed Objective or reused the failed session" }
+          if (-not $smoke.replacement_session_reclaimed -or -not $smoke.recovery_lease_reclaimed) { throw "Release browser recovery leaked the replacement session or lease" }
+          if ($smoke.recovery_budget_attempts -ne 1 -or -not $smoke.objective_completed) { throw "Release browser recovery did not converge exactly once" }
+          Get-Content $receipt
+
+      - name: Verify Windows release executable previous-to-current update reconciliation
+        shell: pwsh
+        env:
+          REPO: ${{ github.repository }}
+          PREVIOUS_TAG: ${{ needs.prepare-release.outputs.scenario_base_tag }}
+        run: |
+          $exe = Get-ChildItem "src-tauri/target/release" -Filter "codefactory.exe" -File | Select-Object -First 1
+          if (-not $exe) { throw "Windows release executable was not produced" }
+          if (-not $env:PREVIOUS_TAG) { throw "Previous release tag is unavailable" }
+          $manifestUrl = "https://github.com/$env:REPO/releases/download/$env:PREVIOUS_TAG/latest.json"
+          $previous = Invoke-RestMethod -Uri $manifestUrl
+          if (-not $previous.version) { throw "Previous public manifest has no version" }
+          if ($previous.build_git_sha -notmatch '^[0-9a-f]{40}$') { throw "Previous public manifest has no exact build SHA" }
+          $receipt = Join-Path $env:RUNNER_TEMP "update-upgrade-release-smoke.json"
+          $process = Start-Process -FilePath $exe.FullName `
+            -ArgumentList @("--update-upgrade-smoke", $receipt, $previous.version, $previous.build_git_sha) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Update upgrade release smoke exited $($process.ExitCode)" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          if ($smoke.status -ne "pass" -or $smoke.scenario_id -ne "E2E-006") { throw "Update upgrade release smoke did not pass E2E-006" }
+          if ($smoke.current_build -ne "${{ needs.prepare-release.outputs.tag_sha }}") { throw "Update upgrade smoke was not built from the release commit" }
+          if ($smoke.previous_build -ne $previous.build_git_sha) { throw "Update fixture did not use the previous public build" }
+          if (-not $smoke.database_reopened) { throw "Update fixture did not cross the restart boundary" }
+          if ($smoke.first_observation -ne "applied" -or $smoke.second_observation -ne "applied") { throw "Update receipt was not idempotently reconciled" }
+          if ($smoke.update_receipt_count -ne 1) { throw "Update reconciliation duplicated its receipt" }
+          if ($smoke.historical_objective_count -ne 1) { throw "Historical objective was lost during update reconciliation" }
+          if (-not $smoke.same_update_objective) { throw "Update reconciliation changed Objective identity" }
           Get-Content $receipt
 
       - name: Verify Windows release executable DeliveryRun recovery
