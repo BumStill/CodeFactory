@@ -106,6 +106,15 @@ const RECOVERY_BACKOFF_CAP_MS: i64 = 5 * 60 * 1_000;
 /// that the same error happened once a day for a week.
 const SIGNATURE_RECOVERY_WINDOW_MS: i64 = 30 * 60 * 1_000;
 
+/// A provider endpoint that keeps answering "unavailable" is not the kind of
+/// transient condition the growing ladder was built for. Waiting it out only
+/// shows "等待中" for twelve minutes while nothing can change until the user
+/// picks another model, so this class converges on a short flat interval and
+/// reaches its ceiling — and therefore a visible, settled state — in about a
+/// minute instead.
+pub const PROVIDER_ENDPOINT_UNAVAILABLE: &str = "provider_endpoint_unavailable";
+const DEAD_ENDPOINT_RETRY_MS: i64 = 10_000;
+
 /// Advance a session's activity time so the sidebar — which orders by
 /// `sessions.updated_at` and renders a relative time from it — does not bury a
 /// session the recovery ceiling just wrote a visible notice into. Measured on a
@@ -137,6 +146,25 @@ async fn touch_session_in_settlement(
         .bind(now)
         .execute(&mut **tx)
         .await;
+}
+
+/// The text a parked system incident shows. It stays system-owned either way —
+/// no `requires_user_action` is manufactured — but it must not tell someone
+/// "你不需要补充输入" when the only thing that can move the objective forward is
+/// them choosing a reachable model.
+pub(crate) fn parked_incident_message(failure_code: Option<&str>) -> &'static str {
+    if failure_code == Some(PROVIDER_ENDPOINT_UNAVAILABLE) {
+        return "当前模型端点连续不可用，本回合已停在安全边界。进度和上下文都已保留：\
+在输入框旁切换到另一个可用模型即可继续同一目标，无需重述需求。";
+    }
+    "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。"
+}
+
+fn recovery_backoff_ms_for(failure_code: Option<&str>, prior_attempts: i64) -> i64 {
+    if failure_code == Some(PROVIDER_ENDPOINT_UNAVAILABLE) {
+        return DEAD_ENDPOINT_RETRY_MS;
+    }
+    recovery_backoff_ms(prior_attempts)
 }
 
 fn recovery_backoff_ms(prior_attempts: i64) -> i64 {
@@ -4383,7 +4411,7 @@ impl ObjectiveStore {
                 )
                 .bind(&visible_final_message_id)
                 .bind(session_id)
-                .bind("本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。")
+                .bind(parked_incident_message(current.failure_code.as_deref()))
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
@@ -4775,7 +4803,8 @@ impl ObjectiveStore {
             // caller asked for, so ordinary recovery stays as responsive as it
             // was and nothing that observes immediately is delayed.
             let scheduled_observation = if prior_attempts > 0 {
-                requested_observation.max(now + recovery_backoff_ms(prior_attempts))
+                requested_observation
+                    .max(now + recovery_backoff_ms_for(decision.failure_code.as_deref(), prior_attempts))
             } else {
                 requested_observation
             };
@@ -8744,6 +8773,63 @@ mod tests {
             current.failure_code.as_deref(),
             Some(TECHNICAL_RECOVERY_EXHAUSTED),
             "attempts older than the window must not condemn the Objective"
+        );
+    }
+
+    #[test]
+    fn a_dead_endpoint_is_not_told_that_no_input_is_needed() {
+        // Saying "你不需要补充输入" is true for a technical ceiling the system will
+        // retry on its own. For an unreachable endpoint it is the opposite of
+        // true: nothing moves until a reachable model is chosen.
+        let generic = parked_incident_message(Some("agent_loop_error"));
+        assert!(generic.contains("你不需要补充输入"), "{generic}");
+
+        let dead = parked_incident_message(Some(PROVIDER_ENDPOINT_UNAVAILABLE));
+        assert!(!dead.contains("你不需要补充输入"), "{dead}");
+        assert!(dead.contains("切换到另一个可用模型"), "{dead}");
+        assert!(dead.contains("进度和上下文都已保留"), "{dead}");
+    }
+
+    #[tokio::test]
+    async fn a_dead_endpoint_converges_fast_instead_of_waiting_out_the_transient_ladder() {
+        // The growing ladder exists to give a *transient* condition room to
+        // clear. An endpoint that is answering "unavailable" is not transient in
+        // that sense: waiting it out just shows "等待中" for twelve minutes while
+        // nothing can change without the user picking another model. Measured on
+        // a real run: 10:07:06 -> 10:19:15 on a dead DeepSeek endpoint.
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-dead-endpoint").await;
+
+        let mut delays = Vec::new();
+        for _ in 0..4 {
+            let issued = Utc::now().timestamp_millis();
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::TechnicalFailure {
+                    domain: RecoveryDomain::Chat,
+                    failure_code: PROVIDER_ENDPOINT_UNAVAILABLE.into(),
+                    failure_signature: "sha256:endpoint-is-down".into(),
+                    next_observation_at: issued + 5_000,
+                    resume_cursor: current.resume_cursor.clone(),
+                },
+            )
+            .unwrap();
+            current = store.apply_decision(current.revision, decision).await.unwrap();
+            let next: i64 = sqlx::query_scalar(
+                "SELECT next_observation_at FROM objective_remediations
+                 WHERE objective_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            )
+            .bind(&current.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            delays.push(next - issued);
+        }
+
+        assert!(
+            delays.iter().all(|delay| *delay <= 15_000),
+            "a dead endpoint must not be granted the transient ladder, got {delays:?}",
         );
     }
 
