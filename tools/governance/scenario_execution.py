@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -205,14 +206,21 @@ def _run_command(
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
-    result = subprocess.run(
-        command,
-        cwd=repo,
-        env=merged_env,
-        capture_output=True,
-        text=True,
-        timeout=45 * 60,
-    )
+    resolved = shutil.which(command[0], path=merged_env.get("PATH"))
+    process_command = [resolved or command[0], *command[1:]]
+    try:
+        result = subprocess.run(
+            process_command,
+            cwd=repo,
+            env=merged_env,
+            capture_output=True,
+            text=True,
+            timeout=45 * 60,
+        )
+    except OSError as error:
+        output = f"unable to start {command[0]}: {error}\n"
+        print(output, end="")
+        return 127, output
     output = (result.stdout or "") + (result.stderr or "")
     if output:
         print(output, end="" if output.endswith("\n") else "\n")
