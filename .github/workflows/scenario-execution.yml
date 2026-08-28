@@ -1,0 +1,200 @@
+name: scenario-execution
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      run_windows: ${{ steps.plan.outputs.run_windows }}
+      windows_node: ${{ steps.plan.outputs.windows_node }}
+      windows_rust: ${{ steps.plan.outputs.windows_rust }}
+      run_macos: ${{ steps.plan.outputs.run_macos }}
+      macos_node: ${{ steps.plan.outputs.macos_node }}
+      macos_rust: ${{ steps.plan.outputs.macos_rust }}
+    steps:
+      - name: Checkout trusted base policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require trusted base execution planner
+        shell: bash
+        run: |
+          if [[ ! -f policy/tools/governance/scenario_execution.py ]]; then
+            echo "::error::Trusted base does not contain scenario_execution.py; this trust-root upgrade requires the documented external governance bootstrap"
+            exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Select affected scenarios and targets
+        id: plan
+        run: >-
+          python policy/tools/governance/scenario_execution.py plan
+          --registry policy/docs/testing/scenario-registry.json
+          --repo candidate
+          --base-sha "${{ github.event.pull_request.base.sha }}"
+          --head-sha "${{ github.event.pull_request.head.sha }}"
+          --output scenario-plan.json
+          --github-output "$GITHUB_OUTPUT"
+      - name: Upload immutable execution plan
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: affected-scenario-plan
+          path: scenario-plan.json
+          if-no-files-found: error
+
+  execute-windows:
+    needs: plan
+    if: ${{ needs.plan.outputs.run_windows == 'true' }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout trusted base policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy
+          persist-credentials: false
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: affected-scenario-plan
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        if: ${{ needs.plan.outputs.windows_node == 'true' }}
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        if: ${{ needs.plan.outputs.windows_node == 'true' }}
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: candidate/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        if: ${{ needs.plan.outputs.windows_node == 'true' }}
+        working-directory: candidate
+        run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ needs.plan.outputs.windows_rust == 'true' }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ needs.plan.outputs.windows_rust == 'true' }}
+        with:
+          workspaces: candidate/src-tauri
+      - name: Execute affected Windows targets
+        run: python policy/tools/governance/scenario_execution.py execute --plan scenario-plan.json --repo candidate --runner windows-latest --output runner-receipt.json
+      - name: Upload Windows target receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: affected-scenario-runner-windows
+          path: runner-receipt.json
+          if-no-files-found: error
+
+  execute-macos:
+    needs: plan
+    if: ${{ needs.plan.outputs.run_macos == 'true' }}
+    runs-on: macos-14
+    steps:
+      - name: Checkout trusted base policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy
+          persist-credentials: false
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: affected-scenario-plan
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        if: ${{ needs.plan.outputs.macos_node == 'true' }}
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        if: ${{ needs.plan.outputs.macos_node == 'true' }}
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: candidate/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        if: ${{ needs.plan.outputs.macos_node == 'true' }}
+        working-directory: candidate
+        run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ needs.plan.outputs.macos_rust == 'true' }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ needs.plan.outputs.macos_rust == 'true' }}
+        with:
+          workspaces: candidate/src-tauri
+      - name: Execute affected macOS targets
+        run: python policy/tools/governance/scenario_execution.py execute --plan scenario-plan.json --repo candidate --runner macos-14 --output runner-receipt.json
+      - name: Upload macOS target receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: affected-scenario-runner-macos
+          path: runner-receipt.json
+          if-no-files-found: error
+
+  receipt:
+    needs: [plan, execute-windows, execute-macos]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout trusted base policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: affected-scenario-plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: affected-scenario-runner-*
+          path: receipts
+          merge-multiple: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Aggregate exact-head execution receipts
+        run: python policy/tools/governance/scenario_execution.py aggregate --plan scenario-plan.json --receipts receipts --output scenario-execution-receipt.json
+      - name: Upload final exact-head receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: affected-scenario-receipt-${{ github.event.pull_request.head.sha }}
+          path: scenario-execution-receipt.json
+          if-no-files-found: error

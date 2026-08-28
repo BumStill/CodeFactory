@@ -32,8 +32,11 @@ TRUST_ROOT_FILES = (
     ".github/workflows/governance-baseline.yml",
     ".github/workflows/lock-independent-desktop-acceptance.yml",
     ".github/workflows/release.yml",
+    ".github/workflows/scenario-execution.yml",
     ".github/workflows/scenario-gate.yml",
+    "docs/testing/scenario-registry.json",
     "tools/governance/run_scenario_harness_gate.py",
+    "tools/governance/scenario_execution.py",
     "tools/governance/validate_scenario_test_governance.py",
 )
 
@@ -103,11 +106,28 @@ def validate_gate_surfaces(repo_root: Path, registry: dict) -> list[str]:
         "path: policy",
         "path: candidate",
         "persist-credentials: false",
+        "scenario_execution.py await-github",
+        "--workflow scenario-execution.yml",
     ):
         if marker not in pr_gate:
             errors.append(f"scenario-gate.yml is missing required marker: {marker}")
     if "continue-on-error" in pr_gate:
         errors.append("scenario-gate.yml must not use continue-on-error")
+
+    execution = _read(repo_root / ".github/workflows/scenario-execution.yml")
+    for marker in (
+        "name: scenario-execution",
+        "pull_request:",
+        "Require trusted base execution planner",
+        "Select affected scenarios and targets",
+        "scenario_execution.py execute",
+        "Aggregate exact-head execution receipts",
+        "affected-scenario-receipt-${{ github.event.pull_request.head.sha }}",
+    ):
+        if marker not in execution:
+            errors.append(f"scenario-execution.yml is missing required marker: {marker}")
+    if "pull_request_target:" in execution or "write" in execution.split("permissions:", 1)[-1].split("jobs:", 1)[0]:
+        errors.append("scenario-execution.yml must remain an unprivileged pull_request workflow")
 
     governance = _read(repo_root / ".github/workflows/governance-baseline.yml")
     if "types: [opened, synchronize, reopened, edited]" not in governance:

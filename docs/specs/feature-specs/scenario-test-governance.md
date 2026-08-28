@@ -39,12 +39,13 @@ CodeFactory 现有测试数量很多，但场景分散在 Rust 测试、Vitest�
 | CF-STG-R17 | 浏览器扩展稳定性必须覆盖 MV3 idle、connection generation、迟到 close/reply、heartbeat ACK、半开失活关闭与多 profile 稳定 winner/standby 接管，不得用单次连接 happy path 代替 | `RTE-002` + `E2E-008` |
 | CF-STG-R18 | attached session 瞬断恢复必须保持 objective、lease、selected tab，并在有界窗口内只重放一次只读调用，不能依赖模型或人工 continue | `RTE-003` + `E2E-008` |
 | CF-STG-R19 | 每个登记的自动化 target 必须绑定到明确的 `pull_request`、`nightly` 或 `release_artifact` 阶段，且该阶段必须被场景自身声明；不能只证明文件/函数存在 | registry v2 `gate_policy.target_bindings` + stage validator |
-| CF-STG-R20 | PR 不得使用候选分支修改后的 validator 自证；唯一 required context `scenario-gate-pr` 必须通过 `pull_request_target` 使用默认分支 runner 只读检查候选树 | trusted `scenario-gate-pr` |
+| CF-STG-R20 | PR 不得使用候选分支修改后的 validator 自证；唯一 required context `scenario-gate-pr` 必须通过 `pull_request_target` 使用默认分支 runner 只读检查候选树，并核验独立无权限执行工作流的 exact-head 回执 | trusted `scenario-gate-pr` |
 | CF-STG-R21 | base SHA、required run 或 live ruleset 状态无法读取时必须失败，不能 warning 后继续 | fail-closed runner + ruleset verifier |
 | CF-STG-R22 | PR 阶段只对**受影响**的场景与复杂用例强制「PR slice 已实现、无 PR gap、全部 required targets 在该阶段真实执行」；不得用无关目录债务冻结当前 PR | `pull_request_gate` + `validate_impacted_execution` |
 | CF-STG-R23 | 逐字节 trust root 同时覆盖审判逻辑和提供执行证据的 required workflow；普通候选 PR 不得把测试改成空跑后自证 | `TRUST_ROOT_FILES` + external governance bootstrap |
 | CF-STG-R24 | 纯版本 bump 只有在四个 manifest 的字段级 diff 同时证明为同一旧版本到同一新版本、且无其他字段变化时才不产生 PR 场景影响；依赖、脚本、Cargo 或 Tauri 配置的其他变化仍按全局产品变更 fail closed | `scenario_impact_files` + version manifest negative fixtures |
 | CF-STG-R25 | Release 门禁以「上一已发布 tag 到候选 tag」的产品差异计算影响集，只要求受影响场景具有绑定到 release workflow 的 exact-artifact target；无关目录债务不得冻结发布，缺基线、未映射产品文件或受影响 target 未绑定时 fail closed | `scenario-gate-release --base-ref` + `validate_impacted_execution(stage=release_artifact)` |
+| CF-STG-R26 | PR 的受影响 Scenario 与 Complex E2E 必须由 trusted base policy 生成 exact target plan；只有计划非空时才启动对应 Windows/macOS runner，最终回执必须逐项匹配 base SHA、head SHA、target ID 与 `passed` outcome | `scenario-execution.yml` + `scenario_execution.py` |
 
 ## Primary User Path
 
@@ -183,7 +184,7 @@ Scenario-Test: HLT-003, HLT-004
 
 ## Gate 策略
 
-- PR：所有 active Scenario 都有明确 `pull_request` 绑定；唯一场景治理 required context 是 trusted `scenario-gate-pr`，并与其绑定的 Rust/frontend/真实 App checks 共同构成门禁。只计算 diff 直接命中的 Scenario 与 Complex E2E；其中任一 `pull_request_gate` 为 `designed`/`partially_implemented`、仍有 PR gap 或 required target 未真实执行时冻结。无关目录的测试债务不阻断该 PR。
+- PR：所有 active Scenario 都有明确 `pull_request` 绑定；唯一场景治理 required context 是 trusted `scenario-gate-pr`。trusted base policy 先按 diff 生成 exact target plan，再由无写权限的 `scenario-execution` 工作流在 candidate checkout 真跑受影响 Windows/macOS target；`scenario-gate-pr` 只接受同一 base/head SHA 的完整成功回执。只计算 diff 直接命中的 Scenario 与 Complex E2E；其中任一 `pull_request_gate` 为 `designed`/`partially_implemented`、仍有 PR gap 或 required target 未真实执行时冻结。计划为空时平台 runner 全部跳过，无关目录的测试债务不阻断该 PR。
 - Nightly：运行旧 schema、故障矩阵、真实 App restart 和 fake-forge 组合场景。
 - Release：`scenario-gate-release` 在创建/复用 draft 前解析上一已发布 release tag，以 default-branch dispatch SHA 的独立 trusted checkout 驱动候选 tag，按完整未发布批次的产品差异计算影响集，并验证受影响 exact-artifact target 已绑定到 release workflow；真正的 target 随 Windows/macOS build job 执行，任一失败都会使 `finalize` 不可达。无关历史缺口和失败未发布 tag 不得截断影响窗口，也不冻结无关批次。
 - Manual canary：只能补充自动化 hard gate，不能是 active Scenario 的唯一门禁。
@@ -192,8 +193,8 @@ Scenario-Test: HLT-003, HLT-004
 
 - `docs/testing/scenario-registry.json`、统一 runner 和 GitHub ruleset 是机器权威；Codex、Claude、IDE 与人工得到同一结论；
 - `AGENTS.md` 与 `CLAUDE.md` 只负责告诉执行者提前运行同一命令；`.githooks/pre-commit`/`pre-push` 提供快速反馈，但允许被本地跳过；
-- 最终权威是 GitHub required checks。`scenario-gate-pr` 自身使用 `pull_request_target` 从 default branch 加载 runner，以只读、无凭据方式检查 candidate checkout，candidate 代码永不执行；不再需要第二个 `scenario-gate-policy` context；
-- 默认分支 policy 逐字比对 ruleset、单一 scenario workflow、runner、validator，以及提供 6 个 required contexts / release gate 的 `ci.yml`、`governance-baseline.yml`、`lock-independent-desktop-acceptance.yml`、`release.yml` 等 trust-root 文件；普通 PR 不允许用 candidate 修改后的 validator 自证。后续治理升级必须走明确的 external governance bootstrap，再重新启用并对账 required contexts；
+- 最终权威是 GitHub required checks。`scenario-gate-pr` 自身使用 `pull_request_target` 从 default branch 加载 runner，以只读方式审判 candidate；它不执行 candidate 代码，只读取 GitHub Actions 上由独立 `pull_request` 工作流产出的回执。候选代码只能在无 secret、`contents: read` 的 `scenario-execution` runner 内执行；不再需要第二个 `scenario-gate-policy` context；
+- 默认分支 policy 逐字比对 ruleset、`scenario-gate.yml`、`scenario-execution.yml`、registry、planner/executor/receipt verifier，以及提供 6 个 required contexts / release gate 的 `ci.yml`、`governance-baseline.yml`、`lock-independent-desktop-acceptance.yml`、`release.yml` 等 trust-root 文件；普通 PR 不允许用 candidate 修改后的 validator 或执行器自证。后续治理升级必须走明确的 external governance bootstrap，再重新启用并对账 required contexts；
 - 个人仓库管理员仍可在 GitHub 控制面修改规则集。组织级 required workflow 或独立 GitHub App 是更高一级的外部信任根；仓库内门禁不虚假声称能约束仓库所有者凭据。
 
 ## Applicable Harnesses
@@ -207,11 +208,12 @@ Scenario-Test: HLT-003, HLT-004
 
 ## 实施顺序
 
-1. 已完成：统一 26 个场景和 11 个复杂 E2E，schema v2 将全部自动化 target 绑定到明确 gate；
+1. 已完成：统一 27 个场景和 11 个复杂 E2E，schema v2 将全部自动化 target 绑定到明确 gate；
 2. 已完成：新增 trusted policy + PR aggregate required contexts、本地统一 hooks、全优先级 change contract 与 fail-closed base SHA；
-3. 当前 gate debt：按每个 Complex E2E 的 `pull_request_gate` 分别记录；产品 PR 和 release 都只需清零本批次 diff 直接命中的 slice，其中 release 还必须真实执行受影响 L4 exact-artifact target。不得把受影响缺口改写成 waiver，也不得要求无关 PR 先清全目录债务；
-4. 逐项补齐真实 Supervisor wake、跨进程 SQLite、并发 finalization、真实 WebView、浏览器 lifecycle、fake-forge 和 exact artifact receipts，并把 case 提升为 `implemented`；
-5. 全部清零后保持 PR 与 release gate 常开，nightly 只扩展故障矩阵，不再替代 required gate。
+3. 已完成：受影响 PR 的 target planner、Windows/macOS 条件执行器、exact-head receipt 聚合与单一 trusted required context 设计和仓库实现；首次启用需要 external governance bootstrap 更新线上 trust root；
+4. 当前 gate debt：按每个 Complex E2E 的 `pull_request_gate` 分别记录；产品 PR 和 release 都只需清零本批次 diff 直接命中的 slice，其中 release 还必须真实执行受影响 L4 exact-artifact target。不得把受影响缺口改写成 waiver，也不得要求无关 PR 先清全目录债务；
+5. 逐项补齐真实 Supervisor wake、跨进程 SQLite、并发 finalization、真实 WebView、浏览器 lifecycle、fake-forge 和 exact artifact receipts，并把 case 提升为 `implemented`；
+6. 全部清零后保持 PR 与 release gate 常开，nightly 只扩展故障矩阵，不再替代 required gate。
 
 ## 验收标准
 
@@ -219,7 +221,8 @@ Scenario-Test: HLT-003, HLT-004
 - change contract 拒绝任意标题下未声明、漏声明 P0/P1/P2 或未映射的产品变更；
 - CI 同时运行 validator 的单元测试和仓库真实注册表验证；
 - 原历史场景目录不再维护第二份场景数据，只保留 canonical registry 指针；
-- 26 个现有场景和 11 个复杂 E2E 可由机器读取，所有 target 都能解析到明确 hard gate；
+- 27 个现有场景和 11 个复杂 E2E 可由机器读取，所有 target 都能解析到明确 hard gate；
+- 受影响 PR 的 exact target plan 非空时必须产出与 base/head SHA 一致的逐 target 成功回执；删除 target、失败、跳过、旧 SHA 或缺 artifact 均使 `scenario-gate-pr` 失败；无影响 PR 不启动 Windows/macOS 执行器；
 - E2E-001 明确保证无人参与执行；
 - 未完成自动化的 case 明确标注 `designed`；只完成部分证据层的 case 标注 `partially_implemented` 并列出 `remaining_gaps`。PR 额外使用 `pull_request_gate` 区分该阶段是否完整：受影响且未完成时失败，无关 case 不参与该 PR 结论；release 对受影响场景执行同样的增量 fail-closed 规则，并要求 L4 exact-artifact receipt。
 

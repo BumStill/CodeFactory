@@ -20,6 +20,38 @@
       "workflow": {"workflows": [".github/workflows/ci.yml", ".github/workflows/unattended-long-task-nightly.yml", ".github/workflows/release.yml"], "step_name_from_target": true, "workflow_stages": {".github/workflows/ci.yml": ["pull_request"], ".github/workflows/unattended-long-task-nightly.yml": ["nightly"], ".github/workflows/release.yml": ["release_artifact"]}}
     }
   },
+  "execution_policy": {
+    "workflow": ".github/workflows/scenario-execution.yml",
+    "receipt_schema_version": 1,
+    "default_runner": "windows-latest",
+    "target_runners": {
+      "binary:--browser-chrome-attach-smoke": "macos-14"
+    },
+    "pull_request_excluded_targets": [
+      "binary:--update-upgrade-smoke",
+      "workflow:Verify Windows release executable browser session lifecycle",
+      "workflow:Verify Windows release executable DeliveryRun recovery",
+      "workflow:Verify Windows release executable historical session restart",
+      "workflow:Verify Windows release executable previous-to-current update reconciliation"
+    ],
+    "workflow_aliases": {
+      "workflow:Unattended long-task cross-process smoke": "binary:--unattended-long-task-smoke",
+      "workflow:Historical session continue/stop/incident cross-process smoke": "binary:--history-session-smoke",
+      "workflow:Browser session lifecycle smoke": "binary:--browser-session-smoke",
+      "workflow:Delivery recovery cross-process smoke": "binary:--delivery-recovery-smoke"
+    },
+    "workflow_commands": {
+      "workflow:New-session composer overlap headless gate": ["node", "scripts/verify-composer-overlap-headless.mjs"]
+    },
+    "binary_receipt_oracles": {
+      "--unattended-long-task-smoke": {"field": "ok", "equals": true},
+      "--history-session-smoke": {"field": "ok", "equals": true},
+      "--delivery-recovery-smoke": {"field": "ok", "equals": true},
+      "--browser-session-smoke": {"field": "status", "equals": "passed"},
+      "--browser-chrome-attach-smoke": {"field": "status", "equals": "passed"},
+      "--evolution-smoke": {"field": "status", "equals": "pass"}
+    }
+  },
   "privacy": {
     "allowed": [
       "aggregate counts",

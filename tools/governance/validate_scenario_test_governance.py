@@ -637,6 +637,98 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
                 if marker not in serialized:
                     errors.append(f"{case_id} unattended oracle missing: {marker}")
 
+    execution_policy = registry.get("execution_policy")
+    if not isinstance(execution_policy, dict):
+        errors.append("execution_policy must be an object")
+        execution_policy = {}
+    if execution_policy.get("workflow") != ".github/workflows/scenario-execution.yml":
+        errors.append("execution_policy.workflow must be scenario-execution.yml")
+    if execution_policy.get("receipt_schema_version") != 1:
+        errors.append("execution_policy.receipt_schema_version must be 1")
+    supported_runners = {"windows-latest", "macos-14"}
+    if execution_policy.get("default_runner") not in supported_runners:
+        errors.append("execution_policy.default_runner must be a supported runner")
+    all_targets = {
+        target
+        for scenario in scenarios
+        for target in scenario.get("automated_by") or []
+        if isinstance(target, str)
+    } | {
+        target
+        for case in cases
+        for target in case.get("automated_by") or []
+        if isinstance(target, str)
+    }
+    excluded_targets = set(execution_policy.get("pull_request_excluded_targets") or [])
+    unknown_excluded = sorted(excluded_targets - all_targets)
+    if unknown_excluded:
+        errors.append(
+            "execution_policy excludes unknown pull_request targets: "
+            + ", ".join(unknown_excluded)
+        )
+    runner_overrides = execution_policy.get("target_runners") or {}
+    if not isinstance(runner_overrides, dict):
+        errors.append("execution_policy.target_runners must be an object")
+        runner_overrides = {}
+    for target, runner in runner_overrides.items():
+        if target not in all_targets:
+            errors.append(f"execution_policy target runner names unknown target: {target}")
+        if runner not in supported_runners:
+            errors.append(f"execution_policy target runner is unsupported: {target}")
+    aliases = execution_policy.get("workflow_aliases") or {}
+    if not isinstance(aliases, dict):
+        errors.append("execution_policy.workflow_aliases must be an object")
+        aliases = {}
+    workflow_commands = execution_policy.get("workflow_commands") or {}
+    if not isinstance(workflow_commands, dict):
+        errors.append("execution_policy.workflow_commands must be an object")
+        workflow_commands = {}
+    workflow_targets = {
+        target
+        for target in all_targets
+        if target.startswith("workflow:") and target not in excluded_targets
+    }
+    for target in sorted(workflow_targets - set(aliases) - set(workflow_commands)):
+        errors.append(f"execution_policy is missing workflow alias: {target}")
+    for target, concrete in aliases.items():
+        if target not in workflow_targets:
+            errors.append(f"execution_policy names unknown workflow target: {target}")
+        if not isinstance(concrete, str) or not _automation_exists(concrete, repo_root):
+            errors.append(f"execution_policy workflow alias is not executable: {target}")
+    for target, command in workflow_commands.items():
+        valid = (
+            target in workflow_targets
+            and isinstance(command, list)
+            and len(command) == 2
+            and command[0] == "node"
+            and isinstance(command[1], str)
+            and command[1].startswith("scripts/")
+            and ".." not in Path(command[1]).parts
+            and (repo_root / command[1]).is_file()
+        )
+        if not valid:
+            errors.append(f"execution_policy workflow command is invalid: {target}")
+    binary_oracles = execution_policy.get("binary_receipt_oracles") or {}
+    if not isinstance(binary_oracles, dict):
+        errors.append("execution_policy.binary_receipt_oracles must be an object")
+        binary_oracles = {}
+    binary_flags = {
+        target.split(":", 1)[1]
+        for target in all_targets
+        if target.startswith("binary:") and target not in excluded_targets
+    }
+    for flag in sorted(binary_flags - set(binary_oracles)):
+        errors.append(f"execution_policy is missing binary receipt oracle: {flag}")
+    for flag, oracle in binary_oracles.items():
+        if flag not in binary_flags:
+            errors.append(f"execution_policy names unknown binary receipt oracle: {flag}")
+        if (
+            not isinstance(oracle, dict)
+            or not isinstance(oracle.get("field"), str)
+            or "equals" not in oracle
+        ):
+            errors.append(f"execution_policy binary receipt oracle is invalid: {flag}")
+
     privacy = registry.get("privacy")
     if not isinstance(privacy, dict) or not privacy.get("forbidden"):
         errors.append("privacy.forbidden must be declared")
