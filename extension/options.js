@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Live affected-scenario gate probe; intentionally no runtime behavior change.
 //
 // Status surface, plus manual pairing as a fallback.
 //
