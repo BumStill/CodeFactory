@@ -875,6 +875,39 @@ class AffectedScenarioExecutionTests(unittest.TestCase):
         self.assertEqual(plan["required_targets"], [])
         self.assertEqual(plan["runners"], {})
 
+    @patch("tools.governance.scenario_execution.subprocess.run")
+    @patch("tools.governance.scenario_execution.shutil.which")
+    def test_executor_resolves_platform_launcher_before_starting_process(
+        self, which, run
+    ) -> None:
+        which.return_value = r"C:\\runner\\pnpm.CMD"
+        run.return_value.returncode = 0
+        run.return_value.stdout = "passed\n"
+        run.return_value.stderr = ""
+
+        returncode, _ = scenario_execution._run_command(
+            ["pnpm", "exec", "vitest", "run", "src/example.test.ts"],
+            REPO_ROOT,
+        )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(run.call_args.args[0][0], r"C:\\runner\\pnpm.CMD")
+
+    @patch("tools.governance.scenario_execution.subprocess.run")
+    @patch("tools.governance.scenario_execution.shutil.which", return_value=None)
+    def test_missing_launcher_becomes_a_receiptable_target_failure(
+        self, _which, run
+    ) -> None:
+        run.side_effect = FileNotFoundError(2, "launcher not found", "pnpm")
+
+        returncode, output = scenario_execution._run_command(
+            ["pnpm", "exec", "vitest", "run", "src/example.test.ts"],
+            REPO_ROOT,
+        )
+
+        self.assertEqual(returncode, 127)
+        self.assertIn("unable to start pnpm", output)
+
     def test_receipt_must_match_both_shas_and_every_required_target(self) -> None:
         plan = {
             "schema_version": 1,
