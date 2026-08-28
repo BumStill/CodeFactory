@@ -908,6 +908,36 @@ class AffectedScenarioExecutionTests(unittest.TestCase):
         self.assertEqual(returncode, 127)
         self.assertIn("unable to start pnpm", output)
 
+    def test_artifact_redirect_does_not_leak_github_authorization_cross_origin(
+        self,
+    ) -> None:
+        handler = scenario_execution._CrossOriginSafeRedirectHandler()
+        request = scenario_execution.urllib.request.Request(
+            "https://api.github.com/repos/owner/repo/actions/artifacts/1/zip",
+            headers={"Authorization": "Bearer secret", "Accept": "application/zip"},
+        )
+
+        cross_origin = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://objects.githubusercontent.com/signed-artifact",
+        )
+        same_origin = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://api.github.com/another-location",
+        )
+
+        self.assertIsNotNone(cross_origin)
+        self.assertIsNone(cross_origin.get_header("Authorization"))
+        self.assertEqual(same_origin.get_header("Authorization"), "Bearer secret")
+
     def test_receipt_must_match_both_shas_and_every_required_target(self) -> None:
         plan = {
             "schema_version": 1,
