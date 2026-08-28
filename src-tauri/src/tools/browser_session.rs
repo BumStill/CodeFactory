@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! CodeFactory-owned browser sessions.
+//! Live RTE-003 gate probe; intentionally no runtime behavior change.
 //!
 //! A browser is an owned task resource, not an incidental side effect of a
 //! `bash` string. Every session gets an opaque, CodeFactory-prefixed id and an
