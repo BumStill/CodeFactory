@@ -388,6 +388,20 @@ def _github_json(url: str, token: str) -> dict[str, Any]:
         return json.load(response)
 
 
+class _CrossOriginSafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep API auth on same-origin redirects, never on signed artifact hosts."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        source = urllib.parse.urlsplit(req.full_url).netloc.lower()
+        destination = urllib.parse.urlsplit(newurl).netloc.lower()
+        if source != destination:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
 def _github_bytes(url: str, token: str) -> bytes:
     request = urllib.request.Request(
         url,
@@ -398,7 +412,8 @@ def _github_bytes(url: str, token: str) -> bytes:
             "User-Agent": "codefactory-scenario-gate",
         },
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    opener = urllib.request.build_opener(_CrossOriginSafeRedirectHandler())
+    with opener.open(request, timeout=60) as response:
         return response.read()
 
 
