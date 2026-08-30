@@ -25,7 +25,8 @@
     "receipt_schema_version": 1,
     "default_runner": "windows-latest",
     "target_runners": {
-      "binary:--browser-chrome-attach-smoke": "macos-14"
+      "binary:--browser-chrome-attach-smoke": "macos-14",
+      "binary:--managed-workspace-cleanup-smoke": "macos-14"
     },
     "pull_request_excluded_targets": [
       "binary:--update-upgrade-smoke",
@@ -49,6 +50,7 @@
       "--delivery-recovery-smoke": {"field": "ok", "equals": true},
       "--browser-session-smoke": {"field": "status", "equals": "passed"},
       "--browser-chrome-attach-smoke": {"field": "status", "equals": "passed"},
+      "--managed-workspace-cleanup-smoke": {"field": "status", "equals": "passed"},
       "--evolution-smoke": {"field": "status", "equals": "pass"}
     }
   },
@@ -323,8 +325,8 @@
       "category": "runtime_lifecycle",
       "priority": "P0",
       "source_kind": "incident_shape",
-      "change_patterns": ["src-tauri/src/agent/execution_workspace.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/migrations/*execution_workspace*.sql"],
-      "automated_by": ["rust:dirty_root_gets_isolated_before_agent_execution", "rust:restart_reattaches_the_exact_objective_workspace", "rust:delivery_rejects_a_different_workspace_before_git_side_effects", "rust:terminal_objective_rejects_late_finished_and_technical_failure_decisions", "rust:completed_objective_releases_managed_workspace_lease_atomically", "rust:cleanup_pending_workspace_cannot_be_reattached_as_active_execution", "rust:schema_upgrade_reconciles_terminal_objective_workspace_lease"],
+      "change_patterns": ["src-tauri/src/agent/execution_workspace.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/src/main.rs", "src-tauri/src/lib.rs", "scripts/verify-macos-release-artifact.sh", "src-tauri/migrations/*execution_workspace*.sql"],
+      "automated_by": ["rust:dirty_root_gets_isolated_before_agent_execution", "rust:restart_reattaches_the_exact_objective_workspace", "rust:delivery_rejects_a_different_workspace_before_git_side_effects", "rust:terminal_objective_rejects_late_finished_and_technical_failure_decisions", "rust:completed_objective_releases_managed_workspace_lease_atomically", "rust:cleanup_pending_workspace_cannot_be_reattached_as_active_execution", "rust:schema_upgrade_reconciles_terminal_objective_workspace_lease", "rust:clean_merged_terminal_workspace_is_closed_without_touching_root_checkout", "rust:dirty_merged_terminal_workspace_is_preserved", "rust:terminal_workspace_without_merge_receipt_is_preserved", "rust:cleanup_restarts_after_worktree_removal_and_deletes_only_exact_branch", "rust:cleanup_rejects_a_workspace_outside_the_managed_container", "rust:concurrent_cleanup_passes_close_the_exact_workspace_once", "rust:schema_and_terminal_reconciliation_preserve_a_live_cleanup_claim", "binary:--managed-workspace-cleanup-smoke"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -615,7 +617,7 @@
       "name": "dirty 旧分支根目录上的新代码任务全程隔离并安全交付",
       "priority": "P0",
       "covers": ["RTE-004", "CXD-002", "HLT-001"],
-      "change_patterns": ["src-tauri/src/agent/execution_workspace.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/migrations/*execution_workspace*.sql"],
+      "change_patterns": ["src-tauri/src/agent/execution_workspace.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/src/main.rs", "src-tauri/src/lib.rs", "scripts/verify-macos-release-artifact.sh", "src-tauri/migrations/*execution_workspace*.sql"],
       "must_remain_unattended": true,
       "fixture": {"synthetic": true, "shape": "根 checkout 停在已有 terminal PR 的旧分支并有未提交文件，远端默认分支更新，两个并发代码 Objective"},
       "steps": [
@@ -635,9 +637,10 @@
         "delivery": ["新分支不含 terminal PR 的旧提交", "canonical PR/CI/merge 与 workspace head 一致", "仅 clean merged workspace 自动 closeout"]
       },
       "execution": {"pull_request": "real Git plus SQLite integration", "nightly": "cross-process fake-forge lifecycle", "release_artifact": "exact installed App CodeFactoryDev-equivalent canary"},
-      "automation_status": "designed",
-      "pull_request_gate": {"status": "designed", "required_targets": [], "remaining_gaps": ["real Git plus SQLite integration 尚未实现"]},
-      "remaining_gaps": ["尚无任何自动化：PR 的 real Git + SQLite integration 未实现", "L2 hard-kill reservation reconciliation", "L3 真实 CodeFactoryDev 双会话并发", "L4 exact release artifact closeout canary"]
+      "automation_status": "partially_implemented",
+      "automated_by": ["rust:dirty_root_gets_isolated_before_agent_execution", "rust:restart_reattaches_the_exact_objective_workspace", "rust:concurrent_objectives_receive_distinct_branches_and_worktrees", "rust:delivery_rejects_a_different_workspace_before_git_side_effects", "rust:clean_merged_terminal_workspace_is_closed_without_touching_root_checkout", "rust:dirty_merged_terminal_workspace_is_preserved", "rust:terminal_workspace_without_merge_receipt_is_preserved", "rust:cleanup_restarts_after_worktree_removal_and_deletes_only_exact_branch", "rust:cleanup_rejects_a_workspace_outside_the_managed_container", "rust:concurrent_cleanup_passes_close_the_exact_workspace_once", "rust:schema_and_terminal_reconciliation_preserve_a_live_cleanup_claim", "binary:--managed-workspace-cleanup-smoke"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:dirty_root_gets_isolated_before_agent_execution", "rust:restart_reattaches_the_exact_objective_workspace", "rust:concurrent_objectives_receive_distinct_branches_and_worktrees", "rust:delivery_rejects_a_different_workspace_before_git_side_effects", "rust:clean_merged_terminal_workspace_is_closed_without_touching_root_checkout", "rust:dirty_merged_terminal_workspace_is_preserved", "rust:terminal_workspace_without_merge_receipt_is_preserved", "rust:cleanup_restarts_after_worktree_removal_and_deletes_only_exact_branch", "rust:cleanup_rejects_a_workspace_outside_the_managed_container", "rust:concurrent_cleanup_passes_close_the_exact_workspace_once", "rust:schema_and_terminal_reconciliation_preserve_a_live_cleanup_claim"], "remaining_gaps": []},
+      "remaining_gaps": ["L2 worktree add 后 SQLite CAS 前 hard-kill reservation reconciliation 尚未实现", "L2 cross-process fake-forge lifecycle 尚未实现", "L3 真实 CodeFactoryDev 双会话并发尚未自动化"]
     },
     {
       "id": "E2E-010",

@@ -38,6 +38,14 @@
 - Git identity、fetch、worktree add、reattach 或 delivery binding 失败：`waiting_system/platform_incident`，零代码副作用，不要求用户发送“继续”。
 - 现有 worktree 与 DB identity 不一致：只读观察并保留两侧证据，不猜测、不覆盖、不删除。
 
+### 异步 closeout 安全契约
+
+- lifecycle supervisor 启动后立即扫描并按 60 秒周期重试；同一候选同时持有 workspace CAS lease 与 repo lease，活 lease 不得被终态幂等 reconciliation 清除。
+- 删除权限只来自逐字段匹配的 `DeliveryRun` 与已提交/已对账的 `provider_pr_merge` 写前日志；PR 号、workspace、repo、gitdir、branch 与 canonical head 任一缺失或冲突都 fail closed。
+- 物理删除前再次确认路径严格位于 App 自有 `execution-workspaces` 容器、worktree 注册与身份一致、HEAD 未漂移且 `git status` 干净；`git worktree remove` 不使用 `--force`。
+- worktree 删除后仅删除同名 `codefactory/objective-*` 本地分支，并在分支 HEAD 仍等于持久 head 时才允许 `-D`；随后以原 cleanup lease CAS 写入 `closed` 与 canonical PR receipt。
+- 进程若在 worktree remove 后崩溃，重启只在路径已消失、Git 已取消注册、分支仍为精确 head（或已消失）时继续分支 closeout；dirty、未合并、缺 receipt、路径越界或身份冲突一律保留并记录原因。
+
 ## Acceptance
 
 - Given 根 checkout 停在旧分支且 dirty，When 新 Objective 获得 Implement 权限，Then 从最新远端默认分支创建独立 worktree，根 checkout 状态与 reflog 不变。

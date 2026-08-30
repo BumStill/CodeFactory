@@ -4,9 +4,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use once_cell::sync::Lazy;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Row, Sqlite, SqlitePool, Transaction};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,6 +16,10 @@ use crate::util::no_window::NoWindow;
 static ALLOCATION_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
 const ATTACHABLE_STATES: &[&str] = &["allocating", "active", "delivering"];
+const CLEANUP_LEASE_TTL_MS: i64 = 300_000;
+const CLEANUP_RETRY_BACKOFF_MS: i64 = 300_000;
+const CLEANUP_BATCH_LIMIT: i64 = 16;
+const CLEANUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct ExecutionWorkspaceRequest {
@@ -86,6 +91,53 @@ struct WorkspaceRow {
     head_sha: Option<String>,
     state: String,
     lease_owner: Option<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct CleanupCandidate {
+    id: String,
+    objective_id: String,
+    repo_identity: String,
+    repo_root: String,
+    git_common_dir: String,
+    worktree_path: String,
+    worktree_identity: String,
+    branch_name: String,
+    head_sha: String,
+}
+
+#[derive(Debug, FromRow)]
+struct CleanupAuthority {
+    workspace_path: String,
+    worktree_identity: String,
+    repo_identity: String,
+    head_branch: String,
+    expected_head_sha: String,
+    canonical_pr_number: i64,
+    canonical_pr_url: String,
+    canonical_head_sha: String,
+    reached_ceiling: String,
+    evidence_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeReceiptEvidence {
+    pr_number: i64,
+    merge_sha: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CleanupPassOutcome {
+    pub scanned: usize,
+    pub closed: usize,
+    pub preserved: usize,
+    pub incidents: usize,
+}
+
+enum CandidateDisposition {
+    Closed { pr_number: i64, pr_url: String },
+    Preserved { code: &'static str, detail: String },
+    Incident(String),
 }
 
 impl WorkspaceRow {
@@ -304,6 +356,831 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
+fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("canonicalize Git worktree path {}", path.display()));
+    }
+
+    let mut ancestor = path.parent();
+    while ancestor.is_some_and(|candidate| !candidate.exists()) {
+        ancestor = ancestor.and_then(Path::parent);
+    }
+    let ancestor = ancestor.ok_or_else(|| {
+        anyhow!(
+            "Git worktree path has no existing ancestor: {}",
+            path.display()
+        )
+    })?;
+    let relative = path
+        .strip_prefix(ancestor)
+        .with_context(|| format!("resolve missing Git worktree path {}", path.display()))?;
+    Ok(ancestor
+        .canonicalize()
+        .with_context(|| format!("canonicalize Git worktree ancestor {}", ancestor.display()))?
+        .join(relative))
+}
+
+fn worktree_is_registered(root: &Path, path: &Path) -> Result<bool> {
+    let listed = git(root, &["worktree", "list", "--porcelain"])?;
+    let expected = canonicalize_allow_missing(path)?;
+    for registered in listed
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+    {
+        let registered = Path::new(registered);
+        if registered == path {
+            return Ok(true);
+        }
+        // Git for Windows reports `C:/...`, while std::fs::canonicalize stores
+        // the same path as `\\?\C:\...`. Canonicalizing both sides (or their
+        // nearest live parent after a prior removal) keeps the equality check
+        // exact without weakening the app-owned-container boundary.
+        if canonicalize_allow_missing(registered).is_ok_and(|value| value == expected) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validate_managed_path(workspace_path: &Path, workspace_container: &Path) -> Result<()> {
+    if !workspace_path.is_absolute() {
+        bail!("managed workspace path is not absolute");
+    }
+    let container = workspace_container
+        .canonicalize()
+        .context("canonicalize managed workspace container")?;
+    let relative = workspace_path
+        .strip_prefix(&container)
+        .context("managed workspace path is outside the app-owned container")?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("managed workspace path is not a strict normalized child of the app-owned container");
+    }
+    if workspace_path.exists() {
+        let canonical = workspace_path
+            .canonicalize()
+            .context("canonicalize managed workspace path")?;
+        if canonical != workspace_path || !canonical.starts_with(&container) {
+            bail!("managed workspace path resolves outside its durable app-owned identity");
+        }
+        return Ok(());
+    }
+
+    // A prior process may have removed the worktree and crashed before deleting
+    // its branch or closing the SQLite row. Validate the nearest existing
+    // ancestor so that this idempotent recovery path still cannot cross a
+    // symlink or `..` boundary.
+    let mut ancestor = workspace_path.parent();
+    while ancestor.is_some_and(|path| !path.exists()) {
+        ancestor = ancestor.and_then(Path::parent);
+    }
+    let ancestor =
+        ancestor.ok_or_else(|| anyhow!("managed workspace path has no live ancestor"))?;
+    let canonical_ancestor = ancestor
+        .canonicalize()
+        .context("canonicalize managed workspace ancestor")?;
+    if !canonical_ancestor.starts_with(&container) {
+        bail!("managed workspace ancestor resolves outside the app-owned container");
+    }
+    Ok(())
+}
+
+async fn load_cleanup_authority(
+    pool: &SqlitePool,
+    candidate: &CleanupCandidate,
+) -> Result<Option<(i64, String)>> {
+    let rows = sqlx::query_as::<_, CleanupAuthority>(
+        "SELECT delivery_runs.workspace_path,
+                delivery_runs.worktree_identity,
+                delivery_runs.repo_identity,
+                delivery_runs.head_branch,
+                delivery_runs.expected_head_sha,
+                delivery_runs.canonical_pr_number,
+                delivery_runs.canonical_pr_url,
+                delivery_runs.canonical_head_sha,
+                delivery_runs.reached_ceiling,
+                delivery_mutation_intents.evidence_json
+         FROM delivery_runs
+         JOIN delivery_mutation_intents
+           ON delivery_mutation_intents.run_id=delivery_runs.id
+         WHERE delivery_runs.objective_id=?
+           AND delivery_mutation_intents.rung='provider_pr_merge'
+           AND delivery_mutation_intents.status IN ('committed', 'reconciled_committed')
+           AND delivery_runs.canonical_pr_number IS NOT NULL
+           AND delivery_runs.canonical_pr_url IS NOT NULL
+           AND delivery_runs.canonical_head_sha IS NOT NULL
+           AND delivery_mutation_intents.evidence_json IS NOT NULL
+         ORDER BY delivery_runs.updated_at DESC,
+                  delivery_mutation_intents.updated_at DESC",
+    )
+    .bind(&candidate.objective_id)
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        if !matches!(
+            row.reached_ceiling.as_str(),
+            "merged" | "release_triggered" | "deployment_succeeded" | "live_verified"
+        ) || row.workspace_path != candidate.worktree_path
+            || row.worktree_identity != candidate.worktree_identity
+            || row.repo_identity != candidate.repo_identity
+            || row.head_branch != candidate.branch_name
+            || row.expected_head_sha != candidate.head_sha
+            || row.canonical_head_sha != candidate.head_sha
+            || row.canonical_pr_number <= 0
+            || row.canonical_pr_url.trim().is_empty()
+        {
+            continue;
+        }
+        let Ok(evidence) = serde_json::from_str::<MergeReceiptEvidence>(&row.evidence_json) else {
+            continue;
+        };
+        if evidence.pr_number == row.canonical_pr_number && !evidence.merge_sha.trim().is_empty() {
+            return Ok(Some((row.canonical_pr_number, row.canonical_pr_url)));
+        }
+    }
+    Ok(None)
+}
+
+async fn claim_cleanup_candidate(
+    pool: &SqlitePool,
+    candidate: &CleanupCandidate,
+    owner: &str,
+) -> Result<bool> {
+    let now = Utc::now().timestamp_millis();
+    Ok(sqlx::query(
+        "UPDATE execution_workspaces
+         SET lease_owner=?, lease_expires_at=?, updated_at=?
+         WHERE id=? AND state='cleanup_pending'
+           AND ((lease_owner IS NULL AND lease_expires_at IS NULL)
+                OR lease_expires_at<=?)",
+    )
+    .bind(owner)
+    .bind(now + CLEANUP_LEASE_TTL_MS)
+    .bind(now)
+    .bind(&candidate.id)
+    .bind(now)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+async fn preserve_cleanup_candidate(
+    pool: &SqlitePool,
+    candidate: &CleanupCandidate,
+    owner: &str,
+    code: &str,
+    detail: &str,
+) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE execution_workspaces
+         SET failure_code=?, failure_detail=?, lease_owner=NULL,
+             lease_expires_at=NULL, updated_at=?
+         WHERE id=? AND state='cleanup_pending' AND lease_owner=?",
+    )
+    .bind(code)
+    .bind(detail.chars().take(1000).collect::<String>())
+    .bind(Utc::now().timestamp_millis())
+    .bind(&candidate.id)
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        bail!("managed workspace cleanup claim changed before preservation receipt");
+    }
+    Ok(())
+}
+
+async fn incident_cleanup_candidate(
+    pool: &SqlitePool,
+    candidate: &CleanupCandidate,
+    owner: &str,
+    detail: &str,
+) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE execution_workspaces
+         SET state='incident', failure_code='workspace_cleanup_identity_conflict',
+             failure_detail=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+         WHERE id=? AND state='cleanup_pending' AND lease_owner=?",
+    )
+    .bind(detail.chars().take(1000).collect::<String>())
+    .bind(Utc::now().timestamp_millis())
+    .bind(&candidate.id)
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        bail!("managed workspace cleanup claim changed before incident receipt");
+    }
+    Ok(())
+}
+
+async fn close_cleanup_candidate(
+    pool: &SqlitePool,
+    candidate: &CleanupCandidate,
+    owner: &str,
+    pr_number: i64,
+    pr_url: &str,
+) -> Result<()> {
+    let now = Utc::now().timestamp_millis();
+    let updated = sqlx::query(
+        "UPDATE execution_workspaces
+         SET state='closed', canonical_pr_number=?, canonical_pr_url=?,
+             failure_code=NULL, failure_detail=NULL, lease_owner=NULL,
+             lease_expires_at=NULL, closed_at=?, updated_at=?
+         WHERE id=? AND state='cleanup_pending' AND lease_owner=?",
+    )
+    .bind(pr_number)
+    .bind(pr_url)
+    .bind(now)
+    .bind(now)
+    .bind(&candidate.id)
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        bail!("managed workspace cleanup claim changed before closeout receipt");
+    }
+    Ok(())
+}
+
+fn inspect_and_remove_candidate(
+    candidate: &CleanupCandidate,
+    workspace_container: &Path,
+    authority: (i64, String),
+) -> Result<CandidateDisposition> {
+    let workspace_path = PathBuf::from(&candidate.worktree_path);
+    if let Err(error) = validate_managed_path(&workspace_path, workspace_container) {
+        return Ok(CandidateDisposition::Incident(error.to_string()));
+    }
+    if !candidate.branch_name.starts_with("codefactory/objective-") {
+        return Ok(CandidateDisposition::Incident(
+            "managed workspace branch is outside the reserved CodeFactory namespace".into(),
+        ));
+    }
+    let repo_root = PathBuf::from(&candidate.repo_root);
+    let canonical_repo_root = match repo_root.canonicalize() {
+        Ok(path) if path == repo_root => path,
+        Ok(_) => {
+            return Ok(CandidateDisposition::Incident(
+                "managed workspace repository root changed canonical identity".into(),
+            ))
+        }
+        Err(error) => {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_inspection_failed",
+                detail: format!("managed repository root unavailable: {error}"),
+            })
+        }
+    };
+    if canonical_repo_root == workspace_path {
+        return Ok(CandidateDisposition::Incident(
+            "managed workspace path points at the source repository root".into(),
+        ));
+    }
+    let common_dir_raw = match git(&canonical_repo_root, &["rev-parse", "--git-common-dir"]) {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_inspection_failed",
+                detail: error.to_string(),
+            })
+        }
+    };
+    let common_dir = match canonical_git_path(&canonical_repo_root, &common_dir_raw) {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_inspection_failed",
+                detail: error.to_string(),
+            })
+        }
+    };
+    if common_dir != PathBuf::from(&candidate.git_common_dir) {
+        return Ok(CandidateDisposition::Incident(
+            "managed workspace common Git directory changed identity".into(),
+        ));
+    }
+
+    let registered = match worktree_is_registered(&canonical_repo_root, &workspace_path) {
+        Ok(registered) => registered,
+        Err(error) => {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_inspection_failed",
+                detail: error.to_string(),
+            })
+        }
+    };
+    if workspace_path.exists() {
+        if !registered {
+            return Ok(CandidateDisposition::Incident(
+                "managed workspace path exists without an exact Git worktree registration".into(),
+            ));
+        }
+        let branch = match git(&workspace_path, &["branch", "--show-current"]) {
+            Ok(branch) => branch,
+            Err(error) => {
+                return Ok(CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_inspection_failed",
+                    detail: error.to_string(),
+                })
+            }
+        };
+        let identity = match workspace_identity(&workspace_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Ok(CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_inspection_failed",
+                    detail: error.to_string(),
+                })
+            }
+        };
+        if branch != candidate.branch_name
+            || identity.0 != candidate.repo_identity
+            || identity.1 != candidate.worktree_identity
+            || identity.2 != candidate.head_sha
+        {
+            return Ok(CandidateDisposition::Incident(
+                "managed workspace repo, gitdir, branch, or HEAD changed before cleanup".into(),
+            ));
+        }
+        let status = match git(
+            &workspace_path,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        ) {
+            Ok(status) => status,
+            Err(error) => {
+                return Ok(CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_inspection_failed",
+                    detail: error.to_string(),
+                })
+            }
+        };
+        if !status.is_empty() {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_dirty",
+                detail: "canonical merged workspace has uncommitted or untracked changes".into(),
+            });
+        }
+        if let Err(error) = git(
+            &canonical_repo_root,
+            &[
+                "worktree",
+                "remove",
+                workspace_path
+                    .to_str()
+                    .ok_or_else(|| anyhow!("managed workspace path is not valid UTF-8"))?,
+            ],
+        ) {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_remove_failed",
+                detail: error.to_string(),
+            });
+        }
+        if workspace_path.exists()
+            || worktree_is_registered(&canonical_repo_root, &workspace_path).unwrap_or(true)
+        {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_remove_failed",
+                detail:
+                    "Git reported success but the managed worktree still exists or is registered"
+                        .into(),
+            });
+        }
+    } else if registered {
+        return Ok(CandidateDisposition::Incident(
+            "managed workspace path is missing while Git still registers it".into(),
+        ));
+    }
+
+    if branch_exists(&canonical_repo_root, &candidate.branch_name) {
+        let branch_ref = format!("refs/heads/{}", candidate.branch_name);
+        let branch_head = match git(&canonical_repo_root, &["rev-parse", &branch_ref]) {
+            Ok(head) => head,
+            Err(error) => {
+                return Ok(CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_branch_failed",
+                    detail: error.to_string(),
+                })
+            }
+        };
+        if branch_head != candidate.head_sha {
+            return Ok(CandidateDisposition::Incident(
+                "managed workspace branch HEAD changed after worktree removal".into(),
+            ));
+        }
+        if let Err(error) = git(
+            &canonical_repo_root,
+            &["branch", "-D", "--", &candidate.branch_name],
+        ) {
+            return Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_branch_failed",
+                detail: error.to_string(),
+            });
+        }
+    }
+    if branch_exists(&canonical_repo_root, &candidate.branch_name) {
+        return Ok(CandidateDisposition::Preserved {
+            code: "workspace_cleanup_branch_failed",
+            detail: "managed workspace branch still exists after exact deletion".into(),
+        });
+    }
+    Ok(CandidateDisposition::Closed {
+        pr_number: authority.0,
+        pr_url: authority.1,
+    })
+}
+
+pub(crate) async fn run_cleanup_pass(
+    pool: &SqlitePool,
+    workspace_container: &Path,
+    process_instance: &str,
+) -> Result<CleanupPassOutcome> {
+    ensure_schema(pool).await?;
+    let _guard = ALLOCATION_LOCK.lock().await;
+    let now = Utc::now().timestamp_millis();
+    let candidates = sqlx::query_as::<_, CleanupCandidate>(
+        "SELECT execution_workspaces.id, execution_workspaces.objective_id,
+                execution_workspaces.repo_identity, execution_workspaces.repo_root,
+                execution_workspaces.git_common_dir, execution_workspaces.worktree_path,
+                execution_workspaces.worktree_identity, execution_workspaces.branch_name,
+                execution_workspaces.head_sha
+         FROM execution_workspaces
+         JOIN objectives ON objectives.id=execution_workspaces.objective_id
+         WHERE execution_workspaces.state='cleanup_pending'
+           AND objectives.status IN ('completed', 'cancelled')
+           AND execution_workspaces.worktree_identity IS NOT NULL
+           AND execution_workspaces.head_sha IS NOT NULL
+           AND ((execution_workspaces.lease_owner IS NULL
+                 AND execution_workspaces.lease_expires_at IS NULL)
+                OR execution_workspaces.lease_expires_at<=?)
+           AND (execution_workspaces.failure_code IS NULL
+                OR execution_workspaces.updated_at<=?)
+         ORDER BY execution_workspaces.updated_at ASC
+         LIMIT ?",
+    )
+    .bind(now)
+    .bind(now - CLEANUP_RETRY_BACKOFF_MS)
+    .bind(CLEANUP_BATCH_LIMIT)
+    .fetch_all(pool)
+    .await?;
+    let mut outcome = CleanupPassOutcome {
+        scanned: candidates.len(),
+        ..CleanupPassOutcome::default()
+    };
+    let owner = format!("workspace-cleanup:{process_instance}");
+
+    for candidate in candidates {
+        if !claim_cleanup_candidate(pool, &candidate, &owner).await? {
+            continue;
+        }
+        if let Err(error) =
+            acquire_repo_allocation_lock(pool, &candidate.repo_identity, &owner).await
+        {
+            preserve_cleanup_candidate(
+                pool,
+                &candidate,
+                &owner,
+                "workspace_cleanup_repo_busy",
+                &error.to_string(),
+            )
+            .await?;
+            outcome.preserved += 1;
+            continue;
+        }
+
+        let disposition = if let Err(error) =
+            validate_managed_path(Path::new(&candidate.worktree_path), workspace_container)
+        {
+            CandidateDisposition::Incident(error.to_string())
+        } else {
+            match load_cleanup_authority(pool, &candidate).await {
+                Ok(Some(authority)) => {
+                    inspect_and_remove_candidate(&candidate, workspace_container, authority)?
+                }
+                Ok(None) => CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_merge_unproven",
+                    detail: "no exact committed canonical PR merge receipt matches this workspace"
+                        .into(),
+                },
+                Err(error) => CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_inspection_failed",
+                    detail: error.to_string(),
+                },
+            }
+        };
+
+        let apply_result = match disposition {
+            CandidateDisposition::Closed { pr_number, pr_url } => {
+                outcome.closed += 1;
+                close_cleanup_candidate(pool, &candidate, &owner, pr_number, &pr_url).await
+            }
+            CandidateDisposition::Preserved { code, detail } => {
+                outcome.preserved += 1;
+                preserve_cleanup_candidate(pool, &candidate, &owner, code, &detail).await
+            }
+            CandidateDisposition::Incident(detail) => {
+                outcome.incidents += 1;
+                incident_cleanup_candidate(pool, &candidate, &owner, &detail).await
+            }
+        };
+        release_repo_allocation_lock(pool, &candidate.repo_identity, &owner).await;
+        apply_result?;
+    }
+    Ok(outcome)
+}
+
+pub(crate) fn spawn_cleanup_supervisor(
+    pool: SqlitePool,
+    workspace_container: PathBuf,
+    process_instance: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        tracing::info!(
+            poll_ms = CLEANUP_POLL_INTERVAL.as_millis(),
+            "managed workspace cleanup supervisor started"
+        );
+        loop {
+            match run_cleanup_pass(&pool, &workspace_container, &process_instance).await {
+                Ok(outcome) if outcome.scanned > 0 => tracing::info!(
+                    scanned = outcome.scanned,
+                    closed = outcome.closed,
+                    preserved = outcome.preserved,
+                    incidents = outcome.incidents,
+                    "managed workspace cleanup pass completed"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    "managed workspace cleanup pass failed closed; retrying later"
+                ),
+            }
+            tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[derive(Debug, Serialize)]
+pub(crate) struct CleanupSmokeReceipt {
+    pub scenario_id: &'static str,
+    pub status: &'static str,
+    pub evidence_level: &'static str,
+    pub clean_workspace_closed: bool,
+    pub clean_branch_deleted: bool,
+    pub dirty_workspace_preserved: bool,
+    pub dirty_branch_preserved: bool,
+    pub root_checkout_unchanged: bool,
+    pub closeout_count: usize,
+    pub preservation_count: usize,
+}
+
+#[cfg(not(test))]
+async fn record_smoke_merge_receipt(
+    pool: &SqlitePool,
+    workspace: &ExecutionWorkspace,
+    pr_number: i64,
+) -> Result<()> {
+    let head_sha = git(&workspace.worktree_path, &["rev-parse", "HEAD"])?;
+    let now = Utc::now().timestamp_millis();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE objectives
+         SET status='cancelled', decision_type='cancelled',
+             cancellation_provenance='explicit_cancel', completed_at=?,
+             lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+         WHERE id=?",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(&workspace.objective_id)
+    .execute(&mut *tx)
+    .await?;
+    mark_objective_terminal_in_tx(&mut tx, &workspace.objective_id, now).await?;
+    sqlx::query("UPDATE execution_workspaces SET head_sha=? WHERE objective_id=?")
+        .bind(&head_sha)
+        .bind(&workspace.objective_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    let run_id = format!("cleanup-smoke-delivery-{pr_number}");
+    sqlx::query(
+        "INSERT INTO delivery_runs
+         (id, objective_id, run_kind, workspace_path, worktree_identity,
+          repo_identity, head_branch, expected_head_sha, canonical_pr_number,
+          canonical_pr_url, canonical_head_sha, requested_ceiling,
+          reached_ceiling, stage, status, last_observed_at, last_progress_at,
+          app_version, app_build, process_instance, created_at, updated_at,
+          claim_epoch, reconciled_claim_epoch)
+         VALUES (?, ?, 'objective', ?, ?, ?, ?, ?, ?, ?, ?, 'through_merge',
+                 'merged', 'completed', 'completed', ?, ?, 'smoke', 'smoke',
+                 'cleanup-smoke', ?, ?, 1, 1)",
+    )
+    .bind(&run_id)
+    .bind(&workspace.objective_id)
+    .bind(workspace.worktree_path.to_string_lossy().into_owned())
+    .bind(&workspace.worktree_identity)
+    .bind(&workspace.repo_identity)
+    .bind(&workspace.branch_name)
+    .bind(&head_sha)
+    .bind(pr_number)
+    .bind(format!("https://example.invalid/pull/{pr_number}"))
+    .bind(&head_sha)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO delivery_mutation_intents
+         (intent_id, run_id, claim_epoch, rung, operation_key, status,
+          process_instance, evidence_json, started_at, updated_at)
+         VALUES (?, ?, 1, 'provider_pr_merge', ?, 'committed',
+                 'cleanup-smoke', ?, ?, ?)",
+    )
+    .bind(format!("cleanup-smoke-intent-{pr_number}"))
+    .bind(&run_id)
+    .bind(format!("cleanup-smoke-merge-{pr_number}"))
+    .bind(
+        serde_json::json!({
+            "pr_number": pr_number,
+            "merge_sha": format!("synthetic-merge-{pr_number}"),
+        })
+        .to_string(),
+    )
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Exact-binary real Git + SQLite smoke for the managed workspace closeout
+/// contract. It is fully synthetic and never opens the installed user DB.
+#[cfg(not(test))]
+pub(crate) async fn run_cleanup_smoke() -> Result<CleanupSmokeReceipt> {
+    use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
+
+    let temp = tempfile::tempdir().context("create cleanup smoke directory")?;
+    let root = temp.path().join("root");
+    let remote = temp.path().join("remote.git");
+    let container = temp.path().join("managed");
+    std::fs::create_dir_all(&root)?;
+    git(
+        temp.path(),
+        &[
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            remote
+                .to_str()
+                .ok_or_else(|| anyhow!("smoke remote path is not valid UTF-8"))?,
+        ],
+    )?;
+    git(&root, &["init", "--initial-branch=main"])?;
+    git(&root, &["config", "user.name", "CodeFactory Smoke"])?;
+    git(
+        &root,
+        &["config", "user.email", "smoke@codefactory.invalid"],
+    )?;
+    std::fs::write(root.join("base.txt"), "base\n")?;
+    git(&root, &["add", "base.txt"])?;
+    git(&root, &["commit", "-m", "synthetic base"])?;
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote
+                .to_str()
+                .ok_or_else(|| anyhow!("smoke remote path is not valid UTF-8"))?,
+        ],
+    )?;
+    git(&root, &["push", "-u", "origin", "main"])?;
+    git(&root, &["checkout", "-b", "old-session"])?;
+    std::fs::write(root.join("root-user-change.txt"), "preserve root\n")?;
+
+    let db_path = temp.path().join("cleanup-smoke.db");
+    let pool = crate::storage::db::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
+    let store = ObjectiveStore::new(pool.clone());
+    for objective_id in ["cleanup-smoke-clean", "cleanup-smoke-dirty"] {
+        store
+            .create(CreateObjective {
+                id: objective_id.into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: None,
+                root_turn_id: None,
+                domain: RecoveryDomain::Delivery,
+                requested_acceptance: "merged".into(),
+                created_surface: "release_artifact_smoke".into(),
+            })
+            .await?;
+    }
+
+    let clean = allocate_or_attach(
+        &pool,
+        ExecutionWorkspaceRequest {
+            objective_id: "cleanup-smoke-clean".into(),
+            session_id: None,
+            source_cwd: root.clone(),
+            workspace_container: container.clone(),
+            process_instance: "cleanup-smoke-allocator".into(),
+        },
+    )
+    .await?;
+    let dirty = allocate_or_attach(
+        &pool,
+        ExecutionWorkspaceRequest {
+            objective_id: "cleanup-smoke-dirty".into(),
+            session_id: None,
+            source_cwd: root.clone(),
+            workspace_container: container.clone(),
+            process_instance: "cleanup-smoke-allocator".into(),
+        },
+    )
+    .await?;
+    for (workspace, marker) in [(&clean, "clean"), (&dirty, "dirty")] {
+        let filename = format!("{marker}-delivery.txt");
+        std::fs::write(
+            workspace.worktree_path.join(&filename),
+            format!("{marker}\n"),
+        )?;
+        git(&workspace.worktree_path, &["add", &filename])?;
+        git(
+            &workspace.worktree_path,
+            &["commit", "-m", &format!("synthetic {marker} delivery")],
+        )?;
+    }
+    record_smoke_merge_receipt(&pool, &clean, 41).await?;
+    record_smoke_merge_receipt(&pool, &dirty, 42).await?;
+    std::fs::write(
+        dirty.worktree_path.join("uncommitted-preservation.txt"),
+        "must remain\n",
+    )?;
+
+    let root_before = (
+        git(&root, &["branch", "--show-current"])?,
+        git(&root, &["rev-parse", "HEAD"])?,
+        git(&root, &["status", "--porcelain=v1"])?,
+        git(&root, &["reflog", "show", "--format=%H %gs", "HEAD"])?,
+    );
+    let outcome = run_cleanup_pass(&pool, &container, "cleanup-smoke-supervisor").await?;
+    let root_after = (
+        git(&root, &["branch", "--show-current"])?,
+        git(&root, &["rev-parse", "HEAD"])?,
+        git(&root, &["status", "--porcelain=v1"])?,
+        git(&root, &["reflog", "show", "--format=%H %gs", "HEAD"])?,
+    );
+    let dirty_state: (String, Option<String>) =
+        sqlx::query_as("SELECT state, failure_code FROM execution_workspaces WHERE objective_id=?")
+            .bind(&dirty.objective_id)
+            .fetch_one(&pool)
+            .await?;
+    let clean_workspace_closed = !clean.worktree_path.exists();
+    let clean_branch_deleted = !branch_exists(&root, &clean.branch_name);
+    let dirty_workspace_preserved = dirty
+        .worktree_path
+        .join("uncommitted-preservation.txt")
+        .is_file()
+        && dirty_state.0 == "cleanup_pending"
+        && dirty_state.1.as_deref() == Some("workspace_cleanup_dirty");
+    let dirty_branch_preserved = branch_exists(&root, &dirty.branch_name);
+    let root_checkout_unchanged = root_before == root_after;
+    if outcome.closed != 1
+        || outcome.preserved != 1
+        || !clean_workspace_closed
+        || !clean_branch_deleted
+        || !dirty_workspace_preserved
+        || !dirty_branch_preserved
+        || !root_checkout_unchanged
+    {
+        bail!("managed workspace cleanup smoke did not satisfy every closeout oracle");
+    }
+    Ok(CleanupSmokeReceipt {
+        scenario_id: "E2E-009",
+        status: "passed",
+        evidence_level: "exact_binary_real_git_sqlite",
+        clean_workspace_closed,
+        clean_branch_deleted,
+        dirty_workspace_preserved,
+        dirty_branch_preserved,
+        root_checkout_unchanged,
+        closeout_count: outcome.closed,
+        preservation_count: outcome.preserved,
+    })
+}
+
 pub fn is_git_repository(cwd: &Path) -> bool {
     git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|value| value == "true")
 }
@@ -331,13 +1208,15 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
                  updated_at=?
              WHERE (state IN ('allocating', 'active', 'delivering')
                     OR (state='cleanup_pending'
-                        AND (lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL)))
+                        AND (lease_owner IS NOT NULL OR lease_expires_at IS NOT NULL)
+                        AND (lease_expires_at IS NULL OR lease_expires_at<=?)))
                AND EXISTS (
                  SELECT 1 FROM objectives
                  WHERE objectives.id=execution_workspaces.objective_id
                    AND objectives.status IN ('completed', 'cancelled')
                )",
         )
+        .bind(now)
         .bind(now)
         .execute(pool)
         .await?;
@@ -368,7 +1247,7 @@ pub(crate) async fn mark_objective_terminal_in_tx(
          SET state='cleanup_pending', lease_owner=NULL, lease_expires_at=NULL,
              updated_at=?
          WHERE objective_id=?
-           AND state IN ('allocating', 'active', 'delivering', 'cleanup_pending')",
+           AND state IN ('allocating', 'active', 'delivering')",
     )
     .bind(now)
     .bind(objective_id)
@@ -887,8 +1766,8 @@ pub async fn verify_objective_workspace(
 mod tests {
     use super::{
         acquire_repo_allocation_lock, allocate_or_attach, attach_existing, ensure_schema,
-        latest_for_session, release_repo_allocation_lock, verify_objective_workspace,
-        ExecutionWorkspaceRequest,
+        latest_for_session, mark_objective_terminal_in_tx, release_repo_allocation_lock,
+        run_cleanup_pass, verify_objective_workspace, ExecutionWorkspaceRequest,
     };
     use crate::util::no_window::NoWindow;
     use sqlx::SqlitePool;
@@ -967,10 +1846,15 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE objectives (id TEXT PRIMARY KEY)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'active'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO objectives(id) VALUES (?)")
             .bind(objective_id)
             .execute(&pool)
@@ -978,6 +1862,79 @@ mod tests {
             .unwrap();
         ensure_schema(&pool).await.unwrap();
         pool
+    }
+
+    async fn record_terminal_merge_receipt(
+        pool: &SqlitePool,
+        workspace: &super::ExecutionWorkspace,
+    ) -> String {
+        crate::agent::delivery_run::ensure_schema(pool)
+            .await
+            .unwrap();
+        let head_sha = git(&workspace.worktree_path, &["rev-parse", "HEAD"]);
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
+            .bind(&workspace.objective_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET head_sha=?, state='cleanup_pending', lease_owner=NULL,
+                 lease_expires_at=NULL, updated_at=?
+             WHERE objective_id=?",
+        )
+        .bind(&head_sha)
+        .bind(now)
+        .bind(&workspace.objective_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let run_id = format!("delivery-{}", workspace.id);
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, objective_id, run_kind, workspace_path, worktree_identity,
+              repo_identity, head_branch, expected_head_sha, canonical_pr_number,
+              canonical_pr_url, canonical_head_sha, requested_ceiling,
+              reached_ceiling, stage, status, last_observed_at, last_progress_at,
+              app_version, app_build, process_instance, created_at, updated_at,
+              claim_epoch, reconciled_claim_epoch)
+             VALUES (?, ?, 'objective', ?, ?, ?, ?, ?, 42,
+                     'https://example.invalid/pull/42', ?, 'through_merge',
+                     'merged', 'completed', 'completed', ?, ?, 'test', 'test',
+                     'test-process', ?, ?, 1, 1)",
+        )
+        .bind(&run_id)
+        .bind(&workspace.objective_id)
+        .bind(workspace.worktree_path.to_string_lossy().into_owned())
+        .bind(&workspace.worktree_identity)
+        .bind(&workspace.repo_identity)
+        .bind(&workspace.branch_name)
+        .bind(&head_sha)
+        .bind(&head_sha)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO delivery_mutation_intents
+             (intent_id, run_id, claim_epoch, rung, operation_key, status,
+              process_instance, evidence_json, started_at, updated_at)
+             VALUES (?, ?, 1, 'provider_pr_merge', 'merge-pr-42', 'committed',
+                     'test-process', ?, ?, ?)",
+        )
+        .bind(format!("intent-{run_id}"))
+        .bind(&run_id)
+        .bind(r#"{"pr_number":42,"merge_sha":"merge-result-sha"}"#)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        head_sha
     }
 
     fn request(root: &Path, container: &Path, process_instance: &str) -> ExecutionWorkspaceRequest {
@@ -1159,6 +2116,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_and_terminal_reconciliation_preserve_a_live_cleanup_claim() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
+            .bind("objective-dirty-root")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET state='cleanup_pending', lease_owner='workspace-cleanup:live',
+                 lease_expires_at=? WHERE objective_id=?",
+        )
+        .bind(now + 120_000)
+        .bind("objective-dirty-root")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        ensure_schema(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let transitioned = mark_objective_terminal_in_tx(
+            &mut tx,
+            "objective-dirty-root",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(transitioned, 0);
+        let live: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT lease_owner, lease_expires_at
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind("objective-dirty-root")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live.0.as_deref(), Some("workspace-cleanup:live"));
+        assert!(live.1.is_some_and(|expires| expires > now));
+
+        sqlx::query("UPDATE execution_workspaces SET lease_expires_at=? WHERE objective_id=?")
+            .bind(now - 1)
+            .bind("objective-dirty-root")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let reclaimed: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT lease_owner, lease_expires_at
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind("objective-dirty-root")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reclaimed, (None, None));
+    }
+
+    #[tokio::test]
     async fn restart_finalizes_a_worktree_created_before_allocation_receipt() {
         let (_temp, root, _remote, container) = init_repo();
         let pool = pool_with_objective("objective-dirty-root").await;
@@ -1298,5 +2320,222 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(workspaces, 0);
+    }
+
+    #[tokio::test]
+    async fn clean_merged_terminal_workspace_is_closed_without_touching_root_checkout() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
+        git(&workspace.worktree_path, &["add", "change.txt"]);
+        git(
+            &workspace.worktree_path,
+            &["commit", "-m", "delivered change"],
+        );
+        record_terminal_merge_receipt(&pool, &workspace).await;
+        let root_branch_before = git(&root, &["branch", "--show-current"]);
+        let root_head_before = git(&root, &["rev-parse", "HEAD"]);
+        let root_status_before = git(&root, &["status", "--porcelain=v1"]);
+        let root_reflog_before = git(&root, &["reflog", "show", "--format=%H %gs", "HEAD"]);
+
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 1);
+        assert_eq!(outcome.preserved, 0);
+        assert!(!workspace.worktree_path.exists());
+        assert!(!super::branch_exists(&root, &workspace.branch_name));
+        let state: (String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT state, closed_at, lease_owner
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind(&workspace.objective_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.0, "closed");
+        assert!(state.1.is_some());
+        assert_eq!(state.2, None);
+        assert_eq!(
+            git(&root, &["branch", "--show-current"]),
+            root_branch_before
+        );
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), root_head_before);
+        assert_eq!(
+            git(&root, &["status", "--porcelain=v1"]),
+            root_status_before
+        );
+        assert_eq!(
+            git(&root, &["reflog", "show", "--format=%H %gs", "HEAD"]),
+            root_reflog_before
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_merged_terminal_workspace_is_preserved() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        record_terminal_merge_receipt(&pool, &workspace).await;
+        std::fs::write(
+            workspace.worktree_path.join("uncommitted.txt"),
+            "preserve\n",
+        )
+        .unwrap();
+
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 0);
+        assert_eq!(outcome.preserved, 1);
+        assert!(workspace.worktree_path.join("uncommitted.txt").is_file());
+        assert!(super::branch_exists(&root, &workspace.branch_name));
+        let state: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT state, failure_code, lease_owner
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind(&workspace.objective_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.0, "cleanup_pending");
+        assert_eq!(state.1.as_deref(), Some("workspace_cleanup_dirty"));
+        assert_eq!(state.2, None);
+        let deferred = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
+        assert_eq!(deferred.scanned, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_workspace_without_merge_receipt_is_preserved() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET status='cancelled' WHERE id=?")
+            .bind(&workspace.objective_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET state='cleanup_pending', lease_owner=NULL, lease_expires_at=NULL
+             WHERE objective_id=?",
+        )
+        .bind(&workspace.objective_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 0);
+        assert_eq!(outcome.preserved, 1);
+        assert!(workspace.worktree_path.is_dir());
+        assert!(super::branch_exists(&root, &workspace.branch_name));
+    }
+
+    #[tokio::test]
+    async fn cleanup_restarts_after_worktree_removal_and_deletes_only_exact_branch() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        record_terminal_merge_receipt(&pool, &workspace).await;
+        git(
+            &root,
+            &[
+                "worktree",
+                "remove",
+                workspace.worktree_path.to_str().unwrap(),
+            ],
+        );
+        assert!(super::branch_exists(&root, &workspace.branch_name));
+        assert!(super::branch_exists(&root, "old-session"));
+
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 1);
+        assert!(!super::branch_exists(&root, &workspace.branch_name));
+        assert!(super::branch_exists(&root, "old-session"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_a_workspace_outside_the_managed_container() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        record_terminal_merge_receipt(&pool, &workspace).await;
+        sqlx::query("UPDATE execution_workspaces SET worktree_path=? WHERE objective_id=?")
+            .bind(root.to_string_lossy().into_owned())
+            .bind(&workspace.objective_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 0);
+        assert_eq!(outcome.incidents, 1);
+        assert!(root.join("user-dirty.txt").is_file());
+        assert!(workspace.worktree_path.is_dir());
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM execution_workspaces WHERE objective_id=?")
+                .bind(&workspace.objective_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "incident");
+    }
+
+    #[tokio::test]
+    async fn concurrent_cleanup_passes_close_the_exact_workspace_once() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        record_terminal_merge_receipt(&pool, &workspace).await;
+
+        let (first, second) = tokio::join!(
+            run_cleanup_pass(&pool, &container, "cleanup-process-a"),
+            run_cleanup_pass(&pool, &container, "cleanup-process-b"),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.closed + second.closed, 1);
+        assert!(!workspace.worktree_path.exists());
+        assert!(!super::branch_exists(&root, &workspace.branch_name));
+        let closed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_workspaces
+             WHERE objective_id=? AND state='closed'",
+        )
+        .bind(&workspace.objective_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(closed, 1);
     }
 }
