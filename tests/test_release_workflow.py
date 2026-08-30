@@ -930,7 +930,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('CODEFACTORY_BROWSER_CHROME_FIXTURE="managed"', artifact_smoke)
         self.assertIn("LocalNetworkAccessAllowedForUrls", artifact_smoke)
         self.assertIn("LoopbackNetworkAllowedForUrls", artifact_smoke)
-        self.assertIn('"chrome-extension://*"', artifact_smoke)
+        # Chromium's policy contract uses the bare wildcard to grant every
+        # origin, including extension and opaque worker origins.  The narrower
+        # looking `chrome-extension://*` pattern left the MV3 worker unable to
+        # reach loopback on Chrome 142+ and kept releases in draft.
+        self.assertIn("-json '[\"*\"]'", artifact_smoke)
+        self.assertNotIn('"chrome-extension://*"', artifact_smoke)
         self.assertIn("RTE003_POLICY_INSTALLED", artifact_smoke)
         self.assertIn('sudo -n /bin/test -e "$policy_file"', artifact_smoke)
         self.assertNotIn("sudo -n /usr/bin/test", artifact_smoke)
