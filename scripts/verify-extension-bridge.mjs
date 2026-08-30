@@ -288,6 +288,10 @@ const chrome = spawn(
     "--no-first-run",
     "--no-default-browser-check",
     "--no-sandbox",
+    // The profile is disposable test state. Never let a local/CI smoke reach
+    // the user's login Keychain or show a modal macOS credential prompt.
+    "--password-store=basic",
+    "--use-mock-keychain",
     "--headless=new",
     `http://127.0.0.1:${page.port}/`,
   ],
