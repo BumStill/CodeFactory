@@ -225,8 +225,12 @@ fi
 # must release its lease without terminating that already-running browser.
 # Chrome 142+ requires a prior Local Network Access grant before a service
 # worker can dial loopback, but a headless release fixture has no user to answer
-# the prompt. Use Chrome's documented managed allowlist only for the isolated
-# Chrome for Testing process, then remove it in cleanup.
+# the prompt. Chromium's own policy tests use the bare `*` pattern for the
+# allow-everything case (including extension and opaque worker origins).  The
+# superficially narrower `chrome-extension://*` pattern does not grant the MV3
+# worker in Chrome 142+, so the extension can load successfully while its
+# loopback WebSocket remains blocked. Use the documented wildcard only for the
+# isolated Chrome for Testing process, then remove it in cleanup.
 CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT="${CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT:-$INSTALL_DIR/browser-chrome-attach-smoke.json}"
 mkdir -p "$(dirname "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT")" "$INSTALL_DIR/browser-attach-home"
 printf '%s\n' \
@@ -246,14 +250,14 @@ RTE003_POLICY_INSTALLED=1
 for policy_file in "${RTE003_POLICY_FILES[@]}"; do
   sudo -n /usr/bin/plutil -create xml1 "$policy_file"
   sudo -n /usr/bin/plutil -insert LocalNetworkAccessAllowedForUrls \
-    -json '["chrome-extension://*"]' "$policy_file"
+    -json '["*"]' "$policy_file"
   sudo -n /usr/bin/plutil -insert LoopbackNetworkAllowedForUrls \
-    -json '["chrome-extension://*"]' "$policy_file"
+    -json '["*"]' "$policy_file"
   sudo -n /bin/chmod 0644 "$policy_file"
   for policy_key in LocalNetworkAccessAllowedForUrls LoopbackNetworkAllowedForUrls; do
     policy_count="$(sudo -n /usr/bin/plutil -extract "$policy_key" raw -expect array "$policy_file")"
     policy_value="$(sudo -n /usr/bin/plutil -extract "$policy_key.0" raw -expect string "$policy_file")"
-    if [[ "$policy_count" != "1" || "$policy_value" != "chrome-extension://*" ]]; then
+    if [[ "$policy_count" != "1" || "$policy_value" != "*" ]]; then
       echo "macOS release artifact smoke failed: temporary Chrome policy '$policy_key' was not written exactly" >&2
       exit 1
     fi

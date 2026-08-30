@@ -1192,6 +1192,13 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--no-sandbox")
+            // This fixture owns a disposable profile and must never consult
+            // the developer or runner login Keychain. Without the same
+            // credential isolation Chromium automation libraries use, macOS
+            // opens a blocking "Chromium keychain not found" dialog even
+            // though no test assertion needs stored passwords.
+            .arg("--password-store=basic")
+            .arg("--use-mock-keychain")
             .arg("--disable-background-networking")
             .arg("--disable-component-update")
             .arg("--disable-sync")

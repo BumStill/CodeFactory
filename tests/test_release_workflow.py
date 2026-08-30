@@ -906,6 +906,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             REPO_ROOT / "scripts/verify-macos-release-artifact.sh"
         ).read_text(encoding="utf-8")
         attach_cli = (REPO_ROOT / "src-tauri/src/lib.rs").read_text(encoding="utf-8")
+        local_extension_smoke = (
+            REPO_ROOT / "scripts/verify-extension-bridge.mjs"
+        ).read_text(encoding="utf-8")
 
         build_job = release.split("\n  build-macos:\n", 1)[1].split(
             "\n  finalize:\n", 1
@@ -930,7 +933,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('CODEFACTORY_BROWSER_CHROME_FIXTURE="managed"', artifact_smoke)
         self.assertIn("LocalNetworkAccessAllowedForUrls", artifact_smoke)
         self.assertIn("LoopbackNetworkAllowedForUrls", artifact_smoke)
-        self.assertIn('"chrome-extension://*"', artifact_smoke)
+        # Chromium's policy contract uses the bare wildcard to grant every
+        # origin, including extension and opaque worker origins.  The narrower
+        # looking `chrome-extension://*` pattern left the MV3 worker unable to
+        # reach loopback on Chrome 142+ and kept releases in draft.
+        self.assertIn("-json '[\"*\"]'", artifact_smoke)
+        self.assertNotIn('"chrome-extension://*"', artifact_smoke)
         self.assertIn("RTE003_POLICY_INSTALLED", artifact_smoke)
         self.assertIn('sudo -n /bin/test -e "$policy_file"', artifact_smoke)
         self.assertNotIn("sudo -n /usr/bin/test", artifact_smoke)
@@ -991,12 +999,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("extension_package::write_pairing", attach_cli)
         self.assertNotIn('format!("--load-extension=', attach_cli)
         self.assertIn('"--enable-unsafe-extension-debugging"', attach_cli)
+        self.assertIn('"--password-store=basic"', attach_cli)
+        self.assertIn('"--use-mock-keychain"', attach_cli)
         self.assertIn('"--remote-debugging-port=0"', attach_cli)
         self.assertIn("Extensions.loadUnpacked", attach_cli)
         self.assertIn('"browser_fixture_version"', attach_cli)
         self.assertIn('"scenario_id": "RTE-003"', attach_cli)
         self.assertIn('"status": "failed"', attach_cli)
         self.assertNotIn('.arg("--headless=new")', attach_cli)
+        self.assertIn('"--password-store=basic"', local_extension_smoke)
+        self.assertIn('"--use-mock-keychain"', local_extension_smoke)
 
     def test_ci_runs_agent_bridge_and_evaluation_tests_on_linux(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
