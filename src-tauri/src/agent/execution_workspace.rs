@@ -356,12 +356,52 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
+fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("canonicalize Git worktree path {}", path.display()));
+    }
+
+    let mut ancestor = path.parent();
+    while ancestor.is_some_and(|candidate| !candidate.exists()) {
+        ancestor = ancestor.and_then(Path::parent);
+    }
+    let ancestor = ancestor.ok_or_else(|| {
+        anyhow!(
+            "Git worktree path has no existing ancestor: {}",
+            path.display()
+        )
+    })?;
+    let relative = path
+        .strip_prefix(ancestor)
+        .with_context(|| format!("resolve missing Git worktree path {}", path.display()))?;
+    Ok(ancestor
+        .canonicalize()
+        .with_context(|| format!("canonicalize Git worktree ancestor {}", ancestor.display()))?
+        .join(relative))
+}
+
 fn worktree_is_registered(root: &Path, path: &Path) -> Result<bool> {
     let listed = git(root, &["worktree", "list", "--porcelain"])?;
-    Ok(listed.lines().any(|line| {
-        line.strip_prefix("worktree ")
-            .is_some_and(|registered| Path::new(registered) == path)
-    }))
+    let expected = canonicalize_allow_missing(path)?;
+    for registered in listed
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+    {
+        let registered = Path::new(registered);
+        if registered == path {
+            return Ok(true);
+        }
+        // Git for Windows reports `C:/...`, while std::fs::canonicalize stores
+        // the same path as `\\?\C:\...`. Canonicalizing both sides (or their
+        // nearest live parent after a prior removal) keeps the equality check
+        // exact without weakening the app-owned-container boundary.
+        if canonicalize_allow_missing(registered).is_ok_and(|value| value == expected) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_managed_path(workspace_path: &Path, workspace_container: &Path) -> Result<()> {
