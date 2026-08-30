@@ -278,6 +278,24 @@ for field in tab_observation_ok detached_without_managed_close lease_reclaimed_a
 done
 cat "$CODEFACTORY_BROWSER_CHROME_ATTACH_RECEIPT"
 
+# RTE-004 / E2E-009 exact-artifact gate. The installed executable creates two
+# synthetic managed worktrees against a temporary real Git remote and SQLite
+# database. Only the clean merge-proven workspace may be removed; the dirty
+# sibling and the source checkout must remain byte-for-byte observable.
+MANAGED_WORKSPACE_CLEANUP_RECEIPT="$INSTALL_DIR/managed-workspace-cleanup-smoke.json"
+"$EXECUTABLE_PATH" --managed-workspace-cleanup-smoke "$MANAGED_WORKSPACE_CLEANUP_RECEIPT"
+if [[ "$(/usr/bin/plutil -extract status raw "$MANAGED_WORKSPACE_CLEANUP_RECEIPT")" != "passed" ]]; then
+  echo "macOS release artifact smoke failed: managed workspace cleanup status was not passed" >&2
+  exit 1
+fi
+for field in clean_workspace_closed clean_branch_deleted dirty_workspace_preserved dirty_branch_preserved root_checkout_unchanged; do
+  if [[ "$(/usr/bin/plutil -extract "$field" raw "$MANAGED_WORKSPACE_CLEANUP_RECEIPT")" != "true" ]]; then
+    echo "macOS release artifact smoke failed: managed workspace cleanup field '$field' was not true" >&2
+    exit 1
+  fi
+done
+cat "$MANAGED_WORKSPACE_CLEANUP_RECEIPT"
+
 EVOLUTION_RECEIPT="$INSTALL_DIR/evolution-release-smoke.json"
 "$EXECUTABLE_PATH" --evolution-smoke "$EVOLUTION_RECEIPT"
 if [[ "$(/usr/bin/plutil -extract status raw "$EVOLUTION_RECEIPT")" != "pass" ]]; then

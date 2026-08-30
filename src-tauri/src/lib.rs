@@ -223,6 +223,60 @@ pub fn run_delivery_recovery_smoke_cli() -> bool {
     }
 }
 
+/// Execute the synthetic real Git + SQLite managed-workspace closeout contract
+/// before Tauri initializes. This never opens the installed user's database.
+#[cfg(not(test))]
+pub fn run_managed_workspace_cleanup_smoke_cli() -> bool {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.get(1).map(String::as_str) != Some("--managed-workspace-cleanup-smoke") {
+        return false;
+    }
+    if args.len() != 3 {
+        eprintln!("usage: CodeFactory --managed-workspace-cleanup-smoke <receipt.json>");
+        std::process::exit(2);
+    }
+    let output = std::path::PathBuf::from(&args[2]);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Managed workspace cleanup smoke could not start: {error}");
+            std::process::exit(1);
+        });
+    match runtime.block_on(agent::execution_workspace::run_cleanup_smoke()) {
+        Ok(receipt) => {
+            let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+            if let Err(error) = std::fs::write(&output, rendered.as_bytes()) {
+                eprintln!(
+                    "Managed workspace cleanup smoke could not write {}: {error}",
+                    output.display()
+                );
+                std::process::exit(1);
+            }
+            println!("{rendered}");
+            true
+        }
+        Err(error) => {
+            let receipt = serde_json::json!({
+                "scenario_id": "E2E-009",
+                "status": "failed",
+                "evidence_level": "exact_binary_real_git_sqlite",
+                "error": error.to_string(),
+            });
+            let rendered = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+            let _ = std::fs::write(&output, rendered.as_bytes());
+            eprintln!("Managed workspace cleanup smoke failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn run_managed_workspace_cleanup_smoke_cli() -> bool {
+    false
+}
+
 /// Execute the network-hermetic, cross-process long-task contract before
 /// Tauri initializes. Both the parent and its internal workers are copies of
 /// this exact formal executable, so release CI never substitutes a test EXE.
@@ -1549,6 +1603,11 @@ pub fn run() {
             agent::objective_supervisor::spawn_objective_recovery_supervisor(
                 app.handle().clone(),
                 objective_pool.clone(),
+            );
+            agent::execution_workspace::spawn_cleanup_supervisor(
+                objective_pool.clone(),
+                data_dir.join("execution-workspaces"),
+                process_instance.clone(),
             );
             app.manage(commands::terminal::TerminalState::new());
 
