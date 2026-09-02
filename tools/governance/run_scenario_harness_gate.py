@@ -189,6 +189,62 @@ def validate_trust_root_immutability(repo_root: Path, policy_root: Path) -> list
     return errors
 
 
+def validate_release_tree_provenance(repo_root: Path, policy_root: Path) -> list[str]:
+    """At release time, prove the tree came through main — not that main has
+    stood still since the tag was cut.
+
+    Byte-freezing the trust root is the right check for a PULL REQUEST: there,
+    a candidate really could rewrite ci.yml to leave target names in comments
+    or skipped steps and self-attest green. A release candidate is a different
+    object. Its tree already passed that gate as a PR; what the byte-comparison
+    asserts afterwards is only that no trust-root file changed on main in the
+    meantime, which is not a property of the candidate at all.
+
+    The cost of asserting it anyway is severe and was paid twice in one day:
+    #475 and #476 each amended release.yml, and each amendment instantly made
+    every already-cut, not-yet-built tag unreleasable — v1.81.36 and v1.81.37
+    both died that way, and seven draft releases accumulated behind them. A
+    governance improvement should not be able to strand shipped-ready builds.
+
+    So at this stage the question becomes provenance: is this exact tree an
+    ancestor of the trusted default branch? If yes it went through the PR gate;
+    if no, it never did, and that is the case worth refusing.
+    """
+
+    if repo_root == policy_root:
+        return []
+    candidate = _git_output(repo_root, "rev-parse", "HEAD")
+    trusted = _git_output(policy_root, "rev-parse", "HEAD")
+    if not candidate or not trusted:
+        return [
+            "release provenance failed closed: could not resolve the candidate "
+            "or trusted HEAD"
+        ]
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", candidate, trusted],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return []
+    if result.returncode != 1:
+        # Could not answer — a missing object or a broken repository. Never let
+        # "I could not check" read as "the tree is fine".
+        detail = (result.stderr or result.stdout).strip() or "unknown git failure"
+        return [f"release provenance failed closed: {detail}"]
+    return [
+        f"release candidate {candidate[:12]} is not an ancestor of the trusted "
+        f"default branch {trusted[:12]}; it never passed the pull_request gate"
+    ]
+
+
+def _git_output(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, text=True
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 def _resolve_local_base(repo_root: Path) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo_root), "rev-parse", "origin/main"],
@@ -224,7 +280,10 @@ def main() -> int:
     if registry:
         errors.extend(validate_registry(registry, repo_root))
         errors.extend(validate_gate_surfaces(repo_root, registry))
-    errors.extend(validate_trust_root_immutability(repo_root, policy_root))
+    if args.stage == "release_artifact":
+        errors.extend(validate_release_tree_provenance(repo_root, policy_root))
+    else:
+        errors.extend(validate_trust_root_immutability(repo_root, policy_root))
 
     base_ref = args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip()
     if args.stage == "local" and not base_ref:
