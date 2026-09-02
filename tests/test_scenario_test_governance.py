@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import os
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -24,6 +25,7 @@ from tools.governance.scenario_execution import (
     validate_aggregate_receipt,
 )
 from tools.governance.validate_scenario_test_governance import (
+    scenario_impact_files,
     _automation_gate_stages,
     _changed_files,
     _impacted_scenarios,
@@ -1120,3 +1122,68 @@ class ReleaseProvenanceTests(unittest.TestCase):
             candidate.mkdir(); policy.mkdir()
             errors = validate_release_tree_provenance(candidate, policy)
             self.assertTrue(any("failed closed" in e for e in errors), errors)
+class VersionBumpExemptionTests(unittest.TestCase):
+    """A version-number change exercised no scenario; it must not claim to."""
+
+    MANIFESTS = {
+        "package.json": ('{{\n  "name": "codefactory",\n  "version": "{v}"\n}}\n'),
+        "src-tauri/Cargo.toml": ('[package]\nname = "codefactory"\nversion = "{v}"\n'),
+        "src-tauri/tauri.conf.json": ('{{\n  "productName": "CodeFactory",\n  "version": "{v}"\n}}\n'),
+        "src-tauri/Cargo.lock": (
+            '[[package]]\nname = "codefactory"\nversion = "{v}"\n'
+        ),
+    }
+
+    def _repo(self, root: Path, version: str) -> None:
+        for relative, template in self.MANIFESTS.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(template.format(v=version), encoding="utf-8")
+
+    def _git(self, root: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+
+    def _bump(self, root: Path, mutate=None) -> str:
+        self._git(root, "init", "-q", "-b", "main")
+        self._repo(root, "1.0.0")
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-qm", "base")
+        base = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self._repo(root, "1.0.1")
+        if mutate:
+            mutate(root)
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-qm", "chore: bump version to 1.0.1")
+        return base
+
+    def test_an_exact_four_file_bump_impacts_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            base = self._bump(root)
+            files = sorted(self.MANIFESTS)
+            self.assertEqual(scenario_impact_files(root, base, files), [])
+
+    def test_a_bump_carrying_any_other_edit_still_impacts(self) -> None:
+        # The exemption is about a pure version transition, not about the four
+        # paths: smuggling a dependency change alongside it must not ride free.
+        def also_touch_a_dependency(root: Path) -> None:
+            (root / "package.json").write_text(
+                '{\n  "name": "codefactory",\n  "version": "1.0.1",\n'
+                '  "dependencies": {"left-pad": "1.0.0"}\n}\n',
+                encoding="utf-8",
+            )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            base = self._bump(root, also_touch_a_dependency)
+            files = sorted(self.MANIFESTS)
+            self.assertEqual(scenario_impact_files(root, base, files), files)

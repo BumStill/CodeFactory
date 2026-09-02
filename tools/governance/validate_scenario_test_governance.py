@@ -1042,14 +1042,30 @@ def main() -> int:
         if requires_change_contract is None:
             errors.append("scenario change contract could not determine CI event type")
         elif requires_change_contract:
-            files, diff_error = _changed_files(
-                repo_root,
-                args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip(),
-            )
+            base_ref = args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip()
+            files, diff_error = _changed_files(repo_root, base_ref)
             if diff_error:
                 errors.append(f"scenario change contract failed closed: {diff_error}")
             else:
-                errors.extend(validate_change_contract(title, body, files, registry))
+                # The release bot's four-file version bump touches package.json,
+                # a GLOBAL_PRODUCT_FILE, so without this every version PR is
+                # "impacted by" all 27 scenarios and has to declare
+                # `Scenario-Test: ALL` — a claim that a version-number change
+                # exercised every scenario in the repository. It does not. The
+                # harness-gate path already exempts an exact version bump; this
+                # entry point (the one governance-baseline runs) did not, so the
+                # two disagreed and the bot's own PRs could only pass by
+                # over-declaring. Teaching people to write declarations they
+                # know are false is the same rot the registry gates exist to
+                # stop.
+                errors.extend(
+                    validate_change_contract(
+                        title,
+                        body,
+                        scenario_impact_files(repo_root, base_ref, files),
+                        registry,
+                    )
+                )
 
     if args.enforce_ready:
         if not args.stage:
