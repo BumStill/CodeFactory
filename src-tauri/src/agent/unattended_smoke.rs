@@ -5,22 +5,29 @@
 //! tools, permissions, SQLite migrations, Objective recovery, mutation
 //! receipts and settlement are the production implementations.
 
+#[path = "scenario_case_observation.rs"]
+mod scenario_case_observation;
+
 use super::events::{CollectingEventSink, EventSink};
 use super::objective::{
     current_process_instance, ClaimedRemediation, DecisionRouter, ObjectiveStatus, ObjectiveStore,
-    RecoveryDomain, RouteSignal, MAX_SIGNATURE_RECOVERY_ATTEMPTS,
-    RECOVERY_CAPABILITY_REVISION, TECHNICAL_RECOVERY_EXHAUSTED,
+    RecoveryDomain, RouteSignal, MAX_SIGNATURE_RECOVERY_ATTEMPTS, RECOVERY_CAPABILITY_REVISION,
+    TECHNICAL_RECOVERY_EXHAUSTED,
 };
 use super::{AgentExecutionContext, AgentLoop, AgentMode, TurnCapability, UsageSurface};
 use crate::config::settings::{ApiStyle, Settings};
 use crate::mcp::McpManager;
 use crate::util::no_window::NoWindow;
 use anyhow::{anyhow, bail, Context};
+use scenario_case_observation::{
+    attach_e2e001_case_observation, e2e001_failure_legacy_receipt, CleanupObservation,
+    ProcessObservation,
+};
 use sqlx::Row;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,11 +42,12 @@ struct ProviderFixture {
     requests: Arc<AtomicUsize>,
     blocked_round_seen: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    active_connections: Arc<AtomicUsize>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ProviderFixture {
-    fn start() -> anyhow::Result<Self> {
+    fn start(active_connections: Arc<AtomicUsize>) -> anyhow::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let base_url = format!("http://{}", listener.local_addr()?);
@@ -49,6 +57,7 @@ impl ProviderFixture {
         let thread_requests = requests.clone();
         let thread_blocked = blocked_round_seen.clone();
         let thread_stop = stop.clone();
+        let thread_connections = active_connections.clone();
         let thread = std::thread::spawn(move || {
             while !thread_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
@@ -56,7 +65,10 @@ impl ProviderFixture {
                         let request_index = thread_requests.fetch_add(1, Ordering::SeqCst) + 1;
                         let connection_stop = thread_stop.clone();
                         let connection_blocked = thread_blocked.clone();
+                        let connection_count = thread_connections.clone();
+                        connection_count.fetch_add(1, Ordering::SeqCst);
                         std::thread::spawn(move || {
+                            let _connection_lease = ConnectionLease(connection_count);
                             if let Err(error) = handle_provider_request(
                                 stream,
                                 request_index,
@@ -84,6 +96,7 @@ impl ProviderFixture {
             requests,
             blocked_round_seen,
             stop,
+            active_connections,
             thread: Some(thread),
         })
     }
@@ -95,7 +108,168 @@ impl Drop for ProviderFixture {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while self.active_connections.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
+}
+
+struct ConnectionLease(Arc<AtomicUsize>);
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn wait_for_child_exit_sync(child: &mut Child, timeout: Duration) -> std::io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct ManagedWorker {
+    child: Child,
+    process_tree: crate::util::process_tree::StdProcessTree,
+    live_workers: Arc<AtomicUsize>,
+    sweep_state: Arc<ProcessSweepState>,
+    reaped: bool,
+    swept: bool,
+}
+
+#[derive(Default)]
+struct ProcessSweepState {
+    spawned_workers: AtomicUsize,
+    swept_workers: AtomicUsize,
+    sweep_failures: AtomicUsize,
+    active_descendants: AtomicUsize,
+}
+
+impl ManagedWorker {
+    fn spawn(
+        state_dir: &Path,
+        base_url: &str,
+        phase: u8,
+        live_workers: Arc<AtomicUsize>,
+        sweep_state: Arc<ProcessSweepState>,
+    ) -> anyhow::Result<Self> {
+        let mut child = spawn_worker(state_dir, base_url, phase)?;
+        let process_tree = match crate::util::process_tree::StdProcessTree::attach(&child) {
+            Ok(process_tree) => process_tree,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = wait_for_child_exit_sync(&mut child, Duration::from_secs(2));
+                sweep_state.sweep_failures.fetch_add(1, Ordering::SeqCst);
+                return Err(error).context("attach unattended worker process tree");
+            }
+        };
+        live_workers.fetch_add(1, Ordering::SeqCst);
+        sweep_state.spawned_workers.fetch_add(1, Ordering::SeqCst);
+        let mut worker = Self {
+            child,
+            process_tree,
+            live_workers,
+            sweep_state,
+            reaped: false,
+            swept: false,
+        };
+        let gate_result = worker
+            .child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("unattended worker start gate is unavailable"))
+            .and_then(|mut gate| {
+                gate.write_all(b"start\n")
+                    .context("release unattended worker start gate")
+            });
+        if let Err(error) = gate_result {
+            drop(worker);
+            return Err(error);
+        }
+        Ok(worker)
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn terminate_tree(&mut self) -> std::io::Result<()> {
+        self.process_tree.terminate(&mut self.child)
+    }
+
+    fn mark_reaped(&mut self) {
+        if !self.reaped {
+            self.reaped = true;
+            self.live_workers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn sweep(&mut self) {
+        if self.swept {
+            return;
+        }
+        self.swept = true;
+        self.sweep_state
+            .swept_workers
+            .fetch_add(1, Ordering::SeqCst);
+
+        let mut failed = self.process_tree.terminate(&mut self.child).is_err();
+        if !self.reaped {
+            match wait_for_child_exit_sync(&mut self.child, Duration::from_secs(2)) {
+                Ok(true) => self.mark_reaped(),
+                Ok(false) | Err(_) => failed = true,
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let active_descendants = loop {
+            match self.process_tree.active_process_count(&mut self.child) {
+                Ok(0) => break 0,
+                Ok(count) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    let _ = count;
+                }
+                Ok(count) => break count as usize,
+                Err(_) => {
+                    failed = true;
+                    break 1;
+                }
+            }
+        };
+        if active_descendants != 0 {
+            self.sweep_state
+                .active_descendants
+                .fetch_add(active_descendants, Ordering::SeqCst);
+        }
+        if failed {
+            self.sweep_state
+                .sweep_failures
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for ManagedWorker {
+    fn drop(&mut self) {
+        self.sweep();
+    }
+}
+
+pub(crate) struct UnattendedSmokeRunOutcome {
+    pub receipt: serde_json::Value,
+    pub error: Option<anyhow::Error>,
 }
 
 fn read_http_request(stream: &mut TcpStream) -> anyhow::Result<()> {
@@ -246,17 +420,17 @@ fn spawn_worker(
     phase: u8,
 ) -> anyhow::Result<std::process::Child> {
     let executable = std::env::current_exe()?;
-    Command::new(executable)
-        .no_window()
+    let mut command = Command::new(executable).no_window();
+    command
         .arg("--unattended-long-task-worker")
         .arg(state_dir)
         .arg(base_url)
         .arg(phase.to_string())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("spawn unattended long-task worker")
+        .stderr(Stdio::inherit());
+    crate::util::process_tree::isolate_std_process_tree(&mut command);
+    command.spawn().context("spawn unattended long-task worker")
 }
 
 async fn wait_for_fault_point(
@@ -291,8 +465,6 @@ async fn wait_for_worker(
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             bail!("{phase} worker did not settle within {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -383,19 +555,51 @@ async fn exhaust_claim_into_legacy_incident(
     }
 }
 
-pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
+pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
     let smoke_id = uuid::Uuid::new_v4();
     let root = std::env::temp_dir().join(format!("codefactory-unattended-smoke-{smoke_id}"));
     let project = root.join("project");
-    std::fs::create_dir_all(&root)?;
-    seed_project(&project)?;
-    let fixture = ProviderFixture::start()?;
+    let live_workers = Arc::new(AtomicUsize::new(0));
+    let process_sweep = Arc::new(ProcessSweepState::default());
+    let active_provider_connections = Arc::new(AtomicUsize::new(0));
+    let mut process_observation = ProcessObservation::default();
+    let mut root_created = false;
+    let mut process_tracking_started = false;
 
-    let result = async {
-        let mut phase_one = spawn_worker(&root, &fixture.base_url, 1)?;
-        wait_for_fault_point(&mut phase_one, &fixture, &project.join("artifact.txt")).await?;
-        phase_one.kill().context("hard-kill phase-one worker")?;
-        let killed_status = phase_one.wait().context("reap phase-one worker")?;
+    let result: anyhow::Result<serde_json::Value> = async {
+        std::fs::create_dir_all(&root)?;
+        root_created = true;
+        process_tracking_started = true;
+        seed_project(&project)?;
+        let fixture = ProviderFixture::start(active_provider_connections.clone())?;
+
+        let mut phase_one = ManagedWorker::spawn(
+            &root,
+            &fixture.base_url,
+            1,
+            live_workers.clone(),
+            process_sweep.clone(),
+        )?;
+        let phase_one_pid = phase_one.id();
+        wait_for_fault_point(
+            phase_one.child_mut(),
+            &fixture,
+            &project.join("artifact.txt"),
+        )
+        .await?;
+        phase_one
+            .terminate_tree()
+            .context("hard-kill phase-one worker process tree")?;
+        process_observation.supervisor_hard_kill_issued = true;
+        let killed_status = wait_for_worker(
+            phase_one.child_mut(),
+            "phase-one hard-kill",
+            Duration::from_secs(5),
+        )
+        .await?;
+        phase_one.mark_reaped();
+        process_observation.worker_reaped = true;
+        process_observation.phase_one_exit_was_failure = !killed_status.success();
 
         let db_url = format!("sqlite:{}", root.join("smoke.db").display());
         let before_pool = crate::storage::db::connect(&db_url).await?;
@@ -424,9 +628,17 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             bail!("expected one durable receipt before restart, found {receipt_before}");
         }
 
-        let mut phase_two = spawn_worker(&root, &fixture.base_url, 2)?;
+        let mut phase_two = ManagedWorker::spawn(
+            &root,
+            &fixture.base_url,
+            2,
+            live_workers.clone(),
+            process_sweep.clone(),
+        )?;
+        process_observation.replacement_process_distinct = phase_two.id() != phase_one_pid;
         let phase_two_status =
-            wait_for_worker(&mut phase_two, "phase-two", Duration::from_secs(45)).await?;
+            wait_for_worker(phase_two.child_mut(), "phase-two", Duration::from_secs(45)).await?;
+        phase_two.mark_reaped();
         if !phase_two_status.success() {
             bail!("phase-two worker exited {phase_two_status}");
         }
@@ -459,9 +671,20 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             bail!("phase-two did not leave one bounded legacy incident");
         }
 
-        let mut phase_three = spawn_worker(&root, &fixture.base_url, 3)?;
-        let phase_three_status =
-            wait_for_worker(&mut phase_three, "phase-three", Duration::from_secs(45)).await?;
+        let mut phase_three = ManagedWorker::spawn(
+            &root,
+            &fixture.base_url,
+            3,
+            live_workers.clone(),
+            process_sweep.clone(),
+        )?;
+        let phase_three_status = wait_for_worker(
+            phase_three.child_mut(),
+            "phase-three",
+            Duration::from_secs(45),
+        )
+        .await?;
+        phase_three.mark_reaped();
         if !phase_three_status.success() {
             bail!("phase-three worker exited {phase_three_status}");
         }
@@ -571,8 +794,11 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             "ok": true,
             "scenario_id": "HLT-001",
             "build_git_sha": option_env!("CODEFACTORY_BUILD_GIT_SHA").unwrap_or("unknown"),
-            "process_restart_observed": true,
-            "phase_one_was_hard_killed": !killed_status.success(),
+            "process_restart_observed": process_observation.worker_reaped
+                && process_observation.replacement_process_distinct,
+            "phase_one_was_hard_killed": process_observation.supervisor_hard_kill_issued
+                && process_observation.worker_reaped
+                && process_observation.phase_one_exit_was_failure,
             "legacy_incident_parked": true,
             "incident_reactivated": incident_reactivation.1 == "admitted",
             "incident_reactivation_count": incident_reactivation.2,
@@ -593,17 +819,51 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
     }
     .await;
 
-    drop(fixture);
-    crate::util::fs_cleanup::remove_fixture_dir(&root).await;
-    let cleanup_ok = !root.exists();
-    match result {
-        Ok(mut receipt) if cleanup_ok => {
-            receipt["cleanup_ok"] = serde_json::Value::Bool(true);
-            Ok(receipt)
-        }
-        Ok(_) => bail!("unattended smoke did not clean its isolated state"),
-        Err(error) => Err(error),
+    let cleanup_attempted = root_created;
+    if cleanup_attempted {
+        crate::util::fs_cleanup::remove_fixture_dir(&root).await;
     }
+    let spawned_workers = process_sweep.spawned_workers.load(Ordering::SeqCst);
+    let swept_workers = process_sweep.swept_workers.load(Ordering::SeqCst);
+    let sweep_failures = process_sweep.sweep_failures.load(Ordering::SeqCst);
+    let descendant_process_count = process_sweep.active_descendants.load(Ordering::SeqCst);
+    let orphan_sweep_performed = process_tracking_started
+        && spawned_workers == swept_workers
+        && sweep_failures == 0
+        && descendant_process_count == 0;
+    let fixture_root_leak = match root.try_exists() {
+        Ok(false) if root_created => 0,
+        Ok(false) => 0,
+        Ok(true) | Err(_) => 1,
+    };
+    let leaked_resource_count = descendant_process_count
+        + sweep_failures
+        + live_workers.load(Ordering::SeqCst)
+        + active_provider_connections.load(Ordering::SeqCst)
+        + fixture_root_leak;
+    process_observation.descendant_process_count =
+        descendant_process_count.min(u32::MAX as usize) as u32;
+    let cleanup_observation = CleanupObservation {
+        cleanup_attempted,
+        orphan_sweep_performed,
+        leaked_resource_count: leaked_resource_count.min(u32::MAX as usize) as u32,
+    };
+
+    let (mut legacy_receipt, mut error) = match result {
+        Ok(receipt) => (receipt, None),
+        Err(error) => (e2e001_failure_legacy_receipt(), Some(error)),
+    };
+    if leaked_resource_count != 0 {
+        legacy_receipt["ok"] = serde_json::Value::Bool(false);
+        if error.is_none() {
+            error = Some(anyhow!(
+                "unattended smoke cleanup left {leaked_resource_count} resource(s)"
+            ));
+        }
+    }
+    let receipt =
+        attach_e2e001_case_observation(legacy_receipt, process_observation, cleanup_observation);
+    UnattendedSmokeRunOutcome { receipt, error }
 }
 
 async fn ensure_session(pool: &sqlx::SqlitePool, project: &Path) -> anyhow::Result<()> {
