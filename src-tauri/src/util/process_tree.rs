@@ -327,6 +327,7 @@ pub async fn output_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::no_window::NoWindow;
     use std::io::Write;
     use std::time::Instant;
 
@@ -360,7 +361,7 @@ mod tests {
 
     #[cfg(unix)]
     fn detached_descendant_command(pid_path: &std::path::Path) -> std::process::Command {
-        let mut command = std::process::Command::new("sh");
+        let mut command = std::process::Command::new("sh").no_window();
         command.args([
             "-c",
             &format!(
@@ -379,7 +380,7 @@ mod tests {
              $p = Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru; \
              Set-Content -LiteralPath '{escaped}' -Value $p.Id"
         );
-        let mut command = std::process::Command::new("powershell");
+        let mut command = std::process::Command::new("powershell").no_window();
         command.args(["-NoProfile", "-Command", &script]);
         command
     }
