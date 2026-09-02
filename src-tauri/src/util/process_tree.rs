@@ -12,6 +12,167 @@ pub enum ProcessOutputError {
 }
 
 #[cfg(unix)]
+pub(crate) fn isolate_std_process_tree(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn isolate_std_process_tree(_command: &mut std::process::Command) {}
+
+pub(crate) struct StdProcessTree {
+    #[cfg(unix)]
+    process_group_id: i32,
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(not(any(unix, windows)))]
+    pid: u32,
+}
+
+impl StdProcessTree {
+    #[cfg(unix)]
+    pub(crate) fn attach(child: &std::process::Child) -> std::io::Result<Self> {
+        Ok(Self {
+            process_group_id: child.id() as i32,
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn attach(child: &std::process::Child) -> std::io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const std::ffi::c_void,
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        let assigned = configured != 0
+            && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) } != 0;
+        if !assigned {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(error);
+        }
+        Ok(Self { job })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn attach(child: &std::process::Child) -> std::io::Result<Self> {
+        Ok(Self { pid: child.id() })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn terminate(&self, _child: &mut std::process::Child) -> std::io::Result<()> {
+        let result = unsafe { libc::kill(-self.process_group_id, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn terminate(&self, _child: &mut std::process::Child) -> std::io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if unsafe { TerminateJobObject(self.job, 1) } != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn terminate(&self, child: &mut std::process::Child) -> std::io::Result<()> {
+        child.kill()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn active_process_count(
+        &self,
+        _child: &mut std::process::Child,
+    ) -> std::io::Result<u32> {
+        let result = unsafe { libc::kill(-self.process_group_id, 0) };
+        if result == 0 {
+            return Ok(1);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(0),
+            Some(libc::EPERM) => Ok(1),
+            _ => Err(error),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn active_process_count(
+        &self,
+        _child: &mut std::process::Child,
+    ) -> std::io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.job,
+                JobObjectBasicAccountingInformation,
+                &mut accounting as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of_val(&accounting) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried != 0 {
+            Ok(accounting.ActiveProcesses)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn active_process_count(
+        &self,
+        child: &mut std::process::Child,
+    ) -> std::io::Result<u32> {
+        let _ = self.pid;
+        Ok(u32::from(child.try_wait()?.is_none()))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StdProcessTree {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.job);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn isolate(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
@@ -161,4 +322,107 @@ pub async fn output_with_timeout(
         stdout,
         stderr,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Instant;
+
+    fn wait_for_parent(child: &mut std::process::Child, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if child.try_wait().expect("poll parent").is_some() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "fixture parent did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_pid(path: &std::path::Path, timeout: Duration) -> u32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture descendant pid was not recorded"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn detached_descendant_command(pid_path: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "read gate; sleep 30 >/dev/null 2>&1 & echo $! > '{}'",
+                pid_path.display()
+            ),
+        ]);
+        command
+    }
+
+    #[cfg(windows)]
+    fn detached_descendant_command(pid_path: &std::path::Path) -> std::process::Command {
+        let escaped = pid_path.display().to_string().replace('\'', "''");
+        let script = format!(
+            "$null = [Console]::In.ReadLine(); \
+             $p = Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' -PassThru; \
+             Set-Content -LiteralPath '{escaped}' -Value $p.Id"
+        );
+        let mut command = std::process::Command::new("powershell");
+        command.args(["-NoProfile", "-Command", &script]);
+        command
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn std_process_tree_sweep_reaps_a_detached_descendant() {
+        let fixture = tempfile::tempdir().expect("fixture dir");
+        let pid_path = fixture.path().join("descendant.pid");
+        let mut command = detached_descendant_command(&pid_path);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate_std_process_tree(&mut command);
+        let mut child = command.spawn().expect("spawn fixture parent");
+        let tree = StdProcessTree::attach(&child).expect("attach process tree");
+        child
+            .stdin
+            .take()
+            .expect("fixture start gate")
+            .write_all(b"start\n")
+            .expect("release fixture start gate");
+
+        wait_for_parent(&mut child, Duration::from_secs(5));
+        let descendant_pid = wait_for_pid(&pid_path, Duration::from_secs(5));
+        assert_ne!(descendant_pid, child.id());
+        assert!(
+            tree.active_process_count(&mut child).expect("count tree") > 0,
+            "fixture must leave a live detached descendant before the sweep"
+        );
+
+        tree.terminate(&mut child).expect("terminate process tree");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if tree.active_process_count(&mut child).expect("recount tree") == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detached descendant survived tree sweep"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
