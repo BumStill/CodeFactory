@@ -17,7 +17,7 @@
 - Product type: `Windows AI 编程 Agent 桌面客户端`
 - Primary runtime: `Tauri 2 + Rust + React + TypeScript + Vite`
 - Default working directory: `D:\CodeFactory`
-- 当前状态：Tauri 2 + React + TypeScript 基础聊天和工具调用代码已初始化，发布通道尚未完成。
+- 当前状态：Tauri 2 + React + TypeScript 桌面客户端、受控工具调用、持久恢复、GitHub PR/CI 交付、macOS/Windows 构建、公开发布与自动更新通道均已启用；最新发布状态必须由 public release、更新元数据和 exact executable 共同确认。
 
 ## Surface Map
 | Surface ID | Type | Entry path or URL | Responsible role | External |
@@ -28,7 +28,7 @@
 | openrouter-api | external api | `https://openrouter.ai/api/v1` | provider | yes |
 | sqlite-store | local database | `%APPDATA%\CodeFactory\sessions.db` | system | no |
 | credential-store | OS credential store | Windows Credential Manager | system | no |
-| release-artifact | installer/update | MSI/NSIS/GitHub Actions，计划中 | release | yes |
+| release-artifact | installer/update | NSIS/MSI、DMG/App、GitHub Actions 与 updater metadata | release | yes |
 | governance | local governance | `docs/`、`.codex/governance/`、`tools/governance/` | planning | no |
 
 ## Critical Roles
@@ -58,16 +58,16 @@
 ### Local verification
 - governance baseline: `python tools/governance/validate_repo_governance_baseline.py`
 - governance PowerShell wrapper: `powershell -ExecutionPolicy Bypass -File tools/governance/check_repo_governance.ps1`
-- typecheck: `pnpm typecheck`，脚手架创建后启用
-- lint: `pnpm lint`，脚手架创建后启用
-- build: `pnpm build` + `cargo build`，脚手架创建后启用
-- unit test: `pnpm test` + `cargo test`，脚手架创建后启用
-- integration test: `cargo test --test <name>`，接口稳定后启用
-- browser test: `pnpm exec playwright test`，前端主路径出现后启用
+- typecheck: `pnpm typecheck`
+- lint: `pnpm lint`
+- build: `pnpm build` + `pnpm cargo:shared -- build`
+- unit test: `pnpm test` + `pnpm cargo:shared -- test`
+- integration test: `pnpm cargo:shared -- test --test <name>`
+- browser acceptance: 使用 `package.json` 中已登记的 `test:*:headless` 入口；不得裸启 Playwright daemon
 
 ### Release
-- deploy: `pnpm tauri build` 后通过 GitHub Actions 发布安装包，尚未启用
-- rollback: 回退到上一安装包或自动更新通道上一版本，尚未启用
+- deploy: 由 `auto-release.yml` / `release.yml` 的受治理 `workflow_dispatch` 或 schedule 切版、构建并发布公开资产
+- rollback: 停止/撤销错误更新元数据，安装上一公开安装包；不得覆盖不可变 tag 或已有资产
 
 ## Platform Map
 | Type | Platform | Notes |
@@ -76,21 +76,21 @@
 | runtime | Tauri 2 / WebView2 | Windows 原生桌面壳 |
 | frontend | React + TypeScript + Vite | 主聊天、权限弹窗、diff、终端 |
 | backend | Rust async runtime | OpenRouter、工具、SQLite、权限、审计 |
-| deploy | GitHub Actions + Windows installer | 计划 MSI/NSIS 和签名 |
+| deploy | GitHub Actions + Windows/macOS installer | 公开资产、签名/校验和与 updater metadata 已启用 |
 | storage | SQLite + Windows Credential Manager | 会话落 SQLite，API Key 落凭据管理器 |
 
 ## Environment and Service Map
 | Environment | Service name or ID | Domain or address | Notes |
 | --- | --- | --- | --- |
-| local-dev | CodeFactory desktop | `D:\CodeFactory` | 当前仅治理基线 |
-| production | CodeFactory installer | 未启用：产品脚手架和发布通道尚未创建 | 发布规格落地后补充真实地址或安装包通道 |
+| local-dev | CodeFactory desktop | 用户 checkout + `CodeFactoryDev.app` wrapper | 真实主路径通过隔离 app data、worktree 指针和 build identity 取证 |
+| production | CodeFactory installer | GitHub public release + updater `latest.json` | 版本、tag SHA、资产 digest、签名和安装后 executable identity 必须同批次对账 |
 | external | OpenRouter | `https://openrouter.ai/api/v1` | 模型路由、SSE、tool_calls、usage |
 
 ## Release Verification Map
 | Field | Value | Notes |
 | --- | --- | --- |
-| HealthPath | 未启用：当前用安装后启动 smoke 作为桌面健康证据 | 桌面应用可用等价物：启动、主窗口、配置读取、模型列表或本地健康命令 |
-| BuildInfoPath | 未启用：发布实现前必须加入版本/build 信息展示或命令 | 安装包版本、commit SHA、构建时间、签名状态 |
+| HealthPath | exact executable 的已登记 smoke + 主窗口/Primary User Path | 不把进程存在或 HTTP 200 单独当成健康证据 |
+| BuildInfoPath | public release/tag、`latest.json`、安装包 manifest 与运行中 executable metadata | 版本、commit SHA、资产 digest、签名状态必须一致 |
 | WarnAfterMinutes | 8 | deployment latency warning threshold |
 | FailAfterMinutes | 20 | deployment latency blocking threshold |
 | PrimarySmokePath | P1 | 安装后跑通 AI 编程主路径的 smoke |

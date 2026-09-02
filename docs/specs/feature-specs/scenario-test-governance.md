@@ -46,6 +46,11 @@ CodeFactory 现有测试数量很多，但场景分散在 Rust 测试、Vitest�
 | CF-STG-R24 | 纯版本 bump 只有在四个 manifest 的字段级 diff 同时证明为同一旧版本到同一新版本、且无其他字段变化时才不产生 PR 场景影响；依赖、脚本、Cargo 或 Tauri 配置的其他变化仍按全局产品变更 fail closed | `scenario_impact_files` + version manifest negative fixtures |
 | CF-STG-R25 | Release 门禁以「上一已发布 tag 到候选 tag」的产品差异计算影响集，只要求受影响场景具有绑定到 release workflow 的 exact-artifact target；无关目录债务不得冻结发布，缺基线、未映射产品文件或受影响 target 未绑定时 fail closed | `scenario-gate-release --base-ref` + `validate_impacted_execution(stage=release_artifact)` |
 | CF-STG-R26 | PR 的受影响 Scenario 与 Complex E2E 必须由 trusted base policy 生成 exact target plan；只有计划非空时才启动对应 Windows/macOS runner，最终回执必须逐项匹配 base SHA、head SHA、target ID 与 `passed` outcome | `scenario-execution.yml` + `scenario_execution.py` |
+| CF-STG-R27 | 人读文档中的 Scenario 数量、分类、Complex E2E 状态和缺口必须由 registry 派生，禁止维护第二套手工统计 | `scenario_catalog_docs.py` + governance rules check |
+| CF-STG-R28 | 所有复杂 E2E 的 UI、持久状态、进程、副作用和交付 oracle 必须绑定到同一个可校验 case receipt | M1 receipt schema + receipt validator |
+| CF-STG-R29 | 桌面、SQLite/WAL、Git/worktree、provider、fake forge、浏览器和安装包 fixture 必须共享隔离的 Scenario World，并在成功、失败、取消、超时后可证明完成清理 | M1 fixture contract + cleanup receipt |
+| CF-STG-R30 | PR、nightly、release 必须按阶段声明 required/not-required oracle；低层 PR slice 不得伪装成 L3/L4 完整场景 | stage-aware oracle policy |
+| CF-STG-R31 | trusted plan 必须绑定真实执行的 scenario driver、oracle verifier 和 fixture manifest 摘要；候选分支不得把 target 实现改成空跑后自报 `passed` | trusted implementation digest + external governance bootstrap |
 
 ## Primary User Path
 
@@ -89,17 +94,27 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 
 ## 分类
 
-| 分类 | 当前数量 | 代表风险 |
-| --- | ---: | --- |
-| 长任务连续性与恢复 | 5 | 中断、恢复预算、历史续接、持久停止、恢复交还 |
-| 对话协作与交付 | 2 | 增量约束、完成证据 |
-| 工作区与会话体验 | 7 | 启动、导航、恢复日志、断线、浏览器连接投影 |
-| 内容输入与呈现 | 2 | 图片、流式 Markdown |
-| 权限与安全 | 1 | 权限模式与可见状态 |
-| 能力演进与用量 | 2 | Evolution、token/cost |
-| 运行时资源生命周期 | 3 | 浏览器进程/租约回收、扩展健康、attached session 续接 |
+<!-- scenario-registry-summary:start -->
+- 逻辑 Scenario：`27`（P0 `14`，P1 `13`，P2 `0`）
+- Complex E2E：`11`（implemented `0`，partially_implemented `10`，designed `1`）
+- 剩余自动化缺口：`26`
+- PR slice：implemented `10`，partially_implemented `0`，missing `1`
+<!-- scenario-registry-summary:end -->
 
-当前统一注册表共有 26 个逻辑 Scenario、11 个 Complex E2E。任何新增主路径能力必须在合并实现前新增或扩展一个 Scenario。
+<!-- scenario-registry-categories:start -->
+| 分类 | 总数 | P0 | P1 | P2 |
+| --- | ---: | ---: | ---: | ---: |
+| 长任务连续性与恢复 (`long_task_continuity`) | 5 | 5 | 0 | 0 |
+| 对话协作与交付 (`conversation_delivery`) | 2 | 1 | 1 | 0 |
+| 工作区与会话体验 (`workspace_session`) | 8 | 1 | 7 | 0 |
+| 内容输入与呈现 (`content_rendering`) | 2 | 0 | 2 | 0 |
+| 权限与安全 (`permission_safety`) | 1 | 0 | 1 | 0 |
+| 能力演进与用量 (`capability_usage`) | 2 | 0 | 2 | 0 |
+| 运行时资源生命周期 (`runtime_lifecycle`) | 4 | 4 | 0 | 0 |
+| Skill 安装、审核与运行生命周期 (`skill_lifecycle`) | 3 | 3 | 0 | 0 |
+<!-- scenario-registry-categories:end -->
+
+任何新增主路径能力必须在合并实现前新增或扩展一个 Scenario。上面两个受管区块由 `scenario-registry.json` 派生；修改 registry 后若未同步，governance required check 必须失败。
 
 ## 证据等级
 
@@ -133,16 +148,21 @@ Scenario-Test: HLT-003, HLT-004
 
 ## 复杂真实 E2E 组合
 
-| Case | 场景 | 主要故障注入 | 最低阻断层 |
-| --- | --- | --- | --- |
-| E2E-001 | 用户离开后长任务自动完成 | hard kill、provider transient、重复 claim | PR L2 + release L4 |
-| E2E-002 | 历史 session 简短继续 | 旧 schema、分页、无内存控制、无 listener | nightly L3 + release L4 |
-| E2E-003 | 停止后永不复活 | cancel/claim race、部分投影失败、两次重启 | nightly L3 + release L4 |
-| E2E-004 | 增量约束贯穿交付 | 测试失败、CI transient、dirty worktree | nightly L2/L3 |
-| E2E-005 | 浏览器失败回收并继续 | 零退出逻辑失败、子进程残留 | PR L2 + release L4 |
-| E2E-006 | 卡住历史任务下完成升级 | 旧进程锁、WAL、安装中断、首次 reconciliation | release L4 |
-| E2E-007 | 恢复耗尽后一致交还 | 计划拒绝、旧 streaming、unknown receipt、两次重启 | PR L1/L2 + release L4 |
-| E2E-008 | 扩展空闲/瞬断/多连接后同一会话续接 | MV3 idle、旧连接迟到关闭、socket drop、App restart | PR L1 + nightly L2 + release L4 |
+<!-- scenario-registry-cases:start -->
+| Case | 名称 | 优先级 | 总体状态 | 剩余缺口 | PR slice | PR 缺口 |
+| --- | --- | --- | --- | ---: | --- | ---: |
+| E2E-001 | 用户离开后长任务跨进程自动完成 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
+| E2E-002 | 历史 session 简短继续精确续接 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
+| E2E-003 | 显式停止清除整个 session 并跨重启保持 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
+| E2E-004 | 长任务中追加约束并完成完整交付链 | P1 | `designed` | 3 | `missing` | 0 |
+| E2E-005 | 浏览器逻辑失败后回收并可继续任务 | P0 | `partially_implemented` | 1 | `implemented` | 0 |
+| E2E-006 | 历史卡住任务存在时仍可完成应用更新 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
+| E2E-007 | 计划拒绝与只读误判后恢复耗尽一致收敛 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
+| E2E-008 | 浏览器扩展空闲、瞬断与多连接交错后同一会话自动续接 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
+| E2E-009 | dirty 旧分支根目录上的新代码任务全程隔离并安全交付 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
+| E2E-010 | 同机 Skill 命令失败后自主诊断、修正并完成 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
+| E2E-011 | DeliveryRun 本地提交掉线续接与外来身份有界停泊 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
+<!-- scenario-registry-cases:end -->
 
 完整 step、fixture 和 oracle 以机器注册表为准。
 
@@ -171,6 +191,67 @@ Scenario-Test: HLT-003, HLT-004
 - delivery oracle：测试、CI、artifact、build SHA 和真实功能验证达到约定边界。
 
 五类 oracle 必须指向同一 `run receipt`，防止拿 A 进程的 UI 截图配 B 数据库的状态。
+
+## 补全架构决策
+
+### 决策
+
+在现有 `scenario_execution.py`、registry 和 exact-head aggregate receipt 上扩展 case receipt，不新建第二套 runner。fixture 采用可组合 capability；第一条纵向切片选择已有跨进程证据最完整的 E2E-001。桌面驱动先做独立 feasibility probe，再根据真实 Tauri 点击、输入、重启、截图和清理结果决定 PR L3 与 release L4 的具体实现，不在规格阶段锁死单一框架。
+
+case receipt schema v2 至少包含：
+
+- `case_id`、完整 `scenario_ids`、`stage`、`base_sha`、`head_sha` 和 canonical target；
+- build identity、fixture schema/digest、runner OS/arch；
+- `ui`、`durable_state`、`process`、`side_effects`、`delivery` 五类 oracle，每类显式为 `passed`、`failed` 或 `not_required_for_stage`；
+- cleanup status、泄漏资源数和失败时仍保留的诊断摘要；
+- release 阶段额外绑定版本、tag SHA、artifact digest 与运行中 executable build SHA。
+
+target 到 case、阶段必需 oracle、driver/verifier/fixture digest 均由 trusted base policy 给出；candidate runner 只能返回观测值，不能自行声明应该执行哪个 case，也不能仅靠候选分支提供的 `passed` 字段成为绿色。
+
+### Fixture capability
+
+Scenario World 由以下能力按需组合，而不是一次性构建巨型 fixture：
+
+- `isolated_app_data`：独立 HOME/app data、app identifier 和清理 owner marker；
+- `sqlite_fixture`：真实 SQLite/WAL、当前 schema 与版本化旧 schema；
+- `git_fixture`：合成 root、bare remote、dirty checkout、worktree 和明确 verifier；
+- `scripted_provider`：可重复的 stream/tool/failure/checkpoint 序列；
+- `fake_forge`：通过现有 `DeliveryRemote` 边界模拟 PR、CI、merge 与 artifact receipt；
+- `managed_browser`：唯一 session/lease，真实 MV3 生命周期及进程树回收；
+- `previous_release`：上一公开版本、候选 exact artifact 与升级/回滚身份。
+
+临时绝对路径只用于运行时，不进入可提交 receipt。manifest 只记录 synthetic seed、schema version、启用能力和规范化 digest。正常退出由 RAII 清理，hard kill 由父 supervisor 根据 owner marker 执行 orphan sweep；两条路径均须有自动化。
+
+### 方案取舍
+
+| 方案 | 结论 | 原因 |
+| --- | --- | --- |
+| 扩展现有 runner/receipt | 采用 | 保持单一 Harness、复用 exact-head 与 target plan，迁移面最小 |
+| 新建独立 E2E 平台 | 拒绝 | 会制造第二套场景计数、门禁和证据语义 |
+| M1 一次性实现所有 fixture | 拒绝 | 无法形成可审查纵向证据，失败定位和清理风险过大 |
+| 先固定 WDIO 为唯一桌面驱动 | 暂缓 | 先用 feasibility probe 验证真实窗口生命周期，再决定 PR/release 分工 |
+| 仅相信 candidate target outcome | 拒绝 | 无法防止候选把测试体或委托脚本改成空跑 |
+
+### 信任根迁移
+
+普通 PR 只落不改变 judge 的规格、可组合 fixture/receipt 实现与失败优先测试。M0 的 candidate-side catalog check 只提供早反馈，进入 trusted validator 仍需要 Bootstrap-1。
+
+至少安排两次最小 external governance bootstrap：Bootstrap-1 建立可信 catalog、case planner/executor/verifier、canonical driver/fixture/oracle digest，并在真实证据满足后补齐 E2E-004 的 PR slice；Bootstrap-2 在全部场景族补齐后提升最终 registry 状态、nightly/release exact-artifact 绑定和 delegated-script trust closure。每次都必须外部审查完整 diff、只临时解除必要门禁、合入默认分支、立即恢复 strict/active/no-bypass ruleset 并用 canary PR 重跑 required checks。任何门禁绕过都需要用户明确审批，不能由候选 PR 自证或静默降级。
+
+## 补全里程碑
+
+| 里程碑 | 范围 | 退出条件 |
+| --- | --- | --- |
+| M0 文档单源化 | registry 派生摘要、分类与 case 表；修正 repo profile 历史状态 | 旧文档先被失败测试抓住；catalog、governance、baseline checks 全绿 |
+| M1 receipt/fixture 纵向切片 + Bootstrap-1 | schema v2、stage oracle、隐私/cleanup、E2E-001；桌面 feasibility probe；基础信任合同 | trusted plan 与 case receipt 可双向核验；canonical driver/oracle/fixture digest 受保护；低层证据不冒充 L3/L4 |
+| M2 会话与恢复桌面族 | E2E-001/002/003/007/011 的真实 WebView、旧 schema、停止/恢复 UI | 该族 remaining gaps 清零且 L3/L4 receipt 绑定 exact identity |
+| M3 Skill 生命周期 | E2E-010 hard-kill nightly、isolated desktop required canary、installed release canary | PR slice 和完整 case 均为 `implemented` |
+| M4 交付与工作区 | E2E-004/009 fake forge、CAS hard kill、并发 worktree/桌面会话 | PR→CI→merge→artifact 全链幂等且 root checkout 不受损 |
+| M5 浏览器生命周期 | E2E-005/008 failure matrix、MV3 lifecycle、真实 Dev/release 扩展升级 | session/lease/进程树无泄漏，瞬断只读调用恰好一次 |
+| M6 更新链 | E2E-006 Windows N→N+1、旧锁/WAL/首次 reconciliation、桌面投影 | previous/candidate/executable 身份一致，升级失败可回滚 |
+| M7 Bootstrap-2 与最终验收 | 最终 registry/targets、nightly/release trust closure、ruleset 对账、11 case probes | 11/11 `implemented`、26→0 gaps、PR slice 11/11、readiness 零错误 |
+
+每个里程碑独立 PR，除 M1/M7 明确的 Bootstrap-1/2 外，不把产品实现和 judge 变更混在同一候选分支。任何 case 只有在本阶段 required oracle、cleanup 和 identity 全部通过时才允许提升状态。
 
 ## 历史场景提取
 
