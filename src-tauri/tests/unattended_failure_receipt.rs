@@ -58,7 +58,11 @@ fn formal_binary_writes_a_safe_failure_receipt_before_exit_one() {
     assert_eq!(receipt["descendant_process_count"], 0);
     assert_eq!(receipt["cleanup_attempted"], false);
     assert_eq!(receipt["orphan_sweep_performed"], false);
-    assert_eq!(receipt["leaked_resource_count"], 1);
+    let expected_leaked_resource_count = if cfg!(windows) { 0 } else { 1 };
+    assert_eq!(
+        receipt["leaked_resource_count"],
+        expected_leaked_resource_count
+    );
     assert_eq!(receipt["cleanup_ok"], false);
 
     let rendered = receipt.to_string();

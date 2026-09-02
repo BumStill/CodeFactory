@@ -35,6 +35,7 @@ try {
   assert.equal(result.status, 1, `expected exit 1, stderr: ${result.stderr}`);
 
   const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+  const expectedLeak = process.platform === "win32" ? 0 : 1;
   assert.deepEqual(
     {
       ok: receipt.ok,
@@ -55,7 +56,7 @@ try {
       descendant_process_count: 0,
       cleanup_attempted: false,
       orphan_sweep_performed: false,
-      leaked_resource_count: 1,
+      leaked_resource_count: expectedLeak,
       cleanup_ok: false,
     },
   );

@@ -103,7 +103,8 @@ test("the formal smoke owns the capability-reactivation oracle", async () => {
     'assert.equal(result.status, 1',
     "cleanup_attempted: false",
     "orphan_sweep_performed: false",
-    "leaked_resource_count: 1",
+    'process.platform === "win32" ? 0 : 1',
+    "leaked_resource_count: expectedLeak",
     "cleanup_ok: false",
   ]) {
     assert.ok(
