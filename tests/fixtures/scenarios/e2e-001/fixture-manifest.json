@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "synthetic": true,
+  "source_kind": "synthetic_fixture",
+  "seed": "e2e-001-v1",
+  "capabilities": [
+    {"id": "isolated_app_data", "schema_version": 1},
+    {"id": "sqlite_fixture", "schema_version": 1},
+    {"id": "git_fixture", "schema_version": 1},
+    {"id": "scripted_provider", "schema_version": 1}
+  ]
+}
