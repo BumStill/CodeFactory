@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: M0 文档单源化与实施方案物化
-- Current checkpoint: 最新 `origin/main` 的 registry 有 27 个 Scenario、11 个 Complex E2E、26 个 remaining gaps；10 个 case 为 `partially_implemented`、1 个为 `designed`，完整 `implemented` 为 0；PR slice 为 10 implemented、0 partial、1 missing。
-- Next owner: 主实现完成 M0 红转绿和第一批 PR；独立 QA 复核 receipt/fixture contract；后续 M1 以 E2E-001 做纵向切片。
+- Current phase: M1a case receipt v2 与 synthetic fixture manifest 基础合同
+- Current checkpoint: M0 已由 PR #502 合入 `main`；M1a 正在普通 PR 中落地不参与 required judge 的 receipt verifier、stage-aware oracle、隐私/cleanup fail-closed 合同和 E2E-001 synthetic fixture。registry 仍保持 27 个 Scenario、11 个 Complex E2E、26 个 remaining gaps，不提升状态。
+- Next owner: 主实现完成 M1a 普通 PR；随后以独立普通 PR 让 E2E-001 binary 输出结构化 raw observation；取得用户明确批准后再执行 Bootstrap-1，把既有 foundation 纳入 trusted plan/executor/verifier。
 - Updated at: 2026-09-02
 
 ## Completed Items
@@ -26,11 +26,14 @@
 - 已确认文档漂移：README 仍写 19/7，规格同时出现 26/27，repo profile 仍称发布未启用。
 - 已制定 M0-M7 顺序、可组合 Scenario World、case receipt schema v2、stage-aware oracle 和 trust-root bootstrap 边界。
 - M0 已先加入失败优先文档契约；旧文档稳定产生 4 个缺 marker/过期错误，证明红灯有效。
+- M0 已通过 PR #502 合入 `main`：registry 派生摘要、分类和 case 表现在由 candidate-side governance check 阻断漂移。
+- M1a 已先加入失败优先测试：在实现模块不存在时稳定因 `ModuleNotFoundError` 失败；独立评审给出的伪绿反例已继续扩成 28 项 receipt/fixture 合同测试。
 
 ## Remaining Items
 
-- M0：补齐 registry 派生块、修正文档历史状态，完成 catalog/governance/baseline 全量验证和 PR。
-- M1：扩展现有 execution receipt，以 E2E-001 建立 case receipt、fixture digest、五类 stage-aware oracle、隐私扫描、失败 receipt 留存和 hard-kill cleanup；完成桌面驱动 feasibility probe；随后通过 Bootstrap-1 把 planner/executor/verifier、canonical driver/fixture/oracle digest 接入可信门禁，并在证据满足后补齐 E2E-004 PR slice。
+- M1a：以普通 PR 合入独立的 case receipt v2 verifier、fixture manifest digest、五类 stage-aware oracle、递归隐私扫描、失败 receipt 留存和 E2E-001 synthetic fixture；该实现暂不参与 required judge。
+- M1b：以普通 PR 让 E2E-001 正式 binary 输出结构化 raw observation，同时保留 execution receipt v1 和 legacy smoke 字段；修复失败路径 cleanup 证据、hard-kill supervisor marker 与 target receipt 临时目录回收。
+- Bootstrap-1：取得用户明确审批后，把已在 `main` 的 planner/executor/verifier、canonical driver/fixture/oracle digest 接入可信门禁，并在证据满足后补齐 E2E-004 PR slice。
 - M2：补 E2E-001/002/003/007/011 的真实 WebView、旧 schema、停止/恢复/停泊 UI 和 exact release canary。
 - M3：补 E2E-010 的二进制 hard-kill nightly、isolated CodeFactoryDev required canary 与安装版单消息 canary。
 - M4：补 E2E-004/009 的 fake forge、完整交付链、worktree reservation CAS hard kill 和双会话并发。
@@ -40,13 +43,13 @@
 
 ## Blockers
 
-- M0 当前无实现 blocker。
+- M1a 当前无实现 blocker。
 - 两次 external governance bootstrap 都涉及临时控制门禁，执行前必须取得用户明确审批；普通候选 PR 不能修改 trust root 后使用自己的 judge 自证。
 - 当前 trust root 保护 target 名称与执行工作流，但尚未完整保护候选分支中的 delegated script、scenario driver 和 oracle verifier；M1/M7 必须闭合这个空跑风险，未闭合前不能把 exact-head outcome 称为可信完整 E2E。
 
 ## Evidence
 
-- Local evidence: 任务开始基线 `origin/main=088847de56a05174e5189abddda94b071ebca60e`；合并 #500/#501 后刷新到 `ab24bc1b`，registry 为 27 Scenario、11 Complex E2E、26 gaps，catalog checker 立即拒绝三处旧派生块；最初 failure-first 运行因 4 个受管块缺失而失败。
+- Local evidence: 任务开始基线 `origin/main=088847de56a05174e5189abddda94b071ebca60e`；M0 合入后 `main=778990c18ae1200c45d9acb304d86e406a164922`。M1a failure-first 运行因缺少 `tools.governance.scenario_case_receipt` 失败；独立 QA/治理评审随后实证发现 stage 降级、runner/fixture 未绑定、oracle observation/reason 未精确绑定、常见凭据形状与隐私自由文本、弱 hard-kill 与 release identity 伪绿，修复后 28 项合同测试覆盖这些反例。`evidence_sha256` 在 M1a 只是不透明证据投影的完整性字段：公开 `run_id` 自哈希不能证明候选证据真实性；只有 Bootstrap-1 由默认分支 trusted builder 从原始执行证据复算并绑定后，才可作为可信 gate 证据。
 - Release evidence: 最近公开 release 与 nightly 证明现有局部 target 可运行，但不等于 11 个完整 case 已实现；每个后续版本仍须记录 tag、asset digest、installed executable 和真实主路径。
 - Blocking evidence: 11 个完整 case 仍无一为 `implemented`；E2E-004 仍无 PR slice。pull request 与 release readiness 的准确错误数以最新 registry 命令输出为准，不复用任务开始时的旧统计。
 
@@ -55,7 +58,7 @@
 - context scope: registry、scenario validator/runner、PR/nightly/release workflow、现有 smoke、桌面验证脚本和公开交付证据；不读取生产聊天正文、真实 session/objective ID 或凭据。
 - assumptions: 沿用同一 Harness；低层 slice 不等于完整 case；fixture 只用 synthetic data；候选自报 outcome 不构成可信 oracle。
 - review point: QA 复核 M0/M1 contract；桌面技术评审决定 feasibility probe；治理评审划分普通 PR 与 external bootstrap，并审计 target implementation digest。
-- validation result: 计划已物化；M0 正在红转绿。后续里程碑只有在相应命令、CI、artifact 与真实主路径证据落档后才能标记完成。
+- validation result: 计划已物化，M0 已合并，M1a 本地合同红转绿；foundation 尚未接入 trusted required gate，registry 状态和 L3/L4 缺口保持不变。
 
 ## Stop Boundary
 
