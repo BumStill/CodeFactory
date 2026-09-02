@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import os
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from tools.governance import scenario_execution
 
 from tools.governance.run_scenario_harness_gate import (
     TRUST_ROOT_FILES,
+    validate_release_tree_provenance,
     validate_trust_root_immutability,
 )
 from tools.governance.scenario_execution import (
@@ -1057,3 +1059,64 @@ class AffectedScenarioExecutionTests(unittest.TestCase):
             [],
         )
         self.assertIn("/actions/runs/2/artifacts", github_json.call_args_list[1].args[0])
+
+
+class ReleaseProvenanceTests(unittest.TestCase):
+    """A release candidate proves it came through main, not that main froze."""
+
+    def _repo(self, root: Path) -> None:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        def git(*args: str) -> None:
+            subprocess.run(["git", "-C", str(root), *args], check=True,
+                           capture_output=True, env=env)
+        git("init", "-q", "-b", "main")
+        (root / "f").write_text("1\n", encoding="utf-8")
+        git("add", "-A"); git("commit", "-qm", "one")
+        (root / "f").write_text("2\n", encoding="utf-8")
+        git("add", "-A"); git("commit", "-qm", "two")
+
+    def _at(self, root: Path, rev: str) -> Path:
+        target = root.parent / f"wt-{rev}"
+        subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "--detach",
+                        str(target), rev], check=True, capture_output=True)
+        return target
+
+    def test_a_tag_that_main_has_moved_past_still_releases(self) -> None:
+        # The exact case that killed v1.81.36 and v1.81.37: main advanced past
+        # the tag, so the trust root differs — but the tree did pass the PR gate.
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "repo"
+            root.mkdir()
+            self._repo(root)
+            candidate = self._at(root, "HEAD~1")
+            policy = self._at(root, "HEAD")
+            self.assertEqual(validate_release_tree_provenance(candidate, policy), [])
+
+    def test_a_tree_that_never_reached_main_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "repo"
+            root.mkdir()
+            self._repo(root)
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+            subprocess.run(["git", "-C", str(root), "checkout", "-q", "-b", "side"],
+                           check=True, capture_output=True, env=env)
+            (root / "f").write_text("side\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "commit", "-qam", "side"],
+                           check=True, capture_output=True, env=env)
+            candidate = self._at(root, "side")
+            policy = self._at(root, "main")
+            errors = validate_release_tree_provenance(candidate, policy)
+            self.assertTrue(
+                any("never passed the pull_request gate" in e for e in errors), errors
+            )
+
+    def test_an_unanswerable_repository_fails_closed(self) -> None:
+        # "I could not check" must never read as "the tree is fine".
+        with tempfile.TemporaryDirectory() as raw:
+            candidate = Path(raw) / "not-a-repo"
+            policy = Path(raw) / "also-not"
+            candidate.mkdir(); policy.mkdir()
+            errors = validate_release_tree_provenance(candidate, policy)
+            self.assertTrue(any("failed closed" in e for e in errors), errors)
