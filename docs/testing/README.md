@@ -7,8 +7,8 @@
 <!-- scenario-registry-summary:start -->
 - 逻辑 Scenario：`27`（P0 `14`，P1 `13`，P2 `0`）
 - Complex E2E：`11`（implemented `0`，partially_implemented `10`，designed `1`）
-- 剩余自动化缺口：`25`
-- PR slice：implemented `9`，partially_implemented `1`，missing `1`
+- 剩余自动化缺口：`26`
+- PR slice：implemented `10`，partially_implemented `0`，missing `1`
 <!-- scenario-registry-summary:end -->
 
 以上区块由 `scenario-registry.json` 派生并由 CI 校验，不手工估算。PR、nightly、release 对同一场景的重复执行只算不同证据层，不重复计数。`implemented 0` 的含义是 11 个复杂旅程目前都还没有同时清零 PR、nightly、真实桌面和 exact release 证据；现有局部测试仍是有效证据，但不能被包装成整条旅程已完成。

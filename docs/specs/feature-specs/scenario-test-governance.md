@@ -97,8 +97,8 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 <!-- scenario-registry-summary:start -->
 - 逻辑 Scenario：`27`（P0 `14`，P1 `13`，P2 `0`）
 - Complex E2E：`11`（implemented `0`，partially_implemented `10`，designed `1`）
-- 剩余自动化缺口：`25`
-- PR slice：implemented `9`，partially_implemented `1`，missing `1`
+- 剩余自动化缺口：`26`
+- PR slice：implemented `10`，partially_implemented `0`，missing `1`
 <!-- scenario-registry-summary:end -->
 
 <!-- scenario-registry-categories:start -->
@@ -160,7 +160,7 @@ Scenario-Test: HLT-003, HLT-004
 | E2E-007 | 计划拒绝与只读误判后恢复耗尽一致收敛 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
 | E2E-008 | 浏览器扩展空闲、瞬断与多连接交错后同一会话自动续接 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-009 | dirty 旧分支根目录上的新代码任务全程隔离并安全交付 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
-| E2E-010 | 同机 Skill 命令失败后自主诊断、修正并完成 | P0 | `partially_implemented` | 2 | `partially_implemented` | 1 |
+| E2E-010 | 同机 Skill 命令失败后自主诊断、修正并完成 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-011 | DeliveryRun 本地提交掉线续接与外来身份有界停泊 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
 <!-- scenario-registry-cases:end -->
 
@@ -236,7 +236,7 @@ Scenario World 由以下能力按需组合，而不是一次性构建巨型 fixt
 
 普通 PR 只落不改变 judge 的规格、可组合 fixture/receipt 实现与失败优先测试。M0 的 candidate-side catalog check 只提供早反馈，进入 trusted validator 仍需要 Bootstrap-1。
 
-至少安排两次最小 external governance bootstrap：Bootstrap-1 建立可信 catalog、case planner/executor/verifier、canonical driver/fixture/oracle digest，并在真实证据满足后解锁 E2E-004/E2E-010 的 PR slice；Bootstrap-2 在全部场景族补齐后提升最终 registry 状态、nightly/release exact-artifact 绑定和 delegated-script trust closure。每次都必须外部审查完整 diff、只临时解除必要门禁、合入默认分支、立即恢复 strict/active/no-bypass ruleset 并用 canary PR 重跑 required checks。任何门禁绕过都需要用户明确审批，不能由候选 PR 自证或静默降级。
+至少安排两次最小 external governance bootstrap：Bootstrap-1 建立可信 catalog、case planner/executor/verifier、canonical driver/fixture/oracle digest，并在真实证据满足后补齐 E2E-004 的 PR slice；Bootstrap-2 在全部场景族补齐后提升最终 registry 状态、nightly/release exact-artifact 绑定和 delegated-script trust closure。每次都必须外部审查完整 diff、只临时解除必要门禁、合入默认分支、立即恢复 strict/active/no-bypass ruleset 并用 canary PR 重跑 required checks。任何门禁绕过都需要用户明确审批，不能由候选 PR 自证或静默降级。
 
 ## 补全里程碑
 
@@ -249,7 +249,7 @@ Scenario World 由以下能力按需组合，而不是一次性构建巨型 fixt
 | M4 交付与工作区 | E2E-004/009 fake forge、CAS hard kill、并发 worktree/桌面会话 | PR→CI→merge→artifact 全链幂等且 root checkout 不受损 |
 | M5 浏览器生命周期 | E2E-005/008 failure matrix、MV3 lifecycle、真实 Dev/release 扩展升级 | session/lease/进程树无泄漏，瞬断只读调用恰好一次 |
 | M6 更新链 | E2E-006 Windows N→N+1、旧锁/WAL/首次 reconciliation、桌面投影 | previous/candidate/executable 身份一致，升级失败可回滚 |
-| M7 Bootstrap-2 与最终验收 | 最终 registry/targets、nightly/release trust closure、ruleset 对账、11 case probes | 11/11 `implemented`、25→0 gaps、PR slice 11/11、readiness 零错误 |
+| M7 Bootstrap-2 与最终验收 | 最终 registry/targets、nightly/release trust closure、ruleset 对账、11 case probes | 11/11 `implemented`、26→0 gaps、PR slice 11/11、readiness 零错误 |
 
 每个里程碑独立 PR，除 M1/M7 明确的 Bootstrap-1/2 外，不把产品实现和 judge 变更混在同一候选分支。任何 case 只有在本阶段 required oracle、cleanup 和 identity 全部通过时才允许提升状态。
 
