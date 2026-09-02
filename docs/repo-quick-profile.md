@@ -3,7 +3,7 @@
 ## Task Entry
 - Repository: `CodeFactory`
 - 产品类型：Windows AI 编程 Agent 桌面客户端。
-- 当前已验证公开版本：`v1.76.2`。一级「进化审查」、人工裁决和持久作业日志已存在；输入控件对齐与会话侧栏归属修正已经过本地真实 App、远程 GUI、公开 macOS DMG 和版本元数据验收。
+- 当前状态：公开发布、自动更新、macOS/Windows 构建与安装包验收通道均已启用。当前版本与 build identity 必须从公开 release、`latest.json` 和正在运行的可执行文件现场读取；本治理简介不固定一个会随发版过期的版本号。
 - 日常任务先加载本文件、任务说明和 quick gate 结果。
 - quick gate 标记 release、compatibility、observation、payload、viewport 或 governance-change 时，再加载 `docs/repo-governance-profile.md`。
 

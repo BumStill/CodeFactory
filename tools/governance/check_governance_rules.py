@@ -33,10 +33,12 @@ try:
     from tools.governance.validate_objective_non_interruption_contract import (
         validate_changed_paths as validate_objective_non_interruption_changes,
     )
+    from tools.governance.scenario_catalog_docs import validate_catalog_docs
 except ModuleNotFoundError:  # direct `python tools/governance/...` execution
     from validate_objective_non_interruption_contract import (  # type: ignore[no-redef]
         validate_changed_paths as validate_objective_non_interruption_changes,
     )
+    from scenario_catalog_docs import validate_catalog_docs  # type: ignore[no-redef]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RULES_PATH = REPO_ROOT / "docs" / "governance" / "rules.yml"
@@ -239,6 +241,20 @@ def check_objective_non_interruption_contract(level: str) -> list[dict]:
     return []
 
 
+def check_scenario_catalog_docs(level: str) -> list[dict]:
+    """Keep human-facing scenario counts and case rows derived from the registry."""
+
+    errors = validate_catalog_docs(REPO_ROOT)
+    if not errors:
+        print("::notice::scenario-catalog-docs: registry-derived blocks are current")
+        return []
+    if level == "error":
+        return [blocker(error) for error in errors]
+    for error in errors:
+        annotate_warning(error)
+    return []
+
+
 def main() -> int:
     failures: list[dict] = []
 
@@ -286,6 +302,8 @@ def main() -> int:
             failures.extend(check_evidence_pack_retention(rule.get("level", "warn")))
         if enf == "check" and rid == "objective-non-interruption-contract":
             failures.extend(check_objective_non_interruption_contract(rule.get("level", "error")))
+        if enf == "check" and rid == "scenario-test-governance":
+            failures.extend(check_scenario_catalog_docs(rule.get("level", "error")))
 
     if failures:
         print(f"governance-rules: {len(failures)} blocker(s)")
