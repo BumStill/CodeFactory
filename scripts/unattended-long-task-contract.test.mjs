@@ -44,7 +44,13 @@ test("required Windows CI executes the cross-process contract", async () => {
 });
 
 test("the formal smoke owns the capability-reactivation oracle", async () => {
-  const smoke = await source("src-tauri/src/agent/unattended_smoke.rs");
+  const [smoke, observation, processTree, failureVerifier, lib] = await Promise.all([
+    source("src-tauri/src/agent/unattended_smoke.rs"),
+    source("src-tauri/src/agent/scenario_case_observation.rs"),
+    source("src-tauri/src/util/process_tree.rs"),
+    source("scripts/verify-unattended-failure-receipt.mjs"),
+    source("src-tauri/src/lib.rs"),
+  ]);
   for (const required of [
     "sync_recovery_capabilities",
     "reactivate_eligible_incidents",
@@ -55,6 +61,56 @@ test("the formal smoke owns the capability-reactivation oracle", async () => {
     "executed_recovery_attempts",
   ]) {
     assert.ok(smoke.includes(required), `formal smoke is missing ${required}`);
+  }
+  for (const required of [
+    "observation_schema_version",
+    "case_id",
+    "scenario_ids",
+    "supervisor_hard_kill_issued",
+    "worker_reaped",
+    "replacement_process_distinct",
+    "descendant_process_count",
+    "cleanup_attempted",
+    "orphan_sweep_performed",
+    "leaked_resource_count",
+  ]) {
+    assert.ok(
+      observation.includes(required),
+      `raw E2E-001 observation is missing ${required}`,
+    );
+  }
+  const writeReceipt = lib.indexOf("std::fs::write(&output");
+  const propagateFailure = lib.indexOf("if let Some(error) = outcome.error");
+  assert.ok(writeReceipt >= 0, "the formal binary must persist its raw receipt");
+  assert.ok(
+    propagateFailure > writeReceipt,
+    "a failed smoke must persist structured cleanup evidence before exiting",
+  );
+  for (const required of [
+    "isolate_std_process_tree",
+    "StdProcessTree",
+    "libc::kill(-self.process_group_id, libc::SIGKILL)",
+    "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+    "QueryInformationJobObject",
+    "std_process_tree_sweep_reaps_a_detached_descendant",
+  ]) {
+    assert.ok(
+      processTree.includes(required),
+      `formal worker process-tree cleanup is missing ${required}`,
+    );
+  }
+  for (const required of [
+    'assert.equal(result.status, 1',
+    "cleanup_attempted: false",
+    "orphan_sweep_performed: false",
+    'process.platform === "win32" ? 0 : 1',
+    "leaked_resource_count: expectedLeak",
+    "cleanup_ok: false",
+  ]) {
+    assert.ok(
+      failureVerifier.includes(required),
+      `formal failure receipt verifier is missing ${required}`,
+    );
   }
 });
 
