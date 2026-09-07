@@ -6,26 +6,55 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 
 async function source(path) {
-  return readFile(new URL(path, root), "utf8");
+  return (await readFile(new URL(path, root), "utf8")).replace(/\r\n/g, "\n");
 }
 
-test("the formal binary exposes the unattended long-task smoke", async () => {
+test("the formal binary dispatches to the canonical unattended module first", async () => {
   const [main, lib] = await Promise.all([
     source("src-tauri/src/main.rs"),
     source("src-tauri/src/lib.rs"),
   ]);
   assert.ok(
-    main.includes("run_unattended_long_task_smoke_cli"),
-    "main must route the formal executable to the unattended smoke",
+    main.startsWith(`// SPDX-License-Identifier: Apache-2.0
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+fn main() {
+    if codefactory_lib::unattended_smoke_cli::run() {
+        return;
+    }
+`),
+    "main must dispatch directly before any mutable smoke wrapper runs",
   );
   assert.ok(
-    lib.includes("--unattended-long-task-smoke"),
-    "the library must parse the public smoke flag",
+    lib.startsWith("// SPDX-License-Identifier: Apache-2.0\npub mod unattended_smoke_cli;\n"),
+    "the canonical module must be the first unconditional library declaration",
   );
   assert.ok(
-    lib.includes("run_unattended_long_task_smoke"),
-    "the library must run the cross-process smoke implementation",
+    !lib.includes("run_unattended_long_task_smoke_cli"),
+    "the library must not retain a mutable unattended wrapper",
   );
+  const cli = await source("src-tauri/src/unattended_smoke_cli.rs");
+  assert.ok(cli.includes('"--unattended-long-task-smoke"'));
+  assert.ok(cli.includes("runtime.block_on(driver::run_parent())"));
+  assert.ok(cli.includes("runtime.block_on(driver::run_worker("));
+});
+
+test("the canonical CLI owns explicit driver and cleanup module paths", async () => {
+  const [cli, smoke, agent] = await Promise.all([
+    source("src-tauri/src/unattended_smoke_cli.rs"),
+    source("src-tauri/src/agent/unattended_smoke.rs"),
+    source("src-tauri/src/agent/mod.rs"),
+  ]);
+  assert.ok(cli.startsWith(`// SPDX-License-Identifier: Apache-2.0
+#[cfg(not(test))]
+#[path = "agent/unattended_smoke.rs"]
+mod driver;
+`));
+  assert.ok(!agent.includes("mod unattended_smoke;"));
+  assert.ok(smoke.includes('#[path = "scenario_case_observation.rs"]\nmod scenario_case_observation;'));
+  assert.ok(smoke.includes('#[path = "../util/process_tree.rs"]\nmod smoke_process_tree;'));
+  assert.ok(!smoke.includes("crate::util::process_tree::"));
+  assert.ok(!smoke.includes("super::"));
 });
 
 test("required Windows CI executes the cross-process contract", async () => {
@@ -44,12 +73,12 @@ test("required Windows CI executes the cross-process contract", async () => {
 });
 
 test("the formal smoke owns the capability-reactivation oracle", async () => {
-  const [smoke, observation, processTree, failureVerifier, lib] = await Promise.all([
+  const [smoke, observation, processTree, failureVerifier, cli] = await Promise.all([
     source("src-tauri/src/agent/unattended_smoke.rs"),
     source("src-tauri/src/agent/scenario_case_observation.rs"),
     source("src-tauri/src/util/process_tree.rs"),
     source("scripts/verify-unattended-failure-receipt.mjs"),
-    source("src-tauri/src/lib.rs"),
+    source("src-tauri/src/unattended_smoke_cli.rs"),
   ]);
   for (const required of [
     "sync_recovery_capabilities",
@@ -79,8 +108,8 @@ test("the formal smoke owns the capability-reactivation oracle", async () => {
       `raw E2E-001 observation is missing ${required}`,
     );
   }
-  const writeReceipt = lib.indexOf("std::fs::write(&output");
-  const propagateFailure = lib.indexOf("if let Some(error) = outcome.error");
+  const writeReceipt = cli.indexOf("std::fs::write(&output");
+  const propagateFailure = cli.indexOf("if let Some(error) = outcome.error");
   assert.ok(writeReceipt >= 0, "the formal binary must persist its raw receipt");
   assert.ok(
     propagateFailure > writeReceipt,
