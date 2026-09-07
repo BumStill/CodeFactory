@@ -134,3 +134,61 @@ jobs:
           name: history-session-nightly-${{ github.run_id }}
           path: ${{ runner.temp }}/history-session-nightly.json
           if-no-files-found: error
+
+  # The unattended long-task smoke is the L2 evidence for HLT-001/E2E-001, and
+  # it ran only on windows-latest — in required PR CI and in the nightly job
+  # above. E2E-001's own gap said so: "PR 门禁只跑 Windows 进程 smoke，macOS 侧
+  # 同一路径未自动化". This runs the same exact-binary smoke on macOS, and
+  # asserts every receipt field rather than trusting the exit code.
+  macos-unattended-smoke:
+    name: macOS unattended long-task smoke (E2E-001)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Unattended long task smoke (macOS)
+        id: unattended_smoke_macos
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/unattended-long-task-nightly-macos.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --unattended-long-task-smoke "$receipt"
+          test -s "$receipt"
+          assert() {
+            local expr="$1" message="$2"
+            if [ "$(jq -r "$expr" "$receipt")" != "true" ]; then
+              echo "::error::$message"
+              jq . "$receipt"
+              exit 1
+            fi
+          }
+          assert '.ok'                               'macOS unattended smoke did not report ok'
+          assert '.scenario_id == "HLT-001"'         'macOS nightly ran the wrong formal scenario'
+          assert '.phase_one_was_hard_killed'        'macOS nightly did not inject a hard kill'
+          assert '.process_restart_observed'         'macOS nightly did not observe a replacement process'
+          assert '.same_objective'                   'macOS recovery changed Objective identity'
+          assert '.user_message_count == 1'          'macOS nightly manufactured a user message'
+          assert '.human_prompt_count == 0'          'macOS nightly requested human participation'
+          assert '.side_effect_receipt_count == 1'   'macOS nightly duplicated a side effect'
+          assert '.objective_status == "completed"'  'macOS Objective did not complete'
+          assert '.live_owner_count == 0'            'macOS nightly left a live owner'
+          assert '.claimable_remediation_count == 0' 'macOS nightly left claimable remediation'
+          assert '.cleanup_ok'                       'macOS nightly leaked isolated state'
+          jq . "$receipt"
+
+      - name: Upload macOS unattended receipt
+        if: ${{ !cancelled() && steps.unattended_smoke_macos.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unattended-long-task-nightly-macos-${{ github.run_id }}
+          path: ${{ runner.temp }}/unattended-long-task-nightly-macos.json
+          if-no-files-found: error
