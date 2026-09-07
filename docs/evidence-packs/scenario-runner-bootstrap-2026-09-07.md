@@ -28,7 +28,7 @@
 
 事务窗口从 `01:45:17.741949Z` 到 `01:45:26.750369Z`，约 9 秒。原始 ruleset `20222077` 已精确恢复，`manage_main_branch_ruleset.py verify` 返回 `status=converged`、`ruleset_matches=true`、无 classic review 漂移；六项检查仍绑定 GitHub Actions App 15368，strict/active/空 bypass actors 均保留。
 
-PR [#504](https://github.com/BumStill/CodeFactory/pull/504) 已同步该主分支，作为恢复后全量 canary；最终通过与合并状态以该 PR 当前 head 的 Windows/macOS 执行回执及 required checks 为准。全量计划仍覆盖 27 个场景、110 个执行目标（Windows 101、macOS 9）。测试基础设施变更不单独发产品版本。11 个完整 E2E 的既有缺口仍保留。
+PR [#504](https://github.com/BumStill/CodeFactory/pull/504) 已同步该主分支，作为恢复后全量 canary；最终通过与合并状态以该 PR 当前 head 的 Windows/macOS 执行回执及 required checks 为准。服务器根据完整 diff 生成的计划覆盖 27 个场景、111 个执行目标（Windows 102、macOS 9）；仅以 Cargo 全局变更做的预检为 110 个，本 PR 的具体改动还带入一个 Complex E2E 的额外目标。测试基础设施变更不单独发产品版本。11 个完整 E2E 的既有缺口仍保留。
 
 ## AI Collaboration
 

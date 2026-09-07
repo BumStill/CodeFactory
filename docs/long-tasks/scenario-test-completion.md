@@ -43,7 +43,7 @@
 
 ## Blockers
 
-- M1b 的 Windows Job Object 与正式 unattended smoke 已通过原 #504 Windows CI；原全量 gate 失败由 #505 的独立门禁更新修复。仍须等待 #504 新基线的全部 required checks 及 110 个执行目标回执通过后才可合并。
+- M1b 的 Windows Job Object 与正式 unattended smoke 已通过原 #504 Windows CI；原全量 gate 失败由 #505 的独立门禁更新修复。仍须等待 #504 新基线的全部 required checks 及 111 个执行目标回执通过后才可合并。
 - 两次 external governance bootstrap 都涉及临时控制门禁，执行前必须取得用户明确审批；普通候选 PR 不能修改 trust root 后使用自己的 judge 自证。
 - 当前 trust root 保护 target 名称与执行工作流，但尚未完整保护候选分支中的 delegated script、scenario driver 和 oracle verifier；M1/M7 必须闭合这个空跑风险，未闭合前不能把 exact-head outcome 称为可信完整 E2E。
 
