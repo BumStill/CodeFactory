@@ -17,6 +17,14 @@
 
 这次本地开发 binary 的编译时 SHA 为 `unknown`，仅作为行为回归证据；新的可信 PR adapter 将要求传入 HEAD 并复核编译时 SHA。Windows Job Object 与服务端 exact-head 行为由该普通 PR 的 required CI 继续验证。未取得 CI 与 merge 证据前不称默认分支完成。
 
+## 首轮 CI 发现的跨平台漏测与修复
+
+首次 exact-head run `34099927824` 在 `338ae23c0c9488488fef3b293e3e06b086ea14cf` 上执行 Windows 55 个目标，54 个通过；唯一失败为 `symlinked_skill_payload_fails_closed_without_replacing_existing_install`，回执明确为 `cargo returned success without running the named test`。其他五项 required checks 通过、macOS 执行通过，但场景门禁正确拒绝合并。正式 unattended binary 目标本身通过。
+
+该 Skill 导入安全测试原来带 `cfg(unix)`，默认 Windows runner 实际编译掉了目标。修复只调整测试：改用 Unix symlink / Windows symlink_file 创建真实符号链接，目标为合成 outside sentinel，不依赖机器上的 `/etc/passwd`；拒绝导入后同时断言既有安装不被替换、外部文件未改变、逃逸 payload 未被安装。创建链接失败直接使测试失败，不允许跳过或把零测试当通过。
+
+独立 `scenario_target_platform.rs` 先因 Unix-only guard 失败，修复后通过；这只是结构早反馈，真实 runner 仍必须执行命名测试。本地 macOS 实际命名 Rust 测试通过（1 passed，未忽略）。Windows 的真实创建权限与运行结果仍须由更新后的 CI 回执补验；本机结果不替代 Windows 验收。该修复不修改 registry、平台路由或 trusted judge。
+
 ## AI Collaboration
 
 - context scope：合成 smoke、专用 CLI、main 分发顺序与共享 Cargo 缓存；不读取生产会话或凭据。
