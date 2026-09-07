@@ -16,7 +16,7 @@
 
 - Current phase: Bootstrap-1a 的 E2E-001 可信执行切片，先完成 canonical CLI 普通前置，再准备信任根升级 PR
 - Current checkpoint: M0/#502、M1a/#503、M1b/#504 均已合入 `main`。#505 最小路由修复合入后，#504 作为全量 canary 通过 111/111 target（Windows 102、macOS 9）和全部六项 required checks，合并提交为 `05461f19c62cb90e592defd0c53fc78c4996835e`；两个已完成 worktree 已按 PR 证据回收，用户主 checkout 未修改。详见 `docs/evidence-packs/scenario-runner-bootstrap-2026-09-07.md`。
-- Next owner: 实现/QA 完成 `docs/design/scenario-case-trusted-execution.md` 的入口保护、原始观察值重算、完整集合与失败回执验收，并提交可审查升级 PR。线上 ruleset 保持不动；上一轮对 #505 的最小批准不授权本轮新增信任根迁移。
+- Next owner: 普通前置 PR #507 完成 CI 与合并；升级实现已提交并通过 19 项新集成测试、286 项可运行 Python 回归和真实 binary→case→aggregate 定向验证（见 `docs/evidence-packs/scenario-case-trusted-execution-2026-09-07.md`），接着提交可审查升级 PR。线上 ruleset 保持不动；上一轮对 #505 的最小批准不授权本轮新增信任根迁移。
 - Updated at: 2026-09-07
 
 ## Completed Items
