@@ -26,7 +26,14 @@
     "default_runner": "windows-latest",
     "target_runners": {
       "binary:--browser-chrome-attach-smoke": "macos-14",
-      "binary:--managed-workspace-cleanup-smoke": "macos-14"
+      "binary:--managed-workspace-cleanup-smoke": "macos-14",
+      "rust:delete_consumes_the_open_directory_not_a_replacement_symlink": "macos-14",
+      "rust:install_target_rejects_a_symlink_before_writing": "macos-14",
+      "rust:local_import_does_not_follow_source_directory_or_file_symlinks": "macos-14",
+      "rust:local_source_handle_is_single_use_and_pins_the_selected_directory": "macos-14",
+      "rust:package_file_rejects_a_symlink_before_writing": "macos-14",
+      "rust:rejected_proposal_state_never_follows_symlinks_or_hardlinks": "macos-14",
+      "rust:root_replacement_in_a_child_process_cannot_write_outside_the_handle": "macos-14"
     },
     "pull_request_excluded_targets": [
       "binary:--update-upgrade-smoke",
@@ -173,7 +180,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/components/MessageInput.tsx", "src/pages/Workspace/WorkspacePage.tsx"],
-      "automated_by": ["pnpm:test:draft-project-picker:headless", "path:src/acceptance/draft-project-picker.tsx"],
+      "automated_by": ["pnpm:test:draft-project-picker:headless"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request"]
     },
@@ -184,7 +191,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/pages/Workspace/*.tsx"],
-      "automated_by": ["pnpm:test:repository-intent:headless", "path:src/acceptance/repository-intent.tsx"],
+      "automated_by": ["pnpm:test:repository-intent:headless"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
@@ -195,7 +202,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/pages/Workspace/*.tsx", "src/stores/chat.ts"],
-      "automated_by": ["pnpm:test:resume:headless", "path:src/acceptance/resume-journal.tsx"],
+      "automated_by": ["pnpm:test:resume:headless"],
       "required_evidence": ["L1", "L3"],
       "gates": ["pull_request"]
     },
@@ -206,7 +213,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/pages/Workspace/*.tsx", "src/stores/chat.ts"],
-      "automated_by": ["pnpm:test:reconnect-banner:headless", "path:src/acceptance/reconnect-banner.tsx"],
+      "automated_by": ["pnpm:test:reconnect-banner:headless"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
@@ -217,7 +224,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/App.tsx", "src/stores/chat.ts", "src/pages/Workspace/*.tsx", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"],
-      "automated_by": ["pnpm:test:startup-session:headless", "path:src/acceptance/startup-session.tsx"],
+      "automated_by": ["pnpm:test:startup-session:headless"],
       "required_evidence": ["L1", "L3", "L4"],
       "gates": ["pull_request", "manual_canary"]
     },
@@ -228,7 +235,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/components/Sidebar*.tsx", "src/pages/Workspace/*.tsx"],
-      "automated_by": ["pnpm:test:sidebar-expansion:headless", "path:src/acceptance/sidebar-expansion.tsx"],
+      "automated_by": ["pnpm:test:sidebar-expansion:headless"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
@@ -239,7 +246,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/components/*Image*.tsx", "src/components/*Attachment*.tsx"],
-      "automated_by": ["pnpm:test:image-preview:headless", "path:src/acceptance/image-preview.tsx"],
+      "automated_by": ["pnpm:test:image-preview:headless"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
@@ -250,7 +257,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/components/Message*.tsx", "src/components/*Markdown*.tsx", "src/stores/chat.ts"],
-      "automated_by": ["pnpm:test:streaming-markdown:headless", "path:src/acceptance/streaming-markdown.tsx"],
+      "automated_by": ["pnpm:test:streaming-markdown:headless"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
@@ -261,7 +268,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs"],
-      "automated_by": ["pnpm:test:permission-mode:headless", "path:src/acceptance/permission-mode.tsx"],
+      "automated_by": ["pnpm:test:permission-mode:headless"],
       "required_evidence": ["L1", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
@@ -283,7 +290,7 @@
       "priority": "P1",
       "source_kind": "product_contract",
       "change_patterns": ["src/components/*Usage*.tsx", "src/pages/*Usage*.tsx", "src/stores/usage*.ts"],
-      "automated_by": ["pnpm:test:usage:headless", "path:src/acceptance/usage.tsx"],
+      "automated_by": ["pnpm:test:usage:headless"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
@@ -382,7 +389,7 @@
       "priority": "P0",
       "source_kind": "product_contract",
       "change_patterns": ["src/components/MessageList.tsx", "src/components/WelcomeScreen.tsx", "src/pages/Workspace/WorkspacePage.tsx"],
-      "automated_by": ["workflow:New-session composer overlap headless gate", "path:src/acceptance/composer-overlap.tsx", "path:src/components/MessageList.welcomeContainment.test.tsx"],
+      "automated_by": ["workflow:New-session composer overlap headless gate", "path:src/components/MessageList.welcomeContainment.test.tsx"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request"]
     }

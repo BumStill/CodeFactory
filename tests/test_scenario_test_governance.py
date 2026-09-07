@@ -210,6 +210,39 @@ class ScenarioRegistryTests(unittest.TestCase):
             )
         )
 
+    def test_a_path_target_must_name_a_vitest_test_file(self) -> None:
+        from tools.governance.validate_scenario_test_governance import _automation_exists
+
+        self.assertFalse(
+            _automation_exists("path:src/acceptance/composer-overlap.tsx", REPO_ROOT)
+        )
+        self.assertTrue(
+            _automation_exists(
+                "path:src/components/MessageList.welcomeContainment.test.tsx",
+                REPO_ROOT,
+            )
+        )
+
+    def test_path_targets_match_the_configured_vitest_include(self) -> None:
+        from tools.governance.validate_scenario_test_governance import _automation_exists
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for marker, expected in (
+                ("src/example.test.ts", True),
+                ("src/nested/example.spec.tsx", True),
+                ("src/example.test.txt", False),
+                ("src/example.test.ts.bak", False),
+                ("src/example.test.js", False),
+                ("other/example.test.ts", False),
+                ("src/../other/example.test.ts", False),
+            ):
+                path = root / marker
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+                with self.subTest(marker=marker):
+                    self.assertEqual(_automation_exists(f"path:{marker}", root), expected)
+
     def test_registry_loader_reports_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "registry.json"
@@ -878,6 +911,34 @@ class AffectedScenarioExecutionTests(unittest.TestCase):
         self.assertEqual(plan["e2e_ids"], [])
         self.assertEqual(plan["required_targets"], [])
         self.assertEqual(plan["runners"], {})
+
+    def test_global_product_change_routes_only_executable_platform_targets(self) -> None:
+        plan = build_execution_plan(
+            self.registry,
+            ["src-tauri/Cargo.toml"],
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+        )
+
+        self.assertFalse(
+            any(
+                target.startswith("path:src/acceptance/")
+                for target in plan["required_targets"]
+            )
+        )
+        unix_only_targets = {
+            "rust:delete_consumes_the_open_directory_not_a_replacement_symlink",
+            "rust:install_target_rejects_a_symlink_before_writing",
+            "rust:local_import_does_not_follow_source_directory_or_file_symlinks",
+            "rust:local_source_handle_is_single_use_and_pins_the_selected_directory",
+            "rust:package_file_rejects_a_symlink_before_writing",
+            "rust:rejected_proposal_state_never_follows_symlinks_or_hardlinks",
+            "rust:root_replacement_in_a_child_process_cannot_write_outside_the_handle",
+        }
+        self.assertTrue(unix_only_targets.issubset(set(plan["runners"]["macos-14"])))
+        self.assertTrue(
+            unix_only_targets.isdisjoint(set(plan["runners"]["windows-latest"]))
+        )
 
     @patch("tools.governance.scenario_execution.subprocess.run")
     @patch("tools.governance.scenario_execution.shutil.which")

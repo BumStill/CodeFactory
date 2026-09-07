@@ -204,7 +204,13 @@ def _automation_exists(target: str, repo_root: Path) -> bool:
         return marker in package.get("scripts", {})
     if kind == "path":
         path = repo_root / marker
-        return path.is_file() and not path.is_symlink()
+        # Keep this aligned with vite.config.ts: src/**/*.{test,spec}.{ts,tsx}.
+        is_vitest_test = (
+            marker.startswith("src/")
+            and ".." not in Path(marker).parts
+            and re.fullmatch(r".+\.(?:test|spec)\.tsx?", path.name) is not None
+        )
+        return path.is_file() and not path.is_symlink() and is_vitest_test
     if kind == "rust":
         # Must be a real test function, not just the name appearing somewhere.
         # Substring matching would keep a declaration "valid" after its test was
