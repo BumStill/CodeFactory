@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: Bootstrap-1a 的 E2E-001 可信执行切片，先完成 canonical CLI 普通前置，再准备信任根升级 PR
+- Current phase: Bootstrap-1a 可信升级 PR #508 已提交；普通前置 #507 已合入，等待新的最小迁移批准
 - Current checkpoint: M0/#502、M1a/#503、M1b/#504 均已合入 `main`。#505 最小路由修复合入后，#504 作为全量 canary 通过 111/111 target（Windows 102、macOS 9）和全部六项 required checks，合并提交为 `05461f19c62cb90e592defd0c53fc78c4996835e`；两个已完成 worktree 已按 PR 证据回收，用户主 checkout 未修改。详见 `docs/evidence-packs/scenario-runner-bootstrap-2026-09-07.md`。
-- Next owner: 普通前置 PR #507 完成 CI 与合并；升级实现已提交并通过 19 项新集成测试、286 项可运行 Python 回归和真实 binary→case→aggregate 定向验证（见 `docs/evidence-packs/scenario-case-trusted-execution-2026-09-07.md`），接着提交可审查升级 PR。线上 ruleset 保持不动；上一轮对 #505 的最小批准不授权本轮新增信任根迁移。
+- Next owner: #507 已以 `b7f65f5fb149f8f792e73460f76781cb8d4f63c0` 合入，69/69 exact-head target 和六项 required checks 通过，所属 clean worktree 已回收。#508 已同步该 main；实现版五项普通 required checks 通过，新的同步提交仍需重跑 CI。19 项新执行测试、29 项 receipt 测试、本地 286 项回归与实际 binary→case→aggregate 通过；Linux CI 313 项中 303 通过、10 项 macOS-only 跳过。旧 gate 正确拒绝两个 trust-root 文件自修改。下一步仅在新批准及 exact-head 普通 CI 全绿后，执行最小迁移、恢复规则集和 schema v2 canary。上一轮 #505 的批准不授权本轮迁移。
 - Updated at: 2026-09-07
 
 ## Completed Items
@@ -30,6 +30,7 @@
 - M1a 已通过 PR #503 合入 `main`：先以缺模块的 `ModuleNotFoundError` 取得失败优先证据，再以 28 项测试覆盖 receipt/fixture 合同及独立评审给出的伪绿反例；该 foundation 仍不参与 trusted required judge。
 - M1b 已先加入失败优先 Rust 测试：因缺少 `scenario_case_observation` 模块稳定编译失败；实现后 3 项集成测试覆盖 legacy 字段兼容、失败 receipt 隐私和派生结果 fail closed。
 - M1b/#504 已合并；正式 Windows canary 实际观察到 hard kill、worker reap、不同进程恢复、零后代/泄漏、单用户消息和零人工 prompt。执行 run `34074235813`、gate run `34074234233` 均成功；该证据只完成非 UI 切片。
+- #507 已合并 canonical CLI 和真实跨平台 Skill symlink 测试：首轮 Windows 55 targets 的唯一失败为 Unix-only 目标零执行，修复后新计划 Windows 60/macOS 9 全通过；独立 QA 确认该命名测试实际 1 passed、0 ignored，并验证完整 schema v1 aggregate 无缺失、重复或多余目标。
 
 ## Remaining Items
 

@@ -4,7 +4,7 @@
 
 Bootstrap-1a 的 case planner/adapter/executor/aggregate/final verifier 本地实现和真实定向集成通过，**not live**：只有经过新的外部信任根迁移批准、默认分支合入、恢复规则与 canary 后，才能称线上可信门禁生效。
 
-依赖普通前置 [PR #507](https://github.com/BumStill/CodeFactory/pull/507)，将正式 binary 的 unattended CLI 放在首个分支，并通过独立模块直接挂载 driver。已复用 #506 的 macOS nightly 改动，不重复实现、不删除它仍保留的 PR/UI/release 缺口。
+普通前置 [PR #507](https://github.com/BumStill/CodeFactory/pull/507) 已合并，将正式 binary 的 unattended CLI 放在首个分支，并通过独立模块直接挂载 driver。可信升级为 [PR #508](https://github.com/BumStill/CodeFactory/pull/508)。已复用 #506 的 macOS nightly 改动，不重复实现、不删除它仍保留的 PR/UI/release 缺口。
 
 ## 失败优先
 
@@ -43,7 +43,16 @@ Bootstrap-1a 的 case planner/adapter/executor/aggregate/final verifier 本地�
 
 本轮没有修改线上 ruleset。只读对账确认 six required contexts 仍为 active/strict/no-bypass，均绑定 GitHub Actions app 15368。网络 EOF/TLS 错误只通过单次命令的 HTTP/1.1/直连参数及已连接 GitHub 服务回退，不修改代理、不跳过同步 hook。
 
-下一步：先普通合并 #507；升级 PR 与 `main` 同步、审查全部 CI；再取得仅针对该升级 PR 的最小 bootstrap 批准，迁移后立即恢复原规则集，并用新默认分支 canary 验证 schema v2 exact-head receipt。完整 11 case、真实 WebView、release/nightly 及任意敌对构建代码的 OS 级隔离均未在本证据中宣称完成。
+## 服务端交付检查点
+
+- #507 测试 head 为 `aa115e322fb9e557dd6c20254e85e483865b81ca`，base 为 `9097a86bfa059e02f38b03cb8501732fd16027ed`。[执行 run 34102523569](https://github.com/BumStill/CodeFactory/actions/runs/34102523569) 与 [gate run 34102522048](https://github.com/BumStill/CodeFactory/actions/runs/34102522048) 均成功，六项 required checks 全绿。独立 QA 以 base 一致的 schema v1 verifier 确认 69/69 targets（Windows 60、macOS 9），完整唯一集合、command digest、runner/final 并集均匹配。
+- 首轮暴露的 Windows Skill symlink 零测试问题已修成真正双平台合成夹具；新 Windows 日志明确为该命名测试 `1 passed; 0 failed; 0 ignored`。不改 registry 或路由绕过测试。#507 合并 SHA 为 `b7f65f5fb149f8f792e73460f76781cb8d4f63c0`，hold trailer 已读回复验；只回收了其 clean worktree 与本地分支，源代码可从已合并 PR 恢复。
+- #508 实现版 head `5ee2c1ea95b6c1cee0b5b41cd4188b661b791f97` 的五项普通 required checks 全通过。[CI run 34102604063](https://github.com/BumStill/CodeFactory/actions/runs/34102604063) 的 Linux 完整集报告 313 项：303 通过，10 项 macOS 专用测试跳过，后者已由本地 macOS 286 项集覆盖；Harbor 相关模块不再是未验证项。
+- 同一 #508 实现版 head 又执行真实本地定向 probe：source/build SHA 均为 `5ee2c1ea95b6c1cee0b5b41cd4188b661b791f97`，target/case passed、errors 为空、四类非 UI oracle 与 cleanup 通过。仍标记 `local_targeted_integration_not_github_attestation`，不冒充线上新 judge 证明。
+- [旧 gate run 34102604124](https://github.com/BumStill/CodeFactory/actions/runs/34102604124) 仅报告 `run_scenario_harness_gate.py` 与 `scenario_execution.py` 两个既有 trust-root 文件不可在普通 PR 中自修改。该拒绝符合设计；五项普通检查通过不授权旁路合并。
+- #508 已同步 #507 合入后的 main，最终差异只保留 11 个可信升级/测试/文档文件。同步提交改变 HEAD，必须重新审查其 exact-head CI，不能复用上一 head 的绿灯作为合并依据。
+
+下一步：待用户另行批准仅针对 #508 的最小 bootstrap，且最终 exact-head 五项普通 required checks 全绿后，迁移并立即恢复原规则集，再用新默认分支 canary 验证 schema v2 receipt。完整 11 case、真实 WebView、release/nightly 及任意敌对构建代码的 OS 级隔离均未在本证据中宣称完成；registry 仍为 10 个部分实现、1 个设计中、26 项 remaining gaps。
 
 ## AI Collaboration
 
