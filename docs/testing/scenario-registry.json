@@ -37,6 +37,7 @@
     ],
     "workflow_aliases": {
       "workflow:Unattended long-task cross-process smoke": "binary:--unattended-long-task-smoke",
+      "workflow:Unattended long task smoke (macOS)": "binary:--unattended-long-task-smoke",
       "workflow:Historical session continue/stop/incident cross-process smoke": "binary:--history-session-smoke",
       "workflow:Browser session lifecycle smoke": "binary:--browser-session-smoke",
       "workflow:Delivery recovery cross-process smoke": "binary:--delivery-recovery-smoke"
@@ -412,9 +413,9 @@
       },
       "execution": {"pull_request": "deterministic Windows process smoke", "nightly": "fault matrix", "release_artifact": "exact Windows executable"},
       "automation_status": "partially_implemented",
-      "automated_by": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"],
+      "automated_by": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke", "workflow:Unattended long task smoke (macOS)"],
       "pull_request_gate": {"status": "implemented", "required_targets": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"], "remaining_gaps": []},
-      "remaining_gaps": ["L2 PR 门禁只跑 Windows 进程 smoke，macOS 侧同一路径未自动化", "L3 真实桌面会话内的无人值守完成尚未自动化，现仅覆盖 headless worker", "L4 exact release artifact 的 macOS 安装版 canary 尚未接入"]
+      "remaining_gaps": ["L2 macOS 侧进程 smoke 已接 nightly；PR 门禁本身仍只跑 Windows", "L3 真实桌面会话内的无人值守完成尚未自动化，现仅覆盖 headless worker", "L4 exact release artifact 的 macOS 安装版 canary 尚未接入"]
     },
     {
       "id": "E2E-002",
