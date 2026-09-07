@@ -8,13 +8,19 @@
 #[path = "scenario_case_observation.rs"]
 mod scenario_case_observation;
 
-use super::events::{CollectingEventSink, EventSink};
-use super::objective::{
+// Compile the canonical cleanup source directly, without a mutable util-module
+// re-export. Its unrelated async helpers have no state and are unused here.
+#[allow(dead_code)]
+#[path = "../util/process_tree.rs"]
+mod smoke_process_tree;
+
+use crate::agent::events::{CollectingEventSink, EventSink};
+use crate::agent::objective::{
     current_process_instance, ClaimedRemediation, DecisionRouter, ObjectiveStatus, ObjectiveStore,
     RecoveryDomain, RouteSignal, MAX_SIGNATURE_RECOVERY_ATTEMPTS, RECOVERY_CAPABILITY_REVISION,
     TECHNICAL_RECOVERY_EXHAUSTED,
 };
-use super::{AgentExecutionContext, AgentLoop, AgentMode, TurnCapability, UsageSurface};
+use crate::agent::{AgentExecutionContext, AgentLoop, AgentMode, TurnCapability, UsageSurface};
 use crate::config::settings::{ApiStyle, Settings};
 use crate::mcp::McpManager;
 use crate::util::no_window::NoWindow;
@@ -138,7 +144,7 @@ fn wait_for_child_exit_sync(child: &mut Child, timeout: Duration) -> std::io::Re
 
 struct ManagedWorker {
     child: Child,
-    process_tree: crate::util::process_tree::StdProcessTree,
+    process_tree: smoke_process_tree::StdProcessTree,
     live_workers: Arc<AtomicUsize>,
     sweep_state: Arc<ProcessSweepState>,
     reaped: bool,
@@ -162,7 +168,7 @@ impl ManagedWorker {
         sweep_state: Arc<ProcessSweepState>,
     ) -> anyhow::Result<Self> {
         let mut child = spawn_worker(state_dir, base_url, phase)?;
-        let process_tree = match crate::util::process_tree::StdProcessTree::attach(&child) {
+        let process_tree = match smoke_process_tree::StdProcessTree::attach(&child) {
             Ok(process_tree) => process_tree,
             Err(error) => {
                 let _ = child.kill();
@@ -429,7 +435,7 @@ fn spawn_worker(
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    crate::util::process_tree::isolate_std_process_tree(&mut command);
+    smoke_process_tree::isolate_std_process_tree(&mut command);
     command.spawn().context("spawn unattended long-task worker")
 }
 
@@ -928,7 +934,7 @@ pub(crate) async fn run_worker(state_dir: &Path, base_url: &str, phase: u8) -> a
             crate::commands::chat::admit_headless_chat_turn(&pool, SESSION_ID, USER_INSTRUCTION)
                 .await
                 .map_err(|error| anyhow!(error.to_string()))?;
-        if admission.objective.kind != super::objective::ObjectiveKind::LocalMutation {
+        if admission.objective.kind != crate::agent::objective::ObjectiveKind::LocalMutation {
             bail!("smoke prompt did not admit a local-mutation Objective");
         }
         if admission.objective.root_turn_id.as_deref() != Some(admission.root_turn_id.as_str()) {
@@ -951,7 +957,8 @@ pub(crate) async fn run_worker(state_dir: &Path, base_url: &str, phase: u8) -> a
             .reconcile_stale_chat_run_controls(&process_instance)
             .await?;
         let provider_recoveries =
-            super::objective_supervisor::reconcile_provider_recovery_on_startup(&pool).await?;
+            crate::agent::objective_supervisor::reconcile_provider_recovery_on_startup(&pool)
+                .await?;
         let stale_objectives = store
             .reconcile_stale_active_objectives(&process_instance)
             .await?;
@@ -987,7 +994,7 @@ pub(crate) async fn run_worker(state_dir: &Path, base_url: &str, phase: u8) -> a
         crate::storage::db::close_and_release_files(pool).await;
         return Ok(());
     }
-    super::objective_supervisor::require_provider_resume_evidence(
+    crate::agent::objective_supervisor::require_provider_resume_evidence(
         &pool,
         &claim.objective.id,
         false,

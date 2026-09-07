@@ -2996,10 +2996,12 @@ mod tests {
         assert!(!destination.join(".git").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_skill_payload_fails_closed_without_replacing_existing_install() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
@@ -3013,7 +3015,10 @@ mod tests {
             "---\nname: Linked Skill\ndescription: fixture\n---\n\nbody",
         )
         .unwrap();
-        symlink("/etc/passwd", source.join("assets/escape")).unwrap();
+        let outside = root.path().join("outside-sentinel");
+        std::fs::write(&outside, "outside-must-stay-unchanged").unwrap();
+        symlink(&outside, source.join("assets/escape"))
+            .expect("create a real symlink; never skip this required scenario");
 
         let source_dir = SecureDir::open_existing(&source).unwrap();
         let error = import_one_skill_dir_into(&source_dir, &installed).unwrap_err();
@@ -3023,6 +3028,12 @@ mod tests {
             std::fs::read_to_string(existing.join("manifest.json")).unwrap(),
             "existing-manifest"
         );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside-must-stay-unchanged"
+        );
+        assert!(!existing.join("assets/escape").exists());
+        drop(source_dir);
     }
 
     #[test]

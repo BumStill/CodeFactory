@@ -36,8 +36,6 @@ pub mod sse_buffer;
 pub mod subagent;
 mod tool_backend;
 pub(crate) mod tool_recovery;
-#[cfg(not(test))]
-pub(crate) mod unattended_smoke;
 pub(crate) mod update_recovery;
 pub mod user_context;
 pub mod verification;
