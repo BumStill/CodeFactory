@@ -14,9 +14,9 @@
 
 ## Current State
 
-- Current phase: M1b E2E-001 正式 binary raw observation
-- Current checkpoint: M0 已由 PR #502、M1a 已由 PR #503 合入 `main`；M1b 在 PR #504 产出正式 smoke 的进程/cleanup 原始观察值和失败回执。用户于 2026-09-07 批准最小门禁更新，PR #505 已修复 11 个不可执行 path 目标及 7 个 Unix-only 目标的平台路由并合入；线上六项 strict/active/no-bypass required checks 已恢复且对账成功。#504 同步新基线后作为全量 canary，合并状态与最终服务器回执见该 PR。
-- Next owner: 主实现完成 #504 的恢复后全量 canary、普通合并及 worktree 回收；随后推进完整 Bootstrap-1 的 case receipt 与 implementation digest 接入设计。本次最小批准只覆盖 #505 的路由/校验修复，不能等同于完整 Bootstrap-1 已完成。
+- Current phase: Bootstrap-1a 的 E2E-001 可信执行切片，先完成 canonical CLI 普通前置，再准备信任根升级 PR
+- Current checkpoint: M0/#502、M1a/#503、M1b/#504 均已合入 `main`。#505 最小路由修复合入后，#504 作为全量 canary 通过 111/111 target（Windows 102、macOS 9）和全部六项 required checks，合并提交为 `05461f19c62cb90e592defd0c53fc78c4996835e`；两个已完成 worktree 已按 PR 证据回收，用户主 checkout 未修改。详见 `docs/evidence-packs/scenario-runner-bootstrap-2026-09-07.md`。
+- Next owner: 实现/QA 完成 `docs/design/scenario-case-trusted-execution.md` 的入口保护、原始观察值重算、完整集合与失败回执验收，并提交可审查升级 PR。线上 ruleset 保持不动；上一轮对 #505 的最小批准不授权本轮新增信任根迁移。
 - Updated at: 2026-09-07
 
 ## Completed Items
@@ -29,11 +29,12 @@
 - M0 已通过 PR #502 合入 `main`：registry 派生摘要、分类和 case 表现在由 candidate-side governance check 阻断漂移。
 - M1a 已通过 PR #503 合入 `main`：先以缺模块的 `ModuleNotFoundError` 取得失败优先证据，再以 28 项测试覆盖 receipt/fixture 合同及独立评审给出的伪绿反例；该 foundation 仍不参与 trusted required judge。
 - M1b 已先加入失败优先 Rust 测试：因缺少 `scenario_case_observation` 模块稳定编译失败；实现后 3 项集成测试覆盖 legacy 字段兼容、失败 receipt 隐私和派生结果 fail closed。
+- M1b/#504 已合并；正式 Windows canary 实际观察到 hard kill、worker reap、不同进程恢复、零后代/泄漏、单用户消息和零人工 prompt。执行 run `34074235813`、gate run `34074234233` 均成功；该证据只完成非 UI 切片。
 
 ## Remaining Items
 
-- M1b：以普通 PR 让 E2E-001 正式 binary 输出结构化 raw observation，同时保留 execution receipt v1 和 legacy smoke 字段；修复失败路径 cleanup 证据、hard-kill supervisor marker 与 target receipt 临时目录回收。
-- Bootstrap-1：取得用户明确审批后，把已在 `main` 的 planner/executor/verifier、canonical driver/fixture/oracle digest 接入可信门禁，并在证据满足后补齐 E2E-004 PR slice。
+- Bootstrap-1a：先普通 PR 固定正式 binary 的首个 CLI 分发入口，再由独立 PR 升级现有 execution receipt 为 v2，绑定 E2E-001 driver/verifier/fixture、原始观察值与实际 runner，补齐临时回执目录清理和严格集合校验。升级 PR 本地/非门禁 CI 通过不能算线上生效；仍须新批准、最小迁移、恢复规则集及 exact-head canary。
+- Bootstrap-1 后续：可信 catalog 接入、桌面 feasibility probe、E2E-004 PR slice；只能在真实证据满足后完成相应里程碑。
 - M2：补 E2E-001/002/003/007/011 的真实 WebView、旧 schema、停止/恢复/停泊 UI 和 exact release canary。
 - M3：补 E2E-010 的二进制 hard-kill nightly、isolated CodeFactoryDev required canary 与安装版单消息 canary。
 - M4：补 E2E-004/009 的 fake forge、完整交付链、worktree reservation CAS hard kill 和双会话并发。
@@ -43,7 +44,7 @@
 
 ## Blockers
 
-- M1b 的 Windows Job Object 与正式 unattended smoke 已通过原 #504 Windows CI；原全量 gate 失败由 #505 的独立门禁更新修复。仍须等待 #504 新基线的全部 required checks 及 111 个执行目标回执通过后才可合并。
+- #504 的 required checks 和全量 canary 已完成，不再列作 blocker。
 - 两次 external governance bootstrap 都涉及临时控制门禁，执行前必须取得用户明确审批；普通候选 PR 不能修改 trust root 后使用自己的 judge 自证。
 - 当前 trust root 保护 target 名称与执行工作流，但尚未完整保护候选分支中的 delegated script、scenario driver 和 oracle verifier；M1/M7 必须闭合这个空跑风险，未闭合前不能把 exact-head outcome 称为可信完整 E2E。
 
@@ -58,7 +59,7 @@
 - context scope: registry、scenario validator/runner、PR/nightly/release workflow、现有 smoke、桌面验证脚本和公开交付证据；不读取生产聊天正文、真实 session/objective ID 或凭据。
 - assumptions: 沿用同一 Harness；低层 slice 不等于完整 case；fixture 只用 synthetic data；候选自报 outcome 不构成可信 oracle。
 - review point: QA 复核 M0/M1 contract；桌面技术评审决定 feasibility probe；治理评审划分普通 PR 与 external bootstrap，并审计 target implementation digest。
-- validation result: 计划已物化，M0 已合并，M1a 本地合同红转绿；foundation 尚未接入 trusted required gate，registry 状态和 L3/L4 缺口保持不变。
+- validation result: M0/M1a/M1b 已合并，最小路由 bootstrap 已恢复并通过 111 个 target canary。Bootstrap-1a 新测试先因缺少 case plan/adapter 失败；独立 QA 实证发现入口截获、Cargo runner 覆盖、bool/int 混淆及重复 target 假绿，逐项补充拒绝测试。新升级尚未进入默认分支 judge，registry 状态和 L3/L4 缺口保持不变。
 
 ## Stop Boundary
 

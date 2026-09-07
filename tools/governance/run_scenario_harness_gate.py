@@ -26,7 +26,11 @@ from tools.governance.validate_scenario_test_governance import (
     validate_registry,
 )
 
-TRUST_ROOT_FILES = (
+from tools.governance.scenario_case_execution import (
+    DRIVER_FILES, FIXTURE_FILE, VERIFIER_FILES, _read_regular, validate_canonical_entry_points,
+)
+
+TRUST_ROOT_FILES = tuple(dict.fromkeys((
     ".github/rulesets/main.json",
     ".github/workflows/ci.yml",
     ".github/workflows/governance-baseline.yml",
@@ -38,7 +42,10 @@ TRUST_ROOT_FILES = (
     "tools/governance/run_scenario_harness_gate.py",
     "tools/governance/scenario_execution.py",
     "tools/governance/validate_scenario_test_governance.py",
-)
+    *DRIVER_FILES,
+    *VERIFIER_FILES,
+    FIXTURE_FILE,
+)))
 
 def _read(path: Path) -> str:
     try:
@@ -169,17 +176,13 @@ def validate_trust_root_immutability(repo_root: Path, policy_root: Path) -> list
 
     if repo_root == policy_root:
         return []
-    errors: list[str] = []
+    errors = validate_canonical_entry_points(repo_root)
     for relative in TRUST_ROOT_FILES:
         candidate = repo_root / relative
         trusted = policy_root / relative
         try:
-            matches = (
-                not candidate.is_symlink()
-                and not trusted.is_symlink()
-                and candidate.read_bytes() == trusted.read_bytes()
-            )
-        except OSError:
+            matches = _read_regular(repo_root, relative) == _read_regular(policy_root, relative)
+        except (OSError, ValueError):
             matches = False
         if not matches:
             errors.append(

@@ -1005,18 +1005,21 @@ class AffectedScenarioExecutionTests(unittest.TestCase):
 
     def test_receipt_must_match_both_shas_and_every_required_target(self) -> None:
         plan = {
-            "schema_version": 1,
+            "schema_version": scenario_execution.SCHEMA_VERSION,
             "base_sha": "a" * 40,
             "head_sha": "b" * 40,
             "required_targets": ["rust:first", "binary:--real-smoke"],
+            "runners": {"windows-latest": ["rust:first", "binary:--real-smoke"]},
+            "case_plans": [], "scenario_ids": [], "e2e_ids": [],
         }
         valid = {
-            "schema_version": 1,
+            "schema_version": scenario_execution.SCHEMA_VERSION,
             "base_sha": "a" * 40,
             "head_sha": "b" * 40,
+            "cases": [], "scenario_ids": [], "e2e_ids": [],
             "targets": [
-                {"target": "rust:first", "outcome": "passed"},
-                {"target": "binary:--real-smoke", "outcome": "passed"},
+                {"target": "rust:first", "outcome": "passed", "runner": "windows-latest", "command_sha256": "d" * 64},
+                {"target": "binary:--real-smoke", "outcome": "passed", "runner": "windows-latest", "command_sha256": "e" * 64},
             ],
         }
         self.assertEqual(validate_aggregate_receipt(plan, valid), [])
@@ -1060,11 +1063,13 @@ class AffectedScenarioExecutionTests(unittest.TestCase):
         self, github_json, github_bytes
     ) -> None:
         plan = {
-            "schema_version": 1,
+            "schema_version": scenario_execution.SCHEMA_VERSION,
             "base_sha": "a" * 40,
             "head_sha": "b" * 40,
             "required_targets": ["rust:first"],
             "blockers": [],
+            "runners": {"windows-latest": ["rust:first"]},
+            "case_plans": [], "scenario_ids": [], "e2e_ids": [],
         }
         github_json.side_effect = [
             {
@@ -1102,10 +1107,11 @@ class AffectedScenarioExecutionTests(unittest.TestCase):
                 "scenario-execution-receipt.json",
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": scenario_execution.SCHEMA_VERSION,
                         "base_sha": "a" * 40,
                         "head_sha": "b" * 40,
-                        "targets": [{"target": "rust:first", "outcome": "passed"}],
+                        "cases": [], "scenario_ids": [], "e2e_ids": [],
+                        "targets": [{"target": "rust:first", "outcome": "passed", "runner": "windows-latest", "command_sha256": "d" * 64}],
                     }
                 ),
             )
