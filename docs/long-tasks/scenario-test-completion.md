@@ -15,9 +15,9 @@
 ## Current State
 
 - Current phase: M1b E2E-001 正式 binary raw observation
-- Current checkpoint: M0 已由 PR #502、M1a 已由 PR #503 合入 `main`；M1b 正在独立普通 PR 中让正式 smoke 产出进程/cleanup 原始观察值，并保证失败先落结构化 receipt 再退出。registry 状态、trusted required judge 和 ruleset 均不在本阶段提升。
-- Next owner: 主实现完成 M1b 普通 PR、CI 和合并；取得用户明确批准后再执行 Bootstrap-1，把已在默认分支的 foundation 纳入 trusted plan/executor/verifier。
-- Updated at: 2026-09-03
+- Current checkpoint: M0 已由 PR #502、M1a 已由 PR #503 合入 `main`；M1b 在 PR #504 产出正式 smoke 的进程/cleanup 原始观察值和失败回执。用户于 2026-09-07 批准最小门禁更新，PR #505 已修复 11 个不可执行 path 目标及 7 个 Unix-only 目标的平台路由并合入；线上六项 strict/active/no-bypass required checks 已恢复且对账成功。#504 同步新基线后作为全量 canary，合并状态与最终服务器回执见该 PR。
+- Next owner: 主实现完成 #504 的恢复后全量 canary、普通合并及 worktree 回收；随后推进完整 Bootstrap-1 的 case receipt 与 implementation digest 接入设计。本次最小批准只覆盖 #505 的路由/校验修复，不能等同于完整 Bootstrap-1 已完成。
+- Updated at: 2026-09-07
 
 ## Completed Items
 
@@ -43,7 +43,7 @@
 
 ## Blockers
 
-- M1b 当前无已知实现 blocker；Windows Job Object 的 tree attach/count/terminate 仍须由 required Windows CI 实机复核，CI 未绿前不得合并。
+- M1b 的 Windows Job Object 与正式 unattended smoke 已通过原 #504 Windows CI；原全量 gate 失败由 #505 的独立门禁更新修复。仍须等待 #504 新基线的全部 required checks 及 110 个执行目标回执通过后才可合并。
 - 两次 external governance bootstrap 都涉及临时控制门禁，执行前必须取得用户明确审批；普通候选 PR 不能修改 trust root 后使用自己的 judge 自证。
 - 当前 trust root 保护 target 名称与执行工作流，但尚未完整保护候选分支中的 delegated script、scenario driver 和 oracle verifier；M1/M7 必须闭合这个空跑风险，未闭合前不能把 exact-head outcome 称为可信完整 E2E。
 
