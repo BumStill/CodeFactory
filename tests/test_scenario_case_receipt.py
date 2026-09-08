@@ -156,6 +156,23 @@ class FixtureManifestContractTests(unittest.TestCase):
 
 
 class CaseReceiptContractTests(unittest.TestCase):
+    def test_raw_scalars_cannot_use_python_truthiness_or_bool_integer_equality(self):
+        for field, value in {
+            "ok": "false", "observation_schema_version": True,
+            "user_message_count": True, "human_prompt_count": False,
+            "side_effect_receipt_count": 1.0, "replay_call_link_count": 2.0,
+            "descendant_process_count": False, "live_owner_count": False,
+            "claimable_remediation_count": 0.0,
+        }.items():
+            with self.subTest(field=field):
+                observed = raw_smoke()
+                observed[field] = value
+                actual = build_e2e001_case_receipt(
+                    observed, expectation(), fixture_manifest(),
+                    runner=runner(), build_identity=build_identity(),
+                )
+                self.assertTrue(validate_case_receipt_for_gate(actual, expectation()))
+
     def test_e2e001_pull_request_slice_is_a_valid_bound_receipt(self) -> None:
         actual = receipt()
 

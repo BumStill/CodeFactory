@@ -16,6 +16,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = REPO_ROOT / "docs" / "testing" / "scenario-registry.json"
+EXECUTION_RECEIPT_SCHEMA_VERSION = 2
 
 ALLOWED_PRIORITIES = {"P0", "P1", "P2"}
 ALLOWED_GATES = {"pull_request", "nightly", "release_artifact", "manual_canary"}
@@ -82,6 +83,17 @@ VERSION_LINE_PATTERNS = {
         rf'^\s*"version"\s*:\s*"{SEMVER}"[,]?\s*$'
     ),
 }
+
+
+def validate_execution_receipt_schema(policy: dict[str, Any]) -> list[str]:
+    """Keep registry validation and direct execution planning on one contract."""
+    version = policy.get("receipt_schema_version")
+    if type(version) is not int or version != EXECUTION_RECEIPT_SCHEMA_VERSION:
+        return [
+            "execution_policy.receipt_schema_version must be the integer "
+            f"{EXECUTION_RECEIPT_SCHEMA_VERSION}"
+        ]
+    return []
 
 
 def _is_test_harness_file(path: str) -> bool:
@@ -649,8 +661,7 @@ def validate_registry(registry: dict[str, Any], repo_root: Path = REPO_ROOT) -> 
         execution_policy = {}
     if execution_policy.get("workflow") != ".github/workflows/scenario-execution.yml":
         errors.append("execution_policy.workflow must be scenario-execution.yml")
-    if execution_policy.get("receipt_schema_version") != 1:
-        errors.append("execution_policy.receipt_schema_version must be 1")
+    errors.extend(validate_execution_receipt_schema(execution_policy))
     supported_runners = {"windows-latest", "macos-14"}
     if execution_policy.get("default_runner") not in supported_runners:
         errors.append("execution_policy.default_runner must be a supported runner")

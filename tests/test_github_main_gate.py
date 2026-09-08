@@ -227,6 +227,16 @@ class GitHubMainGateTests(unittest.TestCase):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text("trusted\n", encoding="utf-8")
 
+            for checkout in (policy, candidate):
+                (checkout / "src-tauri/src/lib.rs").write_text(
+                    "// SPDX-License-Identifier: Apache-2.0\npub mod unattended_smoke_cli;\n",
+                    encoding="utf-8",
+                )
+                (checkout / "src-tauri/Cargo.toml").write_text(
+                    '[package]\nname="codefactory"\n[lib]\nname="codefactory_lib"\n',
+                    encoding="utf-8",
+                )
+
             self.assertEqual(validate_trust_root_immutability(candidate, policy), [])
             changed = candidate / TRUST_ROOT_FILES[0]
             changed.write_text("weakened\n", encoding="utf-8")
