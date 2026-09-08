@@ -854,13 +854,14 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         }
         Ok(serde_json::json!({
             "ok": true,
-            "scenario_ids": ["E2E-002", "E2E-003", "E2E-007", "E2E-012"],
+            "scenario_ids": ["E2E-002", "E2E-003", "E2E-007"],
             "build_git_sha": option_env!("CODEFACTORY_BUILD_GIT_SHA").unwrap_or("unknown"),
             "process_restart_count": 10,
             "abandoned_objective_reaped_across_restart": true,
             "terminal_objective_orphan_receipt_swept": true,
             "sweeps_are_idempotent": true,
             "sweep_timer_oracle_status": "supervisor_cadence_covered_by_unit_wiring_only",
+            "abandoned_phase_registry_status": "runs_on_every_pr_but_not_yet_registered_as_HLT-006_E2E-012",
             "stop_request_was_hard_killed": true,
             "same_objective": same_objective,
             "continuation_objective_count": continuation_objective_count,

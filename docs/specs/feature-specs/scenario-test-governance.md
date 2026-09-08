@@ -95,16 +95,16 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 ## 分类
 
 <!-- scenario-registry-summary:start -->
-- 逻辑 Scenario：`29`（P0 `15`，P1 `14`，P2 `0`）
-- Complex E2E：`12`（implemented `0`，partially_implemented `11`，designed `1`）
-- 剩余自动化缺口：`28`
-- PR slice：implemented `11`，partially_implemented `0`，missing `1`
+- 逻辑 Scenario：`28`（P0 `14`，P1 `14`，P2 `0`）
+- Complex E2E：`11`（implemented `0`，partially_implemented `10`，designed `1`）
+- 剩余自动化缺口：`26`
+- PR slice：implemented `10`，partially_implemented `0`，missing `1`
 <!-- scenario-registry-summary:end -->
 
 <!-- scenario-registry-categories:start -->
 | 分类 | 总数 | P0 | P1 | P2 |
 | --- | ---: | ---: | ---: | ---: |
-| 长任务连续性与恢复 (`long_task_continuity`) | 6 | 6 | 0 | 0 |
+| 长任务连续性与恢复 (`long_task_continuity`) | 5 | 5 | 0 | 0 |
 | 对话协作与交付 (`conversation_delivery`) | 2 | 1 | 1 | 0 |
 | 工作区与会话体验 (`workspace_session`) | 9 | 1 | 8 | 0 |
 | 内容输入与呈现 (`content_rendering`) | 2 | 0 | 2 | 0 |
@@ -162,7 +162,6 @@ Scenario-Test: HLT-003, HLT-004
 | E2E-009 | dirty 旧分支根目录上的新代码任务全程隔离并安全交付 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-010 | 同机 Skill 命令失败后自主诊断、修正并完成 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-011 | DeliveryRun 本地提交掉线续接与外来身份有界停泊 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
-| E2E-012 | 会话停摆与遗留回执跨重启收敛为可见故障 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
 <!-- scenario-registry-cases:end -->
 
 完整 step、fixture 和 oracle 以机器注册表为准。
