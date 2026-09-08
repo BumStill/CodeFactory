@@ -1,5 +1,11 @@
 # 场景测试完整补全长任务记录
 
+## 当前进展（通俗版）
+
+已经修好了测试结果格式不一致、可能把不完整结果误判为通过的问题，新检查程序已合入，原来的保护已恢复。现在通过普通 PR 在 Windows 和 Mac 上实际复测，确认新检查程序能用。
+
+所有场景还没有补完：复杂场景仍有 26 项缺口，主要在真实界面操作、浏览器异常恢复、完整交付过程和安装升级。下面的技术记录用于核对证据，不把“检查程序升级完成”说成“所有测试补齐”。
+
 ## Basics
 
 - Task ID: CF-SCENARIO-COMPLETION-20260902
@@ -9,14 +15,14 @@
 
 ## Completion Standard
 
-- Done means: registry 中 27 个 active Scenario 全部绑定可执行 target；11 个 Complex E2E 均为 `implemented`，`remaining_gaps=0`，PR slice 11/11 implemented；PR/nightly/release 的 stage-required oracle、cleanup、exact SHA/artifact identity 和真实 L3/L4 证据全部通过；trusted implementation digest 与线上 ruleset 已经外部 bootstrap 并复核。
+- Done means: registry 中全部 active Scenario 绑定可执行 target（数量从 registry 派生）；11 个 Complex E2E 均为 `implemented`，`remaining_gaps=0`，PR slice 11/11 implemented；PR/nightly/release 的 stage-required oracle、cleanup、exact SHA/artifact identity 和真实 L3/L4 证据全部通过；trusted implementation digest 与线上 ruleset 已经外部 bootstrap 并复核。
 - Blocked means: 已完成所有不依赖外部控制面的实现与验证，但 external governance bootstrap、Windows/macOS runner、公开签名产物或受管 Chrome 环境连续无法取得；必须保留失败 receipt、准确的 `not live` 边界和下一条可执行动作。
 
 ## Current State
 
-- Current phase: Bootstrap-1a 可信升级 PR #508 迁移预检已补 registry/validator/planner 版本契约；等待新 HEAD CI 和针对完整 13 文件差异的最小迁移批准
+- Current phase: Bootstrap-1a / #508 已合入，原始规则集已恢复；非空 Windows/macOS canary 随本记录所在普通 PR 执行
 - Current checkpoint: M0/#502、M1a/#503、M1b/#504 均已合入 `main`。#505 最小路由修复合入后，#504 作为全量 canary 通过 111/111 target（Windows 102、macOS 9）和全部六项 required checks，合并提交为 `05461f19c62cb90e592defd0c53fc78c4996835e`；两个已完成 worktree 已按 PR 证据回收，用户主 checkout 未修改。详见 `docs/evidence-packs/scenario-runner-bootstrap-2026-09-07.md`。
-- Next owner: #507 已以 `b7f65f5fb149f8f792e73460f76781cb8d4f63c0` 合入，69/69 exact-head target 和六项 required checks 通过，所属 clean worktree 已回收。#508 同步 main 后的 `331eb9f1e79138b8be6ea00c74d530cbf8fd2cd6` 五项普通 required checks 全通过；独立预检随后发现 registry/validator 仍要求 v1、executor 已为 v2，先以四个新增测试方法复现 26 个失败断言，再统一严格版本合同。20 项执行测试、29 项 receipt 测试、本地 290 项回归与治理校验通过；旧实现的真实 binary→case→aggregate 和 Linux 313 项结果保留为历史证据，不冒充本次新 HEAD 验证。下一步取得新 HEAD CI、新批准后才可迁移、恢复规则集，并以非空 canary 验证 110 targets 和一个 Windows E2E-001 v2 case（按新基线重新计算）。上一轮 #505 的批准不授权本轮迁移。
+- Next owner: #508 已获本轮最小迁移授权；同步 #510/#509 后，以 head `7bbc4f2dc96551ea01d286ac3ef80922e851db2b` 通过五项普通检查，合并为 `fc2432658b87993b8af10df0cc416f594218e6ac`。约 12.1 秒窗口后，原始六项保护精确恢复，标准 verify 为 converged。下一步核验当前普通 canary 的 exact-head 非空回执与六项检查；新基线预期 113 targets（Windows 104、macOS 9）、一个 Windows E2E-001 v2 case，须由实际计划复算。通过后继续桌面可执行性验证与 E2E-004 PR slice，不重复请求或执行已完成的 #508 迁移。细节见 `docs/evidence-packs/scenario-case-trusted-bootstrap-2026-09-08.md`。
 - Updated at: 2026-09-08
 
 ## Completed Items
@@ -31,12 +37,13 @@
 - M1b 已先加入失败优先 Rust 测试：因缺少 `scenario_case_observation` 模块稳定编译失败；实现后 3 项集成测试覆盖 legacy 字段兼容、失败 receipt 隐私和派生结果 fail closed。
 - M1b/#504 已合并；正式 Windows canary 实际观察到 hard kill、worker reap、不同进程恢复、零后代/泄漏、单用户消息和零人工 prompt。执行 run `34074235813`、gate run `34074234233` 均成功；该证据只完成非 UI 切片。
 - #507 已合并 canonical CLI 和真实跨平台 Skill symlink 测试：首轮 Windows 55 targets 的唯一失败为 Unix-only 目标零执行，修复后新计划 Windows 60/macOS 9 全通过；独立 QA 确认该命名测试实际 1 passed、0 ignored，并验证完整 schema v1 aggregate 无缺失、重复或多余目标。
-- #508 迁移前独立 QA 发现 receipt 版本声明漂移；失败优先修复后，registry 与 direct planner 均拒绝缺失/旧版/非法类型，即使零 target 也不放行。变更保留在升级 PR 中，未动线上 ruleset，未提升任何完整 case 状态。
+- #508 迁移前独立 QA 发现 receipt 版本声明漂移；失败优先修复后，registry 与 direct planner 均拒绝缺失/旧版/非法类型，即使零 target 也不放行。升级现已合入，未提升任何完整 case 状态；网络中断时自动恢复保护的实际路径和成功后的完整恢复均已验证。
 
 ## Remaining Items
 
-- Bootstrap-1a：先普通 PR 固定正式 binary 的首个 CLI 分发入口，再由独立 PR 升级现有 execution receipt 为 v2，绑定 E2E-001 driver/verifier/fixture、原始观察值与实际 runner，补齐临时回执目录清理和严格集合校验。升级 PR 本地/非门禁 CI 通过不能算线上生效；仍须新批准、最小迁移、恢复规则集及 exact-head canary。
+- Bootstrap-1a：入口、执行回执 v2、可信摘要、原始观测重算、目录清理与严格集合校验已随 #507/#508 合入；剩余收尾为完整保护下的非空 exact-head canary 及独立回执复核，不能把只读预检或零目标计划记为完成。
 - Bootstrap-1 后续：可信 catalog 接入、桌面 feasibility probe、E2E-004 PR slice；只能在真实证据满足后完成相应里程碑。
+- 本轮发现的报告标签偏差：Chrome attach smoke 在 debug binary 上硬编码 `exact_release_artifact`。先修正生产者与消费方的证据边界，保留真实运行断言，不把调试版结果计作正式安装包验收。
 - M2：补 E2E-001/002/003/007/011 的真实 WebView、旧 schema、停止/恢复/停泊 UI 和 exact release canary。
 - M3：补 E2E-010 的二进制 hard-kill nightly、isolated CodeFactoryDev required canary 与安装版单消息 canary。
 - M4：补 E2E-004/009 的 fake forge、完整交付链、worktree reservation CAS hard kill 和双会话并发。
@@ -61,7 +68,7 @@
 - context scope: registry、scenario validator/runner、PR/nightly/release workflow、现有 smoke、桌面验证脚本和公开交付证据；不读取生产聊天正文、真实 session/objective ID 或凭据。
 - assumptions: 沿用同一 Harness；低层 slice 不等于完整 case；fixture 只用 synthetic data；候选自报 outcome 不构成可信 oracle。
 - review point: QA 复核 M0/M1 contract；桌面技术评审决定 feasibility probe；治理评审划分普通 PR 与 external bootstrap，并审计 target implementation digest。
-- validation result: M0/M1a/M1b 已合并，最小路由 bootstrap 已恢复并通过 111 个 target canary。Bootstrap-1a 新测试先因缺少 case plan/adapter 失败；独立 QA 实证发现入口截获、Cargo runner 覆盖、bool/int 混淆及重复 target 假绿，逐项补充拒绝测试。新升级尚未进入默认分支 judge，registry 状态和 L3/L4 缺口保持不变。
+- validation result: M0/M1a/M1b 已合并，旧最小路由 bootstrap 已通过 111 个 target canary。Bootstrap-1a 的入口、配置、类型、隐私、重复结果和版本漂移问题均已补失败优先测试，#508 已进入默认分支 judge，原始保护恢复。新基线非空 canary 随本 PR 验证，完整 case 状态和 L3/L4 缺口保持不变。
 
 ## Stop Boundary
 
