@@ -1006,6 +1006,10 @@ async fn load_chrome_attachment_fixture_extension(
 
 #[cfg(not(test))]
 pub fn run_browser_chrome_attach_smoke_cli() -> bool {
+    // The runtime proves native bridge behavior, not where its executable came
+    // from. Only the external artifact verifier can attest release provenance.
+    const EVIDENCE_LEVEL: &str = "native_runtime_smoke";
+
     let mut args = std::env::args();
     let _program = args.next();
     let Some(flag) = args.next() else {
@@ -1040,7 +1044,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 errors::AppError::Other(
-                    "CODEFACTORY_BROWSER_CHROME_FIXTURE must be 'managed' or name the Chrome for Testing executable used by the release smoke"
+                    "CODEFACTORY_BROWSER_CHROME_FIXTURE must be 'managed' or name the Chrome for Testing executable used by the runtime smoke"
                         .into(),
                 )
             })?;
@@ -1140,7 +1144,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             .await
         {
             return Err(errors::AppError::Other(
-                "Chrome fixture did not connect to the exact-artifact extension bridge within 40 seconds"
+                "Chrome fixture did not connect to the native extension bridge within 40 seconds"
                     .into(),
             ));
         }
@@ -1215,7 +1219,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             } else {
                 "failed"
             },
-            "evidence_level": "exact_release_artifact",
+            "evidence_level": EVIDENCE_LEVEL,
             "native_tool": "browser_session",
             "connection_kind": "attached_chrome",
             "browser_fixture_version": browser_fixture_version,
@@ -1255,7 +1259,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
             let receipt = serde_json::json!({
                 "scenario_id": "RTE-003",
                 "status": "failed",
-                "evidence_level": "exact_release_artifact",
+                "evidence_level": EVIDENCE_LEVEL,
                 "error": error.to_string(),
             });
             let _ = std::fs::write(

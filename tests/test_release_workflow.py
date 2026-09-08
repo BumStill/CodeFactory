@@ -891,6 +891,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("scripts/verify-macos-release-artifact.sh", published_job)
         self.assertIn("macos-published-release-gui-evidence", published_job)
 
+    def test_chrome_attach_runtime_receipts_do_not_claim_artifact_provenance(self) -> None:
+        source = (REPO_ROOT / "src-tauri/src/lib.rs").read_text(encoding="utf-8")
+        runtime = source.split("pub fn run_browser_chrome_attach_smoke_cli() -> bool {", 1)[1]
+        runtime = runtime.split("pub fn run_headless_smoke_cli() -> bool {", 1)[0]
+        self.assertTrue(
+            'const EVIDENCE_LEVEL: &str = "native_runtime_smoke";' in runtime,
+            "the native smoke must declare runtime-only evidence scope",
+        )
+        self.assertEqual(runtime.count('"evidence_level":'), 2)
+        self.assertEqual(runtime.count('"evidence_level": EVIDENCE_LEVEL'), 2)
+        self.assertNotIn("exact_release_artifact", runtime)
+        self.assertNotIn("exact-artifact extension bridge", runtime)
+        self.assertNotIn("used by the release smoke", runtime)
+
     def test_macos_chrome_attach_gate_uses_the_exact_installed_artifact(self) -> None:
         """RTE-003 must run before the temporary DMG install is removed.
 
