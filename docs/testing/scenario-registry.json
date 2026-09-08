@@ -114,7 +114,7 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs"],
-      "automated_by": ["rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "binary:--delivery-recovery-smoke"],
+      "automated_by": ["rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "binary:--delivery-recovery-smoke", "rust:new_completion_evidence_mints_a_new_signature_and_a_fresh_budget", "rust:completion_evidence_gate_rejection_counts_as_no_progress"],
       "required_evidence": ["L0", "L1", "L2"],
       "gates": ["pull_request", "nightly"]
     },
@@ -125,7 +125,7 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
-      "automated_by": ["rust:arbitrary_real_user_message_links_the_unique_open_objective", "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident", "binary:--history-session-smoke"],
+      "automated_by": ["rust:arbitrary_real_user_message_links_the_unique_open_objective", "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident", "binary:--history-session-smoke", "rust:a_continuation_steer_keeps_a_standing_delivery_grant", "rust:a_continuation_steer_does_not_revoke_the_sessions_delivery_grant"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -147,9 +147,20 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/tool_backend.rs", "src-tauri/src/commands/chat.rs", "src-tauri/src/commands/session.rs", "src/stores/chat.ts", "src/stores/chatEvents.ts", "src/lib/turnOwnership.ts", "src/components/MessageList.tsx", "src/pages/Workspace/WorkspacePage.tsx", "src/acceptance/turn-handback.tsx", "scripts/verify-turn-handback-headless.mjs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs"],
-      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/pages/Workspace/WorkspacePage.systemStop.test.tsx", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke"],
+      "automated_by": ["rust:invalid_plan_revision_never_poison_receipts_or_the_next_tool", "rust:rejected_invocation_with_unchanged_workspace_terminalizes_its_receipt", "rust:completion_accepts_cancelled_receipt_only_for_a_failed_tool_call", "rust:corrected_skill_command_closes_requested_observable_without_repeat_probes", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:poll_once_publishes_a_parked_incident_instead_of_dropping_it", "rust:message_page_projects_unified_objective_state_into_turn_activity", "path:src/stores/chatEvents.test.ts", "path:src/stores/chat.hydration.test.ts", "path:src/pages/Workspace/WorkspacePage.systemStop.test.tsx", "pnpm:test:turn-handback:headless", "binary:--history-session-smoke", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke", "rust:quoted_shell_metacharacters_stay_inside_one_read_only_segment", "rust:quoting_never_launders_a_mutating_segment", "rust:read_only_flag_checks_read_flags_not_substrings", "rust:gh_read_only_queries_count_as_verification", "rust:a_technical_failure_keeps_a_bounded_redacted_copy_of_its_error_text", "rust:unsettled_receipts_on_a_terminal_objective_are_swept"],
       "required_evidence": ["L0", "L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
+    },
+    {
+      "id": "HLT-006",
+      "name": "停摆的 Objective 变成可见故障而不是无限进行中",
+      "category": "long_task_continuity",
+      "priority": "P0",
+      "source_kind": "anonymized_history_shape",
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/history_session_smoke.rs", "src-tauri/src/agent/tool_backend.rs"],
+      "automated_by": ["rust:an_abandoned_active_objective_is_reaped_into_a_visible_failure", "rust:unsettled_receipts_on_a_terminal_objective_are_swept", "binary:--history-session-smoke"],
+      "required_evidence": ["L0", "L1", "L2", "L4"],
+      "gates": ["pull_request", "release_artifact"]
     },
     {
       "id": "CXD-001",
@@ -717,6 +728,29 @@
       "automated_by": ["rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:committed_branch_update_recovers_from_merged_pr_ref_after_head_branch_deletion_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke", "workflow:Verify Windows release executable DeliveryRun recovery"],
       "pull_request_gate": {"status": "implemented", "required_targets": ["rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:committed_branch_update_recovers_from_merged_pr_ref_after_head_branch_deletion_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "rust:parked_objective_makes_its_linked_delivery_run_unclaimable", "binary:--delivery-recovery-smoke", "workflow:Delivery recovery cross-process smoke"], "remaining_gaps": []},
       "remaining_gaps": ["L3 正式桌面会话内尚未把本场景 synthetic DeliveryRun 绑定到可见 spinner/Stop/停泊文案自动验收", "macOS 公开安装包中的 --delivery-recovery-smoke 仍需在 release canary 执行并绑定 exact tag SHA"]
+    },
+    {
+      "id": "E2E-012",
+      "name": "会话停摆与遗留回执跨重启收敛为可见故障",
+      "priority": "P0",
+      "covers": ["HLT-006", "HLT-002", "HLT-005"],
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/history_session_smoke.rs"],
+      "must_remain_unattended": true,
+      "fixture": {"synthetic": true, "shape": "两个 Objective：一个 active 但无 lease/无 remediation/无观察排程且心跳 90 分钟前，一个已终态但仍持 20 天未结算回执"},
+      "steps": ["种入停摆与遗留回执两种形状，随后进程退出", "新进程先证明缺口真实存在：停摆 Objective 无法被常规领取路径看到", "在同一进程内执行两个清扫，并重复一次验证幂等", "再次重启，确认停摆已成为具名故障、已重新进入恢复阶梯，且遗留回执不再计入不确定"],
+      "fault_injection": ["abandoned active objective with no lease, remediation or observation", "stale chat turn heartbeat", "unsettled receipt on a terminal objective", "process restart between seed, sweep and verification"],
+      "oracles": {
+        "ui": ["停摆会话不得继续显示进行中；必须落到 waiting_system 并带具名 failure_code"],
+        "durable_state": ["objectives.status 不再是 active 且 failure_code=objective_progress_stalled", "终态 Objective 上不再存在 started/unknown 回执", "重启后结论不回滚", "user message 总数为 1、human prompt 总数为 0：全程无人参与"],
+        "process": ["seed、sweep、verify 分别由三个独立进程执行，数据库由上一进程写入"],
+        "side_effects": ["同一进程内第二次清扫必须影响 0 行；清扫不得触碰活跃 Objective 的未结算回执"],
+        "delivery": ["receipt JSON 记录 reaped/swept/idempotent 与本用例仍缺的 oracle"]
+      },
+      "execution": {"pull_request": "SQLite 与真实多进程重启", "release_artifact": "正式产物上运行同一批 smoke 阶段"},
+      "automation_status": "partially_implemented",
+      "automated_by": ["binary:--history-session-smoke", "rust:an_abandoned_active_objective_is_reaped_into_a_visible_failure", "rust:unsettled_receipts_on_a_terminal_objective_are_swept"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["binary:--history-session-smoke", "rust:an_abandoned_active_objective_is_reaped_into_a_visible_failure", "rust:unsettled_receipts_on_a_terminal_objective_are_swept"], "remaining_gaps": []},
+      "remaining_gaps": ["L3 真实桌面：尚未在真实 WebView 中观察一个停摆会话自行转为可见故障", "supervisor 的五分钟清扫节奏只有接线级单测覆盖，没有计时器层面的端到端断言"]
     }
   ]
 }

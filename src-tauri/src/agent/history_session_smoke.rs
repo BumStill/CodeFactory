@@ -21,6 +21,7 @@ use uuid::Uuid;
 const CONTINUE_SESSION: &str = "history-continue-session";
 const STOP_SESSION: &str = "history-stop-session";
 const INCIDENT_SESSION: &str = "history-incident-session";
+const ABANDONED_SESSION: &str = "history-abandoned-session";
 const ORIGINAL_INSTRUCTION: &str =
     "实现一个长任务并验证结果；遇到可恢复故障或应用重启时由系统自动恢复，不要等待人工参与。";
 const HISTORY_PADDING: i64 = 12;
@@ -286,6 +287,173 @@ async fn seed_incident_session(pool: &SqlitePool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Replay of the two shapes a 2026-09-08 field report left behind, taken as
+/// anonymised structure only — no session id, message text, path or tool
+/// argument from the real database appears here.
+///
+/// 1. An Objective that stopped while `active`, owning no lease, no live
+///    remediation and no `next_observation_at`, with a chat turn whose
+///    heartbeat is ninety minutes old. Nothing claims it, so no poll can see
+///    it: the real one sat like this for 83 minutes while the UI said 进行中.
+/// 2. An Objective that reached a terminal state still carrying an unsettled
+///    side-effect receipt. Production held five of those aged 17 to 20 days,
+///    and the only remedy on record was editing the database by hand.
+async fn seed_abandoned_session(pool: &SqlitePool) -> anyhow::Result<()> {
+    ensure_session(pool, ABANDONED_SESSION, "Abandoned recovery smoke").await?;
+    let admission = crate::commands::chat::admit_headless_chat_turn(
+        pool,
+        ABANDONED_SESSION,
+        "继续推进既有长任务，并在系统故障时自行恢复。",
+    )
+    .await
+    .map_err(|error| anyhow!(error.to_string()))?;
+    let now = Utc::now().timestamp_millis();
+    let stale = now - 90 * 60_000;
+
+    // Nothing owns it and nothing is scheduled to look at it again.
+    sqlx::query(
+        "UPDATE objectives
+         SET lease_owner=NULL, lease_expires_at=NULL, next_observation_at=NULL,
+             last_progress_at=?
+         WHERE id=?",
+    )
+    .bind(stale)
+    .bind(&admission.objective.id)
+    .execute(pool)
+    .await?;
+    sqlx::query("UPDATE chat_turn_state SET updated_at=? WHERE objective_id=?")
+        .bind(stale)
+        .bind(&admission.objective.id)
+        .execute(pool)
+        .await?;
+
+    // A terminal Objective in the same session, still holding an unsettled
+    // receipt that no ladder will ever come back for.
+    sqlx::query(
+        "INSERT INTO objectives
+         (id, revision, kind, status, decision_type, domain,
+          requested_acceptance, cancellation_provenance, completed_at,
+          created_surface, created_at, updated_at)
+         VALUES ('history-abandoned-terminal', 1, 'informational', 'cancelled',
+                 'cancelled', 'chat', 'informational_answer',
+                 'explicit_cancel', ?, 'smoke', ?, ?)",
+    )
+    .bind(stale)
+    .bind(stale)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO side_effect_receipts
+         (id, objective_id, revision, action_fingerprint, idempotency_key,
+          status, created_at, observed_at)
+         VALUES ('history-abandoned-orphan-receipt', 'history-abandoned-terminal',
+                 1, 'sha256:abandoned-orphan', 'sha256:abandoned-orphan-key',
+                 'unknown', ?, ?)",
+    )
+    .bind(now - 20 * 24 * 3_600_000)
+    .bind(now - 20 * 24 * 3_600_000)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A fresh process, a database written by an earlier one: prove the gap is real
+/// from here, then prove the sweeps close it.
+async fn sweep_abandoned_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
+    let store = ObjectiveStore::new(pool.clone());
+    let stalled: String =
+        sqlx::query_scalar("SELECT id FROM objectives WHERE session_id=? AND status='active'")
+            .bind(ABANDONED_SESSION)
+            .fetch_one(pool)
+            .await?;
+
+    // The gap itself: the ordinary claim path cannot see this Objective at all.
+    let claims = store
+        .claim_due_remediation_batch("history-abandoned-probe", 8, 30_000)
+        .await?;
+    if claims.claims.iter().any(|claim| claim.objective.id == stalled) {
+        bail!("fixture is wrong: the stalled Objective was already claimable");
+    }
+
+    let reaped = store
+        .reap_stalled_active_objectives(super::objective::STALLED_ACTIVE_OBJECTIVE_MS)
+        .await?;
+    if reaped.len() != 1 || reaped[0].id != stalled {
+        bail!(
+            "expected exactly the stalled Objective to be reaped, got {:?}",
+            reaped.iter().map(|o| o.id.as_str()).collect::<Vec<_>>()
+        );
+    }
+    if reaped[0].failure_code.as_deref() != Some(super::objective::OBJECTIVE_PROGRESS_STALLED) {
+        bail!("a reaped Objective must carry the stalled failure code");
+    }
+
+    let swept = store.cancel_receipts_on_terminal_objectives().await?;
+    if swept != 1 {
+        bail!("expected one orphaned receipt to be cancelled, got {swept}");
+    }
+    // Both sweeps are idempotent: a second pass in the same process changes
+    // nothing, which is what makes running them on a timer safe.
+    if !store
+        .reap_stalled_active_objectives(super::objective::STALLED_ACTIVE_OBJECTIVE_MS)
+        .await?
+        .is_empty()
+        || store.cancel_receipts_on_terminal_objectives().await? != 0
+    {
+        bail!("sweeps are not idempotent");
+    }
+    Ok(())
+}
+
+/// One more restart: the settlement has to be durable, not a projection that
+/// re-opens when the next process hydrates.
+async fn verify_abandoned_settled(pool: &SqlitePool) -> anyhow::Result<()> {
+    let (status, failure_code, claimable): (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT objective.status, objective.failure_code,
+                (SELECT COUNT(*) FROM objective_remediations remediation
+                 WHERE remediation.objective_id=objective.id
+                   AND remediation.status IN ('queued','waiting','claimed'))
+         FROM objectives objective
+         WHERE objective.session_id=? AND objective.id<>'history-abandoned-terminal'",
+    )
+    .bind(ABANDONED_SESSION)
+    .fetch_one(pool)
+    .await?;
+    if status == "active" {
+        bail!("a swept Objective must not go back to claiming it is running");
+    }
+    if failure_code.as_deref() != Some(super::objective::OBJECTIVE_PROGRESS_STALLED) {
+        bail!("the stall must survive the restart as a named failure");
+    }
+    if claimable == 0 {
+        bail!("a reaped Objective must re-enter the recovery ladder, not merely stop");
+    }
+    let uncertain: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM side_effect_receipts
+         WHERE objective_id='history-abandoned-terminal'
+           AND status IN ('started','unknown')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if uncertain != 0 {
+        bail!("a terminal Objective must stop poisoning its own id across restarts");
+    }
+    // The E2E-001 baseline, asserted rather than asserted-about: the whole
+    // sweep must happen with no one at the keyboard. One seeded user message,
+    // and never a second — a recovery that needs someone to type 继续 is the
+    // failure this fixture exists to catch.
+    let user_messages: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'")
+            .bind(ABANDONED_SESSION)
+            .fetch_one(pool)
+            .await?;
+    if user_messages != 1 {
+        bail!("unattended baseline broken: user message 总数为 {user_messages}, expected 1");
+    }
+    Ok(())
+}
+
 async fn seed(pool: &SqlitePool) -> anyhow::Result<()> {
     // Exhaust the incident fixture before seeding the independent continue/stop
     // Objectives. The recovery claimant is intentionally global, so relying on
@@ -521,6 +689,9 @@ pub(crate) async fn run_worker(state_dir: &Path, phase: &str) -> anyhow::Result<
         "stop-request" => request_stop_then_crash(&pool, state_dir).await,
         "verify-stop" => verify_cancelled(&pool, 1).await,
         "verify-stop-again" => verify_cancelled(&pool, 0).await,
+        "seed-abandoned" => seed_abandoned_session(&pool).await,
+        "sweep-abandoned" => sweep_abandoned_after_restart(&pool).await,
+        "verify-abandoned" => verify_abandoned_settled(&pool).await,
         _ => bail!("unknown history-session worker phase {phase}"),
     };
     crate::storage::db::close_and_release_files(pool).await;
@@ -599,12 +770,21 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             pids.push(run_phase(&root, phase).await?);
         }
         pids.push(run_stop_request_fault(&root).await?);
-        for phase in ["verify-stop", "verify-stop-again", "verify-incident-again"] {
+        for phase in [
+            "verify-stop",
+            "verify-stop-again",
+            "verify-incident-again",
+            // Appended last, and scoped to their own session, so replaying the
+            // 2026-09-08 shapes cannot perturb the oracles above.
+            "seed-abandoned",
+            "sweep-abandoned",
+            "verify-abandoned",
+        ] {
             pids.push(run_phase(&root, phase).await?);
         }
         pids.sort_unstable();
         pids.dedup();
-        if pids.len() != 8 {
+        if pids.len() != 11 {
             bail!("history-session smoke did not observe distinct worker processes");
         }
 
@@ -674,9 +854,13 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         }
         Ok(serde_json::json!({
             "ok": true,
-            "scenario_ids": ["E2E-002", "E2E-003", "E2E-007"],
+            "scenario_ids": ["E2E-002", "E2E-003", "E2E-007", "E2E-012"],
             "build_git_sha": option_env!("CODEFACTORY_BUILD_GIT_SHA").unwrap_or("unknown"),
-            "process_restart_count": 7,
+            "process_restart_count": 10,
+            "abandoned_objective_reaped_across_restart": true,
+            "terminal_objective_orphan_receipt_swept": true,
+            "sweeps_are_idempotent": true,
+            "sweep_timer_oracle_status": "supervisor_cadence_covered_by_unit_wiring_only",
             "stop_request_was_hard_killed": true,
             "same_objective": same_objective,
             "continuation_objective_count": continuation_objective_count,
