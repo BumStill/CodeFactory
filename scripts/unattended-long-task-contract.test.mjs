@@ -177,7 +177,7 @@ test("the exact Windows release executable repeats the same contract", async () 
 });
 
 test("history-derived scenarios use the unified synthetic registry", async () => {
-  const [catalog, redirect, agent, delivery, deliveryRun, deliveryTool, objective, toolBackend, chat, trajectory, skills, loop, ci, nightly, release] = await Promise.all([
+  const [catalog, redirect, agent, delivery, deliveryRun, deliveryTool, objective, toolBackend, chat, trajectory, skills, loop, dispatch, interjections, agentCore, historySmoke, supervisor, ci, nightly, release] = await Promise.all([
     source("docs/testing/scenario-registry.json"),
     source("docs/testing/history-derived-long-task-scenarios.json"),
     source("src-tauri/src/agent/mod.rs"),
@@ -190,6 +190,15 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
     source("src-tauri/src/trajectory.rs"),
     source("src-tauri/src/commands/skills.rs"),
     source("src-tauri/crates/agent-loop/src/run.rs"),
+    // Scenario automation is not confined to the files this list happened to
+    // start with. A target living anywhere else read as "missing automation",
+    // which pushes the next author toward deleting the declaration rather than
+    // widening the search — the opposite of what this contract is for.
+    source("src-tauri/src/agent/dispatch.rs"),
+    source("src-tauri/src/commands/interjections.rs"),
+    source("src-tauri/crates/agent-core/src/lib.rs"),
+    source("src-tauri/src/agent/history_session_smoke.rs"),
+    source("src-tauri/src/agent/objective_supervisor.rs"),
     source(".github/workflows/ci.yml"),
     source(".github/workflows/unattended-long-task-nightly.yml"),
     source(".github/workflows/release.yml"),
@@ -224,7 +233,7 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
     ),
     "every scenario must name an executable automation target",
   );
-  const implementation = `${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}`;
+  const implementation = `${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${trajectory}\n${skills}\n${loop}\n${dispatch}\n${interjections}\n${agentCore}\n${historySmoke}\n${supervisor}\n${ci}\n${nightly}\n${release}`;
   for (const scenario of parsed.scenarios.filter((item) => legacy.scenario_ids.includes(item.id))) {
     for (const automation of scenario.automated_by) {
       const target = automation.slice(automation.indexOf(":") + 1);
