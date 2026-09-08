@@ -15,10 +15,17 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::objective::{ClaimedRemediation, ObjectiveSnapshot, ObjectiveStore, RecoveryDomain};
+use super::objective::{
+    ClaimedRemediation, ObjectiveSnapshot, ObjectiveStore, RecoveryDomain,
+    STALLED_ACTIVE_OBJECTIVE_MS,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LEASE_MS: i64 = 60_000;
+/// The stalled-Objective sweep is a table scan, and nothing it looks for can
+/// change in five seconds. Run it on its own slow cadence inside the same loop:
+/// once every 60 polls, i.e. every five minutes.
+const STALL_SWEEP_EVERY_POLLS: u32 = 60;
 const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const UNHANDLED_REOBSERVE_MS: i64 = 15_000;
 
@@ -1162,6 +1169,7 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             ),
         }
         let store = ObjectiveStore::new(pool.clone());
+        let mut polls_since_stall_sweep = 0_u32;
         loop {
             let Some(state) = app.try_state::<crate::AppState>() else {
                 tracing::error!("objective supervisor stopped: application state is unavailable");
@@ -1200,6 +1208,47 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             .await
             {
                 tracing::warn!(%error, "objective supervisor poll failed");
+            }
+            // Everything above claims DUE REMEDIATIONS. An Objective that
+            // stopped while `active` owns none, so no poll can ever see it —
+            // that is precisely how a session becomes invisible rather than
+            // failed. Sweep for those separately and hand each one to the
+            // ordinary recovery ladder, which can resume it or, failing that,
+            // settle it into a fault the user can actually see.
+            polls_since_stall_sweep += 1;
+            if polls_since_stall_sweep >= STALL_SWEEP_EVERY_POLLS {
+                polls_since_stall_sweep = 0;
+                match store
+                    .reap_stalled_active_objectives(STALLED_ACTIVE_OBJECTIVE_MS)
+                    .await
+                {
+                    Ok(reaped) => {
+                        for objective in reaped {
+                            tracing::warn!(
+                                objective_id = %objective.id,
+                                domain = ?objective.domain,
+                                "reaped an abandoned active Objective: no lease, \
+                                 no live remediation, no scheduled observation"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "stalled Objective sweep failed");
+                    }
+                }
+                // A receipt on a terminal Objective can never be settled by
+                // anyone, but the mutation fence still counts it. Production
+                // held five of these for as long as twenty days.
+                match store.cancel_receipts_on_terminal_objectives().await {
+                    Ok(0) => {}
+                    Ok(swept) => tracing::info!(
+                        swept,
+                        "cancelled unsettled receipts left on terminal Objectives"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "terminal-Objective receipt sweep failed");
+                    }
+                }
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
