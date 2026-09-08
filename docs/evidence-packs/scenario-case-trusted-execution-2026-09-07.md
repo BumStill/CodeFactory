@@ -14,12 +14,13 @@ Bootstrap-1a 的 case planner/adapter/executor/aggregate/final verifier 本地�
 4. 独立 QA 找到 Cargo runner 配置绕过；extensionless 配置负例先失败，保护配置及拒绝新变体后通过。
 5. 非 case 字段夹带私密原文、`detail={}` 触发 TypeError 均有反例；现输出安全字段或匿名失败诊断。
 6. tracked tree 变脏和 Cargo 构建缺少 `--locked` 的负例先失败；修复后拒绝源树漂移和隐式锁文件更新。
+7. 2026-09-08 独立预检发现 execution envelope 已是 v2，但 registry 与 validator 仍要求 v1；旧 validator 还把 `true` 当作 v1，planner 则忽略该字段。新增四个测试方法先产生 26 个失败断言，再将 registry、validator 与 planner 统一为严格整数 v2。缺失、旧版、未来版、bool、float、string、object、list，以及空计划路径均有拒绝测试；修复后四个方法全部通过。
 
 ## 本地测试
 
-- 新 case execution 测试 **19/19**：含真正的 driver 文件束、symlink 父目录、CLI 前缀、Cargo 配置/入口、实际 HEAD/平台、完整集合、畸形输入、隐私、非零退出和临时目录回收。
+- 新 case execution 测试 **20/20**：含真正的 driver 文件束、symlink 父目录、CLI 前缀、Cargo 配置/入口、实际 HEAD/平台、完整集合、畸形输入、隐私、非零退出、临时目录回收和 registry 版本漂移阻断。
 - receipt contract **29/29**。
-- 可运行的 Python discovery 测试集 **286/286**。唯一未装载的模块为 `test_codefactory_bench_agent`：本机没有 Harbor；临时 Python 3.12 环境安装 `harbor==0.15.0` 的依赖下载超时，离线缓存不完整。未修改系统 Python，也未把该模块记作通过；完整含 Harbor 的验证由升级 PR 的 `agent-bridge-linux` required check 补齐。
+- 2026-09-08 本机可运行的 Python 测试集 **290/290**（16 个模块，36.993 秒）。唯一未装载的模块为 `test_codefactory_bench_agent`：本机没有 Harbor；此前临时 Python 3.12 环境安装 `harbor==0.15.0` 的依赖下载超时，离线缓存不完整。未修改系统 Python，也未把该模块记作本地通过；完整含 Harbor 的验证由升级 PR 的 `agent-bridge-linux` required check 补齐。
 - governance baseline 与 `git diff --check` 通过。
 - 前置入口的实际 Rust 分发测试、正式 binary failure-receipt 测试、真实成功 smoke 与 TypeScript 检查，见前置 PR evidence pack。
 
@@ -50,9 +51,10 @@ Bootstrap-1a 的 case planner/adapter/executor/aggregate/final verifier 本地�
 - #508 实现版 head `5ee2c1ea95b6c1cee0b5b41cd4188b661b791f97` 的五项普通 required checks 全通过。[CI run 34102604063](https://github.com/BumStill/CodeFactory/actions/runs/34102604063) 的 Linux 完整集报告 313 项：303 通过，10 项 macOS 专用测试跳过，后者已由本地 macOS 286 项集覆盖；Harbor 相关模块不再是未验证项。
 - 同一 #508 实现版 head 又执行真实本地定向 probe：source/build SHA 均为 `5ee2c1ea95b6c1cee0b5b41cd4188b661b791f97`，target/case passed、errors 为空、四类非 UI oracle 与 cleanup 通过。仍标记 `local_targeted_integration_not_github_attestation`，不冒充线上新 judge 证明。
 - [旧 gate run 34102604124](https://github.com/BumStill/CodeFactory/actions/runs/34102604124) 仅报告 `run_scenario_harness_gate.py` 与 `scenario_execution.py` 两个既有 trust-root 文件不可在普通 PR 中自修改。该拒绝符合设计；五项普通检查通过不授权旁路合并。
-- #508 已同步 #507 合入后的 main，最终差异只保留 11 个可信升级/测试/文档文件。同步提交改变 HEAD，必须重新审查其 exact-head CI，不能复用上一 head 的绿灯作为合并依据。
+- #508 同步 #507 合入后的 head `331eb9f1e79138b8be6ea00c74d530cbf8fd2cd6`，五项普通 required checks 全通过：[CI run 34104816654](https://github.com/BumStill/CodeFactory/actions/runs/34104816654)、[baseline run 34104816747](https://github.com/BumStill/CodeFactory/actions/runs/34104816747)、[GUI run 34104800407](https://github.com/BumStill/CodeFactory/actions/runs/34104800407)。旧 `scenario-gate-pr` 仍拒绝信任根自修改。这是版本漂移修复前的历史证据，不作为新 HEAD 的合并依据。
+- 2026-09-08 迁移预检修复 registry/validator v1 与 executor v2 的矛盾后，差异扩为 13 文件、四个既有 trust-root 文件。registry 仅升级 execution receipt 声明，不改变路由、状态或缺口；raw observation/fixture/capability v1 保持不变。新 HEAD 的五项普通 required checks 必须重新取得，旧 judge 也应拒绝新增的 registry/validator 自修改。
 
-下一步：待用户另行批准仅针对 #508 的最小 bootstrap，且最终 exact-head 五项普通 required checks 全绿后，迁移并立即恢复原规则集，再用新默认分支 canary 验证 schema v2 receipt。完整 11 case、真实 WebView、release/nightly 及任意敌对构建代码的 OS 级隔离均未在本证据中宣称完成；registry 仍为 10 个部分实现、1 个设计中、26 项 remaining gaps。
+下一步：待用户另行批准针对 #508 最新 13 文件差异的最小 bootstrap，且最终 exact-head 五项普通 required checks 全绿后，迁移并立即恢复原规则集。使用设计中的 `package.json` 脚本 canary 产生非空计划；当前预期 110 targets（Windows 101、macOS 9）与一个 Windows E2E-001 schema v2 case，必须从新 base/head 复算并实际执行，不能以 docs-only 的零目标绿灯替代。完整 11 case、真实 WebView、release/nightly 及任意敌对构建代码的 OS 级隔离均未在本证据中宣称完成；registry 仍为 10 个部分实现、1 个设计中、26 项 remaining gaps。
 
 ## AI Collaboration
 

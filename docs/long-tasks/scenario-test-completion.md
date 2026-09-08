@@ -14,10 +14,10 @@
 
 ## Current State
 
-- Current phase: Bootstrap-1a 可信升级 PR #508 已提交；普通前置 #507 已合入，等待新的最小迁移批准
+- Current phase: Bootstrap-1a 可信升级 PR #508 迁移预检已补 registry/validator/planner 版本契约；等待新 HEAD CI 和针对完整 13 文件差异的最小迁移批准
 - Current checkpoint: M0/#502、M1a/#503、M1b/#504 均已合入 `main`。#505 最小路由修复合入后，#504 作为全量 canary 通过 111/111 target（Windows 102、macOS 9）和全部六项 required checks，合并提交为 `05461f19c62cb90e592defd0c53fc78c4996835e`；两个已完成 worktree 已按 PR 证据回收，用户主 checkout 未修改。详见 `docs/evidence-packs/scenario-runner-bootstrap-2026-09-07.md`。
-- Next owner: #507 已以 `b7f65f5fb149f8f792e73460f76781cb8d4f63c0` 合入，69/69 exact-head target 和六项 required checks 通过，所属 clean worktree 已回收。#508 已同步该 main；实现版五项普通 required checks 通过，新的同步提交仍需重跑 CI。19 项新执行测试、29 项 receipt 测试、本地 286 项回归与实际 binary→case→aggregate 通过；Linux CI 313 项中 303 通过、10 项 macOS-only 跳过。旧 gate 正确拒绝两个 trust-root 文件自修改。下一步仅在新批准及 exact-head 普通 CI 全绿后，执行最小迁移、恢复规则集和 schema v2 canary。上一轮 #505 的批准不授权本轮迁移。
-- Updated at: 2026-09-07
+- Next owner: #507 已以 `b7f65f5fb149f8f792e73460f76781cb8d4f63c0` 合入，69/69 exact-head target 和六项 required checks 通过，所属 clean worktree 已回收。#508 同步 main 后的 `331eb9f1e79138b8be6ea00c74d530cbf8fd2cd6` 五项普通 required checks 全通过；独立预检随后发现 registry/validator 仍要求 v1、executor 已为 v2，先以四个新增测试方法复现 26 个失败断言，再统一严格版本合同。20 项执行测试、29 项 receipt 测试、本地 290 项回归与治理校验通过；旧实现的真实 binary→case→aggregate 和 Linux 313 项结果保留为历史证据，不冒充本次新 HEAD 验证。下一步取得新 HEAD CI、新批准后才可迁移、恢复规则集，并以非空 canary 验证 110 targets 和一个 Windows E2E-001 v2 case（按新基线重新计算）。上一轮 #505 的批准不授权本轮迁移。
+- Updated at: 2026-09-08
 
 ## Completed Items
 
@@ -31,6 +31,7 @@
 - M1b 已先加入失败优先 Rust 测试：因缺少 `scenario_case_observation` 模块稳定编译失败；实现后 3 项集成测试覆盖 legacy 字段兼容、失败 receipt 隐私和派生结果 fail closed。
 - M1b/#504 已合并；正式 Windows canary 实际观察到 hard kill、worker reap、不同进程恢复、零后代/泄漏、单用户消息和零人工 prompt。执行 run `34074235813`、gate run `34074234233` 均成功；该证据只完成非 UI 切片。
 - #507 已合并 canonical CLI 和真实跨平台 Skill symlink 测试：首轮 Windows 55 targets 的唯一失败为 Unix-only 目标零执行，修复后新计划 Windows 60/macOS 9 全通过；独立 QA 确认该命名测试实际 1 passed、0 ignored，并验证完整 schema v1 aggregate 无缺失、重复或多余目标。
+- #508 迁移前独立 QA 发现 receipt 版本声明漂移；失败优先修复后，registry 与 direct planner 均拒绝缺失/旧版/非法类型，即使零 target 也不放行。变更保留在升级 PR 中，未动线上 ruleset，未提升任何完整 case 状态。
 
 ## Remaining Items
 

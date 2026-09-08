@@ -22,7 +22,7 @@
   },
   "execution_policy": {
     "workflow": ".github/workflows/scenario-execution.yml",
-    "receipt_schema_version": 1,
+    "receipt_schema_version": 2,
     "default_runner": "windows-latest",
     "target_runners": {
       "binary:--browser-chrome-attach-smoke": "macos-14",

@@ -117,6 +117,32 @@ class ScenarioRegistryTests(unittest.TestCase):
         self.assertGreaterEqual(len(registry["scenarios"]), 18)
         self.assertGreaterEqual(len(registry["complex_e2e_cases"]), 6)
 
+    def test_registry_and_executor_use_the_same_execution_receipt_schema(self) -> None:
+        registry = load_registry(REGISTRY_PATH)
+        declared = registry["execution_policy"]["receipt_schema_version"]
+        self.assertIs(type(declared), int)
+        self.assertEqual(declared, 2)
+        self.assertEqual(declared, scenario_execution.SCHEMA_VERSION)
+
+    def test_registry_accepts_execution_receipt_schema_v2(self) -> None:
+        registry = load_registry(REGISTRY_PATH)
+        registry["execution_policy"]["receipt_schema_version"] = 2
+        self.assertEqual(validate_registry(registry, REPO_ROOT), [])
+
+    def test_registry_rejects_missing_or_non_v2_execution_receipt_schema(self) -> None:
+        for version in (None, 1, 3, True, False, 2.0, "2", {}, [], "missing"):
+            with self.subTest(version=version):
+                registry = load_registry(REGISTRY_PATH)
+                if version == "missing":
+                    registry["execution_policy"].pop("receipt_schema_version")
+                else:
+                    registry["execution_policy"]["receipt_schema_version"] = version
+                errors = validate_registry(registry, REPO_ROOT)
+                self.assertTrue(
+                    any("execution_policy.receipt_schema_version" in error for error in errors),
+                    errors,
+                )
+
     def test_duplicate_ids_and_unknown_categories_are_rejected(self) -> None:
         registry = load_registry(REGISTRY_PATH)
         broken = json.loads(json.dumps(registry))

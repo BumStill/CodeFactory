@@ -30,7 +30,11 @@ SCRIPT_REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(SCRIPT_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_REPO_ROOT))
 
-from tools.governance.validate_scenario_test_governance import scenario_impact_files
+from tools.governance.validate_scenario_test_governance import (
+    EXECUTION_RECEIPT_SCHEMA_VERSION,
+    scenario_impact_files,
+    validate_execution_receipt_schema,
+)
 from tools.governance.scenario_case_execution import (
     build_case_entry,
     build_case_plans,
@@ -39,7 +43,7 @@ from tools.governance.scenario_case_execution import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = EXECUTION_RECEIPT_SCHEMA_VERSION
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SUPPORTED_RUNNERS = {"windows-latest", "macos-14"}
 GLOBAL_PRODUCT_FILES = {
@@ -91,6 +95,7 @@ def build_execution_plan(
     if not SHA_PATTERN.fullmatch(head_sha):
         blockers.append("execution plan head SHA must be a full lowercase commit SHA")
     policy = _execution_policy(registry)
+    blockers.extend(validate_execution_receipt_schema(policy))
     excluded = set(policy.get("pull_request_excluded_targets") or [])
 
     for scenario in registry.get("scenarios") or []:

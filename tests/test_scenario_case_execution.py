@@ -37,6 +37,25 @@ def raw() -> dict:
 
 
 class TrustedCaseExecutionTests(unittest.TestCase):
+    def test_planner_blocks_invalid_registry_schema_even_without_selected_targets(self):
+        for changed_files in (["docs/notes.md"], ["src-tauri/src/agent/unattended_smoke.rs"]):
+            for version in (None, 1, 3, True, False, 2.0, "2", {}, [], "missing", "missing_policy"):
+                with self.subTest(changed_files=changed_files, version=version):
+                    registry = json.loads((ROOT / "docs/testing/scenario-registry.json").read_text())
+                    if version == "missing_policy":
+                        registry.pop("execution_policy")
+                    elif version == "missing":
+                        registry["execution_policy"].pop("receipt_schema_version")
+                    else:
+                        registry["execution_policy"]["receipt_schema_version"] = version
+                    selected = execution.build_execution_plan(
+                        registry, changed_files, base_sha=BASE, head_sha=HEAD,
+                    )
+                    self.assertTrue(
+                        any("execution_policy.receipt_schema_version" in error for error in selected["blockers"]),
+                        selected["blockers"],
+                    )
+
     def test_dirty_candidate_cannot_claim_exact_head_execution(self):
         selected = plan()
         def git(command, **kwargs):
@@ -127,6 +146,7 @@ class TrustedCaseExecutionTests(unittest.TestCase):
 
     def test_selected_binary_requires_one_case_even_when_selected_via_scenario(self):
         actual = plan()
+        self.assertEqual(actual["blockers"], [])
         self.assertEqual(len(actual["case_plans"]), 1)
         case = actual["case_plans"][0]
         expected = case["expectation"]
@@ -142,6 +162,7 @@ class TrustedCaseExecutionTests(unittest.TestCase):
     def test_unrelated_plan_has_no_case_or_runner(self):
         registry = json.loads((ROOT / "docs/testing/scenario-registry.json").read_text())
         actual = execution.build_execution_plan(registry, ["docs/notes.md"], base_sha=BASE, head_sha=HEAD)
+        self.assertEqual(actual["blockers"], [])
         self.assertEqual(actual["case_plans"], [])
         self.assertEqual(actual["runners"], {})
 

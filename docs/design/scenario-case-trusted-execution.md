@@ -15,13 +15,15 @@
 
 | 阶段 | 输入与动作 | 拒绝条件 |
 | --- | --- | --- |
-| trusted plan | base registry 按 diff 选择 target；只要选到 canonical binary（含 alias），恰好生成一个 E2E-001 case plan | 缺实现文件、alias 跨平台、fixture 无效 |
+| trusted plan | base registry 按 diff 选择 target；只要选到 canonical binary（含 alias），恰好生成一个 E2E-001 case plan | registry 回执版本不匹配、缺实现文件、alias 跨平台、fixture 无效 |
 | unprivileged execute | 重新生成计划；检查实际 HEAD、OS/arch、受保护 driver 摘要及入口；执行正式 binary | 修改计划、入口改向、错误平台、driver 变化、退出非零 |
 | runner receipt | 保存白名单、严格类型的 raw 投影及 case receipt；成功/失败都清理临时回执目录 | 缺字段、错误类型、清理失败、回执不完整 |
 | trusted aggregate | runner/target/case 完整唯一集合；由 base adapter 从 raw 重算 receipt | 缺失、重复、多余、错 SHA/runner、候选声明与重算不一致 |
 | independent await | 重新生成 base/head plan，从 exact-head workflow artifact 再次重算 | 旧 schema、错误执行 run、缺 artifact、修改后的结果 |
 
 execution envelope 升为 schema v2；case receipt 继续使用 M1a 的 schema v2。旧 execution v1 不作隐式降级兼容，迁移后的 canary 必须使用新默认分支重新执行。
+
+`execution_policy.receipt_schema_version` 必须是整数 `2`，registry validator 和 planner 共用同一个版本常量与严格类型校验。缺失、v1、未来版本、bool、浮点、字符串或容器值均阻断；即使 diff 未选中任何 target，也不能以空计划绕过该契约。raw observation、fixture manifest 和 capability 的 schema v1 属于独立格式，不随 execution envelope 升级。
 
 PR build identity 绑定实际 checkout HEAD 与 `CODEFACTORY_BUILD_GIT_SHA`，formal smoke 的编译时 SHA 必须相同。执行前后检查 tracked tree 不得变脏，并使用 Cargo `--locked` 禁止构建时悄悄改变锁文件。Python 入口要求 3.11 以上（CI 为 3.11/3.12）。PR 的 executable/artifact digest、tag 与 version 留空，明确不提供安装包身份保证；release 的更高要求不因此放宽。
 
@@ -51,3 +53,7 @@ runner policy 固定 Windows x86_64 与 macOS aarch64，并在实际执行进程
 必须覆盖 source/entry/config 改向、缺失/重复/错误平台、类型混淆、伪造 passed、修改 raw 后重哈希、隐私旁路、非零退出和清理失败。先在本地通过 Python 负例与正式 binary 的真实 hard-kill/重启/幂等/清理路径，再提交独立升级 PR。
 
 线上迁移前必须展示完整差异、前置 PR 和 CI 证据及用户批准范围。只临时移除必要的 `scenario-gate-pr`，保留其他五项 required checks、strict/active/no-bypass 与 PR 保护，merge 后在 finally 恢复原始规则集并读回对账；随后用新基线 canary 验证 exact-head、完整 target 集合和 E2E-001 重算。未完成迁移与 canary 时状态必须为 **not live**。
+
+2026-09-08 独立预检补上版本声明漂移后，#508 审批差异为 13 个文件，其中修改四个既有 trust root：`docs/testing/scenario-registry.json`、`tools/governance/validate_scenario_test_governance.py`、`tools/governance/scenario_execution.py`、`tools/governance/run_scenario_harness_gate.py`。registry 只把 execution receipt 版本从 1 改为 2，不提升 case 状态、不改 target 路由；不得沿用此前仅含 11 文件差异的审查结论。
+
+迁移后的非空 canary 方案：在 `package.json` 增加可复用的 `test:scenario-platform` 脚本，调用 `node scripts/cargo-shared.mjs test --manifest-path src-tauri/Cargo.toml --test scenario_target_platform`。当前 planner 预期为 27 scenarios、110 targets（Windows 101、macOS 9）与恰好一个 Windows E2E-001 case，blockers 为空；执行时须按新 base/head 重新生成并核对，不硬编码旧计数。Windows 须提供 raw → case → aggregate → independent gate 的完整重算证据；macOS 九个目标不是 macOS E2E-001 PR 覆盖。纯文档 canary 的零目标计划不能作为迁移成功证据。
