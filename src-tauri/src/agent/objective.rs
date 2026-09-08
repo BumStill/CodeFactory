@@ -10039,6 +10039,129 @@ mod tests {
         );
     }
 
+    /// A second user-driven generation may retry the work, but it must not
+    /// re-print the same system-incident notice every time it exhausts again.
+    /// The visible message is written once per Objective; later generations
+    /// reuse it instead of spamming the transcript.
+    #[tokio::test]
+    async fn reprompt_after_exhaustion_does_not_repeat_the_incident_notice() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE messages (
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+               content TEXT NOT NULL, completion_state TEXT, created_at INTEGER NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               revision INTEGER NOT NULL DEFAULT 1,
+               phase TEXT NOT NULL DEFAULT 'working',
+               status TEXT NOT NULL,
+               recent_activity_kind TEXT,
+               recent_activity_label TEXT,
+               waiting_reason TEXT,
+               updated_at INTEGER NOT NULL DEFAULT 0,
+               completed_at INTEGER,
+               terminal_reason TEXT,
+               turn_settled_at INTEGER,
+               stream_closed_at INTEGER,
+               terminal_revision INTEGER,
+               objective_revision INTEGER,
+               visible_final_message_id TEXT,
+               visible_final_kind TEXT,
+               next_action TEXT,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-notice-once").await;
+        let signature = "sha256:notice-once-same-failure";
+
+        while current.failure_code.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED) {
+            current = route_technical_failure(
+                &store,
+                &current,
+                "completion_evidence_incomplete",
+                signature,
+            )
+            .await;
+        }
+        assert_parked_system_incident(&current);
+
+        let original_root_turn_id = current.root_turn_id.clone().unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, status, objective_id)
+             VALUES (?, ?, 'waiting_system', ?),
+                    ('turn-notice-once-reprompt', ?, 'active', NULL)",
+        )
+        .bind(&original_root_turn_id)
+        .bind(current.session_id.as_deref().unwrap())
+        .bind(&current.id)
+        .bind(current.session_id.as_deref().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let reopened = store
+            .ensure_or_continue_chat_objective(
+                current.session_id.as_deref().unwrap(),
+                "turn-notice-once-reprompt",
+                Some(&original_root_turn_id),
+                current.kind,
+                &current.requested_acceptance,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened.status, ObjectiveStatus::Active);
+
+        let mut current_generation = reopened;
+        while current_generation.failure_code.as_deref()
+            != Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        {
+            current_generation = route_technical_failure(
+                &store,
+                &current_generation,
+                "completion_evidence_incomplete",
+                signature,
+            )
+            .await;
+        }
+        assert_parked_system_incident(&current_generation);
+
+        let notice_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE content LIKE '本回合的自动恢复已达到安全上限%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            notice_count, 1,
+            "the system-incident notice must be written once per objective, not once per generation"
+        );
+        let distinct_notices: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT visible_final_message_id) FROM chat_turn_state
+             WHERE objective_id=? AND visible_final_kind='system_incident'
+               AND visible_final_message_id IS NOT NULL",
+        )
+        .bind(&current_generation.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            distinct_notices, 1,
+            "later generations must reuse the original incident notice"
+        );
+    }
+
     async fn exhausted_reprompt_compatibility_fixture(
         user_reprompt_driver: Option<&str>,
     ) -> (SqlitePool, ObjectiveStore, String) {
