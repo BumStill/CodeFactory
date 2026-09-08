@@ -43,6 +43,7 @@
 
 - Bootstrap-1a：入口、执行回执 v2、可信摘要、原始观测重算、目录清理与严格集合校验已随 #507/#508 合入；剩余收尾为完整保护下的非空 exact-head canary 及独立回执复核，不能把只读预检或零目标计划记为完成。
 - Bootstrap-1 后续：可信 catalog 接入、桌面 feasibility probe、E2E-004 PR slice；只能在真实证据满足后完成相应里程碑。
+- 本轮发现的报告标签偏差：Chrome attach smoke 在 debug binary 上硬编码 `exact_release_artifact`。先修正生产者与消费方的证据边界，保留真实运行断言，不把调试版结果计作正式安装包验收。
 - M2：补 E2E-001/002/003/007/011 的真实 WebView、旧 schema、停止/恢复/停泊 UI 和 exact release canary。
 - M3：补 E2E-010 的二进制 hard-kill nightly、isolated CodeFactoryDev required canary 与安装版单消息 canary。
 - M4：补 E2E-004/009 的 fake forge、完整交付链、worktree reservation CAS hard kill 和双会话并发。
