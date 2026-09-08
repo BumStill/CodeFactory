@@ -57,5 +57,5 @@
 ## 后续门禁
 
 本地提交使用正常 pre-commit 同步和 canonical scenario hook；提交前 fresh fetch，必要时 merge 最新 main 后重新验证。独立复核通过后，由主执行者继续普通 PR、CI 和合并；不启动 GUI，不绕过场景门禁。测试改动不单独触发产品发版。
-实际 `delivery.rs` 的 change_patterns 命中 HLT-001、HLT-002、HLT-005、CXD-002。普通 PR 应显式声明 `Scenario-Test: E2E-004, CXD-001, CXD-002, HLT-001, HLT-002, HLT-005`，并再次用可信 base 的计划核对实际影响。Windows 进程 job/临时 Git 路径分支尚未在本机验证；现有 `check-rust` 的全包 `cargo test` 会执行本模块，应交 Windows runner，不把 Mac 通过视为跨平台完成。
+实际 `delivery.rs` 的 change_patterns 命中 HLT-001、HLT-002、HLT-005、CXD-002。普通 PR 声明 `Scenario-Test: CXD-001, CXD-002, HLT-001, HLT-002, HLT-005`，并再次用可信 base 的计划核对实际影响。此字段只接受业务 scenario IDs，E2E-004 的前置关系和 E2E-001/011 的已有回归关系写在正文与机器执行计划，不能将 E2E 编号混入声明。#516 首轮两个治理失败已实际指出 unknown E2E IDs；在本地用 trusted base 的 pull_request 入口先复现拒绝，再修正声明，不修改 validator。Windows 进程 job/临时 Git 路径分支尚未在本机验证；现有 `check-rust` 的全包 `cargo test` 会执行本模块，应交 Windows runner，不把 Mac 通过视为跨平台完成。
 测试策略采用分层验收：基础持久化红灯、生产交付函数行为、独立进程恢复；不把夹具自检替代业务完成证据。
