@@ -799,6 +799,27 @@ fn browser_observation_plan(
     })
 }
 
+/// The same wait, with a named cause attached.
+///
+/// `external_state_uncertain` used to arrive as one opaque sentence, so a loop
+/// around it left no trace of WHICH prior effect was still unsettled or how
+/// long it had been that way — on 2026-09-08 four Objectives cycled through
+/// this fence and the transcript could not distinguish one round from the next.
+/// The detail rides in `metadata`, which is machine-readable and never shown to
+/// the user as prose.
+fn waiting_result_with_detail(
+    command: &str,
+    kind: ToolKind,
+    code: &str,
+    detail: serde_json::Value,
+) -> ToolInvocationResult {
+    let mut result = waiting_result(command, kind, code);
+    if let Some(serde_json::Value::Object(metadata)) = result.metadata.as_mut() {
+        metadata.insert("blocked_by".into(), detail);
+    }
+    result
+}
+
 fn waiting_result(command: &str, kind: ToolKind, code: &str) -> ToolInvocationResult {
     let (content, next_action) = match code {
         // Naming the family matters: the old wording described the gate rather
@@ -1640,26 +1661,37 @@ impl DesktopToolBackend {
             }
         }
 
-        let uncertain: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM side_effect_receipts
+        // Name the oldest blocker, not just the count: a fence that reports
+        // only "something is uncertain" makes every round of a loop look
+        // identical, which is exactly why 2026-09-08 took a database audit to
+        // explain.
+        let blocker: Option<(String, i64, i64)> = sqlx::query_as(
+            "SELECT id, status = 'unknown', created_at FROM side_effect_receipts
              WHERE objective_id=? AND binding_id=?
-               AND status IN ('started','unknown')",
+               AND status IN ('started','unknown')
+             ORDER BY created_at
+             LIMIT 1",
         )
         .bind(&objective_id)
         .bind(&binding_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|error| ToolError {
             message: format!("inspect uncertain mutation receipts: {error}"),
         })?;
-        if uncertain > 0 {
+        if let Some((receipt_id, is_unknown, created_at)) = blocker {
             tx.commit().await.map_err(|error| ToolError {
                 message: format!("commit uncertain mutation attribution: {error}"),
             })?;
-            return Ok(MutationAdmission::Waiting(waiting_result(
+            return Ok(MutationAdmission::Waiting(waiting_result_with_detail(
                 command,
                 kind,
                 "external_state_uncertain",
+                serde_json::json!({
+                    "receipt_id": receipt_id,
+                    "receipt_status": if is_unknown == 1 { "unknown" } else { "started" },
+                    "unsettled_ms": chrono::Utc::now().timestamp_millis() - created_at,
+                }),
             )));
         }
 
