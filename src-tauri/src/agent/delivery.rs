@@ -9177,6 +9177,10 @@ impl DeliveryRemote for GithubRemote {
 }
 
 #[cfg(test)]
+#[path = "delivery_scenario_tests.rs"]
+mod scenario_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
