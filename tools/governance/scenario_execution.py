@@ -30,10 +30,20 @@ SCRIPT_REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(SCRIPT_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_REPO_ROOT))
 
-from tools.governance.validate_scenario_test_governance import scenario_impact_files
+from tools.governance.validate_scenario_test_governance import (
+    EXECUTION_RECEIPT_SCHEMA_VERSION,
+    scenario_impact_files,
+    validate_execution_receipt_schema,
+)
+from tools.governance.scenario_case_execution import (
+    build_case_entry,
+    build_case_plans,
+    validate_case_entry,
+    validate_case_execution_inputs,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = EXECUTION_RECEIPT_SCHEMA_VERSION
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SUPPORTED_RUNNERS = {"windows-latest", "macos-14"}
 GLOBAL_PRODUCT_FILES = {
@@ -85,6 +95,7 @@ def build_execution_plan(
     if not SHA_PATTERN.fullmatch(head_sha):
         blockers.append("execution plan head SHA must be a full lowercase commit SHA")
     policy = _execution_policy(registry)
+    blockers.extend(validate_execution_receipt_schema(policy))
     excluded = set(policy.get("pull_request_excluded_targets") or [])
 
     for scenario in registry.get("scenarios") or []:
@@ -141,6 +152,15 @@ def build_execution_plan(
         item["node"] = item["node"] or kind in {"path", "pnpm", "node-command"}
         item["rust"] = item["rust"] or kind in {"rust", "binary"}
 
+    case_plans = []
+    try:
+        case_plans = build_case_plans(
+            targets, runners, policy.get("workflow_aliases") or {},
+            policy_root=SCRIPT_REPO_ROOT, base_sha=base_sha, head_sha=head_sha,
+        )
+    except (OSError, ValueError, KeyError) as error:
+        blockers.append(f"trusted case plan cannot be constructed: {type(error).__name__}")
+
     return {
         "schema_version": SCHEMA_VERSION,
         "base_sha": base_sha,
@@ -150,16 +170,24 @@ def build_execution_plan(
         "e2e_ids": sorted(e2e_ids),
         "required_targets": sorted(targets),
         "runners": runners,
+        "target_aliases": {target: concrete for target, concrete in (policy.get("workflow_aliases") or {}).items() if target in targets},
         "requirements": requirements,
+        "case_plans": case_plans,
         "blockers": sorted(set(blockers)),
     }
 
 
 def validate_aggregate_receipt(
-    plan: dict[str, Any], receipt: dict[str, Any]
+    plan: dict[str, Any], receipt: Any
 ) -> list[str]:
     errors: list[str] = []
-    if receipt.get("schema_version") != SCHEMA_VERSION:
+    if not isinstance(receipt, dict):
+        return ["scenario execution receipt must be an object"]
+    if set(receipt) - {"schema_version", "base_sha", "head_sha", "scenario_ids", "e2e_ids", "targets", "cases", "receipt_errors"}:
+        errors.append("scenario execution receipt has unexpected fields")
+    if plan.get("schema_version") != SCHEMA_VERSION or "case_plans" not in plan:
+        errors.append("scenario execution plan has an unsupported schema version")
+    if type(receipt.get("schema_version")) is not int or receipt.get("schema_version") != SCHEMA_VERSION:
         errors.append("scenario execution receipt has an unsupported schema version")
     if receipt.get("base_sha") != plan.get("base_sha"):
         errors.append("scenario execution receipt base SHA does not match the plan")
@@ -167,16 +195,63 @@ def validate_aggregate_receipt(
         errors.append("scenario execution receipt head SHA does not match the plan")
     if plan.get("blockers"):
         errors.append("scenario execution plan contains blockers")
+    if "receipt_errors" in receipt and not isinstance(receipt["receipt_errors"], list):
+        errors.append("scenario execution diagnostics must be a list")
+    if receipt.get("receipt_errors"):
+        errors.append("scenario execution receipt contains invalid runner artifacts")
+    for field in ("scenario_ids", "e2e_ids"):
+        if receipt.get(field) != plan.get(field):
+            errors.append(f"scenario execution receipt {field} does not match the plan")
 
-    passed = {
-        item.get("target")
-        for item in receipt.get("targets") or []
-        if isinstance(item, dict) and item.get("outcome") == "passed"
-    }
-    for target in plan.get("required_targets") or []:
+    planned = {target: runner for runner, targets in (plan.get("runners") or {}).items()
+               for target in targets}
+    targets = receipt.get("targets")
+    if not isinstance(targets, list):
+        targets = []
+        errors.append("scenario execution targets must be a list")
+    seen: set[str] = set()
+    passed: set[str] = set()
+    for item in targets:
+        if not isinstance(item, dict) or not isinstance(item.get("target"), str):
+            errors.append("scenario execution target entry is malformed")
+            continue
+        target = item["target"]
+        if target in seen or target not in planned:
+            errors.append("duplicate or unplanned execution target")
+            if target not in planned:
+                continue
+        if set(item) - {"target", "outcome", "runner", "command_sha256", "alias_of", "detail"}:
+            errors.append("execution target has unexpected fields")
+        if item.get("alias_of") != plan.get("target_aliases", {}).get(target):
+            errors.append("execution target alias does not match the plan")
+        if "detail" in item and (not isinstance(item["detail"], str) or item["detail"] not in {"target_execution_failed", "case_observations_rejected"}):
+            errors.append("execution target diagnostic must be a safe code")
+        seen.add(target)
+        if item.get("runner") != planned.get(target):
+            errors.append(f"execution target runner does not match the plan: {target}")
+        if item.get("outcome") == "passed":
+            passed.add(target)
+            if not isinstance(item.get("command_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", item["command_sha256"]):
+                errors.append(f"execution command digest is missing or invalid: {target}")
+    for target in plan.get("required_targets", []):
         if target not in passed:
             errors.append(f"missing successful execution receipt for {target}")
-    return errors
+    cases = receipt.get("cases")
+    if not isinstance(cases, list):
+        cases = []
+        errors.append("scenario execution cases must be a list")
+    expected_cases = {case["expectation"]["case_id"]: case for case in plan.get("case_plans", [])}
+    seen_cases = set()
+    for entry in cases:
+        case_id = entry.get("case_id") if isinstance(entry, dict) else None
+        if not isinstance(case_id, str) or case_id not in expected_cases or case_id in seen_cases:
+            errors.append("duplicate, malformed or unplanned case receipt")
+            continue
+        seen_cases.add(case_id)
+        errors.extend(validate_case_entry(entry, expected_cases[case_id]))
+    if seen_cases != set(expected_cases):
+        errors.append("missing required case receipt")
+    return sorted(set(errors))
 
 
 def _git_changed_files(repo: Path, base_sha: str, head_sha: str) -> list[str]:
@@ -234,7 +309,7 @@ def _smoke_passed(flag: str, receipt_path: Path, policy: dict[str, Any]) -> bool
         return False
     oracle = (policy.get("binary_receipt_oracles") or {}).get(flag) or {}
     field = oracle.get("field")
-    return isinstance(field, str) and payload.get(field) == oracle.get("equals")
+    return isinstance(payload, dict) and isinstance(field, str) and payload.get(field) == oracle.get("equals")
 
 
 def _execute_concrete_target(
@@ -271,6 +346,9 @@ def _execute_concrete_target(
             marker,
             str(smoke_receipt),
         ]
+        if marker == "--unattended-long-task-smoke":
+            command[4:4] = ["--bin", "codefactory", "--locked"]
+            env["CODEFACTORY_BUILD_GIT_SHA"] = policy["case_build_head_sha"]
         if marker == "--browser-session-smoke":
             env["CODEFACTORY_BROWSER_HEADLESS"] = "1"
         if marker == "--browser-chrome-attach-smoke":
@@ -300,19 +378,33 @@ def _execute_concrete_target(
     return True, _command_digest(command)
 
 
+def _validate_case_execution_inputs(plan: dict, repo: Path, runner: str) -> list[str]:
+    registry = json.loads((SCRIPT_REPO_ROOT / "docs/testing/scenario-registry.json").read_text(encoding="utf-8"))
+    trusted_plan = build_execution_plan(
+        registry, plan.get("changed_files", []), base_sha=plan.get("base_sha", ""),
+        head_sha=plan.get("head_sha", ""),
+    )
+    errors = [] if plan == trusted_plan else ["execution plan differs from trusted policy recomputation"]
+    errors.extend(validate_case_execution_inputs(trusted_plan, repo, runner, SCRIPT_REPO_ROOT))
+    return errors
+
+
 def execute_plan(plan: dict[str, Any], repo: Path, runner: str) -> dict[str, Any]:
-    policy_path = Path(os.environ.get("SCENARIO_EXECUTION_REGISTRY", ""))
-    if policy_path.is_file():
-        registry = json.loads(policy_path.read_text(encoding="utf-8"))
-    else:
-        registry = json.loads(
-            (repo / "docs/testing/scenario-registry.json").read_text(encoding="utf-8")
-        )
+    registry = json.loads(
+        (SCRIPT_REPO_ROOT / "docs/testing/scenario-registry.json").read_text(encoding="utf-8")
+    )
     policy = _execution_policy(registry)
+    policy["case_build_head_sha"] = plan.get("head_sha")
     aliases = policy.get("workflow_aliases") or {}
     selected = list((plan.get("runners") or {}).get(runner) or [])
     results: dict[str, dict[str, Any]] = {}
+    case_results: dict[str, dict[str, Any]] = {}
+    cases = {case["expectation"]["canonical_target"]: case for case in plan.get("case_plans", [])
+             if case["expectation"]["runner"]["name"] == runner}
     receipt_dir = Path(tempfile.mkdtemp(prefix="scenario-target-receipts-"))
+    execution_errors = _validate_case_execution_inputs(plan, repo, runner)
+    if plan.get("blockers") or plan.get("schema_version") != SCHEMA_VERSION:
+        execution_errors.append("execution plan is blocked or obsolete")
 
     def execute(target: str) -> dict[str, Any]:
         if target in results:
@@ -329,23 +421,47 @@ def execute_plan(plan: dict[str, Any], repo: Path, runner: str) -> dict[str, Any
                 "command_sha256": underlying.get("command_sha256"),
             }
         else:
-            passed, detail = _execute_concrete_target(target, repo, receipt_dir, policy)
+            if execution_errors:
+                passed, detail = False, "case_execution_preflight_failed"
+            else:
+                passed, detail = _execute_concrete_target(target, repo, receipt_dir, policy)
             result = {
                 "target": target,
                 "outcome": "passed" if passed else "failed",
-                ("command_sha256" if passed else "detail"): detail,
+                ("command_sha256" if passed else "detail"): detail if passed else "target_execution_failed",
             }
+            if target in cases:
+                raw_path = receipt_dir / (target.split(":", 1)[1].removeprefix("--") + ".json")
+                try:
+                    raw = json.loads(raw_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    raw = {}
+                entry = build_case_entry(raw, cases[target])
+                case_results[target] = entry
+                case_errors = validate_case_entry({**entry, "runner": runner}, cases[target])
+                case_errors.extend(_validate_case_execution_inputs(plan, repo, runner))
+                if case_errors:
+                    result["outcome"] = "failed"
+                    result["detail"] = "case_observations_rejected"
         results[target] = result
         return result
 
-    for target in selected:
-        execute(target)
+    try:
+        for target in selected:
+            execute(target)
+    finally:
+        try:
+            shutil.rmtree(receipt_dir)
+        except OSError:
+            execution_errors.append("target_receipt_directory_cleanup_failed")
     return {
         "schema_version": SCHEMA_VERSION,
         "base_sha": plan.get("base_sha"),
         "head_sha": plan.get("head_sha"),
         "runner": runner,
         "targets": [results[target] for target in selected],
+        "cases": list(case_results.values()),
+        "receipt_errors": ["runner_execution_failed"] if execution_errors else [],
     }
 
 
@@ -353,25 +469,94 @@ def aggregate_receipts(
     plan: dict[str, Any], receipt_paths: list[Path]
 ) -> dict[str, Any]:
     targets: list[dict[str, Any]] = []
+    cases: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen_runners: set[str] = set()
     for path in receipt_paths:
         try:
             receipt = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            errors.append("runner receipt is unreadable")
             continue
         if (
-            receipt.get("schema_version") == SCHEMA_VERSION
-            and receipt.get("base_sha") == plan.get("base_sha")
-            and receipt.get("head_sha") == plan.get("head_sha")
+            not isinstance(receipt, dict)
+            or type(receipt.get("schema_version")) is not int
+            or receipt.get("schema_version") != SCHEMA_VERSION
+            or receipt.get("base_sha") != plan.get("base_sha")
+            or receipt.get("head_sha") != plan.get("head_sha")
         ):
-            targets.extend(receipt.get("targets") or [])
-    return {
+            errors.append("runner receipt identity or schema does not match the plan")
+            continue
+        if set(receipt) - {"schema_version", "base_sha", "head_sha", "runner", "targets", "cases", "receipt_errors"}:
+            errors.append("runner receipt has unexpected fields")
+        runner = receipt.get("runner")
+        if not isinstance(runner, str) or runner not in plan.get("runners", {}) or runner in seen_runners:
+            errors.append("duplicate or unplanned runner receipt")
+            continue
+        seen_runners.add(runner)
+        if not isinstance(receipt.get("receipt_errors"), list):
+            errors.append("runner receipt diagnostics must be a list")
+        if receipt.get("receipt_errors"):
+            errors.append("runner reported execution or cleanup errors")
+        for field, destination in (("targets", targets), ("cases", cases)):
+            entries = receipt.get(field)
+            if not isinstance(entries, list):
+                errors.append(f"runner {field} must be a list")
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or ("runner" in entry and entry["runner"] != runner):
+                    errors.append(f"runner {field} entry is malformed")
+                    continue
+                if field == "targets":
+                    target = entry.get("target")
+                    if not isinstance(target, str) or target not in plan.get("required_targets", []):
+                        errors.append("unplanned execution target")
+                        continue
+                    if set(entry) - {"target", "outcome", "command_sha256", "alias_of", "detail", "runner"}:
+                        errors.append("execution target has unexpected fields")
+                    if "detail" in entry and (not isinstance(entry["detail"], str) or entry["detail"] not in {"target_execution_failed", "case_observations_rejected"}):
+                        errors.append("execution target diagnostic is invalid")
+                    exported = {"target": target, "outcome": "passed" if entry.get("outcome") == "passed" else "failed", "runner": runner}
+                    digest = entry.get("command_sha256")
+                    if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+                        exported["command_sha256"] = digest
+                    if "alias_of" in entry:
+                        alias = plan.get("target_aliases", {}).get(target)
+                        if entry["alias_of"] != alias:
+                            errors.append("execution target alias does not match the plan")
+                        elif alias is not None:
+                            exported["alias_of"] = alias
+                    if exported["outcome"] == "failed":
+                        exported["detail"] = "target_execution_failed"
+                    destination.append(exported)
+                else:
+                    case = next((case for case in plan.get("case_plans", [])
+                                 if case["expectation"]["case_id"] == entry.get("case_id")), None)
+                    if case is None:
+                        errors.append("unplanned case execution entry")
+                        continue
+                    if validate_case_entry({**entry, "runner": runner}, case):
+                        errors.append("case evidence failed trusted recomputation")
+                    # Re-export only the trusted privacy projection, retaining a
+                    # failure marker if the uploaded claims disagreed with it.
+                    destination.append({**build_case_entry(entry.get("raw_observations"), case), "runner": runner})
+    if seen_runners != set(plan.get("runners", {})):
+        errors.append("missing required runner receipt")
+    aggregate = {
         "schema_version": SCHEMA_VERSION,
         "base_sha": plan.get("base_sha"),
         "head_sha": plan.get("head_sha"),
         "scenario_ids": plan.get("scenario_ids") or [],
         "e2e_ids": plan.get("e2e_ids") or [],
         "targets": targets,
+        "cases": cases,
+        "receipt_errors": ["runner_artifacts_invalid"] if errors else [],
     }
+    # The independent await-github verifier repeats this calculation using a
+    # newly constructed base plan; neither layer trusts an uploaded verdict.
+    errors.extend(validate_aggregate_receipt(plan, aggregate))
+    aggregate["receipt_errors"] = ["aggregate_validation_failed"] if errors else []
+    return aggregate
 
 
 def _github_json(url: str, token: str) -> dict[str, Any]:
@@ -564,7 +749,7 @@ def main() -> int:
         )
         receipt = execute_plan(plan, Path(args.repo), args.runner)
         _write_json(Path(args.output), receipt)
-        return 0 if all(item.get("outcome") == "passed" for item in receipt["targets"]) else 1
+        return 0 if not receipt["receipt_errors"] and all(item.get("outcome") == "passed" for item in receipt["targets"]) else 1
     if args.command == "aggregate":
         plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
         paths = sorted(Path(args.receipts).rglob("runner-receipt.json"))

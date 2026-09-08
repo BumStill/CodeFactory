@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Build and validate privacy-safe Scenario case receipts.
 
-This module is the candidate-side M1 contract implementation.  It deliberately
-does not replace the trusted execution receipt v1 yet: Bootstrap-1 will load the
-same verifier from the default branch, bind its implementation digest, and
-attach case receipts to the existing exact-head aggregate receipt.
+The affected-scenario executor and independent final gate load this adapter
+from the trusted base, bind its implementation digest and recompute the case
+receipt from bounded raw observations. Release and UI evidence remain separate.
 """
 
 from __future__ import annotations
@@ -668,6 +667,11 @@ def _not_required(reason: str) -> dict[str, Any]:
     }
 
 
+def _count_is(raw: dict[str, Any], field: str, expected: int) -> bool:
+    value = raw.get(field)
+    return type(value) is int and value == expected
+
+
 def build_e2e001_case_receipt(
     raw_receipt: dict[str, Any],
     expectation: dict[str, Any],
@@ -686,35 +690,35 @@ def build_e2e001_case_receipt(
     manifest_sha256 = fixture_manifest_digest(manifest)
     raw_identity_ok = all(
         (
-            raw_receipt.get("observation_schema_version") == 1,
+            _count_is(raw_receipt, "observation_schema_version", 1),
             raw_receipt.get("case_id") == "E2E-001",
             raw_receipt.get("scenario_ids") == E2E001_SCENARIO_IDS,
             raw_receipt.get("scenario_id") == "HLT-001",
         )
     )
-    durable_ok = bool(raw_receipt.get("ok")) and raw_identity_ok and all(
+    durable_ok = raw_receipt.get("ok") is True and raw_identity_ok and all(
         (
             raw_receipt.get("same_objective") is True,
-            raw_receipt.get("user_message_count") == 1,
-            raw_receipt.get("human_prompt_count") == 0,
+            _count_is(raw_receipt, "user_message_count", 1),
+            _count_is(raw_receipt, "human_prompt_count", 0),
             raw_receipt.get("objective_status") == "completed",
         )
     )
-    process_ok = bool(raw_receipt.get("ok")) and all(
+    process_ok = raw_receipt.get("ok") is True and all(
         (
             raw_receipt.get("process_restart_observed") is True,
             raw_receipt.get("supervisor_hard_kill_issued") is True,
             raw_receipt.get("worker_reaped") is True,
             raw_receipt.get("replacement_process_distinct") is True,
-            raw_receipt.get("descendant_process_count") == 0,
-            raw_receipt.get("live_owner_count") == 0,
-            raw_receipt.get("claimable_remediation_count") == 0,
+            _count_is(raw_receipt, "descendant_process_count", 0),
+            _count_is(raw_receipt, "live_owner_count", 0),
+            _count_is(raw_receipt, "claimable_remediation_count", 0),
         )
     )
-    side_effects_ok = bool(raw_receipt.get("ok")) and all(
+    side_effects_ok = raw_receipt.get("ok") is True and all(
         (
-            raw_receipt.get("side_effect_receipt_count") == 1,
-            raw_receipt.get("replay_call_link_count") == 2,
+            _count_is(raw_receipt, "side_effect_receipt_count", 1),
+            _count_is(raw_receipt, "replay_call_link_count", 2),
             raw_receipt.get("artifact_verified") is True,
         )
     )
@@ -817,18 +821,18 @@ def build_e2e001_case_receipt(
         "ok": raw_receipt.get("ok") is True,
         "raw_identity_matches": raw_identity_ok,
         "same_objective": raw_receipt.get("same_objective") is True,
-        "single_user_message": raw_receipt.get("user_message_count") == 1,
-        "zero_human_prompt": raw_receipt.get("human_prompt_count") == 0,
-        "single_side_effect_receipt": raw_receipt.get("side_effect_receipt_count") == 1,
-        "two_replay_links": raw_receipt.get("replay_call_link_count") == 2,
+        "single_user_message": _count_is(raw_receipt, "user_message_count", 1),
+        "zero_human_prompt": _count_is(raw_receipt, "human_prompt_count", 0),
+        "single_side_effect_receipt": _count_is(raw_receipt, "side_effect_receipt_count", 1),
+        "two_replay_links": _count_is(raw_receipt, "replay_call_link_count", 2),
         "objective_completed": raw_receipt.get("objective_status") == "completed",
-        "no_live_owner": raw_receipt.get("live_owner_count") == 0,
-        "no_claimable_remediation": raw_receipt.get("claimable_remediation_count") == 0,
+        "no_live_owner": _count_is(raw_receipt, "live_owner_count", 0),
+        "no_claimable_remediation": _count_is(raw_receipt, "claimable_remediation_count", 0),
         "process_restart_observed": raw_receipt.get("process_restart_observed") is True,
         "supervisor_hard_kill_issued": raw_receipt.get("supervisor_hard_kill_issued") is True,
         "worker_reaped": raw_receipt.get("worker_reaped") is True,
         "replacement_process_distinct": raw_receipt.get("replacement_process_distinct") is True,
-        "zero_descendants": raw_receipt.get("descendant_process_count") == 0,
+        "zero_descendants": _count_is(raw_receipt, "descendant_process_count", 0),
         "artifact_verified": raw_receipt.get("artifact_verified") is True,
         "cleanup_attempted": cleanup_attempted,
         "orphan_sweep_performed": orphan_sweep_performed,
