@@ -9,28 +9,37 @@ export const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 // catalog failure never removes subscription models from the product.
 export const CHATGPT_FALLBACK_MODELS: CustomModel[] = [
   {
-    id: "gpt-5.6-sol",
-    name: "GPT-5.6 Sol",
+    id: "gpt-6-astra",
+    name: "GPT-6-Astra",
     context_length: 272000,
-    max_context_length: 272000,
+    max_context_length: 872000,
+    effective_context_window_percent: 95,
+    default_reasoning_effort: "medium",
+    supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  {
+    id: "gpt-5.6-sol",
+    name: "GPT-5.6-Sol",
+    context_length: 272000,
+    max_context_length: 872000,
     effective_context_window_percent: 95,
     default_reasoning_effort: "low",
     supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
   },
   {
     id: "gpt-5.6-terra",
-    name: "GPT-5.6 Terra",
+    name: "GPT-5.6-Terra",
     context_length: 272000,
-    max_context_length: 272000,
+    max_context_length: 872000,
     effective_context_window_percent: 95,
     default_reasoning_effort: "medium",
     supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
   },
   {
     id: "gpt-5.6-luna",
-    name: "GPT-5.6 Luna",
+    name: "GPT-5.6-Luna",
     context_length: 272000,
-    max_context_length: 272000,
+    max_context_length: 872000,
     effective_context_window_percent: 95,
     default_reasoning_effort: "medium",
     supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
@@ -45,17 +54,8 @@ export const CHATGPT_FALLBACK_MODELS: CustomModel[] = [
     supported_reasoning_efforts: ["low", "medium", "high", "xhigh"],
   },
   {
-    id: "gpt-5.4",
-    name: "GPT-5.4",
-    context_length: 272000,
-    max_context_length: 1000000,
-    effective_context_window_percent: 95,
-    default_reasoning_effort: "medium",
-    supported_reasoning_efforts: ["low", "medium", "high", "xhigh"],
-  },
-  {
     id: "gpt-5.4-mini",
-    name: "GPT-5.4 Mini",
+    name: "GPT-5.4-Mini",
     context_length: 272000,
     max_context_length: 272000,
     effective_context_window_percent: 95,
@@ -64,7 +64,12 @@ export const CHATGPT_FALLBACK_MODELS: CustomModel[] = [
   },
 ];
 
-export const CHATGPT_DEFAULT_MODEL = CHATGPT_FALLBACK_MODELS[0].id;
+// Pinned deliberately rather than derived from the snapshot's first entry.
+// The snapshot's job is to mirror the live catalog; the default's job is a
+// product choice. Deriving one from the other meant that refreshing the
+// snapshot silently moved every new install onto whatever model the server
+// happened to list first — changing the default should be its own decision.
+export const CHATGPT_DEFAULT_MODEL = "gpt-5.6-sol";
 
 export function selectChatGptCatalog(live: CustomModel[] | null | undefined): CustomModel[] {
   return live && live.length > 0 ? live : CHATGPT_FALLBACK_MODELS;

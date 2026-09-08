@@ -165,7 +165,12 @@ describe("SettingsPage keychain handling", () => {
     render(<SettingsPage onBack={() => {}} />);
 
     await waitFor(() => expect(mocks.applyCodexModels).toHaveBeenCalled());
-    expect(mocks.applyCodexModels.mock.calls[0]?.[0]?.[0]?.id).toBe("gpt-5.6-sol");
+    const applied = mocks.applyCodexModels.mock.calls[0]?.[0] ?? [];
+    // Offline falls back to the bundled snapshot, which mirrors the live
+    // catalog — so it must still carry the newest subscription model rather
+    // than whatever was newest when the file was last edited.
+    expect(applied[0]?.id).toBe("gpt-6-astra");
+    expect(applied.map((model: { id: string }) => model.id)).toContain("gpt-5.6-sol");
   });
 
   it("preserves the last successful catalog and model selection while offline", async () => {

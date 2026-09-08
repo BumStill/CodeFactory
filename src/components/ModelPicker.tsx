@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import { ChevronDown, Sparkles } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
+import { refreshChatGptCatalogIfStale } from "../stores/chatgptCatalog";
 import { invoke } from "../lib/tauri";
 import { ReasoningEffortPicker } from "./ReasoningEffortPicker";
 
@@ -77,6 +78,26 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
     setOpen(false);
     triggerRef.current?.focus();
   }, []);
+
+  // Opening the menu is the one moment the list has to be right, so it is
+  // also the moment to ask the server. The catalog was otherwise fetched only
+  // at startup and on the Settings page: an app left running never learned
+  // about a newly published model, and re-picking the endpoint only re-read
+  // what startup had already written. The call is TTL-guarded, single-flight,
+  // and returns immediately when signed out.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    // `activeEndpoint` is declared below this effect, so resolve the same
+    // expression here rather than reading it from the temporal dead zone.
+    const endpoint = activeSession?.endpoint_id ?? settings?.default_endpoint ?? "openrouter";
+    void refreshChatGptCatalogIfStale().then(() => {
+      if (!cancelled) void loadModels(endpoint);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, activeSession?.endpoint_id, settings?.default_endpoint, loadModels]);
 
   useEffect(() => {
     if (!open) return;
