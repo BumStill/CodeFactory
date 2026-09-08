@@ -11,6 +11,15 @@ def secret_expressions(text):
             if re.search(r"\bsecrets\s*(?:\.|\[)", expression, re.I)]
 
 
+def unsupported_job_references(text):
+    environment = text.split("    env:\n", 1)[1].split("    steps:\n", 1)[0]
+    expressions = re.findall(r"\$\{\{(.*?)\}\}", environment, re.S)
+    # A deliberately narrow contract for this workflow, not a general Actions
+    # expression parser. No composite expressions or other contexts are needed.
+    return [expression for expression in expressions
+            if re.fullmatch(r"\s*github\.(?:workspace|event\.pull_request\.head\.sha)\s*", expression) is None]
+
+
 class NativeObserverWorkflowTests(unittest.TestCase):
     def workflow(self):
         return (ROOT / ".github/workflows/native-desktop-observer.yml").read_text()
@@ -31,6 +40,26 @@ class NativeObserverWorkflowTests(unittest.TestCase):
         self.assertEqual(secret_expressions("paths: ['src-tauri/src/secrets.rs']"), [])
         for expression in ["${{ secrets.TOKEN }}", "${{ secrets['TOKEN'] }}", "${{ SECRETS.TOKEN }}"]:
             self.assertTrue(secret_expressions(expression))
+
+    def test_job_environment_uses_only_available_contexts_and_ignored_private_paths(self):
+        text = self.workflow()
+        environment = text.split("    env:\n", 1)[1].split("    steps:\n", 1)[0]
+        # GitHub rejects runner.* in jobs.<job>.env before any step can run.
+        expressions = re.findall(r"\$\{\{(.*?)\}\}", environment, re.S)
+        self.assertTrue(expressions)
+        self.assertEqual(unsupported_job_references(text), [])
+        for suffix in ["STATE", "CONFIG", "DRIVER", "RAW", "PUBLIC"]:
+            self.assertIn("CODEFACTORY_OBSERVER_" + suffix + ": ${{ github.workspace }}/.codefactory-cache/", environment)
+        self.assertIn(".codefactory-cache/", (ROOT / ".gitignore").read_text())
+
+    def test_job_context_contract_rejects_composite_and_alias_forms_without_banning_step_contexts(self):
+        for reference in ["runner.temp", "RUNNER.TEMP", "runner['temp']",
+                          "format('{0}', runner.temp)", "github.workspace || runner.temp"]:
+            text = "    env:\n      EXAMPLE: ${{ " + reference + " }}\n    steps:\n"
+            with self.subTest(reference=reference):
+                self.assertTrue(unsupported_job_references(text))
+        self.assertEqual(unsupported_job_references("    env:\n      EXAMPLE: ${{ github.workspace }}\n"
+                                                  "    steps:\n      with: ${{ runner.temp }}\n"), [])
 
     def test_private_world_and_real_candidate_use_the_canonical_observer(self):
         text = self.workflow()
@@ -70,7 +99,7 @@ class NativeObserverWorkflowTests(unittest.TestCase):
         text = self.workflow()
         upload = text.split("- name: Upload anonymous observer receipt", 1)[1]
         self.assertIn("if: ${{ always() && steps.publish.outputs.public_receipt_ready == 'true' }}", upload)
-        self.assertIn("path: ${{ runner.temp }}/native-observer-evidence/receipt.json", upload)
+        self.assertIn("path: ${{ github.workspace }}/.codefactory-cache/native-observer-evidence/receipt.json", upload)
         self.assertIn("if-no-files-found: error", upload)
         self.assertNotIn("**", upload)
         self.assertNotIn("state.json", upload)

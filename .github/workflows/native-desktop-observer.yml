@@ -31,11 +31,11 @@ jobs:
     env:
       CODEFACTORY_BUILD_GIT_SHA: ${{ github.event.pull_request.head.sha }}
       CARGO_TARGET_DIR: ${{ github.workspace }}/.codefactory-cache/cargo-target
-      CODEFACTORY_OBSERVER_STATE: ${{ runner.temp }}/native-observer-state.json
-      CODEFACTORY_OBSERVER_CONFIG: ${{ runner.temp }}/native-observer-build.json
-      CODEFACTORY_OBSERVER_DRIVER: ${{ runner.temp }}/codefactory-native-observer
-      CODEFACTORY_OBSERVER_RAW: ${{ runner.temp }}/native-observer-private/receipt.json
-      CODEFACTORY_OBSERVER_PUBLIC: ${{ runner.temp }}/native-observer-evidence/receipt.json
+      CODEFACTORY_OBSERVER_STATE: ${{ github.workspace }}/.codefactory-cache/native-observer-state.json
+      CODEFACTORY_OBSERVER_CONFIG: ${{ github.workspace }}/.codefactory-cache/native-observer-build.json
+      CODEFACTORY_OBSERVER_DRIVER: ${{ github.workspace }}/.codefactory-cache/codefactory-native-observer
+      CODEFACTORY_OBSERVER_RAW: ${{ github.workspace }}/.codefactory-cache/native-observer-private/receipt.json
+      CODEFACTORY_OBSERVER_PUBLIC: ${{ github.workspace }}/.codefactory-cache/native-observer-evidence/receipt.json
     steps:
       - name: Checkout the exact candidate without saved credentials
         uses: actions/checkout@v4
@@ -113,6 +113,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native-observer-receipt-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/native-observer-evidence/receipt.json
+          path: ${{ github.workspace }}/.codefactory-cache/native-observer-evidence/receipt.json
           if-no-files-found: error
           retention-days: 7

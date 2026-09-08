@@ -14,6 +14,8 @@
 4. `observe` 只使用自己创建的进程及真实 OS 身份。它不能终止 LaunchServices 意外返回的另一个 App；每次 AX 观察与回收前重新验证 PID、birth token、executable path/digest、bundle identifier。没有验证的行为保留 unknown，不填假零值。
 5. 上传只有匿名 `receipt.json`。必须校验精确 expected build SHA、observer slice 与 full probe 的不同状态；world 保留不能写成完整清理通过，未知请求/凭据次数必须为 null。runner 销毁也不能冒充用例清理能力。
 
+job-level `env` 只使用该层合法的 `github.*` 上下文。构建之外的私有 state/raw/public 输出位于 checkout 的 ignored `.codefactory-cache` 中，与 `cargo-target` 并列，不进入 Rust target 缓存；输出父目录仍由 supervisor 逐层核验。#515 首轮 `34189620864` 实际产生 workflow 文件级启动失败，没有执行 App；普通 YAML 解析不能验证 GitHub 上下文可用性。已补 `runner.temp` 在 job env 中被拒绝的失败优先回归，改为显式 `github.workspace` 路径后再到远端验证。
+
 ## 失败处理
 
 - observer 缺权限或不能观察时退出 3，明确 `blocked`；身份/路径不安全或其他执行失败退出 2。公开回执校验器拒绝结果或发布失败时退出 1。
