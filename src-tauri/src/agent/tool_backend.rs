@@ -392,20 +392,77 @@ fn strip_discarded_redirects(command: &str) -> String {
     stripped
 }
 
-/// A trailing `&` backgrounds the command, so its completion is unobservable
-/// no matter how read-only the verb looks. `&&` is a sequencer, not a fork.
-fn has_background_operator(command: &str) -> bool {
-    let bytes = command.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'&' {
-            if bytes.get(index + 1) == Some(&b'&') {
-                index += 2;
-                continue;
+/// Walk the command once, yielding each character with whether it is
+/// SHELL-ACTIVE — outside every quoted span, where `|`, `&`, `;` and `>` still
+/// mean what the shell thinks they mean. Inside quotes they are literal text.
+///
+/// This distinction is the whole fix for the 2026-09-08 lockup: the scanners
+/// below used to read `grep -E 'a|b' file` as three piped commands, two of
+/// which are not read-only verbs, so the most ordinary repository search an
+/// agent performs fell through to `mutation_preflight`.
+fn shell_active_chars(command: &str) -> impl Iterator<Item = (char, bool)> + '_ {
+    let mut quote: Option<char> = None;
+    command.chars().map(move |character| match quote {
+        Some(open) => {
+            if character == open {
+                quote = None;
             }
-            return true;
+            (character, false)
         }
-        index += 1;
+        None => {
+            if matches!(character, '\'' | '"') {
+                quote = Some(character);
+                (character, false)
+            } else {
+                (character, true)
+            }
+        }
+    })
+}
+
+/// True when any of `needles` appears unquoted. `grep -n 'a > b' notes.txt`
+/// searches for a literal `>`; it does not redirect.
+fn contains_active(command: &str, needles: &[char]) -> bool {
+    shell_active_chars(command).any(|(character, active)| active && needles.contains(&character))
+}
+
+/// Command substitution can hide any verb inside a read-only looking shell.
+/// Single quotes make it literal, double quotes do NOT: `grep '$(x)' f` reads
+/// a file, `grep "$(x)" f` runs `x`. Tracking both quote kinds keeps
+/// `echo "it's fine"` from flipping the single-quote state on an apostrophe.
+fn contains_command_substitution(command: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut characters = command.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '`' if !in_single => return true,
+            '$' if !in_single && characters.peek() == Some(&'(') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A trailing `&` backgrounds the command, so its completion is unobservable
+/// no matter how read-only the verb looks. `&&` is a sequencer, not a fork,
+/// and a quoted `&` is neither.
+fn has_background_operator(command: &str) -> bool {
+    let mut characters = shell_active_chars(command).peekable();
+    while let Some((character, active)) = characters.next() {
+        if !active || character != '&' {
+            continue;
+        }
+        if characters
+            .peek()
+            .is_some_and(|(next, next_active)| *next_active && *next == '&')
+        {
+            characters.next();
+            continue;
+        }
+        return true;
     }
     false
 }
@@ -413,12 +470,19 @@ fn has_background_operator(command: &str) -> bool {
 fn split_shell_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
-    let mut characters = command.chars().peekable();
-    while let Some(character) = characters.next() {
+    let mut characters = shell_active_chars(command).peekable();
+    while let Some((character, active)) = characters.next() {
+        if !active {
+            current.push(character);
+            continue;
+        }
         match character {
             '\n' | ';' => segments.push(std::mem::take(&mut current)),
             '&' | '|' => {
-                if characters.peek() == Some(&character) {
+                if characters
+                    .peek()
+                    .is_some_and(|(next, next_active)| *next_active && *next == character)
+                {
                     characters.next();
                 }
                 segments.push(std::mem::take(&mut current));
@@ -434,23 +498,42 @@ fn split_shell_segments(command: &str) -> Vec<String> {
 /// Some whitelisted verbs carry flags that turn them into writers. `find` can
 /// delete or exec, and `sed -n` still edits in place under `-i`. Keep these
 /// per-verb: a blanket `-i` denylist would fence the very common `grep -i`.
+///
+/// Match FLAGS, not substrings. `sed -n '1,5p' my-input.txt` reads a file whose
+/// NAME contains `-i`, and `find . -path './src-exec/*'` names a directory —
+/// the old `segment.contains("-i")` fenced both.
 fn read_only_verb_flags_are_safe(segment: &str) -> bool {
+    let flags = || {
+        segment
+            .split_whitespace()
+            .map(|token| token.trim_matches(['\'', '"']))
+            .filter(|token| token.starts_with('-') && *token != "-" && *token != "--")
+    };
     if segment.starts_with("find") {
-        return ![
-            "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint",
-        ]
-        .iter()
-        .any(|flag| segment.contains(flag));
+        return !flags().any(|token| {
+            matches!(token, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls")
+                || token.starts_with("-fprint")
+        });
     }
     if segment.starts_with("sed") {
-        return !segment.contains("-i");
+        return !flags().any(|token| match token.strip_prefix("--") {
+            Some(long) => long.starts_with("in-place"),
+            // A short cluster: `-i`, `-i.bak`, `-ni`. Any `i` before the
+            // optional in-place suffix rewrites the file.
+            None => token
+                .trim_start_matches('-')
+                .split(['.', '='])
+                .next()
+                .is_some_and(|cluster| cluster.contains('i')),
+        });
     }
     true
 }
 
 fn bash_segment_is_read_only(segment: &str) -> bool {
-    // A redirect that survived stripping writes somewhere real.
-    if segment.contains('>') || segment.contains('&') {
+    // A redirect that survived stripping writes somewhere real — but only
+    // outside quotes.
+    if contains_active(segment, &['>', '&']) {
         return false;
     }
     let lower = segment.trim().to_ascii_lowercase();
@@ -484,8 +567,7 @@ fn bash_segment_is_strict_mode_prelude(segment: &str) -> bool {
 /// Segment the command instead and keep it read-only only when *every* segment
 /// is an explicitly read-only verb; anything unrecognized still fences it.
 fn bash_is_explicit_read_only(command: &str) -> bool {
-    // Command substitution can hide any verb inside a read-only looking shell.
-    if command.contains('`') || command.contains("$(") {
+    if contains_command_substitution(command) {
         return false;
     }
     let normalized = strip_discarded_redirects(command);
@@ -2751,6 +2833,81 @@ mod tests {
             assert!(
                 bash_is_explicit_read_only(command),
                 "{command} only reads and must not be fenced behind a receipt"
+            );
+        }
+    }
+
+    /// 2026-09-08 field report: seven resumed sessions locked up and four burned
+    /// their whole recovery budget. The trigger was `grep -nE 'a|b|c' file` —
+    /// the most ordinary way an agent searches a repository. `split_shell_segments`
+    /// scanned for `&`, `|` and `;` without tracking quotes, so the alternation
+    /// inside the pattern split one read into `grep -nE 'a`, `b` and `c' file`.
+    /// Two of those are not read-only verbs, the command fell through to
+    /// `mutation_preflight`, and the `uncertain > 0` receipt fence then answered
+    /// `external_state_uncertain` forever — including for the very reads the
+    /// agent needed to diagnose itself out of the loop.
+    #[test]
+    fn quoted_shell_metacharacters_stay_inside_one_read_only_segment() {
+        for command in [
+            "grep -nE 'completion_evidence_incomplete|TechnicalFailure' src/a.rs src/b.rs",
+            "grep -E 'a|b' file.txt",
+            "rg 'x|y' src",
+            "grep -nE 'foo|bar' src && sed -n '1,20p' src/main.rs",
+            "grep -n \"alpha|beta\" src",
+            "grep -n 'a > b' notes.txt",
+            "grep -n 'x & y' notes.txt",
+            "grep -n 'one;two' notes.txt",
+        ] {
+            assert!(
+                bash_is_explicit_read_only(command),
+                "{command} only reads and must not be fenced behind a receipt"
+            );
+        }
+    }
+
+    /// Quoting hides a metacharacter from the shell, not a verb from this gate.
+    /// A quoted span must never turn a writer into a reader.
+    #[test]
+    fn quoting_never_launders_a_mutating_segment() {
+        for command in [
+            "grep -n 'a|b' file && rm -rf build",
+            "grep -n 'a|b' file > out.txt",
+            "echo 'safe' | tee out.txt",
+            "grep -n 'a|b' file; sed -i 's/a/b/' file",
+            "grep -n \"$(rm -rf /tmp/x)\" file",
+        ] {
+            assert!(
+                !bash_is_explicit_read_only(command),
+                "{command} can mutate external state and must stay fenced"
+            );
+        }
+    }
+
+    /// Flags are tokens, not substrings. `sed -n '1,5p' my-input.txt` reads a
+    /// file whose NAME contains `-i`; `sed -i` and the `-ni` cluster edit in
+    /// place. The old `segment.contains("-i")` could not tell them apart.
+    #[test]
+    fn read_only_flag_checks_read_flags_not_substrings() {
+        for command in [
+            "sed -n '1,5p' my-input.txt",
+            "sed -n '1,20p' src/handlers-init.rs",
+            "find . -name '*.rs' -path './src-exec/*'",
+        ] {
+            assert!(
+                bash_is_explicit_read_only(command),
+                "{command} only reads and must not be fenced behind a receipt"
+            );
+        }
+        for command in [
+            "sed -i 's/a/b/' file.txt",
+            "sed -n -i.bak 's/a/b/' file",
+            "sed -ni 's/a/b/' file",
+            "sed --in-place 's/a/b/' file",
+            "find . -name '*.tmp' -delete",
+        ] {
+            assert!(
+                !bash_is_explicit_read_only(command),
+                "{command} edits in place and must stay fenced"
             );
         }
     }
