@@ -38,7 +38,7 @@ runtime smoke 观察 native bridge、真实 synthetic Chrome attach/detach、标
 - 最小差异影响 `RTE-003`、`RTE-004` 和 `E2E-009`，现有 PR 计划为 19 个 target；不命中 E2E-004 的路径，没有 missing-gate blocker。
 - 变更不属于受保护文件；`lib.rs` 首个无条件 canonical CLI module 声明保持不变。
 - Mac managed Chrome 的本地成功路径已补证；后续仍需普通 PR 的 required checks 与真实 macOS runner 复验。
-- 本次不是正式安装包验收，也不声明修复已发布。按任务边界只先提交到本地分支，不推送或创建 PR。
+- 本次不是正式安装包验收，也不声明修复已发布。#512 合并后，主执行者已同步最新默认分支 `c9bd334091551240f38cd3072159e4e88f9101d9`，继续正常 PR、CI 与独立验收；不修改或绕过门禁。
 
 ## AI Collaboration
 
