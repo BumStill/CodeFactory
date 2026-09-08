@@ -968,6 +968,17 @@ fn config_path_for(config_root: &Path, is_debug: bool) -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
+    match crate::desktop_context::current() {
+        crate::desktop_context::DesktopContext::Synthetic(context) => {
+            return context
+                .settings_path()
+                .expect("synthetic settings path rejected");
+        }
+        crate::desktop_context::DesktopContext::Rejected => {
+            panic!("desktop context rejected settings access")
+        }
+        crate::desktop_context::DesktopContext::Normal => {}
+    }
     config_path_for(
         &dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")),
         cfg!(debug_assertions),
@@ -1015,6 +1026,15 @@ fn migrate_legacy_delivery_ceiling_default(settings: &mut Settings) -> bool {
 }
 
 pub fn load() -> Settings {
+    match crate::desktop_context::current() {
+        crate::desktop_context::DesktopContext::Synthetic(context) => {
+            return load_synthetic(&context).expect("synthetic settings rejected");
+        }
+        crate::desktop_context::DesktopContext::Rejected => {
+            panic!("desktop context rejected settings access")
+        }
+        crate::desktop_context::DesktopContext::Normal => {}
+    }
     let new_path = config_path();
 
     // Dev builds copy the release settings once into their own identifier-based
@@ -1440,7 +1460,88 @@ fn save_to_path(path: &Path, settings: &Settings) -> crate::errors::Result<()> {
 }
 
 pub fn save(settings: &Settings) -> crate::errors::Result<()> {
+    match crate::desktop_context::current() {
+        crate::desktop_context::DesktopContext::Synthetic(context) => {
+            return save_synthetic(&context, settings).map_err(crate::errors::AppError::Other);
+        }
+        crate::desktop_context::DesktopContext::Rejected => {
+            return Err(crate::errors::AppError::Other(
+                "desktop context rejected settings access".into(),
+            ));
+        }
+        crate::desktop_context::DesktopContext::Normal => {}
+    }
     save_to_path(&config_path(), settings)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyntheticSettings {
+    schema_version: u32,
+    theme: Theme,
+}
+
+fn synthetic_defaults() -> Settings {
+    let mut settings = Settings::default();
+    settings.endpoints.clear();
+    settings.default_endpoint.clear();
+    settings.default_model.clear();
+    settings.permissions.allow.clear();
+    settings.permissions.ask.clear();
+    settings.permissions.deny = vec!["*".into()];
+    settings.onboarded = true;
+    settings
+}
+
+pub(crate) fn load_synthetic(
+    context: &crate::desktop_context::SyntheticContext,
+) -> Result<Settings, String> {
+    let mut settings = synthetic_defaults();
+    if let Some(bytes) = context.read_settings()? {
+        let stored: SyntheticSettings =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid synthetic settings schema")?;
+        if stored.schema_version != 1 {
+            return Err("unsupported synthetic settings schema".into());
+        }
+        settings.theme = stored.theme;
+    }
+    Ok(settings)
+}
+
+pub(crate) fn save_synthetic(
+    context: &crate::desktop_context::SyntheticContext,
+    settings: &Settings,
+) -> Result<(), String> {
+    let mut allowed = synthetic_defaults();
+    allowed.theme = settings.theme.clone();
+    if serde_json::to_value(settings).map_err(|_| "invalid settings")?
+        != serde_json::to_value(&allowed).map_err(|_| "invalid defaults")?
+    {
+        return Err("synthetic desktop permits only theme changes".into());
+    }
+    let path = context.settings_path()?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".scenario-settings-")
+        .tempfile_in(path.parent().ok_or("missing synthetic settings parent")?)
+        .map_err(|_| "cannot create synthetic settings temporary file")?;
+    let bytes = serde_json::to_vec(&SyntheticSettings {
+        schema_version: 1,
+        theme: settings.theme.clone(),
+    })
+    .map_err(|_| "cannot serialize synthetic settings")?;
+    temporary
+        .write_all(&bytes)
+        .map_err(|_| "cannot write synthetic settings")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|_| "cannot sync synthetic settings")?;
+    context.settings_path()?;
+    temporary
+        .persist(path)
+        .map_err(|_| "cannot persist synthetic settings")?;
+    context.verify()?;
+    Ok(())
 }
 
 #[cfg(test)]
