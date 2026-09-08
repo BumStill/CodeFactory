@@ -1,0 +1,223 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+import { observeOwnedChild } from "./run-macos-native-observer.mjs";
+import * as supervisor from "./run-macos-native-observer.mjs";
+import { assertPreparedLayout } from "./native-desktop-probe-contract.mjs";
+
+const run = "00000000-0000-4000-8000-000000000001";
+const owner = "00000000-0000-4000-8000-000000000002";
+const expected = { run_id: run, owner_token: owner, executable_sha256: "a".repeat(64),
+  bundle_id: `com.codefactory.scenario.${run.replaceAll("-", "")}` };
+
+function fixture(overrides = {}) {
+  const calls = [];
+  const child = { pid: 123, exitCode: null, signalCode: null };
+  const identity = { ...expected, pid: child.pid, start_token: "123:456" };
+  const adapters = {
+    checkWorld: async () => { calls.push("check"); },
+    launch: async () => { calls.push("launch"); return child; },
+    inspect: async () => { calls.push("inspect"); return identity; },
+    observe: async () => { calls.push("observe"); return { ax_window_seen: true, settings_control: true }; },
+    stop: async (_lease, force) => { calls.push(force ? "kill" : "term"); child.signalCode = "SIGTERM"; },
+    waitForExit: async () => child.exitCode !== null || child.signalCode !== null,
+    ...overrides,
+  };
+  return { calls, child, identity, adapters };
+}
+
+test("real observer slice and full feasibility keep separate outcomes without invented access counts", async () => {
+  const { calls, adapters } = fixture();
+  const result = await observeOwnedChild(expected, adapters);
+  assert.equal(result.observer_slice.status, "passed");
+  assert.equal(result.full_probe.status, "blocked");
+  assert.equal(result.request_count, null);
+  assert.equal(result.credential_access_count, null);
+  assert.equal(result.cleanup.child_reaped, true);
+  assert.equal(result.cleanup.world_directory, "retained");
+  assert.ok(calls.indexOf("check") < calls.indexOf("launch"));
+  assert.ok(calls.lastIndexOf("inspect") < calls.indexOf("term"));
+  assert.ok(!JSON.stringify(result).includes(owner));
+});
+
+test("wrong bundle never acquires signal authority", async () => {
+  const base = fixture();
+  base.adapters.inspect = async () => ({ ...base.identity, bundle_id: "com.codefactory.app" });
+  const result = await observeOwnedChild(expected, base.adapters);
+  assert.equal(result.observer_slice.status, "failed");
+  assert.equal(result.cleanup.child_reaped, false);
+  assert.ok(!base.calls.includes("term") && !base.calls.includes("kill"));
+});
+
+test("PID reuse before cleanup blocks signal and retains world", async () => {
+  const base = fixture();
+  let count = 0;
+  base.adapters.inspect = async () => ({ ...base.identity, start_token: ++count === 1 ? "123:456" : "999:1" });
+  const result = await observeOwnedChild(expected, base.adapters);
+  assert.equal(result.observer_slice.status, "failed");
+  assert.ok(!base.calls.includes("term") && !base.calls.includes("kill"));
+  assert.equal(result.cleanup.world_directory, "retained");
+});
+
+test("AX failure still reclaims the exactly owned main child without exporting diagnostic text", async () => {
+  const base = fixture({ observe: async () => { throw new Error("private text and /private/path"); } });
+  const result = await observeOwnedChild(expected, base.adapters);
+  assert.equal(result.cleanup.child_reaped, true);
+  assert.equal(result.observer_slice.status, "blocked");
+  assert.ok(base.calls.includes("term"));
+  assert.ok(!JSON.stringify(result).includes("private"));
+});
+
+test("a changed root before cleanup blocks signal", async () => {
+  const base = fixture();
+  let checks = 0;
+  base.adapters.checkWorld = async () => { if (++checks >= 3) throw new Error("replaced root"); };
+  const result = await observeOwnedChild(expected, base.adapters);
+  assert.equal(result.observer_slice.status, "failed");
+  assert.ok(!base.calls.includes("term"));
+});
+
+test("a hanging AX adapter is bounded and cleanup still runs", async () => {
+  const base = fixture({ observe: () => new Promise(() => {}) });
+  const result = await observeOwnedChild(expected, base.adapters, { operationTimeoutMs: 20 });
+  assert.equal(result.observer_slice.status, "blocked");
+  assert.equal(result.cleanup.child_reaped, true);
+});
+
+test("world validation failure prevents launch", async () => {
+  const base = fixture({ checkWorld: async () => { throw new Error("unsafe root"); } });
+  const result = await observeOwnedChild(expected, base.adapters);
+  assert.ok(!base.calls.includes("launch"));
+  assert.equal(result.observer_slice.status, "failed");
+});
+
+test("unknown AX fields are never forwarded as public evidence", async () => {
+  const base = fixture({ observe: async () => ({ ax_window_seen: true, settings_control: true, raw_ax_tree: "secret" }) });
+  const result = await observeOwnedChild(expected, base.adapters);
+  assert.ok(!JSON.stringify(result).includes("secret"));
+  assert.ok(!JSON.stringify(result).includes("raw_ax_tree"));
+});
+
+test("preflight stdout projection is strict booleans with no arbitrary helper fields", () => {
+  assert.deepEqual(supervisor.preflightProjection({ accessibility: true, screen_capture: "true", gui_session: 1,
+    owner_token: owner, raw_ax_tree: "private" }), { accessibility: true, screen_capture: false, gui_session: false });
+  assert.deepEqual(supervisor.preflightProjection(null), { accessibility: false, screen_capture: false, gui_session: false });
+});
+
+test("unreaped child permits at most two identity-checked signal attempts and never passes", async () => {
+  const base = fixture({ stop: async () => {}, waitForExit: async () => false });
+  const result = await observeOwnedChild(expected, base.adapters);
+  assert.equal(result.cleanup.signal_attempts, 2);
+  assert.equal(result.cleanup.child_reaped, false);
+  assert.equal(result.observer_slice.status, "failed");
+  assert.equal(base.calls.filter((value) => value === "inspect").length, 3);
+});
+
+test("an initially empty AX tree retries until one later snapshot proves both controls", async () => {
+  let attempts = 0;
+  const result = await supervisor.observeAXUntilReachable(async (remaining) => {
+    assert.ok(remaining > 0 && remaining <= 100);
+    attempts++;
+    return attempts === 1 ? { ax_window_seen: false, settings_control: false }
+      : { ax_window_seen: true, settings_control: true };
+  }, { timeoutMs: 100, pollMs: 1 });
+  assert.equal(attempts, 2);
+  assert.deepEqual(result, { ax_window_seen: true, settings_control: true });
+});
+
+test("unreachable or split AX snapshots cannot pass and the total wait is bounded", async () => {
+  let attempts = 0;
+  const start = Date.now();
+  const result = await supervisor.observeAXUntilReachable(async () => {
+    attempts++;
+    return { ax_window_seen: attempts % 2 === 0, settings_control: attempts % 2 !== 0 };
+  }, { timeoutMs: 25, pollMs: 1 });
+  assert.ok(attempts > 1);
+  assert.ok(result.ax_window_seen !== true || result.settings_control !== true);
+  assert.ok(Date.now() - start < 500);
+  await assert.rejects(supervisor.observeAXUntilReachable(() => new Promise(() => {}),
+    { timeoutMs: 15, pollMs: 1 }), /operation_timeout/);
+});
+
+test("AX retry propagates identity failure without taking another snapshot", async () => {
+  let attempts = 0;
+  await assert.rejects(supervisor.observeAXUntilReachable(async () => {
+    attempts++;
+    throw new Error("process_birth_mismatch");
+  }, { timeoutMs: 100, pollMs: 1 }), /process_birth_mismatch/);
+  assert.equal(attempts, 1);
+});
+
+test("native signal boundary rejects identity changes during expensive validation", { skip: process.platform !== "darwin" }, () => {
+  const outer = fs.mkdtempSync(path.join(fs.realpathSync("/tmp"), "native-observer-signal-test-"));
+  try {
+    const driver = path.join(outer, "contract-driver");
+    execFileSync("xcrun", ["swiftc", "-D", "NATIVE_OBSERVER_CONTRACT_TESTS",
+      fileURLToPath(new URL("./macos-native-observer.swift", import.meta.url)), "-o", driver],
+    { timeout: 15000, stdio: "pipe" });
+    // A compile-time branch executes only injected pure closures, never an App,
+    // OS process observer, AX query, permission API or real signal.
+    const output = execFileSync(driver, [], { input: "{}", encoding: "utf8", timeout: 1000, stdio: "pipe" });
+    assert.equal(output.trim(), "native_signal_contracts_passed");
+  } finally { fs.rmSync(outer, { recursive: true }); }
+});
+
+test("prepare creates private parent directories and compatible product world without launching an app", () => {
+  const outer = fs.mkdtempSync(path.join(fs.realpathSync("/tmp"), "native-observer-cli-test-"));
+  const stateFile = path.join(outer, "private", "state.json");
+  let state;
+  try {
+    const output = execFileSync(process.execPath, [fileURLToPath(new URL("./run-macos-native-observer.mjs", import.meta.url)),
+      "prepare", "--state", stateFile, "--build-config", path.join(outer, "build.json"),
+      "--expected-build-sha", "a".repeat(40)], { encoding: "utf8" });
+    state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    assertPreparedLayout(state.layout);
+    assert.equal(fs.statSync(stateFile).mode & 0o077, 0);
+    assert.equal(fs.statSync(path.dirname(stateFile)).mode & 0o077, 0);
+    assert.ok(!fs.existsSync(state.layout.app));
+    assert.ok(!output.includes(state.layout.ownerToken) && !output.includes(state.layout.root));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(outer, "build.json"), "utf8")).build.devUrl, null);
+  } finally {
+    if (state) fs.rmSync(state.layout.root, { recursive: true });
+    fs.rmSync(outer, { recursive: true });
+  }
+});
+
+test("observe outside macOS CI creates anonymous failure receipt and never launches an app", () => {
+  const outer = fs.mkdtempSync(path.join(fs.realpathSync("/tmp"), "native-observer-cli-test-"));
+  const receipt = path.join(outer, "private", "receipt.json");
+  try {
+    assert.throws(() => execFileSync(process.execPath, [fileURLToPath(new URL("./run-macos-native-observer.mjs", import.meta.url)),
+      "observe", "--state", "/not-opened", "--candidate-app", "/not-opened", "--driver", "/not-opened", "--receipt", receipt],
+    { env: { ...process.env, GITHUB_ACTIONS: "false" }, stdio: "pipe" }));
+    const result = JSON.parse(fs.readFileSync(receipt, "utf8"));
+    assert.equal(result.observer_slice.status, "failed");
+    assert.equal(result.process, null);
+    assert.equal(result.cleanup.signal_attempts, 0);
+    assert.ok(!JSON.stringify(result).includes("/not-opened"));
+  } finally { fs.rmSync(outer, { recursive: true }); }
+});
+
+test("prepare rejects symlink output parents and existing state without replacing anything", () => {
+  const outer = fs.mkdtempSync(path.join(fs.realpathSync("/tmp"), "native-observer-cli-test-"));
+  const runPrepare = (state) => execFileSync(process.execPath,
+    [fileURLToPath(new URL("./run-macos-native-observer.mjs", import.meta.url)), "prepare",
+      "--state", state, "--build-config", path.join(outer, "build.json"), "--expected-build-sha", "a".repeat(40)],
+    { stdio: "pipe" });
+  const worlds = () => fs.readdirSync(fs.realpathSync("/tmp")).filter((name) => name.startsWith("codefactory-scenario-")).sort();
+  try {
+    fs.mkdirSync(path.join(outer, "private"), { mode: 0o700 });
+    fs.symlinkSync(path.join(outer, "private"), path.join(outer, "alias"));
+    const before = worlds();
+    assert.throws(() => runPrepare(path.join(outer, "alias", "state.json")));
+    assert.deepEqual(worlds(), before);
+    assert.ok(!fs.existsSync(path.join(outer, "private", "state.json")));
+    fs.writeFileSync(path.join(outer, "private", "state.json"), "existing", { mode: 0o600 });
+    assert.throws(() => runPrepare(path.join(outer, "private", "state.json")));
+    assert.equal(fs.readFileSync(path.join(outer, "private", "state.json"), "utf8"), "existing");
+    assert.deepEqual(worlds(), before);
+  } finally { fs.rmSync(outer, { recursive: true }); }
+});
