@@ -19,7 +19,22 @@ const anonymousIdentity = (value) => value && Object.fromEntries(
   ["run_id", "pid", "start_token", "executable_sha256", "bundle_id"].map((key) => [key, value[key]]));
 
 export const preflightProjection = (value) => ({ accessibility: value?.accessibility === true,
-  screen_capture: value?.screen_capture === true, gui_session: value?.gui_session === true });
+  screen_capture: value?.screen_capture === true, gui_session: value?.gui_session === true,
+  session_present: value?.session_present === true, on_console: value?.on_console === true,
+  login_done: value?.login_done === true, same_uid: value?.same_uid === true,
+  lock_state: ["locked", "unlocked", "unknown"].includes(value?.lock_state) ? value.lock_state : "unknown" });
+
+export async function readOnlyPreflight(driver, { platform = process.platform, environment = process.env, call = native } = {}) {
+  if (platform !== "darwin" || environment.GITHUB_ACTIONS !== "true" || environment.RUNNER_OS !== "macOS") {
+    throw new Error("macos_ci_only");
+  }
+  if (typeof driver !== "string" || !path.isAbsolute(driver)) throw new Error("absolute_driver_required");
+  let raw = null;
+  try { raw = await call(driver, { operation: "preflight" }); } catch { /* No raw helper errors leave this boundary. */ }
+  const preflight = preflightProjection(raw);
+  const ready = preflight.accessibility && preflight.screen_capture && preflight.gui_session;
+  return { scope: "native-desktop-preflight", status: ready ? "ready" : "blocked", preflight };
+}
 
 async function bounded(operation, milliseconds) {
   let timer;
@@ -266,7 +281,8 @@ async function observe(args, progress) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const allowed = command === "prepare" ? ["state", "build-config", "expected-build-sha"]
-    : command === "observe" ? ["state", "candidate-app", "driver", "receipt"] : [];
+    : command === "observe" ? ["state", "candidate-app", "driver", "receipt"]
+      : command === "preflight" ? ["driver"] : [];
   const args = {};
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i]?.replace(/^--/, "");
@@ -275,6 +291,12 @@ async function main() {
   }
   if (allowed.length === 0 || allowed.some((key) => !args[key])) throw new Error("invalid_arguments");
   if (command === "prepare") { console.log(JSON.stringify(prepare(args))); return; }
+  if (command === "preflight") {
+    const result = await readOnlyPreflight(args.driver);
+    console.log(JSON.stringify(result));
+    process.exitCode = result.status === "ready" ? 0 : 3;
+    return;
+  }
   // Refuse unsafe receipt paths before any possible app launch. Only this file
   // is raw private evidence; stdout is a fixed summary, never the receipt.
   prepareOutput(args.receipt);

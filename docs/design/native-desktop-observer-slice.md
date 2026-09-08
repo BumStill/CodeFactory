@@ -4,11 +4,16 @@
 
 ## 接口
 
+0. 在依赖安装及产品构建之前，CI 可先编译原生 helper，执行 `node scripts/run-macos-native-observer.mjs preflight --driver <绝对路径>`。该入口只接受 GitHub macOS CI，不读取 state/candidate、不创建 world、不启动 App，只调用 helper 的只读 preflight。单行匿名结果为 `scope=native-desktop-preflight`、`status=ready|blocked` 与下面的八字段投影；就绪退出 0，仅表示前置条件就绪，不是 observer passed。权限/GUI/helper 未证实退出 3；非法 CLI 或非 macOS CI 退出 2。
 1. `node scripts/run-macos-native-observer.mjs prepare --state <私有state.json> --build-config <tauri-override.json> --expected-build-sha <完整commit>`：建立产品协议的 `/tmp` world，写独立 identifier、`devUrl:null`、`createUpdaterArtifacts:false` 的构建配置。私有 state/manifest/owner 不上传。
 2. CI 构建真实嵌入式前端 `.app`，编译 `scripts/macos-native-observer.swift` 为独立 driver。
 3. `node scripts/run-macos-native-observer.mjs observe --state <state.json> --candidate-app <本checkout构建.app> --driver <已编译driver> --receipt <私有raw-receipt.json>`：复制候选 bundle 至 owned world，绑定 candidate/copied/running executable digest；本轮仅允许显式 GitHub macOS CI 环境调用。raw 回执仅在私有目录落盘，由独立 verifier 生成可上传的匿名投影；不能上传 state、原始 helper 输出或整个 world。
 
-prepare/receipt 缺失的父目录逐层创建为 0700，拒绝 symlink 父目录和现有输出文件；文件以 0600、O_EXCL/O_NOFOLLOW 创建，已有用户目录不 chmod。写入前后检查持有的目录 device/inode；这不是对恶意同 UID 并发修改者的完整沙箱。prepare 在分配 world 前预检输出，observe 在可能 launch 前预检 receipt。标准输出只包含 prepare 的 run/identifier、固定状态摘要，以及三个严格 boolean 的权限投影；不输出 owner token、绝对路径、原始 AX 或原始异常。
+prepare/receipt 缺失的父目录逐层创建为 0700，拒绝 symlink 父目录和现有输出文件；文件以 0600、O_EXCL/O_NOFOLLOW 创建，已有用户目录不 chmod。写入前后检查持有的目录 device/inode；这不是对恶意同 UID 并发修改者的完整沙箱。prepare 在分配 world 前预检输出，observe 在可能 launch 前预检 receipt。标准输出只包含 prepare 的 run/identifier、固定状态摘要和固定匿名预检投影；不输出 owner token、绝对路径、原始 AX 或原始异常。
+
+预检保留 `accessibility`、`screen_capture`、`gui_session`，追加严格 boolean 的 `session_present`、`on_console`、`login_done`、`same_uid` 以及 `lock_state=locked|unlocked|unknown`。不发布 session 原始字典、用户名或 UID；NSNumber 1、字符串和 null 不作为原生 CFBoolean 接受。`same_uid` 仅表示 session 用户与当前有效 UID 是否一致，不加入或替代本次准入判据。GUI 判据仍为 on_console 且 login_done 且明确 locked=false；缺 key/非法类型保持 unknown、gui_session=false。最终准入仍要求原有三个 boolean 同为 true，未移除 screen_capture 条件，也未变更权限。
+
+本次诊断来自远端 run `34190155096` 的实际阻塞：`accessibility=true, screen_capture=true, gui_session=false`、exit 3，停于 launch 前。三项合并结果不能指出具体缺失条件，因此新增独立前置 CLI 以便无需重复完整产品构建即可取得匿名原因。当前 slice 没有截图能力，screen_capture 作为硬条件是否必要是另一个范围建议，本次不改变它。
 
 ## 有界状态流
 
@@ -32,6 +37,6 @@ prepare 的 `expected_build_sha` 是 CI 提供的构建输入，记录为 declar
 
 ## 本地验证与证据边界
 
-本地执行 `node --test scripts/native-desktop-probe-contract.test.mjs scripts/macos-native-observer-supervisor.test.mjs` 与 `xcrun swiftc -typecheck scripts/macos-native-observer.swift`。macOS 上 Node suite 会用 `-D NATIVE_OBSERVER_CONTRACT_TESTS` 编译并运行纯闭包 signal fixture；该编译分支不会执行 App、OS 进程读取、AX、权限或真实 signal。普通 driver 仅 typecheck/链接编译，不运行 GUI。新增 supervisor 测试先于实现失败；私有目录创建、CI guard 失败回执、symlink 输出路径拒绝、严格 preflight 投影、AX 延迟可达和原生 signal 边界均另有先红后绿反例。适配器 fixture 测试只验证状态流和拒绝条件，不能替代真实 Tauri 观察；当前尚无本切片实际 App 运行成功证据。
+本地执行 `node --test scripts/native-desktop-probe-contract.test.mjs scripts/macos-native-observer-supervisor.test.mjs` 与 `xcrun swiftc -typecheck scripts/macos-native-observer.swift`。macOS 上 Node suite 会用 `-D NATIVE_OBSERVER_CONTRACT_TESTS` 编译并运行纯闭包 signal fixture，并用 `-D NATIVE_PREFLIGHT_CONTRACT_TESTS` 编译纯字典投影/CLI fixture；这些编译分支不会执行 App、OS 进程读取、AX、权限或真实 signal。普通 driver 仅 typecheck/链接编译，不运行 GUI。新增 supervisor 测试先于实现失败；私有目录创建、CI guard 失败回执、symlink 输出路径拒绝、严格 preflight 投影、AX 延迟可达和原生 signal 边界均另有先红后绿反例。匿名诊断另观察四组先红，再修复投影、CLI 和 Swift fixture；缺 lock 的合成 CLI 必须仍退出 3。适配器 fixture 测试只验证状态流和拒绝条件，不能替代真实 Tauri 观察；当前尚无本切片实际 App 运行成功证据。
 
 完整缺项固定为九项：native_theme_click、native_text_input、restart_theme_persistence、owned_window_screenshots、descendant_process_cleanup、world_directory_cleanup、request_observation、credential_observation、embedded_build_identity。任意失败保留这个完整集合，不能把 blocked 改为 passed。prepare 后发生的安全失败会保留 world；本切片没有自动删目录命令。

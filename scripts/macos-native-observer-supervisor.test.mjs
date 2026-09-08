@@ -103,8 +103,81 @@ test("unknown AX fields are never forwarded as public evidence", async () => {
 
 test("preflight stdout projection is strict booleans with no arbitrary helper fields", () => {
   assert.deepEqual(supervisor.preflightProjection({ accessibility: true, screen_capture: "true", gui_session: 1,
-    owner_token: owner, raw_ax_tree: "private" }), { accessibility: true, screen_capture: false, gui_session: false });
-  assert.deepEqual(supervisor.preflightProjection(null), { accessibility: false, screen_capture: false, gui_session: false });
+    session_present: true, on_console: 1, login_done: "true", same_uid: true, lock_state: false,
+    owner_token: owner, raw_ax_tree: "private" }), { accessibility: true, screen_capture: false, gui_session: false,
+    session_present: true, on_console: false, login_done: false, same_uid: true, lock_state: "unknown" });
+  assert.deepEqual(supervisor.preflightProjection(null), { accessibility: false, screen_capture: false, gui_session: false,
+    session_present: false, on_console: false, login_done: false, same_uid: false, lock_state: "unknown" });
+  for (const lock_state of ["locked", "unlocked", "unknown"]) {
+    assert.equal(supervisor.preflightProjection({ lock_state }).lock_state, lock_state);
+  }
+});
+
+test("read-only preflight dispatch accepts only the original three readiness conditions", async () => {
+  const value = { accessibility: true, screen_capture: true, gui_session: true,
+    session_present: true, on_console: true, login_done: true, same_uid: true, lock_state: "unlocked" };
+  const options = { platform: "darwin", environment: { GITHUB_ACTIONS: "true", RUNNER_OS: "macOS" } };
+  let calls = 0;
+  const call = async (driver, request) => {
+    assert.equal(driver, "/synthetic-driver");
+    assert.deepEqual(request, { operation: "preflight" });
+    calls++;
+    return value;
+  };
+  const result = await supervisor.readOnlyPreflight("/synthetic-driver", { ...options, call });
+  assert.equal(calls, 1);
+  assert.equal(result.scope, "native-desktop-preflight");
+  assert.equal(result.status, "ready");
+  for (const field of ["accessibility", "screen_capture", "gui_session"]) {
+    const blocked = await supervisor.readOnlyPreflight("/synthetic-driver", {
+      ...options, call: async () => ({ ...value, [field]: false }),
+    });
+    assert.equal(blocked.status, "blocked");
+  }
+  const unavailable = await supervisor.readOnlyPreflight("/synthetic-driver", {
+    ...options, call: async () => { throw new Error("private /path owner_token"); },
+  });
+  assert.equal(unavailable.status, "blocked");
+  assert.equal(unavailable.preflight.lock_state, "unknown");
+  assert.ok(!JSON.stringify(unavailable).includes("private"));
+});
+
+test("read-only preflight rejects non-CI or relative driver before any helper invocation", async () => {
+  let calls = 0;
+  const call = async () => { calls++; };
+  for (const overrides of [
+    { platform: "linux", environment: { GITHUB_ACTIONS: "true", RUNNER_OS: "macOS" } },
+    { platform: "darwin", environment: { GITHUB_ACTIONS: "false", RUNNER_OS: "macOS" } },
+  ]) await assert.rejects(supervisor.readOnlyPreflight("/synthetic-driver", { call, ...overrides }), /macos_ci_only/);
+  await assert.rejects(supervisor.readOnlyPreflight("relative-driver", { call, platform: "darwin",
+    environment: { GITHUB_ACTIONS: "true", RUNNER_OS: "macOS" } }), /absolute_driver_required/);
+  assert.equal(calls, 0);
+});
+
+test("pure native preflight fixture diagnoses missing lock and CLI exits blocked without an App", { skip: process.platform !== "darwin" }, () => {
+  const outer = fs.mkdtempSync(path.join(fs.realpathSync("/tmp"), "native-observer-preflight-test-"));
+  try {
+    const driver = path.join(outer, "contract-driver");
+    execFileSync("xcrun", ["swiftc", "-D", "NATIVE_PREFLIGHT_CONTRACT_TESTS",
+      fileURLToPath(new URL("./macos-native-observer.swift", import.meta.url)), "-o", driver],
+    { timeout: 15000, stdio: "pipe" });
+    assert.equal(execFileSync(driver, [], { input: "{}", encoding: "utf8", timeout: 1000, stdio: "pipe" }).trim(),
+      "native_preflight_contracts_passed");
+    let failure;
+    try {
+      execFileSync(process.execPath, [fileURLToPath(new URL("./run-macos-native-observer.mjs", import.meta.url)),
+        "preflight", "--driver", driver], { encoding: "utf8", stdio: "pipe", timeout: 3000,
+        env: { ...process.env, GITHUB_ACTIONS: "true", RUNNER_OS: "macOS" } });
+    } catch (error) { failure = error; }
+    assert.equal(failure?.status, 3);
+    const result = JSON.parse(failure.stdout);
+    assert.equal(result.scope, "native-desktop-preflight");
+    assert.equal(result.status, "blocked");
+    assert.deepEqual(result.preflight, { accessibility: true, screen_capture: true, gui_session: false,
+      session_present: true, on_console: true, login_done: true, same_uid: true, lock_state: "unknown" });
+    assert.ok(!failure.stdout.includes(outer) && !failure.stdout.includes("synthetic-private"));
+    assert.deepEqual(fs.readdirSync(outer), ["contract-driver"]);
+  } finally { fs.rmSync(outer, { recursive: true }); }
 });
 
 test("unreaped child permits at most two identity-checked signal attempts and never passes", async () => {

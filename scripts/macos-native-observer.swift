@@ -172,13 +172,25 @@ func observeAX(_ request: [String: Any]) throws -> [String: Any] {
     _ = try identity(bound) // Recheck after the bounded native read operation.
     return ["ax_window_seen": windowSeen, "settings_control": settingsSeen]
 }
+func strictBoolean(_ value: Any?) -> Bool? {
+    guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+    return number.boolValue
+}
+func preflightDiagnostics(session: [String: Any]?, currentUID: uid_t,
+                          accessibility: Bool, screenCapture: Bool) -> [String: Any] {
+    let onConsole = strictBoolean(session?[kCGSessionOnConsoleKey as String]) ?? false
+    let loggedIn = strictBoolean(session?[kCGSessionLoginDoneKey as String]) ?? false
+    let locked = strictBoolean(session?["CGSSessionScreenIsLocked"])
+    let userID = session?[kCGSessionUserIDKey as String] as? NSNumber
+    let sameUID = userID.map { CFGetTypeID($0) != CFBooleanGetTypeID() && $0.doubleValue == Double(currentUID) } ?? false
+    return ["accessibility": accessibility, "screen_capture": screenCapture,
+        "gui_session": onConsole && loggedIn && locked == false,
+        "session_present": session != nil, "on_console": onConsole, "login_done": loggedIn,
+        "same_uid": sameUID, "lock_state": locked == true ? "locked" : locked == false ? "unlocked" : "unknown"]
+}
 func preflight() -> [String: Any] {
-    let session = CGSessionCopyCurrentDictionary() as? [String: Any]
-    let onConsole = session?[kCGSessionOnConsoleKey as String] as? Bool ?? false
-    let loggedIn = session?[kCGSessionLoginDoneKey as String] as? Bool ?? false
-    let locked = session?["CGSSessionScreenIsLocked"] as? Bool
-    return ["accessibility": AXIsProcessTrusted(), "screen_capture": CGPreflightScreenCaptureAccess(),
-        "gui_session": onConsole && loggedIn && locked == false]
+    preflightDiagnostics(session: CGSessionCopyCurrentDictionary() as? [String: Any], currentUID: geteuid(),
+        accessibility: AXIsProcessTrusted(), screenCapture: CGPreflightScreenCaptureAccess())
 }
 func run() throws -> [String: Any] {
     let bytes = try FileHandle.standardInput.read(upToCount: 65537) ?? Data()
@@ -202,7 +214,56 @@ func run() throws -> [String: Any] {
     default: throw ProbeFailure.code("invalid_operation")
     }
 }
-#if NATIVE_OBSERVER_CONTRACT_TESTS
+#if NATIVE_PREFLIGHT_CONTRACT_TESTS
+do {
+    // This compile-time branch uses synthetic dictionaries only. It never calls
+    // preflight(), an App/AX API, process observer, permission API or signal.
+    let input = try JSONSerialization.jsonObject(with: FileHandle.standardInput.readDataToEndOfFile()) as? [String: Any]
+    let synthetic: [String: Any] = [kCGSessionOnConsoleKey as String: true,
+        kCGSessionLoginDoneKey as String: true, kCGSessionUserIDKey as String: 501,
+        kCGSessionUserNameKey as String: "synthetic-private", "private_path": "/synthetic-private"]
+    func project(_ session: [String: Any]?, uid: uid_t = 501) -> [String: Any] {
+        preflightDiagnostics(session: session, currentUID: uid, accessibility: true, screenCapture: true)
+    }
+    if input?["operation"] as? String == "preflight" {
+        // The CLI fixture deliberately models a present GUI whose lock state is
+        // unknown. The production readiness predicate must still return blocked.
+        FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: project(synthetic), options: [.sortedKeys]))
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    } else {
+        let missing = project(synthetic)
+        try require(missing["lock_state"] as? String == "unknown" && missing["gui_session"] as? Bool == false,
+            "fixture_missing_lock_passed")
+        try require(project(nil)["session_present"] as? Bool == false && project(nil)["same_uid"] as? Bool == false,
+            "fixture_missing_session_passed")
+        for value: Any in [NSNumber(value: 1), "true", NSNull()] {
+            var malformed = synthetic
+            malformed["CGSSessionScreenIsLocked"] = value
+            malformed[kCGSessionOnConsoleKey as String] = value
+            malformed[kCGSessionLoginDoneKey as String] = value
+            let result = project(malformed)
+            try require(result["lock_state"] as? String == "unknown" && result["on_console"] as? Bool == false
+                && result["login_done"] as? Bool == false && result["gui_session"] as? Bool == false,
+                "fixture_coerced_session_value")
+        }
+        for locked in [true, false] {
+            var known = synthetic
+            known["CGSSessionScreenIsLocked"] = locked
+            let result = project(known)
+            try require(result["lock_state"] as? String == (locked ? "locked" : "unlocked")
+                && result["gui_session"] as? Bool == !locked, "fixture_known_lock_mismatch")
+        }
+        var wrongUser = synthetic
+        wrongUser[kCGSessionUserIDKey as String] = true
+        try require(project(wrongUser, uid: 1)["same_uid"] as? Bool == false, "fixture_boolean_uid_passed")
+        try require(project(synthetic, uid: 502)["same_uid"] as? Bool == false, "fixture_wrong_uid_passed")
+        let allowed: Set<String> = ["accessibility", "screen_capture", "gui_session", "session_present",
+            "on_console", "login_done", "same_uid", "lock_state"]
+        try require(Set(missing.keys) == allowed, "fixture_private_fields_exported")
+        print("native_preflight_contracts_passed")
+    }
+} catch { print("native_preflight_contracts_failed"); exit(2) }
+#elseif NATIVE_OBSERVER_CONTRACT_TESTS
 do {
     let original = ProcessStamp(start: "1:1", executable: "/synthetic/executable")
     for changed in [ProcessStamp(start: "2:2", executable: original.executable),
