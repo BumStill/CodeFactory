@@ -392,6 +392,17 @@
       "automated_by": ["workflow:New-session composer overlap headless gate", "path:src/components/MessageList.welcomeContainment.test.tsx"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request"]
+    },
+    {
+      "id": "UI-015",
+      "name": "订阅模型目录刷新与选择",
+      "category": "workspace_session",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src/components/ModelPicker.tsx", "src/lib/chatgptModels.ts", "src/stores/chatgptCatalog.ts"],
+      "automated_by": ["path:src/components/ModelPicker.test.tsx", "path:src/lib/chatgptModels.test.ts", "path:src/stores/chatgptCatalog.freshness.test.ts"],
+      "required_evidence": ["L0"],
+      "gates": ["pull_request"]
     }
   ],
   "complex_e2e_cases": [

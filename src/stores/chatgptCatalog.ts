@@ -6,6 +6,50 @@ import {
 } from "../lib/chatgptModels";
 import { useSettingsStore } from "./settings";
 
+/** How long a completed sync stays authoritative. Opening the model picker is
+ * a frequent, deliberate act; without a window, every open would hit the
+ * network. Five minutes is short enough that a model published while the app
+ * is running shows up the next time the user goes looking for it. */
+const CATALOG_TTL_MS = 5 * 60 * 1000;
+let lastSyncedAt = 0;
+let inFlight: Promise<void> | null = null;
+
+/** Refresh the catalog when it is worth refreshing, and never more than once
+ * at a time.
+ *
+ * The catalog used to be fetched only at startup and on the Settings page, so
+ * an app left open never learned about a newly published model. Re-picking the
+ * endpoint in the composer appeared to fix it, but that only re-read what
+ * `syncChatGptCatalog` had already written at launch — the server was not
+ * consulted again.
+ */
+export async function refreshChatGptCatalogIfStale(): Promise<void> {
+  if (Date.now() - lastSyncedAt < CATALOG_TTL_MS) return;
+  if (inFlight) return inFlight;
+  // Opening the model picker must never depend on this succeeding. The
+  // transport can reject, and it can also throw synchronously when the
+  // command is unavailable, which a promise `.catch` would not see — so the
+  // call itself is wrapped, not just its result. A failed refresh leaves the
+  // last known catalog in place and lets the next open try again.
+  inFlight = (async () => {
+    try {
+      await syncChatGptCatalog();
+      lastSyncedAt = Date.now();
+    } catch {
+      /* keep the last known catalog; retry on the next open */
+    } finally {
+      inFlight = null;
+    }
+  })();
+  return inFlight;
+}
+
+/** Test seam: forget the last successful sync. */
+export function resetChatGptCatalogFreshness(): void {
+  lastSyncedAt = 0;
+  inFlight = null;
+}
+
 /** Refresh the signed-in subscription endpoint from the official Codex model
  * catalog. The bundled snapshot keeps startup usable when refresh is offline. */
 export async function syncChatGptCatalog(knownSignedIn = false): Promise<void> {

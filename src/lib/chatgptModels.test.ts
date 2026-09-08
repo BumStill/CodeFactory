@@ -9,14 +9,19 @@ import type { CustomModel } from "./tauri";
 
 describe("ChatGPT model capability catalog", () => {
   it("falls back to the current visible Codex subscription models", () => {
+    // The snapshot is what a signed-out or offline launch shows, so it has to
+    // lead with the newest subscription model rather than whatever was newest
+    // when the file was last touched.
     expect(CHATGPT_FALLBACK_MODELS[0]).toMatchObject({
-      id: "gpt-5.6-sol",
+      id: "gpt-6-astra",
       context_length: 272000,
-      max_context_length: 272000,
+      max_context_length: 872000,
       effective_context_window_percent: 95,
-      default_reasoning_effort: "low",
+      default_reasoning_effort: "medium",
       supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"],
     });
+    expect(CHATGPT_FALLBACK_MODELS.find((model) => model.id === "gpt-5.6-sol"))
+      .toMatchObject({ default_reasoning_effort: "low", max_context_length: 872000 });
     expect(CHATGPT_FALLBACK_MODELS.find((model) => model.id === "gpt-5.5"))
       .toMatchObject({ supported_reasoning_efforts: ["low", "medium", "high", "xhigh"] });
   });
