@@ -49,6 +49,7 @@
 - Bootstrap-1 后续：可信 catalog 接入、桌面 feasibility probe、E2E-004 PR slice；只能在真实证据满足后完成相应里程碑。
 - 桌面安全前置：源码检查确认独立 HOME 仍可能访问共享 Keychain、普通配置迁移和后台账号/更新入口。新增 Synthetic 入口在 WebView/插件之前验证真实目录，关闭普通账号、更新、恢复、数据库和后台入口，只开放合成设置的主题读写，凭据公共边界拒绝访问。本地失败优先测试与独立代码审查已完成，仍需普通 PR/CI 和真实 Tauri 结果；不把源码隔离当成 OS 沙箱或已观测零请求/零凭据访问。
 - M1 远端原生观察实验：只在一次性 macOS CI 从精确候选源码构建 App，按实际 PID/birth/path/digest/bundle 身份观察窗口与设置控件，并回收本次主进程。公开回执严格验证后才上传；原始 AX、owner/state/manifest 不上传。即使 observer slice 通过，完整 probe 仍为 blocked：点击、输入、重启持久化、窗口截图、后代清理、目录清理、请求观测、凭据观测和二进制内嵌身份仍为九项未完成内容。supervisor 取消后的清理也未实现。本机只读核对已锁屏，未请求解锁或启动 App。
+- #515 实际尝试：head `9d837d750776e19532ca4aee170fdace47caf929` 的远端 Mac 成功完成测试、打包和源码未改核验；[原生实验 34190155096](https://github.com/BumStill/CodeFactory/actions/runs/34190155096) 在启动 App 前被 `gui_session=false` 拦截，辅助功能和截图权限均为 true。当前证据不能区分缺会话、未登录或锁屏未知，不把它说成产品行为失败或远端明确锁屏。继续补匿名预检定位，并前移到编译之前。原六项合并检查和完整执行回执另行验收，不能用它们替代这个失败结果。
 - M2：补 E2E-001/002/003/007/011 的真实 WebView、旧 schema、停止/恢复/停泊 UI 和 exact release canary。
 - M3：补 E2E-010 的二进制 hard-kill nightly、isolated CodeFactoryDev required canary 与安装版单消息 canary。
 - M4：补 E2E-004/009 的 fake forge、完整交付链、worktree reservation CAS hard kill 和双会话并发。

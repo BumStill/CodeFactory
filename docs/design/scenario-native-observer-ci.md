@@ -9,12 +9,16 @@
 ## 流程与接口
 
 1. 新增独立、非 required 的 `pull_request` 工作流，权限只有 `contents: read`。checkout 使用 PR 的精确 head SHA，关闭凭据持久化；不使用 `pull_request_target`，不读取或传入 secrets，不修改现有工作流与合并规则。
-2. `run-macos-native-observer.mjs prepare` 在 canonical `/tmp` 的专属目录创建 Scenario World；私有 state、manifest 和 owner 不上传。生成命令级 Tauri override：唯一 identifier、内嵌前端、禁用 updater artifact。仓库配置与依赖不改。
+2. 先编译 Swift helper，执行只读 `preflight --driver <绝对路径>`；条件未证实时立即退出，不安装产品依赖、不构建 App、不创建 World。条件满足后，`run-macos-native-observer.mjs prepare` 在 canonical `/tmp` 的专属目录创建 Scenario World；私有 state、manifest 和 owner 不上传。生成命令级 Tauri override：唯一 identifier、内嵌前端、禁用 updater artifact。仓库配置与依赖不改。
 3. 从同一候选源码构建真实 debug App 和 Swift 原生观察器。构建输入的 expected SHA 绑定 PR head，但本片尚未验证二进制内嵌身份，必须标为 `ci_input_unverified_in_binary`；候选二进制与复制到 World 的二进制摘要必须一致，不能用输入标签替代正式产物来源证明。
 4. `observe` 只使用自己创建的进程及真实 OS 身份。它不能终止 LaunchServices 意外返回的另一个 App；每次 AX 观察与回收前重新验证 PID、birth token、executable path/digest、bundle identifier。没有验证的行为保留 unknown，不填假零值。
 5. 上传只有匿名 `receipt.json`。必须校验精确 expected build SHA、observer slice 与 full probe 的不同状态；world 保留不能写成完整清理通过，未知请求/凭据次数必须为 null。runner 销毁也不能冒充用例清理能力。
 
 job-level `env` 只使用该层合法的 `github.*` 上下文。构建之外的私有 state/raw/public 输出位于 checkout 的 ignored `.codefactory-cache` 中，与 `cargo-target` 并列，不进入 Rust target 缓存；输出父目录仍由 supervisor 逐层核验。#515 首轮 `34189620864` 实际产生 workflow 文件级启动失败，没有执行 App；普通 YAML 解析不能验证 GitHub 上下文可用性。已补 `runner.temp` 在 job env 中被拒绝的失败优先回归，改为显式 `github.workspace` 路径后再到远端验证。
+
+#515 的 `9d837d75` 已实际完成预测试、真实 App 打包及 source-preserved 核验；run `34190155096` 在 observe 之前返回 `accessibility=true`、`screen_capture=true`、`gui_session=false`，退出 3。它证明窗口测试未执行，不证明远端锁屏，也不证明产品窗口不可达。本次将只读 preflight 前移至依赖安装和产品编译之前，匿名区分 session、控制台、登录、同用户及锁屏未知条件；仍在不具备条件时失败，不使用 unknown 代替 unlocked，也不改权限。`ready` 仅代表预检条件满足，不能替代后续实际 AX 和清理断言。
+
+前移检查已先观察旧工作流缺少早期检查的失败，再合并独立诊断实现；本地 57 项 Python、39 项 Node 测试、Swift typecheck、治理基线及场景治理验证通过。纯 Swift 字典与 CLI fixture 不读取真实桌面，不作为 App 验收证据。
 
 ## 失败处理
 

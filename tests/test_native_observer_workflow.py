@@ -71,6 +71,20 @@ class NativeObserverWorkflowTests(unittest.TestCase):
         self.assertIn("run-macos-native-observer.mjs observe", text)
         self.assertIn(".codefactory-cache/cargo-target/debug/bundle/macos/CodeFactory.app", text)
 
+    def test_native_session_is_checked_before_installing_or_building_the_app(self):
+        text = self.workflow()
+        marker = "- name: Check the native desktop session before building"
+        self.assertTrue(marker in text, "missing early read-only session check")
+        self.assertLess(text.index("- name: Compile the native read-only observer"), text.index(marker))
+        self.assertLess(text.index(marker), text.index("- name: Install locked frontend dependencies"))
+        self.assertLess(text.index(marker), text.index("- name: Build the exact embedded desktop candidate"))
+        step = text.split(marker, 1)[1].split("      - ", 1)[0]
+        self.assertIn("run-macos-native-observer.mjs preflight", step)
+        self.assertIn("--driver \"$CODEFACTORY_OBSERVER_DRIVER\"", step)
+        self.assertNotIn("--candidate-app", step)
+        self.assertNotIn("--state", step)
+        self.assertNotIn("continue-on-error", step)
+
     def test_prelaunch_tests_and_tauri_bundle_use_the_same_canonical_target(self):
         text = self.workflow()
         self.assertIn("CARGO_TARGET_DIR: ${{ github.workspace }}/.codefactory-cache/cargo-target", text)
