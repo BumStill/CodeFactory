@@ -160,7 +160,10 @@ test("native signal boundary rejects identity changes during expensive validatio
     { timeout: 15000, stdio: "pipe" });
     // A compile-time branch executes only injected pure closures, never an App,
     // OS process observer, AX query, permission API or real signal.
-    const output = execFileSync(driver, [], { input: "{}", encoding: "utf8", timeout: 1000, stdio: "pipe" });
+    // macOS may spend over a second loading system frameworks for a fresh
+    // executable while Cargo is compiling. Bound startup without weakening any
+    // of the injected identity/signal assertions inside the fixture.
+    const output = execFileSync(driver, [], { input: "{}", encoding: "utf8", timeout: 5000, stdio: "pipe" });
     assert.equal(output.trim(), "native_signal_contracts_passed");
   } finally { fs.rmSync(outer, { recursive: true }); }
 });

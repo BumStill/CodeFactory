@@ -2,9 +2,11 @@
 
 对应场景补全规格 M1 的桌面 feasibility probe。此文记录本地安全合同和只读原生权限预检；后续新增的 CI-only AX observer 见 [原生只读观察器设计](../design/native-desktop-observer-slice.md)。尚无真实 Tauri 点击、输入、重启或截图结果，不构成 L3/L4、完整 E2E 或场景门禁。没有替代产品的 AppKit 演示程序。
 
-## 当前阻塞
+## 原始风险与当前边界
 
 对 `5c25e49f` 源码的检查发现，独立 HOME 和临时 bundle identifier 不能隔离 CodeFactory 的共享 Keychain。不能直接复制或启动现有产品二进制进行测试。
+
+本 PR 已加入 [Synthetic 产品隔离入口](../design/scenario-desktop-isolation.md)，并通过独立代码审查和本地合成测试。只有从本次源码构建且通过该入口核验的 App 才进入远端观察；旧二进制不适用。以下表格保留最初检查到的普通启动风险，不表示新增隔离入口仍无条件执行这些路径。真实桌面运行和完整 probe 的证据仍待取得。
 
 | 路径 | 已确认的行为 |
 | --- | --- |
@@ -18,7 +20,7 @@
 
 这些结论来自源码检查。没有打开生产 DB、配置、凭据或运行中的 App，也没有实际触发上述命令。
 
-## 最小隔离设计，待后续产品切片实现与审核
+## 最小隔离设计，本 PR 已实现并审核，待真实运行
 
 1. 产品进程启动时先验证显式 probe 模式及单 run 所有权标记，再初始化 settings、DB、credential broker 或任何后台任务。缺失、非临时根、symlink、身份不匹配一律退出；不能回落到正常用户路径。
 2. settings 与 Tauri app data 必须都定向到同一个专属 root。加载合成配置时禁止 release/legacy 迁移、已有 session 恢复和用户配置发现；fixture 的 endpoints、key refs、MCP、hooks、远程仓库均为空。
@@ -58,7 +60,7 @@ identifier 为 `com.codefactory.scenario.<run UUID 去掉连字符>`。root 必�
 
 - `scripts/native-desktop-probe-contract.mjs`：本地纯身份/观测合同与只读路径检查。不会 launch、signal、删除文件或接入 registry。`canStopOwnedProcess` 和 `cleanupEligible` 只表达必要条件，不是实际清理能力；未来任何删目录或发进程信号的适配器，必须在操作前重新核对完整进程身份与持有目录的 device/inode，并防止核验后路径被替换。历史 predicate 不能缓存为授权。
 - `scripts/native-desktop-probe-contract.test.mjs`：合成 identity、临时目录和观测对象；覆盖 PID 复用、非 owned 进程、symlink/hardlink、越界路径、错误 owner、UUID/SHA 强制类型转换、PID 与计数边界、缺点击/输入/重启、跨 run 截图、隐私和清理失败。
-- `scripts/probe-macos-native-preflight.swift`：只读查询 Accessibility、Screen Capture 和当前 GUI session 的布尔状态，不弹权限申请、不启动 App、不读取 AX 树、不抓屏、不改环境。始终输出 `blocked` 并退出 3，因为真实交互驱动及产品隔离尚未完成。GUI 解锁状态无法证明时同样保持 blocked。
+- `scripts/probe-macos-native-preflight.swift`：只读查询 Accessibility、Screen Capture 和当前 GUI session 的布尔状态，不弹权限申请、不启动 App、不读取 AX 树、不抓屏、不改环境。该单独的历史预检始终输出 `blocked` 并退出 3，因为它本身不执行产品隔离和真实交互验收。GUI 解锁状态无法证明时同样保持 blocked。
 
 纯合同允许的观测只含固定 synthetic input digest、run/executable 身份、计数、主题枚举、截图摘要和清理状态；不接受原始文本、绝对路径、endpoint、key reference 或未知字段。所有观测的真实性仍须由之后的原生驱动证明；合成合同测试通过不能证明真实桌面体验。
 
