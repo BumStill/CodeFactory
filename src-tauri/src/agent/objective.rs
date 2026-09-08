@@ -214,6 +214,11 @@ fn recovery_backoff_ms(prior_attempts: i64) -> i64 {
 /// multi-stage recovery never trips it.
 pub const MAX_OBJECTIVE_RECOVERY_ATTEMPTS: i64 = 20;
 
+/// Enough of a stack or provider response to recognise the fault, far short of
+/// a whole stream. A stored diagnostic is for reading later, not for archiving
+/// payloads, and it is redacted before it is truncated.
+const FAILURE_DETAIL_MAX_CHARS: usize = 1_500;
+
 impl ObjectiveStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled)
@@ -1639,6 +1644,50 @@ impl ObjectiveStore {
             }
         }
         Ok(reactivated)
+    }
+
+    /// Keep a bounded, redacted copy of a technical failure's text beside the
+    /// decision that acted on it.
+    ///
+    /// `failure_signature` is a SHA of the error text, which makes repeats easy
+    /// to COUNT and impossible to READ. On 2026-09-08 four Objectives exhausted
+    /// their recovery budget on `agent_loop_error` — one signature spanning two
+    /// unrelated sessions, so plainly systematic — and every `decision_applied`
+    /// row carried a NULL `detail_json`, so nothing on the machine could say
+    /// what the error had been.
+    ///
+    /// This records a diagnosis, never a decision: it leaves revision, status
+    /// and the recovery budget untouched, so failing to write it can never
+    /// change what the control plane does.
+    pub async fn record_failure_detail(
+        &self,
+        objective_id: &str,
+        domain: RecoveryDomain,
+        failure_code: &str,
+        failure_signature: &str,
+        error_text: &str,
+    ) -> anyhow::Result<()> {
+        let detail = serde_json::json!({
+            "failure_signature": failure_signature,
+            "error_text": crate::trajectory::redact_text(error_text, FAILURE_DETAIL_MAX_CHARS),
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO objective_events
+             (id, objective_id, revision, event_type, status, decision_type,
+              domain, failure_code, detail_json, created_at)
+             SELECT ?, id, revision, 'technical_failure_detail', status,
+                    decision_type, ?, ?, ?, ? FROM objectives WHERE id=?",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(domain.as_str())
+        .bind(failure_code)
+        .bind(detail)
+        .bind(Utc::now().timestamp_millis())
+        .bind(objective_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn create(&self, create: CreateObjective) -> anyhow::Result<ObjectiveSnapshot> {
@@ -9539,6 +9588,61 @@ mod tests {
             delays.iter().all(|delay| *delay <= 15_000),
             "a dead endpoint must not be granted the transient ladder, got {delays:?}",
         );
+    }
+
+    /// 2026-09-08: four Objectives exhausted their recovery budget on
+    /// `agent_loop_error`, and one signature — `sha256:5facdc14…` — showed up in
+    /// two unrelated sessions, so it was systematic. Every `decision_applied`
+    /// row carried a NULL `detail_json` and only one of the two chat call sites
+    /// logged the text, so nothing on the machine could say what the error WAS.
+    /// A signature is a fingerprint, not a diagnosis.
+    #[tokio::test]
+    async fn a_technical_failure_keeps_a_bounded_redacted_copy_of_its_error_text() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = recovery_ceiling_objective(&pool, "objective-detail").await;
+
+        store
+            .record_failure_detail(
+                &objective.id,
+                RecoveryDomain::Chat,
+                "agent_loop_error",
+                "sha256:deadbeef",
+                &format!(
+                    "upstream 502 with api_key=sk-live-not-a-real-secret while streaming {}",
+                    "x".repeat(4_000)
+                ),
+            )
+            .await
+            .unwrap();
+
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail_json FROM objective_events
+             WHERE objective_id=? AND event_type='technical_failure_detail'",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let text = detail["error_text"].as_str().unwrap();
+        assert!(text.contains("upstream 502"), "{text}");
+        assert!(
+            !text.contains("sk-live-not-a-real-secret"),
+            "a stored diagnostic must never carry a credential: {text}"
+        );
+        assert!(
+            text.chars().count() < 2_000,
+            "the copy is bounded, not the whole stream: {} chars",
+            text.chars().count()
+        );
+        assert_eq!(detail["failure_signature"], "sha256:deadbeef");
+
+        // Recording a diagnostic is not a decision: it must not move the
+        // Objective or spend any part of the recovery budget.
+        let after = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(after.revision, objective.revision);
+        assert_eq!(after.status, objective.status);
     }
 
     #[tokio::test]

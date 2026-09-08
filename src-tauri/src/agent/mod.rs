@@ -43,7 +43,8 @@ pub mod worktree;
 
 pub use dispatch::{
     decide_chat_contract, decide_chat_mode, is_contextual_approval, is_delivery_revocation,
-    proposal_capability, steer_capability_override, with_persisted_delivery_authorization,
+    proposal_capability, steer_capability_override, steer_capability_override_with_authorization,
+    with_persisted_delivery_authorization,
     TurnGrants,
 };
 pub(crate) use internal_text::{generate_bounded_text, InternalTextOutput};
@@ -1353,6 +1354,12 @@ impl AgentLoop {
                         >
                 },
             );
+        // Read the standing delivery grant once, here, where we can await. A
+        // mid-run steer arrives on the synchronous `capability_override` path
+        // and must not silently revoke it; see
+        // `steer_capability_override_with_authorization`.
+        let delivery_authorized =
+            fetch_session_delivery_authorized(&self.db, &self.session_id).await;
         let svc = codefactory_agent_loop::run::LoopServices {
             transport: std::sync::Arc::new(
                 self.model_transport(
@@ -1378,6 +1385,7 @@ impl AgentLoop {
                     std::sync::Arc::new(crate::commands::interjections::SessionSteerInbox {
                         queue,
                         session_id: self.session_id.clone(),
+                        delivery_authorized,
                     })
                 }
                 None => std::sync::Arc::new(codefactory_agent_loop::services::NoSteering),

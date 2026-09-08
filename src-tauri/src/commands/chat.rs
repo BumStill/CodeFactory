@@ -1443,10 +1443,27 @@ async fn settle_chat_objective_from_error(
         } else {
             "agent_loop_error"
         };
+        let failure_signature = format!("sha256:{:x}", Sha256::digest(error_text.as_bytes()));
+        // The signature makes repeats countable; it does not make them
+        // readable. Keep a bounded, redacted copy so the next person to meet
+        // this failure_code can tell what it actually was. Best-effort: a
+        // diagnostic must never be able to block the decision it describes.
+        if let Err(error) = store
+            .record_failure_detail(
+                objective_id,
+                RecoveryDomain::Chat,
+                failure_code,
+                &failure_signature,
+                error_text,
+            )
+            .await
+        {
+            tracing::warn!("failed to record chat failure detail: {error}");
+        }
         RouteSignal::TechnicalFailure {
             domain: RecoveryDomain::Chat,
             failure_code: failure_code.into(),
-            failure_signature: format!("sha256:{:x}", Sha256::digest(error_text.as_bytes())),
+            failure_signature,
             next_observation_at: Utc::now().timestamp_millis() + 5_000,
             resume_cursor: Some(root_turn_id.to_string()),
         }
@@ -3173,6 +3190,9 @@ async fn resume_chat_objective_inner(
             .await?,
         ),
         Err(error_text) => {
+            // The other settle-from-error site has always logged this; this one
+            // did not, so half of every `agent_loop_error` left no trace at all.
+            tracing::error!("Agent loop error: {error_text}");
             let auth_expired = is_chatgpt_auth_expired(&endpoint_for_error, &error_text);
             let settled = settle_chat_objective_from_error(
                 &db,
