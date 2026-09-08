@@ -68,6 +68,10 @@ pub async fn drain_for_session(
 pub struct SessionSteerInbox {
     pub queue: InterjectionQueue,
     pub session_id: String,
+    /// The session's standing delivery grant, read once when the loop starts.
+    /// `capability_override` is synchronous, so it cannot query the row itself,
+    /// and the flag is settled at turn entry before the loop is built.
+    pub delivery_authorized: bool,
 }
 
 #[async_trait::async_trait]
@@ -84,7 +88,10 @@ impl codefactory_agent_loop::services::SteerInbox for SessionSteerInbox {
         &self,
         content: &str,
     ) -> Option<codefactory_agent_loop::run::TurnCapability> {
-        crate::agent::steer_capability_override(content)
+        crate::agent::steer_capability_override_with_authorization(
+            content,
+            self.delivery_authorized,
+        )
     }
 }
 
@@ -107,5 +114,32 @@ mod tests {
         assert_eq!(drained.len(), 1);
         let drained_again = drain_for_session(&q, "s1").await;
         assert!(drained_again.is_empty());
+    }
+
+    /// The inbox is where the 2026-09-08 regression actually bit: it asked
+    /// "what does this message mean on its own" and threw away what the
+    /// session already held, so `继续` demoted a delivery-authorized session to
+    /// local-only work and every commit, PR and release was then refused.
+    #[tokio::test]
+    async fn a_continuation_steer_does_not_revoke_the_sessions_delivery_grant() {
+        use codefactory_agent_loop::services::SteerInbox;
+        let authorized = SessionSteerInbox {
+            queue: Arc::new(Mutex::new(HashMap::new())),
+            session_id: "s1".into(),
+            delivery_authorized: true,
+        };
+        assert_eq!(
+            authorized.capability_override("继续"),
+            Some(codefactory_agent_loop::run::TurnCapability::Deliver),
+        );
+        let unauthorized = SessionSteerInbox {
+            queue: Arc::new(Mutex::new(HashMap::new())),
+            session_id: "s1".into(),
+            delivery_authorized: false,
+        };
+        assert_eq!(
+            unauthorized.capability_override("继续"),
+            Some(codefactory_agent_loop::run::TurnCapability::Implement),
+        );
     }
 }

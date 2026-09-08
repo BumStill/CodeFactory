@@ -733,6 +733,31 @@ pub fn steer_capability_override(user_msg: &str) -> Option<TurnCapability> {
     None
 }
 
+/// The same steer, read against what the session already holds.
+///
+/// [`steer_capability_override`] answers only "what is the user asking for
+/// right now", so it necessarily lands on `Implement` for a bare `继续` — the
+/// word carries no delivery verb. Applied to a session that had ALREADY been
+/// granted delivery, that reads as a revocation: `policy::capability_denial`
+/// then refuses every commit, PR and release with "当前意图只授权本地实施".
+/// On 2026-09-08 seven resumed sessions hit exactly this, so the one word the
+/// user typed to keep the work moving was what stopped it from finishing.
+///
+/// A steer changes the current ACTION, not the standing grant. Only an
+/// explicit read-only steer (handled above, and preserved here) or an explicit
+/// revocation ([`is_delivery_revocation`], applied upstream where the durable
+/// flag is cleared) may lower it — the same rule
+/// [`with_persisted_delivery_authorization`] already applies at turn entry.
+pub fn steer_capability_override_with_authorization(
+    user_msg: &str,
+    delivery_authorized: bool,
+) -> Option<TurnCapability> {
+    match steer_capability_override(user_msg)? {
+        TurnCapability::Implement if delivery_authorized => Some(TurnCapability::Deliver),
+        capability => Some(capability),
+    }
+}
+
 fn grants_browser_read(user_msg: &str) -> bool {
     let text = user_msg.to_ascii_lowercase();
     if [
@@ -1401,5 +1426,39 @@ mod tests {
             steer_capability_override("先别修改，继续分析"),
             Some(TurnCapability::ReviewOnly),
         );
+    }
+
+    /// 2026-09-08 field report. Seven sessions were resumed with the single
+    /// word `继续`; every one of them lost its standing delivery grant on the
+    /// spot, because the steer path routed `继续` to `Implement` and
+    /// `policy::capability_denial` then refused every commit, PR and release
+    /// with "当前意图只授权本地实施". The word the user typed to keep the work
+    /// moving was the reason it could not finish. A steer changes the current
+    /// ACTION, and only an explicit read-only steer or an explicit revocation
+    /// lowers a grant the session already holds — the same rule
+    /// `with_persisted_delivery_authorization` applies at turn entry.
+    #[test]
+    fn a_continuation_steer_keeps_a_standing_delivery_grant() {
+        for message in ["继续", "接着做", "继续实施", "go on"] {
+            assert_eq!(
+                steer_capability_override_with_authorization(message, true),
+                steer_capability_override(message).map(|_| TurnCapability::Deliver),
+                "{message} must not revoke a delivery grant the session already holds"
+            );
+        }
+        // Without a grant nothing is inherited: the steer still means Implement.
+        assert_eq!(
+            steer_capability_override_with_authorization("继续", false),
+            Some(TurnCapability::Implement),
+        );
+        // An explicit read-only steer still wins over a standing grant, and an
+        // explicit revocation is handled by `is_delivery_revocation` upstream.
+        assert_eq!(
+            steer_capability_override_with_authorization("先别修改，继续分析", true),
+            Some(TurnCapability::ReviewOnly),
+        );
+        assert!(is_delivery_revocation("先别发布"));
+        // A message that steers nothing still steers nothing.
+        assert_eq!(steer_capability_override_with_authorization("嗯", true), None);
     }
 }

@@ -722,9 +722,21 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     // state) are verification — the third allowlist expansion (pnpm test →
     // vitest/tsc → gh). Mutating gh subcommands (merge, workflow run,
     // api -X POST) stay out of this lane.
-    let gh_read_only_verification = ["gh run view", "gh run list", "gh pr checks", "gh pr view"]
-        .iter()
-        .any(|w| lower.contains(w))
+    let gh_read_only_verification = [
+        "gh run view",
+        "gh run list",
+        "gh pr checks",
+        "gh pr view",
+        // A published release is remote state the agent must be able to READ
+        // to confirm a fix actually shipped. `is_long_running_observation_command`
+        // already treats these as observations; leaving them out here classified
+        // them `ReadOnly`, which `native_requires_mutation_receipt` then fenced
+        // behind a receipt bash can never satisfy — "系统未执行", 2026-09-08.
+        "gh release view",
+        "gh release list",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
         || (lower.contains("gh api")
             && !lower.contains(" -x ")
             && !lower.contains("--method")
@@ -5488,6 +5500,16 @@ mod tests {
             "gh pr checks 166 --repo BumStill/CodeFactory",
             "gh pr view 166 --json statusCheckRollup",
             "gh api repos/BumStill/CodeFactory/commits/abc/check-runs",
+            // 2026-09-08 field report: `gh release view` was the ONE query the
+            // agent needed to confirm a fix had actually shipped, and it was
+            // the one this list forgot. Missing here it fell through to the
+            // mutation branch, where bash can supply no observation contract,
+            // and the turn settled `Waiting` with "系统未执行".
+            // `is_long_running_observation_command` already treats it as an
+            // observation; these two answers must not disagree.
+            "gh release view --json tagName,url,body,assets",
+            "gh release view v1.81.44 --repo BumStill/CodeFactory",
+            "gh release list --repo BumStill/CodeFactory --limit 5",
         ] {
             assert_eq!(
                 classify_command(command, 300_000),
@@ -5500,6 +5522,9 @@ mod tests {
             "gh pr merge 166 --squash",
             "gh workflow run auto-release.yml --ref main",
             "gh api repos/x/y/dispatches -X POST",
+            "gh release create v1.0.0 --notes x",
+            "gh release delete v1.0.0 --yes",
+            "gh release upload v1.0.0 dist/app.dmg",
         ] {
             assert_ne!(
                 classify_command(command, 300_000),
