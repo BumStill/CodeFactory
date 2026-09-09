@@ -1,0 +1,124 @@
+name: Native desktop observer experiment
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/native-desktop-observer.yml'
+      - 'scripts/*native*observer*'
+      - 'scripts/native-desktop-probe-contract*'
+      - 'scripts/probe-macos-native-preflight.swift'
+      - 'src-tauri/src/desktop_context*'
+      - 'src-tauri/src/config/settings.rs'
+      - 'src-tauri/src/secrets.rs'
+      - 'src-tauri/src/lib.rs'
+      - 'tests/test_native_observer_workflow.py'
+      - 'tests/test_native_observer_receipt.py'
+      - 'tests/test_desktop_isolation_contract.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-desktop-observer-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  native-observer-slice:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CODEFACTORY_BUILD_GIT_SHA: ${{ github.event.pull_request.head.sha }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.codefactory-cache/cargo-target
+      CODEFACTORY_OBSERVER_STATE: ${{ github.workspace }}/.codefactory-cache/native-observer-state.json
+      CODEFACTORY_OBSERVER_CONFIG: ${{ github.workspace }}/.codefactory-cache/native-observer-build.json
+      CODEFACTORY_OBSERVER_DRIVER: ${{ github.workspace }}/.codefactory-cache/codefactory-native-observer
+      CODEFACTORY_OBSERVER_RAW: ${{ github.workspace }}/.codefactory-cache/native-observer-private/receipt.json
+      CODEFACTORY_OBSERVER_PUBLIC: ${{ github.workspace }}/.codefactory-cache/native-observer-evidence/receipt.json
+    steps:
+      - name: Checkout the exact candidate without saved credentials
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile the native read-only observer
+        run: |
+          mkdir -p .codefactory-cache
+          xcrun swiftc scripts/macos-native-observer.swift -o "$CODEFACTORY_OBSERVER_DRIVER"
+
+      - name: Check the native desktop session before building
+        run: >-
+          node scripts/run-macos-native-observer.mjs preflight
+          --driver "$CODEFACTORY_OBSERVER_DRIVER"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> ../.codefactory-cache/cargo-target
+
+      - name: Install locked frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify synthetic contracts before launching anything
+        run: |
+          node --test scripts/native-desktop-probe-contract.test.mjs scripts/macos-native-observer-supervisor.test.mjs
+          python3 -B -m unittest tests.test_native_observer_receipt tests.test_native_observer_workflow tests.test_desktop_isolation_contract -q
+          pnpm cargo:shared -- test --manifest-path src-tauri/Cargo.toml --lib desktop_context --locked
+          pnpm cargo:shared -- test --manifest-path src-tauri/Cargo.toml --lib config::settings::settings_persistence_tests --locked
+          pnpm cargo:shared -- test --manifest-path src-tauri/Cargo.toml --lib secrets::tests --locked
+
+      - name: Prepare a private synthetic world and build override
+        run: >-
+          node scripts/run-macos-native-observer.mjs prepare
+          --state "$CODEFACTORY_OBSERVER_STATE"
+          --build-config "$CODEFACTORY_OBSERVER_CONFIG"
+          --expected-build-sha "$CODEFACTORY_BUILD_GIT_SHA"
+
+      - name: Build the exact embedded desktop candidate
+        run: >-
+          pnpm exec tauri build --debug --bundles app
+          --config "$CODEFACTORY_OBSERVER_CONFIG" -- --locked
+
+      - name: Confirm the build preserved the candidate source
+        run: |
+          test "$(git rev-parse HEAD)" = "$CODEFACTORY_BUILD_GIT_SHA"
+          git diff HEAD --exit-code
+
+      - name: Observe the owned native process and reclaim it
+        run: >-
+          node scripts/run-macos-native-observer.mjs observe
+          --state "$CODEFACTORY_OBSERVER_STATE"
+          --candidate-app .codefactory-cache/cargo-target/debug/bundle/macos/CodeFactory.app
+          --driver "$CODEFACTORY_OBSERVER_DRIVER"
+          --receipt "$CODEFACTORY_OBSERVER_RAW"
+
+      - name: Keep the observer slice separate from full desktop coverage
+        id: publish
+        if: ${{ always() }}
+        run: >-
+          python3 scripts/assert_native_observer_receipt.py
+          --receipt "$CODEFACTORY_OBSERVER_RAW"
+          --expected-build-sha "$CODEFACTORY_BUILD_GIT_SHA"
+          --public-output "$CODEFACTORY_OBSERVER_PUBLIC"
+
+      - name: Upload anonymous observer receipt
+        if: ${{ always() && steps.publish.outputs.public_receipt_ready == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-observer-receipt-${{ github.event.pull_request.head.sha }}
+          path: ${{ github.workspace }}/.codefactory-cache/native-observer-evidence/receipt.json
+          if-no-files-found: error
+          retention-days: 7

@@ -189,6 +189,10 @@ fn delete_os_key(account: &str) -> crate::errors::Result<()> {
 }
 
 pub fn get_key(account: &str) -> crate::errors::Result<Option<String>> {
+    crate::desktop_context::read_secret(|| get_key_normal(account))
+}
+
+fn get_key_normal(account: &str) -> crate::errors::Result<Option<String>> {
     let recovery_copy = fallback_key(account);
     // macOS always keeps a user-only recovery copy after an authorized save.
     // Prefer it so lock-screen keychain availability cannot block model calls.
@@ -213,6 +217,10 @@ pub fn get_key(account: &str) -> crate::errors::Result<Option<String>> {
 }
 
 pub fn set_key(account: &str, value: &str) -> crate::errors::Result<()> {
+    crate::desktop_context::write_secret(|| set_key_normal(account, value))
+}
+
+fn set_key_normal(account: &str, value: &str) -> crate::errors::Result<()> {
     if fallback_key(account).is_some() {
         save_fallback_key(account, value)?;
         remove_legacy_key(account)?;
@@ -252,6 +260,10 @@ pub fn set_key(account: &str, value: &str) -> crate::errors::Result<()> {
 }
 
 pub fn delete_key(account: &str) -> crate::errors::Result<()> {
+    crate::desktop_context::write_secret(|| delete_key_normal(account))
+}
+
+fn delete_key_normal(account: &str) -> crate::errors::Result<()> {
     let had_fallback = remove_fallback_key(account)?;
     if let Err(error) = delete_os_key(account) {
         if !cfg!(target_os = "macos") || !had_fallback {

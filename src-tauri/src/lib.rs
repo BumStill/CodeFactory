@@ -10,6 +10,7 @@ mod codex_auth;
 mod commands;
 mod config;
 mod credential_broker;
+mod desktop_context;
 mod errors;
 mod git_remote;
 mod http_util;
@@ -77,6 +78,7 @@ pub fn run_history_session_smoke_cli() -> bool {
     if !matches!(flag, "--history-session-smoke" | "--history-session-worker") {
         return false;
     }
+    desktop_context::reject_world_request_for_cli();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -149,6 +151,7 @@ pub fn run_delivery_recovery_smoke_cli() -> bool {
     ) {
         return false;
     }
+    desktop_context::reject_world_request_for_cli();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         // The recovery path intentionally drives the full production DeliveryRun
         // state machine. Windows executables have a much smaller main-thread
@@ -233,6 +236,7 @@ pub fn run_managed_workspace_cleanup_smoke_cli() -> bool {
     if args.get(1).map(String::as_str) != Some("--managed-workspace-cleanup-smoke") {
         return false;
     }
+    desktop_context::reject_world_request_for_cli();
     if args.len() != 3 {
         eprintln!("usage: CodeFactory --managed-workspace-cleanup-smoke <receipt.json>");
         std::process::exit(2);
@@ -349,6 +353,7 @@ pub fn run_evolution_smoke_cli() -> bool {
     if flag != "--evolution-smoke" {
         return false;
     }
+    desktop_context::reject_world_request_for_cli();
     let Some(output) = args.next() else {
         eprintln!("usage: CodeFactory --evolution-smoke <receipt.json>");
         std::process::exit(2);
@@ -394,6 +399,7 @@ pub fn run_browser_session_smoke_cli() -> bool {
     if flag != "--browser-session-smoke" {
         return false;
     }
+    desktop_context::reject_world_request_for_cli();
     let Some(output) = args.next() else {
         eprintln!("usage: CodeFactory --browser-session-smoke <receipt.json>");
         std::process::exit(2);
@@ -842,6 +848,7 @@ pub fn run_update_upgrade_smoke_cli() -> bool {
     if args.get(1).map(String::as_str) != Some("--update-upgrade-smoke") {
         return false;
     }
+    desktop_context::reject_world_request_for_cli();
     if args.len() != 5 {
         eprintln!(
             "usage: CodeFactory --update-upgrade-smoke <receipt.json> <previous-version> <previous-build-sha>"
@@ -1018,6 +1025,7 @@ pub fn run_browser_chrome_attach_smoke_cli() -> bool {
     if flag != "--browser-chrome-attach-smoke" {
         return false;
     }
+    desktop_context::reject_world_request_for_cli();
     let Some(output) = args.next() else {
         eprintln!("usage: CodeFactory --browser-chrome-attach-smoke <receipt.json>");
         std::process::exit(2);
@@ -1292,6 +1300,7 @@ pub fn run_headless_smoke_cli() -> bool {
     if flag != "--headless-smoke" {
         return false;
     }
+    desktop_context::reject_world_request_for_cli();
     let Some(output) = args.next() else {
         eprintln!("usage: CodeFactory --headless-smoke <receipt.json>");
         std::process::exit(2);
@@ -1325,6 +1334,21 @@ pub fn run_headless_smoke_cli() -> bool {
 }
 
 pub fn run() {
+    let context = tauri::generate_context!();
+    match desktop_context::initialize(&context) {
+        Ok(desktop_context::DesktopContext::Normal) => {}
+        Ok(desktop_context::DesktopContext::Synthetic(synthetic)) => {
+            if let Err(error) = desktop_context::run_synthetic(context, synthetic) {
+                eprintln!("Synthetic desktop rejected: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(desktop_context::DesktopContext::Rejected) | Err(_) => {
+            eprintln!("Desktop isolation validation rejected startup");
+            std::process::exit(1);
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1776,6 +1800,6 @@ pub fn run() {
             commands::costs::get_usage_budget_status,
             commands::costs::get_session_usage,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running CodeFactory");
 }

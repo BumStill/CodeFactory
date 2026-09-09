@@ -4,6 +4,8 @@
 
 已经修好了测试结果格式不一致、可能把不完整结果误判为通过的问题，新检查程序已合入，原来的保护已恢复。随后通过普通 PR #512 在 Windows 和 Mac 上实际复测：113 个执行项全部通过，原始记录独立核对一致，六项合并检查通过后正常合入。
 
+#514 也已正常合并：修正了“调试程序测试通过，却被写成正式安装包已验收”的报告标签，19 个执行项和六项合并检查通过。现在继续准备真实桌面测试：先让测试程序不接触真实账号和配置，再到一次性远端 Mac 上确认能看到它自己的窗口和设置按钮、结束后能回收主进程。本机锁屏不动；这一步还没有真实界面成功结果。
+
 所有场景还没有补完：复杂场景仍有 26 项缺口，主要在真实界面操作、浏览器异常恢复、完整交付过程和安装升级。下面的技术记录用于核对证据，不把“检查程序升级完成”说成“所有测试补齐”。
 
 ## Basics
@@ -20,9 +22,9 @@
 
 ## Current State
 
-- Current phase: Bootstrap-1a 已验收 / #508 已合入且原始规则集恢复；#512 在完整保护下完成非空 Windows/macOS canary 并合入。继续桌面安全隔离与可执行性验证。
+- Current phase: Bootstrap-1a/#508、完整保护 canary/#512、runtime 证据标签修正/#514 已合并验收。继续 M1 桌面安全隔离与非 required 的远端原生观察实验；不改变 registry、trusted judge 或现有合并规则。
 - Current checkpoint: M0/#502、M1a/#503、M1b/#504 均已合入 `main`。#505 最小路由修复合入后，#504 作为全量 canary 通过 111/111 target（Windows 102、macOS 9）和全部六项 required checks，合并提交为 `05461f19c62cb90e592defd0c53fc78c4996835e`；两个已完成 worktree 已按 PR 证据回收，用户主 checkout 未修改。详见 `docs/evidence-packs/scenario-runner-bootstrap-2026-09-07.md`。
-- Next owner: #512 已在 base `5c25e49fc1947ea7557ee0d4184129b63400ffae` / head `ac38ea66b7cee9bb56be78928a07f85e624868b4` 实际通过 113 targets（Windows 104、macOS 9）和唯一 Windows E2E-001 v2 case；正常合并为 `c9bd334091551240f38cd3072159e4e88f9101d9`，父提交和完整文件树读回与被测版本一致。六项检查、可信原始观测复算、12 类主执行者反例与 24 项独立 QA 反例均通过。下一步修正 Chrome runtime 报告的证据范围，并完成不接触真实账号/配置的桌面前置隔离；再继续桌面可执行性验证与 E2E-004 PR slice。不重复请求或执行已完成的 #508 迁移。
+- Next owner: #512 已在 base `5c25e49fc1947ea7557ee0d4184129b63400ffae` / head `ac38ea66b7cee9bb56be78928a07f85e624868b4` 实际通过 113 targets（Windows 104、macOS 9）和唯一 Windows E2E-001 v2 case；正常合并为 `c9bd334091551240f38cd3072159e4e88f9101d9`，父提交和完整文件树读回与被测版本一致。六项检查、可信原始观测复算、12 类主执行者反例与 24 项独立 QA 反例均通过。#514 后继修正已合并为 `52bd3657ed15b75ea916cc5c1a271a5d85b2bacc`。下一步提交已独立审查的桌面隔离入口与原生观察实验，取得远端实测结果后再决定桌面 feasibility 和 E2E-004 PR slice 的接入；不重复请求或执行已完成的 #508 迁移。
 - Updated at: 2026-09-08
 
 ## Completed Items
@@ -39,13 +41,15 @@
 - #507 已合并 canonical CLI 和真实跨平台 Skill symlink 测试：首轮 Windows 55 targets 的唯一失败为 Unix-only 目标零执行，修复后新计划 Windows 60/macOS 9 全通过；独立 QA 确认该命名测试实际 1 passed、0 ignored，并验证完整 schema v1 aggregate 无缺失、重复或多余目标。
 - #508 迁移前独立 QA 发现 receipt 版本声明漂移；失败优先修复后，registry 与 direct planner 均拒绝缺失/旧版/非法类型，即使零 target 也不放行。升级现已合入，未提升任何完整 case 状态；网络中断时自动恢复保护的实际路径和成功后的完整恢复均已验证。
 - #512 恢复后 canary 已正常合并：[执行 34184641912](https://github.com/BumStill/CodeFactory/actions/runs/34184641912) 与 [独立 gate 34184640431](https://github.com/BumStill/CodeFactory/actions/runs/34184640431) 在同一 base/head 全通过。单用户消息、零人工 prompt、真实中断与不同进程接管、幂等副作用和零泄漏清理均由原始记录核验；不包含 UI、Mac E2E-001 或正式安装包证明。线上 ruleset 标准 verify 为 converged。
+- #514 runtime 标签修正已正常合并：[执行 34186734056](https://github.com/BumStill/CodeFactory/actions/runs/34186734056) 和 [独立 gate 34186734286](https://github.com/BumStill/CodeFactory/actions/runs/34186734286) 通过，Windows 17/macOS 2 targets 均有实际结果；完整 plan/aggregate 由原始 runner 回执独立复算，六项 required checks 通过。被测 head `f714f489e0265630965d3de194083167c195bbe5` 与 merge `52bd3657ed15b75ea916cc5c1a271a5d85b2bacc` 文件树相同。实际 Mac Chrome attach 回执为 `native_runtime_smoke`，四项 bridge/tab/detach/lease 断言成立；正式 DMG 来源校验未放松。这是测试证据修正，不单独触发产品发版。
 
 ## Remaining Items
 
 - Bootstrap-1a：入口、执行回执 v2、可信摘要、原始观测重算、目录清理与严格集合校验已随 #507/#508 合入，完整保护下的非空 exact-head canary 与独立复核已由 #512 完成；后续不重复计为待办。
 - Bootstrap-1 后续：可信 catalog 接入、桌面 feasibility probe、E2E-004 PR slice；只能在真实证据满足后完成相应里程碑。
-- 本轮发现的报告标签偏差：Chrome attach smoke 在 debug binary 上硬编码 `exact_release_artifact`。先修正生产者与消费方的证据边界，保留真实运行断言，不把调试版结果计作正式安装包验收。
-- 桌面安全前置：源码检查确认独立 HOME 仍可能访问共享 Keychain、普通配置迁移和后台账号/更新入口。先验证隔离入口早于 WebView、只开放已审查设置操作、阻断真实凭据及后台动作，再启动真实 Tauri probe。当前只读权限预检不构成桌面通过证据。
+- 桌面安全前置：源码检查确认独立 HOME 仍可能访问共享 Keychain、普通配置迁移和后台账号/更新入口。新增 Synthetic 入口在 WebView/插件之前验证真实目录，关闭普通账号、更新、恢复、数据库和后台入口，只开放合成设置的主题读写，凭据公共边界拒绝访问。本地失败优先测试与独立代码审查已完成，仍需普通 PR/CI 和真实 Tauri 结果；不把源码隔离当成 OS 沙箱或已观测零请求/零凭据访问。
+- M1 远端原生观察实验：只在一次性 macOS CI 从精确候选源码构建 App，按实际 PID/birth/path/digest/bundle 身份观察窗口与设置控件，并回收本次主进程。公开回执严格验证后才上传；原始 AX、owner/state/manifest 不上传。即使 observer slice 通过，完整 probe 仍为 blocked：点击、输入、重启持久化、窗口截图、后代清理、目录清理、请求观测、凭据观测和二进制内嵌身份仍为九项未完成内容。supervisor 取消后的清理也未实现。本机只读核对已锁屏，未请求解锁或启动 App。
+- #515 实际尝试：head `9d837d750776e19532ca4aee170fdace47caf929` 的远端 Mac 成功完成测试、打包和源码未改核验；[原生实验 34190155096](https://github.com/BumStill/CodeFactory/actions/runs/34190155096) 在启动 App 前被 `gui_session=false` 拦截，辅助功能和截图权限均为 true。当前证据不能区分缺会话、未登录或锁屏未知，不把它说成产品行为失败或远端明确锁屏。继续补匿名预检定位，并前移到编译之前。原六项合并检查和完整执行回执另行验收，不能用它们替代这个失败结果。
 - M2：补 E2E-001/002/003/007/011 的真实 WebView、旧 schema、停止/恢复/停泊 UI 和 exact release canary。
 - M3：补 E2E-010 的二进制 hard-kill nightly、isolated CodeFactoryDev required canary 与安装版单消息 canary。
 - M4：补 E2E-004/009 的 fake forge、完整交付链、worktree reservation CAS hard kill 和双会话并发。
