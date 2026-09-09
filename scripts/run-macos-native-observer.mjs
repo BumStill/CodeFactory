@@ -24,6 +24,32 @@ export const preflightProjection = (value) => ({ accessibility: value?.accessibi
   login_done: value?.login_done === true, same_uid: value?.same_uid === true,
   lock_state: ["locked", "unlocked", "unknown"].includes(value?.lock_state) ? value.lock_state : "unknown" });
 
+// Session observation and permission to launch are different facts. In
+// particular, a missing private lock key must never erase an observed session
+// or be treated as evidence that the screen is unlocked.
+export function preflightDecision(raw) {
+  const preflight = preflightProjection(raw);
+  const reason_codes = [];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.session_present !== "boolean") {
+    reason_codes.push("preflight_observation_unavailable");
+  } else if (!preflight.session_present) {
+    // This means the caller's CGSession query returned no session, not that no
+    // user anywhere on the machine has a WindowServer session.
+    reason_codes.push("no_session_observed");
+  } else {
+    if (!preflight.accessibility) reason_codes.push("accessibility_unavailable");
+    if (!preflight.screen_capture) reason_codes.push("screen_capture_unavailable");
+    if (!preflight.on_console) reason_codes.push("session_not_on_console");
+    if (!preflight.login_done) reason_codes.push("session_login_unproven");
+    if (!preflight.same_uid) reason_codes.push("session_uid_unproven");
+    if (!preflight.gui_session) reason_codes.push("gui_session_unproven");
+    if (preflight.lock_state === "locked") reason_codes.push("screen_locked");
+    if (preflight.lock_state === "unknown") reason_codes.push("unlock_state_unproven");
+  }
+  return { scope: "native-desktop-preflight", status: reason_codes.length === 0 ? "ready" : "blocked",
+    preflight, reason_codes: reason_codes.sort() };
+}
+
 export async function readOnlyPreflight(driver, { platform = process.platform, environment = process.env, call = native } = {}) {
   if (platform !== "darwin" || environment.GITHUB_ACTIONS !== "true" || environment.RUNNER_OS !== "macOS") {
     throw new Error("macos_ci_only");
@@ -31,9 +57,7 @@ export async function readOnlyPreflight(driver, { platform = process.platform, e
   if (typeof driver !== "string" || !path.isAbsolute(driver)) throw new Error("absolute_driver_required");
   let raw = null;
   try { raw = await call(driver, { operation: "preflight" }); } catch { /* No raw helper errors leave this boundary. */ }
-  const preflight = preflightProjection(raw);
-  const ready = preflight.accessibility && preflight.screen_capture && preflight.gui_session;
-  return { scope: "native-desktop-preflight", status: ready ? "ready" : "blocked", preflight };
+  return preflightDecision(raw);
 }
 
 async function bounded(operation, milliseconds) {
@@ -229,9 +253,9 @@ async function observe(args, progress) {
     identifier: layout.identifier, expected_build_sha: state.expected_build_sha,
     build_identity_source: "ci_input_unverified_in_binary", source_executable_sha256: sourceSHA,
     copy_executable_sha256: copySHA, driver_sha256: digest(args.driver) };
-  const preflight = preflightProjection(await native(args.driver, { operation: "preflight" }));
-  console.log(JSON.stringify({ preflight }));
-  if (!preflight.accessibility || !preflight.screen_capture || !preflight.gui_session) {
+  const decision = preflightDecision(await native(args.driver, { operation: "preflight" }));
+  console.log(JSON.stringify(decision));
+  if (decision.status !== "ready") {
     return { ...result, process: null, observer_slice: { status: "blocked", reason_codes: ["native_preflight_unproven"],
       ax_window_seen: false, settings_control: false }, cleanup: { child_reaped: false, signal_attempts: 0, world_directory: "retained" },
     full_probe: { status: "blocked", missing: [...missing] }, request_count: null, credential_access_count: null };

@@ -184,7 +184,7 @@ func preflightDiagnostics(session: [String: Any]?, currentUID: uid_t,
     let userID = session?[kCGSessionUserIDKey as String] as? NSNumber
     let sameUID = userID.map { CFGetTypeID($0) != CFBooleanGetTypeID() && $0.doubleValue == Double(currentUID) } ?? false
     return ["accessibility": accessibility, "screen_capture": screenCapture,
-        "gui_session": onConsole && loggedIn && locked == false,
+        "gui_session": onConsole && loggedIn,
         "session_present": session != nil, "on_console": onConsole, "login_done": loggedIn,
         "same_uid": sameUID, "lock_state": locked == true ? "locked" : locked == false ? "unlocked" : "unknown"]
 }
@@ -232,8 +232,8 @@ do {
         FileHandle.standardOutput.write(Data("\n".utf8))
     } else {
         let missing = project(synthetic)
-        try require(missing["lock_state"] as? String == "unknown" && missing["gui_session"] as? Bool == false,
-            "fixture_missing_lock_passed")
+        try require(missing["lock_state"] as? String == "unknown" && missing["gui_session"] as? Bool == true,
+            "fixture_missing_lock_erased_session")
         try require(project(nil)["session_present"] as? Bool == false && project(nil)["same_uid"] as? Bool == false,
             "fixture_missing_session_passed")
         for value: Any in [NSNumber(value: 1), "true", NSNull()] {
@@ -251,7 +251,7 @@ do {
             known["CGSSessionScreenIsLocked"] = locked
             let result = project(known)
             try require(result["lock_state"] as? String == (locked ? "locked" : "unlocked")
-                && result["gui_session"] as? Bool == !locked, "fixture_known_lock_mismatch")
+                && result["gui_session"] as? Bool == true, "fixture_known_lock_erased_session")
         }
         var wrongUser = synthetic
         wrongUser[kCGSessionUserIDKey as String] = true

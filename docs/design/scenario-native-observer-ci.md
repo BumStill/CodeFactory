@@ -2,7 +2,7 @@
 
 ## 目的与边界
 
-对应 CF-STG-R29 与 M1 桌面 feasibility probe。本机当前锁屏，不要求用户解锁、不绕过系统保护；使用一次性 macOS runner 验证独立的真实 Tauri App 能否被原生 Accessibility 观察，并能回收本次启动的进程。
+对应 CF-STG-R29 与 M1 桌面 feasibility probe。首次设计时本机锁屏，因此选择不要求用户解锁、不绕过系统保护的路线；使用一次性 macOS runner 验证独立的真实 Tauri App 能否被原生 Accessibility 观察，并能回收本次启动的进程。该历史条件不用于推断本机当前锁状态。
 
 本切片不是完整桌面验收。点击、输入、主题重开、截图、完整目录清理和请求/凭据访问计数尚未取得时，`full_probe.status` 必须保留 `blocked`。`observer_slice.status=passed` 仅说明本片列出的原生观察与进程回收成立，不提升 registry 或 L3/L4 状态。
 
@@ -19,6 +19,8 @@ job-level `env` 只使用该层合法的 `github.*` 上下文。构建之外的�
 #515 的 `9d837d75` 已实际完成预测试、真实 App 打包及 source-preserved 核验；run `34190155096` 在 observe 之前返回 `accessibility=true`、`screen_capture=true`、`gui_session=false`，退出 3。它证明窗口测试未执行，不证明远端锁屏，也不证明产品窗口不可达。本次将只读 preflight 前移至依赖安装和产品编译之前，匿名区分 session、控制台、登录、同用户及锁屏未知条件；仍在不具备条件时失败，不使用 unknown 代替 unlocked，也不改权限。`ready` 仅代表预检条件满足，不能替代后续实际 AX 和清理断言。
 
 前移检查已先观察旧工作流缺少早期检查的失败，再合并独立诊断实现；本地 57 项 Python、39 项 Node 测试、Swift typecheck、治理基线及场景治理验证通过。纯 Swift 字典与 CLI fixture 不读取真实桌面，不作为 App 验收证据。
+
+2026-09-09 诊断修正：`522a1c23` 的早期预检实际返回 session_present/on_console/login_done/same_uid=true、lock_state=unknown。旧 gui_session 把“明确未锁屏”混入会话存在性，导致 false 容易被误读为“没有 Aqua 会话”。新实现分离会话、锁屏与准入，固定原因码区分无会话观察、诊断不可用、已锁屏和解锁未证实；early CLI 与 launch 前共用同一决策，必须明确解锁且同 UID。blocked 仍退出 3，实验仍非 required，不降低 L3 门槛。业务 L3 分工和可判定清单见 [会话类 L3 验收交接](../testing/l3-session-acceptance-handoff.md)。
 
 ## 失败处理
 
