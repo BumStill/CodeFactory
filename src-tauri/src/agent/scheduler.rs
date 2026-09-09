@@ -1928,7 +1928,14 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(remediations, MAX_SIGNATURE_RECOVERY_ATTEMPTS);
+        assert_eq!(
+            remediations,
+            crate::agent::objective::max_signature_attempts_for(Some(
+                crate::agent::objective::COMPLETION_EVIDENCE_INCOMPLETE
+            )),
+            "the ceiling for this failure class, whatever it is, must be the \
+             thing that ends the loop"
+        );
 
         let (status, recovery_state, error): (String, Option<String>, Option<String>) =
             sqlx::query_as("SELECT status, recovery_state, error FROM task_runs WHERE id=?")

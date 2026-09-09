@@ -76,6 +76,16 @@ string_enum!(ObjectiveStatus {
 /// transport turn (`chat_turn_state.terminal_reason`) so a settled turn and the
 /// objective that produced it name the same thing.
 pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
+
+/// An Objective that stopped without deciding anything: not a provider fault,
+/// not a tool fault — the turn simply ended and left the row `active`, owning
+/// no lease, no remediation and no scheduled observation.
+pub const OBJECTIVE_PROGRESS_STALLED: &str = "objective_progress_stalled";
+
+/// How long an `active` Objective may go without a heartbeat before it is
+/// treated as abandoned. Deliberately generous: a healthy turn running a ten-
+/// minute build still publishes activity, so nothing legitimate comes close.
+pub const STALLED_ACTIVE_OBJECTIVE_MS: i64 = 30 * 60 * 1000;
 pub const OBJECTIVE_INCIDENT_CONTROLLER: &str = "objective-incident-controller";
 
 /// Version of the durable Chat recovery contract, not the application build.
@@ -118,6 +128,30 @@ pub const UPDATE_SAFE_POINT_PENDING: &str = "update_safe_point_pending";
 /// same broken route a fresh budget. Only an explicit user reprompt after
 /// exhaustion starts another independently bounded generation.
 pub const MAX_SIGNATURE_RECOVERY_ATTEMPTS: i64 = 5;
+
+/// The verdict "you finished, but the evidence does not support it".
+pub const COMPLETION_EVIDENCE_INCOMPLETE: &str = "completion_evidence_incomplete";
+
+/// A completion verdict that saw no new evidence cannot improve by being asked
+/// again: the model already answered, the arbiter already refused it, and
+/// nothing between two identical rounds changed. Every further round costs the
+/// user another copy of the same answer — 2026-09-08 produced EIGHT between
+/// 10:01 and 10:23, and exhausted the budget anyway — so this class converges
+/// far sooner than the generic transient ladder.
+///
+/// This is not a tighter leash on progress. Folding the evidence digest into
+/// the failure signature is what makes stagnation observable: a round that DID
+/// gather something mints a different signature and starts again with the full
+/// budget. Only a round that changed nothing is charged here.
+const MAX_STAGNANT_COMPLETION_ATTEMPTS: i64 = 2;
+
+/// How many repeats of ONE signature are allowed before the Objective parks.
+pub(crate) fn max_signature_attempts_for(failure_code: Option<&str>) -> i64 {
+    if failure_code == Some(COMPLETION_EVIDENCE_INCOMPLETE) {
+        return MAX_STAGNANT_COMPLETION_ATTEMPTS;
+    }
+    MAX_SIGNATURE_RECOVERY_ATTEMPTS
+}
 
 /// A repeating failure signature must not spend the whole recovery budget in
 /// seconds. Scheduling every repeat at a flat five seconds means five identical
@@ -1129,7 +1163,7 @@ pub fn decision_for_run_outcome_with_reason(
         StopReason::IterationCeiling => ("iteration_ceiling", RecoveryDomain::Chat),
         StopReason::Incomplete => ("objective_incomplete", RecoveryDomain::Chat),
         StopReason::Blocked => ("run_blocked", RecoveryDomain::Chat),
-        StopReason::Finished => ("completion_evidence_incomplete", RecoveryDomain::Chat),
+        StopReason::Finished => (COMPLETION_EVIDENCE_INCOMPLETE, RecoveryDomain::Chat),
         StopReason::Cancelled => unreachable!("explicit cancellation handled above"),
     };
     DecisionRouter::route(
@@ -1138,10 +1172,27 @@ pub fn decision_for_run_outcome_with_reason(
             domain,
             failure_code: failure_code.into(),
             failure_signature: format!(
-                "{}:{:?}:{}",
+                "{}:{:?}:{}{}",
                 objective.id,
                 outcome.stop_reason,
-                terminal_reason.unwrap_or("none")
+                terminal_reason.unwrap_or("none"),
+                // A completion verdict is only the SAME failure when the
+                // evidence behind it is unchanged. The signature used to be
+                // constant per Objective, so a round that gathered real
+                // evidence was charged exactly like a round that gathered none:
+                // progress was punished and stagnation excused, identically.
+                // Fold the evidence state in and the two become distinguishable
+                // — which is what lets `max_signature_attempts_for` cut a
+                // stagnant loop short without ever shortening a productive one.
+                match outcome.stop_reason {
+                    StopReason::Finished | StopReason::Incomplete => format!(
+                        ":{:x}",
+                        Sha256::digest(
+                            format!("{:?}", outcome.completion_evidence).as_bytes()
+                        )
+                    ),
+                    _ => String::new(),
+                }
             ),
             next_observation_at: Utc::now().timestamp_millis() + 5_000,
             resume_cursor: if matches!(
@@ -1688,6 +1739,118 @@ impl ObjectiveStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Settle `active` Objectives that nothing will ever wake again.
+    ///
+    /// The supervisor claims DUE REMEDIATIONS. An Objective that is `active`
+    /// with no lease, no live remediation and no `next_observation_at` owns no
+    /// such row, so every sweep passes over it: it stops, and the UI keeps
+    /// saying 进行中. On 2026-09-08 one session sat exactly like this for 83
+    /// minutes — not failed, not finished, just lost, and with no record a user
+    /// or a later session could act on.
+    ///
+    /// Liveness is read from `chat_turn_state.updated_at`, which a running turn
+    /// republishes on every step. `objectives.last_progress_at` cannot serve:
+    /// it advances only when a DECISION is applied, so a healthy ten-minute
+    /// build looks identical to a dead turn.
+    pub async fn reap_stalled_active_objectives(
+        &self,
+        stall_after_ms: i64,
+    ) -> anyhow::Result<Vec<ObjectiveSnapshot>> {
+        let now = Utc::now().timestamp_millis();
+        let heartbeat = if table_exists(&self.pool, "chat_turn_state").await? {
+            "COALESCE((SELECT MAX(turn.updated_at) FROM chat_turn_state turn
+                       WHERE turn.objective_id = objectives.id),
+                      objectives.last_progress_at, objectives.updated_at)"
+        } else {
+            "COALESCE(objectives.last_progress_at, objectives.updated_at)"
+        };
+        let ids: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT id FROM objectives
+             WHERE status='active'
+               AND lease_owner IS NULL
+               AND next_observation_at IS NULL
+               AND {heartbeat} < ?
+               AND NOT EXISTS (
+                     SELECT 1 FROM objective_remediations remediation
+                     WHERE remediation.objective_id = objectives.id
+                       AND remediation.status NOT IN
+                           ('completed', 'cancelled', 'superseded'))
+             ORDER BY created_at"
+        ))
+        .bind(now - stall_after_ms)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut reaped = Vec::new();
+        for id in ids {
+            let Some(current) = self.get(&id).await? else {
+                continue;
+            };
+            // Re-check under the current revision: a turn that woke up between
+            // the scan and here must keep running.
+            if current.status != ObjectiveStatus::Active {
+                continue;
+            }
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::TechnicalFailure {
+                    domain: current.domain,
+                    failure_code: OBJECTIVE_PROGRESS_STALLED.into(),
+                    failure_signature: format!("{OBJECTIVE_PROGRESS_STALLED}:{}", current.id),
+                    next_observation_at: now + 5_000,
+                    resume_cursor: current
+                        .resume_cursor
+                        .clone()
+                        .or_else(|| current.root_turn_id.clone()),
+                },
+            )?;
+            reaped.push(self.apply_decision(current.revision, decision).await?);
+        }
+        Ok(reaped)
+    }
+
+    /// Cancel side-effect receipts left unsettled on an Objective that has
+    /// already reached a terminal state.
+    ///
+    /// `uncertain > 0` in the mutation fence counts every `started`/`unknown`
+    /// receipt for an Objective, and only the recovery ladder ever settles one.
+    /// When the Objective itself is `completed` or `cancelled` that ladder is
+    /// gone, so the receipt can never be settled and never stops counting.
+    ///
+    /// A 2026-09-08 audit of the production database found five such receipts
+    /// aged 17 to 20 days, on Objectives cancelled weeks earlier; the only
+    /// previous remedy had been manual surgery on the database. Declaring these
+    /// dead is not a guess about whether the effect landed — it is a statement
+    /// that no code path can ever act on the answer.
+    ///
+    /// Receipts on a LIVE Objective are deliberately untouched: there, "we do
+    /// not know whether this landed" is still a real question, and assuming it
+    /// did not is how a side effect gets performed twice.
+    pub async fn cancel_receipts_on_terminal_objectives(&self) -> anyhow::Result<u64> {
+        let swept = sqlx::query(
+            "UPDATE side_effect_receipts
+             SET status='cancelled',
+                 summary_json=?,
+                 observed_at=?
+             WHERE status IN ('started', 'unknown')
+               AND objective_id IN (
+                     SELECT id FROM objectives
+                     WHERE status IN ('completed', 'cancelled'))",
+        )
+        .bind(
+            serde_json::json!({
+                "status": "cancelled",
+                "recovery": "objective_terminal_before_settlement",
+            })
+            .to_string(),
+        )
+        .bind(Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(swept)
     }
 
     pub async fn create(&self, create: CreateObjective) -> anyhow::Result<ObjectiveSnapshot> {
@@ -2844,7 +3007,7 @@ impl ObjectiveStore {
                 .bind(now - SIGNATURE_RECOVERY_WINDOW_MS)
                 .fetch_one(&mut *tx)
                 .await?;
-                if signature_attempts >= MAX_SIGNATURE_RECOVERY_ATTEMPTS
+                if signature_attempts >= max_signature_attempts_for(Some(&failure_code))
                     || objective_attempts >= MAX_OBJECTIVE_RECOVERY_ATTEMPTS
                 {
                     tx.rollback().await?;
@@ -3785,7 +3948,7 @@ impl ObjectiveStore {
         .bind(Utc::now().timestamp_millis() - SIGNATURE_RECOVERY_WINDOW_MS)
         .fetch_one(&self.pool)
         .await?;
-        if signature_attempts < MAX_SIGNATURE_RECOVERY_ATTEMPTS
+        if signature_attempts < max_signature_attempts_for(decision.failure_code.as_deref())
             && objective_attempts < MAX_OBJECTIVE_RECOVERY_ATTEMPTS
         {
             return Ok(decision);
@@ -9645,6 +9808,168 @@ mod tests {
         assert_eq!(after.status, objective.status);
     }
 
+    /// 2026-09-08 audit of the production database: five side-effect receipts
+    /// had sat at `unknown` for 17 to 20 days, on Objectives cancelled weeks
+    /// earlier during a manual "unfreeze". Nothing can ever settle them — the
+    /// recovery ladder that owned them is gone — yet the mutation fence counts
+    /// them, so the Objective stays poisoned and the only fix on record was
+    /// editing the database by hand.
+    #[tokio::test]
+    async fn unsettled_receipts_on_a_terminal_objective_are_swept() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let live = recovery_ceiling_objective(&pool, "objective-live").await;
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objectives
+             (id, revision, kind, status, decision_type, domain,
+              requested_acceptance, cancellation_provenance, completed_at,
+              created_surface, created_at, updated_at)
+             VALUES ('objective-gone', 1, 'informational', 'cancelled',
+                     'cancelled', 'chat', 'informational_answer',
+                     'explicit_cancel', ?, 'test', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (objective_id, key) in [
+            ("objective-gone", "dead-1"),
+            ("objective-gone", "dead-2"),
+            (live.id.as_str(), "live-1"),
+        ] {
+            sqlx::query(
+                "INSERT INTO side_effect_receipts
+                 (id, objective_id, revision, action_fingerprint, idempotency_key,
+                  status, created_at, observed_at)
+                 VALUES (?, ?, 1, ?, ?, 'unknown', ?, ?)",
+            )
+            .bind(format!("receipt-{key}"))
+            .bind(objective_id)
+            .bind(key)
+            .bind(key)
+            .bind(now - 20 * 24 * 3_600_000)
+            .bind(now - 20 * 24 * 3_600_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(store.cancel_receipts_on_terminal_objectives().await.unwrap(), 2);
+
+        let still_uncertain: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM side_effect_receipts
+             WHERE objective_id='objective-gone' AND status IN ('started','unknown')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            still_uncertain, 0,
+            "a terminal Objective must stop poisoning its own id"
+        );
+
+        // A live Objective's unsettled receipt is a real open question and must
+        // survive: assuming it never landed is how an effect happens twice.
+        let live_status: String = sqlx::query_scalar(
+            "SELECT status FROM side_effect_receipts WHERE id='receipt-live-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live_status, "unknown");
+
+        assert_eq!(
+            store.cancel_receipts_on_terminal_objectives().await.unwrap(),
+            0,
+            "the sweep is idempotent"
+        );
+    }
+
+    /// 2026-09-08: one session stopped mid-turn and stayed `active` — no lease,
+    /// no queued remediation, `next_observation_at` NULL. The supervisor only
+    /// claims due remediations, so nothing owned it and nothing would ever wake
+    /// it; 83 minutes later the UI still said 进行中. Not failed, not finished,
+    /// just lost. A stalled Objective has to become a real failure so the
+    /// recovery ladder — and then the user — can see it.
+    #[tokio::test]
+    async fn an_abandoned_active_objective_is_reaped_into_a_visible_failure() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        // The production liveness table, in the shape this query reads.
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               objective_id TEXT, updated_at INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stalled = recovery_ceiling_objective(&pool, "objective-stalled").await;
+        let building = recovery_ceiling_objective(&pool, "objective-building").await;
+        let now = Utc::now().timestamp_millis();
+        for (objective, heartbeat) in [
+            (&stalled, now - 90 * 60_000),
+            // A healthy turn twelve minutes into a build still publishes
+            // activity; it must be left alone.
+            (&building, now - 12 * 60_000),
+        ] {
+            sqlx::query(
+                "INSERT INTO chat_turn_state
+                 (root_turn_id, session_id, objective_id, updated_at)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(objective.root_turn_id.as_deref().unwrap())
+            .bind(objective.session_id.as_deref().unwrap())
+            .bind(&objective.id)
+            .bind(heartbeat)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let reaped = store
+            .reap_stalled_active_objectives(STALLED_ACTIVE_OBJECTIVE_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            reaped.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            vec![stalled.id.as_str()],
+            "only the Objective nothing will wake again may be reaped"
+        );
+
+        let settled = store.get(&stalled.id).await.unwrap().unwrap();
+        assert_ne!(
+            settled.status,
+            ObjectiveStatus::Active,
+            "a reaped Objective must stop claiming to be running"
+        );
+        assert_eq!(
+            settled.failure_code.as_deref(),
+            Some(OBJECTIVE_PROGRESS_STALLED)
+        );
+
+        let untouched = store.get(&building.id).await.unwrap().unwrap();
+        assert_eq!(untouched.status, ObjectiveStatus::Active);
+        assert_eq!(
+            untouched.revision, building.revision,
+            "a live turn must not even be revised by the sweep"
+        );
+
+        assert!(
+            store
+                .reap_stalled_active_objectives(STALLED_ACTIVE_OBJECTIVE_MS)
+                .await
+                .unwrap()
+                .is_empty(),
+            "reaping is idempotent: a settled Objective is not reaped twice"
+        );
+    }
+
     #[tokio::test]
     async fn a_repeating_failure_backs_off_instead_of_burning_the_budget_in_seconds() {
         // Every repeat of the same signature is scheduled at a flat now+5s, so
@@ -9875,7 +10200,8 @@ mod tests {
         }
 
         assert_eq!(
-            queued_rounds, MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+            queued_rounds,
+            max_signature_attempts_for(Some(COMPLETION_EVIDENCE_INCOMPLETE)),
             "system recovery must stop re-queueing at the global ceiling"
         );
         assert_parked_system_incident(&current);
@@ -10136,8 +10462,14 @@ mod tests {
         assert_eq!(
             attempts_by_generation,
             vec![
-                (0, MAX_SIGNATURE_RECOVERY_ATTEMPTS),
-                (1, MAX_SIGNATURE_RECOVERY_ATTEMPTS)
+                (
+                    0,
+                    max_signature_attempts_for(Some(COMPLETION_EVIDENCE_INCOMPLETE))
+                ),
+                (
+                    1,
+                    max_signature_attempts_for(Some(COMPLETION_EVIDENCE_INCOMPLETE))
+                )
             ],
             "each user-authorized generation stays independently bounded"
         );
@@ -10688,11 +11020,75 @@ mod tests {
         );
         assert_eq!(
             total_remediations(&pool, &current.id).await,
-            MAX_SIGNATURE_RECOVERY_ATTEMPTS,
-            "the evidence gate may only buy the bounded number of model re-runs"
+            MAX_STAGNANT_COMPLETION_ATTEMPTS,
+            "an unchanged answer against unchanged evidence may buy only the \
+             stagnation bound of model re-runs, not the full transient ladder"
         );
         assert_parked_system_incident(&current);
         assert_eq!(claimable_remediations(&pool, &current.id).await, 0);
+    }
+
+    /// The other half of the stagnation bound. A round that GATHERED something
+    /// must not be charged like a round that changed nothing.
+    ///
+    /// The signature used to be `{objective_id}:Finished:{terminal_reason}` —
+    /// constant for the life of the Objective — so progress and stagnation were
+    /// literally indistinguishable to the budget: on 2026-09-08 five attempts
+    /// went on re-sending one answer, and a genuinely improving turn would have
+    /// been condemned exactly as fast. Folding the evidence state in is what
+    /// lets the tight stagnation bound exist without ever shortening real work.
+    #[tokio::test]
+    async fn new_completion_evidence_mints_a_new_signature_and_a_fresh_budget() {
+        let pool = pool().await;
+        // A LocalMutation whose evidence never satisfies the arbiter: the same
+        // shape the field report produced, so every round really does route a
+        // technical failure rather than completing.
+        let objective = ObjectiveStore::new(pool.clone())
+            .create(CreateObjective {
+                id: "objective-evidence-signature".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-evidence-signature".into()),
+                root_turn_id: Some("turn-evidence-signature".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        let outcome_for = |verification: Option<u64>| RunOutcome {
+            final_text: "同一段答案".into(),
+            final_message_id: Some("assistant-answer".into()),
+            completion_evidence: CompletionEvidence {
+                last_successful_verification_sequence: verification,
+                ..CompletionEvidence::default()
+            },
+            input_tokens: 1,
+            output_tokens: 1,
+            stop_reason: StopReason::Finished,
+        };
+        let signature_for = |verification: Option<u64>| {
+            decision_for_run_outcome(&objective, &outcome_for(verification))
+                .unwrap()
+                .failure_signature
+                .unwrap()
+        };
+
+        assert_eq!(
+            signature_for(None),
+            signature_for(None),
+            "an unchanged evidence set is the same failure and must be charged once"
+        );
+        assert_ne!(
+            signature_for(None),
+            signature_for(Some(7)),
+            "a round that gathered verification evidence is progress, not a repeat"
+        );
+        assert_ne!(
+            signature_for(Some(7)),
+            signature_for(Some(9)),
+            "further evidence is further progress"
+        );
     }
 
     /// The ceiling must never swallow a real capability restoration: that is
