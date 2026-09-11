@@ -429,7 +429,13 @@ impl RoutedDesktopModelTransport {
              JOIN objective_bindings b ON b.objective_id=o.id
                 AND b.resource_kind='chat_root_turn' AND b.resource_id=c.root_turn_id
              WHERE c.session_id=? AND c.root_turn_id=? AND c.status='active'
-               AND o.session_id=c.session_id AND o.root_turn_id=c.root_turn_id
+               AND o.session_id=c.session_id
+               -- A reprompt keeps o.root_turn_id at the ORIGINAL turn and moves
+               -- the live turn into resume_cursor, so a bare o.root_turn_id
+               -- comparison found 0 and fatalled every wake of an exhausted
+               -- session (2026-09-08). Resolve the current turn the same way
+               -- the remediation branch above already does.
+               AND COALESCE(NULLIF(o.resume_cursor, ''), o.root_turn_id)=c.root_turn_id
                AND o.status='active'
              ORDER BY b.resource_generation DESC LIMIT 2",
         )
@@ -2281,6 +2287,166 @@ mod tests {
         .await
         .unwrap();
         (pool, objective)
+    }
+
+    /// A foreground objective that has been reprompted after a settled turn:
+    /// `root_turn_id` stays at the ORIGINAL turn, `resume_cursor` points at the
+    /// NEW turn, and the live chat_run_control + binding are on that new turn.
+    /// This is the exact 2026-09-08 shape — `objective.rs` reactivation keeps
+    /// root_turn_id and moves the live turn into resume_cursor.
+    async fn durable_reprompt_fixture(
+        suffix: &str,
+    ) -> (SqlitePool, String, String) {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
+        };
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, model_policy TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let session_id = format!("reprompt-{suffix}-session");
+        let original_root = format!("reprompt-{suffix}-root-original");
+        let new_root = format!("reprompt-{suffix}-root-new");
+        sqlx::query("INSERT INTO sessions(id, model_policy) VALUES (?, 'fixed')")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let objective = ObjectiveStore::new(pool.clone())
+            .create(CreateObjective {
+                id: format!("reprompt-{suffix}-objective"),
+                kind: ObjectiveKind::Informational,
+                session_id: Some(session_id.clone()),
+                root_turn_id: Some(original_root.clone()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        // Reactivation: active foreground turn, original root kept, live turn in
+        // resume_cursor (mirrors objective.rs ensure_or_continue_chat_objective).
+        sqlx::query(
+            "UPDATE objectives SET status='active', resume_cursor=?, updated_at=?
+             WHERE id=?",
+        )
+        .bind(&new_root)
+        .bind(now)
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The live binding is on the NEW turn.
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES (?, ?, 'chat', 'chat_root_turn', ?, 1, ?, ?, ?, ?)",
+        )
+        .bind(format!("reprompt-{suffix}-binding-new"))
+        .bind(&objective.id)
+        .bind(&new_root)
+        .bind(format!("sha256:{suffix}-binding-new"))
+        .bind(&new_root)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'active', 'test-process', ?, ?)",
+        )
+        .bind(format!("reprompt-{suffix}-run"))
+        .bind(&session_id)
+        .bind(&new_root)
+        .bind(&objective.id)
+        .bind(objective.revision)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        (pool, session_id, new_root)
+    }
+
+    /// 2026-09-08 root cause, pinned from the live database: a reprompted
+    /// foreground turn could never resolve its provider owner, because the
+    /// query compared `o.root_turn_id = c.root_turn_id` while a reprompt leaves
+    /// root_turn_id at the original and tracks the live turn in resume_cursor.
+    /// It fatalled `PROVIDER_DURABLE_IDENTITY_MISSING ... found 0`, burning one
+    /// recovery attempt on every wake of an exhausted session. The remediation
+    /// branch already resolves the current turn via
+    /// COALESCE(NULLIF(resume_cursor,''), root_turn_id); the foreground branch
+    /// must do the same.
+    #[tokio::test]
+    async fn a_reprompted_foreground_turn_resolves_its_provider_owner() {
+        let (pool, session_id, new_root) = durable_reprompt_fixture("owner").await;
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id,
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                    "reprompt-provider",
+                    "reprompt-model",
+                    "http://127.0.0.1:1".to_string(),
+                )),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool,
+            root_turn_id: Some(new_root.clone()),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+        let owner = transport
+            .resolve_provider_owner()
+            .await
+            .expect("a reprompted foreground turn must resolve its durable owner, not fatal")
+            .expect("the reprompted turn's binding (on resume_cursor) must be found");
+
+        // Gate 1 (resolve_provider_owner) is not enough: open_episode re-checks
+        // the same identity through permit_is_current, which had the SAME stale
+        // root_turn_id comparison. Drive the real second gate — a reprompted
+        // turn must open its episode, not be fenced.
+        let spec = super::super::provider_recovery::ProviderEpisodeSpec {
+            id: "reprompt-owner-episode".into(),
+            session_id: transport.session_id.clone(),
+            root_turn_id: new_root.clone(),
+            policy: "prefer".into(),
+            candidate_snapshot_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            candidate_snapshot_json: r#"[{"endpoint":"reprompt-provider","model":"reprompt-model"}]"#.into(),
+            resume_cursor: new_root.clone(),
+        };
+        let opened = super::super::provider_recovery::ProviderRecoveryStore::new(
+            transport.db.clone(),
+        )
+        .open_episode(&owner, &spec, chrono::Utc::now().timestamp_millis())
+        .await
+        .expect("open_episode must not error");
+        assert!(
+            matches!(
+                opened,
+                super::super::provider_recovery::ProviderMutation::Applied(_)
+            ),
+            "a reprompted turn must open its provider episode, not be fenced by permit_is_current"
+        );
     }
 
     async fn durable_context_transport_fixture() -> (

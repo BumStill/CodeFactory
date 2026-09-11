@@ -1712,7 +1712,14 @@ async fn permit_is_current(
                  WHERE o.id=? AND o.revision=? AND o.status='active'
                    AND b.resource_generation=?
                    AND c.objective_id=o.id AND c.objective_revision=o.revision
-                   AND c.session_id=o.session_id AND c.root_turn_id=o.root_turn_id
+                   AND c.session_id=o.session_id
+                   -- Second site of the reprompt stale-turn bug: a reprompt
+                   -- keeps o.root_turn_id at the original turn and tracks the
+                   -- live turn in resume_cursor, while chat_run_controls is on
+                   -- the new turn. Resolve the current turn the way open_episode
+                   -- and the remediation branch already do, or permit_is_current
+                   -- returns 0 and open_episode fences every reprompted turn.
+                   AND c.root_turn_id=COALESCE(NULLIF(o.resume_cursor, ''), o.root_turn_id)
                    AND c.status='active'",
             )
             .bind(&permit.binding_id)
