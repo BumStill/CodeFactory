@@ -666,7 +666,7 @@ async fn process_claim(
                         // Every domain can leave a stale provider attempt behind,
                         // so settle it before dispatch rather than only on the
                         // Provider path (see the helper's note).
-                        reconcile_provider_attempt_before_resume(&pool, &objective.id).await?;
+                        settle_stale_provider_attempt_best_effort(&pool, &objective.id).await;
                         match executor {
                             AdapterExecutor::Chat => {
                                 crate::commands::chat::resume_chat_objective(
@@ -986,6 +986,31 @@ pub(crate) async fn reconcile_provider_attempt_before_resume(
                 "provider recovery reconciliation failed: {error}"
             ))
         })
+}
+
+/// Settle a stale provider attempt, but never let that settle block the resume.
+///
+/// The sweep is an assist: it clears an attempt that is already proven
+/// effect-free so the next resume is not fenced by it. If the sweep itself
+/// cannot run — a locked database, a schema that predates these tables, any
+/// SQL error — the recovery it was meant to help must still proceed. Making it
+/// a hard precondition would add a new single point of failure to the one path
+/// whose entire purpose is to stop objectives from getting stuck.
+///
+/// The error is logged rather than swallowed silently, so a sweep that is
+/// failing repeatedly stays visible instead of degrading into a quiet no-op.
+async fn settle_stale_provider_attempt_best_effort(pool: &SqlitePool, objective_id: &str) -> u64 {
+    match reconcile_provider_attempt_before_resume(pool, objective_id).await {
+        Ok(settled) => settled,
+        Err(error) => {
+            tracing::warn!(
+                objective_id = %objective_id,
+                %error,
+                "stale provider attempt sweep failed; resuming anyway"
+            );
+            0
+        }
+    }
 }
 
 pub(crate) async fn require_provider_resume_evidence(
@@ -2948,6 +2973,39 @@ mod tests {
             event,
             codefactory_agent_loop::types::StreamEvent::ContextCompressed { .. }
         )));
+    }
+
+    /// The sweep added in #525 was wired in with `?`, which turned an assist
+    /// into a hard precondition: any failure inside it — a locked database, an
+    /// older schema, any SQL error — would abort the resume entirely. That put
+    /// a new single point of failure on the one path whose whole job is to keep
+    /// objectives from getting stuck, which is the opposite of what #525 was
+    /// for.
+    #[tokio::test]
+    async fn a_failing_sweep_does_not_abort_the_resume() {
+        // A pool with no provider tables: the sweep cannot possibly run.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // The raw helper still surfaces the error — diagnosis must stay honest.
+        assert!(
+            super::reconcile_provider_attempt_before_resume(&pool, "objective-missing-schema")
+                .await
+                .is_err(),
+            "the sweep itself must report why it could not run"
+        );
+
+        // The resume path absorbs it: a sweep that cannot run is not a reason
+        // to abandon the recovery.
+        assert_eq!(
+            super::settle_stale_provider_attempt_best_effort(&pool, "objective-missing-schema")
+                .await,
+            0,
+            "a failing sweep must not block the resume it was meant to help"
+        );
     }
 
     /// 2026-09-14 production: a chat-domain objective's provider attempt was
