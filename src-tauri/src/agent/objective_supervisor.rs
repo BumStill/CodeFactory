@@ -663,6 +663,10 @@ async fn process_claim(
                     &claim,
                     &permit,
                     move |executor| async move {
+                        // Every domain can leave a stale provider attempt behind,
+                        // so settle it before dispatch rather than only on the
+                        // Provider path (see the helper's note).
+                        reconcile_provider_attempt_before_resume(&pool, &objective.id).await?;
                         match executor {
                             AdapterExecutor::Chat => {
                                 crate::commands::chat::resume_chat_objective(
@@ -955,6 +959,35 @@ async fn resume_browser_objective(
 /// unresolved provider side effect/output can be replayed reaches the Chat
 /// executor. Auth additionally requires a current-revision capability receipt;
 /// neither path treats an identity-shaped Objective as sufficient proof.
+/// Settle a stale, effect-free provider attempt before ANY executor resumes.
+///
+/// Provider attempts are produced by every recovery domain, but the sweep that
+/// settles them only ran on the `Provider` executor path and at startup. A
+/// chat-domain objective whose attempt was left `in_flight` by a transport
+/// failure therefore had no way to settle it while the app kept running: each
+/// resume hit the replay-safety fence in `open_episode`, burned one recovery
+/// attempt, and the objective eventually exhausted its budget (observed in
+/// production 2026-09-14 — the sweep's own conditions all held; only the call
+/// site was out of reach).
+///
+/// The sweep's conditions are NOT relaxed here: it still refuses anything with
+/// observed output, side effects, unresolved receipts, a live chat run, or an
+/// output checkpoint. This only makes it reachable.
+pub(crate) async fn reconcile_provider_attempt_before_resume(
+    pool: &SqlitePool,
+    objective_id: &str,
+) -> Result<u64, crate::errors::AppError> {
+    let now = chrono::Utc::now().timestamp_millis();
+    super::provider_recovery::ProviderRecoveryStore::new(pool.clone())
+        .reconcile_stale_effect_free_attempt_for_objective(objective_id, now)
+        .await
+        .map_err(|error| {
+            crate::errors::AppError::Other(format!(
+                "provider recovery reconciliation failed: {error}"
+            ))
+        })
+}
+
 pub(crate) async fn require_provider_resume_evidence(
     pool: &SqlitePool,
     objective_id: &str,
@@ -2915,6 +2948,185 @@ mod tests {
             event,
             codefactory_agent_loop::types::StreamEvent::ContextCompressed { .. }
         )));
+    }
+
+    /// 2026-09-14 production: a chat-domain objective's provider attempt was
+    /// left `in_flight` by a deepseek transport failure with no bytes observed.
+    /// The sweep that settles exactly this shape existed and every one of its
+    /// conditions held — but it only ran on the `Provider` executor path and at
+    /// startup, so a chat-domain objective could not reach it while the app kept
+    /// running. Each resume then hit the replay-safety fence below, burned one
+    /// recovery attempt, and the objective ended in
+    /// `technical_recovery_exhausted` after 1h48m.
+    ///
+    /// The fence itself is correct and stays: an attempt that may have reached
+    /// the provider must not be replayed blindly. What this pins is that the
+    /// settle path is reachable for a chat-domain objective, and that once the
+    /// attempt is settled the next resume proceeds.
+    #[tokio::test]
+    async fn a_chat_domain_stale_in_flight_attempt_is_settled_and_unfences_resume() {
+        use crate::agent::provider_recovery::{
+            ProviderAttemptSpec, ProviderEpisodeSpec, ProviderMutation, ProviderOwnerPermit,
+            ProviderRecoveryStore,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-chat-inflight".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("session-chat-inflight".into()),
+                root_turn_id: Some("turn-chat-inflight".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('binding-chat-inflight', ?, 'chat', 'chat_root_turn',
+                     'turn-chat-inflight', 1, 'sha256:chat-inflight',
+                     'turn-chat-inflight', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let open_run = |run: &'static str, at: i64| {
+            let pool = pool.clone();
+            let objective_id = objective.id.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO chat_run_controls
+                     (run_instance_id, session_id, root_turn_id, objective_id,
+                      objective_revision, status, created_process_instance, created_at, updated_at)
+                     VALUES (?, 'session-chat-inflight', 'turn-chat-inflight', ?, 1,
+                             'active', 'test-process', ?, ?)",
+                )
+                .bind(run)
+                .bind(&objective_id)
+                .bind(at)
+                .bind(at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let settle_run = |run: &'static str, at: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE chat_run_controls SET status='completed', settled_at=?, updated_at=?
+                     WHERE run_instance_id=?",
+                )
+                .bind(at)
+                .bind(at)
+                .bind(run)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let episode_spec = |id: &str| ProviderEpisodeSpec {
+            id: id.into(),
+            session_id: "session-chat-inflight".into(),
+            root_turn_id: "turn-chat-inflight".into(),
+            policy: "fixed".into(),
+            candidate_snapshot_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            candidate_snapshot_json: r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
+            resume_cursor: "turn-chat-inflight".into(),
+        };
+        let provider = ProviderRecoveryStore::new(pool.clone());
+
+        // The turn that died: a POST went out, nothing came back.
+        open_run("run-chat-inflight-1", now).await;
+        let permit1 = ProviderOwnerPermit::chat_run(
+            &objective.id, 1, "binding-chat-inflight", 1, "run-chat-inflight-1", 1,
+        );
+        provider
+            .open_episode(&permit1, &episode_spec("episode-chat-inflight-1"), now)
+            .await
+            .unwrap();
+        provider
+            .begin_attempt(
+                &permit1,
+                &ProviderAttemptSpec {
+                    id: "attempt-chat-inflight".into(),
+                    episode_id: "episode-chat-inflight-1".into(),
+                    endpoint: "test".into(),
+                    model: "test-model".into(),
+                    request_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .into(),
+                    resume_cursor: "turn-chat-inflight".into(),
+                },
+                now + 1,
+            )
+            .await
+            .unwrap();
+        provider
+            .mark_in_flight(&permit1, "attempt-chat-inflight", now + 2)
+            .await
+            .unwrap();
+        settle_run("run-chat-inflight-1", now + 3).await;
+
+        // A resume that does NOT settle the attempt first is fenced — correctly.
+        open_run("run-chat-inflight-2", now + 4).await;
+        let permit2 = ProviderOwnerPermit::chat_run(
+            &objective.id, 1, "binding-chat-inflight", 1, "run-chat-inflight-2", 1,
+        );
+        let fenced = provider
+            .open_episode(&permit2, &episode_spec("episode-chat-inflight-2"), now + 5)
+            .await;
+        assert!(
+            fenced.is_err(),
+            "a live in_flight attempt must fence a new episode; that guard is not what broke"
+        );
+        settle_run("run-chat-inflight-2", now + 6).await;
+
+        // The supervisor settles it BEFORE dispatch, while no chat run is live.
+        let settled = super::reconcile_provider_attempt_before_resume(&pool, &objective.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            settled, 1,
+            "a chat-domain objective must be able to reach the stale-attempt sweep"
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM provider_route_attempts WHERE id='attempt-chat-inflight'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed_replayable");
+
+        // With the attempt settled, the very same resume now proceeds.
+        open_run("run-chat-inflight-3", now + 7).await;
+        let permit3 = ProviderOwnerPermit::chat_run(
+            &objective.id, 1, "binding-chat-inflight", 1, "run-chat-inflight-3", 1,
+        );
+        let opened = provider
+            .open_episode(&permit3, &episode_spec("episode-chat-inflight-3"), now + 8)
+            .await
+            .unwrap();
+        assert!(
+            matches!(opened, ProviderMutation::Applied(_)),
+            "after the settle, the resume that kept burning budget must go through"
+        );
     }
 
     #[tokio::test]
