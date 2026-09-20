@@ -21,8 +21,38 @@ pub fn is_vision_rejection(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     ["image", "vision", "multimodal"]
         .iter()
-        .any(|needle| lower.contains(needle))
+        .any(|needle| starts_a_word(&lower, needle))
         && !lower.contains("rate limit")
+}
+
+/// `contains`, but the needle must begin a word.
+///
+/// A bare `contains` made "a new Objective revision" match "vision", so a
+/// provider-ownership failure was reported to the user as "this model rejected
+/// your images, switch to one that supports them" — pointing at something that
+/// was never wrong, on a session with no images, while the Fatal wrapper burned
+/// a recovery attempt each time. `revision` is a core word in this codebase
+/// (objective_revision, admission_revision), so that collision is routine.
+///
+/// Only the LEADING boundary is enforced. Trailing inflections carry the same
+/// capability meaning ("images are not supported", "image_url"), so requiring a
+/// trailing boundary too would trade one silent misread for another.
+fn starts_a_word(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let at = from + offset;
+        let preceded_by_word_char = haystack[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        if !preceded_by_word_char {
+            return true;
+        }
+        // `needle` is ASCII, so `at` lands on a char boundary and `at + 1` is
+        // a valid resume point.
+        from = at + 1;
+    }
+    false
 }
 
 /// Count image parts without mutating history. Capability gating must preserve
@@ -128,4 +158,45 @@ pub fn repair_openai_tool_protocol(messages: Vec<ChatMessage>) -> Vec<ChatMessag
 
     append_missing_results(&mut repaired, &mut pending_tool_calls);
     repaired
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-09-14, production: a provider-ownership failure reached the user as
+    /// "当前模型拒绝了图片输入……请切换到支持图片的模型后重试", because the
+    /// underlying text ended in "before a new Objective revision" and
+    /// `revision` ends with `vision`. The session had no images at all, so the
+    /// advice pointed at something that was never wrong — and the wrapper is
+    /// Fatal, so each occurrence also burned a recovery attempt. `revision` is
+    /// a core word here (objective_revision, admission_revision), so this
+    /// collision is routine, not exotic.
+    #[test]
+    fn a_revision_error_is_not_a_vision_rejection() {
+        assert!(!is_vision_rejection(
+            "open provider episode: prior provider episode is not proven replay-safe; \
+             observe/reconcile before a new Objective revision"
+        ));
+        assert!(!is_vision_rejection(
+            "objective revision conflict: expected 3, actual 4"
+        ));
+        assert!(!is_vision_rejection("admission_revision mismatch"));
+    }
+
+    /// The guard above must not cost us the real capability signal: a genuine
+    /// vision rejection still has to strip images and prompt a model switch.
+    #[test]
+    fn real_capability_wording_still_matches() {
+        assert!(is_vision_rejection("This model does not support image input"));
+        assert!(is_vision_rejection("images are not supported by this model"));
+        assert!(is_vision_rejection("Invalid content type: image_url"));
+        assert!(is_vision_rejection("vision input is not supported"));
+        assert!(is_vision_rejection("multimodal input rejected"));
+    }
+
+    #[test]
+    fn a_rate_limited_image_error_is_not_a_capability_rejection() {
+        assert!(!is_vision_rejection("image rate limit exceeded"));
+    }
 }
