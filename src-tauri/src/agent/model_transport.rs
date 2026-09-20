@@ -1525,6 +1525,28 @@ impl ModelTransport for RoutedDesktopModelTransport {
         tools: &[ToolDefinition],
         opts: &RoundOptions,
     ) -> std::result::Result<ModelResponse, TransportError> {
+        // The latches describe what was still uncommitted when the PREVIOUS
+        // round ended. A tool result sitting at the end of the history this
+        // round is built from is no longer that: the fallback would be handed
+        // the very same result, so it cannot re-run the tool. Clearing it here
+        // is the same reasoning the success path already applies one round
+        // later — "part of the conversation the next round is built from" —
+        // only applied when that next round actually begins, rather than
+        // requiring the next provider call to succeed first.
+        //
+        // Without this, a long agent turn that ran tools and then met a dead
+        // endpoint could never reach its own fallbacks: the latch set by the
+        // tool result was only ever cleared by a successful call, and the calls
+        // were exactly what kept failing. Production 2026-09-20: deepseek
+        // answered `HTTP 503 Service is too busy` (its body advising a switch)
+        // and three recovery generations burned against it while chatgpt and
+        // openrouter sat unused in the same candidate snapshot.
+        //
+        // A round whose tool result is NOT yet in the history keeps the latch,
+        // so an uncommitted side effect still blocks a switch.
+        if messages.last().is_some_and(|message| message.role == "tool") {
+            self.turn_uncommitted_side_effect.store(false, Ordering::SeqCst);
+        }
         let mut transitions = self
             .route_state
             .take_initial_route_change()
@@ -2213,6 +2235,91 @@ mod tests {
             }
         });
         (base_url, hits)
+    }
+
+    /// Production 2026-09-20 (v1.81.48), session 1e98e0b6. A long agent turn
+    /// had run tools, so the side-effect latch was set. deepseek then answered
+    /// `HTTP 503 Service Unavailable: Service is too busy. We advise users to
+    /// temporarily switch to alternative LLM API service providers.` — its own
+    /// body asking to be switched away from. The episode's candidate snapshot
+    /// held three endpoints (deepseek, chatgpt, openrouter) and `model_policy`
+    /// was `prefer`, yet every `model_route_attempts` row says
+    /// `endpoint=deepseek`: three recovery generations burned without one
+    /// switch, because the latch was only ever cleared by a successful call and
+    /// the calls were what kept failing.
+    ///
+    /// The distinction that makes the switch safe here — and that
+    /// `routed_transport_does_not_switch_after_a_prior_tool_side_effect_without_visible_text`
+    /// still holds on the other side of — is whether the tool result is already
+    /// in the history this round is built from. Here it is, so the fallback
+    /// would receive the identical result and cannot re-run the tool.
+    #[tokio::test]
+    async fn a_tool_result_already_in_history_does_not_block_this_round_s_fallback() {
+        const BUSY: (&str, &str, &str) = (
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":{"message":"Service is too busy. We advise users to temporarily switch to alternative LLM API service providers."}}"#,
+        );
+        let (busy_url, busy_hits) = serve_responses(vec![BUSY, BUSY, BUSY, BUSY]);
+        let (healthy_url, healthy_hits) = serve_responses(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"carried by the fallback\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "busy-primary",
+            "busy-model",
+            busy_url,
+        ));
+        plan.push_fallback(openai_candidate(
+            "healthy-fallback",
+            "healthy-model",
+            healthy_url,
+        ));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "tool-result-in-history".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            // Set by the tool result that is now the last message below.
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(true)),
+            db: unused_provider_db(),
+            root_turn_id: None,
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: true,
+            durable_provider_required: false,
+        };
+
+        let history = vec![codefactory_agent_loop::types::ChatMessage {
+            role: "tool".into(),
+            content: codefactory_agent_loop::types::MessageContent::Text(
+                "the tool already ran and this is its result".into(),
+            ),
+            tool_calls: None,
+            tool_call_id: Some("call_already_settled".into()),
+            name: None,
+            reasoning_content: None,
+        }];
+
+        let response = transport
+            .complete(&history, &[], &RoundOptions::default())
+            .await
+            .expect("a committed tool result must not pin the turn to a dead endpoint");
+        assert!(busy_hits.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            healthy_hits.load(Ordering::SeqCst),
+            1,
+            "the healthy candidate in the same plan must actually carry this round"
+        );
+        assert!(response.text.contains("carried by the fallback"));
     }
 
     async fn durable_foreground_fixture(
