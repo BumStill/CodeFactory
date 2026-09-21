@@ -97,6 +97,13 @@ pub(super) struct ProviderAttemptRuntime {
     post_admitted: Arc<AtomicBool>,
 }
 
+/// A durable round asked for `tool_choice: required`, the provider refused it,
+/// and the retry without it is a different request that needs its own attempt.
+/// Only `RoutedDesktopModelTransport::complete` opens attempts, so the inner
+/// transport reports this and the loop performs the downgrade.
+const REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT: &str =
+    "PROVIDER_REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderFailureAction {
     RetrySafe,
@@ -731,6 +738,18 @@ impl DesktopModelTransport {
         });
         if !required_choice_unsupported {
             return first;
+        }
+        if self.provider_attempt.is_some() {
+            // Dropping required tool choice rewrites the request, and a durable
+            // attempt admits exactly one POST — the refused request already
+            // spent this one. Only `complete` can open the next attempt, so ask
+            // it to; retrying here is what produced
+            // PROVIDER_REQUEST_REWRITE_REQUIRES_NEW_ATTEMPT on every durable
+            // round against a provider that refuses required tool choice
+            // (production 2026-09-14 and 2026-09-21).
+            return Err(crate::errors::AppError::Other(
+                REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT.into(),
+            ));
         }
         match self.api_style {
             ApiStyle::Chatgpt => {
@@ -1415,7 +1434,9 @@ impl DesktopModelTransport {
             return first;
         }
         if self.provider_attempt.is_some() {
-            return first;
+            return Err(crate::errors::AppError::Other(
+                REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT.into(),
+            ));
         }
         super::anthropic_client::stream_anthropic(
             &self.http,
@@ -1552,7 +1573,12 @@ impl ModelTransport for RoutedDesktopModelTransport {
             .take_initial_route_change()
             .into_iter()
             .collect::<Vec<_>>();
+        // Set once the provider refuses `tool_choice: required`. The retry
+        // without it is a different request, so it runs on a fresh attempt
+        // opened by the next turn of this loop.
+        let mut downgraded_options: Option<RoundOptions> = None;
         loop {
+            let opts = downgraded_options.as_ref().unwrap_or(opts);
             let route = self.route_state.current();
             let output_started = Arc::new(AtomicBool::new(false));
             let provider_attempt = self
@@ -1642,6 +1668,21 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     if let Some(attempt) = provider_attempt.as_ref() {
                         let _ = attempt.settle_failure(&error).await?;
                     }
+                    if error.to_string().contains(REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT)
+                        && downgraded_options.is_none()
+                    {
+                        // The refused attempt is settled just above; the next
+                        // turn of the loop opens a fresh one and re-sends
+                        // without `tool_choice: required`. Once per call, so a
+                        // provider that keeps refusing still terminates. The
+                        // route is untouched: the endpoint answered correctly,
+                        // it simply does not accept that option.
+                        downgraded_options = Some(RoundOptions {
+                            require_tool: false,
+                            ..opts.clone()
+                        });
+                        continue;
+                    }
                     self.route_state.record_current_failure(&error.to_string());
                     return Err(error);
                 }
@@ -1658,6 +1699,19 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         return Err(TransportError::Retryable(
                             "PROVIDER_RECOVERY_WAITING: provider overloaded".into(),
                         ));
+                    }
+                    if reason.contains(REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT)
+                        && downgraded_options.is_none()
+                    {
+                        // The attempt that carried the refused request is
+                        // settled above; the next turn opens a fresh one for the
+                        // rewritten request. Only ever once per call, so a
+                        // provider that keeps refusing still terminates.
+                        downgraded_options = Some(RoundOptions {
+                            require_tool: false,
+                            ..opts.clone()
+                        });
+                        continue;
                     }
                     // A provider can fail after yielding visible SSE. Replaying
                     // on another model would mix answers and can duplicate tool
@@ -2320,6 +2374,90 @@ mod tests {
             "the healthy candidate in the same plan must actually carry this round"
         );
         assert!(response.text.contains("carried by the fallback"));
+    }
+
+    /// Production 2026-09-14 and again 2026-09-21 (six times in one session):
+    /// every durable round against deepseek ended in
+    /// `PROVIDER_REQUEST_REWRITE_REQUIRES_NEW_ATTEMPT: a durable attempt admits
+    /// exactly one POST`, and the Objective exhausted its recovery budget.
+    ///
+    /// deepseek refuses `tool_choice: required`, which the transport answers by
+    /// re-sending without it. That rewrite is a different request and needs its
+    /// own write-ahead attempt — the refusal even says so — but the retry ran on
+    /// the attempt the refused request had already spent. The Anthropic path
+    /// sidestepped it by abandoning the downgrade whenever an attempt existed;
+    /// now both families hand it to `complete`, which owns attempt lifecycle.
+    #[tokio::test]
+    async fn a_required_tool_choice_downgrade_opens_its_own_durable_attempt() {
+        const REFUSES: (&str, &str, &str) = (
+            "400 Bad Request",
+            "application/json",
+            r#"{"error":{"message":"tool_choice: required is not supported by this model"}}"#,
+        );
+        const ANSWERS: (&str, &str, &str) = (
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answered after downgrade\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let (base_url, hits) = serve_responses(vec![REFUSES, ANSWERS]);
+        let (pool, objective) = durable_foreground_fixture("tool-choice").await;
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: objective.session_id.clone().unwrap(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                    "tool-choice-provider",
+                    "tool-choice-model",
+                    base_url,
+                )),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+        let tools = vec![ToolDefinition {
+            r#type: "function".into(),
+            function: codefactory_agent_loop::types::FunctionDefinition {
+                name: "noop".into(),
+                description: "test".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }];
+
+        let response = transport
+            .complete(
+                &[],
+                &tools,
+                &RoundOptions {
+                    require_tool: true,
+                    ..RoundOptions::default()
+                },
+            )
+            .await
+            .expect("a refused required tool choice must downgrade, not refuse itself");
+        assert!(response.text.contains("answered after downgrade"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "refusal, then downgraded retry");
+
+        // The rewritten request is a different request, so the write-ahead log
+        // must show it as its own attempt.
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_route_attempts WHERE objective_id=?",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 2, "the downgrade needs its own durable attempt");
     }
 
     async fn durable_foreground_fixture(
