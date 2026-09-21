@@ -1451,11 +1451,86 @@ async fn reattach(
     result
 }
 
+/// Give a workspace parked in `incident` one chance to prove it is usable again.
+///
+/// `mark_incident` and `mark_identity_incident` park a workspace, and nothing
+/// ever moved it out: `ATTACHABLE_STATES` excludes `incident` and no production
+/// path rewrites that state. Every later setup for the Objective then failed on
+/// the not-attachable guard below — silently, because a chat setup abort carries
+/// no failure text of its own. Production 2026-09-21: an agent checked out a
+/// different branch inside its managed worktree, and from then on the session
+/// died on every attempt with nothing to read; recovering it meant editing the
+/// row by hand.
+///
+/// Identity conflicts are usually external and reversible — a branch switched
+/// back, a path restored. So re-run exactly the checks that park a workspace,
+/// and return it to service only when ALL of them pass. One whose conflict is
+/// still real fails a check and stays parked, exactly as before.
+async fn recover_incident_if_identity_is_whole(
+    pool: &SqlitePool,
+    row: WorkspaceRow,
+) -> WorkspaceRow {
+    if row.state != "incident" {
+        return row;
+    }
+    let Ok(canonical_path) = PathBuf::from(&row.worktree_path).canonicalize() else {
+        return row;
+    };
+    let Ok(branch) = git(&canonical_path, &["branch", "--show-current"]) else {
+        return row;
+    };
+    if branch != row.branch_name {
+        return row;
+    }
+    let Ok((repo_identity, worktree_identity, head_sha)) = workspace_identity(&canonical_path)
+    else {
+        return row;
+    };
+    if repo_identity != row.repo_identity {
+        return row;
+    }
+    if row
+        .worktree_identity
+        .as_deref()
+        .is_some_and(|recorded| recorded != worktree_identity)
+    {
+        return row;
+    }
+    let now = Utc::now().timestamp_millis();
+    let restored = sqlx::query(
+        "UPDATE execution_workspaces
+         SET state='active', failure_code=NULL, failure_detail=NULL,
+             worktree_identity=?, head_sha=?, updated_at=?
+         WHERE objective_id=? AND state='incident'",
+    )
+    .bind(&worktree_identity)
+    .bind(&head_sha)
+    .bind(now)
+    .bind(&row.objective_id)
+    .execute(pool)
+    .await;
+    if !matches!(restored, Ok(ref result) if result.rows_affected() == 1) {
+        return row;
+    }
+    tracing::info!(
+        objective_id = %row.objective_id,
+        branch = %row.branch_name,
+        "managed workspace recovered from incident: identity checks pass again"
+    );
+    WorkspaceRow {
+        state: "active".into(),
+        worktree_identity: Some(worktree_identity),
+        head_sha: Some(head_sha),
+        ..row
+    }
+}
+
 async fn reattach_inner(
     pool: &SqlitePool,
     row: WorkspaceRow,
     process_instance: &str,
 ) -> Result<ExecutionWorkspace> {
+    let row = recover_incident_if_identity_is_whole(pool, row).await;
     if !ATTACHABLE_STATES.contains(&row.state.as_str()) {
         bail!("managed workspace is not attachable in state {}", row.state);
     }
@@ -1935,6 +2010,91 @@ mod tests {
         .await
         .unwrap();
         head_sha
+    }
+
+    /// Production 2026-09-21: an agent checked out a different branch inside its
+    /// managed worktree. The identity check parked the workspace in `incident`,
+    /// and nothing ever moved it out — so every later chat setup for that
+    /// Objective aborted with no failure text at all, and the session burned
+    /// generation after generation until the row was edited by hand.
+    ///
+    /// Once the branch is back, the workspace is whole and must return to
+    /// service on its own.
+    #[tokio::test]
+    async fn an_incident_workspace_recovers_once_its_identity_is_whole_again() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-incident-recovers").await;
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-incident-recovers", "process-a"),
+        )
+        .await
+        .unwrap();
+
+        // What the agent did: switch the managed worktree onto another branch.
+        git(&workspace.worktree_path, &["checkout", "-b", "some-other-branch"]);
+        let conflicted = attach_existing(&pool, "objective-incident-recovers", "process-b").await;
+        assert!(
+            conflicted.is_err(),
+            "a switched branch must still park the workspace"
+        );
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind("objective-incident-recovers")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "incident");
+
+        // Put the branch back; the conflict is gone.
+        git(&workspace.worktree_path, &["checkout", &workspace.branch_name]);
+        let recovered = attach_existing(&pool, "objective-incident-recovers", "process-c")
+            .await
+            .expect("a workspace whose identity is whole again must return to service")
+            .expect("the recovered workspace must be handed back");
+        assert_eq!(recovered.branch_name, workspace.branch_name);
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind("objective-incident-recovers")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "active");
+    }
+
+    /// The recovery must not become a way around the guard: a workspace whose
+    /// conflict is still real stays parked.
+    #[tokio::test]
+    async fn an_incident_workspace_with_a_live_conflict_stays_parked() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-incident-stays").await;
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-incident-stays", "process-a"),
+        )
+        .await
+        .unwrap();
+        git(&workspace.worktree_path, &["checkout", "-b", "still-wrong-branch"]);
+        assert!(attach_existing(&pool, "objective-incident-stays", "process-b")
+            .await
+            .is_err());
+
+        // The branch is NOT restored, so every later attach must keep failing.
+        let again = attach_existing(&pool, "objective-incident-stays", "process-c").await;
+        assert!(
+            again.is_err(),
+            "an unresolved identity conflict must not be recovered"
+        );
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind("objective-incident-stays")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "incident");
     }
 
     fn request(root: &Path, container: &Path, process_instance: &str) -> ExecutionWorkspaceRequest {
