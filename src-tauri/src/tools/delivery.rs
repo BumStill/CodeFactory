@@ -4028,6 +4028,7 @@ mod tests {
             requested_ceiling: "through_release".into(),
             effective_ceiling: "through_release".into(),
             capability_gap: None,
+            lowered_from_configured: None,
             release_receipt: None,
             summary: "summary".into(),
         }

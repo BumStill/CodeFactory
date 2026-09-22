@@ -136,6 +136,10 @@ pub struct DeliveryOutcome {
     pub requested_ceiling: String,
     pub effective_ceiling: String,
     pub capability_gap: Option<String>,
+    /// Set when this call asked for a lower ceiling than the user configured.
+    /// Carries the configured label, so the result can name what was skipped
+    /// instead of letting the remaining stages be silently assumed by no one.
+    pub lowered_from_configured: Option<String>,
     /// Durable local receipt written after a successful release dispatch. It
     /// lets a retry re-observe live state without dispatching the release again.
     pub release_receipt: Option<String>,
@@ -3731,6 +3735,16 @@ pub async fn deliver<R: DeliveryRemote>(
         Some(req) => configured_ceiling.clamp_request(req),
         None => configured_ceiling,
     };
+    // A per-call ceiling may lower the user's configured one, and nothing used
+    // to record that it happened. Production 2026-09-21: a conversational aside
+    // ("I'll take it from here") led the agent to call with `pr_only` against a
+    // configured `through_release`; it opened the PR, stopped, and the PR sat
+    // untouched with red CI. Both sides believed the other was carrying it.
+    //
+    // The user's configured ceiling is a standing decision; one call asking for
+    // less is a deviation from it, and the result has to say so.
+    let lowered_below_configured =
+        requested_ceiling.rank() < configured_ceiling.rank() && opts.requested_ceiling.is_some();
     let mut outcome = DeliveryOutcome {
         steps: Vec::new(),
         branch: None,
@@ -3748,6 +3762,8 @@ pub async fn deliver<R: DeliveryRemote>(
         requested_ceiling: ceiling_label(requested_ceiling).into(),
         effective_ceiling: ceiling_label(requested_ceiling).into(),
         capability_gap: None,
+        lowered_from_configured: lowered_below_configured
+            .then(|| ceiling_label(configured_ceiling).to_string()),
         release_receipt: None,
         summary: String::new(),
     };
@@ -5297,6 +5313,20 @@ fn finish(mut outcome: DeliveryOutcome, branch: &str) -> DeliveryOutcome {
         outcome.summary.push_str(&format!(
             "\n本次实际到达 {}，未达到请求的 {}：缺少 {gap}。{next_action}",
             outcome.reached_state, outcome.requested_ceiling
+        ));
+    } else if let Some(configured) = outcome.lowered_from_configured.clone() {
+        // Not a capability gap — everything asked for was delivered. It is the
+        // ask itself that stopped short of the standing configuration, so the
+        // remaining stages need an owner named out loud rather than assumed.
+        outcome.stage = "complete".into();
+        outcome.code = "delivery_ceiling_lowered_by_request".into();
+        outcome.next_action = Some(format!(
+            "本次调用把交付天花板降到 {}，低于你配置的 {}。剩余阶段不会自动进行；             需要继续时再次调用 deliver_changes（已完成步骤会复用，不重复 merge 或 release）。",
+            outcome.effective_ceiling, configured,
+        ));
+        outcome.summary.push_str(&format!(
+            "\n注意：本次按 {} 交付，低于你配置的 {}，因此停在这里。剩余阶段没有自动进行。",
+            outcome.effective_ceiling, configured,
         ));
     } else {
         outcome.stage = "complete".into();
@@ -9253,6 +9283,7 @@ mod tests {
             requested_ceiling: "through_release".into(),
             effective_ceiling: "through_release".into(),
             capability_gap: None,
+            lowered_from_configured: None,
             release_receipt: None,
             summary: String::new(),
         }
@@ -9481,6 +9512,7 @@ mod tests {
             requested_ceiling: "through_release".into(),
             effective_ceiling: "pr_only".into(),
             capability_gap: Some("CI observer".into()),
+            lowered_from_configured: None,
             release_receipt: None,
             summary: String::new(),
         };
@@ -10028,6 +10060,68 @@ Release-Urgency: hold"
         ));
     }
 
+    fn delivered_outcome(lowered_from: Option<&str>) -> DeliveryOutcome {
+        DeliveryOutcome {
+            steps: vec![StepResult::ok("pr", "opened")],
+            branch: Some("feat/x".into()),
+            commit_sha: Some("abc123".into()),
+            pr_url: Some("https://example.test/pr/1".into()),
+            pr_number: Some(1),
+            final_state: "delivered".into(),
+            stage: "pr".into(),
+            code: "pr_opened".into(),
+            recoverable: false,
+            recovery_class: RecoveryClass::None,
+            retry_after_ms: None,
+            next_action: None,
+            reached_state: "pr_only".into(),
+            requested_ceiling: "pr_only".into(),
+            effective_ceiling: "pr_only".into(),
+            capability_gap: None,
+            lowered_from_configured: lowered_from.map(str::to_string),
+            release_receipt: None,
+            summary: String::new(),
+        }
+    }
+
+    /// Production 2026-09-21: a conversational aside ("I'll take it from here")
+    /// led the agent to call `deliver_changes` with `pr_only` while the user's
+    /// configured ceiling was `through_release`. It opened the PR and stopped.
+    /// The result read exactly like a completed delivery, so nobody waited for
+    /// CI — which was red — and the PR sat untouched until the user noticed.
+    ///
+    /// A call may still ask for less than the standing configuration, but the
+    /// result has to say that it did, and name what is left.
+    #[test]
+    fn a_ceiling_lowered_below_the_configured_one_says_so() {
+        let outcome = finish(delivered_outcome(Some("through_release")), "feat/x");
+        assert_eq!(outcome.code, "delivery_ceiling_lowered_by_request");
+        assert!(
+            outcome.summary.contains("低于你配置的 through_release"),
+            "the summary must name the standing configuration it stopped short of: {}",
+            outcome.summary
+        );
+        assert!(
+            outcome
+                .next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("剩余阶段不会自动进行")),
+            "the remaining stages must be handed to someone explicitly"
+        );
+        // It is not a failure: everything that was asked for was delivered.
+        assert_eq!(outcome.final_state, "delivered");
+    }
+
+    /// A call that honours the configured ceiling must stay silent about it —
+    /// the notice is for a deviation, not for every delivery.
+    #[test]
+    fn a_ceiling_matching_the_configured_one_adds_no_notice() {
+        let outcome = finish(delivered_outcome(None), "feat/x");
+        assert_eq!(outcome.code, "delivery_ceiling_reached");
+        assert!(!outcome.summary.contains("低于你配置的"));
+        assert!(outcome.next_action.is_none());
+    }
+
     #[test]
     fn release_without_live_evidence_is_not_reported_as_delivered_or_live() {
         let mut outcome = DeliveryOutcome {
@@ -10050,6 +10144,7 @@ Release-Urgency: hold"
             requested_ceiling: "through_release".into(),
             effective_ceiling: "through_release".into(),
             capability_gap: None,
+            lowered_from_configured: None,
             release_receipt: None,
             summary: String::new(),
         };
@@ -10097,6 +10192,7 @@ Release-Urgency: hold"
             requested_ceiling: "through_release".into(),
             effective_ceiling: "through_release".into(),
             capability_gap: None,
+            lowered_from_configured: None,
             release_receipt: None,
             summary: String::new(),
         };
