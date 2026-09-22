@@ -663,10 +663,6 @@ async fn process_claim(
                     &claim,
                     &permit,
                     move |executor| async move {
-                        // Every domain can leave a stale provider attempt behind,
-                        // so settle it before dispatch rather than only on the
-                        // Provider path (see the helper's note).
-                        reconcile_provider_attempt_before_resume(&pool, &objective.id).await?;
                         match executor {
                             AdapterExecutor::Chat => {
                                 crate::commands::chat::resume_chat_objective(
@@ -959,35 +955,6 @@ async fn resume_browser_objective(
 /// unresolved provider side effect/output can be replayed reaches the Chat
 /// executor. Auth additionally requires a current-revision capability receipt;
 /// neither path treats an identity-shaped Objective as sufficient proof.
-/// Settle a stale, effect-free provider attempt before ANY executor resumes.
-///
-/// Provider attempts are produced by every recovery domain, but the sweep that
-/// settles them only ran on the `Provider` executor path and at startup. A
-/// chat-domain objective whose attempt was left `in_flight` by a transport
-/// failure therefore had no way to settle it while the app kept running: each
-/// resume hit the replay-safety fence in `open_episode`, burned one recovery
-/// attempt, and the objective eventually exhausted its budget (observed in
-/// production 2026-09-14 — the sweep's own conditions all held; only the call
-/// site was out of reach).
-///
-/// The sweep's conditions are NOT relaxed here: it still refuses anything with
-/// observed output, side effects, unresolved receipts, a live chat run, or an
-/// output checkpoint. This only makes it reachable.
-pub(crate) async fn reconcile_provider_attempt_before_resume(
-    pool: &SqlitePool,
-    objective_id: &str,
-) -> Result<u64, crate::errors::AppError> {
-    let now = chrono::Utc::now().timestamp_millis();
-    super::provider_recovery::ProviderRecoveryStore::new(pool.clone())
-        .reconcile_stale_effect_free_attempt_for_objective(objective_id, now)
-        .await
-        .map_err(|error| {
-            crate::errors::AppError::Other(format!(
-                "provider recovery reconciliation failed: {error}"
-            ))
-        })
-}
-
 pub(crate) async fn require_provider_resume_evidence(
     pool: &SqlitePool,
     objective_id: &str,
@@ -1280,6 +1247,25 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                     ),
                     Err(error) => {
                         tracing::warn!(%error, "terminal-Objective receipt sweep failed");
+                    }
+                }
+                // A provider attempt left `in_flight` with no observed output,
+                // side effect, live run, or checkpoint cannot be settled by its
+                // own Objective: nothing owns it while the app keeps running.
+                // Sweep every domain's leftovers here instead of in front of
+                // executor dispatch — that path still owes a claim heartbeat
+                // (see `provider_attempt_sweep_stays_off_the_claim_hot_path`).
+                match super::provider_recovery::ProviderRecoveryStore::new(pool.clone())
+                    .reconcile_stale_effect_free_in_flight(chrono::Utc::now().timestamp_millis())
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(settled) => tracing::info!(
+                        settled,
+                        "settled stale in-flight provider attempts left behind by every domain"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "provider attempt sweep failed");
                     }
                 }
             }
@@ -2950,6 +2936,45 @@ mod tests {
         )));
     }
 
+    /// #525 wired the stale-attempt sweep into `process_claim`, directly in
+    /// front of executor dispatch. That is the lease-sensitive path: the
+    /// sweep's multi-subquery SQL runs on the same pool the claim heartbeat
+    /// still needs, so on a slow runner the short lease exercised by
+    /// `short_claim_lease_stays_live_until_adapter_settlement` can expire
+    /// before its next renewal (Windows CI: "objective remediation ownership
+    /// changed; adapter cancelled"; macOS stayed green). The sweep belongs on
+    /// the periodic stall sweep, which owns no claim to keep alive, and a
+    /// failure inside it must stay a logged no-op.
+    #[test]
+    fn provider_attempt_sweep_stays_off_the_claim_hot_path() {
+        let source = include_str!("objective_supervisor.rs");
+        // Spelled in two pieces: `include_str!` captures this text as well, so
+        // an assertion must not be satisfied by its own literal.
+        let per_objective = concat!("reconcile_provider_attempt", "_before_resume");
+        let best_effort = concat!("settle_stale_provider_attempt", "_best_effort");
+        assert!(
+            !source.contains(per_objective),
+            "the per-objective sweep must not run on the resume path"
+        );
+        assert!(
+            !source.contains(best_effort),
+            "the best-effort wrapper existed only to run that sweep before dispatch"
+        );
+
+        let sweep_block = source
+            .split("if polls_since_stall_sweep >= STALL_SWEEP_EVERY_POLLS {")
+            .nth(1)
+            .and_then(|rest| rest.split("tokio::time::sleep(POLL_INTERVAL)").next())
+            .expect("the periodic stall sweep block must exist");
+        let sweep_at = sweep_block
+            .find("reconcile_stale_effect_free_in_flight")
+            .expect("the periodic stall sweep must schedule the provider-attempt sweep");
+        assert!(
+            sweep_block[sweep_at..].contains("Err(error) =>"),
+            "a failing provider-attempt sweep must be logged, never propagated"
+        );
+    }
+
     /// 2026-09-14 production: a chat-domain objective's provider attempt was
     /// left `in_flight` by a deepseek transport failure with no bytes observed.
     /// The sweep that settles exactly this shape existed and every one of its
@@ -3098,8 +3123,9 @@ mod tests {
         );
         settle_run("run-chat-inflight-2", now + 6).await;
 
-        // The supervisor settles it BEFORE dispatch, while no chat run is live.
-        let settled = super::reconcile_provider_attempt_before_resume(&pool, &objective.id)
+        // The periodic stall sweep settles it, while no chat run is live.
+        let settled = provider
+            .reconcile_stale_effect_free_in_flight(now + 6)
             .await
             .unwrap();
         assert_eq!(
