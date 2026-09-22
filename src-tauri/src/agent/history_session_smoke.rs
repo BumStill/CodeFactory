@@ -711,10 +711,38 @@ fn spawn_worker(state_dir: &Path, phase: &str) -> anyhow::Result<std::process::C
         .with_context(|| format!("spawn history-session worker {phase}"))
 }
 
+/// How long this smoke may wait for a freshly spawned worker to reach its next
+/// observable point.
+///
+/// This was a bare 30 seconds, which is the wall a cold CI runner keeps hitting:
+/// it loads a ~135 MB debug binary and opens SQLite before anything is
+/// observable, on a shared and contended machine. Two different smokes have now
+/// failed on exactly this budget with nothing wrong in the code under test —
+/// `history-session worker seed did not settle within 30 seconds` (2026-09-20)
+/// and, in the unattended smoke, `phase-one worker did not reach post-mutation
+/// provider wait within 30 seconds` (2026-09-22).
+///
+/// A longer budget costs a passing run nothing: these loops poll and return the
+/// moment their condition holds, so the budget is only spent when something is
+/// genuinely stuck — and then the extra wait buys a real verdict instead of a
+/// coin flip. `CODEFACTORY_SMOKE_WORKER_TIMEOUT_SECS` overrides it for a
+/// deliberately short negative test.
+///
+/// `agent/unattended_smoke.rs` carries the same helper: it is compiled into its
+/// own CLI unit through `#[path]`, so it cannot share this one.
+fn worker_observation_budget() -> Duration {
+    Duration::from_secs(codefactory_agent_core::smoke_worker_budget_secs(
+        std::env::var("CODEFACTORY_SMOKE_WORKER_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    ))
+}
+
 async fn run_phase(state_dir: &Path, phase: &str) -> anyhow::Result<u32> {
     let mut child = spawn_worker(state_dir, phase)?;
     let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let budget = worker_observation_budget();
+    let deadline = Instant::now() + budget;
     loop {
         if let Some(status) = child.try_wait()? {
             if status.success() {
@@ -725,7 +753,10 @@ async fn run_phase(state_dir: &Path, phase: &str) -> anyhow::Result<u32> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("history-session worker {phase} did not settle within 30 seconds");
+            bail!(
+                "history-session worker {phase} did not settle within {}s",
+                budget.as_secs()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -735,7 +766,8 @@ async fn run_stop_request_fault(state_dir: &Path) -> anyhow::Result<u32> {
     let mut child = spawn_worker(state_dir, "stop-request")?;
     let pid = child.id();
     let marker = state_dir.join("stop-fence-ready");
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let budget = worker_observation_budget();
+    let deadline = Instant::now() + budget;
     loop {
         if let Some(status) = child.try_wait()? {
             bail!("stop-request worker exited before hard kill: {status}");
@@ -751,7 +783,10 @@ async fn run_stop_request_fault(state_dir: &Path) -> anyhow::Result<u32> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("stop-request worker did not persist its fence within 30 seconds");
+            bail!(
+                "stop-request worker did not persist its fence within {}s",
+                budget.as_secs()
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -891,3 +926,4 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         Err(error) => Err(error),
     }
 }
+
