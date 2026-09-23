@@ -67,6 +67,32 @@ internal mechanisms such as this gate.",
 /// Some reasoning transports accept tools but reject forced tool selection.
 /// Keep this detector narrow so malformed requests and unrelated provider 400s
 /// still fail visibly instead of silently changing request semantics.
+/// Seconds a cross-process smoke may wait for a freshly spawned worker to reach
+/// its next observable point.
+///
+/// The smokes used a bare 30 seconds, which a cold CI runner kept losing to: it
+/// loads a ~135 MB debug binary and opens SQLite before anything is observable,
+/// on a shared and contended machine. Two different smokes failed on exactly
+/// that budget with nothing wrong in the code under test —
+/// `history-session worker seed did not settle within 30 seconds` (2026-09-20)
+/// and `phase-one worker did not reach post-mutation provider wait within 30
+/// seconds` (2026-09-22).
+///
+/// A longer budget costs a passing run nothing: those loops poll and return the
+/// moment their condition holds, so it is only spent when something is genuinely
+/// stuck — and then the extra wait buys a verdict instead of a coin flip.
+///
+/// A negative test still needs a short deadline, so the value is overridable;
+/// an unusable override falls back to the default rather than producing a
+/// zero-length deadline that would make every wait fail instantly.
+pub fn smoke_worker_budget_secs(override_value: Option<&str>) -> u64 {
+    const DEFAULT_SECS: u64 = 120;
+    override_value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_SECS)
+}
+
 pub fn provider_rejects_required_tool_choice(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
     detail.contains("tool_choice")
@@ -4992,6 +5018,37 @@ fact that blocks implementation."
 
 #[cfg(test)]
 mod tests {
+
+    /// A cold CI runner kept losing to the old bare 30 seconds — twice, in two
+    /// different smokes, with nothing wrong in the code under test. The budget
+    /// must leave room for loading a large debug binary and opening SQLite on a
+    /// shared machine.
+    #[test]
+    fn the_smoke_worker_budget_leaves_room_for_a_cold_runner() {
+        // Strictly greater: 30 is the value that kept losing, so a default
+        // equal to it would pass this test while changing nothing.
+        assert!(
+            super::smoke_worker_budget_secs(None) > 30,
+            "the default must exceed the 30s that kept failing, not merely match it"
+        );
+        assert_eq!(super::smoke_worker_budget_secs(Some("90")), 90);
+        assert_eq!(super::smoke_worker_budget_secs(Some("  45 ")), 45);
+    }
+
+    /// A negative test needs a short deadline, so the value stays overridable —
+    /// but an unusable override must fall back rather than yield a zero-length
+    /// deadline that makes every wait fail instantly.
+    #[test]
+    fn an_unusable_smoke_budget_override_falls_back() {
+        let default = super::smoke_worker_budget_secs(None);
+        for bogus in ["", "0", "-5", "abc", "12x"] {
+            assert_eq!(
+                super::smoke_worker_budget_secs(Some(bogus)),
+                default,
+                "{bogus:?} must fall back to the default"
+            );
+        }
+    }
     use super::*;
 
     fn outcome(sequence: u64, kind: ToolKind, return_code: i32) -> ToolOutcome {

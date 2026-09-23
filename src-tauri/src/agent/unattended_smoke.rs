@@ -439,12 +439,38 @@ fn spawn_worker(
     command.spawn().context("spawn unattended long-task worker")
 }
 
+/// How long a smoke may wait for a freshly spawned worker to reach its next
+/// observable point.
+///
+/// This was a bare 30 seconds, which is the wall a cold CI runner keeps hitting:
+/// it has to load a ~135 MB debug binary, open SQLite, and drive a provider
+/// fixture before anything is observable, and it is doing that on a shared,
+/// contended machine. Two different smokes have now failed on exactly this
+/// budget without anything being wrong with the code under test —
+/// `history-session worker seed did not settle within 30 seconds` (2026-09-20)
+/// and `phase-one worker did not reach post-mutation provider wait within 30
+/// seconds` (2026-09-22).
+///
+/// A longer budget costs nothing on a passing run: every one of these loops
+/// polls and returns the moment its condition holds, so the budget is only
+/// spent when something is genuinely stuck — and in that case the extra wait
+/// buys a real verdict instead of a coin flip. `CODEFACTORY_SMOKE_WORKER_TIMEOUT_SECS`
+/// overrides it for a deliberately short negative test.
+pub(super) fn worker_observation_budget() -> Duration {
+    Duration::from_secs(codefactory_agent_core::smoke_worker_budget_secs(
+        std::env::var("CODEFACTORY_SMOKE_WORKER_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    ))
+}
+
 async fn wait_for_fault_point(
     child: &mut std::process::Child,
     fixture: &ProviderFixture,
     artifact: &Path,
 ) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let budget = worker_observation_budget();
+    let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
             bail!("phase-one worker exited before injected crash: {status}");
@@ -457,7 +483,10 @@ async fn wait_for_fault_point(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    bail!("phase-one worker did not reach post-mutation provider wait within 30 seconds")
+    bail!(
+        "phase-one worker did not reach post-mutation provider wait within {}s",
+        budget.as_secs()
+    )
 }
 
 async fn wait_for_worker(
