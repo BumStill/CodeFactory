@@ -1551,6 +1551,7 @@ async fn converge_aborted_chat_setup(
     pool: &sqlx::SqlitePool,
     control: &crate::ChatRunControl,
     session_id: &str,
+    failure_text: Option<&str>,
 ) -> Result<Option<ChatSetupConvergence>, AppError> {
     use crate::agent::objective::{DecisionRouter, ObjectiveStatus, RecoveryDomain, RouteSignal};
 
@@ -1635,17 +1636,40 @@ async fn converge_aborted_chat_setup(
         // Only the exact admitted revision may be transferred. If another
         // actor already advanced the Objective, this stale setup guard merely
         // retires its own transport receipt and projects the durable winner.
+        let failure_code = "chat_setup_aborted";
+        let failure_signature = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                format!("chat_setup_aborted:{}", control.run_instance_id).as_bytes()
+            )
+        );
+        // The signature makes repeats countable; it does not make them
+        // readable. Keep this abort's own text beside the decision that acted
+        // on it, exactly as settle_chat_objective_from_error does. It is
+        // recorded ONLY for the revision this guard owns: a newer revision has
+        // its own decision and must never inherit a stale runner's reason.
+        if let Some(failure_text) = failure_text {
+            if let Err(error) = store
+                .record_failure_detail(
+                    &objective_id,
+                    RecoveryDomain::Chat,
+                    failure_code,
+                    &failure_signature,
+                    failure_text,
+                )
+                .await
+            {
+                // Best-effort: a diagnostic must never be able to block the
+                // decision it describes.
+                tracing::warn!("failed to record chat setup failure detail: {error}");
+            }
+        }
         let decision = DecisionRouter::route(
             &objective,
             RouteSignal::TechnicalFailure {
                 domain: RecoveryDomain::Chat,
-                failure_code: "chat_setup_aborted".into(),
-                failure_signature: format!(
-                    "sha256:{:x}",
-                    Sha256::digest(
-                        format!("chat_setup_aborted:{}", control.run_instance_id).as_bytes()
-                    )
-                ),
+                failure_code: failure_code.into(),
+                failure_signature,
                 next_observation_at: Utc::now().timestamp_millis() + 5_000,
                 resume_cursor: Some(root_turn_id.clone()),
             },
@@ -1678,8 +1702,9 @@ async fn converge_and_project_aborted_chat_setup(
     control: &Arc<crate::ChatRunControl>,
     session_id: &str,
     event_app: Option<&AppHandle>,
+    failure_text: Option<&str>,
 ) -> Result<(), AppError> {
-    let settlement = converge_aborted_chat_setup(pool, control, session_id).await?;
+    let settlement = converge_aborted_chat_setup(pool, control, session_id, failure_text).await?;
     if let (Some(app), Some(settlement)) = (event_app, settlement) {
         let event_name = format!("stream:{session_id}");
         project_chat_objective(
@@ -2314,7 +2339,7 @@ impl ChatRunningSetupGuard {
     /// admission. Drop remains the panic/cancellation fallback, but ordinary
     /// setup errors await their durable recovery receipt before the command
     /// reports success to the frontend.
-    async fn settle_now(&mut self) -> Result<(), AppError> {
+    async fn settle_now(&mut self, failure_text: Option<&str>) -> Result<(), AppError> {
         if !self.armed {
             return Ok(());
         }
@@ -2330,11 +2355,12 @@ impl ChatRunningSetupGuard {
             &self.control,
             &self.session_id,
             self.event_app.as_ref(),
+            failure_text,
         )
         .await?;
         #[cfg(test)]
         {
-            converge_aborted_chat_setup(db, &self.control, &self.session_id).await?;
+            converge_aborted_chat_setup(db, &self.control, &self.session_id, failure_text).await?;
             clear_chat_running_if_current(&self.chat_cancels, &self.session_id, &self.control)
                 .await;
         }
@@ -2370,11 +2396,15 @@ impl Drop for ChatRunningSetupGuard {
                             &control,
                             &session_id,
                             event_app.as_ref(),
+                            // Drop is the panic/cancellation fallback: it has no
+                            // error text to hand down, and inventing one would
+                            // put a made-up reason in the durable diagnosis.
+                            None,
                         )
                         .await;
                         #[cfg(test)]
                         let convergence = async {
-                            converge_aborted_chat_setup(&db, &control, &session_id).await?;
+                            converge_aborted_chat_setup(&db, &control, &session_id, None).await?;
                             clear_chat_running_if_current(&chat_cancels, &session_id, &control)
                                 .await;
                             Ok::<(), AppError>(())
@@ -2460,7 +2490,14 @@ pub async fn send_message(
                         error = %setup_error,
                         "chat setup failed after atomic admission; transferring to system recovery"
                     );
-                    if let Err(convergence_error) = running_setup_guard.settle_now().await {
+                    // The tracing line above is not durable. Hand the same text
+                    // to the recovery that outlives this process, so the abort
+                    // stays explainable after a restart.
+                    let setup_failure_text = setup_error.to_string();
+                    if let Err(convergence_error) = running_setup_guard
+                        .settle_now(Some(setup_failure_text.as_str()))
+                        .await
+                    {
                         // The still-armed Drop path keeps retrying the same
                         // durable identity after this command returns.
                         tracing::error!(
@@ -3987,6 +4024,122 @@ mod tests {
         ));
     }
 
+    /// A chat setup that aborts keeps only `sha256:<hash>` of the error. On
+    /// 2026-09-20 a session whose setup failed could not be explained from the
+    /// database at all: the reason lived in one tracing line, and the signature
+    /// cannot be read back. The abort must carry its own failure text into the
+    /// durable diagnosis, the way `settle_chat_objective_from_error` already
+    /// does for a settled turn.
+    #[tokio::test]
+    async fn aborted_setup_records_the_underlying_failure_text() {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-setup-detail".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-setup-detail".into()),
+                root_turn_id: Some("turn-setup-detail".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-setup-detail', 'session-setup-detail', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let flags: crate::ChatCancelMap =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let control = Arc::new(crate::ChatRunControl::pending());
+        flags
+            .lock()
+            .await
+            .insert("session-setup-detail".into(), control.clone());
+        register_chat_run_control(&pool, &control, "session-setup-detail")
+            .await
+            .unwrap();
+        bind_chat_run_root(
+            &pool,
+            &control.run_instance_id,
+            "session-setup-detail",
+            "turn-setup-detail",
+        )
+        .await
+        .unwrap();
+        bind_chat_run_objective(
+            &pool,
+            &control.run_instance_id,
+            "session-setup-detail",
+            "turn-setup-detail",
+            &objective.id,
+            objective.revision,
+        )
+        .await
+        .unwrap();
+
+        let mut guard = ChatRunningSetupGuard::new(
+            flags.clone(),
+            "session-setup-detail".into(),
+            control.clone(),
+        );
+        guard.attach_durable_db(pool.clone());
+        guard
+            .settle_now(Some("deepseek: HTTP 503 Service is too busy"))
+            .await
+            .expect("the explicit early-return seam must persist recovery");
+
+        let recovered = store.get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, ObjectiveStatus::WaitingSystem);
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail_json FROM objective_events
+             WHERE objective_id=? AND event_type='technical_failure_detail'
+               AND failure_code='chat_setup_aborted'
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&objective.id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        let detail = detail.expect(
+            "an aborted chat setup must keep the failure text, not only its signature",
+        );
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(
+            detail["error_text"].as_str(),
+            Some("deepseek: HTTP 503 Service is too busy"),
+            "the durable diagnosis must carry the reason the setup actually failed"
+        );
+    }
+
     #[tokio::test]
     async fn admitted_setup_failure_moves_the_exact_objective_to_system_recovery() {
         use crate::agent::objective::{
@@ -4070,7 +4223,7 @@ mod tests {
         );
         guard.attach_durable_db(pool.clone());
         guard
-            .settle_now()
+            .settle_now(None)
             .await
             .expect("the explicit early-return seam must persist recovery");
         assert!(!flags.lock().await.contains_key("session-setup-failure"));
@@ -4103,7 +4256,7 @@ mod tests {
                 .unwrap();
         assert_eq!(control_status, "completed");
 
-        let repeated = converge_aborted_chat_setup(&pool, &control, "session-setup-failure")
+        let repeated = converge_aborted_chat_setup(&pool, &control, "session-setup-failure", None)
             .await
             .unwrap()
             .expect("the terminal control keeps its exact durable identity");
@@ -4168,7 +4321,7 @@ mod tests {
             .await
             .unwrap();
         let projected =
-            converge_aborted_chat_setup(&pool, &stale_control, "session-newer-setup-owner")
+            converge_aborted_chat_setup(&pool, &stale_control, "session-newer-setup-owner", None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -4267,7 +4420,7 @@ mod tests {
         .await
         .unwrap();
 
-        let settled = converge_aborted_chat_setup(&pool, &control, "session-continuation-setup")
+        let settled = converge_aborted_chat_setup(&pool, &control, "session-continuation-setup", None)
             .await
             .expect("the durable continuation identity should converge")
             .expect("the continuation keeps its Objective receipt");
@@ -4355,7 +4508,7 @@ mod tests {
         request_chat_run_cancel(&pool, &control.run_instance_id, "session-setup-cancel")
             .await
             .unwrap();
-        let settled = converge_aborted_chat_setup(&pool, &control, "session-setup-cancel")
+        let settled = converge_aborted_chat_setup(&pool, &control, "session-setup-cancel", None)
             .await
             .unwrap()
             .unwrap();
