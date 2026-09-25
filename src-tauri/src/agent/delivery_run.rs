@@ -677,7 +677,8 @@ pub async fn create_delivery_run(
             "SELECT objective_id, run_kind, session_id, task_id,
                     workspace_path, worktree_identity, repo_identity, base_branch, head_branch,
                     change_set_digest, expected_head_sha, requested_ceiling,
-                    lease_owner, lease_expires_at, claim_epoch
+                    lease_owner, lease_expires_at, claim_epoch, reconciled_claim_epoch,
+                    progress_revision, stage, status, wait_class
              FROM delivery_runs WHERE id=?",
         )
         .bind(&run.id)
@@ -708,28 +709,63 @@ pub async fn create_delivery_run(
         }
         let existing_owner = existing.try_get::<Option<String>, _>("lease_owner")?;
         let existing_lease_expires_at = existing.try_get::<Option<i64>, _>("lease_expires_at")?;
-        if existing_owner.as_deref() != Some(process.instance_id.as_str())
-            && existing_lease_expires_at.is_some_and(|expires_at| expires_at > now)
+        let current_claim_epoch = existing.try_get::<i64, _>("claim_epoch")?;
+        let existing_reconciled_claim_epoch: i64 = existing.try_get("reconciled_claim_epoch")?;
+        let live_foreign_lease = existing_owner.as_deref() != Some(process.instance_id.as_str())
+            && existing_lease_expires_at.is_some_and(|expires_at| expires_at > now);
+        // Only a mutation-capable live lease is a competing invocation. An
+        // observe-only holder (a positive epoch that was never reconciled) may
+        // not mutate at all, so the foreground path takes the claim over here —
+        // advancing the epoch and reconciling before its first side effect —
+        // instead of waiting behind a supervisor that keeps renewing an
+        // unreconciled lease. Production evidence: run
+        // `delivery-e1e2a2f79fcf…` on 2026-09-23 renewed an observe-only
+        // startup lease every 60s with a 90s TTL (`claim_epoch=16`,
+        // `reconciled_claim_epoch=1`), so the lock could never expire and every
+        // foreground `deliver_changes` burned the objective recovery budget
+        // until it reported `technical_recovery_exhausted` — the observer was
+        // waiting for an agent its own lock had shut out.
+        if live_foreign_lease
+            && lease_authorizes_mutation(current_claim_epoch, existing_reconciled_claim_epoch)
         {
-            return Err(crate::errors::AppError::Other(
-                "delivery run already has an active invocation; attach to the existing objective instead of starting a concurrent worktree mutation"
-                    .into(),
-            ));
+            let holder = ActiveDeliveryLease {
+                run_id: run.id.clone(),
+                owner: existing_owner.clone().unwrap_or_default(),
+                mode: DeliveryLeaseMode::from_lease_epochs(
+                    current_claim_epoch,
+                    existing_reconciled_claim_epoch,
+                ),
+                claim_epoch: current_claim_epoch,
+                reconciled_claim_epoch: existing_reconciled_claim_epoch,
+                progress_revision: existing.try_get::<i64, _>("progress_revision")?,
+                lease_expires_at: existing_lease_expires_at,
+            };
+            return Err(crate::errors::AppError::Other(format!(
+                "delivery run already has an active invocation; attach to the existing objective instead of starting a concurrent worktree mutation {}",
+                holder.encode()
+            )));
         }
         // A foreground retry in the same live process is an idempotent lease
         // renewal, not a new ownership claim. Advancing the epoch here would
         // strand the normal execution path behind its own observe-only fence.
-        // Expired or different-owner claims still advance monotonically and
-        // therefore require takeover reconciliation before mutation.
+        // Expired, observe-only, or different-owner claims still advance
+        // monotonically and therefore require takeover reconciliation before
+        // mutation.
         let same_live_claim = existing_owner.as_deref() == Some(process.instance_id.as_str())
             && existing_lease_expires_at.is_some_and(|expires_at| expires_at > now);
-        let current_claim_epoch = existing.try_get::<i64, _>("claim_epoch")?;
+        let took_over_observe_only_lease = live_foreign_lease
+            && !lease_authorizes_mutation(current_claim_epoch, existing_reconciled_claim_epoch);
         let next_claim_epoch = if same_live_claim {
             current_claim_epoch
         } else {
             current_claim_epoch.saturating_add(1)
         };
-        let renewed = sqlx::query(
+        // An observe-only holder cannot mutate, so it does not own the
+        // worktree and the foreground takeover is allowed to replace it; a
+        // reconciled (mutation-capable) holder still requires ownership or an
+        // expired lease. `NOT (…)` is the observe-only side of the single
+        // shared lease judgement, not a second copy of the rule.
+        let renewal = format!(
             "UPDATE delivery_runs
              SET lease_owner=?, lease_expires_at=?, process_instance=?, app_version=?, app_build=?,
                  claim_epoch=?,
@@ -739,8 +775,11 @@ pub async fn create_delivery_run(
                  autonomous_completion=MAX(autonomous_completion, ?), updated_at=?
              WHERE id=? AND objective_id=? AND repo_identity=?
                AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
-               AND (lease_owner=? OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
-        )
+               AND (lease_owner=? OR lease_expires_at IS NULL OR lease_expires_at <= ?
+                    OR NOT ({}))",
+            LEASE_MUTATION_CAPABLE_SQL
+        );
+        let renewed = sqlx::query(&renewal)
         .bind(&process.instance_id)
         .bind(now.saturating_add(lease_ttl))
         .bind(&process.instance_id)
@@ -767,6 +806,36 @@ pub async fn create_delivery_run(
             return Err(crate::errors::AppError::Other(
                 "delivery run id collision or source identity changed".into(),
             ));
+        }
+        if took_over_observe_only_lease {
+            // Durable evidence that the foreground displaced an observe-only
+            // holder: the supervisor's own epoch-16 claim is superseded here,
+            // and the observer leaves on the epoch fence it already watches.
+            sqlx::query(
+                "INSERT INTO delivery_run_events
+                 (id, run_id, event_kind, stage, status, wait_class, detail_json, process_instance, created_at)
+                 VALUES (?, ?, 'lease_takeover', ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&run.id)
+            .bind(existing.try_get::<String, _>("stage")?)
+            .bind(existing.try_get::<String, _>("status")?)
+            .bind(existing.try_get::<Option<String>, _>("wait_class")?)
+            .bind(
+                serde_json::json!({
+                    "mode": "takeover",
+                    "action": "foreground_delivery",
+                    "previous_owner": existing_owner,
+                    "previous_claim_epoch": current_claim_epoch,
+                    "previous_reconciled_claim_epoch": existing_reconciled_claim_epoch,
+                    "next_claim_epoch": next_claim_epoch,
+                })
+                .to_string(),
+            )
+            .bind(&process.instance_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         }
     } else {
         // Epoch zero is reserved for legacy rows that have never held a
@@ -1822,6 +1891,116 @@ where
     .await?;
     tx.commit().await?;
     Ok(result)
+}
+
+/// The single judgement for whether a delivery lease may authorize mutation.
+///
+/// A lease authorizes a local or remote mutation only when it holds a positive
+/// claim epoch that has already been reconciled against observed state. An
+/// unreconciled takeover claim is observe-only: it serializes observers, but it
+/// may never mutate, and it must never be reported as a competing invocation.
+/// The restart guard in `commands/update_safety.rs::count_active_delivery_leases`
+/// states the same rule by interpolating this constant into its query, and the
+/// foreground admission path in [`create_delivery_run`] calls
+/// [`lease_authorizes_mutation`]. There is exactly one definition; do not write
+/// a second one.
+pub const LEASE_MUTATION_CAPABLE_SQL: &str =
+    "claim_epoch > 0 AND reconciled_claim_epoch = claim_epoch";
+
+/// Rust spelling of [`LEASE_MUTATION_CAPABLE_SQL`], for callers that already
+/// hold the two epochs in memory.
+pub fn lease_authorizes_mutation(claim_epoch: i64, reconciled_claim_epoch: i64) -> bool {
+    claim_epoch > 0 && reconciled_claim_epoch == claim_epoch
+}
+
+/// How a live delivery lease is allowed to use the worktree it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryLeaseMode {
+    /// Observe-only: it holds the lease to serialize observers but may not
+    /// mutate, so the foreground delivery path may take it over.
+    Observe,
+    /// Mutation-capable: its positive epoch was reconciled, so it owns the
+    /// worktree exclusively until the lease expires.
+    Mutation,
+}
+
+impl DeliveryLeaseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryLeaseMode::Observe => "observe",
+            DeliveryLeaseMode::Mutation => "mutation",
+        }
+    }
+
+    fn from_lease_epochs(claim_epoch: i64, reconciled_claim_epoch: i64) -> Self {
+        if lease_authorizes_mutation(claim_epoch, reconciled_claim_epoch) {
+            DeliveryLeaseMode::Mutation
+        } else {
+            DeliveryLeaseMode::Observe
+        }
+    }
+}
+
+/// Structured description of the live lease that refused a competing foreground
+/// admission.
+///
+/// The refusal travels as an [`crate::errors::AppError`] string, so the payload
+/// is appended after [`ActiveDeliveryLease::MARKER`] as JSON and recovered with
+/// [`ActiveDeliveryLease::from_error_message`]. That lets `deliver_changes`
+/// report the holder, its mode and its real expiry instead of an opaque
+/// "already running" that the agent retries until the objective recovery budget
+/// is exhausted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveDeliveryLease {
+    pub run_id: String,
+    pub owner: String,
+    pub mode: DeliveryLeaseMode,
+    pub claim_epoch: i64,
+    pub reconciled_claim_epoch: i64,
+    pub progress_revision: i64,
+    pub lease_expires_at: Option<i64>,
+}
+
+impl ActiveDeliveryLease {
+    const MARKER: &'static str = "[delivery-lease-holder]";
+
+    pub fn encode(&self) -> String {
+        format!(
+            "{} {}",
+            Self::MARKER,
+            serde_json::json!({
+                "run_id": self.run_id,
+                "lease_owner": self.owner,
+                "lease_mode": self.mode.as_str(),
+                "claim_epoch": self.claim_epoch,
+                "reconciled_claim_epoch": self.reconciled_claim_epoch,
+                "progress_revision": self.progress_revision,
+                "lease_expires_at": self.lease_expires_at,
+            })
+        )
+    }
+
+    pub fn from_error_message(message: &str) -> Option<Self> {
+        let payload = message.split(Self::MARKER).nth(1)?.trim();
+        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        Some(Self {
+            run_id: value.get("run_id")?.as_str()?.to_string(),
+            owner: value.get("lease_owner")?.as_str()?.to_string(),
+            mode: match value.get("lease_mode")?.as_str()? {
+                "mutation" => DeliveryLeaseMode::Mutation,
+                _ => DeliveryLeaseMode::Observe,
+            },
+            claim_epoch: value.get("claim_epoch")?.as_i64()?,
+            reconciled_claim_epoch: value.get("reconciled_claim_epoch")?.as_i64()?,
+            progress_revision: value
+                .get("progress_revision")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            lease_expires_at: value
+                .get("lease_expires_at")
+                .and_then(serde_json::Value::as_i64),
+        })
+    }
 }
 
 /// Promote an observe-only takeover claim into a mutation-capable claim after
@@ -4893,6 +5072,234 @@ mod tests {
         create_delivery_run(pool, &run, process, now, lease_ttl)
             .await
             .unwrap()
+    }
+
+    fn foreground_admission_fixture(id: &str) -> NewDeliveryRun {
+        NewDeliveryRun {
+            id: id.into(),
+            objective_id: format!("objective-opaque-{id}"),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: format!("worktree:{id}"),
+            repo_identity: "example.invalid/repo".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest-a".into(),
+            expected_head_sha: "aaa".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        }
+    }
+
+    /// Reproduction of the production deadlock (run `delivery-e1e2a2f79fcf…`,
+    /// 2026-09-23 14:39–14:52): the background delivery recovery supervisor
+    /// claimed an observe-only startup lease and renewed it every 60s under a
+    /// 90s TTL, so its lease never expired; its claim was
+    /// `claim_epoch=16` / `reconciled_claim_epoch=1`, i.e. it never reconciled
+    /// and therefore could never mutate. The foreground `deliver_changes` was
+    /// refused with `delivery_operation_already_running` on every attempt and
+    /// burned the objective recovery budget to `technical_recovery_exhausted`
+    /// while the observer waited for the agent its own lock had shut out.
+    #[tokio::test]
+    async fn observe_only_live_lease_does_not_block_foreground_delivery() {
+        let pool = pool().await;
+        let run = foreground_admission_fixture("observe-only-lock");
+        let supervisor = ProcessIdentity::new("recovery-supervisor", "1.81.52", "18152");
+        create_delivery_run(&pool, &run, &supervisor, 1_000, 90)
+            .await
+            .unwrap();
+        // A live, repeatedly-renewed observe-only claim: unexpired lease, but a
+        // positive epoch that was never reconciled.
+        sqlx::query(
+            "UPDATE delivery_runs
+             SET lease_owner='delivery-recovery-supervisor', lease_expires_at=91000,
+                 claim_epoch=16, reconciled_claim_epoch=1, wait_class='recoverable',
+                 status='agent_action_required', process_instance='recovery-supervisor'
+             WHERE id='observe-only-lock'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let foreground = ProcessIdentity::new("foreground:delivery:1", "1.81.52", "18152");
+        let claim_epoch = create_delivery_run(&pool, &run, &foreground, 2_000, 90)
+            .await
+            .expect("an observe-only live lease must not block the foreground delivery path");
+        assert_eq!(
+            claim_epoch, 17,
+            "the foreground takes the claim over by advancing the epoch"
+        );
+
+        let (owner, expires_at, status, reconciled): (String, i64, String, i64) = sqlx::query_as(
+            "SELECT lease_owner, lease_expires_at, status, reconciled_claim_epoch
+             FROM delivery_runs WHERE id='observe-only-lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(owner, "foreground:delivery:1");
+        assert_eq!(expires_at, 2_090);
+        assert_eq!(
+            status, "agent_action_required",
+            "taking the lease over must not rewrite the run's own state machine"
+        );
+        assert_eq!(
+            reconciled, 1,
+            "the takeover is observe-only until the foreground reconciles before mutating"
+        );
+
+        let takeover: (String, String) = sqlx::query_as(
+            "SELECT event_kind, detail_json FROM delivery_run_events
+             WHERE run_id='observe-only-lock' AND event_kind='lease_takeover'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            takeover.1.contains("delivery-recovery-supervisor")
+                && takeover.1.contains("\"previous_claim_epoch\":16"),
+            "a displaced observe-only holder must leave durable evidence: {}",
+            takeover.1
+        );
+    }
+
+    /// The reverse direction: a live lease that IS mutation-capable still owns
+    /// the worktree, so a second foreground invocation is refused and the
+    /// refusal carries the holder, the mode and the real expiry.
+    #[tokio::test]
+    async fn mutation_capable_live_lease_still_blocks_foreground_delivery() {
+        let pool = pool().await;
+        let run = foreground_admission_fixture("mutation-capable-lock");
+        let first = ProcessIdentity::new("foreground:delivery:a", "1.81.52", "18152");
+        create_delivery_run(&pool, &run, &first, 1_000, 900)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE delivery_runs
+             SET lease_owner='foreground:delivery:a', lease_expires_at=91000,
+                 claim_epoch=5, reconciled_claim_epoch=5, progress_revision=42
+             WHERE id='mutation-capable-lock'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let second = ProcessIdentity::new("foreground:delivery:b", "1.81.52", "18152");
+        let error = create_delivery_run(&pool, &run, &second, 2_000, 90)
+            .await
+            .expect_err("a reconciled live lease owns the worktree exclusively");
+        assert!(error.to_string().contains("active invocation"));
+        let holder = ActiveDeliveryLease::from_error_message(&error.to_string())
+            .expect("the refusal must carry a machine-readable holder");
+        assert_eq!(holder.owner, "foreground:delivery:a");
+        assert_eq!(holder.mode, DeliveryLeaseMode::Mutation);
+        assert_eq!(holder.claim_epoch, 5);
+        assert_eq!(holder.progress_revision, 42);
+        assert_eq!(holder.lease_expires_at, Some(91_000));
+
+        let holder_epoch: (String, i64) = sqlx::query_as(
+            "SELECT lease_owner, claim_epoch FROM delivery_runs WHERE id='mutation-capable-lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            holder_epoch,
+            ("foreground:delivery:a".into(), 5),
+            "a refused admission must not mutate the holder's claim"
+        );
+    }
+
+    /// Two foreground invocations are still mutually exclusive, and their lease
+    /// owners stay unique per invocation (pinned separately in
+    /// `tools::delivery`); this asserts the epoch never advances for the loser.
+    #[tokio::test]
+    async fn live_foreground_admission_is_unchanged_for_its_own_owner() {
+        let pool = pool().await;
+        let run = foreground_admission_fixture("same-owner-retry");
+        let owner = ProcessIdentity::new("foreground:delivery:c", "1.81.52", "18152");
+        let first = create_delivery_run(&pool, &run, &owner, 1_000, 90)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE delivery_runs SET claim_epoch=4, reconciled_claim_epoch=4 WHERE id='same-owner-retry'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let second = create_delivery_run(&pool, &run, &owner, 1_050, 90)
+            .await
+            .unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(
+            second, 4,
+            "an idempotent retry by the same live owner renews without advancing the epoch"
+        );
+    }
+
+    /// The restart guard in `commands/update_safety.rs` and the admission path
+    /// here must never grow two definitions of "mutation-capable lease". This
+    /// pins the Rust predicate and the SQL fragment to each other over the same
+    /// rows so either drifting fails.
+    #[tokio::test]
+    async fn lease_mutation_capability_has_exactly_one_definition() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE delivery_runs (
+                id TEXT PRIMARY KEY,
+                claim_epoch INTEGER NOT NULL,
+                reconciled_claim_epoch INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, claim_epoch, reconciled_claim_epoch) in [
+            ("reconciled", 16_i64, 16_i64),
+            ("observe-only", 16, 1),
+            ("epoch-zero", 0, 0),
+            ("unreconciled-than-zero", 1, 0),
+            ("negative", -3, -3),
+        ] {
+            sqlx::query(
+                "INSERT INTO delivery_runs (id, claim_epoch, reconciled_claim_epoch) VALUES (?,?,?)",
+            )
+            .bind(id)
+            .bind(claim_epoch)
+            .bind(reconciled_claim_epoch)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let sql_says: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM delivery_runs WHERE id=? AND ({LEASE_MUTATION_CAPABLE_SQL})"
+            ))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                sql_says == 1,
+                lease_authorizes_mutation(claim_epoch, reconciled_claim_epoch),
+                "the shared SQL fragment and the Rust predicate must agree for {id}"
+            );
+        }
     }
 
     async fn insert_recovery_fixture(
