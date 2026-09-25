@@ -143,4 +143,24 @@ describe("ToolCallCard — open generated file", () => {
     expect(detail).not.toHaveClass("border-t");
   });
 
+  it("surfaces CI progress directly on a running deliver_changes row", async () => {
+    mocks.invoke.mockResolvedValue({
+      remote_available: true,
+      pr: { number: 438 },
+      ci_status: "pending",
+      error: null,
+    });
+
+    render(<ToolCallCard tc={tc({ name: "deliver_changes", status: "running", result: undefined })} />);
+
+    expect(await screen.findByText("CI 运行中")).toBeInTheDocument();
+    expect(screen.getByText("PR #438")).toBeInTheDocument();
+    expect(mocks.invoke).toHaveBeenCalledWith("workspace_delivery_status", {
+      cwd: "/proj",
+      sessionId: "session-1",
+      branch: null,
+      prNumber: null,
+    });
+  });
+
 });
