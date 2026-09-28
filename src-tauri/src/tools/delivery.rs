@@ -19,8 +19,8 @@ use crate::agent::delivery::{
     OpenPrObservation, ReleaseUrgency,
 };
 use crate::agent::delivery_run::{
-    self, CoreInputRequest, DeliveryIdentityRevision, DeliveryObservation, NewDeliveryRun,
-    ProcessIdentity,
+    self, ActiveDeliveryLease, CoreInputRequest, DeliveryIdentityRevision, DeliveryLeaseMode,
+    DeliveryObservation, NewDeliveryRun, ProcessIdentity,
 };
 use crate::agent::objective::ObjectiveStore;
 #[cfg(not(test))]
@@ -144,23 +144,12 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             })));
         }
         Err(error) if error.to_string().contains("active invocation") => {
-            return Ok(ToolOutput::waiting(
-                "同一 objective 已有一条交付执行持有 worktree lease；当前调用已附着等待，未并发执行 stage/commit/push。",
-            )
-            .with_metadata(json!({
-                "status": "recovering",
-                "delivery_state": "waiting",
-                "stage": "lease",
-                "code": "delivery_operation_already_running",
-                "recoverable": true,
-                "recovery_class": "agent_action_required",
-                "decision_type": "system_owned",
-                "requires_user_continue": false,
-                "retry_after_ms": 1_000,
-                "next_action": "attach_existing_delivery_run",
-                "requested_ceiling": requested_ceiling.map(ceiling_label).unwrap_or_else(|| ceiling_label(settings.delivery_ceiling)),
-                "reached_state": "local"
-            })));
+            return Ok(active_delivery_lease_output(
+                &error.to_string(),
+                settings.delivery_ceiling,
+                requested_ceiling,
+                chrono::Utc::now().timestamp_millis(),
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -212,6 +201,189 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         let retry_after_ms = outcome.retry_after_ms.unwrap_or(30_000).clamp(1, 60_000);
         tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms)).await;
     }
+}
+
+/// A foreground `deliver_changes` may attach to a live, mutation-capable lease.
+/// Attaching forever burns the objective recovery budget on a lock that never
+/// clears, so the ledger remembers the holder snapshot of the last attachment
+/// per run: the same holder with no claim-epoch and no progress advance for
+/// [`MAX_LEASE_ATTACHMENTS_WITHOUT_PROGRESS`] consecutive attachments turns the
+/// wait into an explicit, non-recoverable failure.
+const MAX_LEASE_ATTACHMENTS_WITHOUT_PROGRESS: u32 = 3;
+
+#[derive(Default)]
+struct LeaseAttachmentLedger {
+    attachments: std::collections::HashMap<String, LeaseAttachment>,
+}
+
+struct LeaseAttachment {
+    owner: String,
+    claim_epoch: i64,
+    progress_revision: i64,
+    count: u32,
+}
+
+impl LeaseAttachmentLedger {
+    /// Records one attachment against `holder` and returns how many consecutive
+    /// attachments this holder has taken without any observable advance.
+    fn observe(&mut self, holder: &ActiveDeliveryLease) -> u32 {
+        use std::collections::hash_map::Entry;
+        match self.attachments.entry(holder.run_id.clone()) {
+            Entry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                let holder_advanced = entry.owner != holder.owner
+                    || entry.claim_epoch != holder.claim_epoch
+                    || entry.progress_revision != holder.progress_revision;
+                if holder_advanced {
+                    entry.owner = holder.owner.clone();
+                    entry.claim_epoch = holder.claim_epoch;
+                    entry.progress_revision = holder.progress_revision;
+                    entry.count = 1;
+                } else {
+                    entry.count = entry.count.saturating_add(1);
+                }
+                entry.count
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(LeaseAttachment {
+                    owner: holder.owner.clone(),
+                    claim_epoch: holder.claim_epoch,
+                    progress_revision: holder.progress_revision,
+                    count: 1,
+                });
+                1
+            }
+        }
+    }
+}
+
+fn lease_attachment_ledger() -> &'static std::sync::Mutex<LeaseAttachmentLedger> {
+    static LEDGER: std::sync::OnceLock<std::sync::Mutex<LeaseAttachmentLedger>> =
+        std::sync::OnceLock::new();
+    LEDGER.get_or_init(|| std::sync::Mutex::new(LeaseAttachmentLedger::default()))
+}
+
+fn observe_lease_attachment(holder: &ActiveDeliveryLease) -> u32 {
+    let mut ledger = lease_attachment_ledger()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ledger.observe(holder)
+}
+
+#[cfg(test)]
+fn reset_lease_attachment_ledger() {
+    let mut ledger = lease_attachment_ledger()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ledger.attachments.clear();
+}
+
+/// Turn a competing-invocation refusal into a tool result.
+///
+/// The wait names the actual holder, its lease mode (observe vs mutation) and
+/// the real `lease_expires_at`, and reports time-to-expiry as `retry_after_ms`
+/// instead of a hardcoded second — the old shape made the agent re-attach every
+/// second until the objective recovery budget hit
+/// `technical_recovery_exhausted`. A holder that makes no progress across
+/// [`MAX_LEASE_ATTACHMENTS_WITHOUT_PROGRESS`] attachments fails closed with
+/// `delivery_lease_holder_stalled` and `recoverable: false`.
+fn active_delivery_lease_output(
+    error_message: &str,
+    configured_ceiling: DeliveryCeiling,
+    requested_ceiling: Option<DeliveryCeiling>,
+    now_ms: i64,
+) -> ToolOutput {
+    let ceiling = requested_ceiling
+        .map(ceiling_label)
+        .unwrap_or_else(|| ceiling_label(configured_ceiling));
+    let Some(holder) = ActiveDeliveryLease::from_error_message(error_message) else {
+        return ToolOutput::waiting(
+            "同一 objective 已有一条交付执行持有 worktree lease；当前调用已附着等待，未并发执行 stage/commit/push。",
+        )
+        .with_metadata(json!({
+            "status": "recovering",
+            "delivery_state": "waiting",
+            "stage": "lease",
+            "code": "delivery_operation_already_running",
+            "recoverable": true,
+            "recovery_class": "agent_action_required",
+            "decision_type": "system_owned",
+            "requires_user_continue": false,
+            "retry_after_ms": 1_000,
+            "next_action": "attach_existing_delivery_run",
+            "requested_ceiling": ceiling,
+            "reached_state": "local"
+        }));
+    };
+
+    let attachments = observe_lease_attachment(&holder);
+    let remaining_ms = holder
+        .lease_expires_at
+        .map(|expires_at| expires_at.saturating_sub(now_ms).max(0) as u64)
+        .unwrap_or(0)
+        .clamp(1_000, 120_000);
+
+    if attachments >= MAX_LEASE_ATTACHMENTS_WITHOUT_PROGRESS {
+        return ToolOutput::err(format!(
+            "交付锁未推进:run {} 的 worktree lease 由 {} 持有(模式 {}),连续 {} 次附着期间 claim_epoch={} 与 progress_revision={} 都没有前进;本次调用以明确失败结束,不再消耗 objective 恢复预算。",
+            holder.run_id,
+            holder.owner,
+            holder.mode.as_str(),
+            attachments,
+            holder.claim_epoch,
+            holder.progress_revision,
+        ))
+        .with_metadata(lease_metadata(&holder, attachments, None, ceiling, false));
+    }
+
+    ToolOutput::waiting(format!(
+        "同一 objective 已有一条交付执行持有 worktree lease(持有者 {},模式 {},到期 {},剩余约 {} ms);当前调用已附着等待,未并发执行 stage/commit/push。",
+        holder.owner,
+        holder.mode.as_str(),
+        holder
+            .lease_expires_at
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        remaining_ms,
+    ))
+    .with_metadata(lease_metadata(
+        &holder,
+        attachments,
+        Some(remaining_ms),
+        ceiling,
+        true,
+    ))
+}
+
+fn lease_metadata(
+    holder: &ActiveDeliveryLease,
+    attachments: u32,
+    retry_after_ms: Option<u64>,
+    ceiling: &'static str,
+    recoverable: bool,
+) -> Value {
+    json!({
+        "status": if recoverable { "recovering" } else { "blocked" },
+        "delivery_state": if recoverable { "waiting" } else { "blocked" },
+        "stage": "lease",
+        "code": if recoverable { "delivery_operation_already_running" } else { "delivery_lease_holder_stalled" },
+        "recoverable": recoverable,
+        "recovery_class": if recoverable { "agent_action_required" } else { "terminal" },
+        "decision_type": "system_owned",
+        "requires_user_continue": false,
+        "retry_after_ms": retry_after_ms,
+        "next_action": if recoverable { "attach_existing_delivery_run" } else { "release_or_advance_holding_delivery_run" },
+        "requested_ceiling": ceiling,
+        "reached_state": "local",
+        "lease_run_id": holder.run_id,
+        "lease_owner": holder.owner,
+        "lease_mode": holder.mode.as_str(),
+        "claim_epoch": holder.claim_epoch,
+        "reconciled_claim_epoch": holder.reconciled_claim_epoch,
+        "progress_revision": holder.progress_revision,
+        "lease_expires_at": holder.lease_expires_at,
+        "attachment_count": attachments,
+    })
 }
 
 struct PreparedDurableRun {
@@ -3974,6 +4146,142 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err("branch-update recovery must never dispatch release".into())
         }
+    }
+
+    fn active_lease_message(
+        run_id: &str,
+        owner: &str,
+        mode: DeliveryLeaseMode,
+        claim_epoch: i64,
+        progress_revision: i64,
+        lease_expires_at: i64,
+    ) -> String {
+        format!(
+            "delivery run already has an active invocation; attach to the existing objective instead of starting a concurrent worktree mutation {}",
+            ActiveDeliveryLease {
+                run_id: run_id.into(),
+                owner: owner.into(),
+                mode,
+                claim_epoch,
+                reconciled_claim_epoch: if mode == DeliveryLeaseMode::Mutation {
+                    claim_epoch
+                } else {
+                    claim_epoch - 1
+                },
+                progress_revision,
+                lease_expires_at: Some(lease_expires_at),
+            }
+            .encode()
+        )
+    }
+
+    #[test]
+    fn already_running_reports_holder_mode_and_real_expiry() {
+        reset_lease_attachment_ledger();
+        let output = active_delivery_lease_output(
+            &active_lease_message(
+                "delivery-locked",
+                "foreground:delivery:7",
+                DeliveryLeaseMode::Mutation,
+                5,
+                42,
+                61_500,
+            ),
+            DeliveryCeiling::ThroughRelease,
+            None,
+            1_500,
+        );
+        assert_eq!(output.status, ToolExecutionStatus::Waiting);
+        assert!(!output.is_error);
+        let metadata = output.metadata.expect("delivery metadata");
+        assert_eq!(metadata["code"], "delivery_operation_already_running");
+        assert_eq!(metadata["recoverable"], true);
+        assert_eq!(metadata["lease_owner"], "foreground:delivery:7");
+        assert_eq!(metadata["lease_mode"], "mutation");
+        assert_eq!(metadata["lease_run_id"], "delivery-locked");
+        assert_eq!(metadata["claim_epoch"], 5);
+        assert_eq!(metadata["progress_revision"], 42);
+        assert_eq!(metadata["lease_expires_at"], 61_500);
+        assert_eq!(metadata["attachment_count"], 1);
+        assert_eq!(
+            metadata["retry_after_ms"], 60_000,
+            "retry_after_ms must be time to lease expiry, not a hardcoded second"
+        );
+    }
+
+    #[test]
+    fn repeated_attachment_without_holder_progress_fails_closed() {
+        reset_lease_attachment_ledger();
+        let frozen = active_lease_message(
+            "delivery-stalled",
+            "foreground:delivery:8",
+            DeliveryLeaseMode::Mutation,
+            5,
+            42,
+            90_000,
+        );
+        for attachment in 1..MAX_LEASE_ATTACHMENTS_WITHOUT_PROGRESS {
+            let output = active_delivery_lease_output(
+                &frozen,
+                DeliveryCeiling::ThroughRelease,
+                None,
+                1_000,
+            );
+            let metadata = output.metadata.expect("delivery metadata");
+            assert_eq!(metadata["recoverable"], true);
+            assert_eq!(metadata["attachment_count"], attachment as i64);
+        }
+
+        let stalled =
+            active_delivery_lease_output(&frozen, DeliveryCeiling::ThroughRelease, None, 1_000);
+        assert!(
+            stalled.is_error,
+            "a lease holder that never advances is a terminal failure, not a wait"
+        );
+        let metadata = stalled.metadata.expect("delivery metadata");
+        assert_eq!(metadata["code"], "delivery_lease_holder_stalled");
+        assert_eq!(metadata["recoverable"], false);
+        assert_eq!(metadata["status"], "blocked");
+        assert!(metadata["retry_after_ms"].is_null());
+        assert_eq!(metadata["lease_owner"], "foreground:delivery:8");
+        assert_eq!(metadata["lease_mode"], "mutation");
+
+        // A holder that finally advances clears the ledger: waiting is honest
+        // again rather than permanently poisoned by an earlier stall.
+        let advanced = active_lease_message(
+            "delivery-stalled",
+            "foreground:delivery:8",
+            DeliveryLeaseMode::Mutation,
+            6,
+            43,
+            90_000,
+        );
+        let resumed =
+            active_delivery_lease_output(&advanced, DeliveryCeiling::ThroughRelease, None, 1_000);
+        assert!(!resumed.is_error);
+        let metadata = resumed.metadata.expect("delivery metadata");
+        assert_eq!(metadata["recoverable"], true);
+        assert_eq!(metadata["attachment_count"], 1);
+        assert_eq!(metadata["claim_epoch"], 6);
+    }
+
+    #[test]
+    fn observe_only_holder_refusal_still_waits_rather_than_stalling() {
+        reset_lease_attachment_ledger();
+        let message = active_lease_message(
+            "delivery-observe",
+            "recovery-supervisor",
+            DeliveryLeaseMode::Observe,
+            16,
+            3,
+            91_000,
+        );
+        let output =
+            active_delivery_lease_output(&message, DeliveryCeiling::ThroughRelease, None, 1_000);
+        let metadata = output.metadata.expect("delivery metadata");
+        assert_eq!(metadata["lease_mode"], "observe");
+        assert_eq!(metadata["claim_epoch"], 16);
+        assert_eq!(metadata["reconciled_claim_epoch"], 15);
     }
 
     #[test]

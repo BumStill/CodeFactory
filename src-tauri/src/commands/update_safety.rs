@@ -895,18 +895,19 @@ async fn count_active_delivery_leases(
     // A takeover claim is observe-only until its positive epoch has been
     // reconciled. Its lease serializes observers, but it cannot authorize a
     // local or remote mutation and is safe to interrupt for an app restart.
-    sqlx::query_scalar(
+    // The predicate is interpolated from the single shared definition in
+    // `agent::delivery_run` — the same one the foreground admission path uses —
+    // so the restart guard and delivery admission can never drift apart.
+    let query = format!(
         "SELECT COUNT(*) FROM delivery_runs
          WHERE status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
            AND lease_owner IS NOT NULL
            AND lease_expires_at IS NOT NULL
            AND lease_expires_at > ?
-           AND claim_epoch > 0
-           AND reconciled_claim_epoch = claim_epoch",
-    )
-    .bind(now)
-    .fetch_one(pool)
-    .await
+           AND ({})",
+        crate::agent::delivery_run::LEASE_MUTATION_CAPABLE_SQL
+    );
+    sqlx::query_scalar(&query).bind(now).fetch_one(pool).await
 }
 
 pub(crate) async fn ensure_update_objective(
