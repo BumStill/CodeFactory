@@ -100,9 +100,13 @@ pub(super) struct ProviderAttemptRuntime {
 /// Failure code recorded for a deterministic client-side rejection
 /// (`type: invalid_request_error`, a required replay field missing, …).
 ///
-/// Shared between the transport that classifies it and the recovery store that
-/// must refuse to treat it as replay-safe: the identical request is guaranteed
-/// to fail identically, so re-driving it only consumes recovery budget.
+/// INFORMATIONAL ONLY. It is what production triage reads to tell "the provider
+/// rejected our bytes" apart from "the transport dropped" — it does not change
+/// the durable replay decision: replay-safety is still decided by the no-effect
+/// proof in `provider_recovery::record_failure`, because the state machine has
+/// no "certain, no side effect, but must not be replayed" terminal state yet.
+/// Making these failures stop consuming recovery budget requires adding that
+/// state first (tracked as a follow-up on the PR).
 pub const DETERMINISTIC_REJECTION_CODE: &str = "provider_request_deterministic_rejected";
 
 /// A durable round asked for `tool_choice: required`, the provider refused it,
@@ -1451,24 +1455,35 @@ const DEEPSEEK_THINKING_REASONING_MARKER: &str =
 /// provider (`type: invalid_request_error`, malformed field combinations, a
 /// required replay field missing, …).
 ///
-/// Such a 400 is a pure function of the request we sent. Re-posting the exact
-/// same bytes can only produce the exact same 400, so it must never be treated
-/// as a replay-safe failure and must never consume recovery budget: production
-/// 2026-09-29 (session `8f0e312c`, `deepseek-v4-flash`, v1.81.56) spent three
-/// consecutive recovery attempts re-sending a request whose history was
-/// missing `reasoning_content`, and was rejected identically every time.
+/// Such a 400 is a pure function of the request we sent: re-posting the exact
+/// same bytes can only produce the exact same 400. Production 2026-09-29
+/// (session `8f0e312c`, `deepseek-v4-flash`, v1.81.56) spent three consecutive
+/// recovery attempts re-sending a request whose history was missing
+/// `reasoning_content`, rejected identically every time.
+///
+/// This predicate is INFORMATIONAL (it selects the failure code recorded for
+/// triage). It deliberately does NOT decide replay-safety: the recovery state
+/// machine has no terminal state for "certainly no side effect, but replaying is
+/// pointless", and marking such attempts `unknown` (which enters observation
+/// reconciliation and can fence the next attempt of the same episode) is wrong.
+/// Suppressing the wasted replays needs that state to exist first — tracked as a
+/// PR follow-up.
+///
+/// Recoverable 400s the transport already answers with a DIFFERENT request are
+/// excluded, because for them "the same bytes fail the same way" is true but
+/// irrelevant:
+///   * `max_completion_tokens` — the body is rewritten and re-posted;
+///   * `tool_choice` — DeepSeek thinking mode refuses `tool_choice: required`
+///     and the loop retries without it successfully (production 2026-07-21 /
+///     2026-09-14);
+///   * context overflow — providers report it as `invalid_request_error` and the
+///     loop compacts the history and retries.
 fn is_deterministic_request_rejection(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    // Recoverable 400s that the transport already answers with a DIFFERENT
-    // request are not deterministic dead ends, even though the provider labels
-    // them `invalid_request_error`:
-    //   * `max_completion_tokens` — the body is rewritten and re-posted on a
-    //     fresh attempt;
-    //   * `tool_choice` — DeepSeek thinking mode refuses `tool_choice:
-    //     required`; the loop retries the same history without it and that
-    //     request succeeds (production 2026-07-21 / 2026-09-14). Classifying
-    //     that refusal as non-replayable broke that downgrade outright.
-    if lower.contains("max_completion_tokens") || lower.contains("tool_choice") {
+    if lower.contains("max_completion_tokens")
+        || lower.contains("tool_choice")
+        || codefactory_agent_loop::context::is_context_overflow(message)
+    {
         return false;
     }
     lower.contains("invalid_request_error")
@@ -2221,13 +2236,19 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_rejection_code_matches_the_recovery_store_copy() {
-        // `provider_recovery.rs` is compiled standalone by the
-        // `provider_auth_recovery` integration test, so its copy of this code is
-        // a literal. Pin the two together.
-        assert_eq!(
-            DETERMINISTIC_REJECTION_CODE,
-            crate::agent::provider_recovery::DETERMINISTIC_REJECTION_CODE
+    fn context_overflow_400_is_not_a_deterministic_rejection() {
+        // Providers report an oversized prompt as a 400 with
+        // `type: invalid_request_error`. The agent loop answers THAT by
+        // compacting the history and retrying with a different request, so it is
+        // recoverable and must not be classified as a deterministic dead end.
+        let overflow = "HTTP 400 Bad Request: {\"error\":{\"message\":\"This model's maximum context length is 65536 tokens. However, your messages resulted in 70000 tokens. Please reduce the length of the messages.\",\"type\":\"invalid_request_error\"}}";
+        assert!(
+            codefactory_agent_loop::context::is_context_overflow(overflow),
+            "the fixture must be a real context-overflow shape"
+        );
+        assert!(
+            !is_deterministic_request_rejection(overflow),
+            "context overflow is recovered by compaction, not by replaying the same bytes"
         );
     }
 

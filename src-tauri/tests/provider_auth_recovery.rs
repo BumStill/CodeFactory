@@ -911,3 +911,80 @@ async fn startup_keychain_ready_observation_is_receipted_without_secrets() {
         1
     );
 }
+
+/// Review rework 2026-09-29. A deterministic client-side rejection (the deepseek
+/// thinking-mode 400 `The reasoning_content in the thinking mode must be passed
+/// back`, `type invalid_request_error`) produces no output, latches no tool
+/// intent and leaves no side-effect receipt: there is no external state to
+/// reconcile. Recording it as `unknown` is therefore wrong — `unknown` enters
+/// observation reconciliation and can fence the next attempt of the same
+/// episode. The no-effect proof must keep deciding, so the attempt stays
+/// `failed_replayable` and the episode keeps its status; the dedicated failure
+/// code is informational metadata only.
+#[tokio::test]
+async fn deterministic_rejection_settles_replayable_without_unknown_status() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    let episode_status_before: String =
+        sqlx::query_scalar("SELECT status FROM provider_route_episodes WHERE id='episode-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    store
+        .begin_attempt(
+            &permit,
+            &attempt("attempt-deterministic", "episode-1", "deepseek"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "attempt-deterministic", NOW + 2)
+        .await
+        .unwrap();
+
+    // The transport classifies this 400 with its dedicated informational code;
+    // the store must still settle it from the no-effect proof.
+    let ProviderMutation::Applied(decision) = store
+        .record_failure(
+            &permit,
+            "attempt-deterministic",
+            "provider_rejected",
+            "provider_request_deterministic_rejected",
+            false,
+            NOW + 3,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("live owner must settle its deterministic rejection");
+    };
+    assert!(
+        matches!(decision, OverloadBudgetDecision::RetryAfter { .. }),
+        "a no-effect deterministic rejection has nothing to park for"
+    );
+
+    let attempt_status: String = sqlx::query_scalar(
+        "SELECT status FROM provider_route_attempts WHERE id='attempt-deterministic'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attempt_status, "failed_replayable",
+        "a deterministic no-effect 400 is replay-safe, not external-state-unknown"
+    );
+    assert_ne!(attempt_status, "unknown");
+    let episode_status_after: String =
+        sqlx::query_scalar("SELECT status FROM provider_route_episodes WHERE id='episode-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        episode_status_after, episode_status_before,
+        "settling a deterministic rejection must not rewrite the episode status"
+    );
+    assert_ne!(episode_status_after, "unknown");
+}
