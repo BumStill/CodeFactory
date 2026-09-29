@@ -97,6 +97,14 @@ pub(super) struct ProviderAttemptRuntime {
     post_admitted: Arc<AtomicBool>,
 }
 
+/// Failure code recorded for a deterministic client-side rejection
+/// (`type: invalid_request_error`, a required replay field missing, …).
+///
+/// Shared between the transport that classifies it and the recovery store that
+/// must refuse to treat it as replay-safe: the identical request is guaranteed
+/// to fail identically, so re-driving it only consumes recovery budget.
+pub const DETERMINISTIC_REJECTION_CODE: &str = "provider_request_deterministic_rejected";
+
 /// A durable round asked for `tool_choice: required`, the provider refused it,
 /// and the retry without it is a different request that needs its own attempt.
 /// Only `RoutedDesktopModelTransport::complete` opens attempts, so the inner
@@ -325,7 +333,15 @@ impl ProviderAttemptRuntime {
         let explicit_response = text.to_ascii_lowercase().contains("http ")
             || text.contains("后端请求失败（")
             || text.contains("Bad Request");
-        let replayable = !self.post_admitted.load(Ordering::SeqCst) || explicit_response;
+        // A deterministic client-side rejection is NOT a replay-safe failure:
+        // the identical request can only be rejected identically, so replaying
+        // it burns recovery budget for a guaranteed-identical 400 (production
+        // 2026-09-29: three consecutive replay attempts, three identical
+        // `invalid_request_error` 400s). Classified as replayed=no below, which
+        // the durable receipt records as a non-replayable failure.
+        let deterministic = is_deterministic_request_rejection(text);
+        let replayable =
+            (!self.post_admitted.load(Ordering::SeqCst) || explicit_response) && !deterministic;
         let (failure_class, failure_code) = if overloaded {
             ("provider_overload", "provider_overloaded")
         } else if text.to_ascii_lowercase().contains("auth")
@@ -333,6 +349,8 @@ impl ProviderAttemptRuntime {
             || text.contains("credential")
         {
             ("provider_auth", "provider_auth_unavailable")
+        } else if deterministic {
+            ("provider_rejected", DETERMINISTIC_REJECTION_CODE)
         } else if replayable {
             ("provider_rejected", "provider_request_rejected")
         } else {
@@ -1090,7 +1108,7 @@ impl DesktopModelTransport {
             crate::config::settings::normalize_model_id(&self.model_id, &self.base_url);
 
         let (tools, tool_choice) = openai_tool_controls(tool_defs, require_tool);
-        let req = ChatRequest {
+        let mut req = ChatRequest {
             model: outbound_model,
             messages: messages.to_vec(),
             tools,
@@ -1102,6 +1120,13 @@ impl DesktopModelTransport {
                 include_usage: true,
             }),
         };
+
+        // DeepSeek thinking mode + `tools` requires every prior assistant turn
+        // to carry `reasoning_content` (its persisted value, or an empty string
+        // when the turn produced no trace). Normalized HERE, at the one place
+        // that serializes the wire body, so the normal assembly and the
+        // recovery replay cannot send structurally different histories.
+        apply_thinking_reasoning_echo(&self.base_url, &self.model_id, tool_defs, &mut req.messages);
 
         // Send the request as-is — including `max_tokens` + `temperature`. We do
         // NOT pre-rewrite by model name: providers and proxies routinely serve
@@ -1156,8 +1181,26 @@ impl DesktopModelTransport {
             && self.provider_attempt.is_some()
         {
             let err_text = response.text().await.unwrap_or_default();
+            // This branch exists for exactly ONE case: the server rejects
+            // `max_tokens` and asks for `max_completion_tokens`. A durable
+            // attempt admits exactly one POST, so the reactive rewrite below is
+            // impossible for it and the rewrite/replay explanation is true.
+            //
+            // Every OTHER 400 on a durable attempt (deepseek thinking-mode
+            // missing `reasoning_content`, `invalid_request_error`, unknown
+            // field, bad model id, …) has nothing to do with rewriting or
+            // replaying. Wrapping those in the rewrite/replay sentence hid the
+            // provider's real reason in production on 2026-09-29 — the user saw
+            // "持久化尝试不会改写、不会重放" instead of DeepSeek's
+            // "The reasoning_content in the thinking mode must be passed back".
+            // Surface the provider's own words verbatim.
+            if err_text.contains("max_completion_tokens") {
+                return Err(crate::errors::AppError::Other(format!(
+                    "HTTP 400 Bad Request: durable provider attempt will not rewrite and replay: {err_text}"
+                )));
+            }
             return Err(crate::errors::AppError::Other(format!(
-                "HTTP 400 Bad Request: durable provider attempt will not rewrite and replay: {err_text}"
+                "HTTP 400 Bad Request: {err_text}"
             )));
         }
         if response.status().as_u16() == 400 && body.get("max_tokens").is_some() {
@@ -1385,6 +1428,80 @@ fn deepseek_reasoning_body_patch(
         "thinking": { "type": "enabled" },
         "reasoning_effort": normalize_deepseek_reasoning_effort(reasoning_effort),
     }))
+}
+
+/// DeepSeek thinking-mode error markers.
+///
+/// Authoritative rule (https://api-docs.deepseek.com/guides/thinking_mode/):
+/// "for requests carrying the `tools` parameter, the `reasoning_content` must be
+/// fully passed back to the API in all subsequent requests — even for turns
+/// where the model did not perform a tool call. If your code does not correctly
+/// pass back `reasoning_content`, the API will return a 400 error."
+///
+/// DeepSeek's own sample code appends `{"role": "assistant",
+/// "reasoning_content": reasoning_content, "content": content}` for *every*
+/// assistant turn — including the turns of a streamed answer where
+/// `reasoning_content` stayed `""`. The contract is about the FIELD being
+/// present on every assistant turn of the array; a missing field is the 400,
+/// an empty field is the documented shape.
+const DEEPSEEK_THINKING_REASONING_MARKER: &str =
+    "reasoning_content in the thinking mode must be passed back";
+
+/// Deterministic client-side contract rejection from an OpenAI-compatible
+/// provider (`type: invalid_request_error`, malformed field combinations, a
+/// required replay field missing, …).
+///
+/// Such a 400 is a pure function of the request we sent. Re-posting the exact
+/// same bytes can only produce the exact same 400, so it must never be treated
+/// as a replay-safe failure and must never consume recovery budget: production
+/// 2026-09-29 (session `8f0e312c`, `deepseek-v4-flash`, v1.81.56) spent three
+/// consecutive recovery attempts re-sending a request whose history was
+/// missing `reasoning_content`, and was rejected identically every time.
+fn is_deterministic_request_rejection(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    // Recoverable 400s that the transport already answers with a DIFFERENT
+    // request are not deterministic dead ends, even though the provider labels
+    // them `invalid_request_error`:
+    //   * `max_completion_tokens` — the body is rewritten and re-posted on a
+    //     fresh attempt;
+    //   * `tool_choice` — DeepSeek thinking mode refuses `tool_choice:
+    //     required`; the loop retries the same history without it and that
+    //     request succeeds (production 2026-07-21 / 2026-09-14). Classifying
+    //     that refusal as non-replayable broke that downgrade outright.
+    if lower.contains("max_completion_tokens") || lower.contains("tool_choice") {
+        return false;
+    }
+    lower.contains("invalid_request_error")
+        || lower.contains("invalid request error")
+        || message.contains(DEEPSEEK_THINKING_REASONING_MARKER)
+}
+
+/// Echo `reasoning_content` for a thinking-mode provider whose request carries
+/// `tools` (see [`DEEPSEEK_THINKING_REASONING_MARKER`]).
+///
+/// Every assistant turn the model produced keeps its persisted reasoning trace
+/// verbatim. An assistant turn with no persisted trace — a pure-text final
+/// reply that streamed no CoT, or a framework-authored assistant notice — still
+/// has to carry the field, so it is sent as the empty string. Dropping the field
+/// is what produced the deterministic 400; excluding the row would silently
+/// rewrite the transcript, so echoing it empty is the smaller, provable change.
+///
+/// Applied at the transport edge, immediately before serialization, so the
+/// normal turn assembly and the recovery-replay assembly cannot diverge.
+fn apply_thinking_reasoning_echo(
+    base_url: &str,
+    model_id: &str,
+    tool_defs: &[ToolDefinition],
+    messages: &mut [ChatMessage],
+) {
+    if tool_defs.is_empty() || !is_deepseek_route(base_url, model_id) {
+        return;
+    }
+    for message in messages.iter_mut() {
+        if message.role == "assistant" && message.reasoning_content.is_none() {
+            message.reasoning_content = Some(String::new());
+        }
+    }
 }
 
 /// The agent-loop `ModelTransport` seam (keystone slice 4.5b). Wraps the
@@ -1862,7 +1979,8 @@ mod tests {
     //! is a network call, exercised end-to-end by the desktop app, not here.
     use super::*;
     use codefactory_agent_loop::types::{
-        ChatMessage, ContentPart, FunctionCall, ImageUrl, MessageContent, ToolCall,
+        ChatMessage, ContentPart, FunctionCall, FunctionDefinition, ImageUrl, MessageContent,
+        ToolCall, ToolDefinition,
     };
     use serde_json::json;
     use std::io::{Read, Write};
@@ -1888,6 +2006,252 @@ mod tests {
             name: None,
             reasoning_content: None,
         }
+    }
+
+    // ── DeepSeek thinking-mode reasoning replay (production 2026-09-29) ─────
+    //
+    // Authoritative rule (https://api-docs.deepseek.com/guides/thinking_mode/):
+    // "for requests carrying the `tools` parameter, the `reasoning_content` must
+    // be fully passed back to the API in all subsequent requests — even for
+    // turns where the model did not perform a tool call ... the API will return
+    // a 400 error." DeepSeek's own sample appends the field on EVERY assistant
+    // turn, `""` included, so the contract is the field being present.
+    //
+    // The normal turn assembly and the recovery replay assembly are one code
+    // path (`AgentLoop::build_openai_messages`); what differs is the transcript
+    // they are handed. Production 2026-09-29 (session 8f0e312c, v1.81.56,
+    // deepseek-v4-flash) showed the divergence: the first request carried old
+    // assistant replies whose persisted reasoning was the empty string and was
+    // accepted, while the post-failure replay — whose transcript also held an
+    // assistant row with NO persisted reasoning — was rejected three times with
+    // "The reasoning_content in the thinking mode must be passed back to the
+    // API" (`type: invalid_request_error`).
+    const DEEPSEEK_BASE: &str = "https://api.deepseek.com";
+
+    fn history_row(
+        id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: Option<&str>,
+        reasoning: Option<&str>,
+    ) -> crate::storage::Message {
+        crate::storage::Message {
+            id: id.into(),
+            session_id: "session-8f0e312c".into(),
+            role: role.into(),
+            content: content.into(),
+            endpoint_id: Some("deepseek".into()),
+            model_id: Some("deepseek-v4-flash".into()),
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls: tool_calls.map(str::to_string),
+            reasoning_content: reasoning.map(str::to_string),
+            completion_state: None,
+            created_at: 0,
+        }
+    }
+
+    fn deepseek_tool() -> ToolDefinition {
+        ToolDefinition {
+            r#type: "function".into(),
+            function: FunctionDefinition {
+                name: "read_file".into(),
+                description: "read a file".into(),
+                parameters: json!({"type": "object", "properties": {}}),
+            },
+        }
+    }
+
+    /// The transcript as it existed *before* the failing turn — what the first
+    /// request of the session was assembled from.
+    fn pre_failure_transcript() -> Vec<crate::storage::Message> {
+        vec![
+            history_row("u1", "user", "修复 DeepSeek 重放缺陷", None, None),
+            history_row(
+                "a1",
+                "assistant",
+                "先跑测试。",
+                Some(
+                    r#"[{"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}]"#,
+                ),
+                Some("我需要先跑测试确认现状。"),
+            ),
+            history_row(
+                "t1",
+                "tool",
+                r#"{"tool_call_id":"call-1","content":"ok"}"#,
+                None,
+                None,
+            ),
+            // Pure-text final reply: no CoT streamed, persisted as "".
+            history_row("a2", "assistant", "已完成。", None, Some("")),
+        ]
+    }
+
+    /// The same session re-assembled by the recovery replay: the failed turn
+    /// added a framework-authored assistant notice with NO persisted reasoning.
+    fn post_failure_replay_transcript() -> Vec<crate::storage::Message> {
+        let mut history = pre_failure_transcript();
+        history.push(history_row(
+            "a3",
+            "assistant",
+            "本回合的自动恢复已达到安全上限，已登记为系统故障。",
+            None,
+            None,
+        ));
+        history.push(history_row("u2", "user", "继续", None, None));
+        history
+    }
+
+    /// Build the exact body `call_openai_model` posts, for one transcript.
+    fn wire_body_for(history: Vec<crate::storage::Message>) -> serde_json::Value {
+        let messages = crate::agent::AgentLoop::build_openai_messages(history, "system");
+        let tool_defs = vec![deepseek_tool()];
+        let (tools, tool_choice) = openai_tool_controls(&tool_defs, false);
+        let mut req = ChatRequest {
+            model: "deepseek-v4-flash".into(),
+            messages,
+            tools,
+            tool_choice: Some(tool_choice),
+            stream: true,
+            temperature: 0.2,
+            max_tokens: 8192,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+        };
+        apply_thinking_reasoning_echo(
+            DEEPSEEK_BASE,
+            "deepseek-v4-flash",
+            &tool_defs,
+            &mut req.messages,
+        );
+        serde_json::to_value(&req).expect("wire body serializes")
+    }
+
+    fn assistant_turns(body: &serde_json::Value) -> Vec<&serde_json::Value> {
+        body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .collect()
+    }
+
+    #[test]
+    fn normal_assembly_replays_every_persisted_reasoning_trace_verbatim() {
+        let body = wire_body_for(pre_failure_transcript());
+        let assistants = assistant_turns(&body);
+        assert_eq!(assistants.len(), 2, "two model-authored assistant turns");
+        assert_eq!(
+            assistants[0]["reasoning_content"], "我需要先跑测试确认现状。",
+            "the tool-calling turn's CoT is replayed verbatim"
+        );
+        assert_eq!(
+            assistants[1]["reasoning_content"], "",
+            "the pure-text final reply persists an empty trace and still carries the field"
+        );
+    }
+
+    #[test]
+    fn recovery_replay_sends_reasoning_content_for_every_assistant_turn() {
+        let body = wire_body_for(post_failure_replay_transcript());
+        let assistants = assistant_turns(&body);
+        assert_eq!(
+            assistants.len(),
+            3,
+            "the replay transcript adds the framework notice as an assistant turn"
+        );
+        for (index, turn) in assistants.iter().enumerate() {
+            assert!(
+                turn.get("reasoning_content").is_some(),
+                "assistant turn {index} must carry reasoning_content — DeepSeek \
+                 thinking mode + tools rejects a missing field with \
+                 invalid_request_error: {turn}"
+            );
+        }
+        assert_eq!(
+            assistants[2]["reasoning_content"], "",
+            "a framework-authored notice has no trace; the documented shape is the empty field"
+        );
+    }
+
+    #[test]
+    fn both_paths_produce_the_same_reasoning_shape_for_the_shared_history() {
+        let normal = wire_body_for(pre_failure_transcript());
+        let replay = wire_body_for(post_failure_replay_transcript());
+        let normal_turns = assistant_turns(&normal);
+        let replay_turns = assistant_turns(&replay);
+        assert!(
+            replay_turns.len() > normal_turns.len(),
+            "the replay transcript is the pre-failure one plus the failed turn's rows"
+        );
+        for (index, turn) in normal_turns.iter().enumerate() {
+            assert_eq!(
+                turn["reasoning_content"], replay_turns[index]["reasoning_content"],
+                "the recovery replay must not reshape an assistant turn the normal path already sent"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_provider_rejection_is_never_replay_safe() {
+        // Verbatim production text (session 8f0e312c, 2026-09-29).
+        let production = "HTTP 400 Bad Request: {\"error\":{\"message\":\"The reasoning_content in the thinking mode must be passed back to the API.\",\"type\":\"invalid_request_error\"}}";
+        assert!(
+            is_deterministic_request_rejection(production),
+            "the three-times-identical deepseek 400 is a deterministic rejection"
+        );
+        // The provider labels this one `invalid_request_error` too, but the
+        // transport answers it with a rewritten body on a fresh attempt.
+        assert!(
+            !is_deterministic_request_rejection(
+                "HTTP 400 Bad Request: {\"error\":{\"message\":\"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.\",\"type\":\"invalid_request_error\"}}"
+            ),
+            "the reactive max_tokens adaptation is a recoverable 400"
+        );
+        // DeepSeek thinking mode refuses `tool_choice: required`; the loop
+        // retries without it and succeeds — that recovery must stay alive.
+        assert!(
+            !is_deterministic_request_rejection(
+                "HTTP 400 Bad Request: {\"error\":{\"message\":\"Thinking mode does not support this tool_choice\",\"type\":\"invalid_request_error\"}}"
+            ),
+            "the tool_choice downgrade is a recoverable 400"
+        );
+    }
+
+    #[test]
+    fn deterministic_rejection_code_matches_the_recovery_store_copy() {
+        // `provider_recovery.rs` is compiled standalone by the
+        // `provider_auth_recovery` integration test, so its copy of this code is
+        // a literal. Pin the two together.
+        assert_eq!(
+            DETERMINISTIC_REJECTION_CODE,
+            crate::agent::provider_recovery::DETERMINISTIC_REJECTION_CODE
+        );
+    }
+
+    #[test]
+    fn thinking_reasoning_echo_only_touches_deepseek_tool_requests() {
+        let tool_defs = vec![deepseek_tool()];
+        let mut messages = vec![cm("assistant", "no trace")];
+        apply_thinking_reasoning_echo("https://api.openai.com", "gpt-5", &tool_defs, &mut messages);
+        assert_eq!(
+            messages[0].reasoning_content, None,
+            "other providers keep their exact payload"
+        );
+        apply_thinking_reasoning_echo(DEEPSEEK_BASE, "deepseek-v4-flash", &[], &mut messages);
+        assert_eq!(
+            messages[0].reasoning_content, None,
+            "without tools DeepSeek ignores reasoning_content, so nothing is rewritten"
+        );
+        apply_thinking_reasoning_echo(
+            DEEPSEEK_BASE,
+            "deepseek-v4-flash",
+            &tool_defs,
+            &mut messages,
+        );
+        assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
     }
 
     #[test]

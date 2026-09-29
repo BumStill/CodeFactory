@@ -1270,7 +1270,7 @@ impl AgentLoop {
             .rev()
             .find(|message| message.role == "user" && message.completion_state.is_none())
             .map(|message| message.id.clone());
-        let messages = self.build_openai_messages(history, system_prompt);
+        let messages = Self::build_openai_messages(history, system_prompt);
         let inputs = codefactory_agent_loop::run::LoopInputs {
             messages,
             system_prompt: system_prompt.to_string(),
@@ -1577,8 +1577,17 @@ impl AgentLoop {
         }
     }
 
-    fn build_openai_messages(
-        &self,
+    /// Deterministic, provider-agnostic mapping from persisted history rows to
+    /// the OpenAI-compatible `ChatMessage` list this turn will send.
+    ///
+    /// It is an associated function (no `&self`) on purpose: the *normal* turn
+    /// assembly and the *recovery replay* assembly are the same code path, so a
+    /// test can feed one synthetic history through this function and diff the
+    /// resulting wire bodies without standing up an `AgentLoop`. Any divergence
+    /// between the two paths can then only come from the history they are handed
+    /// (`pre-failure` transcript vs `post-failure` transcript), which is exactly
+    /// what production showed on 2026-09-29.
+    pub(super) fn build_openai_messages(
         history: Vec<Message>,
         system_prompt: &str,
     ) -> Vec<ChatMessage> {

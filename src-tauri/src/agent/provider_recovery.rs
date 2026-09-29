@@ -12,6 +12,19 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
+/// Failure code recorded by the transport for a deterministic client-side
+/// rejection (`type: invalid_request_error`, a required replay field missing, …)
+/// whose identical bytes can only be rejected identically.
+///
+/// Declared as a literal here because this file is ALSO compiled as a ROOT
+/// module by `tests/provider_auth_recovery.rs`
+/// (`#[path = "../src/agent/provider_recovery.rs"] mod provider_recovery;`),
+/// where neither `super::` nor `crate::agent::` paths resolve. The lib-side test
+/// `deterministic_rejection_code_matches_the_recovery_store_copy` asserts it is
+/// byte-identical to `agent::model_transport::DETERMINISTIC_REJECTION_CODE`, so
+/// the two copies cannot drift.
+pub(crate) const DETERMINISTIC_REJECTION_CODE: &str = "provider_request_deterministic_rejected";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderMutation<T> {
     Applied(T),
@@ -903,9 +916,13 @@ impl ProviderRecoveryStore {
         attempt_id: &str,
         failure_class: &str,
         failure_code: &str,
-        // Retained for API/back-compat: retry-safety is now decided from the
-        // durable no-effect proof below, not the transport's admission hint.
-        _replayable: bool,
+        // The transport's own replay opinion is deliberately NOT trusted here.
+        // An admitted failure with no output/effect has no external effect to
+        // protect, so retry-safety is decided by the durable proof below alone
+        // (pinned by `admitted_no_output_failure_is_replay_safe_not_external_state_uncertain`).
+        // Deterministic client-side rejections are excluded from that proof by
+        // their failure code instead of by this hint.
+        _: bool,
         now: i64,
     ) -> Result<ProviderMutation<OverloadBudgetDecision>> {
         validate_identifier("failure_class", failure_class)?;
@@ -936,7 +953,15 @@ impl ProviderRecoveryStore {
         // (`reconcile_stale_effect_free_in_flight`), which already treats
         // exactly this state as retry-safe; only partial output or an
         // uncertain receipt keeps the attempt fenced and observation-only.
-        let replay_is_proven = !attempt.output_started
+        // Deterministic client-side rejection: the EXACT same request bytes can
+        // only be rejected identically, so the no-effect proof must not launder
+        // it into `failed_replayable` and let the recovery plane re-drive it
+        // (production 2026-09-29: three consecutive identical deepseek 400s
+        // burned the whole recovery budget on session 8f0e312c). Every other
+        // failure class keeps the proof-based decision untouched.
+        let deterministic_rejection = failure_code == DETERMINISTIC_REJECTION_CODE;
+        let replay_is_proven = !deterministic_rejection
+            && !attempt.output_started
             && !attempt.side_effect_started
             && attempt.side_effect_receipt_id.is_none();
         let status = if replay_is_proven {
