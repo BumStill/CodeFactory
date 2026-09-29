@@ -529,6 +529,13 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_task_runs_session ON task_runs(session_id)")
         .execute(pool)
         .await?;
+    // β (2026-09-28): the structured read-only flag for delegated tasks — the
+    // only thing that makes a subagent turn review-only. Installed through the
+    // idempotent column sync rather than a versioned migration because the
+    // production startup order is `migrate!` → `ensure_schema`: a migration that
+    // ALTERs `task_runs` would run before this CREATE TABLE on a fresh database
+    // and fail with "no such table", leaving the column missing for good.
+    ensure_column(pool, "task_runs", "read_only", "INTEGER NOT NULL DEFAULT 0").await?;
 
     // CF-EVO-R1: normalized tool lifecycle is the observation truth source.
     // Historic databases may only have messages.tool_calls JSON, so create

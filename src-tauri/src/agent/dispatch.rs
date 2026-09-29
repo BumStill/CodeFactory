@@ -40,9 +40,23 @@ pub struct ChatContract {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnGrants {
     pub browser_read: bool,
-    /// The current message explicitly constrains mutations. This is separate
-    /// from a default question/diagnostic classification.
+    /// The turn is hard read-only because a STRUCTURED source said so — an
+    /// explicit field supplied by the caller (for example `delegate_tasks`
+    /// marking a review-only subagent, or an acceptance scenario declaration).
+    /// Wording never sets this.
     pub explicit_read_only: bool,
+}
+
+/// A structured, caller-supplied turn intent.
+///
+/// This is the only source of a hard read-only turn. The wording of the user's
+/// message may choose the POSTURE (discuss first vs. act) and may add
+/// instructions for the model, but it can never grant or revoke capability —
+/// see `docs/specs/architecture-constraints.md` §意图推断约束 and the phase-1
+/// forensics in `docs/plans/explicit-read-only-inference-*`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnIntent {
+    pub structured_read_only: bool,
 }
 
 /// Negation cues — substring-matched (CJK). If any appears we refuse to read
@@ -428,7 +442,14 @@ pub fn is_approval(user_msg: &str) -> bool {
     toks.iter().any(|t| WEAK_EN.contains(t))
 }
 
-fn is_explicit_planning_request(user_msg: &str) -> bool {
+/// Wording-level POSTURE cue: "should this turn discuss first?" — and nothing
+/// else. Since β it never grants or revokes a capability.
+///
+/// Renamed from `is_explicit_planning_request` (2026-09-28). The old name read
+/// like a permission verdict, callers treated it as one, and that is how a
+/// conditional aside — "如果 CI 再遇到环境抖动，不要改代码或验收脚本" — revoked a
+/// whole delivery turn's write capability (field report, 2026-09-24).
+fn planning_cue_present(user_msg: &str) -> bool {
     let m = user_msg.trim().to_lowercase();
     if m.is_empty() {
         return false;
@@ -498,7 +519,7 @@ fn is_explicit_planning_request(user_msg: &str) -> bool {
 
 fn is_direct_execution_request(user_msg: &str) -> bool {
     let m = user_msg.trim().to_lowercase();
-    if m.is_empty() || is_explicit_planning_request(&m) {
+    if m.is_empty() || planning_cue_present(&m) {
         return false;
     }
     let toks = tokens(&m);
@@ -513,7 +534,7 @@ fn is_direct_execution_request(user_msg: &str) -> bool {
 
 fn is_delivery_request(user_msg: &str) -> bool {
     let m = user_msg.trim().to_lowercase();
-    if m.is_empty() || is_explicit_planning_request(&m) || is_delivery_revocation(&m) {
+    if m.is_empty() || planning_cue_present(&m) || is_delivery_revocation(&m) {
         return false;
     }
     let toks = tokens(&m);
@@ -524,7 +545,7 @@ fn is_delivery_request(user_msg: &str) -> bool {
 
 fn is_explicit_continuation_request(user_msg: &str) -> bool {
     let m = user_msg.trim().to_lowercase();
-    if m.is_empty() || is_explicit_planning_request(&m) {
+    if m.is_empty() || planning_cue_present(&m) {
         return false;
     }
     let diagnostic = ["为什么", "为何", "原因", "怎么会", "why", "how"]
@@ -579,7 +600,7 @@ fn is_explicit_continuation_request(user_msg: &str) -> bool {
 /// undo.
 pub fn is_change_request(user_msg: &str) -> bool {
     let m = user_msg.trim().to_lowercase();
-    if m.is_empty() || is_explicit_planning_request(&m) {
+    if m.is_empty() || planning_cue_present(&m) {
         return false;
     }
     let toks = tokens(&m);
@@ -717,9 +738,10 @@ pub fn with_persisted_delivery_authorization(
 /// round boundary. This is separate from normal permission approval: it
 /// changes the user's objective and therefore must reach policy evaluation.
 pub fn steer_capability_override(user_msg: &str) -> Option<TurnCapability> {
-    if is_explicit_planning_request(user_msg) {
-        return Some(TurnCapability::ReviewOnly);
-    }
+    // β (2026-09-28): a wording-level planning cue used to return `ReviewOnly`
+    // here, i.e. a mid-run sentence could revoke the turn's write capability.
+    // Wording no longer votes on capability; a hard read-only steer comes from
+    // the structured intent the caller supplies at turn entry.
     if is_delivery_request(user_msg) {
         return Some(TurnCapability::Deliver);
     }
@@ -819,13 +841,61 @@ fn grants_browser_read(user_msg: &str) -> bool {
     existing_browser_target && read_action
 }
 
+/// Wording constraints become INSTRUCTIONS for the model, never permissions.
+///
+/// A message like "如果 CI 再遇到环境抖动，不要改代码或验收脚本" yields an
+/// instruction block for this turn and nothing else: capability is untouched,
+/// and the caller records the constraint as a durable `objective_events` row
+/// for audit. Detection reuses the existing posture cue table — this adds no
+/// cue entry and no regex.
+pub fn constraint_instruction_block(user_msg: &str) -> Option<String> {
+    if !planning_cue_present(user_msg) {
+        return None;
+    }
+    Some(
+        "<turn-constraint>\n\
+         本轮用户消息里带有一条措辞层面的改动约束。按约束执行，不要扩大改动范围；\n\
+         若该约束附带条件（例如某个假设情形），只在条件成立时生效。\n\
+         这条约束不改变本轮的授权能力。\n\
+         </turn-constraint>"
+            .to_string(),
+    )
+}
+
+/// Durable audit payload for a wording constraint: the constraint was seen and
+/// turned into an instruction — never into a capability change. Pure, so the
+/// runtime can persist it into `objective_events` without a second detection
+/// pass.
+pub fn constraint_audit_payload(user_msg: &str) -> Option<serde_json::Value> {
+    let block = constraint_instruction_block(user_msg)?;
+    Some(serde_json::json!({
+        "kind": "turn_wording_constraint",
+        "capability_effect": "none",
+        "instruction_block": block,
+    }))
+}
+
 pub fn decide_chat_contract(prev_assistant: Option<&str>, user_msg: &str) -> ChatContract {
-    let explicit_read_only = is_explicit_planning_request(user_msg);
+    decide_chat_contract_with_intent(prev_assistant, user_msg, TurnIntent::default())
+}
+
+/// [`decide_chat_contract`] with the caller's STRUCTURED intent.
+///
+/// β (2026-09-28): the wording of `user_msg` decides the posture (`mode`) and
+/// the instructions handed to the model, never the capability. A hard read-only
+/// turn exists only when the caller says so through
+/// [`TurnIntent::structured_read_only`] — set by `delegate_tasks` for a
+/// review-only subagent or by an acceptance-scenario declaration.
+pub fn decide_chat_contract_with_intent(
+    prev_assistant: Option<&str>,
+    user_msg: &str,
+    intent: TurnIntent,
+) -> ChatContract {
     let grants = TurnGrants {
         browser_read: grants_browser_read(user_msg),
-        explicit_read_only,
+        explicit_read_only: intent.structured_read_only,
     };
-    if explicit_read_only {
+    if intent.structured_read_only {
         return ChatContract {
             mode: AgentMode::Interactive,
             capability: TurnCapability::ReviewOnly,
@@ -1083,8 +1153,21 @@ mod tests {
 
     #[test]
     fn turn_capability_separates_review_implementation_and_delivery() {
+        // β: wording alone never selects ReviewOnly…
         assert_eq!(
             decide_chat_contract(None, "先系统分析，不要修改代码").capability,
+            TurnCapability::Implement
+        );
+        // …a hard read-only turn comes from a structured intent instead.
+        assert_eq!(
+            decide_chat_contract_with_intent(
+                None,
+                "先系统分析，不要修改代码",
+                TurnIntent {
+                    structured_read_only: true
+                }
+            )
+            .capability,
             TurnCapability::ReviewOnly
         );
         assert_eq!(
@@ -1131,12 +1214,26 @@ mod tests {
     }
 
     #[test]
-    fn persisted_delivery_authorization_never_overrides_explicit_planning() {
-        let planning = decide_chat_contract(None, "先系统分析，不要修改代码");
-        assert_eq!(planning.capability, TurnCapability::ReviewOnly);
-        // Even with a standing grant, an explicit planning request stays
-        // review-only — the user's current intent wins.
-        let kept = with_persisted_delivery_authorization(planning, true);
+    fn persisted_delivery_authorization_never_overrides_a_structured_read_only_turn() {
+        // β: a wording cue no longer revokes anything, so a standing grant still
+        // applies to it.
+        let wording_only = decide_chat_contract(None, "先系统分析，不要修改代码");
+        assert_eq!(wording_only.capability, TurnCapability::Implement);
+        assert_eq!(
+            with_persisted_delivery_authorization(wording_only, true).capability,
+            TurnCapability::Deliver
+        );
+        // A STRUCTURED read-only turn stays review-only whatever the session
+        // holds.
+        let structured = decide_chat_contract_with_intent(
+            None,
+            "先系统分析，不要修改代码",
+            TurnIntent {
+                structured_read_only: true,
+            },
+        );
+        assert_eq!(structured.capability, TurnCapability::ReviewOnly);
+        let kept = with_persisted_delivery_authorization(structured, true);
         assert_eq!(kept.capability, TurnCapability::ReviewOnly);
     }
 
@@ -1263,15 +1360,34 @@ mod tests {
                 "{message:?} must not lose write capability on a guess"
             );
         }
+        // β (2026-09-28): the same read-only wording no longer revokes write
+        // capability. It keeps the discuss-first posture and hands the model an
+        // instruction; the capability stays Implement, and the audit payload
+        // records that the constraint had no capability effect.
         for message in ["先分析一下，不要改代码", "只评估风险，别执行"] {
             let contract = decide_chat_contract(None, message);
-            assert!(contract.grants.explicit_read_only, "{message:?}");
-            assert_eq!(
-                contract.capability,
-                TurnCapability::ReviewOnly,
-                "{message:?}"
+            assert!(
+                !contract.grants.explicit_read_only,
+                "{message:?} is wording, not a structured grant"
             );
+            assert_eq!(contract.capability, TurnCapability::Implement, "{message:?}");
+            assert_eq!(contract.mode, AgentMode::Interactive, "{message:?}");
+            let block = constraint_instruction_block(message).expect("instruction block");
+            assert!(block.contains("turn-constraint"), "{message:?}");
+            let payload = constraint_audit_payload(message).expect("audit payload");
+            assert_eq!(payload["capability_effect"], "none", "{message:?}");
         }
+
+        // The hard gate is still reachable — from a structured source only.
+        let structured = decide_chat_contract_with_intent(
+            None,
+            "先分析一下，不要改代码",
+            TurnIntent {
+                structured_read_only: true,
+            },
+        );
+        assert!(structured.grants.explicit_read_only);
+        assert_eq!(structured.capability, TurnCapability::ReviewOnly);
     }
 
     #[test]
@@ -1315,15 +1431,31 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_read_only_request_still_wins_over_a_change_request() {
+    fn a_wording_constraint_no_longer_wins_over_a_change_request() {
         for message in [
             "先分析一下这个布局为什么这么丑，不要改代码",
             "别改，先给个方案：这两个圆角不一致，应该统一成 8px",
         ] {
+            // β: the constraint becomes an instruction; the change request
+            // keeps its write capability.
             let contract = decide_chat_contract(None, message);
-            assert_eq!(contract.capability, TurnCapability::ReviewOnly);
-            assert!(contract.grants.explicit_read_only, "{message:?}");
+            assert_ne!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+            assert!(!contract.grants.explicit_read_only, "{message:?}");
+            assert!(
+                constraint_instruction_block(message).is_some(),
+                "{message:?} should still be handed to the model as a constraint"
+            );
         }
+        // Only a structured read-only intent still wins over a change request.
+        let structured = decide_chat_contract_with_intent(
+            None,
+            "先分析一下这个布局为什么这么丑，不要改代码",
+            TurnIntent {
+                structured_read_only: true,
+            },
+        );
+        assert_eq!(structured.capability, TurnCapability::ReviewOnly);
+        assert!(structured.grants.explicit_read_only);
     }
 
     /// End-to-end reproduction of the field failure, across BOTH modules that
@@ -1374,7 +1506,15 @@ mod tests {
         }
 
         // …while a user who DID ask for read-only still gets the hard gate.
-        let constrained = decide_chat_contract(None, "先分析一下这个布局，不要改代码");
+        // β (2026-09-28): the gate is still reachable, but only from a
+        // STRUCTURED read-only intent — wording alone no longer sets it.
+        let constrained = decide_chat_contract_with_intent(
+            None,
+            "先分析一下这个布局，不要改代码",
+            TurnIntent {
+                structured_read_only: true,
+            },
+        );
         assert!(
             capability_denial(
                 constrained.capability,
@@ -1422,10 +1562,9 @@ mod tests {
             steer_capability_override("继续发布上线"),
             Some(TurnCapability::Deliver),
         );
-        assert_eq!(
-            steer_capability_override("先别修改，继续分析"),
-            Some(TurnCapability::ReviewOnly),
-        );
+        // β (2026-09-28): a wording cue no longer steers the capability at all;
+        // it is an instruction, not a permission.
+        assert_eq!(steer_capability_override("先别修改，继续分析"), None);
     }
 
     /// 2026-09-08 field report. Seven sessions were resumed with the single
@@ -1453,12 +1592,142 @@ mod tests {
         );
         // An explicit read-only steer still wins over a standing grant, and an
         // explicit revocation is handled by `is_delivery_revocation` upstream.
+        // β: wording no longer revokes, so this steer leaves the standing grant
+        // alone instead of dropping the turn to ReviewOnly.
         assert_eq!(
             steer_capability_override_with_authorization("先别修改，继续分析", true),
-            Some(TurnCapability::ReviewOnly),
+            None,
         );
         assert!(is_delivery_revocation("先别发布"));
         // A message that steers nothing still steers nothing.
         assert_eq!(steer_capability_override_with_authorization("嗯", true), None);
+    }
+
+    /// β fixture 1 — the 2026-09-24 shape: a delivery request that ends with a
+    /// constraint about a hypothetical case. Synthesized, not the field text.
+    #[test]
+    fn a_conditional_aside_never_revokes_the_turn_it_travels_with() {
+        let message =
+            "先合并主干并跑测试，然后调用交付工具；如果新提交的 CI 再遇到环境抖动，不要改代码或验收脚本。";
+        let contract = decide_chat_contract(None, message);
+        assert_ne!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+        assert!(!contract.grants.explicit_read_only, "{message:?}");
+        let payload = constraint_audit_payload(message).expect("audit payload");
+        assert_eq!(payload["capability_effect"], "none");
+        assert!(payload["instruction_block"]
+            .as_str()
+            .is_some_and(|block| block.contains("turn-constraint")));
+    }
+
+    /// β fixture 2 — a pure read-only sentence: discuss-first posture, write
+    /// capability retained, instruction handed to the model.
+    #[test]
+    fn a_read_only_sentence_keeps_write_capability_and_becomes_an_instruction() {
+        let message = "先分析一下这个布局，不要改代码";
+        let contract = decide_chat_contract(None, message);
+        assert_eq!(contract.mode, AgentMode::Interactive, "{message:?}");
+        assert_eq!(contract.capability, TurnCapability::Implement, "{message:?}");
+        assert!(!contract.grants.explicit_read_only, "{message:?}");
+        assert!(constraint_instruction_block(message).is_some(), "{message:?}");
+    }
+
+    /// β fixture 3 — an explicitly read-only delegated subagent is the only
+    /// thing that yields ReviewOnly, and it must still be able to hand back
+    /// evidence: read-only tools stay allowed while mutations stay refused.
+    #[test]
+    fn a_structured_read_only_subagent_turn_can_still_hand_back_evidence() {
+        use codefactory_agent_core::ToolKind;
+        use codefactory_agent_loop::policy::capability_denial;
+
+        let contract = decide_chat_contract_with_intent(
+            None,
+            "只读审查当前分支的实现，运行必要的聚焦测试并返回证据，不要修改文件。",
+            TurnIntent {
+                structured_read_only: true,
+            },
+        );
+        assert_eq!(contract.capability, TurnCapability::ReviewOnly);
+        assert!(contract.grants.explicit_read_only);
+        // Reading and read-only shell probes still work…
+        for (tool, kind, args) in [
+            (
+                "read_file",
+                ToolKind::ReadOnly,
+                serde_json::json!({ "path": "src/lib.rs" }),
+            ),
+            (
+                "bash",
+                ToolKind::ReadOnly,
+                serde_json::json!({ "command": "git status --porcelain" }),
+            ),
+        ] {
+            assert!(
+                capability_denial(contract.capability, tool, tool, &kind, &args).is_none(),
+                "{tool} must stay available so a review turn can hand back evidence"
+            );
+        }
+        // …while a mutation is still refused.
+        assert!(
+            capability_denial(
+                contract.capability,
+                "edit_file",
+                "edit_file src/a.rs",
+                &ToolKind::Mutation,
+                &serde_json::json!({ "path": "src/a.rs", "old_string": "a", "new_string": "b" }),
+            )
+            .is_some(),
+            "a review-only turn must not edit product code"
+        );
+    }
+
+    /// β fixture 4 — a delegated brief that carries ONLY read-only wording (no
+    /// structured field) keeps write capability.
+    #[test]
+    fn a_delegated_brief_with_only_read_only_wording_keeps_write_capability() {
+        let message = "只读审查当前分支的实现，不要修改文件。";
+        let contract = decide_chat_contract(None, message);
+        assert!(!contract.grants.explicit_read_only, "{message:?}");
+        assert_ne!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+    }
+
+    /// β fixture 5 — a structured read-only turn must still hand back evidence:
+    /// running the project's own tests is allowed, editing is not.
+    #[test]
+    fn a_structured_read_only_turn_may_run_project_tests_but_not_edit() {
+        use codefactory_agent_core::ToolKind;
+        use codefactory_agent_loop::policy::capability_denial;
+
+        let contract = decide_chat_contract_with_intent(
+            None,
+            "只读审查当前分支的实现并运行项目测试。",
+            TurnIntent {
+                structured_read_only: true,
+            },
+        );
+        assert_eq!(contract.capability, TurnCapability::ReviewOnly);
+        for command in ["cargo test --lib dispatch", "pnpm test", "npm test"] {
+            assert!(
+                capability_denial(
+                    contract.capability,
+                    "bash",
+                    command,
+                    &ToolKind::ReadOnly,
+                    &serde_json::json!({ "command": command }),
+                )
+                .is_none(),
+                "{command} must stay available so a review-only turn can hand back evidence"
+            );
+        }
+        assert!(
+            capability_denial(
+                contract.capability,
+                "edit_file",
+                "edit_file src/a.rs",
+                &ToolKind::Mutation,
+                &serde_json::json!({ "path": "src/a.rs", "old_string": "a", "new_string": "b" }),
+            )
+            .is_some(),
+            "a review-only turn must not edit product code"
+        );
     }
 }

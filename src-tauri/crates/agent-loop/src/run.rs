@@ -1049,6 +1049,13 @@ pub async fn run_agent_loop(
             // in-flight tool call is ever interrupted to deliver it.
             for steer_text in steer.drain().await {
                 if let Some(next_capability) = steer.capability_override(&steer_text) {
+                    // β (2026-09-28): a mid-run sentence may not widen a turn
+                    // that a STRUCTURED source made review-only. Since the gate
+                    // is now reachable only from such a source, `ReviewOnly`
+                    // means "cannot be raised by wording".
+                    if turn_capability == TurnCapability::ReviewOnly {
+                        continue;
+                    }
                     if next_capability != turn_capability {
                         structural_denial_seen = false;
                     }
@@ -5574,7 +5581,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_explicit_steer_updates_action_intent_before_the_next_tool_batch() {
+    /// β (2026-09-28): a review-only turn can now only come from a STRUCTURED
+    /// source (a delegated task marked `read_only`), so a sentence steered in
+    /// mid-run — "继续执行" here — must not widen it. This test used to assert
+    /// the opposite (the steer lifted the turn and `t2` ran); that encoded the
+    /// retired promise that wording can set and clear the hard gate.
+    async fn a_steer_cannot_widen_a_structured_read_only_turn() {
         let transport = Arc::new(ScriptedTransport::new(vec![
             response(
                 "先检查",
@@ -5616,21 +5628,24 @@ mod tests {
 
         run_agent_loop(inputs(), cfg, svc).await.expect("loop runs");
 
-        assert!(events.events().iter().any(|event| matches!(
-            event,
-            StreamEvent::ToolResult {
-                tool_call_id,
-                status,
-                ..
-            } if tool_call_id == "t2" && status == "done"
-        )));
+        assert!(
+            events.events().iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolResult {
+                    tool_call_id,
+                    status,
+                    ..
+                } if tool_call_id == "t2" && status == "denied"
+            )),
+            "a mid-run steer must not widen a structured read-only turn"
+        );
         assert!(!events.events().iter().any(|event| matches!(
             event,
             StreamEvent::ToolResult {
                 tool_call_id,
                 status,
                 ..
-            } if tool_call_id == "t2" && status == "denied"
+            } if tool_call_id == "t2" && status == "done"
         )));
     }
 

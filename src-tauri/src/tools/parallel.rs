@@ -145,7 +145,8 @@ mod tests {
                 created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT,
                 result TEXT, error TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
                 verification_results TEXT, task_context_json TEXT,
-                acceptance_criteria_json TEXT, spec_req_id TEXT, spec_title TEXT,
+                acceptance_criteria_json TEXT,
+                read_only INTEGER NOT NULL DEFAULT 0, spec_req_id TEXT, spec_title TEXT,
                 owner_pid INTEGER, owner_start_token TEXT
             )",
         )

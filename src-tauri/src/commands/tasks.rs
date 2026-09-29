@@ -373,6 +373,7 @@ pub async fn create_task_tree(
             result: None,
             error: None,
             attempt_count: 0,
+            read_only: false,
             verification_results: None,
             task_context_json: Some(task_context_json.clone()),
             acceptance_criteria_json: acceptance_json,

@@ -909,6 +909,7 @@ mod tests {
                 started_at TEXT, completed_at TEXT, result TEXT, error TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0, verification_results TEXT,
                 task_context_json TEXT, acceptance_criteria_json TEXT,
+                read_only INTEGER NOT NULL DEFAULT 0,
                 spec_req_id TEXT, spec_title TEXT, owner_pid INTEGER, owner_start_token TEXT,
                 objective_id TEXT, recovery_state TEXT, next_observation_at INTEGER
             )",
@@ -972,6 +973,7 @@ mod tests {
             result: Some("{\"summary\":\"done\"}".into()),
             error: None,
             attempt_count: 1,
+            read_only: false,
             verification_results: None,
             task_context_json: None,
             acceptance_criteria_json: None,

@@ -48,9 +48,30 @@ pub struct SubagentBrief {
     pub allowed_tools: Vec<String>,
     /// Optional acceptance criteria the subagent should self-verify against.
     pub acceptance_criteria: Option<String>,
+    /// β (2026-09-28): the caller explicitly marked this task read-only. It is
+    /// the ONLY structured source of a read-only turn — the subagent runs with
+    /// `TurnCapability::ReviewOnly`, so it may still read files and run project
+    /// tests but may not modify anything.
+    #[serde(default)]
+    pub read_only: bool,
     /// Connector scope selected by the parent task. Persisted before execution
     /// and rendered into the brief so tool access is explicit.
     pub connector_context: Option<TaskConnectorContext>,
+}
+
+/// β (2026-09-28): the ONLY structured source of a read-only subagent turn.
+///
+/// `run_subagent` builds its own `AgentLoop` and never passes through the chat
+/// turn admission, so this mapping is the only thing that turns
+/// [`SubagentBrief::read_only`] into an enforced capability. `run_subagent` MUST
+/// derive the capability through this function, otherwise a delegated read-only
+/// task silently runs write-capable.
+pub fn subagent_turn_capability(brief: &SubagentBrief) -> codefactory_agent_loop::run::TurnCapability {
+    if brief.read_only {
+        codefactory_agent_loop::run::TurnCapability::ReviewOnly
+    } else {
+        codefactory_agent_loop::run::TurnCapability::Implement
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -323,6 +344,10 @@ pub async fn run_subagent(
         }),
         crate::agent::AgentMode::Autonomous,
     )
+    // β (2026-09-28): the subagent's capability comes from the brief, through
+    // the single mapping function — a delegated read-only task must not silently
+    // run write-capable.
+    .with_turn_capability(subagent_turn_capability(&brief))
     .with_failover_plan(route_plan);
 
     // A subtask stops on its terminal result or explicit cancellation, not an
@@ -418,6 +443,51 @@ mod outcome_integrity_tests {
     use super::*;
     use codefactory_agent_core::CompletionEvidence;
     use codefactory_agent_loop::run::{RunOutcome, StopReason};
+
+    /// β (2026-09-28): a delegated read-only task must ACTUALLY run review-only.
+    ///
+    /// `run_subagent` builds its own `AgentLoop` and never goes through the chat
+    /// turn admission, so `brief.read_only` is only real if this mapping is wired
+    /// into that builder chain. This asserts both halves: the mapping's verdict,
+    /// and — because a passing mapping test would still prove nothing about
+    /// production — that `run_subagent` calls the very same function.
+    #[test]
+    fn a_read_only_brief_runs_the_subagent_review_only() {
+        let mut brief = SubagentBrief {
+            task_id: "task-read-only".into(),
+            title: "只读审查".into(),
+            description: "只读审查当前分支，运行聚焦测试并返回证据".into(),
+            cwd: "/tmp/proj".into(),
+            parent_summary: None,
+            allowed_tools: Vec::new(),
+            acceptance_criteria: None,
+            read_only: true,
+            connector_context: None,
+        };
+        assert_eq!(
+            subagent_turn_capability(&brief),
+            codefactory_agent_loop::run::TurnCapability::ReviewOnly,
+            "a read-only brief must run review-only"
+        );
+        brief.read_only = false;
+        assert_eq!(
+            subagent_turn_capability(&brief),
+            codefactory_agent_loop::run::TurnCapability::Implement,
+            "an ordinary brief keeps today's capability"
+        );
+
+        // The needle is built at runtime on purpose: if it appeared verbatim in
+        // this file, this very assertion would satisfy its own check.
+        let needle = format!(
+            "{}{}",
+            ".with_turn_capability(", "subagent_turn_capability(&brief))"
+        );
+        let source = include_str!("subagent.rs");
+        assert!(
+            source.contains(needle.as_str()),
+            "run_subagent must derive its capability through subagent_turn_capability"
+        );
+    }
 
     fn outcome(stop_reason: StopReason, evidence_completed: bool) -> RunOutcome {
         RunOutcome {

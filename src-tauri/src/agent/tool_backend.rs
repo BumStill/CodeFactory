@@ -579,6 +579,13 @@ fn bash_is_explicit_read_only(command: &str) -> bool {
         && segments.iter().enumerate().all(|(index, segment)| {
             bash_segment_is_read_only(segment)
                 || (index == 0 && bash_segment_is_strict_mode_prelude(segment))
+                // β (2026-09-28): a review-only turn must still be able to run the
+                // project's own tests and hand back the evidence. A plain
+                // test-runner invocation writes nothing to the repository.
+                // Known gap (PR follow-up): the classifier cannot yet tell a
+                // snapshot-updating variant (e.g. `... -u`) apart from a plain
+                // run.
+                || codefactory_agent_core::is_project_test_command(segment)
         })
 }
 

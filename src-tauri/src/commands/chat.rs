@@ -2102,7 +2102,20 @@ async fn admit_persisted_chat_turn(
         !crate::agent::is_contextual_approval(content)
             || crate::agent::proposal_capability(message).is_some()
     });
-    let mut contract = crate::agent::decide_chat_contract(previous_assistant.as_deref(), content);
+    // β (2026-09-28): the ONLY structured source of a hard read-only turn is the
+    // caller's declaration on the delegated task. Read it from durable storage on
+    // every turn: it survives restarts, and no wording — including a sentence
+    // inserted mid-run — can turn such a turn writable.
+    let structured_read_only =
+        crate::storage::tasks::sub_session_read_only(&mut *tx, session_id).await?;
+    let mut contract = crate::agent::decide_chat_contract_with_intent(
+        previous_assistant.as_deref(),
+        content,
+        crate::agent::TurnIntent {
+            structured_read_only,
+        },
+    );
+    let wording_constraint = crate::agent::constraint_audit_payload(content);
     let delivery_authorized: i64 =
         sqlx::query_scalar("SELECT delivery_authorized FROM sessions WHERE id=?")
             .bind(session_id)
@@ -2135,6 +2148,13 @@ async fn admit_persisted_chat_turn(
         )
         .await
         .map_err(|error| AppError::Other(error.to_string()))?;
+    // β (2026-09-28): best-effort audit — the turn carried a wording-level
+    // constraint, it became an instruction, and it had no capability effect.
+    // Recording must never block turn admission, so failures only log
+    // (same semantics as `record_failure_detail`).
+    if let Some(payload) = wording_constraint.as_ref() {
+        store.record_turn_wording_constraint(&objective.id, payload).await;
+    }
     if setup
         .expected_objective_id
         .as_deref()
@@ -3137,7 +3157,18 @@ async fn resume_chat_objective_inner(
         .ok_or_else(|| AppError::Other("objective resume has no model route".into()))?
         .clone();
     let endpoint_for_error = primary_route.endpoint_name.clone();
-    let inferred = crate::agent::decide_chat_contract(None, &original_content);
+    // β (2026-09-28): resume admission mirrors the main admission — the ONLY
+    // structured source of a hard read-only turn is the delegated task's flag,
+    // read from durable storage so a resumed objective cannot come back writable.
+    let structured_read_only =
+        crate::storage::tasks::sub_session_read_only(&db, &session_id).await?;
+    let inferred = crate::agent::decide_chat_contract_with_intent(
+        None,
+        &original_content,
+        crate::agent::TurnIntent {
+            structured_read_only,
+        },
+    );
     let (mode, capability) = match objective.kind {
         ObjectiveKind::Informational => (
             crate::agent::AgentMode::Interactive,

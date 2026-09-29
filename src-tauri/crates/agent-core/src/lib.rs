@@ -1474,7 +1474,7 @@ fn is_dependency_install_command(command: &str) -> bool {
     )
 }
 
-fn is_project_test_command(command: &str) -> bool {
+pub fn is_project_test_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     contains_any(
         &lower,
