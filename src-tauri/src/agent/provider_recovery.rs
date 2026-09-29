@@ -903,9 +903,13 @@ impl ProviderRecoveryStore {
         attempt_id: &str,
         failure_class: &str,
         failure_code: &str,
-        // Retained for API/back-compat: retry-safety is now decided from the
-        // durable no-effect proof below, not the transport's admission hint.
-        _replayable: bool,
+        // The transport's own replay opinion is deliberately NOT trusted here.
+        // An admitted failure with no output/effect has no external effect to
+        // protect, so retry-safety is decided by the durable proof below alone
+        // (pinned by `admitted_no_output_failure_is_replay_safe_not_external_state_uncertain`).
+        // Deterministic client-side rejections are excluded from that proof by
+        // their failure code instead of by this hint.
+        _: bool,
         now: i64,
     ) -> Result<ProviderMutation<OverloadBudgetDecision>> {
         validate_identifier("failure_class", failure_class)?;
@@ -936,6 +940,15 @@ impl ProviderRecoveryStore {
         // (`reconcile_stale_effect_free_in_flight`), which already treats
         // exactly this state as retry-safe; only partial output or an
         // uncertain receipt keeps the attempt fenced and observation-only.
+        // Review rework 2026-09-29: a deterministic client-side rejection has no
+        // external state to reconcile, so the no-effect proof keeps deciding and
+        // the attempt stays `failed_replayable`. Recording it as `unknown` (the
+        // earlier attempt here) wrongly entered observation reconciliation and
+        // could fence the next attempt of the same episode. There is no
+        // "certain, no side effect, but must not be replayed" terminal state in
+        // the machine yet, so making these failures non-replayable is a
+        // follow-up that must add that state first — the transport's
+        // `DETERMINISTIC_REJECTION_CODE` remains informational metadata.
         let replay_is_proven = !attempt.output_started
             && !attempt.side_effect_started
             && attempt.side_effect_receipt_id.is_none();
