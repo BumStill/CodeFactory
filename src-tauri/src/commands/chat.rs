@@ -2150,10 +2150,16 @@ async fn admit_persisted_chat_turn(
         .map_err(|error| AppError::Other(error.to_string()))?;
     // β (2026-09-28): best-effort audit — the turn carried a wording-level
     // constraint, it became an instruction, and it had no capability effect.
-    // Recording must never block turn admission, so failures only log
-    // (same semantics as `record_failure_detail`).
+    // It is written on the SAME transaction that just created the Objective:
+    // the pool writer could not see that uncommitted row, and SQLite admits one
+    // writer, so it waited out `busy_timeout` and silently dropped the event
+    // (production: 0 `turn_wording_constraint` rows). Recording still must
+    // never block turn admission, so failures only log (same semantics as
+    // `record_failure_detail`).
     if let Some(payload) = wording_constraint.as_ref() {
-        store.record_turn_wording_constraint(&objective.id, payload).await;
+        store
+            .record_turn_wording_constraint_in_tx(&mut tx, &objective.id, payload)
+            .await;
     }
     if setup
         .expected_objective_id
@@ -3687,6 +3693,73 @@ mod tests {
         ));
         assert_eq!(projection.activity_kind, "core_input_required");
         assert_eq!(projection.terminal_reason, None);
+    }
+
+    /// β fixture 7 — the wording-constraint audit must survive the REAL
+    /// admission path, not just a direct call on an already-committed
+    /// Objective. Admission creates the Objective inside its own transaction,
+    /// so the audit write has to go where that row is visible AND where it does
+    /// not contend with the transaction still holding SQLite's single write
+    /// lock. The previous code called `record_turn_wording_constraint` through
+    /// the pool while that transaction was open: the row did not exist for the
+    /// other connection, the writer waited out `busy_timeout`, the insert
+    /// failed, and the failure was only logged — so the event was silently lost
+    /// and admission paid a lock wait for nothing.
+    #[tokio::test]
+    async fn admission_records_a_wording_constraint_without_waiting_on_the_write_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "cf-chat-admission-wording-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("chat.sqlite");
+        let pool = crate::storage::db::connect(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('session-wording', 'title', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let control = crate::ChatRunControl::pending();
+        let started = std::time::Instant::now();
+        let receipt = admit_persisted_chat_turn(
+            &pool,
+            &control,
+            "session-wording",
+            None,
+            "先分析一下，不要改代码",
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        // 1) The audit event exists for the Objective admission itself created,
+        //    and it says explicitly that the constraint had no capability effect.
+        let (event_type, detail): (String, String) = sqlx::query_as(
+            "SELECT event_type, detail_json FROM objective_events
+             WHERE objective_id=? AND event_type='turn_wording_constraint'",
+        )
+        .bind(&receipt.objective.id)
+        .fetch_one(&pool)
+        .await
+        .expect("admission must durably audit the wording constraint it saw");
+        assert_eq!(event_type, "turn_wording_constraint");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["capability_effect"], "none");
+
+        // 2) Admission did not wait on the write lock. sqlx's default
+        //    `busy_timeout` is 5s, so a contended write shows up as a multi-second
+        //    admission; a write inside the admission transaction is immediate.
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "admission waited on the SQLite write lock: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn reprompt_test_pool() -> sqlx::SqlitePool {

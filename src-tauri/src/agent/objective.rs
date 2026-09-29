@@ -1357,6 +1357,23 @@ async fn ensure_objective_binding(
     Ok((binding_id, generation))
 }
 
+/// β (2026-09-29): the wording-constraint audit insert, shared by the pool and
+/// transaction writers so both keep identical projection columns.
+const TURN_WORDING_CONSTRAINT_INSERT: &str = "INSERT INTO objective_events
+     (id, objective_id, revision, event_type, status, decision_type,
+      domain, failure_code, detail_json, created_at)
+     SELECT ?, id, revision, 'turn_wording_constraint', status,
+            decision_type, domain, NULL, ?, ? FROM objectives WHERE id=?";
+
+fn turn_wording_constraint_detail(payload: &serde_json::Value) -> String {
+    const TURN_CONSTRAINT_DETAIL_MAX_CHARS: usize = 2048;
+    let mut detail = payload.to_string();
+    if detail.len() > TURN_CONSTRAINT_DETAIL_MAX_CHARS {
+        detail.truncate(TURN_CONSTRAINT_DETAIL_MAX_CHARS);
+    }
+    detail
+}
+
 impl ObjectiveStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -1750,24 +1767,41 @@ impl ObjectiveStore {
         objective_id: &str,
         payload: &serde_json::Value,
     ) {
-        const TURN_CONSTRAINT_DETAIL_MAX_CHARS: usize = 2048;
-        let mut detail = payload.to_string();
-        if detail.len() > TURN_CONSTRAINT_DETAIL_MAX_CHARS {
-            detail.truncate(TURN_CONSTRAINT_DETAIL_MAX_CHARS);
+        if let Err(error) = sqlx::query(TURN_WORDING_CONSTRAINT_INSERT)
+            .bind(Uuid::new_v4().to_string())
+            .bind(turn_wording_constraint_detail(payload))
+            .bind(Utc::now().timestamp_millis())
+            .bind(objective_id)
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!(
+                "objective {objective_id}: turn wording constraint audit skipped: {error}"
+            );
         }
-        if let Err(error) = sqlx::query(
-            "INSERT INTO objective_events
-             (id, objective_id, revision, event_type, status, decision_type,
-              domain, failure_code, detail_json, created_at)
-             SELECT ?, id, revision, 'turn_wording_constraint', status,
-                    decision_type, domain, NULL, ?, ? FROM objectives WHERE id=?",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(detail)
-        .bind(Utc::now().timestamp_millis())
-        .bind(objective_id)
-        .execute(&self.pool)
-        .await
+    }
+
+    /// β fixture 7 (2026-09-29): the same audit, written on the caller's
+    /// transaction. Chat admission creates the Objective inside that
+    /// transaction, so this is the only connection that can see the row — and
+    /// SQLite admits a single writer, so the pool variant would first wait out
+    /// `busy_timeout` and then drop the event, exactly what production showed
+    /// (`turn_wording_constraint` never reached `objective_events`). Still
+    /// best-effort: a failed audit only logs and never fails the transaction
+    /// that carries the turn.
+    pub async fn record_turn_wording_constraint_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        objective_id: &str,
+        payload: &serde_json::Value,
+    ) {
+        if let Err(error) = sqlx::query(TURN_WORDING_CONSTRAINT_INSERT)
+            .bind(Uuid::new_v4().to_string())
+            .bind(turn_wording_constraint_detail(payload))
+            .bind(Utc::now().timestamp_millis())
+            .bind(objective_id)
+            .execute(&mut **tx)
+            .await
         {
             tracing::warn!(
                 "objective {objective_id}: turn wording constraint audit skipped: {error}"
