@@ -886,6 +886,7 @@ impl TaskScheduler {
                                 .map(|s| s.to_string())
                                 .collect(),
                             acceptance_criteria: task_acceptance.clone(),
+                            read_only: task.read_only,
                             connector_context: tasks::TaskConnectorContext::from_json(
                                 task.task_context_json.as_deref(),
                             ),
@@ -1714,6 +1715,7 @@ mod tests {
                 started_at TEXT, completed_at TEXT, result TEXT, error TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0, verification_results TEXT,
                 task_context_json TEXT, acceptance_criteria_json TEXT,
+                read_only INTEGER NOT NULL DEFAULT 0,
                 spec_req_id TEXT, spec_title TEXT, owner_pid INTEGER,
                 owner_start_token TEXT, objective_id TEXT,
                 recovery_state TEXT, next_observation_at INTEGER
@@ -1772,6 +1774,7 @@ mod tests {
             verification_results: None,
             task_context_json: None,
             acceptance_criteria_json: Some(r#"["change is present","focused test passes"]"#.into()),
+            read_only: false,
             spec_req_id: None,
             spec_title: None,
         }

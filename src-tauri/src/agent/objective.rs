@@ -1741,6 +1741,40 @@ impl ObjectiveStore {
         Ok(())
     }
 
+    /// β (2026-09-28): record that a wording-level constraint was turned into an
+    /// instruction for this turn — evidence that the constraint was seen and had
+    /// NO capability effect. Best-effort on purpose: audit must never block turn
+    /// admission, exactly like [`Self::record_failure_detail`].
+    pub async fn record_turn_wording_constraint(
+        &self,
+        objective_id: &str,
+        payload: &serde_json::Value,
+    ) {
+        const TURN_CONSTRAINT_DETAIL_MAX_CHARS: usize = 2048;
+        let mut detail = payload.to_string();
+        if detail.len() > TURN_CONSTRAINT_DETAIL_MAX_CHARS {
+            detail.truncate(TURN_CONSTRAINT_DETAIL_MAX_CHARS);
+        }
+        if let Err(error) = sqlx::query(
+            "INSERT INTO objective_events
+             (id, objective_id, revision, event_type, status, decision_type,
+              domain, failure_code, detail_json, created_at)
+             SELECT ?, id, revision, 'turn_wording_constraint', status,
+                    decision_type, domain, NULL, ?, ? FROM objectives WHERE id=?",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(detail)
+        .bind(Utc::now().timestamp_millis())
+        .bind(objective_id)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(
+                "objective {objective_id}: turn wording constraint audit skipped: {error}"
+            );
+        }
+    }
+
     /// Settle `active` Objectives that nothing will ever wake again.
     ///
     /// The supervisor claims DUE REMEDIATIONS. An Objective that is `active`
@@ -5802,6 +5836,44 @@ mod tests {
             .unwrap();
         ensure_schema(&pool).await.unwrap();
         pool
+    }
+
+    /// β fixture 6 — the wording constraint is audited durably, and the record
+    /// says explicitly that it had no capability effect.
+    #[tokio::test]
+    async fn a_turn_wording_constraint_is_recorded_without_a_capability_effect() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-turn-wording-constraint".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-turn-wording-constraint".into()),
+                root_turn_id: Some("turn-turn-wording-constraint".into()),
+                domain: RecoveryDomain::Tool,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        let payload = crate::agent::constraint_audit_payload("先分析一下，不要改代码")
+            .expect("a read-only sentence yields an audit payload");
+        store
+            .record_turn_wording_constraint(&objective.id, &payload)
+            .await;
+
+        let (event_type, detail): (String, String) = sqlx::query_as(
+            "SELECT event_type, detail_json FROM objective_events \
+             WHERE objective_id = ? AND event_type = 'turn_wording_constraint'",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_type, "turn_wording_constraint");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["capability_effect"], "none");
     }
 
     #[tokio::test]

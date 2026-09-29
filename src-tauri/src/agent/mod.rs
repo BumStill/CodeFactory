@@ -42,10 +42,10 @@ pub mod verification;
 pub mod worktree;
 
 pub use dispatch::{
-    decide_chat_contract, decide_chat_mode, is_contextual_approval, is_delivery_revocation,
-    proposal_capability, steer_capability_override, steer_capability_override_with_authorization,
-    with_persisted_delivery_authorization,
-    TurnGrants,
+    constraint_audit_payload, constraint_instruction_block, decide_chat_contract,
+    decide_chat_contract_with_intent, decide_chat_mode, is_contextual_approval,
+    is_delivery_revocation, proposal_capability, steer_capability_override_with_authorization,
+    with_persisted_delivery_authorization, TurnGrants, TurnIntent,
 };
 pub(crate) use internal_text::{generate_bounded_text, InternalTextOutput};
 
@@ -1582,9 +1582,21 @@ impl AgentLoop {
         history: Vec<Message>,
         system_prompt: &str,
     ) -> Vec<ChatMessage> {
+        // β (2026-09-28): a wording-level constraint reaches the model as an
+        // INSTRUCTION here — the same place the turn's context is assembled — and
+        // only when the turn actually carries one. It never touches capability.
+        let turn_constraint = history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .and_then(|message| constraint_instruction_block(&message.content));
+        let system_text = match turn_constraint {
+            Some(block) => format!("{system_prompt}\n\n{block}"),
+            None => system_prompt.to_string(),
+        };
         let mut msgs = vec![ChatMessage {
             role: "system".into(),
-            content: MessageContent::Text(system_prompt.to_string()),
+            content: MessageContent::Text(system_text),
             tool_calls: None,
             tool_call_id: None,
             name: None,

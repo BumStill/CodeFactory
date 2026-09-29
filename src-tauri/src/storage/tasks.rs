@@ -94,6 +94,12 @@ pub struct TaskRun {
     pub verification_results: Option<String>,
     /// JSON TaskConnectorContext persisted at task creation time.
     pub task_context_json: Option<String>,
+    /// β (2026-09-28): the caller explicitly marked this delegated task as
+    /// read-only. This structured flag — never the wording of any message — is
+    /// what makes the subagent's turn review-only. Defaults to false so
+    /// pre-existing rows stay write-capable.
+    #[serde(default)]
+    pub read_only: bool,
     /// JSON Vec<String> of user-visible acceptance criteria the agent
     /// must verify before declaring done. Drives autonomous-mode
     /// completion check + scheduler-side respawn-on-incomplete loop.
@@ -169,6 +175,22 @@ pub async fn start_task_objective_attempt(
     Ok(())
 }
 
+/// β (2026-09-28): is this chat session the sub-session of a delegated task that
+/// its caller explicitly marked read-only? Turn admission reads this on EVERY
+/// turn — and after a restart — so the structured flag, never any wording,
+/// decides whether a turn is review-only.
+pub async fn sub_session_read_only(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    sub_session_id: &str,
+) -> Result<bool> {
+    let flag: Option<i64> =
+        sqlx::query_scalar("SELECT read_only FROM task_runs WHERE sub_session_id = ?")
+            .bind(sub_session_id)
+            .fetch_optional(executor)
+            .await?;
+    Ok(flag.unwrap_or(0) != 0)
+}
+
 pub async fn attach_attempt_sub_session(
     pool: &SqlitePool,
     attempt_id: &str,
@@ -241,8 +263,9 @@ pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     sqlx::query(
         "INSERT INTO task_runs (id, session_id, title, description, status, cwd, parent_task_id, \
          sub_session_id, created_at, started_at, completed_at, result, error, attempt_count, \
-         verification_results, task_context_json, acceptance_criteria_json, spec_req_id, spec_title) \
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         verification_results, task_context_json, acceptance_criteria_json, spec_req_id, spec_title, \
+         read_only) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&task.id)
     .bind(&task.session_id)
@@ -263,6 +286,7 @@ pub async fn insert_task(pool: &SqlitePool, task: &TaskRun) -> Result<()> {
     .bind(&task.acceptance_criteria_json)
     .bind(&task.spec_req_id)
     .bind(&task.spec_title)
+    .bind(task.read_only)
     .execute(pool)
     .await?;
     Ok(())
@@ -897,6 +921,7 @@ mod tests {
                 verification_results TEXT,
                 task_context_json TEXT,
                 acceptance_criteria_json TEXT,
+                read_only INTEGER NOT NULL DEFAULT 0,
                 spec_req_id TEXT,
                 spec_title TEXT,
                 owner_pid INTEGER,
@@ -1089,6 +1114,7 @@ mod tests {
             error: Some("stale error".into()),
             attempt_count: 3,
             verification_results: Some(r#"[{"check":"test","passed":false}]"#.into()),
+            read_only: false,
             task_context_json: None,
             acceptance_criteria_json: None,
             spec_req_id: None,

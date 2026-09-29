@@ -42,6 +42,11 @@ struct DelegatedTask {
     #[serde(default)]
     dependencies: Vec<String>,
     acceptance_criteria: Vec<String>,
+    /// β (2026-09-28): the caller explicitly declares this task read-only. It is
+    /// the ONLY thing that makes a subagent's turn review-only — a brief whose
+    /// wording merely says "don't edit" keeps write capability.
+    #[serde(default)]
+    read_only: bool,
 }
 
 pub fn definition() -> ToolDefinition {
@@ -73,6 +78,10 @@ pub fn definition() -> ToolDefinition {
                                     "minItems": 1,
                                     "items": { "type": "string" },
                                     "description": "Machine-checkable or observable done conditions"
+                                },
+                                "read_only": {
+                                    "type": "boolean",
+                                    "description": "Set true ONLY when this task must not modify any file. The subagent then runs review-only: it can still read files and run the project's tests, but no wording of yours can grant it write access. Omit or set false for normal implementation work."
                                 }
                             },
                             "required": ["id", "title", "description", "dependencies", "acceptance_criteria"],
@@ -246,6 +255,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 verification_results: None,
                 task_context_json: Some(task_context_json.clone()),
                 acceptance_criteria_json: Some(serde_json::to_string(&task.acceptance_criteria)?),
+                read_only: task.read_only,
                 spec_req_id: None,
                 spec_title: None,
             },
@@ -318,6 +328,7 @@ mod tests {
             description: format!("Implement {id}"),
             dependencies: dependencies.iter().map(|value| (*value).into()).collect(),
             acceptance_criteria: vec![format!("{id} test passes")],
+            read_only: false,
         }
     }
 
