@@ -82,13 +82,16 @@ test("the formal smoke owns the capability-reactivation oracle", async () => {
   ]);
   for (const required of [
     "reclassify_synthetic_technical_handbacks",
-    "seed_legacy_exhausted_state",
+    "seed_legacy_suspended_objective",
     "durable_state_snapshot",
     "legacy_incident_converged_to_failed",
+    "legacy_convergence_provider_requests",
     "convergence_notice_count",
     "incident_status",
     "session_order_preserved",
     "second_restart_mutations",
+    "replay_call_link_count",
+    "provider_requests_after_resume",
     "capability_revision",
     "executed_recovery_attempts",
   ]) {
