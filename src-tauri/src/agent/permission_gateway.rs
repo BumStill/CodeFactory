@@ -385,7 +385,7 @@ impl DesktopPermissionGateway {
              FROM objective_bindings binding
              JOIN objectives objective ON objective.id=binding.objective_id
              WHERE binding.resource_kind=? AND binding.resource_id=?
-               AND objective.status NOT IN ('completed','cancelled','legacy_orphan')
+               AND objective.status NOT IN ('completed','cancelled','failed','legacy_orphan')
              ORDER BY binding.resource_generation DESC LIMIT 2",
         )
         .bind(resource.0)

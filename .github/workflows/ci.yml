@@ -346,10 +346,16 @@ jobs:
           if ($smoke.human_prompt_count -ne 0) { throw "Recoverable work requested human input" }
           if ($smoke.side_effect_receipt_count -ne 1) { throw "Mutation receipt was duplicated" }
           if ($smoke.replay_call_link_count -ne 2) { throw "Both provider Tool calls did not resolve to one receipt" }
-          if ($smoke.objective_status -ne "completed") { throw "Recovered Objective did not complete" }
+          if ($smoke.objective_status -ne "completed") { throw "The interrupted task did not resume to completion on its own" }
+          if ($smoke.provider_request_count -lt 5) { throw "The resumed provider trajectory was incomplete" }
+          if (-not $smoke.legacy_incident_converged_to_failed) { throw "A legacy suspended Objective did not converge to the failed terminal" }
+          if ($smoke.convergence_notice_count -ne 1) { throw "The failed terminal did not publish exactly one summary" }
+          if ($smoke.incident_status -ne "resolved") { throw "The legacy incident was not closed" }
+          if ($smoke.legacy_convergence_provider_requests -ne 0) { throw "Legacy convergence performed provider work" }
+          if (-not $smoke.session_order_preserved) { throw "Startup convergence reordered the session" }
+          if ($smoke.second_restart_mutations -ne 0) { throw "A further restart mutated settled state" }
           if ($smoke.live_owner_count -ne 0) { throw "A live owner survived settlement" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "A remediation remained claimable" }
-          if ($smoke.provider_request_count -lt 5) { throw "The deterministic provider trajectory was incomplete" }
           if (-not $smoke.artifact_verified) { throw "The recovered workspace was not verified" }
           if (-not $smoke.cleanup_ok) { throw "The unattended smoke leaked isolated state" }
           Get-Content $receipt
@@ -376,9 +382,10 @@ jobs:
           if ($smoke.identity_revision_count -ne 1) { throw "Local head revision was not exactly once" }
           if (-not $smoke.canonical_parent_reconciled) { throw "Receipted child could not observe its canonical PR parent" }
           if ($smoke.canonical_parent_mutation_count -ne 0) { throw "Canonical-parent observation issued a mutation" }
-          if (-not $smoke.foreign_identity_parked) { throw "Foreign identity did not park" }
+          if (-not $smoke.foreign_identity_failed_closed) { throw "Foreign identity did not converge to the failed terminal" }
           if (-not $smoke.claim_epoch_plateau) { throw "Delivery claims did not plateau" }
-          if ($smoke.recovery_parked_event_count -ne 1) { throw "Parked incident was not singular" }
+          if ($smoke.objective_failed_event_count -ne 1) { throw "Objective failure event was not singular" }
+          if ($smoke.recovery_parked_event_count -ne 0) { throw "A retired parked incident was emitted" }
           if ($smoke.duplicate_remote_write_count -ne 0) { throw "Recovery duplicated a remote mutation" }
           if (-not $smoke.remote_head_unchanged) { throw "Foreign recovery changed the remote head" }
           if ($smoke.user_message_count -ne 1) { throw "Delivery recovery manufactured or lost user input" }
@@ -411,7 +418,7 @@ jobs:
           if ($smoke.explicit_cancel_count -ne 3) { throw "Session stop did not cancel every owned Objective" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "A cancelled remediation remained claimable" }
           if (-not $smoke.second_restart_stayed_cancelled) { throw "A cancelled Objective revived after the second restart" }
-          if (-not $smoke.system_incident_survived_two_restarts) { throw "A parked system incident became runnable after restart" }
+          if (-not $smoke.failed_terminal_survived_two_restarts) { throw "The failed terminal was revived after restart" }
           if (-not $smoke.cleanup_ok) { throw "Historical session smoke leaked isolated state" }
           Get-Content $receipt
 

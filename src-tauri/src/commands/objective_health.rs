@@ -403,7 +403,7 @@ async fn aggregate_health(
     let window_start_ms = now_ms.saturating_sub(HEALTH_WINDOW_MS);
     let open: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objectives
-         WHERE status NOT IN ('completed','cancelled','legacy_orphan')",
+         WHERE status NOT IN ('completed','cancelled','failed','legacy_orphan')",
     )
     .fetch_one(pool)
     .await?;

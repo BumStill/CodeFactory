@@ -16,8 +16,7 @@ mod smoke_process_tree;
 
 use crate::agent::events::{CollectingEventSink, EventSink};
 use crate::agent::objective::{
-    current_process_instance, ClaimedRemediation, DecisionRouter, ObjectiveStatus, ObjectiveStore,
-    RecoveryDomain, RouteSignal, MAX_SIGNATURE_RECOVERY_ATTEMPTS, RECOVERY_CAPABILITY_REVISION,
+    current_process_instance, ObjectiveStatus, ObjectiveStore, OBJECTIVE_INCIDENT_CONTROLLER,
     TECHNICAL_RECOVERY_EXHAUSTED,
 };
 use crate::agent::{AgentExecutionContext, AgentLoop, AgentMode, TurnCapability, UsageSurface};
@@ -40,6 +39,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
 const SESSION_ID: &str = "unattended-long-task-session";
+/// The legacy suspended Objective lives in its own session in the same database:
+/// E2E-001's main case must keep counting exactly one user turn, and the
+/// migration phase must not be able to hide inside it.
+const LEGACY_SESSION_ID: &str = "unattended-long-task-legacy-session";
+const LEGACY_INSTRUCTION: &str =
+    "把上一轮遗留的长任务收口：如果系统自己恢复不了，就给出一个明确的失败结论。";
 const ARTIFACT_CONTENT: &str = "durable-once\n";
 const USER_INSTRUCTION: &str = "实现这个长任务：创建 artifact.txt，内容必须精确为 durable-once 加换行；运行项目测试验证，然后完成。执行期间遇到可恢复故障或应用重启时不要询问我，也不要等待我回复继续。";
 
@@ -506,88 +511,143 @@ async fn wait_for_worker(
     }
 }
 
-async fn exhaust_claim_into_legacy_incident(
+/// Rebuild the on-disk shape a pre-#553 build left behind when system-owned
+/// recovery hit its ceiling: the Objective parks in `waiting_system` behind an
+/// open incident that only a capability bump could clear, nothing is left
+/// queued, and its chat turn still presents itself as running.
+///
+/// The current build no longer produces that state at all, so the smoke has to
+/// write it by hand. That is the point: a real user's database still holds rows
+/// like this, and the restart below has to prove the product converges them
+/// instead of leaving them parked forever.
+async fn seed_legacy_exhausted_state(
     pool: &sqlx::SqlitePool,
-    store: &ObjectiveStore,
-    owner: &str,
-    mut claim: ClaimedRemediation,
-) -> anyhow::Result<i64> {
-    let signature: String = sqlx::query_scalar(
-        "SELECT failure_signature FROM objective_remediations WHERE id=?",
+    objective_id: &str,
+    root_turn_id: &str,
+    suspended_at: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE objectives
+         SET status='waiting_system', decision_type='failed_internal',
+             failure_code=?, recovery_owner=?, resume_cursor=?, remediation_id=NULL,
+             next_observation_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
+             updated_at=?
+         WHERE id=?",
     )
-    .bind(&claim.remediation_id)
-    .fetch_one(pool)
+    .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+    .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+    .bind(root_turn_id)
+    .bind(suspended_at)
+    .bind(objective_id)
+    .execute(pool)
     .await?;
-    let mut executed_attempts = 0_i64;
-    loop {
-        if !store
-            .charge_claimed_remediation_attempt(
-                &claim.objective.id,
-                &claim.remediation_id,
-                owner,
-                claim.claim_epoch,
-            )
-            .await?
-        {
-            bail!("legacy recovery attempt lost its exact claim before execution");
-        }
-        executed_attempts += 1;
-        let permit = codefactory_agent_loop::tool::MutationPermit {
-            objective_id: claim.objective.id.clone(),
-            remediation_id: claim.remediation_id.clone(),
-            owner: owner.into(),
-            claim_epoch: claim.claim_epoch,
-            binding_id: claim.binding_id.clone(),
-            resource_generation: claim.resource_generation,
-        };
-        let decision = DecisionRouter::route(
-            &claim.objective,
-            RouteSignal::TechnicalFailure {
-                domain: RecoveryDomain::Chat,
-                failure_code: "provider_transport_failed_before_output".into(),
-                failure_signature: signature.clone(),
-                next_observation_at: chrono::Utc::now().timestamp_millis(),
-                resume_cursor: claim.objective.root_turn_id.clone(),
-            },
-        )?;
-        let current = store
-            .apply_claimed_decision(claim.objective.revision, decision, &permit)
-            .await?;
-        if current.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED) {
-            if executed_attempts != MAX_SIGNATURE_RECOVERY_ATTEMPTS {
-                bail!(
-                    "legacy recovery parked after {executed_attempts} executed attempts, expected {MAX_SIGNATURE_RECOVERY_ATTEMPTS}"
-                );
-            }
-            return Ok(executed_attempts);
-        }
-        let accelerated_now = chrono::Utc::now().timestamp_millis();
-        sqlx::query(
-            "UPDATE objective_remediations SET next_observation_at=?, updated_at=?
-             WHERE objective_id=? AND id=? AND status IN ('queued','waiting')",
-        )
-        .bind(accelerated_now)
-        .bind(accelerated_now)
-        .bind(&current.id)
-        .bind(current.remediation_id.as_deref())
+    sqlx::query(
+        "UPDATE chat_turn_state
+         SET status='waiting_system', next_action='await_system_recovery',
+             waiting_reason='await_system_recovery', terminal_reason=NULL
+         WHERE objective_id=? AND root_turn_id=?",
+    )
+    .bind(objective_id)
+    .bind(root_turn_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE objective_remediations SET status='cancelled', updated_at=?
+         WHERE objective_id=? AND status IN ('queued','waiting','claimed')",
+    )
+    .bind(suspended_at)
+    .bind(objective_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO objective_incidents
+         (id, objective_id, status, failure_code, owner, domain,
+          blocked_capability_revision, opened_at, updated_at)
+         VALUES (?, ?, 'open', ?, ?, 'chat', 0, ?, ?)",
+    )
+    .bind(format!("legacy-incident-{objective_id}"))
+    .bind(objective_id)
+    .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+    .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+    .bind(suspended_at)
+    .bind(suspended_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Everything a restart is allowed to move, as a comparable fingerprint, so the
+/// second restart can assert it moved *nothing* at all — across both the
+/// completed main Objective and the converged legacy one.
+async fn durable_state_snapshot(pool: &sqlx::SqlitePool) -> anyhow::Result<Vec<(String, i64)>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT 'objectives', COUNT(*) FROM objectives
+         UNION ALL SELECT 'objective_revision_sum', COALESCE(SUM(revision), 0) FROM objectives
+         UNION ALL SELECT 'completed_objectives', COUNT(*) FROM objectives WHERE status='completed'
+         UNION ALL SELECT 'failed_objectives', COUNT(*) FROM objectives WHERE status='failed'
+         UNION ALL SELECT 'session_messages', (
+           SELECT COUNT(*) FROM messages WHERE session_id IN (?, ?))
+         UNION ALL SELECT 'convergence_notices', (
+           SELECT COUNT(*) FROM messages
+            WHERE session_id IN (?, ?) AND id LIKE 'system-incident-%')
+         UNION ALL SELECT 'queued_remediations', (
+           SELECT COUNT(*) FROM objective_remediations
+            WHERE status IN ('queued','waiting','claimed'))
+         UNION ALL SELECT 'open_incidents', (
+           SELECT COUNT(*) FROM objective_incidents WHERE status='open')
+         ORDER BY 1",
+    )
+    .bind(SESSION_ID)
+    .bind(LEGACY_SESSION_ID)
+    .bind(SESSION_ID)
+    .bind(LEGACY_SESSION_ID)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Create the legacy suspended Objective through the real admission path, then
+/// stamp it into the pre-#553 shape. It is a *second* Objective in its own
+/// session inside the same database, so the migration phase cannot borrow any
+/// of E2E-001's main-case evidence.
+async fn seed_legacy_suspended_objective(
+    pool: &sqlx::SqlitePool,
+    project: &Path,
+    suspended_at: i64,
+) -> anyhow::Result<String> {
+    ensure_session(pool, LEGACY_SESSION_ID, "Unattended legacy smoke", project).await?;
+    let admission = crate::commands::chat::admit_headless_chat_turn(
+        pool,
+        LEGACY_SESSION_ID,
+        LEGACY_INSTRUCTION,
+    )
+    .await
+    .map_err(|error| anyhow!(error.to_string()))?;
+    seed_legacy_exhausted_state(
+        pool,
+        &admission.objective.id,
+        &admission.root_turn_id,
+        suspended_at,
+    )
+    .await?;
+    // The suspended session must look an hour stale, not "just touched now".
+    // With a fresh `updated_at` a stray write can land in the same millisecond
+    // and hide; pinned to the suspension time it reproduces on every platform.
+    sqlx::query("UPDATE sessions SET updated_at=? WHERE id=?")
+        .bind(suspended_at)
+        .bind(LEGACY_SESSION_ID)
         .execute(pool)
         .await?;
-        sqlx::query(
-            "UPDATE objectives SET next_observation_at=?, updated_at=?
-             WHERE id=? AND remediation_id=?",
-        )
-        .bind(accelerated_now)
-        .bind(accelerated_now)
-        .bind(&current.id)
-        .bind(current.remediation_id.as_deref())
+    // Its own message dates from the suspension as well. A message newer than
+    // the suspension would legitimately pull the sidebar time forward (that is
+    // what the boot-time activity backfill is for), and this phase is about the
+    // convergence itself, not about message activity.
+    sqlx::query("UPDATE messages SET created_at=? WHERE session_id=?")
+        .bind(suspended_at)
+        .bind(LEGACY_SESSION_ID)
         .execute(pool)
         .await?;
-        claim = store
-            .claim_due_remediations(owner, 1, 60_000)
-            .await?
-            .pop()
-            .ok_or_else(|| anyhow!("legacy recovery did not publish its next due remediation"))?;
-    }
+    Ok(admission.objective.id)
 }
 
 pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
@@ -635,6 +695,10 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
         phase_one.mark_reaped();
         process_observation.worker_reaped = true;
         process_observation.phase_one_exit_was_failure = !killed_status.success();
+        // The crash window closes before the replacement process is allowed to
+        // make any model call: phase one's provider work is measured here so the
+        // resumed trajectory below can be attributed correctly.
+        let provider_requests_after_phase_one = fixture.requests.load(Ordering::SeqCst);
 
         let db_url = format!("sqlite:{}", root.join("smoke.db").display());
         let before_pool = crate::storage::db::connect(&db_url).await?;
@@ -663,6 +727,12 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
             bail!("expected one durable receipt before restart, found {receipt_before}");
         }
 
+        // E2E-001's main case: the process was killed mid-task and the user
+        // never types anything again. The replacement process must adopt the
+        // crashed provider wait, replay the receipted tool calls onto the one
+        // durable receipt, and finish the task on its own. #553 rewrote much of
+        // this path, so it is asserted directly instead of being inferred from a
+        // recovery-ladder side effect.
         let mut phase_two = ManagedWorker::spawn(
             &root,
             &fixture.base_url,
@@ -678,33 +748,49 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
             bail!("phase-two worker exited {phase_two_status}");
         }
 
-        let parked_pool = crate::storage::db::connect(&db_url).await?;
-        let parked: (String, Option<String>, i64, i64) = sqlx::query_as(
+        // The main case must end completed, with the two replayed tool calls
+        // folded onto the one durable receipt — the exact promise of E2E-001.
+        let resumed_pool = crate::storage::db::connect(&db_url).await?;
+        let resumed: (String, Option<String>, i64) = sqlx::query_as(
             "SELECT objective.status, objective.failure_code,
-                    incident.blocked_capability_revision, incident.reactivation_count
-             FROM objectives objective
-             JOIN objective_incidents incident ON incident.objective_id=objective.id
-             WHERE objective.id=? AND incident.status='open'",
+                    (SELECT COUNT(*) FROM tool_recovery_call_links link
+                      JOIN side_effect_receipts receipt ON receipt.id=link.receipt_id
+                      WHERE receipt.objective_id=objective.id)
+             FROM objectives objective WHERE objective.id=?",
         )
         .bind(&before.0)
-        .fetch_one(&parked_pool)
+        .fetch_one(&resumed_pool)
         .await?;
-        let parked_claimable_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM objective_remediations
-             WHERE objective_id=? AND status IN ('queued','waiting','claimed')",
-        )
-        .bind(&before.0)
-        .fetch_one(&parked_pool)
-        .await?;
-        crate::storage::db::close_and_release_files(parked_pool).await;
-        if parked.0 != "waiting_system"
-            || parked.1.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED)
-            || parked.2 != 0
-            || parked.3 != 0
-            || parked_claimable_count != 0
-        {
-            bail!("phase-two did not leave one bounded legacy incident");
+        crate::storage::db::close_and_release_files(resumed_pool).await;
+        if resumed.0 != "completed" || resumed.2 != 2 {
+            bail!(
+                "the restart did not resume the interrupted task to completion: \
+                 status={}, failure_code={:?}, replay_call_links={}",
+                resumed.0,
+                resumed.1,
+                resumed.2
+            );
         }
+        let provider_requests_after_resume = fixture.requests.load(Ordering::SeqCst);
+
+        // Legacy cleanup is a *separate* Objective in the same database: the
+        // pre-#553 suspended shape a real user is still carrying, parked behind
+        // an open incident that only a capability bump could clear. It must
+        // converge without either restart doing any model work.
+        let suspended_at = chrono::Utc::now().timestamp_millis() - 3_600_000;
+        let (legacy_objective_id, legacy_session_updated_at_before) = {
+            let seed_pool = crate::storage::db::connect(&db_url).await?;
+            let objective_id =
+                seed_legacy_suspended_objective(&seed_pool, &project, suspended_at).await?;
+            let updated_at: String =
+                sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM sessions WHERE id=?")
+                    .bind(LEGACY_SESSION_ID)
+                    .fetch_one(&seed_pool)
+                    .await?;
+            crate::storage::db::close_and_release_files(seed_pool).await;
+            (objective_id, updated_at)
+        };
+        let legacy_requests_before = fixture.requests.load(Ordering::SeqCst);
 
         let mut phase_three = ManagedWorker::spawn(
             &root,
@@ -722,6 +808,126 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
         phase_three.mark_reaped();
         if !phase_three_status.success() {
             bail!("phase-three worker exited {phase_three_status}");
+        }
+
+        let converged_pool = crate::storage::db::connect(&db_url).await?;
+        let converged: (String, Option<String>, String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT objective.status, objective.failure_code, turn.status,
+                        turn.terminal_reason, turn.visible_final_kind
+                 FROM objectives objective
+                 JOIN chat_turn_state turn ON turn.objective_id=objective.id
+                 WHERE objective.id=?",
+            )
+            .bind(&legacy_objective_id)
+            .fetch_one(&converged_pool)
+            .await?;
+        let incident_status: String =
+            sqlx::query_scalar("SELECT status FROM objective_incidents WHERE objective_id=?")
+                .bind(&legacy_objective_id)
+                .fetch_one(&converged_pool)
+                .await?;
+        // The notice must be written once, and it must carry the moment the task
+        // was suspended — not the moment the app happened to start — so a task
+        // that stalled days ago does not resurface as today's news.
+        let settlement: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+               (SELECT COUNT(*) FROM messages message
+                 WHERE message.session_id=? AND message.id LIKE 'system-incident-%'),
+               (SELECT COUNT(*) FROM messages message
+                 WHERE message.session_id=? AND message.id LIKE 'system-incident-%'
+                   AND message.created_at=?),
+               (SELECT COUNT(*) FROM objective_remediations remediation
+                 WHERE remediation.objective_id=?
+                   AND remediation.status IN ('queued','waiting','claimed'))",
+        )
+        .bind(LEGACY_SESSION_ID)
+        .bind(LEGACY_SESSION_ID)
+        .bind(suspended_at)
+        .bind(&legacy_objective_id)
+        .fetch_one(&converged_pool)
+        .await?;
+        let session_updated_at_after: String =
+            sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM sessions WHERE id=?")
+                .bind(LEGACY_SESSION_ID)
+                .fetch_one(&converged_pool)
+                .await?;
+        let converged_snapshot = durable_state_snapshot(&converged_pool).await?;
+        crate::storage::db::close_and_release_files(converged_pool).await;
+
+        let legacy_convergence_provider_requests =
+            fixture.requests.load(Ordering::SeqCst) - legacy_requests_before;
+        let legacy_incident_converged_to_failed = converged.0 == "failed"
+            && converged.1.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
+            && converged.2 == "completed"
+            && converged.3.as_deref() == Some("objective_failed")
+            && converged.4.as_deref() == Some("assistant_final")
+            && incident_status == "resolved"
+            && settlement.0 == 1
+            && settlement.1 == 1
+            && settlement.2 == 0
+            && legacy_convergence_provider_requests == 0;
+        if !legacy_incident_converged_to_failed {
+            bail!(
+                "startup cleanup did not converge the legacy suspended Objective to the failed terminal: \
+                 status={}, failure_code={:?}, turn_status={}, terminal_reason={:?}, \
+                 visible_final_kind={:?}, incident={incident_status}, convergence_notices={}, \
+                 notices_carrying_the_suspension_time={}, queued_remediations={}, \
+                 legacy_provider_requests={legacy_convergence_provider_requests}",
+                converged.0,
+                converged.1,
+                converged.2,
+                converged.3,
+                converged.4,
+                settlement.0,
+                settlement.1,
+                settlement.2
+            );
+        }
+        let session_order_preserved = legacy_session_updated_at_before == session_updated_at_after;
+        if !session_order_preserved {
+            bail!(
+                "startup convergence reordered the legacy session: updated_at {legacy_session_updated_at_before} -> {session_updated_at_after}"
+            );
+        }
+
+        let mut phase_four = ManagedWorker::spawn(
+            &root,
+            &fixture.base_url,
+            4,
+            live_workers.clone(),
+            process_sweep.clone(),
+        )?;
+        let phase_four_status =
+            wait_for_worker(phase_four.child_mut(), "phase-four", Duration::from_secs(45)).await?;
+        phase_four.mark_reaped();
+        if !phase_four_status.success() {
+            bail!("phase-four worker exited {phase_four_status}");
+        }
+
+        // The last restart must be a genuine no-op: the completed main Objective
+        // stays completed, the converged legacy one stays failed, no second
+        // notice, no fresh remediation, no reordered session.
+        let second_pool = crate::storage::db::connect(&db_url).await?;
+        let second_restart_snapshot = durable_state_snapshot(&second_pool).await?;
+        let session_updated_at_second: String =
+            sqlx::query_scalar("SELECT CAST(updated_at AS TEXT) FROM sessions WHERE id=?")
+                .bind(LEGACY_SESSION_ID)
+                .fetch_one(&second_pool)
+                .await?;
+        crate::storage::db::close_and_release_files(second_pool).await;
+        let second_restart_mutations = converged_snapshot
+            .iter()
+            .zip(second_restart_snapshot.iter())
+            .filter(|(before_row, after_row)| before_row != after_row)
+            .count() as i64;
+        if second_restart_mutations != 0 {
+            bail!(
+                "a further restart mutated settled state: {converged_snapshot:?} -> {second_restart_snapshot:?}"
+            );
+        }
+        if session_updated_at_second != session_updated_at_after {
+            bail!("a further restart reordered the legacy session");
         }
 
         let pool = crate::storage::db::connect(&db_url).await?;
@@ -755,14 +961,6 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
                 .bind(&objective_id)
                 .fetch_one(&pool)
                 .await?;
-        let replay_call_link_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM tool_recovery_call_links link
-             JOIN side_effect_receipts receipt ON receipt.id=link.receipt_id
-             WHERE receipt.objective_id=?",
-        )
-        .bind(&objective_id)
-        .fetch_one(&pool)
-        .await?;
         let claimable_remediation_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objective_remediations remediation
              WHERE remediation.objective_id=?
@@ -778,10 +976,10 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
         .bind(SESSION_ID)
         .fetch_one(&pool)
         .await?;
-        let incident_reactivation: (String, String, i64, Option<i64>) = sqlx::query_as(
-            "SELECT status, reactivation_status, reactivation_count,
-                    last_reactivated_revision
-             FROM objective_incidents WHERE objective_id=?",
+        let replay_call_link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tool_recovery_call_links link
+             JOIN side_effect_receipts receipt ON receipt.id=link.receipt_id
+             WHERE receipt.objective_id=?",
         )
         .bind(&objective_id)
         .fetch_one(&pool)
@@ -801,6 +999,7 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
         .await?;
         crate::storage::db::close_and_release_files(pool).await;
 
+        let provider_request_count = fixture.requests.load(Ordering::SeqCst);
         let artifact_ok =
             std::fs::read_to_string(project.join("artifact.txt"))? == ARTIFACT_CONTENT;
         let same_objective = before.0 == objective_id && before.1 == root_turn_id;
@@ -815,15 +1014,32 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
             && objective_status == "completed"
             && live_owner_count == 0
             && claimable_remediation_count == 0
-            && incident_reactivation.0 == "resolved"
-            && incident_reactivation.1 == "admitted"
-            && incident_reactivation.2 == 1
-            && incident_reactivation.3 == Some(RECOVERY_CAPABILITY_REVISION)
-            && capability_revision == RECOVERY_CAPABILITY_REVISION
-            && executed_recovery_attempts == MAX_SIGNATURE_RECOVERY_ATTEMPTS
-            && fixture.requests.load(Ordering::SeqCst) >= 5;
+            && provider_requests_after_resume >= 5
+            && provider_request_count >= 5
+            && provider_request_count > provider_requests_after_phase_one
+            && legacy_incident_converged_to_failed
+            && legacy_convergence_provider_requests == 0
+            && second_restart_mutations == 0
+            && session_order_preserved;
         if !ok {
-            bail!("unattended smoke oracle rejected the recovered trajectory");
+            bail!(
+                "unattended smoke oracle rejected the resumed trajectory: \
+                 artifact_verified={artifact_ok}, same_objective={same_objective}, \
+                 phase_one_user_messages={}, user_message_count={user_message_count}, \
+                 human_prompt_count={human_prompt_count}, \
+                 side_effect_receipt_count={side_effect_receipt_count}, \
+                 replay_call_link_count={replay_call_link_count}, \
+                 objective_status={objective_status}, live_owner_count={live_owner_count}, \
+                 claimable_remediation_count={claimable_remediation_count}, \
+                 provider_requests_after_phase_one={provider_requests_after_phase_one}, \
+                 provider_requests_after_resume={provider_requests_after_resume}, \
+                 provider_requests_total={provider_request_count}, \
+                 legacy_converged_to_failed={legacy_incident_converged_to_failed}, \
+                 legacy_convergence_provider_requests={legacy_convergence_provider_requests}, \
+                 second_restart_mutations={second_restart_mutations}, \
+                 session_order_preserved={session_order_preserved}",
+                before.2
+            );
         }
         Ok(serde_json::json!({
             "ok": true,
@@ -834,11 +1050,12 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
             "phase_one_was_hard_killed": process_observation.supervisor_hard_kill_issued
                 && process_observation.worker_reaped
                 && process_observation.phase_one_exit_was_failure,
-            "legacy_incident_parked": true,
-            "incident_reactivated": incident_reactivation.1 == "admitted",
-            "incident_reactivation_count": incident_reactivation.2,
-            "capability_revision": capability_revision,
-            "executed_recovery_attempts": executed_recovery_attempts,
+            "legacy_incident_converged_to_failed": legacy_incident_converged_to_failed,
+            "legacy_convergence_provider_requests": legacy_convergence_provider_requests,
+            "convergence_notice_count": settlement.0,
+            "incident_status": incident_status,
+            "session_order_preserved": session_order_preserved,
+            "second_restart_mutations": second_restart_mutations,
             "same_objective": same_objective,
             "user_message_count": user_message_count,
             "human_prompt_count": human_prompt_count,
@@ -847,7 +1064,11 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
             "objective_status": objective_status,
             "live_owner_count": live_owner_count,
             "claimable_remediation_count": claimable_remediation_count,
-            "provider_request_count": fixture.requests.load(Ordering::SeqCst),
+            "provider_request_count": provider_request_count,
+            "provider_requests_after_phase_one": provider_requests_after_phase_one,
+            "provider_requests_after_resume": provider_requests_after_resume,
+            "executed_recovery_attempts": executed_recovery_attempts,
+            "capability_revision": capability_revision,
             "artifact_verified": artifact_ok,
             "cleanup_ok": false
         }))
@@ -901,16 +1122,22 @@ pub(crate) async fn run_parent() -> UnattendedSmokeRunOutcome {
     UnattendedSmokeRunOutcome { receipt, error }
 }
 
-async fn ensure_session(pool: &sqlx::SqlitePool, project: &Path) -> anyhow::Result<()> {
+async fn ensure_session(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    title: &str,
+    project: &Path,
+) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
     sqlx::query(
         "INSERT OR IGNORE INTO sessions
          (id, title, cwd, model_id, endpoint_id, model_policy,
           permission_mode, created_at, updated_at)
-         VALUES (?, 'Unattended smoke', ?, 'smoke-model', 'smoke-endpoint',
+         VALUES (?, ?, ?, 'smoke-model', 'smoke-endpoint',
                  'fixed', 'trusted', ?, ?)",
     )
-    .bind(SESSION_ID)
+    .bind(session_id)
+    .bind(title)
     .bind(project.to_string_lossy().as_ref())
     .bind(now)
     .bind(now)
@@ -956,7 +1183,7 @@ pub(crate) async fn run_worker(state_dir: &Path, base_url: &str, phase: u8) -> a
     let project = state_dir.join("project");
     let db_url = format!("sqlite:{}", state_dir.join("smoke.db").display());
     let pool = crate::storage::db::connect(&db_url).await?;
-    ensure_session(&pool, &project).await?;
+    ensure_session(&pool, SESSION_ID, "Unattended smoke", &project).await?;
 
     if phase == 1 {
         let admission =
@@ -974,14 +1201,17 @@ pub(crate) async fn run_worker(state_dir: &Path, base_url: &str, phase: u8) -> a
         let _never_returns_before_parent_kill = agent.run(history).await?;
         bail!("phase-one worker reached a terminal outcome before injected crash")
     }
-    if phase != 2 && phase != 3 {
+    if phase != 2 && phase != 3 && phase != 4 {
         bail!("unknown unattended worker phase {phase}");
     }
 
     let store = ObjectiveStore::new(pool.clone());
     let process_instance = current_process_instance();
     let owner = format!("unattended-smoke:{process_instance}");
-    let mut claims = if phase == 2 {
+
+    if phase == 2 {
+        // E2E-001 main case: adopt the crashed provider wait and finish the task
+        // without a capability bump, a second user turn, or an exhausted ladder.
         let stale_runs = store
             .reconcile_stale_chat_run_controls(&process_instance)
             .await?;
@@ -993,100 +1223,121 @@ pub(crate) async fn run_worker(state_dir: &Path, base_url: &str, phase: u8) -> a
             .await?;
         if stale_runs != 1 || provider_recoveries != 1 || stale_objectives != 0 {
             bail!(
-                "restart reconciliation expected run/provider/generic 1/1/0, observed {stale_runs}/{provider_recoveries}/{stale_objectives}"
+                "resume restart expected run/provider/generic 1/1/0, observed {stale_runs}/{provider_recoveries}/{stale_objectives}"
             );
         }
-        store.claim_due_remediations(&owner, 1, 60_000).await?
-    } else {
-        store.sync_recovery_capabilities().await?;
-        let reactivated = store.reactivate_eligible_incidents(1).await?;
-        if reactivated.len() != 1 {
+        let mut claims = store.claim_due_remediations(&owner, 1, 60_000).await?;
+        let claim = claims
+            .pop()
+            .ok_or_else(|| anyhow!("resume restart produced no claimable remediation"))?;
+        if !claims.is_empty() || claim.objective.status != ObjectiveStatus::WaitingSystem {
+            bail!("resume restart produced an ambiguous claim set");
+        }
+        crate::agent::objective_supervisor::require_provider_resume_evidence(
+            &pool,
+            &claim.objective.id,
+            false,
+        )
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
+        if !store
+            .charge_claimed_remediation_attempt(
+                &claim.objective.id,
+                &claim.remediation_id,
+                &owner,
+                claim.claim_epoch,
+            )
+            .await?
+        {
+            bail!("resumed recovery lost its exact claim before execution");
+        }
+        let permit = codefactory_agent_loop::tool::MutationPermit {
+            objective_id: claim.objective.id.clone(),
+            remediation_id: claim.remediation_id.clone(),
+            owner: owner.clone(),
+            claim_epoch: claim.claim_epoch,
+            binding_id: claim.binding_id.clone(),
+            resource_generation: claim.resource_generation,
+        };
+        let root_turn_id = claim
+            .objective
+            .root_turn_id
+            .clone()
+            .ok_or_else(|| anyhow!("claimed chat Objective has no root turn"))?;
+        let history = crate::storage::load_agent_history(&pool, SESSION_ID).await?;
+        let mut agent = build_agent(pool.clone(), project, base_url, Some(permit.clone()));
+        let outcome = agent.run(history).await?;
+        let settled = crate::commands::chat::settle_headless_chat_objective_from_outcome(
+            &pool,
+            &claim.objective.id,
+            claim.objective.revision,
+            &root_turn_id,
+            &outcome,
+            Some(&permit),
+        )
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
+        if settled.status != ObjectiveStatus::Completed {
             bail!(
-                "new recovery capability reactivated {} incidents instead of one",
-                reactivated.len()
+                "the resumed Objective settled as {} (failure_code={:?}, stop_reason={:?}, final_text={:?})",
+                settled.status.as_str(),
+                settled.failure_code,
+                outcome.stop_reason,
+                outcome.final_text
             );
         }
-        store.claim_due_remediations(&owner, 1, 60_000).await?
-    };
-    let claim = claims
-        .pop()
-        .ok_or_else(|| anyhow!("restart reconciliation produced no claimable remediation"))?;
-    if !claims.is_empty() || claim.objective.status != ObjectiveStatus::WaitingSystem {
-        bail!("restart reconciliation produced an ambiguous claim set");
-    }
-    if phase == 2 {
-        let executed_attempts =
-            exhaust_claim_into_legacy_incident(&pool, &store, &owner, claim).await?;
-        if executed_attempts != MAX_SIGNATURE_RECOVERY_ATTEMPTS {
-            bail!("phase-two did not consume the exact executable recovery budget");
+        let remaining = store.claim_due_remediations(&owner, 8, 60_000).await?;
+        if !remaining.is_empty() {
+            bail!(
+                "the completed resume left {} claimable remediation(s)",
+                remaining.len()
+            );
         }
         crate::storage::db::close_and_release_files(pool).await;
         return Ok(());
     }
-    crate::agent::objective_supervisor::require_provider_resume_evidence(
-        &pool,
-        &claim.objective.id,
-        false,
-    )
-    .await
-    .map_err(|error| anyhow!(error.to_string()))?;
-    if !store
-        .charge_claimed_remediation_attempt(
-            &claim.objective.id,
-            &claim.remediation_id,
-            &owner,
-            claim.claim_epoch,
-        )
-        .await?
-    {
-        bail!("reactivated recovery lost its exact claim before execution");
-    }
-    let permit = codefactory_agent_loop::tool::MutationPermit {
-        objective_id: claim.objective.id.clone(),
-        remediation_id: claim.remediation_id.clone(),
-        owner: owner.clone(),
-        claim_epoch: claim.claim_epoch,
-        binding_id: claim.binding_id.clone(),
-        resource_generation: claim.resource_generation,
-    };
-    let root_turn_id = claim
-        .objective
-        .root_turn_id
-        .clone()
-        .ok_or_else(|| anyhow!("claimed chat Objective has no root turn"))?;
-    let history = crate::storage::load_agent_history(&pool, SESSION_ID).await?;
-    let mut agent = build_agent(pool.clone(), project, base_url, Some(permit.clone()));
-    let outcome = agent.run(history).await?;
-    let settled = crate::commands::chat::settle_headless_chat_objective_from_outcome(
-        &pool,
-        &claim.objective.id,
-        claim.objective.revision,
-        &root_turn_id,
-        &outcome,
-        Some(&permit),
-    )
-    .await
-    .map_err(|error| anyhow!(error.to_string()))?;
-    if settled.status != ObjectiveStatus::Completed {
-        let durable_trace: Vec<(String, String, String, i64)> = sqlx::query_as(
-            "SELECT 'receipt', binding_id, action_fingerprint, revision
-             FROM side_effect_receipts WHERE objective_id=?
-             UNION ALL
-             SELECT 'tool_call', COALESCE(binding_id, ''),
-                    COALESCE(action_signature, ''), COALESCE(resource_generation, 0)
-             FROM tool_calls WHERE objective_id=? ORDER BY 1, 2, 3",
-        )
-        .bind(&claim.objective.id)
-        .bind(&claim.objective.id)
-        .fetch_all(&pool)
+
+    // Phases three and four: the legacy suspended Objective. This mirrors the
+    // production startup order in `lib.rs` — stale runs, reclassify the
+    // exhausted ceiling, refresh capabilities, then recovery admission — so the
+    // convergence is asserted on the real startup path, and the *next* restart
+    // proves the settled result is inert.
+    let stale_runs = store
+        .reconcile_stale_chat_run_controls(&process_instance)
         .await?;
+    let reclassified = store.reclassify_synthetic_technical_handbacks().await?;
+    store.sync_recovery_capabilities().await?;
+    // A settled failure terminal must never be adopted here: the ceiling stays
+    // closed even when a capability bump arrives. That is the inverse of the
+    // retired "incident_reactivated" evidence, and a stricter one.
+    let reactivated = store.reactivate_eligible_incidents(32).await?;
+    let provider_recoveries =
+        crate::agent::objective_supervisor::reconcile_provider_recovery_on_startup(&pool).await?;
+    let stale_objectives = store
+        .reconcile_stale_active_objectives(&process_instance)
+        .await?;
+    if !reactivated.is_empty() {
         bail!(
-            "recovered Objective settled as {} (failure_code={:?}, stop_reason={:?}, final_text={:?}, evidence={:?}, durable_trace={durable_trace:?})",
-            settled.status.as_str(),
-            settled.failure_code,
-            outcome.stop_reason,
-            outcome.final_text,
-            outcome.completion_evidence
+            "a restart reactivated {} settled failure terminal(s)",
+            reactivated.len()
+        );
+    }
+    if stale_objectives != 0 {
+        bail!("restart reconciliation adopted {stale_objectives} live objectives");
+    }
+    if phase == 3 && reclassified != 1 {
+        bail!(
+            "convergence restart expected exactly one reclassified ceiling, observed {reclassified} (runs/stale/provider/generic {stale_runs}/{stale_objectives}/{provider_recoveries})"
+        );
+    }
+    if phase == 4 && reclassified != 0 {
+        bail!("the no-op restart reclassified {reclassified} ceiling(s) a second time");
+    }
+    let claims = store.claim_due_remediations(&owner, 8, 60_000).await?;
+    if !claims.is_empty() {
+        bail!(
+            "settled failed terminal published {} claimable remediation(s)",
+            claims.len()
         );
     }
     crate::storage::db::close_and_release_files(pool).await;

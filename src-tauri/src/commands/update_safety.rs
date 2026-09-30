@@ -125,14 +125,15 @@ impl UpdateSafetyStatus {
 
 #[cfg(test)]
 async fn count_nonterminal_objectives(pool: &sqlx::SqlitePool) -> Result<i64, sqlx::Error> {
-    // Keep this aligned with ObjectiveStatus::is_terminal: waiting states are
-    // durable resumable work, not completion, and must survive before restart.
-    sqlx::query_scalar(
+    // Kept in step with ObjectiveStatus::is_terminal by construction: waiting
+    // states are durable resumable work, not completion, and must survive a
+    // restart — while a `failed` terminal is finished and must not.
+    let sql = format!(
         "SELECT COUNT(*) FROM objectives
-         WHERE status NOT IN ('completed', 'cancelled')",
-    )
-    .fetch_one(pool)
-    .await
+         WHERE status NOT IN ({})",
+        crate::agent::objective::ObjectiveStatus::TERMINAL_SQL
+    );
+    sqlx::query_scalar(&sql).fetch_one(pool).await
 }
 
 fn objective_owner(row: &sqlx::sqlite::SqliteRow) -> Result<String, sqlx::Error> {
@@ -971,7 +972,7 @@ pub(crate) async fn ensure_update_objective(
          FROM objectives objective
          JOIN objective_bindings binding ON binding.objective_id=objective.id
          WHERE objective.domain='update'
-           AND objective.status NOT IN ('completed','cancelled','legacy_orphan')
+           AND objective.status NOT IN ('completed','cancelled','failed','legacy_orphan')
            AND binding.domain='update' AND binding.resource_kind=?
          ORDER BY objective.created_at, objective.id LIMIT 1",
     )

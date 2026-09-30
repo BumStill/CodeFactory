@@ -1895,7 +1895,7 @@ async fn validate_scope(
     let objective_matches: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objectives
          WHERE id=? AND revision=?
-           AND status NOT IN ('completed','cancelled','legacy_orphan')",
+           AND status NOT IN ('completed','cancelled','failed','legacy_orphan')",
     )
     .bind(&scope.objective_id)
     .bind(scope.objective_revision)
@@ -1928,7 +1928,7 @@ async fn scope_is_authoritative(
          FROM objectives objective
          JOIN objective_bindings binding ON binding.objective_id=objective.id
          WHERE objective.id=? AND objective.revision=?
-           AND objective.status NOT IN ('completed','cancelled','legacy_orphan')
+           AND objective.status NOT IN ('completed','cancelled','failed','legacy_orphan')
            AND binding.id=? AND binding.resource_generation=?",
     )
     .bind(&scope.objective_id)

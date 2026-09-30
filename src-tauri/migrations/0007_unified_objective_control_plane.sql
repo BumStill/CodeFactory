@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS objectives (
     status                   TEXT NOT NULL CHECK(status IN (
                                  'active', 'waiting_system', 'waiting_core_input',
                                  'waiting_authorization', 'waiting_business_decision',
-                                 'completed', 'cancelled', 'legacy_orphan')),
+                                 'completed', 'cancelled', 'failed', 'legacy_orphan')),
     decision_type            TEXT NOT NULL CHECK(decision_type IN (
                                  'continue', 'waiting', 'apply_recommended',
                                  'platform_incident', 'failed_internal',

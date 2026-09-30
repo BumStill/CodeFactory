@@ -246,7 +246,7 @@ impl Persistence for SqlitePersistence {
                AND NOT EXISTS (
                  SELECT 1 FROM objectives objective
                  WHERE objective.id=chat_turn_state.objective_id
-                   AND objective.status IN ('completed','cancelled')
+                   AND objective.status IN ('completed','cancelled','failed')
                )",
         )
         .bind(&update.phase)

@@ -48,18 +48,18 @@ describe("TurnProgress", () => {
   });
 
   it("renders a waiting reason as human text and never as the raw internal code", () => {
-    const stopped: TurnPlan = { ...plan, waitingReason: "technical_recovery_exhausted" };
+    const stopped: TurnPlan = { ...plan, waitingReason: "objective_failed" };
     render(
       <TurnProgress plan={stopped} timingProfile={timing} externalJobs={[]} elapsedMs={90_000} />,
     );
 
     const banner = screen.getByTestId("turn-progress");
-    expect(banner).not.toHaveTextContent("technical_recovery_exhausted");
-    expect(banner).toHaveTextContent(/自动恢复/);
+    expect(banner).not.toHaveTextContent("objective_failed");
+    expect(banner).toHaveTextContent(/这件事没做成/);
   });
 
   it("stops quoting a remaining time once the turn is no longer running", () => {
-    const stopped: TurnPlan = { ...plan, waitingReason: "technical_recovery_exhausted" };
+    const stopped: TurnPlan = { ...plan, waitingReason: "objective_failed" };
     render(
       <TurnProgress plan={stopped} timingProfile={timing} externalJobs={[]} elapsedMs={90_000} />,
     );

@@ -1695,7 +1695,7 @@ async fn permit_is_current(
                  JOIN objective_bindings b ON b.id=? AND b.objective_id=o.id
                  JOIN objective_remediations r ON r.id=? AND r.objective_id=o.id
                  WHERE o.id=? AND o.revision=?
-                   AND o.status NOT IN ('completed', 'cancelled', 'legacy_orphan')
+                   AND o.status NOT IN ('completed', 'cancelled', 'failed', 'legacy_orphan')
                    AND o.remediation_id=r.id
                    AND o.lease_owner=? AND o.lease_expires_at>?
                    AND b.resource_generation=?

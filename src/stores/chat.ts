@@ -1786,6 +1786,10 @@ export function dbMessagesToUI(
       lastProgressAt: activity.last_progress_at ?? null,
     };
     if (
+      activity.terminal_reason === "objective_failed" ||
+      activity.recent_activity_kind === "objective_failed" ||
+      // Historical rows written before the honest failure terminal landed
+      // still need their transient tools settled.
       activity.terminal_reason === "technical_recovery_exhausted" ||
       activity.recent_activity_kind === "technical_recovery_exhausted"
     ) {

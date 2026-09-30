@@ -14,6 +14,10 @@ use crate::errors::Result;
 
 const NON_TERMINAL_PREDICATE: &str =
     "status NOT IN ('completed', 'failed', 'cancelled', 'rejected')";
+/// The complement of [`NON_TERMINAL_PREDICATE`]: a run in one of these states has
+/// finished and can be superseded rather than treated as a live owner.
+const TERMINAL_STATUS_PREDICATE: &str =
+    "status IN ('completed', 'failed', 'cancelled', 'rejected')";
 pub(crate) const MAX_IDENTICAL_TAKEOVER_FAILURES: i64 = 2;
 const STABLE_IDENTITY_PREDICATE: &str = "(
     objective_id IS NOT NULL AND objective_id <> ''
@@ -859,18 +863,64 @@ pub async fn create_delivery_run(
     .fetch_one(&mut *tx)
     .await?;
     if objectives_exist == 1 {
-        let linked = sqlx::query(
+        // A pointer that already names a *terminal* run is a finished attempt,
+        // not a live owner: the honest-failure terminal leaves exactly such a row
+        // behind, and the user's next "把这些改动交付" must be able to start a new
+        // run on the same workspace and branch. A non-terminal pointer still fails
+        // closed — two writable runs on one Objective is what this check exists to
+        // prevent.
+        let previous_pointer: Option<String> =
+            sqlx::query_scalar("SELECT delivery_run_id FROM objectives WHERE id=?")
+                .bind(&run.objective_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+        let previous_is_terminal = match previous_pointer.as_deref() {
+            Some(previous_id) => {
+                sqlx::query_scalar::<_, i64>(&format!(
+                    "SELECT COUNT(*) FROM delivery_runs WHERE id=? AND {TERMINAL_STATUS_PREDICATE}"
+                ))
+                .bind(previous_id)
+                .fetch_one(&mut *tx)
+                .await?
+                    == 1
+            }
+            None => false,
+        };
+        let linked = sqlx::query(&format!(
             "UPDATE objectives
              SET delivery_run_id=?, updated_at=?
-             WHERE id=? AND status IN ('active','waiting_system')
-               AND (delivery_run_id IS NULL OR delivery_run_id=?)",
-        )
+             WHERE id=? AND status NOT IN ('completed','cancelled','legacy_orphan')
+               AND (delivery_run_id IS NULL OR delivery_run_id=?
+                    OR EXISTS (
+                      SELECT 1 FROM delivery_runs previous
+                      WHERE previous.id=objectives.delivery_run_id
+                        AND {TERMINAL_STATUS_PREDICATE}))"
+        ))
         .bind(&run.id)
         .bind(now)
         .bind(&run.objective_id)
         .bind(&run.id)
         .execute(&mut *tx)
         .await?;
+        if linked.rows_affected() == 1
+            && previous_is_terminal
+            && previous_pointer.as_deref() != Some(run.id.as_str())
+        {
+            insert_mutation_intent_event(
+                &mut tx,
+                &run.id,
+                "delivery_run_supersedes_terminal_run",
+                &serde_json::json!({
+                    "previous_run_id": previous_pointer,
+                    "reason": "previous_delivery_run_is_terminal",
+                })
+                .to_string(),
+                &process.instance_id,
+                now,
+            )
+            .await?;
+        }
         if linked.rows_affected() != 1 {
             return Err(crate::errors::AppError::Other(format!(
                 "durable DeliveryRun pointer conflict for Objective {}; run creation rolled back before external mutation",
@@ -4179,7 +4229,8 @@ mod tests {
                 recovery_owner TEXT,
                 remediation_id TEXT,
                 next_observation_at INTEGER,
-                requires_user_action INTEGER NOT NULL DEFAULT 0
+                requires_user_action INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
             )",
         )
         .execute(&pool)
@@ -4235,6 +4286,198 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, (0, None, None));
+    }
+
+    /// S4: a failed Objective leaves a terminal, lease-free DeliveryRun behind
+    /// (authority revoked in the same transaction). That row must not fence the
+    /// branch: "把这些改动交付" creates a new run on the same worktree and head
+    /// branch, it owns the only writable lease, and it can begin a mutation
+    /// intent — while the terminal row stays exactly where it is.
+    #[tokio::test]
+    async fn a_failed_delivery_run_does_not_block_a_new_run_on_the_same_branch() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                delivery_run_id TEXT,
+                status TEXT NOT NULL,
+                failure_code TEXT,
+                recovery_owner TEXT,
+                remediation_id TEXT,
+                next_observation_at INTEGER,
+                requires_user_action INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_recovery_fixture(
+            &pool,
+            "failed-run",
+            Some("session-s4"),
+            Some("turn-s4"),
+            "running",
+            10,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE delivery_runs
+             SET status='failed', stage='failed', lease_owner=NULL, lease_expires_at=NULL,
+                 next_action=NULL, next_action_authorized=0,
+                 reconciled_claim_epoch=claim_epoch
+             WHERE id='failed-run'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives (
+                id, delivery_run_id, status, failure_code, recovery_owner,
+                remediation_id, next_observation_at, requires_user_action
+             ) VALUES (
+                'objective-opaque-failed-run', 'failed-run', 'failed',
+                'technical_recovery_exhausted', 'objective-incident-controller', NULL, NULL, 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A second, still-live run proves the plan below really does claim
+        // eligible rows, so an empty claim set is a verdict and not a no-op.
+        insert_recovery_fixture(
+            &pool,
+            "live-run",
+            Some("session-s4-live"),
+            Some("turn-s4-live"),
+            "running",
+            10,
+        )
+        .await;
+        sqlx::query("UPDATE delivery_runs SET next_action_authorized=1 WHERE id='live-run'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let plan = plan_startup_recovery(
+            &pool,
+            &ProcessIdentity::new("process-new", "1.81.58", "18158"),
+            100,
+            30,
+        )
+        .await
+        .unwrap();
+        let claimed: Vec<&str> = plan.claimed.iter().map(|run| run.run_id.as_str()).collect();
+        assert_eq!(
+            claimed,
+            vec!["live-run"],
+            "a terminal failure must not be recovered or re-parked, while live work still is"
+        );
+        let unchanged: (String, Option<String>, Option<String>, i64) = sqlx::query_as(
+            "SELECT status, lease_owner, next_action, next_action_authorized
+             FROM delivery_runs WHERE id='failed-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, ("failed".into(), None, None, 0));
+
+        let process = ProcessIdentity::new("process-new", "1.81.58", "18158");
+        create_delivery_run(
+            &pool,
+            &NewDeliveryRun {
+                id: "retry-run".into(),
+                objective_id: "objective-opaque-failed-run".into(),
+                run_kind: "chat_delivery".into(),
+                session_id: Some("session-s4".into()),
+                root_turn_id: Some("turn-s4".into()),
+                task_segment_id: None,
+                task_id: None,
+                workspace_path: "/workspace".into(),
+                worktree_identity: "worktree:fixture".into(),
+                repo_identity: "example.invalid/repo".into(),
+                base_branch: "main".into(),
+                head_branch: "feature".into(),
+                change_set_digest: "digest".into(),
+                expected_head_sha: "abc".into(),
+                canonical_pr_number: None,
+                canonical_pr_url: None,
+                canonical_head_sha: None,
+                requested_ceiling: "through_release".into(),
+                reached_ceiling: "local".into(),
+                stage: "deliver".into(),
+                status: "running".into(),
+                wait_class: Some("recoverable".into()),
+                next_action: Some("observe_remote".into()),
+                next_action_authorized: false,
+                autonomous_completion: true,
+            },
+            &process,
+            100,
+            30,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE delivery_runs SET reconciled_claim_epoch=claim_epoch WHERE id='retry-run'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let claim_epoch: i64 =
+            sqlx::query_scalar("SELECT claim_epoch FROM delivery_runs WHERE id='retry-run'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let mutatable = begin_delivery_mutation_intent(
+            &pool,
+            "retry-intent",
+            "retry-run",
+            &process,
+            claim_epoch,
+            "push",
+            "operation-retry",
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(
+            mutatable,
+            "the new run must be able to mutate on the branch the failed run used"
+        );
+        let writable: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_runs
+             WHERE objective_id='objective-opaque-failed-run'
+               AND status NOT IN ('completed','failed','cancelled','rejected')
+               AND lease_owner IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(writable, 1, "exactly one run may be mutation-capable");
+        let pointer: String = sqlx::query_scalar(
+            "SELECT delivery_run_id FROM objectives WHERE id='objective-opaque-failed-run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pointer, "retry-run",
+            "the new attempt takes over the Objective pointer from the failed run"
+        );
+        let superseded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_run_events
+             WHERE run_id='retry-run' AND event_kind='delivery_run_supersedes_terminal_run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            superseded, 1,
+            "replacing a terminal run is audited, never silent"
+        );
     }
 
     #[tokio::test]
@@ -4953,7 +5196,8 @@ mod tests {
                 recovery_owner TEXT,
                 remediation_id TEXT,
                 next_observation_at INTEGER,
-                requires_user_action INTEGER NOT NULL DEFAULT 0
+                requires_user_action INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
             )",
         )
         .execute(&pool)
