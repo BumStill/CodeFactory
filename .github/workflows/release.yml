@@ -478,9 +478,10 @@ jobs:
           if ($smoke.identity_revision_count -ne 1) { throw "Release revised delivery identity more than once" }
           if (-not $smoke.canonical_parent_reconciled) { throw "Release could not reconcile the canonical PR parent" }
           if ($smoke.canonical_parent_mutation_count -ne 0) { throw "Release canonical-parent observation issued a mutation" }
-          if (-not $smoke.foreign_identity_parked) { throw "Release did not park foreign identity drift" }
+          if (-not $smoke.foreign_identity_failed_closed) { throw "Release foreign identity did not converge to the failed terminal" }
           if (-not $smoke.claim_epoch_plateau) { throw "Release delivery claim epoch did not plateau" }
-          if ($smoke.recovery_parked_event_count -ne 1) { throw "Release emitted duplicate parked incidents" }
+          if ($smoke.objective_failed_event_count -ne 1) { throw "Release objective failure event was not singular" }
+          if ($smoke.recovery_parked_event_count -ne 0) { throw "Release emitted a retired parked incident" }
           if ($smoke.duplicate_remote_write_count -ne 0) { throw "Release recovery duplicated a remote mutation" }
           if (-not $smoke.remote_head_unchanged) { throw "Release foreign recovery changed the remote" }
           if ($smoke.user_message_count -ne 1) { throw "Release recovery manufactured or lost user input" }
