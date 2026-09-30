@@ -19,6 +19,7 @@
 //   2. Entering an existing conversation happens ONE way: clicking its row.
 //      Clicking a folder expands it, nothing more.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { sessionAccessibleName } from "../lib/sessionLabel";
 import {
   Plus,
   Folder,
@@ -418,7 +419,7 @@ function SessionRow({
         ) : (
           <button
             type="button"
-            aria-label={`打开会话 ${title}`}
+            aria-label={`打开会话 ${sessionAccessibleName(title, session.id, session.updated_at)}`}
             aria-current={active ? "page" : undefined}
             title={`${title} · 双击标题可重命名`}
             onClick={onClick}

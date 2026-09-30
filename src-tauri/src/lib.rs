@@ -16,6 +16,8 @@ mod git_remote;
 mod http_util;
 mod knowledge;
 mod mcp;
+mod menu;
+mod menu_spec;
 mod notify;
 mod openrouter;
 mod panic_log;
@@ -1361,6 +1363,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // 菜单栏点击统一在这里翻译成前端事件:原生侧只发信封,具体行为由前端
+        // 走和界面按钮完全相同的那条代码路径。
+        .on_menu_event(|app, event| {
+            crate::menu::handle_menu_event(app, event.id().as_ref());
+        })
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("app data dir unavailable");
             std::fs::create_dir_all(&data_dir)?;
@@ -1369,6 +1376,12 @@ pub fn run() {
             // `panic = "abort"` leaves a crash report that names no symbols and
             // a message on a stderr nobody reads (v1.78.6, 2026-08-10).
             crate::panic_log::install(&data_dir);
+
+            // 原生菜单栏:「会话」菜单。菜单栏是唯一在窗口不活动时依然可靠的
+            // 原生命令通道,也是后台无障碍操作的入口。
+            if let Err(error) = crate::menu::install(app.handle()) {
+                tracing::warn!("session menu unavailable: {error}");
+            }
 
             // Rolling daily DB backup — one snapshot per day, 7-day retention.
             // Best-effort: failures are logged and never block startup.
@@ -1633,6 +1646,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            menu::sync_session_menu,
+            menu::read_session_clipboard,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::save_api_key,
