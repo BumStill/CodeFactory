@@ -956,14 +956,11 @@ fn escapes_workspace_observation(command: &str) -> bool {
     if lower.trim().is_empty() {
         return true;
     }
-    // `&&` sequences; a lone trailing `&` forks.
-    if lower.ends_with('&') && !lower.ends_with("&&") {
-        return true;
-    }
-    if ["nohup ", "start-process ", "start-job "]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
+    // A process that outlives this call can never be observed, whichever shell
+    // spelled it: a lone `&` on POSIX, `Start-Process` / `Start-Job` on
+    // PowerShell. The refusal's family name is the same question, so both sides
+    // ask this shared function instead of keeping parallel marker lists.
+    if super::tool_backend::command_forks_to_background(&trimmed) {
         return true;
     }
     // A request with a method or a body changes state on the far side, which no

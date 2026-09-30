@@ -166,7 +166,7 @@ async fn prepare_file_observation(
     }
     let Some(requested) = args.get("path").and_then(serde_json::Value::as_str) else {
         return FileObservationAdmission::Refused(format!(
-            "`{tool_name}` 缺少字符串参数 `path`，未执行。请补上要写入的工作区相对路径后重试。"
+            "`{tool_name}` 缺少字符串参数 `path`，未执行。请补上要写入的工作区相对路径后再调用。"
         ));
     };
     // A parent component can only ever resolve outside the workspace, and when
@@ -185,7 +185,7 @@ async fn prepare_file_observation(
         Ok(workspace) => workspace,
         Err(error) => {
             return FileObservationAdmission::Refused(format!(
-                "工作目录 `{}` 无法解析（{error}），`{tool_name}` 未执行。请确认工作目录存在后重试。",
+                "工作目录 `{}` 无法解析（{error}），`{tool_name}` 未执行。请确认工作目录存在后再调用。",
                 cwd.display()
             ))
         }
@@ -203,7 +203,7 @@ async fn prepare_file_observation(
             ) {
                 "请改用工作区内的相对路径。"
             } else {
-                "请先 read_file 或 glob 核对该路径是否存在，再重试。"
+                "请先 read_file 或 glob 核对该路径是否存在，再调用。"
             };
             return FileObservationAdmission::Refused(format!(
                 "`{tool_name}` 无法访问 `{requested}`：{}。未执行；{hint}",
@@ -233,7 +233,7 @@ async fn prepare_file_observation(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             return FileObservationAdmission::Refused(format!(
-                "`{tool_name}` 无法读取 `{relative}`：{error}。未执行；请先确认该文件可读，再重试。"
+                "`{tool_name}` 无法读取 `{relative}`：{error}。未执行；请先确认该文件可读，再调用。"
             ))
         }
     };
@@ -248,7 +248,7 @@ async fn prepare_file_observation(
             Some(content) => content.as_bytes().to_vec(),
             None => {
                 return FileObservationAdmission::Refused(
-                    "`write_file` 缺少字符串参数 `content`，未执行。请补上要写入的内容后重试。"
+                    "`write_file` 缺少字符串参数 `content`，未执行。请补上要写入的内容后再调用。"
                         .to_string(),
                 )
             }
@@ -266,14 +266,14 @@ async fn prepare_file_observation(
             let Some(old_string) = args.get("old_string").and_then(serde_json::Value::as_str)
             else {
                 return FileObservationAdmission::Refused(
-                    "`edit_file` 缺少字符串参数 `old_string`，未执行。请补上要替换的原文后重试。"
+                    "`edit_file` 缺少字符串参数 `old_string`，未执行。请补上要替换的原文后再调用。"
                         .to_string(),
                 );
             };
             let Some(new_string) = args.get("new_string").and_then(serde_json::Value::as_str)
             else {
                 return FileObservationAdmission::Refused(
-                    "`edit_file` 缺少字符串参数 `new_string`，未执行。请补上替换后的内容后重试。"
+                    "`edit_file` 缺少字符串参数 `new_string`，未执行。请补上替换后的内容后再调用。"
                         .to_string(),
                 );
             };
@@ -286,7 +286,7 @@ async fn prepare_file_observation(
                 if count == 0 {
                     return FileObservationAdmission::Refused(format!(
                         "`{relative}` 里没有找到 `old_string`（出现 0 次）。\
-请先 read_file 核对这段原文，包括缩进和空白，再重试。"
+请先 read_file 核对这段原文，包括缩进和空白，再调用。"
                     ));
                 }
                 if count > 1 {
@@ -577,6 +577,28 @@ fn has_background_operator(command: &str) -> bool {
     }
     false
 }
+
+/// Commands that hand the work to a process outliving the tool call.
+///
+/// Two spellings of one idea: a shell forks with a lone `&`, while PowerShell
+/// and its siblings say `Start-Process` / `Start-Job` (and `nohup` survives the
+/// shell exiting). The observation gate and the refusal's family name are the
+/// same question, so they ask this one function — when the two kept separate
+/// lists, `Start-Process` was fenced by the gate yet classified as a local file
+/// edit, and the agent was told the wrong thing about its own call.
+pub(crate) fn command_forks_to_background(command: &str) -> bool {
+    if has_background_operator(command) {
+        return true;
+    }
+    let lower = command.to_ascii_lowercase();
+    BACKGROUND_COMMAND_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Lowercase substrings that mean "detached from this call", portable across
+/// the shells these hosts run.
+const BACKGROUND_COMMAND_MARKERS: [&str; 3] = ["nohup ", "start-process ", "start-job "];
 
 fn split_shell_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
@@ -1051,7 +1073,7 @@ fn unobservable_mutation_refusal(
                 .to_string(),
         );
     }
-    if has_background_operator(command) {
+    if command_forks_to_background(command) {
         return (
             "background_process_without_observation",
             "这条命令会 fork 到后台进程，效果脱离前台、无法核对，未执行。\
@@ -4799,6 +4821,36 @@ mod tests {
             "a fenced effect must name a reachable alternative, got: {}",
             outcome.content
         );
+    }
+
+    /// The gate and the refusal's family name must answer the same question.
+    /// Windows spells a background process without `&`, so this asserts both
+    /// spellings through the shared classifier — and it runs everywhere, which
+    /// is what keeps the Windows form covered from macOS and Linux hosts.
+    #[test]
+    fn background_spellings_classify_as_background_on_every_platform() {
+        for command in [
+            "Start-Process powershell -ArgumentList '-Command whoami'",
+            "Start-Job -ScriptBlock { Get-Date }",
+            "nohup sh -c 'touch launched' >/dev/null 2>&1 &",
+            "nohup ./server >server.log 2>&1",
+            "sleep 30 &",
+        ] {
+            assert!(
+                super::command_forks_to_background(command),
+                "expected the background family for: {command}"
+            );
+        }
+        for command in [
+            "cargo test --manifest-path src-tauri/Cargo.toml",
+            "echo one && echo two",
+            "grep -n 'a & b' src/lib.rs",
+        ] {
+            assert!(
+                !super::command_forks_to_background(command),
+                "expected a foreground family for: {command}"
+            );
+        }
     }
 
     #[tokio::test]
