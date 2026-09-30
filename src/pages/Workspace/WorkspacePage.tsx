@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { MessageList } from "../../components/MessageList";
 import { DocumentPreview, type DocumentTab } from "../../components/DocumentPreview";
-import { MessageInput } from "../../components/MessageInput";
+import { MessageInput, type MessageInputHandle } from "../../components/MessageInput";
 import { SessionSidebar } from "../../components/SessionSidebar";
 import { DraftScopeBar } from "../../components/DraftScopeBar";
 import { ModelPicker } from "../../components/ModelPicker";
@@ -46,6 +46,7 @@ import type { BrowserSession, TaskRun, VerificationResult } from "../../lib/taur
 import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
 import { currentTurnOwnership } from "../../lib/turnOwnership";
+import { useDesktopMenuBridge } from "../../lib/useDesktopMenuBridge";
 
 type WorkspaceBrowserSession = BrowserSession & {
   status?: string | null;
@@ -137,6 +138,7 @@ export function WorkspacePage({
   const {
     activeSession, draftSession, sessions,
     sendOrQueue, steerRun, cancelStream, removeFromQueue, setDraftProject, setDraftAnonymous,
+    setDraftPermissionMode, updateActiveSessionPermissionMode,
     respondPermission, exitAnonymous, renameSession, loadOlderMessages,
   } = useChatStore();
   const activeDraft = draftSession?.id === sessionId ? draftSession : null;
@@ -324,6 +326,41 @@ export function WorkspacePage({
     ? executionWorkspace.worktree_path
     : null;
   const activeCwd = managedCwd ?? sourceCwd;
+
+  // 输入框的对外控制面:菜单栏 / 无障碍通道的聚焦与发送都走它,不依赖键盘
+  // 焦点(WKWebView 在非活动窗口里不处理键盘事件)。
+  const composerRef = useRef<MessageInputHandle>(null);
+  // 原生「会话」菜单的接线。每个处理器都复用界面上同一个动作:新建/切换走
+  // App 传下来的回调(和侧边栏按钮完全一致),发送走输入框自己的提交路径,
+  // 停止走同一个 cancelStream —— 菜单里没有第二套业务逻辑。
+  useDesktopMenuBridge({
+    sessions,
+    openSessionId: activeSession?.id ?? null,
+    permissionMode: activeSession?.permission_mode ?? activeDraft?.permissionMode ?? "standard",
+    hasProject: Boolean(activeCwd),
+    running: turnInFlight,
+    handlers: {
+      newSession: () => onNewConversation(activeCwd ?? null),
+      switchSession: (id) => onOpenSession(id),
+      setPermissionMode: async (mode) => {
+        // 草稿还没有数据库行:先暂存,首条消息落库时一起写进去(M12)。
+        if (activeDraft) setDraftPermissionMode(mode);
+        else await updateActiveSessionPermissionMode(mode);
+      },
+      focusInput: () => {
+        composerRef.current?.focus();
+      },
+      sendComposer: async () => {
+        await composerRef.current?.submit();
+      },
+      sendText: async (text) => {
+        await composerRef.current?.sendText(text);
+      },
+      stopRun: async () => {
+        if (await cancelStream(sessionId)) setDurableTurnActive(false);
+      },
+    },
+  });
   const draftProjects = useMemo(() => recentProjects(sessions ?? []), [sessions]);
   const projectTasks = useTasksStore((state) => state.tasks[sessionId]);
   const projectTasksLoading = Boolean(useTasksStore((state) => state.loading?.[sessionId]));
@@ -934,6 +971,7 @@ export function WorkspacePage({
                 <QueueBadge queue={queue} onRemove={removeFromQueue} />
               )}
               <MessageInput
+                ref={composerRef}
                 key={activeSession?.id ?? activeDraft?.id ?? sessionId}
                 initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
                 onSend={(t) => void sendOrQueue(t)}

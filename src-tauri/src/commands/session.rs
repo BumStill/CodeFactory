@@ -259,11 +259,41 @@ pub async fn update_session_permission_mode(
 ) -> Result<Session, AppError> {
     validate_permission_mode(&mode)?;
     let pool = state.db.read().await;
-    sqlx::query("UPDATE sessions SET permission_mode = ? WHERE id = ?")
-        .bind(&mode)
-        .bind(&session_id)
-        .execute(&*pool)
-        .await?;
+    let previous: Option<String> =
+        sqlx::query_scalar("SELECT permission_mode FROM sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_optional(&*pool)
+            .await?;
+    let Some(previous) = previous else {
+        return Err(AppError::Other(format!("Unknown session '{session_id}'")));
+    };
+    // 权限变化是真实活动:必须抬高 updated_at,否则会话不会回到最近列表顶部,
+    // 用户刚做的这个决定在界面上看起来像没发生。(U7 相关)
+    sqlx::query(
+        "UPDATE sessions
+            SET permission_mode = ?,
+                updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
+          WHERE id = ?",
+    )
+    .bind(&mode)
+    .bind(&session_id)
+    .execute(&*pool)
+    .await?;
+    // 审计事件:切权限只改一列,但它是安全边界的移动,必须可追溯。
+    let detail = serde_json::json!({ "from": previous, "to": mode }).to_string();
+    if let Err(error) = sqlx::query(
+        "INSERT INTO session_audit_events (id, session_id, kind, actor, detail_json, created_at)
+         VALUES (?, ?, 'permission_mode_changed', 'user', ?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&session_id)
+    .bind(&detail)
+    .execute(&*pool)
+    .await
+    {
+        // 审计写入失败不能把用户的权限设置回滚,但必须留下痕迹。
+        tracing::warn!("permission audit event not recorded for {session_id}: {error}");
+    }
     let session = sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = ?")
         .bind(&session_id)
         .fetch_one(&*pool)

@@ -1427,6 +1427,26 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_task_journal_session ON task_journal(session_id)")
         .execute(pool)
         .await?;
+    // 会话级审计事件。权限模式一类的"用户动作"必须留下可查的痕迹:界面被关掉、
+    // 进程重启之后,仍然要能回答"这个会话什么时候被从安全切成信任"。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_audit_events (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            actor       TEXT NOT NULL,
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at  INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_session_audit_events_session
+            ON session_audit_events(session_id, created_at)",
+    )
+    .execute(pool)
+    .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_task_journal_checkpoint ON task_journal(checkpoint_id)",
     )

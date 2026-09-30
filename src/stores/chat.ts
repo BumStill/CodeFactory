@@ -160,6 +160,8 @@ interface ChatStore {
    *  the ONLY thing picking a project does — it never opens a session. */
   setDraftProject: (cwd: string | null) => void;
   setDraftAnonymous: (anonymous: boolean) => void;
+  /** 草稿期间选权限模式:会话还没落库,先暂存,首条消息把它一起带进去(M12)。 */
+  setDraftPermissionMode: (mode: PermissionMode) => void;
   updateDraftText: (text: string) => void;
   discardDraft: () => void;
   /** Per-session ephemeral chat state, keyed by session id. Source of truth for
@@ -286,6 +288,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   setDraftAnonymous: (anonymous) => set((state) => ({
     draftSession: state.draftSession ? { ...state.draftSession, anonymous } : null,
+  })),
+
+  // 草稿没有数据库行,所以模式只能先存在前端;真正落库发生在
+  // `sendOrQueue` 的 materialize 分支(见那里的注释)。
+  setDraftPermissionMode: (mode) => set((state) => ({
+    draftSession: state.draftSession ? { ...state.draftSession, permissionMode: mode } : null,
   })),
 
   updateDraftText: (text) => set((state) => ({
@@ -780,7 +788,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         set({ _draftMaterialization: materialization });
       }
       try {
-        const session = await materialization;
+        let session = await materialization;
+        // 草稿期间选的权限模式必须跟着第一条消息一起落地:否则用户先选了
+        // "信任",首条消息仍然按默认模式跑,那个选择被静默丢弃(M12)。
+        // 走的是界面权限选择器同一条命令,所以同样写审计事件并抬高 updated_at。
+        if (draft.permissionMode && draft.permissionMode !== session.permission_mode) {
+          try {
+            session = await invoke<Session>("update_session_permission_mode", {
+              sessionId: session.id,
+              mode: draft.permissionMode,
+            });
+          } catch (error) {
+            console.error("draft permission mode was not applied", error);
+          }
+        }
         // A concurrent Enter joins the same materialization and must not start
         // a duplicate turn after the first caller has already begun streaming.
         const alreadyMaterialized = get().activeSession?.id === session.id;

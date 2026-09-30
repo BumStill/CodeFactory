@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useRef, useState, useEffect, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent, type ReactNode } from "react";
+import { forwardRef, useRef, useState, useEffect, useImperativeHandle, ChangeEvent, KeyboardEvent, ClipboardEvent, DragEvent, type ReactNode } from "react";
 import { recallHistory, pushHistory } from "./messageHistory";
 import { Send, Square, Paperclip, X, Loader2, Check } from "lucide-react";
 import {
@@ -84,7 +84,35 @@ interface Props {
  *  human "commit then send" double-Enters measure well above this. */
 const IME_COMMIT_GRACE_MS = 100;
 
-export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory, toolbar }: Props) {
+/** 输入框对外的控制面。菜单栏 / 无障碍通道靠它聚焦和发送,不依赖键盘焦点 ——
+ *  WKWebView 在非活动窗口里不处理键盘事件,所以"后台发一条消息"必须能从外面
+ *  驱动输入框,而不是假装敲键盘。 */
+export interface MessageInputHandle {
+  /** 聚焦输入框(⌘L / 菜单「聚焦输入框」)。 */
+  focus: () => void;
+  /** 发送输入框此刻的真实内容(菜单「发送输入框内容」)。 */
+  submit: () => Promise<void>;
+  /** 把文本写进输入框再发送(菜单「从剪贴板发送到当前会话」)。
+   *  文本会先出现在输入框里,用户看得见要发什么,然后走同一个 submit。 */
+  sendText: (text: string) => Promise<void>;
+}
+
+/** 发送时以输入框的**真实 DOM 值**为准。
+ *
+ * 只信 React state 会漏掉所有非键盘写入:菜单栏的剪贴板发送、无障碍工具写
+ * AXValue、以及任何脚本直接改 `textarea.value`。这些情况下 state 还是旧的,
+ * 用户却已经在输入框里看见了内容 —— 发出去的必须是看见的那一份。
+ * DOM 与 state 一致时(正常打字)两者等价,取谁都一样。 */
+export function readComposerText(
+  element: HTMLTextAreaElement | null,
+  stateValue: string,
+): string {
+  const domValue = element?.value;
+  if (typeof domValue === "string" && domValue !== stateValue) return domValue.trim();
+  return stateValue.trim();
+}
+
+export const MessageInput = forwardRef<MessageInputHandle, Props>(function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory, toolbar }: Props, handleRef) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
@@ -211,7 +239,9 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
   const commandCandidate = parseSlashCommand(value.trim());
 
   const submit = async ({ forceQueue = false }: { forceQueue?: boolean } = {}) => {
-    const text = value.trim();
+    // 真实 DOM 值优先:粘贴、无障碍写值、菜单栏剪贴板发送都不经过 React 的
+    // onChange,state 可能落后于用户眼前看到的内容。
+    const text = readComposerText(ref.current, value);
     // Allow submission with attachments but no text — the markdown links
     // appended below count as content for the model.
     if (!text && attachments.length === 0) return;
@@ -270,6 +300,44 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
     ref.current!.style.height = "auto";
     onSend(outgoing);
   };
+
+  // 非键盘写入同步:菜单栏 / 无障碍工具直接改 DOM 值时不会触发 React 的
+  // onChange,发送按钮会一直停在禁用状态 —— 用户看见输入框里有字却发不出去。
+  // 监听原生 input 事件把 DOM 值同步回 state,按钮的可用状态就跟着对上了。
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const sync = () => {
+      if (el.value === valueRef.current) return;
+      valueRef.current = el.value;
+      setValue(el.value);
+      setHistPos(0);
+      if (guidanceState.kind !== "idle") setGuidanceState({ kind: "idle" });
+      autoResize();
+    };
+    el.addEventListener("input", sync);
+    return () => el.removeEventListener("input", sync);
+  }, [guidanceState.kind]);
+
+  // 菜单栏 / 无障碍通道的入口。三个动作都复用界面自己的提交路径,所以
+  // "从菜单发送"和"手动输入后按发送"在数据层是同一次调用。
+  useImperativeHandle(handleRef, () => ({
+    focus: () => {
+      ref.current?.focus();
+    },
+    submit: () => submit(),
+    sendText: async (text: string) => {
+      // 先把文本放进输入框(用户看得见要发什么),再走同一个 submit —— 空文本
+      // 会在 submit 里被同一条校验挡下。
+      const el = ref.current;
+      if (el) el.value = text;
+      valueRef.current = text;
+      setValue(text);
+      await submit();
+    },
+  }));
 
   const moveCursorToEnd = () => {
     requestAnimationFrame(() => {
@@ -552,4 +620,4 @@ export function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, 
       )}
     </div>
   );
-}
+});
