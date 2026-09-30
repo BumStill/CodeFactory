@@ -1401,6 +1401,9 @@ mod tests {
             "mkdir -p vendor",
             "sh install.sh",
             "cargo run --bin migrate -- --path $(git rev-parse --show-toplevel)",
+            "cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | tail -30",
+            "pnpm test > test.log 2>&1",
+            "make build &> build.log",
         ] {
             assert!(
                 !escapes_workspace_observation(command),

@@ -560,17 +560,35 @@ fn contains_command_substitution(command: &str) -> bool {
 /// A trailing `&` backgrounds the command, so its completion is unobservable
 /// no matter how read-only the verb looks. `&&` is a sequencer, not a fork,
 /// and a quoted `&` is neither.
+/// A lone, unquoted `&` that sends the command to the background.
+///
+/// `&` also appears inside redirections and pipes that stay in the
+/// foreground: `2>&1`, `>&2`, `<&3`, `&>log`, `&>>log`, `|&`. Treating those as
+/// forks fenced every `cargo test … 2>&1 | tail` an agent runs once the
+/// observation gate began asking this function, so they are skipped here.
 fn has_background_operator(command: &str) -> bool {
-    let mut characters = shell_active_chars(command).peekable();
-    while let Some((character, active)) = characters.next() {
+    let characters: Vec<(char, bool)> = shell_active_chars(command).collect();
+    let mut index = 0;
+    while index < characters.len() {
+        let (character, active) = characters[index];
         if !active || character != '&' {
+            index += 1;
             continue;
         }
-        if characters
-            .peek()
-            .is_some_and(|(next, next_active)| *next_active && *next == '&')
-        {
-            characters.next();
+        let next = characters.get(index + 1).copied();
+        if next.is_some_and(|(next, next_active)| next_active && next == '&') {
+            index += 2;
+            continue;
+        }
+        let redirect_or_pipe = index
+            .checked_sub(1)
+            .and_then(|previous| characters.get(previous))
+            .is_some_and(|(previous, previous_active)| {
+                *previous_active && matches!(previous, '>' | '<' | '|')
+            })
+            || next.is_some_and(|(next, next_active)| next_active && next == '>');
+        if redirect_or_pipe {
+            index += 1;
             continue;
         }
         return true;
@@ -4835,6 +4853,8 @@ mod tests {
             "nohup sh -c 'touch launched' >/dev/null 2>&1 &",
             "nohup ./server >server.log 2>&1",
             "sleep 30 &",
+            "./server & echo started",
+            "cargo build 2>&1 &",
         ] {
             assert!(
                 super::command_forks_to_background(command),
@@ -4845,6 +4865,13 @@ mod tests {
             "cargo test --manifest-path src-tauri/Cargo.toml",
             "echo one && echo two",
             "grep -n 'a & b' src/lib.rs",
+            "cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | tail -30",
+            "pnpm test > out.log 2>&1",
+            "make build &> build.log",
+            "make build &>> build.log",
+            "echo failed >&2",
+            "exec 3<&0",
+            "cargo test |& tee test.log",
         ] {
             assert!(
                 !super::command_forks_to_background(command),
