@@ -196,7 +196,8 @@ describe("SessionSidebar", () => {
     // row (the folder is only a subtitle), with nothing to expand and no
     // per-folder action yet. Clicking it opens that conversation directly.
     expect(screen.queryByLabelText("在 ledger 里新建会话")).not.toBeInTheDocument();
-    const row = screen.getByRole("button", { name: "打开会话 记账 app" });
+    // R4 起无障碍名称是「打开会话 标题(短id,相对时间)」——同名会话靠短 id 区分。
+    const row = screen.getByRole("button", { name: /^打开会话 记账 app\(/ });
     expect(row).not.toHaveAttribute("aria-expanded");
 
     fireEvent.click(screen.getByText("记账 app"));
@@ -275,7 +276,7 @@ describe("SessionSidebar", () => {
       <SessionSidebar currentSessionId="q1" onOpenSession={noop} onNewConversation={noop} />,
     );
 
-    expect(screen.getByRole("button", { name: "打开会话 改图脚本" })).toHaveAttribute(
+    expect(screen.getByRole("button", { name: /^打开会话 改图脚本\(/ })).toHaveAttribute(
       "aria-current",
       "page",
     );
@@ -294,7 +295,7 @@ describe("SessionSidebar", () => {
     expectNoNestedInteractive(container);
 
     await user.click(projectToggle);
-    const sessionOpen = screen.getByRole("button", { name: "打开会话 CodeFactory 主线" });
+    const sessionOpen = screen.getByRole("button", { name: /^打开会话 CodeFactory 主线\(/ });
     const sessionRow = sessionOpen.closest<HTMLElement>("[data-session-row]");
     expect(sessionRow).not.toBeNull();
     const sessionMenu = within(sessionRow!).getByRole("button", { name: "更多操作" });
@@ -327,7 +328,7 @@ describe("SessionSidebar", () => {
     await user.keyboard(" ");
     expect(screen.queryByText("CodeFactory 主线")).not.toBeInTheDocument();
 
-    const sessionOpen = screen.getByRole("button", { name: "打开会话 改图脚本" });
+    const sessionOpen = screen.getByRole("button", { name: /^打开会话 改图脚本\(/ });
     sessionOpen.focus();
     await user.keyboard("{Enter}");
     expect(onOpen).toHaveBeenCalledWith("q1");
