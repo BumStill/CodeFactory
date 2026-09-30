@@ -143,19 +143,10 @@ jobs:
           # The PR already ran the full CI suite on the exact same code — the
           # squash merge to main cannot change its outcome. Requiring main CI
           # here just adds 6-8 minutes of dead wait per release.
-          HEAD_SHA=$(git rev-parse HEAD)
-          CONC=$(gh run list --workflow governance-baseline --branch main --limit 30 \
-                   --json headSha,conclusion \
-                   -q "[.[] | select(.headSha==\"$HEAD_SHA\")][0].conclusion" 2>/dev/null || echo "")
-          if [ -z "$CONC" ]; then
-            echo "::error::governance-baseline for $HEAD_SHA was not found — refusing to infer green."
-            exit 1
-          fi
-          if [ "$CONC" != "success" ]; then
-            echo "::error::governance-baseline for $HEAD_SHA is '$CONC' — refusing to release on red."
-            exit 1
-          fi
-          echo "governance-baseline for $HEAD_SHA: $CONC"
+          # The script looks the run up by exact SHA, retries transient API
+          # errors with visible stderr, and still never infers green.
+          set -euo pipefail
+          tools/release/require_green_governance.sh "$(git rev-parse HEAD)"
 
       - name: Reconcile interrupted version release
         id: reconcile

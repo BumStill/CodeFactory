@@ -612,6 +612,191 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "the guard must be read-only; a failed check may not rewrite the remote",
         )
 
+    GOVERNANCE_SHA = "5c9b68d0" + "0" * 32
+    GOVERNANCE_GREEN = "completed|success|36547443796\n"
+    # What gh printed during the 2026-09-29 outage behind run 36554865773.
+    GH_EOF = (
+        1,
+        "",
+        'Get "https://api.github.com/repos/BumStill/CodeFactory/actions/runs": EOF\n',
+    )
+
+    def _governance_lookup(
+        self,
+        responses: list[tuple[int, str, str]],
+        sha: str | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str], list[str]]:
+        """Run the governance gate against a scripted stand-in for ``gh``.
+
+        Each response is ``(exit_code, stdout, stderr)`` for one ``gh`` call;
+        calls past the end repeat the last one, like a persistent outage.
+        ``gh`` and ``sleep`` are exported shell functions, so the real backoff
+        schedule is recorded without waiting, and nothing depends on Git Bash
+        resolving an extensionless script on PATH.
+        """
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        fake = Path(temp_dir.name)
+        for index, (code, out, err) in enumerate(responses, start=1):
+            # Bytes, not text: Windows newline translation would append \r.
+            (fake / f"{index}.rc").write_bytes(str(code).encode())
+            (fake / f"{index}.out").write_bytes(out.encode())
+            (fake / f"{index}.err").write_bytes(err.encode())
+        (fake / "count").write_bytes(b"0")
+        stub = (
+            "gh() {\n"
+            '  local n=$(( $(cat "$FAKE_GH/count") + 1 )) call="$*"\n'
+            '  echo "$n" > "$FAKE_GH/count"\n'
+            "  # One line per call, even though the jq filter spans lines.\n"
+            '  printf "%s\\n" "${call//$\'\\n\'/ }" >> "$FAKE_GH/argv"\n'
+            f'  [ "$n" -le {len(responses)} ] || n={len(responses)}\n'
+            '  cat "$FAKE_GH/$n.err" >&2\n'
+            '  cat "$FAKE_GH/$n.out"\n'
+            '  return "$(cat "$FAKE_GH/$n.rc")"\n'
+            "}\n"
+            'sleep() { printf "%s\\n" "$1" >> "$FAKE_GH/sleeps"; }\n'
+            "export -f gh sleep\n"
+            'bash "$1" "$2"\n'
+        )
+        script = (REPO_ROOT / "tools/release/require_green_governance.sh").as_posix()
+        result = subprocess.run(
+            [
+                self._workflow_bash(),
+                "-c",
+                stub,
+                "governance",
+                script,
+                self.GOVERNANCE_SHA if sha is None else sha,
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "FAKE_GH": fake.as_posix()},
+        )
+
+        def recorded(name: str) -> list[str]:
+            path = fake / name
+            if not path.exists():
+                return []
+            return path.read_text(encoding="utf-8").splitlines()
+
+        return result, recorded("argv"), recorded("sleeps")
+
+    def test_governance_gate_retries_a_transient_api_error_and_shows_it(self) -> None:
+        """Run 36554865773 was blocked twice by an EOF reported as "not found"."""
+        result, calls, sleeps = self._governance_lookup(
+            [self.GH_EOF, (0, self.GOVERNANCE_GREEN, "")]
+        )
+
+        self.assertEqual(
+            result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        self.assertIn("36547443796", result.stdout)
+        self.assertIn(
+            ": EOF",
+            result.stderr,
+            "gh's own error must reach the log instead of being discarded",
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, ["10"])
+        for call in calls:
+            self.assertIn(
+                f"--commit {self.GOVERNANCE_SHA}",
+                call,
+                "look the run up by its exact head SHA, not by scanning recent runs",
+            )
+            self.assertIn("--workflow governance-baseline", call)
+            self.assertIn("--branch main", call)
+
+    def test_governance_gate_waits_for_a_run_that_is_not_recorded_or_done(
+        self,
+    ) -> None:
+        result, calls, sleeps = self._governance_lookup(
+            [
+                (0, "", ""),
+                (0, "in_progress||36547443796\n", ""),
+                (0, self.GOVERNANCE_GREEN, ""),
+            ]
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, ["10", "20"], "backoff grows between lookups")
+
+    def test_governance_gate_fails_closed_after_the_retry_budget(self) -> None:
+        for name, response, cause in (
+            ("api error", self.GH_EOF, ": EOF"),
+            ("no run", (0, "", ""), "no governance-baseline run"),
+            ("never finishes", (0, "queued||36547443796\n", ""), "still queued"),
+        ):
+            with self.subTest(name):
+                result, calls, sleeps = self._governance_lookup([response])
+
+                self.assertEqual(result.returncode, 1, "never infer green")
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(sleeps, ["10", "20", "30"])
+                self.assertIn("::error::", result.stderr)
+                self.assertIn("refusing to infer green", result.stderr)
+                self.assertIn(cause, result.stderr)
+                self.assertNotIn("success", result.stdout)
+
+    def test_governance_gate_never_retries_a_finished_red_run(self) -> None:
+        for conclusion in ("failure", "cancelled", ""):
+            with self.subTest(conclusion=conclusion):
+                result, calls, sleeps = self._governance_lookup(
+                    [
+                        (0, f"completed|{conclusion}|36547443796\n", ""),
+                        (0, self.GOVERNANCE_GREEN, ""),
+                    ]
+                )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(
+                    len(calls), 1, "a red conclusion is an answer, not an outage"
+                )
+                self.assertEqual(sleeps, [])
+                self.assertIn(f"concluded '{conclusion}'", result.stderr)
+
+    def test_governance_gate_requires_an_exact_commit_sha(self) -> None:
+        for sha in ("", "HEAD", self.GOVERNANCE_SHA[:12], 'x" or true'):
+            with self.subTest(sha=sha):
+                result, calls, _ = self._governance_lookup(
+                    [(0, self.GOVERNANCE_GREEN, "")], sha=sha
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(calls, [], "a malformed SHA must not reach the query")
+
+    def test_auto_release_gates_on_the_governance_script_not_a_silent_lookup(
+        self,
+    ) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/auto-release.yml").read_text(
+            encoding="utf-8"
+        )
+        step = workflow.split("- name: Verify main governance check is green", 1)[
+            1
+        ].split("\n      - name:", 1)[0]
+
+        self.assertIn("tools/release/require_green_governance.sh", step)
+        self.assertNotIn("2>/dev/null", step, "gh errors must stay visible")
+        self.assertNotIn('|| echo ""', step, "an API error is not an empty result")
+        mode = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(REPO_ROOT),
+                "ls-files",
+                "-s",
+                "tools/release/require_green_governance.sh",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertTrue(
+            mode.startswith("100755 "),
+            "the workflow executes the script directly, so it must be executable",
+        )
+
     @staticmethod
     def _job_steps(workflow: str, job: str) -> list[str]:
         """Split one job's `steps:` block into individual step texts."""
