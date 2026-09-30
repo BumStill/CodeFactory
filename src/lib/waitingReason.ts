@@ -7,7 +7,7 @@
 /// ASCII identifier is treated as such a code: named ones get their sentence,
 /// unnamed ones fall back to a generic one rather than leaking.
 const WAITING_REASON_LABELS: Record<string, string> = {
-  technical_recovery_exhausted: "系统多轮自动恢复没有进展，已登记为系统故障；你不需要补充输入",
+  objective_failed: "这件事没做成，已把试过的办法和保留下来的改动写给你",
   agent_loop_error: "执行过程中断，已停止并把当前结论交还给你",
   context_compaction_exhausted: "对话上下文已压缩到极限，已停止并把当前结论交还给你",
   run_budget_exhausted: "本轮预算已用完，已停止并把当前结论交还给你",
@@ -20,7 +20,7 @@ const WAITING_REASON_LABELS: Record<string, string> = {
 /// Reasons that mean the turn stopped for good. A stopped turn must not keep
 /// quoting a remaining time.
 const TERMINAL_WAITING_REASONS = new Set([
-  "technical_recovery_exhausted",
+  "objective_failed",
   "agent_loop_error",
   "context_compaction_exhausted",
   "run_budget_exhausted",

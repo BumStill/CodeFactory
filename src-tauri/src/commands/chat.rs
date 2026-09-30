@@ -975,14 +975,15 @@ async fn admit_chat_run(
 
 fn chat_settlement_status(objective: &crate::agent::objective::ObjectiveSnapshot) -> &'static str {
     use crate::agent::objective::{ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED};
-    if objective.status == ObjectiveStatus::WaitingSystem
+    if objective.status == ObjectiveStatus::Failed
         && objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
     {
-        return "system_incident";
+        return "objective_failed";
     }
     match objective.status {
         ObjectiveStatus::Completed => "completed",
         ObjectiveStatus::Cancelled => "cancelled",
+        ObjectiveStatus::Failed => "objective_failed",
         ObjectiveStatus::WaitingCoreInput
         | ObjectiveStatus::WaitingAuthorization
         | ObjectiveStatus::WaitingBusinessDecision => "waiting_user",
@@ -1152,18 +1153,19 @@ fn chat_turn_projection(
     objective: &crate::agent::objective::ObjectiveSnapshot,
 ) -> ChatTurnProjection {
     use crate::agent::objective::{ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED};
-    // Recovery that ran out of budget is a settled turn, not a live one. The
-    // objective stays non-terminal (the work was never finished), but the
-    // transport turn must stop presenting itself as still recovering.
-    let recovery_exhausted = objective.status == ObjectiveStatus::WaitingSystem
+    // Every system-owned route was tried and none worked: the turn is over.
+    // It must not keep presenting itself as still recovering, and it must not
+    // ask the user for anything — the answer is a plain-language failure
+    // summary written into the conversation.
+    let recovery_exhausted = objective.status == ObjectiveStatus::Failed
         && objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED);
     let (phase, activity_kind, activity_label) = match objective.status {
         ObjectiveStatus::Completed => ("finalizing", "objective_completed", "目标证据已满足"),
         ObjectiveStatus::Cancelled => ("finalizing", "objective_cancelled", "已按用户要求停止"),
-        ObjectiveStatus::WaitingSystem if recovery_exhausted => (
-            "waiting",
-            TECHNICAL_RECOVERY_EXHAUSTED,
-            "自动恢复已达到安全上限；系统已登记故障，无需补充输入",
+        ObjectiveStatus::Failed => (
+            "finalizing",
+            "objective_failed",
+            "这件事没做成，已把试过的办法和保留下来的改动写给你",
         ),
         ObjectiveStatus::WaitingSystem => ("recovering", "system_recovery", "系统正在恢复并续接"),
         ObjectiveStatus::WaitingCoreInput => ("waiting", "core_input_required", "需要补充核心输入"),
@@ -1185,7 +1187,7 @@ fn chat_turn_projection(
         activity_kind,
         activity_label,
         terminal_reason: if recovery_exhausted {
-            Some(TECHNICAL_RECOVERY_EXHAUSTED)
+            Some("objective_failed")
         } else if objective.status.is_terminal() {
             Some(objective.decision_type.as_str())
         } else {
@@ -3575,29 +3577,30 @@ mod tests {
         objective
     }
 
-    /// A bounded-out recovery must settle the transport turn. Leaving it
-    /// `recovering` with no terminal reason is exactly what showed the user an
-    /// endless "系统仍在恢复" spinner while nothing was left to observe.
+    /// A bounded-out recovery must settle the transport turn as a real failure
+    /// terminal. Leaving it `recovering` with no terminal reason is exactly what
+    /// showed the user an endless "系统仍在恢复" spinner while nothing was left
+    /// to observe.
     #[test]
     fn exhausted_recovery_settles_the_turn_instead_of_spinning() {
         use crate::agent::objective::{
             DecisionType, ObjectiveStatus, TECHNICAL_RECOVERY_EXHAUSTED,
         };
         let projection = chat_turn_projection(&projection_objective(
-            ObjectiveStatus::WaitingSystem,
+            ObjectiveStatus::Failed,
             DecisionType::FailedInternal,
             Some(TECHNICAL_RECOVERY_EXHAUSTED),
         ));
-        assert_eq!(projection.phase, "waiting");
-        assert_eq!(projection.activity_kind, TECHNICAL_RECOVERY_EXHAUSTED);
+        assert_eq!(projection.phase, "finalizing");
+        assert_eq!(projection.activity_kind, "objective_failed");
         assert_eq!(
-            projection.terminal_reason,
-            Some(TECHNICAL_RECOVERY_EXHAUSTED),
+            projection.terminal_reason.as_deref(),
+            Some("objective_failed"),
             "the settled turn must name why the system stopped"
         );
         assert!(
-            projection.activity_label.contains("无需补充输入"),
-            "the user must be told the incident remains system-owned"
+            projection.activity_label.contains("这件事没做成"),
+            "the user must be told the task did not work out"
         );
     }
 

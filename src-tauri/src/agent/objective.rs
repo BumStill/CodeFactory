@@ -69,6 +69,10 @@ string_enum!(ObjectiveStatus {
     WaitingBusinessDecision => "waiting_business_decision",
     Completed => "completed",
     Cancelled => "cancelled",
+    // The honest failure terminal: every system-owned route was tried and none
+    // worked. It sits beside `completed`/`cancelled` as a real terminal state,
+    // never a "waiting for a future capability" limbo the user cannot act on.
+    Failed => "failed",
     LegacyOrphan => "legacy_orphan",
 });
 
@@ -255,7 +259,7 @@ const FAILURE_DETAIL_MAX_CHARS: usize = 1_500;
 
 impl ObjectiveStatus {
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Cancelled)
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
     }
 
     pub const fn is_system_owned(self) -> bool {
@@ -546,8 +550,11 @@ pub struct DecisionEnvelope {
 }
 
 impl DecisionEnvelope {
+    /// A system-owned recovery ceiling reached a terminal `failed` objective.
+    /// This is a real failure terminal, not a paused incident: the turn is
+    /// settled, no lease/observation remains, and nothing will ever wake it.
     fn is_parked_system_incident(&self) -> bool {
-        self.status == ObjectiveStatus::WaitingSystem
+        self.status == ObjectiveStatus::Failed
             && self.decision_type == DecisionType::FailedInternal
             && self.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
             && !self.requires_user_action
@@ -2886,19 +2893,27 @@ impl ObjectiveStore {
         Ok(reconciled)
     }
 
-    /// Reclassify historical synthetic handbacks from releases that treated a
-    /// technical recovery ceiling as if the user owed a core input. A genuine
-    /// unconsumed user reprompt is recovered first by the compatibility path
-    /// above; every remaining row becomes a system-owned incident without
-    /// creating a new Objective or rewriting receipt truth.
+    /// R4 start-up convergence of the retired "recovery exhausted" limbo.
+    ///
+    /// Releases before this one parked a technical ceiling as a *non-terminal*
+    /// system-owned wait and opened an incident that only a capability-version
+    /// change could clear — which, by construction, never happened. Real users
+    /// were left with a sentence they could not act on and a status that never
+    /// moved.
+    ///
+    /// Existing rows are converted to the honest failure terminal: the
+    /// objective finishes, its incident closes, its turn stops presenting
+    /// itself as running, and the notice is written once. The guarded `WHERE`
+    /// clauses make a second start a no-op, so no objective is told twice.
     pub async fn reclassify_synthetic_technical_handbacks(&self) -> anyhow::Result<usize> {
         let candidates = sqlx::query_as::<_, (String, i64, Option<String>, Option<String>)>(
             "SELECT id, revision, session_id, COALESCE(resume_cursor, root_turn_id)
              FROM objectives
-             WHERE status='waiting_core_input'
-               AND decision_type='core_input_required'
-               AND domain='chat'
-               AND failure_code=?",
+             WHERE failure_code=?
+               AND (
+                 (status='waiting_core_input' AND decision_type='core_input_required')
+                 OR (status='waiting_system' AND decision_type='failed_internal')
+               )",
         )
         .bind(TECHNICAL_RECOVERY_EXHAUSTED)
         .fetch_all(&self.pool)
@@ -2911,18 +2926,20 @@ impl ObjectiveStore {
                 format!("system-incident-{}-{}", objective_id, next_revision);
             let mut tx = self.pool.begin().await?;
             let updated = sqlx::query(
-                "UPDATE objectives SET revision=?, status='waiting_system',
+                "UPDATE objectives SET revision=?, status='failed',
                    decision_type='failed_internal', requires_user_action=0,
                    request_key=NULL, decision_key=NULL, attention_request_json=NULL,
                    failure_code=?, recovery_owner=?, remediation_id=NULL,
                    next_observation_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
-                   completed_at=NULL, updated_at=?
-                 WHERE id=? AND revision=? AND status='waiting_core_input'
+                   completed_at=?, updated_at=?
+                 WHERE id=? AND revision=?
+                   AND status IN ('waiting_core_input','waiting_system')
                    AND failure_code=?",
             )
             .bind(next_revision)
             .bind(TECHNICAL_RECOVERY_EXHAUSTED)
             .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+            .bind(now)
             .bind(now)
             .bind(&objective_id)
             .bind(revision)
@@ -2933,76 +2950,128 @@ impl ObjectiveStore {
                 tx.rollback().await?;
                 continue;
             }
-            if let (Some(session_id), Some(_)) =
-                (session_id.as_deref(), terminal_root_turn_id.as_deref())
-            {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO messages
-                     (id, session_id, role, content, completion_state, created_at)
-                     VALUES (?, ?, 'assistant', ?, NULL, ?)",
+            if let Some(session_id) = session_id.as_deref() {
+                let has_messages: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='messages'",
                 )
-                .bind(&visible_final_message_id)
-                .bind(session_id)
-                .bind("本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。")
-                .bind(now)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await?;
+                if has_messages == 1 {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO messages
+                         (id, session_id, role, content, completion_state, created_at)
+                         VALUES (?, ?, 'assistant', ?, NULL, ?)",
+                    )
+                    .bind(&visible_final_message_id)
+                    .bind(session_id)
+                    .bind("这件事没做成：你交代的目标没有达成。试过的办法和保留下来的改动都还在会话里；直接回一句「继续」或「把这些改动交付」就可以接着做。")
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 touch_session_in_settlement(&mut tx, session_id, now).await;
             }
-            sqlx::query(
-                "UPDATE chat_turn_state SET revision=revision+1,
-                   phase='waiting', status='waiting_system',
-                   recent_activity_kind=?,
-                   recent_activity_label='自动恢复已达到安全上限；系统已登记故障，无需补充输入',
-                   waiting_reason=?, updated_at=?,
-                   completed_at=COALESCE(completed_at, ?), terminal_reason=?,
+            let has_turn_state: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='chat_turn_state'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_turn_state == 1 {
+                sqlx::query(
+                    "UPDATE chat_turn_state SET revision=revision+1,
+                   phase='finalizing', status='completed',
+                   recent_activity_kind='objective_failed',
+                   recent_activity_label='这件事没做成，已把试过的办法和保留下来的改动写给你',
+                   waiting_reason=NULL, updated_at=?,
+                   completed_at=COALESCE(completed_at, ?),
+                   terminal_reason='objective_failed',
                    objective_revision=?,
                    turn_settled_at=COALESCE(turn_settled_at, ?),
                    stream_closed_at=COALESCE(stream_closed_at, ?),
                    terminal_revision=?, visible_final_message_id=?,
-                   visible_final_kind='system_incident',
-                   next_action='await_system_recovery'
+                   visible_final_kind='assistant_final',
+                   next_action=NULL
                  WHERE objective_id=? AND root_turn_id=?",
+                )
+                .bind(now)
+                .bind(now)
+                .bind(next_revision)
+                .bind(now)
+                .bind(now)
+                .bind(next_revision)
+                .bind(&visible_final_message_id)
+                .bind(&objective_id)
+                .bind(&terminal_root_turn_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let has_incidents: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='objective_incidents'",
             )
-            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
-            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
-            .bind(now)
-            .bind(now)
-            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
-            .bind(next_revision)
-            .bind(now)
-            .bind(now)
-            .bind(next_revision)
-            .bind(&visible_final_message_id)
-            .bind(&objective_id)
-            .bind(&terminal_root_turn_id)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-            sqlx::query(
-                "INSERT INTO objective_incidents
-                 (id, objective_id, status, failure_code, failure_signature,
-                  owner, resume_cursor, opened_at, updated_at)
-                 VALUES (?, ?, 'open', ?,
-                         (SELECT failure_signature FROM objectives WHERE id=?),
-                         ?, ?, ?, ?)
-                 ON CONFLICT(objective_id) DO UPDATE SET
-                   status='open', owner=excluded.owner,
-                   resume_cursor=excluded.resume_cursor,
-                   updated_at=excluded.updated_at, resolved_at=NULL",
+            if has_incidents == 1 {
+                sqlx::query(
+                    "UPDATE objective_incidents
+                     SET status='resolved', resolved_at=?, updated_at=?,
+                         reactivation_status='resolved'
+                     WHERE objective_id=? AND status='open'",
+                )
+                .bind(now)
+                .bind(now)
+                .bind(&objective_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let has_delivery_runs: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='delivery_runs'",
             )
-            .bind(Uuid::new_v4().to_string())
-            .bind(&objective_id)
-            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
-            .bind(&objective_id)
-            .bind(OBJECTIVE_INCIDENT_CONTROLLER)
-            .bind(&terminal_root_turn_id)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+            if has_delivery_runs == 1 {
+                sqlx::query(
+                    "UPDATE delivery_runs
+                     SET status='failed', wait_class=NULL, next_action=NULL,
+                         next_action_authorized=0,
+                         lease_owner=NULL, lease_expires_at=NULL,
+                         failure_code=COALESCE(failure_code, 'objective_failed'),
+                         failure_class=COALESCE(failure_class, 'objective_failed'),
+                         last_observed_at=?, updated_at=?
+                     WHERE objective_id=?
+                       AND status NOT IN ('completed','failed','cancelled','rejected')",
+                )
+                .bind(now)
+                .bind(now)
+                .bind(&objective_id)
+                .execute(&mut *tx)
+                .await?;
+            }
             tx.commit().await?;
             reclassified += 1;
         }
+        // Incidents left open by an objective the user already moved past —
+        // completed, cancelled, or now failed — close here too, so nothing in
+        // the ledger keeps claiming it is waiting for something.
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE objective_incidents
+             SET status='resolved', resolved_at=?, updated_at=?,
+                 reactivation_status='resolved'
+             WHERE status='open'
+               AND EXISTS (
+                 SELECT 1 FROM objectives objective
+                 WHERE objective.id=objective_incidents.objective_id
+                   AND objective.status IN ('completed','cancelled','failed')
+               )",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
         Ok(reclassified)
     }
 
@@ -3568,7 +3637,7 @@ impl ObjectiveStore {
             .get(objective_id)
             .await?
             .ok_or_else(|| anyhow!("objective not found"))?;
-        if current.status == ObjectiveStatus::WaitingSystem
+        if current.status == ObjectiveStatus::Failed
             && current.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED)
             && current.recovery_owner.as_deref() == Some(OBJECTIVE_INCIDENT_CONTROLLER)
             && current.remediation_id.is_none()
@@ -3592,7 +3661,7 @@ impl ObjectiveStore {
             },
         )?;
         decision.decision_type = DecisionType::FailedInternal;
-        decision.status = ObjectiveStatus::WaitingSystem;
+        decision.status = ObjectiveStatus::Failed;
         decision.failure_code = Some(TECHNICAL_RECOVERY_EXHAUSTED.into());
         decision.failure_signature = Some(failure_signature.into());
         decision.recovery_owner = Some(OBJECTIVE_INCIDENT_CONTROLLER.into());
@@ -4031,7 +4100,7 @@ impl ObjectiveStore {
             "system recovery made no progress; parking a system-owned incident"
         );
         decision.decision_type = DecisionType::FailedInternal;
-        decision.status = ObjectiveStatus::WaitingSystem;
+        decision.status = ObjectiveStatus::Failed;
         decision.request_key = None;
         // Keep the exhausted signature for forensics; the failure code becomes
         // the typed reason so the transport turn and the objective agree.
@@ -4085,6 +4154,19 @@ impl ObjectiveStore {
             .as_ref()
             .map(|evidence| evidence.evidence_ref.clone());
         let mut delivery_run_to_complete: Option<DeliveryCompletionCandidate> = None;
+        // R2: the user-visible failure report is generated from structured data
+        // before the transaction opens — the pool may allow a single
+        // connection, and the report reads the real workspace on disk.
+        let failure_summary_message = if decision.is_parked_system_incident() {
+            self.build_failure_summary(&current, &decision).await
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            "这件事没做成。你交代的目标没有达成，当前进度已保留在会话里；\
+直接回一句「继续」或「把这些改动交付」就可以接着做。"
+                .to_string()
+        });
         let mut tx = self.pool.begin().await?;
         // The decision transaction may be the only SQLite connection in a
         // deterministic test or embedded deployment. Inspect schema through
@@ -4919,13 +5001,13 @@ impl ObjectiveStore {
                 let parked_delivery = if let Some(park) = delivery_identity_park.as_ref() {
                     let parked = sqlx::query(
                         "UPDATE delivery_runs
-                         SET status='platform_incident',
-                             wait_class='delivery_identity_conflict',
-                             next_action='await_system_capability_change',
+                         SET status='failed',
+                             wait_class=NULL,
+                             next_action=NULL,
                              next_action_authorized=0,
                              lease_owner=NULL, lease_expires_at=NULL,
-                             failure_code='delivery_identity_conflict',
-                             failure_class='platform_incident',
+                             failure_code='objective_failed',
+                             failure_class='objective_failed',
                              failure_signature=?, stage_attempt=?,
                              last_observed_at=?, updated_at=?
                          WHERE id=? AND objective_id=?
@@ -4953,17 +5035,13 @@ impl ObjectiveStore {
                 } else {
                     sqlx::query(
                         "UPDATE delivery_runs
-                     SET status='platform_incident',
-                         wait_class=CASE
-                           WHEN stage='takeover_reconciliation'
-                            AND wait_class='external_state_uncertain'
-                           THEN 'delivery_identity_conflict'
-                           ELSE wait_class END,
-                         next_action='await_system_capability_change',
+                     SET status='failed',
+                         wait_class=NULL,
+                         next_action=NULL,
                          next_action_authorized=0,
                          lease_owner=NULL, lease_expires_at=NULL,
-                         failure_code=COALESCE(failure_code, 'delivery_identity_conflict'),
-                         failure_class=COALESCE(failure_class, 'platform_incident'),
+                         failure_code=COALESCE(failure_code, 'objective_failed'),
+                         failure_class=COALESCE(failure_class, 'objective_failed'),
                          last_observed_at=?, updated_at=?
                      WHERE objective_id=?
                        AND id=(SELECT delivery_run_id FROM objectives WHERE id=?)
@@ -4987,22 +5065,19 @@ impl ObjectiveStore {
                     if has_delivery_events == 1 {
                         let run_id: String = run.try_get("id")?;
                         let stage: String = run.try_get("stage")?;
-                        let wait_class: Option<String> = run.try_get("wait_class")?;
                         sqlx::query(
                             "INSERT INTO delivery_run_events
                              (id, run_id, event_kind, stage, status, wait_class,
                               detail_json, process_instance, created_at)
-                             VALUES (?, ?, 'objective_incident_parked', ?,
-                                     'platform_incident', ?, ?, ?, ?)",
+                             VALUES (?, ?, 'objective_failed', ?, 'failed', NULL, ?, ?, ?)",
                         )
                         .bind(Uuid::new_v4().to_string())
                         .bind(run_id)
                         .bind(stage)
-                        .bind(wait_class)
                         .bind(
                             serde_json::json!({
-                                "reason": "linked_objective_recovery_exhausted",
-                                "next_action": "await_system_capability_change",
+                                "reason": "linked_objective_failed",
+                                "next_action": null,
                                 "failure_signature": delivery_identity_park.as_ref().map(|park| &park.failure_signature),
                                 "stage_attempt": delivery_identity_park.as_ref().map(|park| park.attempt_index),
                                 "claim_epoch": delivery_identity_park.as_ref().map(|park| park.claim_epoch),
@@ -5085,29 +5160,28 @@ impl ObjectiveStore {
                 )
                 .bind(&visible_final_message_id)
                 .bind(session_id)
-                .bind(parked_incident_message(current.failure_code.as_deref()))
+                .bind(failure_summary_message.as_str())
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
                 touch_session_in_settlement(&mut tx, session_id, now).await;
                 let projected = sqlx::query(
                     "UPDATE chat_turn_state
-                     SET revision=revision+1, phase='waiting', status='waiting_system',
-                         recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
-                         updated_at=?, completed_at=?, terminal_reason=?, objective_revision=?,
+                     SET revision=revision+1, phase='finalizing', status='completed',
+                         recent_activity_kind='objective_failed',
+                         recent_activity_label='这件事没做成，已把试过的办法和保留下来的改动写给你',
+                         waiting_reason=NULL,
+                         updated_at=?, completed_at=?, terminal_reason='objective_failed',
+                         objective_revision=?,
                          turn_settled_at=COALESCE(turn_settled_at, ?),
                          stream_closed_at=COALESCE(stream_closed_at, ?),
                          terminal_revision=?, visible_final_message_id=?,
-                         visible_final_kind='system_incident',
-                         next_action='await_system_recovery'
+                         visible_final_kind='assistant_final',
+                         next_action=NULL
                      WHERE objective_id=? AND root_turn_id=?",
                 )
-                .bind(TECHNICAL_RECOVERY_EXHAUSTED)
-                .bind("自动恢复已达到安全上限；系统已登记故障，无需补充输入")
-                .bind(TECHNICAL_RECOVERY_EXHAUSTED)
                 .bind(now)
                 .bind(now)
-                .bind(TECHNICAL_RECOVERY_EXHAUSTED)
                 .bind(decision.revision)
                 .bind(now)
                 .bind(now)
@@ -5135,7 +5209,7 @@ impl ObjectiveStore {
                      WHERE objective_id=?
                        AND status IN ('pending','running','waiting','waiting_permission')",
                 )
-                .bind("系统已停止自动恢复，当前步骤未继续执行。")
+                .bind("这件事没做成，这一步没有继续执行；已完成的改动都保留在工作区里。")
                 .bind(&decision.objective_id)
                 .execute(&mut *tx)
                 .await?;
@@ -5180,40 +5254,25 @@ impl ObjectiveStore {
                      WHERE objective_id=? AND status IN ('pending','running')",
                 )
                 .bind(completed_at)
-                .bind("系统多轮自动恢复没有进展，已停止自动恢复并登记故障。")
+                .bind("这件事没做成，已停止自动重试；保留下来的改动仍在工作区里。")
                 .bind(&decision.objective_id)
                 .execute(&mut *tx)
                 .await?;
             }
 
+            // R1/R4: the incident ledger closes here instead of opening a
+            // capability-gated wait. Nothing in a future build changes this
+            // outcome, so keeping the row open would only leave a permanent
+            // "waiting for something" record the user cannot act on.
             sqlx::query(
-                "INSERT INTO objective_incidents
-                 (id, objective_id, status, failure_code, failure_signature,
-                  owner, resume_cursor, opened_at, updated_at, domain,
-                  blocked_capability_revision, reactivation_status)
-                 VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?,
-                         COALESCE((SELECT revision FROM recovery_capabilities WHERE domain=?), ?),
-                         'waiting_capability')
-                 ON CONFLICT(objective_id) DO UPDATE SET
-                   status='open', failure_code=excluded.failure_code,
-                   failure_signature=excluded.failure_signature,
-                   owner=excluded.owner, resume_cursor=excluded.resume_cursor,
-                   domain=excluded.domain,
-                   blocked_capability_revision=excluded.blocked_capability_revision,
-                   reactivation_status='waiting_capability',
-                   updated_at=excluded.updated_at, resolved_at=NULL",
+                "UPDATE objective_incidents
+                 SET status='resolved', resolved_at=?, updated_at=?,
+                     reactivation_status='resolved'
+                 WHERE objective_id=? AND status='open'",
             )
-            .bind(Uuid::new_v4().to_string())
+            .bind(now)
+            .bind(now)
             .bind(&decision.objective_id)
-            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
-            .bind(&decision.failure_signature)
-            .bind(OBJECTIVE_INCIDENT_CONTROLLER)
-            .bind(&decision.resume_cursor)
-            .bind(now)
-            .bind(now)
-            .bind(decision.domain.as_str())
-            .bind(decision.domain.as_str())
-            .bind(0_i64)
             .execute(&mut *tx)
             .await?;
         }
@@ -5581,6 +5640,269 @@ impl ObjectiveStore {
     }
 }
 
+impl ObjectiveStore {
+    /// Structured inputs for the user-visible failure report: which approaches
+    /// were tried and why each stopped, plus what survived in the execution
+    /// workspace and any PR already opened for it. Step two — "automatically
+    /// try a different approach" — consumes this same structure instead of
+    /// parsing prose.
+    async fn build_failure_summary(
+        &self,
+        current: &ObjectiveSnapshot,
+        decision: &DecisionEnvelope,
+    ) -> Option<String> {
+        let attempts = self
+            .collect_attempt_summaries(&decision.objective_id, decision.revision)
+            .await;
+        let work = self.collect_preserved_work(current).await;
+        let goal = current.requested_acceptance.clone();
+        match crate::agent::failure_summary::build_failure_report(
+            &goal,
+            attempts.clone(),
+            work.clone(),
+        ) {
+            Ok(text) => Some(text),
+            // The goal text comes from the user and may itself trip the
+            // vocabulary guard. The report must still be delivered, so retry
+            // with an unnamed goal instead of dropping the explanation.
+            Err(_) => {
+                crate::agent::failure_summary::build_failure_report("", attempts, work).ok()
+            }
+        }
+    }
+
+    async fn collect_attempt_summaries(
+        &self,
+        objective_id: &str,
+        upto_revision: i64,
+    ) -> Vec<crate::agent::failure_summary::AttemptSummary> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT COALESCE(failure_code, ''), domain, COUNT(*)
+             FROM objective_decisions
+             WHERE objective_id=? AND revision<?
+             GROUP BY failure_code, domain
+             ORDER BY MIN(created_at), failure_code, domain",
+        )
+        .bind(objective_id)
+        .bind(upto_revision)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(code, domain, attempts)| crate::agent::failure_summary::AttemptSummary {
+                approach: crate::agent::failure_summary::plain_approach(Some(domain.as_str())),
+                attempts,
+                reason: crate::agent::failure_summary::plain_failure_reason(
+                    (!code.is_empty()).then_some(code.as_str()),
+                ),
+            })
+            .collect()
+    }
+
+    async fn collect_preserved_work(
+        &self,
+        current: &ObjectiveSnapshot,
+    ) -> crate::agent::failure_summary::PreservedWork {
+        let mut work = crate::agent::failure_summary::PreservedWork::default();
+        if let Some(session_id) = current.session_id.as_deref() {
+            if let Ok(Some(view)) =
+                crate::agent::execution_workspace::latest_for_session(&self.pool, session_id).await
+            {
+                let root = std::path::PathBuf::from(&view.worktree_path);
+                let (changes, total) = workspace_changes(&root, &view.base_sha);
+                work.location = Some(view.worktree_path.clone());
+                work.branch = Some(view.branch_name.clone());
+                work.changes = changes;
+                work.total_changed_files = total;
+            }
+        }
+        if let Some((url, status)) = self.latest_delivery_pr(&current.id).await {
+            work.pr_url = Some(url);
+            work.pr_state = Some(delivery_state_label(&status).to_string());
+        }
+        work
+    }
+
+    /// The PR a previous delivery attempt already opened, when both the schema
+    /// and the row carry it. Best-effort and schema-tolerant by design: an
+    /// older database without the column must still produce a report.
+    async fn latest_delivery_pr(&self, objective_id: &str) -> Option<(String, String)> {
+        let has_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .ok()?;
+        if has_table != 1 {
+            return None;
+        }
+        let has_column: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('delivery_runs')
+             WHERE name='canonical_pr_url'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .ok()?;
+        if has_column != 1 {
+            return None;
+        }
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT canonical_pr_url, status FROM delivery_runs
+             WHERE objective_id=? AND canonical_pr_url IS NOT NULL
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(objective_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+/// Uncommitted changes in an execution workspace relative to its baseline,
+/// plus files that are not tracked yet. Read-only git calls; a missing or
+/// non-repository path yields an empty list rather than failing the settlement
+/// that is reporting on it.
+fn workspace_changes(
+    root: &std::path::Path,
+    base_sha: &str,
+) -> (Vec<crate::agent::failure_summary::PreservedChange>, i64) {
+    use crate::util::no_window::NoWindow;
+    use std::process::Command;
+
+    let mut changes = Vec::new();
+    let mut numstat = Command::new("git").no_window();
+    numstat
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--numstat"])
+        .arg(base_sha);
+    if let Ok(output) = numstat.output()
+    {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let mut parts = line.splitn(3, '\t');
+                let added = parts.next().unwrap_or("0");
+                let removed = parts.next().unwrap_or("0");
+                let path = parts.next().unwrap_or("").trim();
+                if path.is_empty() {
+                    continue;
+                }
+                changes.push(crate::agent::failure_summary::PreservedChange {
+                    path: path.to_string(),
+                    added: added.parse().unwrap_or(0),
+                    removed: removed.parse().unwrap_or(0),
+                    untracked: false,
+                });
+            }
+        }
+    }
+    let mut untracked = Command::new("git").no_window();
+    untracked
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--others", "--exclude-standard"]);
+    if let Ok(output) = untracked.output()
+    {
+        if output.status.success() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let path = line.trim();
+                if path.is_empty() {
+                    continue;
+                }
+                changes.push(crate::agent::failure_summary::PreservedChange {
+                    path: path.to_string(),
+                    added: 0,
+                    removed: 0,
+                    untracked: true,
+                });
+            }
+        }
+    }
+    let total = changes.len() as i64;
+    (changes, total)
+}
+
+/// User-facing wording for a delivery run status.
+fn delivery_state_label(status: &str) -> &'static str {
+    match status {
+        "completed" | "merged" | "released" => "已经完成",
+        "failed" => "这一步没成",
+        "cancelled" => "已经取消",
+        _ => "还在进行中",
+    }
+}
+
+/// Extend the persisted `objectives.status` vocabulary with the terminal
+/// `failed` value.
+///
+/// SQLite cannot widen an existing CHECK constraint in place, so the table is
+/// rebuilt from its own live DDL with exactly one clause rewritten. The whole
+/// routine is guarded by reading `sqlite_master` first, which makes it a no-op
+/// on every startup whose schema is already widened — and keeps it correct for
+/// databases that were created by an older release, a test fixture, or a
+/// hand-built schema.
+pub async fn ensure_objective_failed_status(pool: &SqlitePool) -> crate::errors::Result<()> {
+    let ddl: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='objectives'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(ddl) = ddl else {
+        return Ok(());
+    };
+    if ddl.contains("'failed'") {
+        return Ok(());
+    }
+    let marker = "'cancelled', 'legacy_orphan'";
+    let Some(position) = ddl.find("CREATE TABLE") else {
+        return Ok(());
+    };
+    if !ddl.contains(marker) {
+        return Ok(());
+    }
+    let (head, tail) = ddl.split_at(position);
+    let rebuilt = format!(
+        "{head}{}",
+        tail.replacen("objectives", "objectives_failed_rebuild", 1)
+            .replace(marker, "'cancelled', 'failed', 'legacy_orphan'")
+    );
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master
+         WHERE type='index' AND tbl_name='objectives' AND sql IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut conn = pool.acquire().await?;
+    // Foreign keys are disabled for this single connection only, so the
+    // dependent tables survive the drop/rename and keep pointing at the
+    // rebuilt table by name.
+    sqlx::query("PRAGMA foreign_keys=OFF")
+        .execute(&mut *conn)
+        .await?;
+    let rebuilt_result = async {
+        sqlx::query(&rebuilt).execute(&mut *conn).await?;
+        sqlx::query("INSERT INTO objectives_failed_rebuild SELECT * FROM objectives")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DROP TABLE objectives").execute(&mut *conn).await?;
+        sqlx::query("ALTER TABLE objectives_failed_rebuild RENAME TO objectives")
+            .execute(&mut *conn)
+            .await?;
+        for index in &indexes {
+            sqlx::query(index).execute(&mut *conn).await?;
+        }
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    sqlx::query("PRAGMA foreign_keys=ON")
+        .execute(&mut *conn)
+        .await?;
+    rebuilt_result?;
+    Ok(())
+}
+
 /// Install the unified Objective schema even when a historical database has a
 /// conflicting sqlx migration version/checksum. The DDL is intentionally the
 /// same file used by fresh installs and is safe to execute on every startup.
@@ -5692,6 +6014,10 @@ pub async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    // Runs after the DDL above so a database created by an older release (or a
+    // fixture carrying the narrow status vocabulary) is widened even though
+    // `CREATE TABLE IF NOT EXISTS` left it untouched.
+    ensure_objective_failed_status(pool).await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_objective_incidents_reactivation
          ON objective_incidents(status, reactivation_status, domain,
@@ -9559,6 +9885,12 @@ mod tests {
             reactivated.is_empty(),
             "restart under the same recovery contract must not buy another budget"
         );
+        assert_eq!(
+            store.get(&parked.id).await.unwrap().unwrap().status,
+            ObjectiveStatus::WaitingSystem,
+            "the retired reactivation gate leaves the legacy row for start-up convergence"
+        );
+        store.reclassify_synthetic_technical_handbacks().await.unwrap();
         assert_parked_system_incident(&store.get(&parked.id).await.unwrap().unwrap());
     }
 
@@ -9641,6 +9973,14 @@ mod tests {
             .unwrap();
         assert!(reactivated.is_empty());
 
+        // The retired gate must not rearm the legacy row here. Convergence then
+        // finishes it as an honest failure, and the unknown receipt is left
+        // exactly as it was: nothing was replayed.
+        assert_eq!(
+            store.get(&parked.id).await.unwrap().unwrap().status,
+            ObjectiveStatus::WaitingSystem
+        );
+        store.reclassify_synthetic_technical_handbacks().await.unwrap();
         let current = store.get(&parked.id).await.unwrap().unwrap();
         assert_parked_system_incident(&current);
         let incident: (String, String) = sqlx::query_as(
@@ -9650,7 +9990,164 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(incident, ("open".into(), "blocked_safety".into()));
+        assert_eq!(incident, ("resolved".into(), "resolved".into()));
+        let receipt: String = sqlx::query_scalar(
+            "SELECT status FROM side_effect_receipts WHERE id='unsafe-rearm-receipt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt, "unknown", "an unknown side effect is never replayed");
+    }
+
+    /// R4: start-up convergence turns the retired limbo into the honest failure
+    /// terminal, keeps the preserved work visible, and is idempotent — a second
+    /// start writes nothing.
+    #[tokio::test]
+    async fn startup_convergence_finishes_legacy_limbo_exactly_once() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let parked = seed_legacy_parked_chat_incident(&pool, "objective-limbo-converge").await;
+        let session_id = parked.session_id.clone().unwrap();
+        let root_turn_id = parked.root_turn_id.clone().unwrap();
+        let now = Utc::now().timestamp_millis();
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sessions
+             (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sessions (id, updated_at) VALUES (?, ?)")
+            .bind(&session_id)
+            .bind(now - 10_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS messages (
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+               content TEXT NOT NULL, completion_state TEXT, created_at INTEGER NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               revision INTEGER NOT NULL DEFAULT 1, phase TEXT NOT NULL DEFAULT 'working',
+               status TEXT NOT NULL, recent_activity_kind TEXT, recent_activity_label TEXT,
+               waiting_reason TEXT, updated_at INTEGER NOT NULL DEFAULT 0,
+               completed_at INTEGER, terminal_reason TEXT, turn_settled_at INTEGER,
+               stream_closed_at INTEGER, terminal_revision INTEGER,
+               objective_revision INTEGER, visible_final_message_id TEXT,
+               visible_final_kind TEXT, next_action TEXT, objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, next_action, objective_id)
+             VALUES (?, ?, 'waiting_system', 'await_system_recovery', ?)",
+        )
+        .bind(&root_turn_id)
+        .bind(&session_id)
+        .bind(&parked.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS delivery_runs (
+               id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, status TEXT NOT NULL,
+               wait_class TEXT, next_action TEXT,
+               next_action_authorized INTEGER NOT NULL DEFAULT 0,
+               lease_owner TEXT, lease_expires_at INTEGER,
+               failure_code TEXT, failure_class TEXT,
+               last_observed_at INTEGER, updated_at INTEGER NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, objective_id, status, wait_class, next_action, lease_owner,
+              lease_expires_at, last_observed_at, updated_at)
+             VALUES ('delivery-limbo-converge', ?, 'platform_incident',
+                     'delivery_identity_conflict', 'await_system_capability_change',
+                     'owner-a', ?, ?, ?)",
+        )
+        .bind(&parked.id)
+        .bind(now + 60_000)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.reclassify_synthetic_technical_handbacks().await.unwrap(),
+            1
+        );
+        assert_parked_system_incident(&store.get(&parked.id).await.unwrap().unwrap());
+
+        let incident: String =
+            sqlx::query_scalar("SELECT status FROM objective_incidents WHERE objective_id=?")
+                .bind(&parked.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(incident, "resolved");
+
+        let turn: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, terminal_reason, next_action FROM chat_turn_state WHERE root_turn_id=?",
+        )
+        .bind(&root_turn_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            turn,
+            ("completed".into(), Some("objective_failed".into()), None)
+        );
+
+        let run: (String, Option<String>, Option<String>, i64) = sqlx::query_as(
+            "SELECT status, wait_class, next_action, next_action_authorized
+             FROM delivery_runs WHERE id='delivery-limbo-converge'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(run, ("failed".into(), None, None, 0));
+
+        let notice: String = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE session_id=? AND role='assistant' LIMIT 1",
+        )
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(notice.contains("这件事没做成"), "{notice}");
+        crate::agent::failure_summary::assert_no_internal_vocabulary(&notice).unwrap();
+
+        assert_eq!(
+            store.reclassify_synthetic_technical_handbacks().await.unwrap(),
+            0
+        );
+        let messages_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=?")
+                .bind(&session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            messages_after, 1,
+            "a second start must not write another notice"
+        );
     }
 
     async fn claimable_remediations(pool: &SqlitePool, objective_id: &str) -> i64 {
@@ -9732,11 +10229,18 @@ mod tests {
         store.get(&waiting.id).await.unwrap().unwrap()
     }
 
+    /// Exhaustion is the honest failure terminal: the objective is finished,
+    /// not parked. It holds no owner, no claimable retry and no future
+    /// wake-up — nothing about a later build changes this outcome.
     fn assert_parked_system_incident(objective: &ObjectiveSnapshot) {
         assert_eq!(
             objective.status,
-            ObjectiveStatus::WaitingSystem,
-            "exhausted recovery remains system-owned"
+            ObjectiveStatus::Failed,
+            "exhausted recovery is a real failure terminal"
+        );
+        assert!(
+            objective.status.is_terminal(),
+            "the failure terminal sits beside completed/cancelled"
         );
         assert_eq!(objective.decision_type, DecisionType::FailedInternal);
         assert!(
@@ -9751,11 +10255,11 @@ mod tests {
         assert!(
             objective.recovery_owner.as_deref() == Some("objective-incident-controller")
                 && objective.remediation_id.is_none(),
-            "a parked incident needs a durable system owner but no claimable retry"
+            "the terminal report names the controller but keeps no claimable retry"
         );
         assert!(
             objective.next_observation_at.is_none(),
-            "a parked incident waits for an explicit system capability change"
+            "nothing will ever wake this objective again"
         );
     }
 
@@ -10337,14 +10841,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             delivery_projection,
-            (
-                "platform_incident".into(),
-                Some("delivery_identity_conflict".into()),
-                0,
-                None,
-                None,
-            ),
-            "Objective recovery exhaustion must atomically fence its linked DeliveryRun"
+            ("failed".into(), None, 0, None, None),
+            "Objective recovery exhaustion must atomically fail its linked DeliveryRun"
         );
         let projection: (
             String,
@@ -10364,18 +10862,18 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(projection.0, "waiting_system");
+        assert_eq!(projection.0, "completed");
         assert!(
             projection.1.is_some() && projection.2.is_some(),
-            "handback must durably settle the turn and close its stream"
+            "the failure terminal must durably settle the turn and close its stream"
         );
         assert_eq!(projection.3, Some(current.revision));
         assert!(projection
             .4
             .as_deref()
             .is_some_and(|value| !value.is_empty()));
-        assert_eq!(projection.5.as_deref(), Some("system_incident"));
-        assert_eq!(projection.6.as_deref(), Some("await_system_recovery"));
+        assert_eq!(projection.5.as_deref(), Some("assistant_final"));
+        assert_eq!(projection.6, None, "a terminal turn queues no next action");
         let visible_final: (String, String) =
             sqlx::query_as("SELECT role, content FROM messages WHERE id=?")
                 .bind(projection.4.as_deref().unwrap())
@@ -10383,20 +10881,22 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(visible_final.0, "assistant");
-        assert!(visible_final.1.contains("不需要补充输入"));
+        assert!(visible_final.1.contains("这件事没做成"));
         assert!(
             !visible_final.1.contains(TECHNICAL_RECOVERY_EXHAUSTED),
-            "the visible incident message must not expose an internal reason code"
+            "the visible failure report must not expose an internal reason code"
         );
-        let incident: (String, String) =
-            sqlx::query_as("SELECT status, owner FROM objective_incidents WHERE objective_id=?")
-                .bind(&current.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let open_incidents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_incidents
+             WHERE objective_id=? AND status='open'",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
-            incident,
-            ("open".into(), "objective-incident-controller".into())
+            open_incidents, 0,
+            "the failure terminal leaves no incident waiting for anything"
         );
         let run_control: (String, Option<i64>) = sqlx::query_as(
             "SELECT status, settled_at FROM chat_run_controls
@@ -10680,18 +11180,18 @@ mod tests {
 
         let notice_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM messages
-             WHERE content LIKE '本回合的自动恢复已达到安全上限%'",
+             WHERE content LIKE '这件事没做成%'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(
             notice_count, 1,
-            "the system-incident notice must be written once per objective, not once per generation"
+            "a settled turn writes one report, never a duplicate"
         );
         let distinct_notices: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT visible_final_message_id) FROM chat_turn_state
-             WHERE objective_id=? AND visible_final_kind='system_incident'
+             WHERE objective_id=? AND visible_final_kind='assistant_final'
                AND visible_final_message_id IS NOT NULL",
         )
         .bind(&current_generation.id)
@@ -10699,8 +11199,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            distinct_notices, 1,
-            "later generations must reuse the original incident notice"
+            distinct_notices, notice_count,
+            "each settled turn points at its own report instead of reusing a stale one"
         );
     }
 

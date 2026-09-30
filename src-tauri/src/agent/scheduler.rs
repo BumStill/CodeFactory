@@ -632,6 +632,17 @@ impl TaskScheduler {
                         tasks::mark_task_cancelled(&self.pool, &task.id).await?;
                         continue;
                     }
+                    ObjectiveStatus::Failed => {
+                        // The task's objective ended in the honest failure
+                        // terminal. Re-dispatching it would restart work the
+                        // system already reported as not done.
+                        let reason = task_objective
+                            .failure_code
+                            .as_deref()
+                            .unwrap_or("objective_failed");
+                        tasks::mark_task_failed(&self.pool, &task.id, reason).await?;
+                        continue;
+                    }
                     ObjectiveStatus::WaitingSystem
                         if task_objective
                             .next_observation_at
@@ -1923,7 +1934,8 @@ mod tests {
         }
 
         assert!(!objective.requires_user_action);
-        assert_eq!(objective.status.as_str(), "waiting_system");
+        assert_eq!(objective.status.as_str(), "failed");
+        assert!(objective.status.is_terminal());
         assert_eq!(objective.decision_type.as_str(), "failed_internal");
         let remediations: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations WHERE objective_id=?")
@@ -1956,8 +1968,8 @@ mod tests {
             "re-arming waiting_system would restart the very loop the ceiling broke"
         );
         assert!(
-            error.unwrap_or_default().contains("已停止自动恢复"),
-            "the settled task must say why the system gave up"
+            error.unwrap_or_default().contains("这件事没做成"),
+            "the settled task must say the task did not work out"
         );
     }
 

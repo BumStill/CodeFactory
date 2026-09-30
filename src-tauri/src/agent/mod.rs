@@ -25,6 +25,7 @@ mod internal_text;
 pub mod journal;
 mod lifecycle_hooks;
 pub mod model_transport;
+pub mod failure_summary;
 pub mod objective;
 pub mod objective_supervisor;
 pub(crate) mod permission_gateway;
