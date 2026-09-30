@@ -50,6 +50,20 @@
 | CF-ORC-R39 | 单次 root turn 内已建立的 browser session 归属已由 task/chat 唯一确定时，后续 browser 动作省略 `session_id` 必须自动续用该 session；只有零个或多个归属会话时才要求显式命名 | 单会话续用 + 跨会话不可达 + 多会话必须命名的单测 |
 | CF-ORC-R40 | 任何在 claim、reconcile、startup 或后台 supervisor 内提交、且改变当前 turn/task ownership 或 settlement 的 Objective transition，都必须作为 post-commit receipt 返回并发布 typed projection；不得因为“没有新 claim”而吞掉已提交 transition。发布前必须复核 `(objective_id, revision, root/resume_cursor, terminal_revision)` 仍是 SQLite 当前胜者；旧 revision 不得终止新 root。事件丢失或发布失败不回滚真相，history hydration 必须从权威 settlement tuple 恢复 | supervisor ceiling callback + committed revision fence + task refresh payload + reducer old/new-root isolation + hydration SQLite integration |
 | CF-ORC-R41 | Objective 与其 DeliveryRun 不得拥有彼此矛盾的恢复生命期。Objective 进入 `technical_recovery_exhausted` system incident pause 时，必须以精确 run/lease owner/claim epoch permit 在同一事务撤销关联 DeliveryRun 的 mutation authority、清空 lease、终止 turn/run-control 并使其不可 claim；`core_input_required`、业务决策、显式拒绝/取消即使残留 `next_action_authorized=1` 也不得被后台 Delivery supervisor 重新认领。反向地，Delivery identity 只有 receipt 可精确证明时自动续接；相同失败预算按不同 claim epoch 计数，同一 lease 内重复 callback 不得提前停泊。任何跨进程恢复最终只能完成或形成一个稳定 system incident，不允许第三种无限 claim/事件增长状态 | linked Objective/DeliveryRun transaction + startup status allowlist + three-process crash/reclaim + claim/event plateau oracle |
+| CF-ORC-R43 | 工具层参数裁决立即如实返回：`edit_file`/`write_file` 的 `old_string` 出现 0 次或出现多次且未设 `replace_all`、路径不存在或越出工作区、文件不是 UTF-8、关键参数缺失，都必须作为普通工具失败原样交给 agent，文案含真实原因、文件路径、出现次数与改法；不得写 side-effect receipt、不得进 `waiting_system`、不得排 remediation、不得消耗恢复预算。已存在的回执仍是权威，重放路径不受此条影响 | 0 次/多次/缺路径/越出工作区/非 UTF-8 双向单测 + 无 receipt/remediation/`waiting_system` 断言 |
+| CF-ORC-R44 | 无观察效果的命令只说它所属的那一类并交回 agent 重新规划：本机文件改动类只说"会改动文件但无法核对"并指向 `edit_file`/`write_file`，远端推送/发布类才提 `deliver_changes`，后台化命令只说后台。命令根本没有执行、没有副作用，属于确定性裁决：不得计入恢复预算，也不得用一段罗列所有类别的门禁文案替代真实原因 | 本机 bash 文案不含"远端推送/发布/集群"、远端命令指向 `deliver_changes`、后台命令只提后台、均无 receipt 的单测 |
+| CF-ORC-R45 | 观察契约准入判断必须在权限网关之前执行：系统注定拒绝的调用不得弹权限框、不得产生 `permission_intents` 行，而是直接按 R43/R44 作为工具结果返回。该前置探测只做规划、不得写持久状态（receipt/contract/remediation），规划器报错时必须 fail open 交回权限网关，真正的门禁仍在派发前执行 | 前置探测只读断言 + 注定拒绝调用不产生权限意图行 |
+
+## 失败要说真话：参数裁决不是系统故障（CF-ORC-R43/R44/R45）
+
+R38 解决了"哪些效果本来就该放行"。R43–R45 解决另一半：**本来就该拒绝的那些调用，怎么把真实原因交回 agent**。
+
+2026-09-30 的现场证据：同一个任务里连续 4 次编辑被观察契约拦住，离恢复耗尽只差一次；agent 收到的理由是"效果落在本机之外（远端推送、发布、集群写入）"，而真实原因是"要替换的原文在文件里出现 0 次"。09-29 的一批并行编辑里，第 5 个（只加一行 `use`）同样被拦，agent 以为改好了，直到编译报错才发现。同一天还出现更矛盾的一幕：用户批准了一条 bash（intent 已 `consumed`），一秒后同一条命令被观察契约拒绝（"系统没有执行"），并且又计入一次恢复。
+
+- **参数错误是可确定性修复的输入错误，不是不可恢复的技术状态。** 同一个调用原样重放必然得到同一个裁决，所以它不属于"系统持有并自动恢复"的对象；把它塞进 `waiting_system` 只是把一次本可以在同一回合修好的问题，变成消耗恢复预算的系统故障。
+- **文案就是模型下一步的动作。** 罗列所有 fence 家族的句子（"远端推送、发布、集群写入、带请求体的网络写入、后台进程"）与一个错误的句子无法区分，模型只能照着最显眼的那个词行动——这正是它开始找 `deliver_changes` 的原因。因此 R44 要求只描述真正适用的那一类。
+- **不能先问再做注定被拒绝的决定。** 观察契约的准入判断是纯函数（读文件、算摘要、看规划），在弹权限框之前就能给出结论。把顺序倒过来，用户就被请去批准一件系统随后拒绝的事，而这次拒绝还会再消耗一次恢复预算。
+- 安全属性不变：没有观察方式的**外部**副作用仍然一律不执行；改变的只是裁决如何回到 agent 手里。
 
 ## 效果范围决定观察契约（CF-ORC-R38）
 

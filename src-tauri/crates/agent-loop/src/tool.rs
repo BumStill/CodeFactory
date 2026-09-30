@@ -146,6 +146,30 @@ pub trait ToolBackend: Send + Sync {
     fn classify(&self, call: &ToolCall, args: &serde_json::Value) -> (String, ToolKind) {
         crate::policy::completion_command_and_kind(&call.function.name, args)
     }
+
+    /// Deterministic, side-effect-free admission check evaluated BEFORE the
+    /// permission gateway (M9/R3).
+    ///
+    /// Two fences can already prove a mutation is unexecutable — a wrong
+    /// `edit_file.old_string`, or a command with no possible observation — and
+    /// neither needs the user's approval to decide. Asking first and refusing
+    /// afterwards is a false question: on 2026-09-30 a user approved a bash
+    /// command, the observation contract refused it one second later, and the
+    /// refusal still consumed an Objective recovery attempt.
+    ///
+    /// `Some(reason)` means: do NOT prompt, do NOT execute — return this reason
+    /// as the tool result. Implementations MUST NOT write durable state here;
+    /// the loop calls this for every receipt-bound mutation, repeating calls
+    /// included. The default (headless, scripted, and stub backends) keeps the
+    /// previous behaviour of always asking the gateway.
+    async fn admission_denial(
+        &self,
+        _call: &ToolCall,
+        _args: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

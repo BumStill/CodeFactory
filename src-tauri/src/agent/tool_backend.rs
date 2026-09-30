@@ -33,6 +33,10 @@ enum MutationAdmission {
     },
     Replay(ToolInvocationResult),
     Waiting(ToolInvocationResult),
+    /// Deterministically refused before any effect: the call is an argument
+    /// error (R1) or has no possible observation (R2). Returned to the agent as
+    /// an ordinary tool failure — never a `waiting_system` recovery round.
+    Refused(ToolInvocationResult),
 }
 
 #[derive(Debug, Clone)]
@@ -136,31 +140,102 @@ fn has_safe_relative_components(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+/// The verdict of building an observation plan for one file-mutating call.
+///
+/// `Refused` carries an ARGUMENT verdict, not a system fault: replaying the
+/// identical call can only produce the identical answer, and the model can fix
+/// every one of them from the message alone. Before the M9 fix these cases
+/// collapsed into `None` and were then reported by the observation-contract
+/// fence as "效果落在本机之外（远端推送、发布、集群写入）" — on 2026-09-30 the
+/// agent was told its `edit_file` was a remote push when the real reason was
+/// "`old_string` 出现 0 次", so it retried blindly and spent the Objective's
+/// recovery budget on a verdict that could never change.
+enum FileObservationAdmission {
+    Plan(FileObservationPlan),
+    Refused(String),
+    NotApplicable,
+}
+
 async fn prepare_file_observation(
     tool_name: &str,
     args: &serde_json::Value,
     cwd: &Path,
-) -> Option<FileObservationPlan> {
-    let requested = args.get("path")?.as_str()?;
-    let workspace = cwd.canonicalize().ok()?;
-    let resolved = match tool_name {
-        "write_file" => {
-            crate::tools::workspace_path::resolve_writable(&workspace, requested).ok()?
-        }
-        "edit_file" => {
-            crate::tools::workspace_path::resolve_existing(&workspace, requested).ok()?
-        }
-        _ => return None,
-    };
-    let relative = resolved.strip_prefix(&workspace).ok()?;
-    if !has_safe_relative_components(relative) {
-        return None;
+) -> FileObservationAdmission {
+    if !matches!(tool_name, "write_file" | "edit_file") {
+        return FileObservationAdmission::NotApplicable;
     }
-    let relative = relative.to_str()?.replace('\\', "/");
+    let Some(requested) = args.get("path").and_then(serde_json::Value::as_str) else {
+        return FileObservationAdmission::Refused(format!(
+            "`{tool_name}` 缺少字符串参数 `path`，未执行。请补上要写入的工作区相对路径后再调用。"
+        ));
+    };
+    // A parent component can only ever resolve outside the workspace, and when
+    // the target does not exist the resolver reports a bare "cannot access"
+    // instead — which hides the real reason (the path escapes the workspace)
+    // behind a misleading "请先核对路径是否存在".
+    if Path::new(requested)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return FileObservationAdmission::Refused(format!(
+            "`{tool_name}` 的目标 `{requested}` 解析后落在工作区之外，未执行。请改用工作区内的相对路径。"
+        ));
+    }
+    let workspace = match cwd.canonicalize() {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return FileObservationAdmission::Refused(format!(
+                "工作目录 `{}` 无法解析（{error}），`{tool_name}` 未执行。请确认工作目录存在后再调用。",
+                cwd.display()
+            ))
+        }
+    };
+    let resolved = match tool_name {
+        "write_file" => crate::tools::workspace_path::resolve_writable(&workspace, requested),
+        _ => crate::tools::workspace_path::resolve_existing(&workspace, requested),
+    };
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let hint = if matches!(
+                error,
+                crate::tools::workspace_path::WorkspacePathError::Outside { .. }
+            ) {
+                "请改用工作区内的相对路径。"
+            } else {
+                "请先 read_file 或 glob 核对该路径是否存在，再调用。"
+            };
+            return FileObservationAdmission::Refused(format!(
+                "`{tool_name}` 无法访问 `{requested}`：{}。未执行；{hint}",
+                error.message()
+            ));
+        }
+    };
+    let relative = match resolved
+        .strip_prefix(&workspace)
+        .ok()
+        .filter(|relative| has_safe_relative_components(relative))
+    {
+        Some(relative) => relative,
+        None => {
+            return FileObservationAdmission::Refused(format!(
+                "`{tool_name}` 的目标 `{requested}` 解析后落在工作区之外，未执行。请改用工作区内的相对路径。"
+            ))
+        }
+    };
+    let Some(relative) = relative.to_str().map(|relative| relative.replace('\\', "/")) else {
+        return FileObservationAdmission::Refused(format!(
+            "`{tool_name}` 的目标 `{requested}` 含非 UTF-8 字符，无法在工作区里定位，未执行。"
+        ));
+    };
     let before = match tokio::fs::read(&resolved).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(_) => return None,
+        Err(error) => {
+            return FileObservationAdmission::Refused(format!(
+                "`{tool_name}` 无法读取 `{relative}`：{error}。未执行；请先确认该文件可读，再调用。"
+            ))
+        }
     };
     let before_exists = resolved.exists();
     let precondition_digest = if before_exists {
@@ -169,19 +244,56 @@ async fn prepare_file_observation(
         absent_file_digest()
     };
     let expected = match tool_name {
-        "write_file" => args.get("content")?.as_str()?.as_bytes().to_vec(),
-        "edit_file" => {
-            let original = String::from_utf8(before).ok()?;
-            let old_string = args.get("old_string")?.as_str()?;
-            let new_string = args.get("new_string")?.as_str()?;
+        "write_file" => match args.get("content").and_then(serde_json::Value::as_str) {
+            Some(content) => content.as_bytes().to_vec(),
+            None => {
+                return FileObservationAdmission::Refused(
+                    "`write_file` 缺少字符串参数 `content`，未执行。请补上要写入的内容后再调用。"
+                        .to_string(),
+                )
+            }
+        },
+        _ => {
+            let original = match String::from_utf8(before) {
+                Ok(original) => original,
+                Err(_) => {
+                    return FileObservationAdmission::Refused(format!(
+                        "`{relative}` 不是 UTF-8 文本，`edit_file` 无法安全改写，未执行。\
+请改用能处理二进制文件的专用工具或脚本，并让改动结果可核对。"
+                    ))
+                }
+            };
+            let Some(old_string) = args.get("old_string").and_then(serde_json::Value::as_str)
+            else {
+                return FileObservationAdmission::Refused(
+                    "`edit_file` 缺少字符串参数 `old_string`，未执行。请补上要替换的原文后再调用。"
+                        .to_string(),
+                );
+            };
+            let Some(new_string) = args.get("new_string").and_then(serde_json::Value::as_str)
+            else {
+                return FileObservationAdmission::Refused(
+                    "`edit_file` 缺少字符串参数 `new_string`，未执行。请补上替换后的内容后再调用。"
+                        .to_string(),
+                );
+            };
             let replace_all = args
                 .get("replace_all")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             if !replace_all {
                 let count = original.matches(old_string).count();
-                if count != 1 {
-                    return None;
+                if count == 0 {
+                    return FileObservationAdmission::Refused(format!(
+                        "`{relative}` 里没有找到 `old_string`（出现 0 次）。\
+请先 read_file 核对这段原文，包括缩进和空白，再调用。"
+                    ));
+                }
+                if count > 1 {
+                    return FileObservationAdmission::Refused(format!(
+                        "`old_string` 在 `{relative}` 里出现了 {count} 次。\
+请加长它使其唯一，或设 `replace_all: true`。"
+                    ));
                 }
             }
             if replace_all {
@@ -190,9 +302,8 @@ async fn prepare_file_observation(
                 original.replacen(old_string, new_string, 1).into_bytes()
             }
         }
-        _ => return None,
     };
-    Some(FileObservationPlan {
+    FileObservationAdmission::Plan(FileObservationPlan {
         safe_locator_json: serde_json::json!({
             "workspace_relative_path": relative,
         })
@@ -449,23 +560,63 @@ fn contains_command_substitution(command: &str) -> bool {
 /// A trailing `&` backgrounds the command, so its completion is unobservable
 /// no matter how read-only the verb looks. `&&` is a sequencer, not a fork,
 /// and a quoted `&` is neither.
+/// A lone, unquoted `&` that sends the command to the background.
+///
+/// `&` also appears inside redirections and pipes that stay in the
+/// foreground: `2>&1`, `>&2`, `<&3`, `&>log`, `&>>log`, `|&`. Treating those as
+/// forks fenced every `cargo test … 2>&1 | tail` an agent runs once the
+/// observation gate began asking this function, so they are skipped here.
 fn has_background_operator(command: &str) -> bool {
-    let mut characters = shell_active_chars(command).peekable();
-    while let Some((character, active)) = characters.next() {
+    let characters: Vec<(char, bool)> = shell_active_chars(command).collect();
+    let mut index = 0;
+    while index < characters.len() {
+        let (character, active) = characters[index];
         if !active || character != '&' {
+            index += 1;
             continue;
         }
-        if characters
-            .peek()
-            .is_some_and(|(next, next_active)| *next_active && *next == '&')
-        {
-            characters.next();
+        let next = characters.get(index + 1).copied();
+        if next.is_some_and(|(next, next_active)| next_active && next == '&') {
+            index += 2;
+            continue;
+        }
+        let redirect_or_pipe = index
+            .checked_sub(1)
+            .and_then(|previous| characters.get(previous))
+            .is_some_and(|(previous, previous_active)| {
+                *previous_active && matches!(previous, '>' | '<' | '|')
+            })
+            || next.is_some_and(|(next, next_active)| next_active && next == '>');
+        if redirect_or_pipe {
+            index += 1;
             continue;
         }
         return true;
     }
     false
 }
+
+/// Commands that hand the work to a process outliving the tool call.
+///
+/// Two spellings of one idea: a shell forks with a lone `&`, while PowerShell
+/// and its siblings say `Start-Process` / `Start-Job` (and `nohup` survives the
+/// shell exiting). The observation gate and the refusal's family name are the
+/// same question, so they ask this one function — when the two kept separate
+/// lists, `Start-Process` was fenced by the gate yet classified as a local file
+/// edit, and the agent was told the wrong thing about its own call.
+pub(crate) fn command_forks_to_background(command: &str) -> bool {
+    if has_background_operator(command) {
+        return true;
+    }
+    let lower = command.to_ascii_lowercase();
+    BACKGROUND_COMMAND_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Lowercase substrings that mean "detached from this call", portable across
+/// the shells these hosts run.
+const BACKGROUND_COMMAND_MARKERS: [&str; 3] = ["nohup ", "start-process ", "start-job "];
 
 fn split_shell_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
@@ -870,6 +1021,123 @@ fn waiting_result(command: &str, kind: ToolKind, code: &str) -> ToolInvocationRe
     }
 }
 
+/// An ordinary, agent-visible tool failure for a call the system
+/// deterministically will not execute (R1/R2).
+///
+/// Deliberately NOT `ToolExecutionStatus::Waiting`: `Waiting` means "the system
+/// owns this and will reconcile it", which is exactly what pushed the Objective
+/// into `waiting_system`, queued a `reconcile_then_resume` remediation and spent
+/// the recovery budget (5 per signature) on a verdict that could never change.
+/// The tool simply did not run, so it returns the shape every other failed tool
+/// returns and the agent replans inside the same round.
+fn mutation_refusal_result(
+    command: &str,
+    kind: ToolKind,
+    code: &str,
+    content: String,
+) -> ToolInvocationResult {
+    ToolInvocationResult {
+        content,
+        is_error: true,
+        status: ToolExecutionStatus::Error,
+        command: command.to_string(),
+        kind,
+        return_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: None,
+        metadata: Some(serde_json::json!({
+            "code": code,
+            "recoverable": true,
+            "next_action": "replan_without_this_call",
+            "system_owned": false,
+            "not_executed": true,
+        })),
+        next_working_directory: None,
+        duration_ms: 0,
+    }
+}
+
+/// R2: the operation genuinely has no way to be observed, so it never ran.
+///
+/// Say which family this call belongs to — and only that family. The sentence
+/// decides what the agent tries next; telling a local file edit that it was a
+/// remote push is what made the model reach for a delivery tool it must not
+/// call. The safety property is untouched: an unobservable external side effect
+/// is still never executed, only the way the verdict travels back changed.
+fn unobservable_mutation_refusal(
+    is_mcp_tool: bool,
+    tool_name: &str,
+    command: &str,
+) -> (&'static str, String) {
+    if is_mcp_tool {
+        return (
+            "mcp_mutation_without_observation",
+            format!(
+                "MCP 工具 `{tool_name}` 会改动外部状态，但本机没有可核对的观察契约，未执行。\
+请改用工作区内可核对的方式：先把目标内容写入工作区文件，再用 edit_file / write_file 应用改动。"
+            ),
+        );
+    }
+    // Only the family that actually applies is mentioned. A sentence that lists
+    // every fence ("远端推送、发布、集群写入") is indistinguishable from a wrong
+    // one, and the agent acts on the sentence, not on the truth behind it.
+    if bash_has_explicit_external_mutation(command) || bash_delivers_to_a_remote_target(command) {
+        return (
+            "external_mutation_without_observation",
+            "这条命令会把改动送到本机之外（远端推送、发布、集群写入、带请求体的网络写入），\
+系统无法核对结果，未执行。需要交付动作时请调用 `deliver_changes`（它记录 CI 门禁与持久回执）；\
+其他远端写入请改成先写入工作区文件再核对的形式。"
+                .to_string(),
+        );
+    }
+    if command_forks_to_background(command) {
+        return (
+            "background_process_without_observation",
+            "这条命令会 fork 到后台进程，效果脱离前台、无法核对，未执行。\
+请改成前台同步命令，或换用能提供持久回执的工具。"
+                .to_string(),
+        );
+    }
+    (
+        "local_mutation_without_observation",
+        "这条命令会改动文件，但系统无法核对改动结果，未执行。\
+改文件请用 `edit_file` 或 `write_file`（两者都有写入后的字节级校验）；\
+需要跑脚本时，请把其中的文件改动单独拆成语义化工具调用。"
+            .to_string(),
+    )
+}
+
+/// The delivery half of `escapes_workspace_observation`'s marker list, mirrored
+/// here so the refusal can name the right family. Kept in sync deliberately:
+/// these are exactly the commands that reach the observation-contract fence
+/// because they write somewhere no local file can attest to.
+fn bash_delivers_to_a_remote_target(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "kubectl ",
+        "helm ",
+        "ssh ",
+        "scp ",
+        "rsync ",
+        "git push",
+        "git tag",
+        "gh pr create",
+        "gh pr merge",
+        "gh workflow run",
+        "gh release ",
+        "npm publish",
+        "pnpm publish",
+        "cargo publish",
+        "docker push",
+        "podman push",
+        "vercel ",
+        "netlify ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 fn replay_result(
     command: &str,
     kind: ToolKind,
@@ -981,8 +1249,17 @@ impl DesktopToolBackend {
                 "browser_observation_contract_required",
             )));
         }
-        let file_observation =
+        // Kept as a verdict rather than an `Option` so the truth survives to the
+        // one place that may act on it. It is deliberately NOT returned here: an
+        // existing receipt is authoritative even when the precondition can no
+        // longer be rebuilt, so a restarted observer must still get its replay
+        // instead of an argument error.
+        let file_admission =
             prepare_file_observation(&call.function.name, args, &ctx.working_directory).await;
+        let file_observation = match &file_admission {
+            FileObservationAdmission::Plan(plan) => Some(plan.clone()),
+            FileObservationAdmission::Refused(_) | FileObservationAdmission::NotApplicable => None,
+        };
         let generic_observation = if is_mcp_tool {
             None
         } else {
@@ -1712,10 +1989,24 @@ impl DesktopToolBackend {
             tx.commit().await.map_err(|error| ToolError {
                 message: format!("commit missing Tool observer attribution: {error}"),
             })?;
-            return Ok(MutationAdmission::Waiting(waiting_result(
-                command,
-                kind,
-                "tool_observation_contract_missing",
+            // R2 (and R1 for a file tool): a command with no possible
+            // observation never ran and never will, so this is a deterministic
+            // verdict for the agent rather than a system fault to reconcile.
+            // Name the actual family: calling an unobservable local edit
+            // "远端推送" sent the agent hunting for a `deliver_changes` that had
+            // nothing to do with its problem.
+            if let FileObservationAdmission::Refused(reason) = &file_admission {
+                return Ok(MutationAdmission::Refused(mutation_refusal_result(
+                    command,
+                    kind,
+                    "file_mutation_arguments_invalid",
+                    reason.clone(),
+                )));
+            }
+            let (code, reason) =
+                unobservable_mutation_refusal(is_mcp_tool, &call.function.name, command);
+            return Ok(MutationAdmission::Refused(mutation_refusal_result(
+                command, kind, code, reason,
             )));
         }
 
@@ -2119,9 +2410,9 @@ impl ToolBackend for DesktopToolBackend {
             MutationAdmission::Unbound
         };
         let (receipt_id, browser_execution) = match admission {
-            MutationAdmission::Replay(result) | MutationAdmission::Waiting(result) => {
-                return Ok(result)
-            }
+            MutationAdmission::Replay(result)
+            | MutationAdmission::Waiting(result)
+            | MutationAdmission::Refused(result) => return Ok(result),
             MutationAdmission::Unbound => (None, None),
             MutationAdmission::Dispatch {
                 receipt_id,
@@ -2189,6 +2480,85 @@ impl ToolBackend for DesktopToolBackend {
         } else {
             desktop_command_and_kind(&call.function.name, args)
         }
+    }
+
+    /// M15/R3: decide the observation contract's deterministic verdict before
+    /// anyone is asked to approve the call.
+    ///
+    /// Read-only by construction: it re-uses the same pure planners as
+    /// [`Self::mutation_preflight`] (`prepare_file_observation` and
+    /// `ToolRecoveryStore::prepare`, both of which only PLAN — the
+    /// `tool_recovery_contracts` INSERT happens later, on dispatch) and returns
+    /// the reason instead of persisting anything. Returning `Some` here means
+    /// the tool result is produced without a permission prompt AND without a
+    /// `permission_intents` row for a command that was never going to run.
+    async fn admission_denial(
+        &self,
+        call: &ToolCall,
+        args: &serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Option<String> {
+        let (command, native_kind) = desktop_command_and_kind(&call.function.name, args);
+        let is_mcp_tool = self
+            .mcp_tool_names
+            .read()
+            .is_ok_and(|names| names.contains(&call.function.name));
+        let kind = if is_mcp_tool {
+            ToolKind::Mutation
+        } else {
+            native_kind
+        };
+        let native_tool_known = crate::tools::all_definitions()
+            .iter()
+            .any(|definition| definition.function.name == call.function.name);
+        let requires_receipt = is_mcp_tool
+            || (native_tool_known
+                && native_requires_mutation_receipt(&call.function.name, args, &kind));
+        if !requires_receipt {
+            return None;
+        }
+        // Schema migrations are idempotent DDL, not durable business state: the
+        // planners below cannot answer without the tables. A failure here fails
+        // OPEN (ask as before) — the real fence still runs in
+        // `mutation_preflight` before anything executes.
+        if self.ensure_observation_schema().await.is_err() {
+            return None;
+        }
+        match prepare_file_observation(&call.function.name, args, &ctx.working_directory).await {
+            // R1: an argument verdict is settled before permission exists.
+            FileObservationAdmission::Refused(reason) => return Some(reason),
+            FileObservationAdmission::Plan(_) => return None,
+            FileObservationAdmission::NotApplicable => {}
+        }
+        if is_mcp_tool {
+            return Some(unobservable_mutation_refusal(true, &call.function.name, &command).1);
+        }
+        // Specialized fences carry their own richer verdicts (browser pairing
+        // recovery, delivery receipts); leave those to mutation_preflight.
+        if matches!(call.function.name.as_str(), "browser_session" | "deliver_changes") {
+            return None;
+        }
+        // A generic observer (workspace file, browser, ...) means the contract
+        // can be satisfied, so the call is admissible and the gateway decides.
+        let generic_observation = match super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
+            .prepare(
+                &call.function.name,
+                args,
+                &ctx.working_directory,
+                ctx.session_id.as_deref(),
+                ctx.root_turn_id.as_deref(),
+            )
+            .await
+        {
+            Ok(plan) => plan,
+            // A planner error must never masquerade as "no observation
+            // contract": this probe only decides whether to ASK.
+            Err(_) => return None,
+        };
+        if generic_observation.is_some() {
+            return None;
+        }
+        Some(unobservable_mutation_refusal(false, &call.function.name, &command).1)
     }
 }
 
@@ -3100,6 +3470,338 @@ mod tests {
         }
     }
 
+    /// Run one call's admission decision and return the agent-visible refusal —
+    /// asserting, while we are here, that the refusal left no receipt, no
+    /// observation contract, no `side_effect_started` and no remediation, and
+    /// did not park the Objective. That is the whole M9 claim: the verdict
+    /// reaches the agent inside the same round and costs no recovery budget.
+    async fn refuse(
+        backend: &DesktopToolBackend,
+        call_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+        cwd: &std::path::Path,
+    ) -> ToolInvocationResult {
+        let call = call_with_args(call_id, tool_name, args);
+        register_tool_call(backend, &call, args).await;
+        let (command, kind) = backend.classify(&call, args);
+        let remediations_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        let admission = backend
+            .mutation_preflight(&call, args, &objective_ctx(cwd), &command, kind, false)
+            .await
+            .unwrap();
+        let MutationAdmission::Refused(outcome) = admission else {
+            panic!("an unexecutable {tool_name} call must be refused, not admitted nor waited on");
+        };
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(receipts, 0, "a refused call must not open a receipt");
+        let contracts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tool_recovery_contracts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            contracts, 0,
+            "a refused call must not persist an observation contract"
+        );
+        let side_effect_started: i64 =
+            sqlx::query_scalar("SELECT side_effect_started FROM objectives WHERE id=?")
+                .bind(TEST_OBJECTIVE_ID)
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(side_effect_started, 0);
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+            .bind(TEST_OBJECTIVE_ID)
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_ne!(
+            status, "waiting_system",
+            "a refusal is not a system fault: the Objective must not be parked"
+        );
+        let remediations_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            remediations_before, remediations_after,
+            "a refusal must not queue a remediation"
+        );
+        outcome
+    }
+
+    /// R1: 2026-09-30 — `edit_file` whose `old_string` appeared zero times was
+    /// reported to the agent as "效果落在本机之外（远端推送、发布、集群写入）".
+    /// The agent then went looking for a delivery tool instead of re-reading the
+    /// file, and every one of those rounds charged the recovery budget.
+    #[tokio::test]
+    async fn edit_file_missing_old_string_is_an_immediate_truthful_failure() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("target.rs"), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        let args = serde_json::json!({
+            "path": "target.rs",
+            "old_string": "gamma",
+            "new_string": "delta",
+        });
+
+        let outcome = refuse(&backend, "edit-missing-old", "edit_file", &args, dir.path()).await;
+
+        assert!(outcome.is_error);
+        assert_eq!(outcome.status, ToolExecutionStatus::Error);
+        for expected in ["target.rs", "出现 0 次", "read_file"] {
+            assert!(
+                outcome.content.contains(expected),
+                "the refusal must carry the real reason ({expected}): {}",
+                outcome.content
+            );
+        }
+        for forbidden in ["远端推送", "发布", "集群", "后台进程", "等待"] {
+            assert!(
+                !outcome.content.contains(forbidden),
+                "the false family must be gone ({forbidden}): {}",
+                outcome.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_file_ambiguous_old_string_reports_the_real_occurrence_count() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("target.rs"), "dup\ndup\ndup\n")
+            .await
+            .unwrap();
+        let args = serde_json::json!({
+            "path": "target.rs",
+            "old_string": "dup",
+            "new_string": "once",
+        });
+
+        let outcome = refuse(&backend, "edit-ambiguous-old", "edit_file", &args, dir.path()).await;
+
+        for expected in ["出现了 3 次", "target.rs", "replace_all"] {
+            assert!(
+                outcome.content.contains(expected),
+                "the refusal must carry the real count ({expected}): {}",
+                outcome.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_all_with_multiple_matches_still_dispatches() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("target.rs"), "dup\ndup\n")
+            .await
+            .unwrap();
+        let args = serde_json::json!({
+            "path": "target.rs",
+            "old_string": "dup",
+            "new_string": "once",
+            "replace_all": true,
+        });
+        let call = call_with_args("edit-replace-all", "edit_file", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let (command, kind) = backend.classify(&call, &args);
+
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(admission, MutationAdmission::Dispatch { .. }),
+            "`replace_all: true` is the documented escape hatch and must stay admissible"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_path_verdicts_are_truthful_and_never_wait_for_recovery() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("binary.bin"), [0xff_u8, 0xfe, 0x00])
+            .await
+            .unwrap();
+
+        for (call_id, args, expected) in [
+            (
+                "edit-missing-path",
+                serde_json::json!({
+                    "path": "nope.rs",
+                    "old_string": "a",
+                    "new_string": "b",
+                }),
+                "nope.rs",
+            ),
+            (
+                "edit-outside-workspace",
+                serde_json::json!({
+                    "path": "../outside.rs",
+                    "old_string": "a",
+                    "new_string": "b",
+                }),
+                "工作区之外",
+            ),
+            (
+                "edit-non-utf8",
+                serde_json::json!({
+                    "path": "binary.bin",
+                    "old_string": "a",
+                    "new_string": "b",
+                }),
+                "不是 UTF-8",
+            ),
+        ] {
+            let outcome = refuse(&backend, call_id, "edit_file", &args, dir.path()).await;
+            assert!(
+                outcome.content.contains(expected),
+                "{call_id} must name the real reason ({expected}): {}",
+                outcome.content
+            );
+            assert!(
+                !outcome.content.contains("远端推送"),
+                "{call_id} must not be dressed up as a remote push: {}",
+                outcome.content
+            );
+        }
+    }
+
+    /// R2: a bash command that edits files but has no observation contract is
+    /// still never executed — but it now SAYS that, and says it to the agent.
+    #[tokio::test]
+    async fn unobservable_bash_file_mutation_is_refused_without_the_remote_wording() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let escaped = dir.path().parent().unwrap().join("m9-outside-seeded.txt");
+        let _ = std::fs::remove_file(&escaped);
+        let args = serde_json::json!({"command": "touch ../m9-outside-seeded.txt"});
+
+        let outcome = refuse(&backend, "bash-unobservable-local", "bash", &args, dir.path()).await;
+
+        for expected in ["改动文件", "无法核对", "edit_file", "write_file"] {
+            assert!(
+                outcome.content.contains(expected),
+                "the local family must say what to do instead ({expected}): {}",
+                outcome.content
+            );
+        }
+        for forbidden in ["远端推送", "发布", "集群", "deliver_changes"] {
+            assert!(
+                !outcome.content.contains(forbidden),
+                "a local file edit is not a remote delivery ({forbidden}): {}",
+                outcome.content
+            );
+        }
+        assert!(!escaped.exists(), "the refused command must never run");
+    }
+
+    #[tokio::test]
+    async fn remote_push_refusal_still_points_at_deliver_changes() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "command": "curl -X POST https://example.invalid/hooks -d secret"
+        });
+
+        let outcome = refuse(&backend, "bash-remote-push", "bash", &args, dir.path()).await;
+
+        for expected in ["本机之外", "deliver_changes"] {
+            assert!(
+                outcome.content.contains(expected),
+                "a real remote write must keep its own wording ({expected}): {}",
+                outcome.content
+            );
+        }
+    }
+
+    /// M15/R3: the pre-permission probe must answer without writing anything —
+    /// it is the check that runs before the user is ever asked.
+    #[tokio::test]
+    async fn pre_permission_admission_probe_is_read_only_and_decisive() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("target.rs"), "alpha\n")
+            .await
+            .unwrap();
+        let ctx = objective_ctx(dir.path());
+
+        let bad_edit = serde_json::json!({
+            "path": "target.rs",
+            "old_string": "gamma",
+            "new_string": "delta",
+        });
+        let denial = backend
+            .admission_denial(
+                &call_with_args("pre-permission-edit", "edit_file", &bad_edit),
+                &bad_edit,
+                &ctx,
+            )
+            .await
+            .expect("an impossible edit must be refused before any permission prompt");
+        assert!(denial.contains("出现 0 次"), "{denial}");
+
+        let unobservable = serde_json::json!({"command": "touch ../m9-outside-probe.txt"});
+        let denial = backend
+            .admission_denial(
+                &call_with_args("pre-permission-bash", "bash", &unobservable),
+                &unobservable,
+                &ctx,
+            )
+            .await
+            .expect("an unobservable mutation must be refused before any permission prompt");
+        assert!(denial.contains("无法核对"), "{denial}");
+
+        // A call the contract CAN observe is admitted here and left to the
+        // permission gateway: the probe must not become a second full fence.
+        let good_edit = serde_json::json!({
+            "path": "target.rs",
+            "old_string": "alpha",
+            "new_string": "beta",
+        });
+        assert_eq!(
+            backend
+                .admission_denial(
+                    &call_with_args("pre-permission-ok", "edit_file", &good_edit),
+                    &good_edit,
+                    &ctx,
+                )
+                .await,
+            None
+        );
+
+        // ...and it wrote nothing while deciding all of that.
+        for table in [
+            "side_effect_receipts",
+            "tool_recovery_contracts",
+            "objective_remediations",
+        ] {
+            let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+            assert_eq!(rows, 0, "the pre-permission probe must not write {table}");
+        }
+    }
+
     #[tokio::test]
     async fn native_mutation_without_observer_fails_before_receipt_or_dispatch() {
         let backend = objective_backend(false).await;
@@ -3123,17 +3825,25 @@ mod tests {
             .await
             .unwrap();
 
-        let MutationAdmission::Waiting(outcome) = admission else {
+        let MutationAdmission::Refused(outcome) = admission else {
             panic!("an unobservable native mutation must fail before dispatch");
         };
-        assert_eq!(outcome.status, ToolExecutionStatus::Waiting);
+        assert_eq!(outcome.status, ToolExecutionStatus::Error);
         assert_eq!(
             outcome
                 .metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("code"))
                 .and_then(serde_json::Value::as_str),
-            Some("tool_observation_contract_missing")
+            Some("external_mutation_without_observation")
+        );
+        assert_eq!(
+            outcome
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("not_executed"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
         let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
             .fetch_one(&backend.db)
@@ -3225,7 +3935,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                matches!(admission, MutationAdmission::Waiting(_)),
+                matches!(admission, MutationAdmission::Refused(_)),
                 "{call_id} unexpectedly reached dispatch"
             );
             let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
@@ -4113,7 +4823,7 @@ mod tests {
             .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
             .await
             .unwrap();
-        let MutationAdmission::Waiting(outcome) = admission else {
+        let MutationAdmission::Refused(outcome) = admission else {
             panic!("publishing to a registry has no local observer");
         };
         assert_eq!(
@@ -4122,13 +4832,52 @@ mod tests {
                 .as_ref()
                 .and_then(|metadata| metadata.get("code"))
                 .and_then(serde_json::Value::as_str),
-            Some("tool_observation_contract_missing")
+            Some("external_mutation_without_observation")
         );
         assert!(
             outcome.content.contains("deliver_changes"),
             "a fenced effect must name a reachable alternative, got: {}",
             outcome.content
         );
+    }
+
+    /// The gate and the refusal's family name must answer the same question.
+    /// Windows spells a background process without `&`, so this asserts both
+    /// spellings through the shared classifier — and it runs everywhere, which
+    /// is what keeps the Windows form covered from macOS and Linux hosts.
+    #[test]
+    fn background_spellings_classify_as_background_on_every_platform() {
+        for command in [
+            "Start-Process powershell -ArgumentList '-Command whoami'",
+            "Start-Job -ScriptBlock { Get-Date }",
+            "nohup sh -c 'touch launched' >/dev/null 2>&1 &",
+            "nohup ./server >server.log 2>&1",
+            "sleep 30 &",
+            "./server & echo started",
+            "cargo build 2>&1 &",
+        ] {
+            assert!(
+                super::command_forks_to_background(command),
+                "expected the background family for: {command}"
+            );
+        }
+        for command in [
+            "cargo test --manifest-path src-tauri/Cargo.toml",
+            "echo one && echo two",
+            "grep -n 'a & b' src/lib.rs",
+            "cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | tail -30",
+            "pnpm test > out.log 2>&1",
+            "make build &> build.log",
+            "make build &>> build.log",
+            "echo failed >&2",
+            "exec 3<&0",
+            "cargo test |& tee test.log",
+        ] {
+            assert!(
+                !super::command_forks_to_background(command),
+                "expected a foreground family for: {command}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4151,13 +4900,13 @@ mod tests {
             .expect("missing observer is a system-owned wait");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        assert_eq!(out.status, ToolExecutionStatus::Waiting);
+        assert_eq!(out.status, ToolExecutionStatus::Error);
         assert_eq!(
             out.metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("code"))
                 .and_then(serde_json::Value::as_str),
-            Some("tool_observation_contract_missing")
+            Some("background_process_without_observation")
         );
         assert!(!marker.exists(), "the background process must never launch");
         let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
@@ -4192,13 +4941,13 @@ mod tests {
             .await
             .expect("undeclared MCP mutation is held by the system");
 
-        assert_eq!(out.status, ToolExecutionStatus::Waiting);
+        assert_eq!(out.status, ToolExecutionStatus::Error);
         assert_eq!(
             out.metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("code"))
                 .and_then(serde_json::Value::as_str),
-            Some("tool_observation_contract_missing")
+            Some("mcp_mutation_without_observation")
         );
         let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
             .fetch_one(&backend.db)
