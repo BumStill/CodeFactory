@@ -393,11 +393,15 @@ jobs:
           if ($smoke.user_message_count -ne 1) { throw "Release recovery manufactured a user message" }
           if ($smoke.human_prompt_count -ne 0) { throw "Release recovery requested human input" }
           if ($smoke.side_effect_receipt_count -ne 1) { throw "Release recovery duplicated a mutation receipt" }
-          if ($smoke.replay_call_link_count -ne 2) { throw "Release Tool calls did not converge on one receipt" }
-          if ($smoke.objective_status -ne "completed") { throw "Release Objective did not complete" }
+          if (-not $smoke.legacy_incident_converged_to_failed) { throw "Release did not converge a legacy exhausted Objective to the failed terminal" }
+          if ($smoke.convergence_notice_count -ne 1) { throw "Release failed terminal did not publish exactly one summary" }
+          if ($smoke.incident_status -ne "resolved") { throw "Release left the legacy incident open" }
+          if ($smoke.objective_status -ne "failed") { throw "Release Objective did not reach the failed terminal" }
+          if (-not $smoke.session_order_preserved) { throw "Release startup convergence reordered the session" }
+          if ($smoke.second_restart_mutations -ne 0) { throw "Release second restart mutated settled state" }
           if ($smoke.live_owner_count -ne 0) { throw "Release smoke left a live owner" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "Release smoke left claimable remediation" }
-          if ($smoke.provider_request_count -lt 5) { throw "Release provider trajectory was incomplete" }
+          if ($smoke.provider_request_count -ne $smoke.provider_requests_after_phase_one) { throw "Release restart performed provider work instead of converging locally" }
           if (-not $smoke.artifact_verified) { throw "Release smoke did not verify the workspace" }
           if (-not $smoke.cleanup_ok) { throw "Release smoke leaked isolated state" }
           Get-Content $receipt
@@ -502,7 +506,7 @@ jobs:
           if (-not $smoke.all_live_objectives_cancelled) { throw "Release session stop left a live Objective" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "Release left claimable cancellation recovery" }
           if (-not $smoke.second_restart_stayed_cancelled) { throw "Release cancellation revived after the second restart" }
-          if (-not $smoke.system_incident_survived_two_restarts) { throw "Release system incident became runnable after restart" }
+          if (-not $smoke.failed_terminal_survived_two_restarts) { throw "Release failed terminal was revived after restart" }
           if (-not $smoke.cleanup_ok) { throw "Release historical session smoke leaked isolated state" }
           Get-Content $receipt
 

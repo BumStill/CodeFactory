@@ -60,8 +60,12 @@ jobs:
           if ($smoke.user_message_count -ne 1) { throw "Nightly manufactured a user message" }
           if ($smoke.human_prompt_count -ne 0) { throw "Nightly requested human participation" }
           if ($smoke.side_effect_receipt_count -ne 1) { throw "Nightly duplicated a side effect" }
-          if ($smoke.replay_call_link_count -ne 2) { throw "Nightly replay did not converge" }
-          if ($smoke.objective_status -ne "completed") { throw "Nightly Objective did not complete" }
+          if (-not $smoke.legacy_incident_converged_to_failed) { throw "Nightly did not converge a legacy exhausted Objective to the failed terminal" }
+          if ($smoke.convergence_notice_count -ne 1) { throw "Nightly failed terminal did not publish exactly one summary" }
+          if ($smoke.incident_status -ne "resolved") { throw "Nightly left the legacy incident open" }
+          if ($smoke.objective_status -ne "failed") { throw "Nightly Objective did not reach the failed terminal" }
+          if (-not $smoke.session_order_preserved) { throw "Nightly startup convergence reordered the session" }
+          if ($smoke.second_restart_mutations -ne 0) { throw "Nightly second restart mutated settled state" }
           if ($smoke.live_owner_count -ne 0) { throw "Nightly left a live owner" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "Nightly left claimable remediation" }
           if (-not $smoke.artifact_verified) { throw "Nightly did not verify the workspace" }
@@ -92,8 +96,10 @@ jobs:
           if (-not $smoke.exact_receipted_head_reconciled) { throw "Nightly did not reconcile the receipted head" }
           if (-not $smoke.canonical_parent_reconciled) { throw "Nightly did not reconcile the canonical PR parent" }
           if ($smoke.canonical_parent_mutation_count -ne 0) { throw "Nightly canonical-parent observation issued a mutation" }
-          if (-not $smoke.foreign_identity_parked) { throw "Nightly did not park foreign identity drift" }
+          if (-not $smoke.foreign_identity_failed_closed) { throw "Nightly did not converge foreign identity drift to the failed terminal" }
           if (-not $smoke.claim_epoch_plateau) { throw "Nightly delivery claim epoch did not plateau" }
+          if ($smoke.objective_failed_event_count -ne 1) { throw "Nightly objective failure event was not singular" }
+          if ($smoke.recovery_parked_event_count -ne 0) { throw "Nightly emitted a retired parked incident" }
           if ($smoke.duplicate_remote_write_count -ne 0) { throw "Nightly duplicated a remote mutation" }
           if ($smoke.user_message_count -ne 1) { throw "Nightly manufactured or lost user input" }
           if ($smoke.human_prompt_count -ne 0) { throw "Nightly requested human participation" }
@@ -123,7 +129,7 @@ jobs:
           if (-not $smoke.all_live_objectives_cancelled) { throw "Nightly session stop left a live Objective" }
           if ($smoke.claimable_remediation_count -ne 0) { throw "Nightly left claimable cancellation recovery" }
           if (-not $smoke.second_restart_stayed_cancelled) { throw "Nightly cancellation revived after the second restart" }
-          if (-not $smoke.system_incident_survived_two_restarts) { throw "Nightly system incident became runnable after restart" }
+          if (-not $smoke.failed_terminal_survived_two_restarts) { throw "Nightly failed terminal was revived after restart" }
           if (-not $smoke.cleanup_ok) { throw "Nightly historical session smoke leaked isolated state" }
           Get-Content $receipt
 

@@ -81,11 +81,14 @@ test("the formal smoke owns the capability-reactivation oracle", async () => {
     source("src-tauri/src/unattended_smoke_cli.rs"),
   ]);
   for (const required of [
-    "sync_recovery_capabilities",
-    "reactivate_eligible_incidents",
-    "legacy_incident_parked",
-    "incident_reactivated",
-    "incident_reactivation_count",
+    "reclassify_synthetic_technical_handbacks",
+    "seed_legacy_exhausted_state",
+    "durable_state_snapshot",
+    "legacy_incident_converged_to_failed",
+    "convergence_notice_count",
+    "incident_status",
+    "session_order_preserved",
+    "second_restart_mutations",
     "capability_revision",
     "executed_recovery_attempts",
   ]) {

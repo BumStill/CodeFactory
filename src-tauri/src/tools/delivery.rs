@@ -3744,10 +3744,21 @@ pub(crate) async fn recover_delivery_recovery_smoke(
     )
     .fetch_one(&pool)
     .await?;
+    // The retired limbo wrote `objective_incident_parked` and left the run in a
+    // non-terminal `platform_incident` wait. The honest failure terminal writes
+    // `objective_failed` instead, so the parked counter is now the *negative*
+    // half of the same assertion: it must stay at zero.
     let recovery_parked_event_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM delivery_run_events
          WHERE run_id='delivery-recovery-smoke-foreign'
            AND event_kind='objective_incident_parked'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    let objective_failed_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_run_events
+         WHERE run_id='delivery-recovery-smoke-foreign'
+           AND event_kind='objective_failed'",
     )
     .fetch_one(&pool)
     .await?;
@@ -3770,12 +3781,13 @@ pub(crate) async fn recover_delivery_recovery_smoke(
         &origin,
         &["rev-parse", "refs/heads/fix/delivery-recovery-smoke"],
     )?;
-    let foreign_identity_parked = status == "platform_incident"
-        && wait_class.as_deref() == Some("delivery_identity_conflict")
+    let foreign_identity_failed_closed = status == "failed"
+        && wait_class.is_none()
         && stage_attempt == 2
         && next_action_authorized == 0
-        && recovery_parked_event_count == 1
-        && foreign_objective.0 == "waiting_system"
+        && objective_failed_event_count == 1
+        && recovery_parked_event_count == 0
+        && foreign_objective.0 == "failed"
         && foreign_objective.1 == "failed_internal"
         && foreign_objective.2.as_deref() == Some("technical_recovery_exhausted")
         && foreign_objective.3.as_deref() == Some("objective-incident-controller")
@@ -3786,7 +3798,7 @@ pub(crate) async fn recover_delivery_recovery_smoke(
     let remote_unchanged = remote_head_before == remote_head_after
         && remote_head_after == reconciled_head
         && foreign_head != remote_head_after;
-    if !foreign_identity_parked
+    if !foreign_identity_failed_closed
         || !claim_epoch_plateau
         || !remote_unchanged
         || foreign_mutation_intent_count != 0
@@ -3794,11 +3806,12 @@ pub(crate) async fn recover_delivery_recovery_smoke(
         || human_prompt_count != 0
     {
         anyhow::bail!(
-            "foreign identity recovery did not converge fail-closed: \
+            "foreign identity recovery did not converge to the failed terminal: \
              status={status}, wait_class={wait_class:?}, stage_attempt={stage_attempt}, \
              next_action_authorized={next_action_authorized}, claim_epoch={claim_epoch}, \
              last_epoch={last_epoch}, claim_epoch_after_third={claim_epoch_after_third}, \
-             third_claims={}, parked_events={recovery_parked_event_count}, \
+             third_claims={}, objective_failed_events={objective_failed_event_count}, \
+             parked_events={recovery_parked_event_count}, \
              mutation_intents={foreign_mutation_intent_count}, \
              user_messages={user_message_count}, human_prompts={human_prompt_count}, \
              remote_before={remote_head_before}, remote_after={remote_head_after}, \
@@ -3815,9 +3828,10 @@ pub(crate) async fn recover_delivery_recovery_smoke(
         "identity_revision_count": identity_revision_count,
         "canonical_parent_reconciled": canonical_parent_reconciled,
         "canonical_parent_mutation_count": canonical_parent_mutation_count,
-        "foreign_identity_parked": foreign_identity_parked,
+        "foreign_identity_failed_closed": foreign_identity_failed_closed,
         "claim_epoch_plateau": claim_epoch_plateau,
         "claim_epoch": claim_epoch,
+        "objective_failed_event_count": objective_failed_event_count,
         "recovery_parked_event_count": recovery_parked_event_count,
         "duplicate_remote_write_count": duplicate_remote_write_count,
         "production_resume_path": true,

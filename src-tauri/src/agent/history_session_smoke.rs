@@ -7,7 +7,8 @@
 
 use super::objective::{
     current_process_instance, CreateObjective, DecisionRouter, ObjectiveKind, ObjectiveSnapshot,
-    ObjectiveStore, RecoveryDomain, RouteSignal,
+    ObjectiveStore, RecoveryDomain, RouteSignal, OBJECTIVE_INCIDENT_CONTROLLER,
+    TECHNICAL_RECOVERY_EXHAUSTED,
 };
 use crate::util::no_window::NoWindow;
 use anyhow::{anyhow, bail, Context};
@@ -230,6 +231,25 @@ async fn seed_incident_session(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Releases before #553 opened this incident when system recovery hit its
+    // ceiling and then parked on it, unactionable, until a capability bump that
+    // never came. Real databases still carry rows like this, so the fixture
+    // seeds one and the ceiling assertion below proves the product resolves it
+    // instead of leaving it open.
+    sqlx::query(
+        "INSERT INTO objective_incidents
+         (id, objective_id, status, failure_code, owner, domain,
+          blocked_capability_revision, opened_at, updated_at)
+         VALUES ('history-incident-legacy', ?, 'open', ?, ?, 'chat', 0, ?, ?)",
+    )
+    .bind(&admission.objective.id)
+    .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+    .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
     let store = ObjectiveStore::new(pool.clone());
     let mut current = admission.objective;
     for _ in 0..32 {
@@ -278,11 +298,60 @@ async fn seed_incident_session(pool: &SqlitePool) -> anyhow::Result<()> {
                 .context("reload incident objective")?;
         }
     }
+    // #553 turned the ceiling into an honest failure terminal instead of a
+    // suspended incident. Nothing here is loosened: the objective must still
+    // stop by itself and must still refuse user action — it now must also leave
+    // nothing queued behind a wake-up that will never arrive, close the incident
+    // ledger, and hand the user a readable summary.
     if current.requires_user_action
-        || current.status.as_str() != "waiting_system"
-        || current.failure_code.as_deref() != Some("technical_recovery_exhausted")
+        || current.status.as_str() != "failed"
+        || current.failure_code.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED)
     {
-        bail!("production recovery ceiling did not park a system-owned incident");
+        bail!(
+            "production recovery ceiling did not reach the failed terminal: status={}, failure_code={:?}, requires_user_action={}",
+            current.status.as_str(),
+            current.failure_code,
+            current.requires_user_action
+        );
+    }
+    let queued_remediations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objective_remediations
+         WHERE objective_id=? AND status IN ('queued','waiting','claimed')",
+    )
+    .bind(&current.id)
+    .fetch_one(pool)
+    .await?;
+    let open_incidents: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objective_incidents WHERE objective_id=? AND status='open'",
+    )
+    .bind(&current.id)
+    .fetch_one(pool)
+    .await?;
+    if queued_remediations != 0 || open_incidents != 0 {
+        bail!(
+            "failed terminal left work behind: queued_remediations={queued_remediations}, open_incidents={open_incidents}"
+        );
+    }
+    let summary: Option<(String, String)> = sqlx::query_as(
+        "SELECT message.role, message.content
+         FROM chat_turn_state turn
+         JOIN messages message ON message.id=turn.visible_final_message_id
+         WHERE turn.objective_id=?",
+    )
+    .bind(&current.id)
+    .fetch_optional(pool)
+    .await?;
+    let (summary_role, summary_text) = summary.ok_or_else(|| {
+        anyhow!("failed terminal did not publish a visible failure summary for the user")
+    })?;
+    if summary_role == "user" {
+        bail!("failure summary was recorded as a user message");
+    }
+    // The summary is shown verbatim, so it must not leak the internal machinery
+    // words ("automatic recovery exhausted", "safety limit", "system fault",
+    // "capability update", "objective", ...).
+    if let Err(leak) = crate::agent::failure_summary::assert_no_internal_vocabulary(&summary_text) {
+        bail!("visible failure summary leaks internal vocabulary: {leak}");
     }
     Ok(())
 }
@@ -389,9 +458,27 @@ async fn sweep_abandoned_after_restart(pool: &SqlitePool) -> anyhow::Result<()> 
         bail!("a reaped Objective must carry the stalled failure code");
     }
 
+    // #553 makes the recovery ceiling a terminal failure, so the incident
+    // fixture's unsettled `unknown` receipt now sits on a terminal Objective too
+    // — exactly the leak this sweep exists to close. Both orphans must be
+    // cancelled, and the sweep must cancel nothing else.
     let swept = store.cancel_receipts_on_terminal_objectives().await?;
-    if swept != 1 {
-        bail!("expected one orphaned receipt to be cancelled, got {swept}");
+    if swept != 2 {
+        bail!(
+            "expected the abandoned orphan and the failed-terminal receipt to be cancelled, got {swept}"
+        );
+    }
+    let surviving_orphans: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM side_effect_receipts receipt
+         JOIN objectives objective ON objective.id=receipt.objective_id
+         WHERE receipt.status='unknown'
+           AND receipt.id IN ('history-abandoned-orphan-receipt',
+                              'history-incident-unknown-receipt')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if surviving_orphans != 0 {
+        bail!("{surviving_orphans} orphaned receipt(s) survived the terminal sweep");
     }
     // Both sweeps are idempotent: a second pass in the same process changes
     // nothing, which is what makes running them on a timer safe.
@@ -480,13 +567,14 @@ async fn verify_incident_after_restart(pool: &SqlitePool) -> anyhow::Result<()> 
         String,
         String,
         String,
+        String,
     ) = sqlx::query_as(
         "SELECT objective.status, objective.revision, turn.status,
                     turn.turn_settled_at, turn.stream_closed_at,
                     turn.terminal_revision, turn.visible_final_message_id,
                     turn.visible_final_kind, turn.next_action,
                     control.status, control.settled_at, tool.status,
-                    receipt.status, incident.status, message.role
+                    receipt.status, incident.status, message.role, message.content
              FROM objectives objective
              JOIN chat_turn_state turn ON turn.objective_id=objective.id
              JOIN chat_run_controls control ON control.objective_id=objective.id
@@ -499,23 +587,29 @@ async fn verify_incident_after_restart(pool: &SqlitePool) -> anyhow::Result<()> 
     .bind(INCIDENT_SESSION)
     .fetch_one(pool)
     .await?;
-    if row.0 != "waiting_system"
-        || row.2 != "waiting_system"
+    // #553: the ceiling is now a terminal failure rather than a suspended
+    // incident, so the oracle asserts the failure terminal — the objective has
+    // failed, its turn settled on a real final answer, the incident ledger is
+    // resolved, and the user got a readable summary. The "never present itself
+    // as still running" property is unchanged; it is now asserted as a settled
+    // turn instead of a parked one.
+    if row.0 != "failed"
+        || row.2 != "completed"
         || row.3.is_none()
         || row.4.is_none()
         || row.5 != Some(row.1)
         || row.6.as_deref().map_or(true, str::is_empty)
-        || row.7.as_deref() != Some("system_incident")
-        || row.8.as_deref() != Some("await_system_recovery")
+        || row.7.as_deref() != Some("assistant_final")
+        || row.8.is_some()
         || row.9 != "completed"
         || row.10.is_none()
         || row.11 != "blocked"
         || row.12 != "unknown"
-        || row.13 != "open"
-        || row.14 != "assistant"
+        || row.13 != "resolved"
+        || row.14 == "user"
     {
         bail!(
-            "restarted incident oracle rejected objective={} revision={} turn={} terminal_revision={:?} final_kind={:?} next_action={:?} run={} tool={} receipt={} incident={} message_role={}",
+            "restarted failed-terminal oracle rejected objective={} revision={} turn={} terminal_revision={:?} final_kind={:?} next_action={:?} run={} tool={} receipt={} incident={} message_role={}",
             row.0,
             row.1,
             row.2,
@@ -528,6 +622,9 @@ async fn verify_incident_after_restart(pool: &SqlitePool) -> anyhow::Result<()> 
             row.13,
             row.14,
         );
+    }
+    if let Err(leak) = crate::agent::failure_summary::assert_no_internal_vocabulary(&row.15) {
+        bail!("visible failure summary leaks internal vocabulary: {leak}");
     }
     let claimable: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objective_remediations remediation
@@ -908,7 +1005,7 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             "claimable_remediation_count": claimable_remediation_count,
             "cancel_intent_status": cancel_intent_status,
             "second_restart_stayed_cancelled": true,
-            "system_incident_survived_two_restarts": true,
+            "failed_terminal_survived_two_restarts": true,
             "ui_oracle_status": "remaining_L3_real_desktop_gap",
             "cleanup_ok": false
         }))

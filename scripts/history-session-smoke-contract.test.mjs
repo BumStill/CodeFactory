@@ -33,7 +33,7 @@ test("required Windows CI runs the cross-process continue, stop and incident ora
     "all_live_objectives_cancelled",
     "second_restart_stayed_cancelled",
     "claimable_remediation_count",
-    "system_incident_survived_two_restarts",
+    "failed_terminal_survived_two_restarts",
   ]) {
     assert.ok(ci.includes(marker), `required CI is missing ${marker}`);
   }
@@ -46,7 +46,7 @@ test("nightly repeats the historical session restart fault path", async () => {
     "--history-session-smoke",
     "stop_request_was_hard_killed",
     "second_restart_stayed_cancelled",
-    "system_incident_survived_two_restarts",
+    "failed_terminal_survived_two_restarts",
     "Upload historical session receipt",
   ]) {
     assert.ok(nightly.includes(marker), `nightly is missing ${marker}`);
@@ -62,7 +62,7 @@ test("the exact Windows release executable runs the same smoke", async () => {
     "stop_request_was_hard_killed",
     "second_restart_stayed_cancelled",
     "E2E-007",
-    "system_incident_survived_two_restarts",
+    "failed_terminal_survived_two_restarts",
   ]) {
     assert.ok(release.includes(marker), `release is missing ${marker}`);
   }

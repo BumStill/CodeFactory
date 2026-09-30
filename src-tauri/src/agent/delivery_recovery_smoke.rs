@@ -325,9 +325,13 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
                 .and_then(serde_json::Value::as_i64)
                 != Some(0)
             || recovered
-                .get("foreign_identity_parked")
+                .get("foreign_identity_failed_closed")
                 .and_then(serde_json::Value::as_bool)
                 != Some(true)
+            || recovered
+                .get("objective_failed_event_count")
+                .and_then(serde_json::Value::as_i64)
+                != Some(1)
             || recovered
                 .get("claim_epoch_plateau")
                 .and_then(serde_json::Value::as_bool)
@@ -355,7 +359,7 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             || recovered
                 .get("recovery_parked_event_count")
                 .and_then(serde_json::Value::as_i64)
-                != Some(1)
+                != Some(0)
             || recovered
                 .get("remote_head_unchanged")
                 .and_then(serde_json::Value::as_bool)
@@ -391,9 +395,10 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             "identity_revision_count": recovered["identity_revision_count"],
             "canonical_parent_reconciled": recovered["canonical_parent_reconciled"],
             "canonical_parent_mutation_count": recovered["canonical_parent_mutation_count"],
-            "foreign_identity_parked": recovered["foreign_identity_parked"],
+            "foreign_identity_failed_closed": recovered["foreign_identity_failed_closed"],
             "claim_epoch_plateau": recovered["claim_epoch_plateau"],
             "claim_epoch": recovered["claim_epoch"],
+            "objective_failed_event_count": recovered["objective_failed_event_count"],
             "recovery_parked_event_count": recovered["recovery_parked_event_count"],
             "duplicate_remote_write_count": recovered["duplicate_remote_write_count"],
             "production_resume_path": recovered["production_resume_path"],
