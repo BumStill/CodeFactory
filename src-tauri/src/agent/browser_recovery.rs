@@ -713,7 +713,7 @@ impl BrowserRecoveryStore {
              WHERE contract.state NOT IN (
                      'settled_committed','settled_reconciled','cancelled'
                    )
-               AND objective.status NOT IN ('completed','cancelled')",
+               AND objective.status NOT IN ('completed','cancelled','failed')",
         )
         .fetch_all(&self.pool)
         .await?)

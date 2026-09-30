@@ -651,7 +651,7 @@ async fn verify_cancelled(pool: &SqlitePool, expect_consumed: usize) -> anyhow::
         .await?;
     let live: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objectives
-         WHERE session_id=? AND status NOT IN ('completed','cancelled','legacy_orphan')",
+         WHERE session_id=? AND status NOT IN ('completed','cancelled','failed','legacy_orphan')",
     )
     .bind(STOP_SESSION)
     .fetch_one(pool)
@@ -846,7 +846,7 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         .await?;
         let live_stop_objectives: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objectives
-             WHERE session_id=? AND status NOT IN ('completed','cancelled','legacy_orphan')",
+             WHERE session_id=? AND status NOT IN ('completed','cancelled','failed','legacy_orphan')",
         )
         .bind(STOP_SESSION)
         .fetch_one(&pool)

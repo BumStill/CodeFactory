@@ -536,18 +536,23 @@ async fn live_chat_objectives(
     pool: &sqlx::SqlitePool,
     session_id: &str,
 ) -> Result<Vec<(String, String)>, AppError> {
-    Ok(sqlx::query_as::<_, (String, String)>(
+    // The terminal vocabulary comes from ObjectiveStatus::is_terminal, so a
+    // stop request can never be asked to reach a `failed` Objective that has
+    // already finished.
+    let sql = format!(
         "SELECT turn.objective_id, turn.root_turn_id
          FROM chat_turn_state turn
          JOIN objectives objective ON objective.id=turn.objective_id
          WHERE turn.session_id=?
            AND turn.objective_id IS NOT NULL
-           AND objective.status NOT IN ('completed', 'cancelled')
+           AND objective.status NOT IN ({})
          ORDER BY objective.updated_at DESC",
-    )
-    .bind(session_id)
-    .fetch_all(pool)
-    .await?)
+        crate::agent::objective::ObjectiveStatus::TERMINAL_SQL
+    );
+    Ok(sqlx::query_as::<_, (String, String)>(&sql)
+        .bind(session_id)
+        .fetch_all(pool)
+        .await?)
 }
 
 /// Stop every Objective a session still owns when no run in this process holds
@@ -4720,10 +4725,47 @@ mod tests {
         (pool, waiting)
     }
 
+    /// S2: a failed Objective is terminal, so it is not live work the composer
+    /// has to queue behind. While it still counted as live, the user's next
+    /// sentence waited for a turn that had already finished.
+    #[tokio::test]
+    async fn a_failed_objective_is_not_live_work_the_next_message_must_queue_behind() {
+        let (pool, objective) = durable_cancel_test_objective("failed-not-live").await;
+        let session_id = objective.session_id.clone().unwrap();
+        assert_eq!(
+            live_chat_objectives(&pool, &session_id).await.unwrap().len(),
+            1,
+            "the fixture starts with exactly one live objective"
+        );
+        sqlx::query(
+            "UPDATE objectives SET status='failed', decision_type='failed_internal',
+               requires_user_action=0, request_key=NULL, decision_key=NULL,
+               attention_request_json=NULL, failure_code='technical_recovery_exhausted',
+               recovery_owner='objective-incident-controller', remediation_id=NULL,
+               next_observation_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
+               completed_at=?, updated_at=?
+             WHERE id=?",
+        )
+        .bind(Utc::now().timestamp_millis())
+        .bind(Utc::now().timestamp_millis())
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            live_chat_objectives(&pool, &session_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed Objective must not be work the next message queues behind"
+        );
+    }
+
     /// A user pressing stop must reach a turn that no run in this process owns.
     /// The in-memory cancel map is empty after a restart and never holds
     /// system-owned recovery, so `cancel_chat` returned `Ok` without doing
-    /// anything and the turn resumed on every launch. Selection therefore has
+    /// anything and the turn resumed on every launch. Selection therefore needs
     /// to come from durable state, and it has to find *every* live Objective:
     /// the 2026-08-13 session grew a second Objective behind the one that had
     /// already been cancelled, which kept the turn unfinished and the user's

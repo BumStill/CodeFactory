@@ -262,6 +262,12 @@ impl ObjectiveStatus {
         matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
     }
 
+    /// Every terminal status as a SQL literal list, kept in step with
+    /// [`Self::is_terminal`]. Query helpers asking "is this Objective still
+    /// live?" build their `[NOT] IN (...)` clause from this rather than
+    /// repeating the vocabulary and silently forgetting a member.
+    pub const TERMINAL_SQL: &'static str = "'completed', 'cancelled', 'failed'";
+
     pub const fn is_system_owned(self) -> bool {
         matches!(self, Self::Active | Self::WaitingSystem)
     }
@@ -1912,7 +1918,7 @@ impl ObjectiveStore {
              WHERE status IN ('started', 'unknown')
                AND objective_id IN (
                      SELECT id FROM objectives
-                     WHERE status IN ('completed', 'cancelled'))",
+                     WHERE status IN ('completed', 'cancelled', 'failed'))",
         )
         .bind(
             serde_json::json!({
@@ -2544,7 +2550,7 @@ impl ObjectiveStore {
                  FROM objectives objective
                  WHERE objective.session_id=?
                    AND objective.root_turn_id IS NOT NULL
-                   AND objective.status NOT IN ('completed','cancelled','legacy_orphan')
+                   AND objective.status NOT IN ('completed','cancelled','failed','legacy_orphan')
                  ORDER BY objective.updated_at DESC",
             )
             .bind(session_id)
@@ -2573,7 +2579,7 @@ impl ObjectiveStore {
             "SELECT COUNT(*) FROM objectives objective
              WHERE objective.session_id=?
                AND objective.root_turn_id IS NOT NULL
-               AND objective.status NOT IN ('completed','cancelled','legacy_orphan')",
+               AND objective.status NOT IN ('completed','cancelled','failed','legacy_orphan')",
         )
         .bind(session_id)
         .fetch_one(&mut *tx)
@@ -2906,20 +2912,27 @@ impl ObjectiveStore {
     /// itself as running, and the notice is written once. The guarded `WHERE`
     /// clauses make a second start a no-op, so no objective is told twice.
     pub async fn reclassify_synthetic_technical_handbacks(&self) -> anyhow::Result<usize> {
-        let candidates = sqlx::query_as::<_, (String, i64, Option<String>, Option<String>)>(
-            "SELECT id, revision, session_id, COALESCE(resume_cursor, root_turn_id)
+        // `updated_at` is the row's suspension time: the moment the objective
+        // gave up. The backfilled notice carries that timestamp instead of the
+        // startup time, so a task that stalled three days ago does not resurface
+        // as today's news.
+        let candidates =
+            sqlx::query_as::<_, (String, i64, Option<String>, Option<String>, i64)>(
+                "SELECT id, revision, session_id,
+                        COALESCE(resume_cursor, root_turn_id), updated_at
              FROM objectives
              WHERE failure_code=?
                AND (
                  (status='waiting_core_input' AND decision_type='core_input_required')
                  OR (status='waiting_system' AND decision_type='failed_internal')
                )",
-        )
-        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+            .fetch_all(&self.pool)
+            .await?;
         let mut reclassified = 0;
-        for (objective_id, revision, session_id, terminal_root_turn_id) in candidates {
+        for (objective_id, revision, session_id, terminal_root_turn_id, suspended_at) in candidates
+        {
             let now = Utc::now().timestamp_millis();
             let next_revision = revision + 1;
             let visible_final_message_id =
@@ -2966,11 +2979,14 @@ impl ObjectiveStore {
                     .bind(&visible_final_message_id)
                     .bind(session_id)
                     .bind("这件事没做成：你交代的目标没有达成。试过的办法和保留下来的改动都还在会话里；直接回一句「继续」或「把这些改动交付」就可以接着做。")
-                    .bind(now)
+                    .bind(suspended_at)
                     .execute(&mut *tx)
                     .await?;
                 }
-                touch_session_in_settlement(&mut tx, session_id, now).await;
+                // Deliberately no `touch_session_in_settlement`: a startup
+                // backfill is not user activity. Advancing `sessions.updated_at`
+                // here would drag a long-dead conversation to the top of the
+                // sidebar, which is exactly the "为什么这个又跑到最上面" bug.
             }
             let has_turn_state: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -5875,30 +5891,69 @@ pub async fn ensure_objective_failed_status(pool: &SqlitePool) -> crate::errors:
     .await?;
 
     let mut conn = pool.acquire().await?;
-    // Foreign keys are disabled for this single connection only, so the
-    // dependent tables survive the drop/rename and keep pointing at the
-    // rebuilt table by name.
+    // Both PRAGMAs are connection-scoped and must be set outside a transaction.
+    // `foreign_keys=OFF` keeps the dependent tables from cascading away during
+    // the drop/rename; `legacy_alter_table=ON` stops SQLite (>= 3.26) from
+    // re-validating every trigger in the schema on RENAME — the schema-wide
+    // check aborts on `trg_permission_intents_scope_insert`, which legitimately
+    // references `objectives` at the moment the rename runs.
     sqlx::query("PRAGMA foreign_keys=OFF")
         .execute(&mut *conn)
         .await?;
-    let rebuilt_result = async {
-        sqlx::query(&rebuilt).execute(&mut *conn).await?;
-        sqlx::query("INSERT INTO objectives_failed_rebuild SELECT * FROM objectives")
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("DROP TABLE objectives").execute(&mut *conn).await?;
-        sqlx::query("ALTER TABLE objectives_failed_rebuild RENAME TO objectives")
-            .execute(&mut *conn)
-            .await?;
-        for index in &indexes {
-            sqlx::query(index).execute(&mut *conn).await?;
-        }
-        Ok::<(), sqlx::Error>(())
-    }
-    .await;
-    sqlx::query("PRAGMA foreign_keys=ON")
+    sqlx::query("PRAGMA legacy_alter_table=ON")
         .execute(&mut *conn)
         .await?;
+
+    // One transaction around the whole rebuild, so a failure at any step (most
+    // realistically the index re-creation) leaves the original table exactly as
+    // it was. Without this the durable state was a lone `objectives_failed_rebuild`
+    // table and the next start silently created an empty `objectives`, losing
+    // every task the user had.
+    let rebuilt_result = async {
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let step = async {
+            sqlx::query(&rebuilt).execute(&mut *conn).await?;
+            sqlx::query("INSERT INTO objectives_failed_rebuild SELECT * FROM objectives")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("DROP TABLE objectives").execute(&mut *conn).await?;
+            sqlx::query("ALTER TABLE objectives_failed_rebuild RENAME TO objectives")
+                .execute(&mut *conn)
+                .await?;
+            for index in &indexes {
+                sqlx::query(index).execute(&mut *conn).await?;
+            }
+            let violations = sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(&mut *conn)
+                .await?;
+            if !violations.is_empty() {
+                return Err(sqlx::Error::Protocol(
+                    "objective status migration broke a foreign key reference".into(),
+                ));
+            }
+            Ok::<(), sqlx::Error>(())
+        }
+        .await;
+        match step {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+    .await;
+
+    // Restore the connection's normal contract before it goes back to the pool.
+    let _ = sqlx::query("PRAGMA legacy_alter_table=OFF")
+        .execute(&mut *conn)
+        .await;
+    let _ = sqlx::query("PRAGMA foreign_keys=ON")
+        .execute(&mut *conn)
+        .await;
     rebuilt_result?;
     Ok(())
 }
@@ -6196,6 +6251,611 @@ mod tests {
             .unwrap();
         ensure_schema(&pool).await.unwrap();
         pool
+    }
+
+    /// The settlement projection a real app carries. `ensure_schema` installs
+    /// the Objective control plane only; sessions, messages and chat_turn_state
+    /// come from the storage migrations, so tests that exercise settlement build
+    /// exactly the columns those paths read and write.
+    async fn settlement_tables(pool: &SqlitePool) {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sessions (
+               id TEXT PRIMARY KEY, title TEXT NOT NULL, cwd TEXT NOT NULL,
+               model_id TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS messages (
+               id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+               content TEXT NOT NULL, completion_state TEXT, created_at INTEGER NOT NULL)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               revision INTEGER NOT NULL DEFAULT 1, phase TEXT NOT NULL DEFAULT 'working',
+               status TEXT NOT NULL, recent_activity_kind TEXT, recent_activity_label TEXT,
+               waiting_reason TEXT, updated_at INTEGER NOT NULL DEFAULT 0, completed_at INTEGER,
+               terminal_reason TEXT, turn_settled_at INTEGER, stream_closed_at INTEGER,
+               terminal_revision INTEGER, objective_revision INTEGER,
+               visible_final_message_id TEXT, visible_final_kind TEXT, next_action TEXT,
+               objective_id TEXT)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// B1 fixture: the `objectives` DDL an already-installed release wrote
+    /// (status CHECK without `'failed'`), the two indexes that ship with it, and
+    /// the `permission_intents` trigger that references `objectives` by name.
+    /// Synthetic rows only.
+    const LEGACY_OBJECTIVES_DDL: &str = "\
+CREATE TABLE objectives (
+    id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL CHECK(status IN (
+        'active', 'waiting_system', 'completed', 'cancelled', 'legacy_orphan')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)";
+
+    const LEGACY_OBJECTIVES_ROWS: i64 = 3;
+
+    async fn legacy_objectives_fixture_with_triggers() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(LEGACY_OBJECTIVES_DDL)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE INDEX idx_objectives_due ON objectives(status, updated_at)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE INDEX idx_objectives_session ON objectives(created_at)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE objective_bindings (
+               id TEXT PRIMARY KEY,
+               objective_id TEXT NOT NULL,
+               resource_generation INTEGER NOT NULL DEFAULT 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE permission_intents (
+               intent_id TEXT PRIMARY KEY,
+               objective_id TEXT NOT NULL,
+               objective_revision INTEGER NOT NULL,
+               binding_id TEXT NOT NULL,
+               resource_generation INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Verbatim from the installed permission migration: this trigger's
+        // reference to `objectives` is what made a bare ALTER TABLE ... RENAME
+        // abort with `no such table: main.objectives`.
+        sqlx::query(
+            "CREATE TRIGGER trg_permission_intents_scope_insert
+             BEFORE INSERT ON permission_intents
+             WHEN NOT EXISTS (
+                    SELECT 1 FROM objectives
+                    WHERE id=NEW.objective_id AND revision=NEW.objective_revision
+                      AND status NOT IN ('completed','cancelled','legacy_orphan')
+                  )
+               OR NOT EXISTS (
+                    SELECT 1 FROM objective_bindings
+                    WHERE id=NEW.binding_id AND objective_id=NEW.objective_id
+                      AND resource_generation=NEW.resource_generation
+                  )
+             BEGIN
+                 SELECT RAISE(ABORT, 'stale permission Objective scope');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for index in 0..LEGACY_OBJECTIVES_ROWS {
+            let stamp = 1_700_000_000_000i64 + index;
+            sqlx::query(
+                "INSERT INTO objectives (id, revision, status, created_at, updated_at)
+                 VALUES (?, 1, 'active', ?, ?)",
+            )
+            .bind(format!("objective-legacy-{index}"))
+            .bind(stamp)
+            .bind(stamp)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool
+    }
+
+    /// B1: on a database that already has the permission triggers, rebuilding
+    /// `objectives` used to stop at the rename and leave only a temporary table
+    /// behind — the next start then created an empty `objectives` and every task
+    /// the user had was gone. The migration must widen the vocabulary, keep the
+    /// rows, keep the triggers, and rebuild the indexes.
+    #[tokio::test]
+    async fn legacy_objectives_ddl_gains_the_failed_status_without_losing_rows() {
+        let pool = legacy_objectives_fixture_with_triggers().await;
+
+        ensure_objective_failed_status(&pool).await.unwrap();
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, LEGACY_OBJECTIVES_ROWS, "every task row must survive");
+        let leftovers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='objectives_failed_rebuild'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leftovers, 0, "no temporary table may survive the migration");
+        let indexes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='index' AND tbl_name='objectives' AND name LIKE 'idx_objectives_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(indexes, 2, "both indexes must be recreated");
+        let triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='trigger' AND name='trg_permission_intents_scope_insert'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(triggers, 1, "the dependent trigger must survive the rebuild");
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+
+        // The widened vocabulary is the contract the honest-failure terminal
+        // depends on: the status the whole design writes must be accepted.
+        sqlx::query("UPDATE objectives SET status='failed' WHERE id='objective-legacy-0'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+            .bind("objective-legacy-0")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        // Every later start is a no-op rather than a second rebuild.
+        ensure_objective_failed_status(&pool).await.unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, LEGACY_OBJECTIVES_ROWS);
+    }
+
+    /// B1: an in-transaction failure rolls the whole rebuild back. The failure
+    /// is injected with a real foreign-key violation, which lands on the same
+    /// `foreign_key_check` gate production uses — after create, insert, drop and
+    /// rename have already run.
+    #[tokio::test]
+    async fn a_failed_objectives_rebuild_rolls_back_and_keeps_the_original_table() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(LEGACY_OBJECTIVES_DDL)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE INDEX idx_objectives_due ON objectives(status, updated_at)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE permission_intents (
+               intent_id TEXT PRIMARY KEY,
+               objective_id TEXT NOT NULL REFERENCES objectives(id),
+               objective_revision INTEGER NOT NULL,
+               binding_id TEXT NOT NULL,
+               resource_generation INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for index in 0..LEGACY_OBJECTIVES_ROWS {
+            let stamp = 1_700_000_000_000i64 + index;
+            sqlx::query(
+                "INSERT INTO objectives (id, revision, status, created_at, updated_at)
+                 VALUES (?, 1, 'active', ?, ?)",
+            )
+            .bind(format!("objective-legacy-{index}"))
+            .bind(stamp)
+            .bind(stamp)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO permission_intents
+             (intent_id, objective_id, objective_revision, binding_id, resource_generation)
+             VALUES ('intent-orphan', 'objective-that-never-existed', 1, 'binding-orphan', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = ensure_objective_failed_status(&pool).await.unwrap_err();
+        assert!(
+            error.to_string().contains("foreign key"),
+            "the foreign-key gate must be the injected failure: {error}"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, LEGACY_OBJECTIVES_ROWS, "the original table must be intact");
+        let leftovers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='objectives_failed_rebuild'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leftovers, 0, "a rollback must not leave a temporary table");
+        let ddl: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='objectives'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !ddl.contains("'failed'"),
+            "a rolled back migration must keep the pre-migration contract: {ddl}"
+        );
+        assert!(
+            sqlx::query("UPDATE objectives SET status='failed' WHERE id='objective-legacy-0'")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "the restored table must still reject the value the reboot would have accepted"
+        );
+    }
+
+    /// S1: the startup backfill writes a notice, not user activity. Advancing
+    /// `sessions.updated_at` dragged a long-dead conversation to the top of the
+    /// sidebar; the notice must also carry the time the task actually stalled
+    /// rather than the moment the app was opened.
+    #[tokio::test]
+    async fn startup_backfill_leaves_session_order_alone_and_dates_the_notice_when_the_task_stalled()
+    {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let session_id = "session-s1-backfill";
+        let suspended_at = Utc::now().timestamp_millis() - 3 * 24 * 60 * 60 * 1000;
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES (?, '旧会话', '/tmp/s1-backfill', 'model-synthetic', ?, ?)",
+        )
+        .bind(session_id)
+        .bind(suspended_at)
+        .bind(suspended_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-s1-backfill".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some(session_id.into()),
+                root_turn_id: Some("turn-s1-backfill".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE objectives SET status='waiting_system', decision_type='failed_internal',
+               failure_code=?, recovery_owner=?, resume_cursor=?, next_observation_at=NULL,
+               lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE id=?",
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind("turn-s1-backfill")
+        .bind(suspended_at)
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_incidents
+             (id, objective_id, status, failure_code, owner, opened_at, updated_at)
+             VALUES ('incident-s1-backfill', ?, 'open', ?, ?, ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind(suspended_at)
+        .bind(suspended_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, next_action, objective_id)
+             VALUES ('turn-s1-backfill', ?, 'waiting_system', 'await_system_recovery', ?)",
+        )
+        .bind(session_id)
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.reclassify_synthetic_technical_handbacks().await.unwrap(),
+            1
+        );
+
+        let session_updated: i64 = sqlx::query_scalar("SELECT updated_at FROM sessions WHERE id=?")
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_updated, suspended_at,
+            "a startup backfill is not user activity and must not reorder the sidebar"
+        );
+        let (role, created_at): (String, i64) = sqlx::query_as(
+            "SELECT role, created_at FROM messages
+             WHERE session_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_ne!(role, "user", "the notice is never attributed to the user");
+        assert_eq!(
+            created_at, suspended_at,
+            "the notice is dated when the task stalled, not when the app started"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+            .bind(&objective.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+    }
+
+    /// S2: `failed` is terminal, so receipts that can never be answered are
+    /// swept exactly like the ones on completed or cancelled work — while a live
+    /// Objective keeps the "we do not know whether this landed" question.
+    #[tokio::test]
+    async fn receipts_on_a_failed_objective_are_swept_as_terminal() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let failed = store
+            .create(CreateObjective {
+                id: "objective-s2-failed-receipts".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-s2-failed-receipts".into()),
+                root_turn_id: Some("turn-s2-failed-receipts".into()),
+                domain: RecoveryDomain::Tool,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let live = store
+            .create(CreateObjective {
+                id: "objective-s2-live-receipts".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-s2-live-receipts".into()),
+                root_turn_id: Some("turn-s2-live-receipts".into()),
+                domain: RecoveryDomain::Tool,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        for (receipt_id, objective_id) in [
+            ("receipt-s2-failed", &failed.id),
+            ("receipt-s2-live", &live.id),
+        ] {
+            sqlx::query(
+                "INSERT INTO side_effect_receipts
+                 (id, objective_id, revision, action_fingerprint, idempotency_key,
+                  status, created_at, observed_at)
+                 VALUES (?, ?, 1, 'sha256:s2-action', ?, 'started', ?, ?)",
+            )
+            .bind(receipt_id)
+            .bind(objective_id)
+            .bind(format!("sha256:{receipt_id}"))
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE objectives SET status='failed', decision_type='failed_internal',
+               failure_code=?, completed_at=?, updated_at=? WHERE id=?",
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(now)
+        .bind(now)
+        .bind(&failed.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            store.cancel_receipts_on_terminal_objectives().await.unwrap(),
+            1,
+            "only the receipt on the terminal objective is decided"
+        );
+        let decided: String =
+            sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE id='receipt-s2-failed'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(decided, "cancelled");
+        let untouched: String =
+            sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE id='receipt-s2-live'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            untouched, "started",
+            "a live objective must keep its unresolved receipt"
+        );
+    }
+
+    /// S3: the failure notice promises "直接回复就能在这些成果上继续". The next
+    /// message in that session reopens the same Objective in place, on the
+    /// execution workspace it already owned, and leaves nothing for it to queue
+    /// behind.
+    #[tokio::test]
+    async fn a_failed_objective_reopens_in_place_on_the_same_workspace_without_queueing() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let session_id = "session-s3-reopen";
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-s3-reopen".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some(session_id.into()),
+                root_turn_id: Some("turn-s3-old".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id, resource_generation,
+              identity_digest, created_at, updated_at)
+             VALUES ('binding-s3-workspace', ?, 'chat', 'execution_workspace',
+                     'workspace-s3', 1, 'sha256:s3-workspace', ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Objective failed, its turn projected as a finished turn with nothing
+        // left for system recovery.
+        sqlx::query(
+            "UPDATE objectives SET status='failed', decision_type='failed_internal',
+               failure_code=?, recovery_generation=1, requires_user_action=0,
+               completed_at=?, updated_at=? WHERE id=?",
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(now)
+        .bind(now)
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, next_action, objective_id)
+             VALUES ('turn-s3-old', ?, 'completed', NULL, ?)",
+        )
+        .bind(session_id)
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, next_action, objective_id)
+             VALUES ('turn-s3-new', ?, 'active', NULL, NULL)",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reopened = store
+            .ensure_or_continue_chat_objective(
+                session_id,
+                "turn-s3-new",
+                Some("turn-s3-old"),
+                ObjectiveKind::LocalMutation,
+                "validated_change",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reopened.id, objective.id,
+            "the next sentence must continue the same task, not open a second one"
+        );
+        assert_eq!(reopened.status, ObjectiveStatus::Active);
+        assert_eq!(
+            reopened.recovery_generation, 2,
+            "reopening a failed Objective is a new recovery generation"
+        );
+        assert_eq!(reopened.failure_code, None);
+        let workspace: String = sqlx::query_scalar(
+            "SELECT resource_id FROM objective_bindings
+             WHERE objective_id=? AND resource_kind='execution_workspace'",
+        )
+        .bind(&objective.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            workspace, "workspace-s3",
+            "the work stays in the workspace it was already using"
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_turn_state
+             WHERE session_id=? AND status IN ('active','waiting_system')
+               AND next_action='await_system_recovery'",
+        )
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending, 0,
+            "nothing may be left that the user's next message has to queue behind"
+        );
+        let bound: String =
+            sqlx::query_scalar("SELECT objective_id FROM chat_turn_state WHERE root_turn_id='turn-s3-new'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bound, objective.id);
     }
 
     /// β fixture 6 — the wording constraint is audited durably, and the record
