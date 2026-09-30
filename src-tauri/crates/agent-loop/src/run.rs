@@ -1985,11 +1985,30 @@ pub async fn run_agent_loop(
                 } else {
                     None
                 };
+                // M15/R3: the observation contract is a deterministic admission
+                // check, so it runs BEFORE the permission gateway. A prompt for
+                // a call the system will then refuse is a question the user
+                // cannot answer usefully.
+                let admission_denial = {
+                    let admission_ctx = crate::tool::ToolCtx {
+                        working_directory: cwd.clone(),
+                        session_id: Some(audit_session_id.clone()),
+                        root_turn_id: root_turn_id.clone(),
+                        task_id: task_id.clone(),
+                        trajectory_session_id: Some(session_id.clone()),
+                        knowledge_library_ids: knowledge_library_ids.clone(),
+                        ..crate::tool::ToolCtx::default()
+                    };
+                    tool_backend.admission_denial(tc, &args, &admission_ctx).await
+                };
+
                 let mut permission_denial_duration_ms = 0_u64;
                 let mut permission_denial_stops_chain = false;
                 let mut permission_denial_terminal_reason: Option<&'static str> = None;
                 let mut permission_denial_waits_system = false;
                 let denial_content = if let Some(content) = capability_denial {
+                    Some(content)
+                } else if let Some(content) = admission_denial {
                     Some(content)
                 } else if let Some(denial) = inspection_denial.or_else(|| {
                     crate::policy::autonomous_budget_denial(
