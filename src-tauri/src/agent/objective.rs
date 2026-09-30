@@ -440,6 +440,9 @@ impl ObjectiveSnapshot {
             visible_final_message_id: None,
             cancellation_provenance: None,
             attention_request: self.attention_request.clone(),
+            // Routing a decision is not itself user activity; callers that
+            // settle state left by an earlier process mark it `as_convergence()`.
+            settlement_origin: SettlementOrigin::Live,
         }
     }
 
@@ -553,9 +556,38 @@ pub struct DecisionEnvelope {
     pub visible_final_message_id: Option<String>,
     pub cancellation_provenance: Option<String>,
     pub attention_request: Option<UserAttentionRequest>,
+    /// Who is settling this decision: a turn failing while the user is actually
+    /// in the session, or startup/background convergence of rows an earlier
+    /// process left behind. Only the former is user activity and may advance
+    /// `sessions.updated_at` — see `SettlementOrigin`.
+    #[serde(default)]
+    pub settlement_origin: SettlementOrigin,
+}
+
+/// Whether settling a decision is user-visible activity.
+///
+/// A stalled pre-#553 Objective is settled at startup by backgrounds
+/// reconcilers. That is bookkeeping about a session the user is not sitting in,
+/// so advancing its `updated_at` drags a long-dead conversation to the top of
+/// the sidebar (S1). Live failures keep the old behaviour: the session the user
+/// is watching should reflect that something just happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SettlementOrigin {
+    /// A turn is failing while the user is in the session.
+    #[default]
+    Live,
+    /// Startup/background convergence of state left by an earlier process.
+    Convergence,
 }
 
 impl DecisionEnvelope {
+    /// Mark this decision as startup/background convergence rather than live
+    /// user activity, so settling it cannot reorder the sidebar.
+    pub fn as_convergence(mut self) -> Self {
+        self.settlement_origin = SettlementOrigin::Convergence;
+        self
+    }
+
     /// A system-owned recovery ceiling reached a terminal `failed` objective.
     /// This is a real failure terminal, not a paused incident: the turn is
     /// settled, no lease/observation remains, and nothing will ever wake it.
@@ -1887,7 +1919,10 @@ impl ObjectiveStore {
                         .or_else(|| current.root_turn_id.clone()),
                 },
             )?;
-            reaped.push(self.apply_decision(current.revision, decision).await?);
+            reaped.push(
+                self.apply_decision(current.revision, decision.as_convergence())
+                    .await?,
+            );
         }
         Ok(reaped)
     }
@@ -3180,7 +3215,10 @@ impl ObjectiveStore {
                             resume_cursor: current.resume_cursor.clone(),
                         },
                     )?;
-                    match self.apply_decision(current.revision, decision).await {
+                    match self
+                        .apply_decision(current.revision, decision.as_convergence())
+                        .await
+                    {
                         Ok(transition) => terminal_transitions.push(transition),
                         Err(error) if error.to_string().contains("revision") => {
                             // Another process may have committed the same
@@ -3530,7 +3568,10 @@ impl ObjectiveStore {
                         .or(objective.delivery_run_id.clone()),
                 },
             )?;
-            match self.apply_decision(objective.revision, decision).await {
+            match self
+                .apply_decision(objective.revision, decision.as_convergence())
+                .await
+            {
                 Ok(_) => reconciled += 1,
                 Err(error) if error.to_string().contains("revision") => continue,
                 Err(error) => return Err(error),
@@ -3569,7 +3610,10 @@ impl ObjectiveStore {
                     resume_cursor: objective.resume_cursor.clone(),
                 },
             )?;
-            match self.apply_decision(objective.revision, decision).await {
+            match self
+                .apply_decision(objective.revision, decision.as_convergence())
+                .await
+            {
                 Ok(_) => resumed += 1,
                 Err(error) if error.to_string().contains("revision") => continue,
                 Err(error) => return Err(error),
@@ -3605,7 +3649,10 @@ impl ObjectiveStore {
                     resume_cursor: objective.resume_cursor.clone(),
                 },
             )?;
-            match self.apply_decision(objective.revision, decision).await {
+            match self
+                .apply_decision(objective.revision, decision.as_convergence())
+                .await
+            {
                 Ok(_) => resumed += 1,
                 Err(error) if error.to_string().contains("revision") => continue,
                 Err(error) => return Err(error),
@@ -5180,7 +5227,12 @@ impl ObjectiveStore {
                 .bind(now)
                 .execute(&mut *tx)
                 .await?;
-                touch_session_in_settlement(&mut tx, session_id, now).await;
+                // Startup/background convergence settles rows a previous
+                // process left behind; that is not user activity, so it must
+                // not advance the session and reorder the sidebar.
+                if decision.settlement_origin == SettlementOrigin::Live {
+                    touch_session_in_settlement(&mut tx, session_id, now).await;
+                }
                 let projected = sqlx::query(
                     "UPDATE chat_turn_state
                      SET revision=revision+1, phase='finalizing', status='completed',
@@ -6539,6 +6591,174 @@ CREATE TABLE objectives (
                 .await
                 .is_err(),
             "the restored table must still reject the value the reboot would have accepted"
+        );
+    }
+
+    /// S1 follow-up (#555): the *whole* startup convergence of a stalled task
+    /// must leave the session's `updated_at` alone — not only the notice
+    /// backfill. Settling a row a previous process left behind is bookkeeping,
+    /// not user activity, so it must not drag an old conversation to the top of
+    /// the sidebar.
+    ///
+    /// The seeded time is an hour in the past on purpose: a stray write then
+    /// reproduces on every platform instead of landing in the same millisecond
+    /// by luck.
+    #[tokio::test]
+    async fn startup_convergence_of_a_stalled_task_never_touches_the_session_order() {
+        async fn session_updated_at(pool: &sqlx::SqlitePool) -> i64 {
+            sqlx::query_scalar("SELECT updated_at FROM sessions WHERE id='session-s1-followup'")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let session_id = "session-s1-followup";
+        let suspended_at = Utc::now().timestamp_millis() - 60 * 60 * 1000;
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES (?, '旧会话', '/tmp/s1-followup', 'model-synthetic', ?, ?)",
+        )
+        .bind(session_id)
+        .bind(suspended_at)
+        .bind(suspended_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The stalled task's own message dates from the suspension too, so the
+        // boot-time activity backfill has nothing newer to pull forward and the
+        // assertion below can only be moved by the convergence itself.
+        sqlx::query(
+            "INSERT OR IGNORE INTO messages (id, session_id, role, content, created_at)
+             VALUES ('message-s1-followup', ?, 'user', '整理这个卡住的长任务', ?)",
+        )
+        .bind(session_id)
+        .bind(suspended_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-s1-followup".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some(session_id.into()),
+                root_turn_id: Some("turn-s1-followup".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        // The pre-#553 shape: parked in `waiting_system` behind an open
+        // incident that only a capability bump could clear, nothing queued, and
+        // its turn still presenting itself as running.
+        sqlx::query(
+            "UPDATE objectives SET status='waiting_system', decision_type='failed_internal',
+               failure_code=?, recovery_owner=?, resume_cursor=?, next_observation_at=NULL,
+               lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE id=?",
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind("turn-s1-followup")
+        .bind(suspended_at)
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_incidents
+             (id, objective_id, status, failure_code, owner, opened_at, updated_at)
+             VALUES ('incident-s1-followup', ?, 'open', ?, ?, ?, ?)",
+        )
+        .bind(&objective.id)
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .bind(OBJECTIVE_INCIDENT_CONTROLLER)
+        .bind(suspended_at)
+        .bind(suspended_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE chat_turn_state
+             SET status='waiting_system', next_action='await_system_recovery',
+                 waiting_reason='await_system_recovery', terminal_reason=NULL
+             WHERE objective_id=?",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Production startup order, one step at a time, so a stray write is
+        // attributed to the step that made it rather than merely detected.
+        let process_instance = current_process_instance();
+        let mut steps: Vec<(&str, i64)> = Vec::new();
+        let _ = store
+            .reconcile_stale_chat_run_controls(&process_instance)
+            .await
+            .unwrap();
+        steps.push((
+            "reconcile_stale_chat_run_controls",
+            session_updated_at(&pool).await,
+        ));
+        let reclassified = store
+            .reclassify_synthetic_technical_handbacks()
+            .await
+            .unwrap();
+        steps.push((
+            "reclassify_synthetic_technical_handbacks",
+            session_updated_at(&pool).await,
+        ));
+        store.sync_recovery_capabilities().await.unwrap();
+        steps.push(("sync_recovery_capabilities", session_updated_at(&pool).await));
+        let _ = store.reactivate_eligible_incidents(32).await.unwrap();
+        steps.push((
+            "reactivate_eligible_incidents",
+            session_updated_at(&pool).await,
+        ));
+        let _ =
+            crate::agent::objective_supervisor::reconcile_provider_recovery_on_startup(&pool)
+                .await
+                .unwrap();
+        steps.push((
+            "reconcile_provider_recovery_on_startup",
+            session_updated_at(&pool).await,
+        ));
+        let _ = store
+            .reconcile_stale_active_objectives(&process_instance)
+            .await
+            .unwrap();
+        steps.push((
+            "reconcile_stale_active_objectives",
+            session_updated_at(&pool).await,
+        ));
+        let _ = store
+            .claim_due_remediations("s1-followup", 8, 60_000)
+            .await
+            .unwrap();
+
+        assert_eq!(reclassified, 1, "the stalled task must converge exactly once");
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+            .bind(&objective.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "the stalled task must reach the failed terminal"
+        );
+        let offender = steps
+            .iter()
+            .copied()
+            .find(|(_, at)| *at != suspended_at)
+            .unwrap_or(("none", suspended_at));
+        assert_eq!(
+            offender,
+            ("none", suspended_at),
+            "startup convergence is not user activity: sessions.updated_at must stay at the suspension time"
         );
     }
 

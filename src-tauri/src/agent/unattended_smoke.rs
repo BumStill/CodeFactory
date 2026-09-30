@@ -630,6 +630,23 @@ async fn seed_legacy_suspended_objective(
         suspended_at,
     )
     .await?;
+    // The suspended session must look an hour stale, not "just touched now".
+    // With a fresh `updated_at` a stray write can land in the same millisecond
+    // and hide; pinned to the suspension time it reproduces on every platform.
+    sqlx::query("UPDATE sessions SET updated_at=? WHERE id=?")
+        .bind(suspended_at)
+        .bind(LEGACY_SESSION_ID)
+        .execute(pool)
+        .await?;
+    // Its own message dates from the suspension as well. A message newer than
+    // the suspension would legitimately pull the sidebar time forward (that is
+    // what the boot-time activity backfill is for), and this phase is about the
+    // convergence itself, not about message activity.
+    sqlx::query("UPDATE messages SET created_at=? WHERE session_id=?")
+        .bind(suspended_at)
+        .bind(LEGACY_SESSION_ID)
+        .execute(pool)
+        .await?;
     Ok(admission.objective.id)
 }
 
