@@ -919,12 +919,45 @@ fn result(world: &Path, phase: &str) -> serde_json::Value {
 }
 
 fn close_world(world: tempfile::TempDir) {
-    let path = world.path().to_path_buf();
-    world.close().unwrap();
+    // Windows refuses to delete a file or directory while any handle to it
+    // lacks FILE_SHARE_DELETE, and it holds every process's working directory
+    // that way. Workers and the survivor descendant run with this world as
+    // their working directory. The Job's ActiveProcesses count (what
+    // `active_process_count` reads) drops when a member leaves the job, which
+    // can precede the kernel closing that member's handles; Defender may also
+    // briefly open files we just wrote. Deleting the world in that window
+    // fails with ERROR_SHARING_VIOLATION (os error 32) although the tree is
+    // already reclaimed. Retry only that error and only for a bounded time:
+    // any other error, or a violation that outlives the budget, still fails.
+    let path = world.keep();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut backoff = Duration::from_millis(10);
+    loop {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => break,
+            Err(error) if is_sharing_violation(&error) && Instant::now() < deadline => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(250));
+            }
+            Err(error) => panic!("could not remove owned world {}: {error:?}", path.display()),
+        }
+    }
     assert!(
         !path.exists(),
         "only this owned world must be fully removed"
     );
+}
+
+#[cfg(windows)]
+fn is_sharing_violation(error: &std::io::Error) -> bool {
+    error.raw_os_error()
+        == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+}
+
+#[cfg(not(windows))]
+fn is_sharing_violation(_error: &std::io::Error) -> bool {
+    // Unix unlinks open files and working directories; raw 32 is EPIPE there.
+    false
 }
 
 /// Opens `path` without FILE_SHARE_DELETE, exactly as Windows holds a process's
@@ -1039,6 +1072,9 @@ fn supervisor_reclaims_owned_descendant_after_main_worker_exits() {
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(worker);
+    // On Windows the reclaimed descendant's working-directory handle on this
+    // world can outlive the Job's zero process count; close_world bounds that
+    // sharing violation rather than relaxing the full-removal check.
     close_world(world);
     assert!(
         waited.is_ok() && !survivor_after_wait,
