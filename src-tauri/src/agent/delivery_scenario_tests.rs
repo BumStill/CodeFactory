@@ -927,6 +927,53 @@ fn close_world(world: tempfile::TempDir) {
     );
 }
 
+/// Opens `path` without FILE_SHARE_DELETE, exactly as Windows holds a process's
+/// working directory: the handle a terminated survivor keeps on this world
+/// until the kernel finishes closing its handles.
+#[cfg(windows)]
+fn hold_without_delete_sharing(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // required to open a directory
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .unwrap()
+}
+
+#[test]
+#[cfg(windows)]
+fn close_world_outlasts_a_transient_sharing_violation() {
+    let world = supervised_world();
+    let held = hold_without_delete_sharing(world.path());
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        drop(held);
+    });
+    close_world(world);
+    release.join().unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn close_world_still_fails_when_the_sharing_violation_persists() {
+    let world = supervised_world();
+    let path = world.path().to_path_buf();
+    let held = hold_without_delete_sharing(&path);
+    let started = Instant::now();
+    let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| close_world(world)));
+    assert!(closed.is_err(), "a lasting sharing violation must still fail");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "teardown retry must stay bounded"
+    );
+    drop(held);
+    std::fs::remove_dir_all(&path).unwrap();
+}
+
 #[test]
 fn ci_not_green_never_merges_or_releases() {
     for phase in ["ci-failure", "ci-pending"] {
