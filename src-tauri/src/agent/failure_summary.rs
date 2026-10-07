@@ -104,6 +104,9 @@ pub fn plain_failure_reason(failure_code: Option<&str>) -> String {
     let text = match code {
         "provider_endpoint_unavailable" => "所选模型服务一直连不上",
         "provider_route_unavailable" => "没有可用的模型线路",
+        "provider_episode_unreconciled" => {
+            "上一次模型回复中断时已经开始了一项改动，这项改动的结果一直没法确认，所以没有贸然重做"
+        }
         "provider_rate_limited" => "模型服务持续拒绝请求",
         "provider_auth_expired" => "模型服务的登录状态已失效",
         "completion_evidence_incomplete" => "给出的结论缺少可核对的依据",
@@ -382,5 +385,34 @@ mod tests {
         ]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].attempts, 5);
+    }
+
+    /// U21 (2026-10-07). The provider episode fence that U21 keeps (an
+    /// unresolved side effect) still runs the ordinary bounded ladder, because
+    /// the tool side may reconcile the receipt; when it does end, the failed
+    /// terminal must explain it in plain language instead of leaking a machine
+    /// identifier or falling back to the generic reason.
+    #[test]
+    fn provider_episode_fence_keeps_the_ladder_and_explains_itself() {
+        assert_eq!(
+            crate::agent::objective::max_signature_attempts_for(Some(
+                crate::agent::objective::PROVIDER_EPISODE_UNRECONCILED
+            )),
+            crate::agent::objective::MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+            "the tool side may still reconcile the receipt, so the fence keeps the ladder"
+        );
+        let reason = plain_failure_reason(Some(
+            crate::agent::objective::PROVIDER_EPISODE_UNRECONCILED,
+        ));
+        assert_ne!(
+            reason,
+            plain_failure_reason(None),
+            "the user must get a specific explanation, not the generic one"
+        );
+        assert_no_internal_vocabulary(&reason).unwrap();
+        assert!(
+            !reason.contains("provider_episode_unreconciled"),
+            "raw identifiers must not reach the user: {reason}"
+        );
     }
 }

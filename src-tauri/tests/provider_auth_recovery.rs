@@ -988,3 +988,340 @@ async fn deterministic_rejection_settles_replayable_without_unknown_status() {
     );
     assert_ne!(episode_status_after, "unknown");
 }
+
+/// U21 (2026-10-07). A model response is only text. An attempt that started
+/// streaming and was then cut off mid-stream, without ever starting a side
+/// effect, has no external mutation to protect: replaying it can cost one extra
+/// paid call and nothing more. Recording it as `unknown` (the pre-U21
+/// behaviour) left the episode open forever, and every later resume died on
+/// "prior provider episode is not proven replay-safe" until the retry budget
+/// ran out. Production saw this in three sessions, always on `output_started=1,
+/// side_effect_started=0`.
+#[tokio::test]
+async fn interrupted_stream_without_side_effect_is_settled_replayable_and_resumes() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(&permit, &attempt("attempt-torn", "episode-1", "a"), NOW + 1)
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "attempt-torn", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .append_partial_output(&permit, "attempt-torn", "half an ans", NOW + 3)
+        .await
+        .unwrap();
+
+    // The socket died mid-stream. The transport reports the generic
+    // "external state uncertain" class because it cannot prove anything from
+    // its own side; the durable no-side-effect proof must overrule that.
+    let ProviderMutation::Applied(decision) = store
+        .record_failure(
+            &permit,
+            "attempt-torn",
+            "provider_transport",
+            "provider_external_state_uncertain",
+            false,
+            NOW + 4,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("live owner must settle its torn stream");
+    };
+    assert!(
+        matches!(decision, OverloadBudgetDecision::RetryAfter { .. }),
+        "an interrupted stream with no side effect must retry, not park the objective"
+    );
+
+    let (status, failure_code): (String, String) = sqlx::query_as(
+        "SELECT status, COALESCE(failure_code, '') FROM provider_route_attempts WHERE id='attempt-torn'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "failed_replayable");
+    assert_eq!(
+        failure_code, "provider_stream_interrupted_no_side_effect",
+        "the durable reason must say what actually happened"
+    );
+    assert_eq!(
+        store.observe("objective-opaque").await.unwrap(),
+        ProviderRecoveryDisposition::RetrySafe {
+            episode_id: "episode-1".into(),
+            attempt_id: "attempt-torn".into(),
+        }
+    );
+
+    // The same episode accepts the next attempt, and that attempt completes.
+    store
+        .begin_attempt(&permit, &attempt("attempt-retry", "episode-1", "b"), NOW + 5)
+        .await
+        .expect("a settled torn stream must not fence its own episode");
+    store
+        .mark_in_flight(&permit, "attempt-retry", NOW + 6)
+        .await
+        .unwrap();
+    store
+        .commit_response(
+            &permit,
+            "attempt-retry",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "a complete answer",
+            false,
+            NOW + 7,
+        )
+        .await
+        .unwrap();
+    let committed: String = sqlx::query_scalar(
+        "SELECT status FROM provider_route_attempts WHERE id='attempt-retry'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(committed, "response_committed");
+
+    // The turn ends, and system recovery mints the next Objective revision.
+    // Pre-U21 this admission bailed with "prior provider episode is not proven
+    // replay-safe" and repeated with that same signature until exhaustion.
+    assert_eq!(
+        store
+            .settle_finished_turn_episodes("session-1", "turn-1", NOW + 8)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query("UPDATE objectives SET revision=5 WHERE id='objective-opaque'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE objective_remediations SET attempt_index=8 WHERE id='remediation-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next_permit = ProviderOwnerPermit::remediation(
+        "objective-opaque",
+        5,
+        "binding-1",
+        3,
+        "remediation-1",
+        "provider-owner",
+        8,
+    );
+    let mut next_episode = episode();
+    next_episode.id = "episode-2".into();
+    let opened = store
+        .open_episode(&next_permit, &next_episode, NOW + 9)
+        .await;
+    assert!(
+        matches!(opened, Ok(ProviderMutation::Applied(_))),
+        "the next revision must be admitted after the torn stream was settled: {opened:?}"
+    );
+}
+
+/// The U21 rule is bounded by side effects, not by bytes. An attempt that
+/// already started a tool or other external mutation still has an unresolved
+/// consequence, so it must stay `unknown`/observe-only and keep the fence shut.
+#[tokio::test]
+async fn interrupted_stream_with_a_started_side_effect_is_still_not_replayed() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(
+            &permit,
+            &attempt("attempt-side-effect", "episode-1", "a"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "attempt-side-effect", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .append_partial_output(&permit, "attempt-side-effect", "calling a tool", NOW + 3)
+        .await
+        .unwrap();
+    store
+        .begin_side_effect(
+            &permit,
+            "attempt-side-effect",
+            "tool:call-1",
+            "attempt-side-effect:tool-1",
+            NOW + 4,
+        )
+        .await
+        .unwrap();
+
+    let ProviderMutation::Applied(decision) = store
+        .record_failure(
+            &permit,
+            "attempt-side-effect",
+            "provider_transport",
+            "provider_external_state_uncertain",
+            false,
+            NOW + 5,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("live owner must settle its torn stream");
+    };
+    assert!(
+        matches!(decision, OverloadBudgetDecision::DurableWaiting { .. }),
+        "an unresolved tool side effect must still park observation"
+    );
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM provider_route_attempts WHERE id='attempt-side-effect'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "unknown", "an unresolved side effect stays unproven");
+    assert!(matches!(
+        store.observe("objective-opaque").await.unwrap(),
+        ProviderRecoveryDisposition::ObserveOnlySideEffect { .. }
+    ));
+    assert!(
+        store
+            .begin_attempt(
+                &permit,
+                &attempt("unsafe-replay", "episode-1", "b"),
+                NOW + 6
+            )
+            .await
+            .is_err(),
+        "an unresolved side effect must not be replayed blindly"
+    );
+
+    sqlx::query("UPDATE objectives SET revision=5 WHERE id='objective-opaque'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE objective_remediations SET attempt_index=8 WHERE id='remediation-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next_permit = ProviderOwnerPermit::remediation(
+        "objective-opaque",
+        5,
+        "binding-1",
+        3,
+        "remediation-1",
+        "provider-owner",
+        8,
+    );
+    let mut next_episode = episode();
+    next_episode.id = "episode-2".into();
+    let error = store
+        .open_episode(&next_permit, &next_episode, NOW + 7)
+        .await
+        .expect_err("an unresolved side effect must keep the episode fence shut");
+    assert!(
+        error.to_string().contains("not proven replay-safe"),
+        "unexpected refusal: {error}"
+    );
+    // The chat runner turns this refusal into its own failure code by this
+    // marker, so the honest terminal can name the real reason instead of the
+    // generic loop error.
+    assert!(
+        error
+            .to_string()
+            .starts_with(provider_recovery::PROVIDER_EPISODE_FENCE_MARKER),
+        "the fence must carry its machine-readable marker: {error}"
+    );
+}
+
+/// Requirement 2. A process that dies mid-stream leaves an attempt in
+/// `streaming` with no live owner. Nothing could ever settle it: the startup
+/// reconcile only covered zero-output `in_flight`/`unknown` attempts, and the
+/// episode admission fence then refused every later revision forever.
+#[tokio::test]
+async fn dangling_streaming_attempt_without_a_live_owner_is_reconciled() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(
+            &permit,
+            &attempt("attempt-dangling", "episode-1", "a"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "attempt-dangling", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .append_partial_output(&permit, "attempt-dangling", "cut off", NOW + 3)
+        .await
+        .unwrap();
+    let before: String = sqlx::query_scalar(
+        "SELECT status FROM provider_route_attempts WHERE id='attempt-dangling'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before, "streaming");
+
+    // The owner is gone: no live chat run holds this objective revision.
+    assert_eq!(
+        store
+            .reconcile_stale_effect_free_in_flight(NOW + 10)
+            .await
+            .unwrap(),
+        1,
+        "a dangling effect-free streaming attempt must be reconciled"
+    );
+    let (status, failure_code): (String, String) = sqlx::query_as(
+        "SELECT status, COALESCE(failure_code, '') FROM provider_route_attempts WHERE id='attempt-dangling'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "failed_replayable");
+    assert_eq!(failure_code, "provider_stream_interrupted_no_side_effect");
+    assert_eq!(
+        store.observe("objective-opaque").await.unwrap(),
+        ProviderRecoveryDisposition::RetrySafe {
+            episode_id: "episode-1".into(),
+            attempt_id: "attempt-dangling".into(),
+        }
+    );
+
+    // The episode must not stay open forever.
+    sqlx::query("UPDATE objectives SET revision=5 WHERE id='objective-opaque'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE objective_remediations SET attempt_index=8 WHERE id='remediation-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next_permit = ProviderOwnerPermit::remediation(
+        "objective-opaque",
+        5,
+        "binding-1",
+        3,
+        "remediation-1",
+        "provider-owner",
+        8,
+    );
+    let mut next_episode = episode();
+    next_episode.id = "episode-2".into();
+    assert!(matches!(
+        store
+            .open_episode(&next_permit, &next_episode, NOW + 11)
+            .await
+            .unwrap(),
+        ProviderMutation::Applied(_)
+    ));
+}

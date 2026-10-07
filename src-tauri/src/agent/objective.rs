@@ -81,6 +81,14 @@ string_enum!(ObjectiveStatus {
 /// objective that produced it name the same thing.
 pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
 
+/// U21 (2026-10-07). The provider episode fence, in the one case U21 keeps:
+/// the last model request started a tool or other external mutation whose
+/// receipt is still unresolved, so nothing proves the request safe to replay
+/// yet. Unlike an interrupted stream (which U21 settles as replay-safe), the
+/// tool side may still reconcile that receipt, so this keeps the ordinary
+/// bounded ladder; its own code only lets the failed terminal say why.
+pub const PROVIDER_EPISODE_UNRECONCILED: &str = "provider_episode_unreconciled";
+
 /// U18/R3: the remediation's durable turn identity disagrees with the
 /// Objective's live turn and reconciliation cannot decide which turn to resume.
 /// Replaying the same call is guaranteed to produce the same answer, so this is

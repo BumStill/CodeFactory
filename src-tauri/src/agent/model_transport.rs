@@ -3510,7 +3510,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_partial_sse_restart_is_checkpointed_and_never_posts_again() {
+    /// U21 (2026-10-07). A process that died mid-stream used to leave the
+    /// attempt `streaming` with no live owner, and every later resume died on
+    /// "prior provider episode is not proven replay-safe" with that same
+    /// signature. The stream is only text and no side effect had started, so the
+    /// reconciled attempt is replay-safe and the resume issues the next request.
+    async fn durable_partial_sse_restart_is_settled_replayable_and_resumes() {
         use crate::agent::objective::{
             CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
         };
@@ -3646,7 +3651,7 @@ mod tests {
             binding_id: claim.binding_id,
             resource_generation: claim.resource_generation,
         };
-        let (must_not_post_url, must_not_post_hits) = serve_responses(vec![(
+        let (resume_url, resume_hits) = serve_responses(vec![(
             "200 OK",
             "text/event-stream",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"duplicate\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
@@ -3659,7 +3664,7 @@ mod tests {
                 super::super::failover::RouteCandidatePlan::new(openai_candidate(
                     "durable-provider",
                     "durable-model",
-                    must_not_post_url,
+                    resume_url,
                 )),
                 super::super::failover::EndpointHealthRegistry::new(
                     std::time::Duration::from_secs(120),
@@ -3678,8 +3683,12 @@ mod tests {
         resumed
             .complete(&[], &tools, &RoundOptions::default())
             .await
-            .expect_err("partial output may not be replayed after restart");
-        assert_eq!(must_not_post_hits.load(Ordering::SeqCst), 0);
+            .expect("an interrupted stream with no side effect must be replayable");
+        assert_eq!(
+            resume_hits.load(Ordering::SeqCst),
+            1,
+            "the resumed attempt must actually issue the new request"
+        );
     }
 
     #[tokio::test]
