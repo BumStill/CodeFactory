@@ -42,6 +42,7 @@
 | CF-SCC-R34 | 长等待心跳与放大提醒必须在 anonymous/headless/desktop surface 保持既有隐私和兼容语义；旧数据库无需 schema 迁移，reload 只恢复最后活动快照和去重后的 notice | compatibility + hydration + privacy negative assertions |
 | CF-SCC-R35 | 命令开头的精确 strict-mode 前导（`set -e/-u/-o pipefail/-eu/-euo pipefail`）不改变后续逐段只读分类；任意其他 `set`、命令替换、真实重定向、后台执行或 writer 仍必须 fenced | production command-shape positive/negative classifier tests |
 | CF-SCC-R36 | 同一当前回合的 durable terminal tuple（业务终态、真实用户门禁或 system incident pause）必须压过 stale `streaming=true`：composer 回到发送、进度/ETA/停止态消失，waiting/running/permission 工具收敛为可见终态；`technical_recovery_exhausted` 不得投影成 core-input CTA，真实 system-owned running 对照不得被误隐藏 | reducer + Workspace + real-browser production-component gate |
+| CF-SCC-R37 | 用户在系统自动恢复期间发消息，消息本身是该任务唯一允许的接管方式：新回合成为该 objective 的当前回合，排队中的系统 remediation 立即 superseded，被取代回合在同一事务内进入终态，用户消息不计入系统恢复预算。一个 objective 任一时刻只有一条非终态回合；结算、终态投影与启动收口都收口该 objective 名下全部非终态回合，只保留 `COALESCE(resume_cursor, root_turn_id)`。因此会话在结算后不再向 composer 暴露 active turn，输入框直接可发送而不是排队 | Rust reprompt/settlement unit + startup convergence idempotency + SQLite truth + real app |
 
 ## Primary User Paths
 
@@ -54,6 +55,8 @@
 用户明确要求实施，或主动批准已有可执行方案后进入 Execute。仅实施请求得到 `implement`，包含提交、PR、合并、发布或上线的明确请求得到 `deliver`。模型尝试结束但验证证据不足时，正文中的候选草稿和内部 recovery prompt 保持隐藏；同一位置显示一句紧凑状态，说明正在补充哪一项证据。每个 segment 只允许一次同策略定向恢复；仍不足时持久化 checkpoint 并由 supervisor 续段或换策略，不能生成候选—拒绝—重试循环，也不能要求用户推动。
 
 运行中发送的新消息属于 steer revision，不是普通模型上下文附注。框架先根据用户原文更新结构 capability，再进入下一次模型调用；升级后重新开放对应工具，降级后下一次 mutation 必须在 permission 之前被拒绝。任何 steer 都不能补充 recovery 配额。
+
+用户消息同样是"系统自动恢复中"状态唯一被允许的接管方式。objective 处于 waiting_system 时，用户在 composer 发来的消息不是等当前执行结束的排队项，而是接管当前任务：同一事务内把 queued remediation 标 superseded 并写审计事件、把 objective 的当前回合移到这条新回合、把被取代回合结算为终态；该消息因此不计入系统恢复预算。一个 objective 任一时刻只有一条非终态回合，结算和启动收口都按这条规则收口其余回合，所以会话在结算后不再向 composer 暴露 active turn——输入框直接可发送，而不是显示"当前执行结束后发送"。
 
 单个工具长时间运行时，框架在 backend 执行区间内刷新脱敏活动心跳；权限等待仍使用独立的 60 秒授权窗口和独立时长。root turn 达到工具放大阈值后，系统只提醒一次并要求下一轮收敛，不以数量替代对真实进展、mutation 与 evidence 的判断。
 
@@ -71,6 +74,7 @@
 | 任意 active | permission timeout/channel close 或 policy deny | waiting_system/安全替代；绝不 completed 或 user blocked |
 | 任意 active | 用户明确拒绝绑定动作或取消目标 | cancelled/denied；不得绕过等价副作用 |
 | 任意 active | 必要核心输入或不可代选业务决定 | typed wait；输入/选择后同 objective 自动续接 |
+| waiting_system（系统自动恢复中） | 用户发来任何消息 | 用户回合接管同一 objective；排队 remediation 变 superseded 并写审计事件；被取代回合同事务终态；该消息不计入恢复预算 |
 
 ### 历史恢复路径
 
@@ -89,7 +93,7 @@
 
 ## Applicable Harnesses
 
-- Spec Harness：CF-SCC-R1..R36，并与 CF-CCE-R1..R30、CF-ORC-R1..R40 的连续性与 ownership 契约联合验证。
+- Spec Harness：CF-SCC-R1..R37，并与 CF-CCE-R1..R30、CF-ORC-R1..R46 的连续性与 ownership 契约联合验证。
 - Compatibility Harness：旧 settings、旧 completion state、旧会话 hydration。
 - Viewport Harness：1366×768、800×600 下状态卡与输入区不重叠。
 - Observation Harness：真实 App 中 Full access 诊断、Execute 恢复和取消路径。
