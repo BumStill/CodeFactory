@@ -1430,6 +1430,26 @@ async fn settle_chat_objective_from_error(
             current.revision
         )));
     }
+    if error_text.contains("PROVIDER_DURABLE_IDENTITY_SUPERSEDED") {
+        // U18/R3: this remediation belongs to a turn the Objective already
+        // replaced (the user's message took over and moved the live turn).
+        // Superseding the queued remediation — instead of creating a fresh one
+        // for the same stale turn — is what stops the session from looping on
+        // PROVIDER_DURABLE_IDENTITY_MISMATCH until the budget is gone. The live
+        // turn is the user's and keeps running on its own.
+        sqlx::query(
+            "UPDATE objective_remediations SET status='superseded',
+               lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE objective_id=?
+               AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(Utc::now().timestamp_millis())
+        .bind(objective_id)
+        .execute(db)
+        .await?;
+        project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
+        return Ok(current);
+    }
     let signal = if auth_expired {
         RouteSignal::AuthorizationRequired {
             domain: RecoveryDomain::Auth,
@@ -1442,7 +1462,13 @@ async fn settle_chat_objective_from_error(
         // loop error. The generic class earns the growing transient ladder;
         // this one cannot improve on its own, so it converges fast to a settled
         // state the user can act on instead of showing "等待中" for minutes.
-        let failure_code = if matches!(
+        let failure_code = if error_text.contains("PROVIDER_DURABLE_IDENTITY_MISMATCH") {
+            // U18/R3: reconciliation could not name a resume target, so this is
+            // deterministic, not transient. `bound_system_recovery` settles it
+            // as the failure terminal on the first occurrence — no second
+            // attempt with the same signature.
+            crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
+        } else if matches!(
             crate::agent::failover::classify_provider_failure(error_text),
             crate::agent::failover::ProviderFailureClass::EndpointUnavailable
         ) {
