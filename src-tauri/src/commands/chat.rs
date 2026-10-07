@@ -1412,8 +1412,7 @@ fn chat_failure_code_for_error(error_text: &str) -> &'static str {
         // as the failure terminal on the first occurrence — no second
         // attempt with the same signature.
         crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
-    } else if error_text.contains(crate::agent::provider_recovery::PROVIDER_EPISODE_FENCE_MARKER)
-    {
+    } else if error_text.contains(crate::agent::provider_recovery::PROVIDER_EPISODE_FENCE_MARKER) {
         // U21: the prior model request started a side effect that is still
         // unresolved. It keeps the ordinary bounded ladder — the tool side may
         // still reconcile that receipt — but ends with a reason the user can read.
@@ -3616,7 +3615,9 @@ mod tests {
             crate::agent::objective::PROVIDER_EPISODE_UNRECONCILED
         );
         assert_eq!(
-            chat_failure_code_for_error("PROVIDER_DURABLE_IDENTITY_MISMATCH: remediation session/root changed"),
+            chat_failure_code_for_error(
+                "PROVIDER_DURABLE_IDENTITY_MISMATCH: remediation session/root changed"
+            ),
             crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
         );
         assert_eq!(
