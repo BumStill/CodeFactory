@@ -53,6 +53,16 @@
 | CF-ORC-R43 | 工具层参数裁决立即如实返回：`edit_file`/`write_file` 的 `old_string` 出现 0 次或出现多次且未设 `replace_all`、路径不存在或越出工作区、文件不是 UTF-8、关键参数缺失，都必须作为普通工具失败原样交给 agent，文案含真实原因、文件路径、出现次数与改法；不得写 side-effect receipt、不得进 `waiting_system`、不得排 remediation、不得消耗恢复预算。已存在的回执仍是权威，重放路径不受此条影响 | 0 次/多次/缺路径/越出工作区/非 UTF-8 双向单测 + 无 receipt/remediation/`waiting_system` 断言 |
 | CF-ORC-R44 | 无观察效果的命令只说它所属的那一类并交回 agent 重新规划：本机文件改动类只说"会改动文件但无法核对"并指向 `edit_file`/`write_file`，远端推送/发布类才提 `deliver_changes`，后台化命令只说后台。命令根本没有执行、没有副作用，属于确定性裁决：不得计入恢复预算，也不得用一段罗列所有类别的门禁文案替代真实原因 | 本机 bash 文案不含"远端推送/发布/集群"、远端命令指向 `deliver_changes`、后台命令只提后台、均无 receipt 的单测 |
 | CF-ORC-R45 | 观察契约准入判断必须在权限网关之前执行：系统注定拒绝的调用不得弹权限框、不得产生 `permission_intents` 行，而是直接按 R43/R44 作为工具结果返回。该前置探测只做规划、不得写持久状态（receipt/contract/remediation），规划器报错时必须 fail open 交回权限网关，真正的门禁仍在派发前执行 | 前置探测只读断言 + 注定拒绝调用不产生权限意图行 |
+| CF-ORC-R46 | 用户消息必须随时被接住。Objective 处于 waiting_system（系统自动恢复中）时收到用户消息，必须在同一事务内取代排队 remediation（标 `superseded` 并写审计事件）、把当前回合并入 `resume_cursor`/binding 指向新回合、把被取代回合结算为终态；该消息是用户驱动，不计入恢复预算。任一时刻一个 Objective 只有一条非终态回合：remediation 续跑、结算、终态投影与启动收口一律绑定 `COALESCE(resume_cursor, root_turn_id)`，且任何写终态的地方都收口该 Objective 名下其余非终态回合（启动收口幂等且不改 `sessions.updated_at`）。remediation 的 root 与 Objective 当前回合不一致属确定性错误：能对账出应续跑回合就重绑，不能确定就立即进入既有 `failed` 终态，绝不原样重试同一签名 | reprompt takeover + settlement fan-out + startup convergence idempotency + identity deterministic-failure unit + SQLite truth |
+
+## 用户消息接管自动恢复（CF-ORC-R46）
+
+2026-09-30 的现场证据：objective 在一次 `waiting_system` 恢复中收到用户消息后出现两个 chat root turn，`objectives.root_turn_id` 与 `resume_cursor` 仍停在旧 root，而恢复续跑拿到的却是会话最新 root——传输层因此反复返回 `PROVIDER_DURABLE_IDENTITY_MISMATCH`，同一签名重试到耗尽；结算只更新 objective 自己那条 root 的 `chat_turn_state`，新 root 的 turn 一直停在 `active/working`，界面上永远显示运行中，用户之后发的每条消息都只能排进"当前执行结束后发送"的队列。用户唯一的出路是点停止，而那会丢掉旧工作区里未提交的改动。
+
+- **用户说话必须随时被接住。** 恢复是系统的选择，不是对用户的锁。`waiting_system` 期间的用户消息接管任务：同一事务内取代排队 remediation、把 objective 的当前回合移到新回合、把被取代回合结算为终态。它是用户驱动，因此不计入系统恢复预算（与 CF-ORC-R35 的预算口径一致）。
+- **一个任务同一时刻只有一个当前回合。** 当前回合的持久身份是 `COALESCE(resume_cursor, root_turn_id)`；remediation、结算与终态投影都绑定它，绝不用最初的 `root_turn_id`，也不用"会话最新 turn"这种猜测。任何写 `chat_turn_state` 终态的地方都要顺带收口该 objective 名下其余非终态回合，否则假运行（CF-ORC-R8 的反面）会一直留在会话里。
+- **身份不一致是确定性错误。** remediation 的 root 与 objective 的当前回合不一致时，先按上面的规则对账：能确定应续跑哪个回合就重绑到它；确定不了就立即进入既有 `failed` 终态，不得把同一个确定性签名重试到预算耗尽。续跑身份仍只接受原始 `root_turn_id` 或精确 `resume_cursor`，不接受其他 session、Objective 或 turn。
+- **启动收口覆盖存量。** 同一 objective 名下有多个非终态 turn 时只保留当前那一条，其余收为终态；objective 已终态但仍有 `active`/`waiting_system` 的 turn 一并收口。这是幂等的，且不改 `sessions.updated_at`。
 
 ## 失败要说真话：参数裁决不是系统故障（CF-ORC-R43/R44/R45）
 
@@ -83,7 +93,7 @@ CF-ORC-R34 已经把"只读探查不是外部变更"写进规格。R38 把同一
 - 判定"无进展"的依据是同一恢复策略代际内 failure signature 重复，而不是 failure code。代际内计数为累计而非连续 streak——否则中间插入一个不同的 failure code 就能把计数清零，同一条坏路径可以无限续命。跨代历史不删除；exhausted 后只有恢复策略/能力版本变化或用户主动 steer 才开启新代际，普通系统重试、进程重启或 permission 恢复都不能重置预算，用户消息不是系统恢复的必要条件。
 - `completion_evidence_incomplete` 明确计入：完成证据门禁驳回后重跑同一 prompt 得到同一答案，是无进展的典型形态。
 - 达到上限后的出口是 system-owned incident pause，不是 `core_input_required`、`completed` 或 `cancelled`。Objective 仍然存活，但 transport turn 原子结算；系统只在恢复策略、产品 build、provider/tool capability 等可审计版本变化后开启新代际，不能继续支付同一条无进展模型路径。
-- 用户主动 steer exhausted Objective 时可持久递增 `recovery_generation` 并恢复同一 Objective，但系统不得把该 steer 作为必需输入或恢复前提；新代际仍受相同 5/20 上限约束。
+- 用户主动 steer exhausted Objective 时可持久递增 `recovery_generation` 并恢复同一 Objective，但系统不得把该 steer 作为必需输入或恢复前提；新代际仍受相同 5/20 上限约束。steer 同时是 `waiting_system` 的接管（CF-ORC-R46）：消息取代排队 remediation、把当前回合移到新回合并结算被取代回合，因此这条用户消息不计入恢复预算。
 - 续接 turn 的持久身份是同一 Objective 的当前 `resume_cursor`；setup/settlement guard 必须接受原始 `root_turn_id` 或这个精确 cursor，不能把合法续接误判为 identity mismatch，也不能接受其他 session、Objective 或 turn。
 - 上限只约束**系统自发**的重试。用户恢复能力（`CapabilityRestored`）与用户授权权限（`resume_authorized_action`）不消耗预算。
 - 上限达成时 transport turn 必须结算并写入 `terminal_reason='technical_recovery_exhausted'`、`next_action='await_system_recovery'` 和 system incident owner；界面停止显示当前 turn 的运行时钟，但不得显示用户输入 CTA。

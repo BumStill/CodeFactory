@@ -1552,6 +1552,20 @@ pub fn run() {
                     "startup: active objectives moved to system-owned recovery"
                 );
             }
+            // U18/R4: an Objective owns one live chat turn. Reprompts and steers
+            // leave extra non-terminal turns behind (and terminal Objectives can
+            // keep `active` ghosts), which render as 运行中 forever and make the
+            // composer queue instead of send. Idempotent: only non-terminal rows
+            // are touched, and `sessions.updated_at` is never rewritten.
+            let converged_turns = tauri::async_runtime::block_on(
+                objective_store.reconcile_stale_chat_turns(),
+            )?;
+            if converged_turns > 0 {
+                tracing::info!(
+                    count = converged_turns,
+                    "startup: superseded chat turns converged to their exact terminal state"
+                );
+            }
             match tauri::async_runtime::block_on(codex_auth::observe_chatgpt_auth_on_startup(
                 &objective_pool,
             )) {

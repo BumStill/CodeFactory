@@ -81,6 +81,13 @@ string_enum!(ObjectiveStatus {
 /// objective that produced it name the same thing.
 pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
 
+/// U18/R3: the remediation's durable turn identity disagrees with the
+/// Objective's live turn and reconciliation cannot decide which turn to resume.
+/// Replaying the same call is guaranteed to produce the same answer, so this is
+/// settled as a terminal failure on the first occurrence instead of being
+/// retried until the recovery budget runs out.
+pub const CHAT_IDENTITY_UNRECONCILABLE: &str = "chat_identity_unreconcilable";
+
 /// An Objective that stopped without deciding anything: not a provider fault,
 /// not a tool fault — the turn simply ended and left the row `active`, owning
 /// no lease, no remediation and no scheduled observation.
@@ -212,6 +219,123 @@ async fn touch_session_in_settlement(
         .bind(now)
         .execute(&mut **tx)
         .await;
+}
+
+/// U18/R2: an Objective owns exactly ONE live chat turn at a time. Every path
+/// that closes the objective's own turn must also close the turns it left
+/// behind — otherwise a user reprompt (or a steer during system recovery) leaves
+/// the superseded root `active` forever: the sidebar keeps showing 运行中 and the
+/// composer can only enqueue "当前执行结束后发送".
+///
+/// `keep_root_turn_id` names the single turn that stays live (the objective's
+/// `COALESCE(resume_cursor, root_turn_id)`); `None` closes every non-terminal
+/// turn, which is what a terminal objective requires.
+///
+/// Idempotent by construction — only non-terminal rows are touched — so a second
+/// startup pass writes nothing. It never edits `sessions`, preserving U3's S1
+/// rule that background convergence must not reorder the sidebar.
+pub(crate) async fn settle_superseded_chat_turns_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    objective_id: &str,
+    keep_root_turn_id: Option<&str>,
+    terminal_reason: &str,
+    now: i64,
+) -> anyhow::Result<u64> {
+    let has_turn_state: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_turn_state'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_turn_state == 0 {
+        return Ok(0);
+    }
+    // Build the SET list from the columns this database actually has: the
+    // conversation projection grew over several releases (`turn_settled_at`,
+    // `stream_closed_at`, …), and older/minimal fixtures only carry the
+    // original shape. Writing a column that is absent would turn convergence
+    // itself into a startup failure.
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('chat_turn_state')")
+            .fetch_all(&mut **tx)
+            .await?;
+    let has = |column: &str| columns.iter().any(|name| name == column);
+    let has_objectives: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objectives'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+
+    enum Binding {
+        Int(i64),
+        Text(String),
+    }
+    let mut sets: Vec<String> = vec!["status='completed'".into()];
+    let mut binds: Vec<Binding> = Vec::new();
+    if has("phase") {
+        sets.push("phase='finalizing'".into());
+    }
+    if has("revision") {
+        sets.push("revision=revision+1".into());
+    }
+    if has("recent_activity_kind") {
+        sets.push("recent_activity_kind='superseded'".into());
+    }
+    if has("recent_activity_label") {
+        sets.push("recent_activity_label='该回合已被同一目标的新回合接管'".into());
+    }
+    if has("waiting_reason") {
+        sets.push("waiting_reason=NULL".into());
+    }
+    if has("updated_at") {
+        sets.push("updated_at=?".into());
+        binds.push(Binding::Int(now));
+    }
+    if has("completed_at") {
+        sets.push("completed_at=COALESCE(completed_at, ?)".into());
+        binds.push(Binding::Int(now));
+    }
+    if has("terminal_reason") {
+        sets.push("terminal_reason=?".into());
+        binds.push(Binding::Text(terminal_reason.to_string()));
+    }
+    if has("objective_revision") && has_objectives == 1 {
+        sets.push(
+            "objective_revision=COALESCE((SELECT revision FROM objectives WHERE id=?), objective_revision)"
+                .into(),
+        );
+        binds.push(Binding::Text(objective_id.to_string()));
+    }
+    if has("turn_settled_at") {
+        sets.push("turn_settled_at=COALESCE(turn_settled_at, ?)".into());
+        binds.push(Binding::Int(now));
+    }
+    if has("stream_closed_at") {
+        sets.push("stream_closed_at=COALESCE(stream_closed_at, ?)".into());
+        binds.push(Binding::Int(now));
+    }
+    if has("next_action") {
+        sets.push("next_action=NULL".into());
+    }
+    let statement = format!(
+        "UPDATE chat_turn_state SET {}
+         WHERE objective_id=?
+           AND root_turn_id<>COALESCE(?, '')
+           AND status NOT IN ('completed','cancelled')",
+        sets.join(", ")
+    );
+    let mut query = sqlx::query(&statement);
+    for binding in &binds {
+        query = match binding {
+            Binding::Int(value) => query.bind(*value),
+            Binding::Text(value) => query.bind(value.clone()),
+        };
+    }
+    let result = query
+        .bind(objective_id)
+        .bind(keep_root_turn_id.unwrap_or(""))
+        .execute(&mut **tx)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 /// The text a parked system incident shows. It stays system-owned either way —
@@ -2169,6 +2293,9 @@ impl ObjectiveStore {
             } else {
                 objective.requested_acceptance.as_str()
             };
+            // U18/R1: remember whether the objective was mid-recovery, so the
+            // takeover audit below can name what the user's message superseded.
+            let prior_status = objective.status;
             let next_revision = objective.revision + 1;
             let next_recovery_generation =
                 if objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED) {
@@ -2218,6 +2345,46 @@ impl ObjectiveStore {
             .bind(&objective_id)
             .execute(&mut **tx)
             .await?;
+            // U18/R1+R2: the user's message takes the Objective over. Settle
+            // every turn this Objective leaves behind in the SAME transaction
+            // that moves `resume_cursor` onto the new turn — otherwise the
+            // superseded root stays `active` forever, the session shows 运行中
+            // with no turn to finish, and the composer can only queue
+            // "当前执行结束后发送". The new turn is user-driven, so no
+            // remediation is created here and the system recovery budget is
+            // untouched.
+            let superseded_turns = settle_superseded_chat_turns_in_tx(
+                tx,
+                &objective_id,
+                Some(root_turn_id),
+                "superseded_by_user_reprompt",
+                now,
+            )
+            .await?;
+            if superseded_turns > 0 || prior_status == ObjectiveStatus::WaitingSystem {
+                sqlx::query(
+                    "INSERT INTO objective_events
+                     (id, objective_id, revision, event_type, status, decision_type,
+                      domain, recovery_owner, detail_json, created_at)
+                     VALUES (?, ?, ?, 'user_steer_superseded_remediation', 'active',
+                             'continue', 'chat', 'chat-foreground', ?, ?)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(&objective_id)
+                .bind(next_revision)
+                .bind(
+                    serde_json::json!({
+                        "root_turn_id": root_turn_id,
+                        "prior_status": prior_status.as_str(),
+                        "settled_turns": superseded_turns,
+                        "budget": "user_driven_excluded",
+                    })
+                    .to_string(),
+                )
+                .bind(now)
+                .execute(&mut **tx)
+                .await?;
+            }
             if current_binding.is_none() {
                 let linked = sqlx::query(
                     "UPDATE chat_turn_state SET objective_id=?
@@ -3580,6 +3747,91 @@ impl ObjectiveStore {
         Ok(reconciled)
     }
 
+    /// U18/R4: startup turn convergence, idempotent and independent of the
+    /// Objective-status pass above.
+    ///
+    /// Two shapes deadlock a conversation and both are repaired here:
+    /// 1. a live Objective with more than one non-terminal chat turn — a user
+    ///    reprompt or steer added a turn but the superseded root was never
+    ///    settled; the Objective's `COALESCE(resume_cursor, root_turn_id)` is
+    ///    the one turn that keeps running, everything else closes;
+    /// 2. an Objective that is already terminal (including `legacy_orphan`) but
+    ///    still owns `active`/`waiting_system` turns — pure fake running.
+    ///
+    /// It writes only `chat_turn_state`, never `sessions.updated_at` (U3's S1
+    /// rule), and only touches non-terminal rows, so a second start closes
+    /// nothing.
+    pub async fn reconcile_stale_chat_turns(&self) -> anyhow::Result<usize> {
+        let has_turn_state: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_turn_state'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if has_turn_state == 0 {
+            return Ok(0);
+        }
+        let mut settled = 0usize;
+
+        // Shape 2: terminal Objectives own no live turn.
+        let terminal_objectives = sqlx::query_scalar::<_, String>(
+            "SELECT objective.id FROM objectives objective
+             WHERE objective.status IN ('completed','cancelled','failed','legacy_orphan')
+               AND EXISTS (
+                 SELECT 1 FROM chat_turn_state turn
+                 WHERE turn.objective_id=objective.id
+                   AND turn.status NOT IN ('completed','cancelled'))",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for objective_id in terminal_objectives {
+            let now = Utc::now().timestamp_millis();
+            let mut tx = self.pool.begin().await?;
+            let closed = settle_superseded_chat_turns_in_tx(
+                &mut tx,
+                &objective_id,
+                None,
+                "objective_already_terminal",
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            settled += closed as usize;
+        }
+
+        // Shape 1: a live Objective with ghost turns keeps only its current one.
+        let live_objectives = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT objective.id,
+                    NULLIF(COALESCE(NULLIF(objective.resume_cursor, ''),
+                                    objective.root_turn_id), '')
+             FROM objectives objective
+             WHERE objective.status NOT IN ('completed','cancelled','failed','legacy_orphan')
+               AND EXISTS (
+                 SELECT 1 FROM chat_turn_state turn
+                 WHERE turn.objective_id=objective.id
+                   AND turn.status NOT IN ('completed','cancelled')
+                   AND turn.root_turn_id<>NULLIF(COALESCE(NULLIF(objective.resume_cursor, ''),
+                                                          objective.root_turn_id), ''))",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (objective_id, active_root) in live_objectives {
+            let now = Utc::now().timestamp_millis();
+            let mut tx = self.pool.begin().await?;
+            let closed = settle_superseded_chat_turns_in_tx(
+                &mut tx,
+                &objective_id,
+                active_root.as_deref(),
+                "superseded_at_startup",
+                now,
+            )
+            .await?;
+            tx.commit().await?;
+            settled += closed as usize;
+        }
+
+        Ok(settled)
+    }
+
     /// Convert satisfied authorization requests into immediate system-owned
     /// recovery. The original objective/root turn is preserved; no user
     /// message is replayed or synthesized.
@@ -4112,6 +4364,22 @@ impl ObjectiveStore {
         if decision.domain == RecoveryDomain::Update
             && decision.failure_code.as_deref() == Some(UPDATE_SAFE_POINT_PENDING)
         {
+            return Ok(decision);
+        }
+        if decision.failure_code.as_deref() == Some(CHAT_IDENTITY_UNRECONCILABLE) {
+            // U18/R3: the remediation's turn identity cannot be reconciled with
+            // the Objective's live turn, so replaying the same call returns the
+            // same answer. Waiting for a budget to run out would only make the
+            // user watch a dead session; settle the honest failure terminal on
+            // the first occurrence and keep the exact reason for forensics.
+            decision.decision_type = DecisionType::FailedInternal;
+            decision.status = ObjectiveStatus::Failed;
+            decision.request_key = None;
+            decision.recovery_owner = Some(OBJECTIVE_INCIDENT_CONTROLLER.into());
+            decision.remediation_id = None;
+            decision.next_observation_at = None;
+            decision.next_action_authorized = false;
+            decision.requires_user_action = false;
             return Ok(decision);
         }
         if decision.status != ObjectiveStatus::WaitingSystem
@@ -5022,6 +5290,17 @@ impl ObjectiveStore {
                 .execute(&mut *tx)
                 .await?;
             }
+            // U18/R2: a terminal Objective owns no live turn. Close any ghost
+            // turn the objective accumulated (reprompts / steers) so the session
+            // stops rendering 运行中 and the composer is immediately usable.
+            settle_superseded_chat_turns_in_tx(
+                &mut tx,
+                &decision.objective_id,
+                None,
+                "objective_terminated",
+                now,
+            )
+            .await?;
         }
 
         if decision.status == ObjectiveStatus::Cancelled {
@@ -5305,6 +5584,19 @@ impl ObjectiveStore {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            // U18/R2/R4: the honest failure terminal is a terminal Objective, so
+            // no turn of it may stay live. Reprompts and steers leave extra
+            // non-terminal rows behind; close them here (not one-by-one at each
+            // exit) so the conversation is immediately usable again.
+            settle_superseded_chat_turns_in_tx(
+                &mut tx,
+                &decision.objective_id,
+                None,
+                "objective_failed",
+                now,
+            )
+            .await?;
 
             let has_task_runs: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -9443,7 +9735,11 @@ CREATE TABLE objectives (
             .fetch_one(&mut *tx)
             .await
             .unwrap(),
-            baseline_event_count + 1
+            // `contextual_root_bound` plus the U18/CF-ORC-R46 takeover audit
+            // (`user_steer_superseded_remediation`): a user message arriving
+            // during system recovery must name what it superseded, and that
+            // event belongs to the same transaction as the binding move.
+            baseline_event_count + 2
         );
         tx.rollback().await.unwrap();
 
@@ -12726,6 +13022,258 @@ CREATE TABLE objectives (
             queued.status,
             ObjectiveStatus::WaitingSystem,
             "user-authorized permissions must not exhaust system recovery"
+        );
+    }
+
+    /// U18/R4: startup turn convergence is the fake-running repair. A live
+    /// Objective with a ghost turn keeps exactly its current turn; an Objective
+    /// that is already terminal owns no live turn at all; and a second start
+    /// writes nothing.
+    #[tokio::test]
+    async fn startup_turn_convergence_closes_ghost_turns_exactly_once() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+
+        let live = store
+            .create(CreateObjective {
+                id: "objective-ghost-live".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-ghost-live".into()),
+                root_turn_id: Some("turn-ghost-old".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET resume_cursor=? WHERE id=?")
+            .bind("turn-ghost-new")
+            .bind(&live.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let terminal = store
+            .create(CreateObjective {
+                id: "objective-ghost-terminal".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("session-ghost-terminal".into()),
+                root_turn_id: Some("turn-ghost-terminal".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "informational_answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE objectives SET status='cancelled', decision_type='cancelled',
+               cancellation_provenance='explicit_cancel', completed_at=?
+             WHERE id=?",
+        )
+        .bind(now)
+        .bind(&terminal.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, waiting_reason, objective_id)
+             VALUES ('turn-ghost-old', 'session-ghost-live', 'waiting_system',
+                     'await_system_recovery', ?),
+                    ('turn-ghost-new', 'session-ghost-live', 'active', NULL, ?),
+                    ('turn-ghost-terminal', 'session-ghost-terminal', 'active', NULL, ?)",
+        )
+        .bind(&live.id)
+        .bind(&live.id)
+        .bind(&terminal.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(store.reconcile_stale_chat_turns().await.unwrap(), 2);
+
+        let live_turns: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT root_turn_id, status, terminal_reason FROM chat_turn_state
+             WHERE objective_id=? ORDER BY root_turn_id",
+        )
+        .bind(&live.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live_turns,
+            vec![
+                (
+                    "turn-ghost-new".to_string(),
+                    "active".to_string(),
+                    None
+                ),
+                (
+                    "turn-ghost-old".to_string(),
+                    "completed".to_string(),
+                    Some("superseded_at_startup".to_string())
+                ),
+            ],
+            "the Objective keeps exactly its current turn and closes the rest"
+        );
+        let terminal_status: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, terminal_reason FROM chat_turn_state WHERE root_turn_id=?",
+        )
+        .bind("turn-ghost-terminal")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            terminal_status,
+            (
+                "completed".to_string(),
+                Some("objective_already_terminal".to_string())
+            ),
+            "a terminal Objective owns no live turn"
+        );
+
+        // Deliberately different second run so it is not mistaken for a repeat.
+        let second = store.reconcile_stale_chat_turns().await.unwrap();
+        assert_eq!(second, 0, "convergence is idempotent");
+    }
+
+    /// U18/R1+R2: a user message during system recovery takes the Objective
+    /// over atomically — the queued remediation is superseded, the cursor moves
+    /// to the user's turn, the superseded turn reaches a terminal state in the
+    /// same transaction, and the user turn stays the only live one.
+    #[tokio::test]
+    async fn user_reprompt_during_system_recovery_settles_the_superseded_turn() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-u18-steer").await;
+        let original_root_turn_id = current.root_turn_id.clone().unwrap();
+        let session_id = current.session_id.clone().unwrap();
+
+        let waiting = route_technical_failure(
+            &store,
+            &current,
+            "completion_evidence_incomplete",
+            &format!("{}:steer:waiting", current.id),
+        )
+        .await;
+        assert_eq!(waiting.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 1);
+
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, next_action, objective_id)
+             VALUES (?, ?, 'waiting_system', 'resume_automatically', ?)",
+        )
+        .bind(&original_root_turn_id)
+        .bind(&session_id)
+        .bind(&current.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, status, objective_id)
+             VALUES ('turn-u18-user-steer', ?, 'active', NULL)",
+        )
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let taken_over = store
+            .ensure_or_continue_chat_objective(
+                &session_id,
+                "turn-u18-user-steer",
+                Some(&original_root_turn_id),
+                current.kind,
+                &current.requested_acceptance,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(taken_over.id, current.id, "the Objective stays stable");
+        assert_eq!(taken_over.status, ObjectiveStatus::Active);
+        assert_eq!(
+            taken_over.resume_cursor.as_deref(),
+            Some("turn-u18-user-steer"),
+            "the Objective's live turn is the user's message"
+        );
+        assert_eq!(
+            claimable_remediations(&pool, &current.id).await,
+            0,
+            "the queued system remediation is superseded"
+        );
+        let superseded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=? AND status='superseded'",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(superseded, 1);
+        let turns: Vec<(String, String)> = sqlx::query_as(
+            "SELECT root_turn_id, status FROM chat_turn_state
+             WHERE objective_id=? ORDER BY root_turn_id",
+        )
+        .bind(&current.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            turns,
+            vec![
+                (
+                    original_root_turn_id.clone(),
+                    "completed".to_string()
+                ),
+                ("turn-u18-user-steer".to_string(), "active".to_string()),
+            ],
+            "exactly one turn stays live, in the same transaction"
+        );
+        let audit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_events
+             WHERE objective_id=? AND event_type='user_steer_superseded_remediation'",
+        )
+        .bind(&current.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit, 1, "the takeover is auditable");
+    }
+
+    /// U18/R3: an identity disagreement that reconciliation cannot resolve is
+    /// deterministic, so it settles the honest failure terminal on the first
+    /// occurrence instead of being retried until the budget runs out.
+    #[tokio::test]
+    async fn unreconcilable_identity_settles_the_failure_terminal_immediately() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-u18-identity").await;
+
+        let settled = route_technical_failure(
+            &store,
+            &current,
+            CHAT_IDENTITY_UNRECONCILABLE,
+            "sha256:identity-unreconcilable-synthetic",
+        )
+        .await;
+
+        assert_eq!(
+            settled.status,
+            ObjectiveStatus::Failed,
+            "no second attempt is spent on a deterministic identity failure"
+        );
+        assert_eq!(
+            settled.failure_code.as_deref(),
+            Some(CHAT_IDENTITY_UNRECONCILABLE)
+        );
+        assert_eq!(
+            claimable_remediations(&pool, &settled.id).await,
+            0,
+            "a terminal identity failure queues no remediation"
         );
     }
 }
