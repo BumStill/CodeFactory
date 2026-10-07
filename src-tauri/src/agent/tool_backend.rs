@@ -1616,6 +1616,95 @@ impl DesktopToolBackend {
                 });
             }
             if matches!(status.as_str(), "committed" | "reconciled") {
+                // A settled receipt is authority over a *repeat of an external
+                // effect*, and for a file-scoped effect it records the state
+                // that effect left behind. It is never authority over a local
+                // command whose only observer is the workspace digest.
+                //
+                // `never_after_dispatch` is exactly that family — tests,
+                // builds, workspace git — and it is the same rule the
+                // crash-recovery path already applies
+                // (`ToolRecoveryStore::reconcile_claimed`). Here it decides
+                // that a re-run must really run: replaying answered `done` with
+                // the canned receipt sentence, so an agent that re-ran a
+                // failing check believed it had re-verified while nothing had
+                // executed.
+                //
+                // The boundary is deliberate. A file-scoped effect
+                // (`exact_if_unchanged`: `edit_file`/`write_file` through
+                // `side_effect_observation_contracts`, and `bash` appends or
+                // downloads that name their destination file through
+                // `tool_recovery_contracts`) keeps its replay: its receipt
+                // carries the resource's own post-state, so answering from it
+                // is a statement about that file, not a fake execution, and the
+                // repo-wide at-most-once guarantee for a repeated provider call
+                // id depends on it
+                // (`forced_reprompt_reuses_one_committed_receipt_across_provider_call_ids`).
+                // A workspace-digest command has no such post-state to stand
+                // on — the digest cannot say "the test already ran" — so there
+                // is nothing truthful to replay.
+                let replay_policy: Option<String> = sqlx::query_scalar(
+                    "SELECT replay_policy FROM tool_recovery_contracts WHERE receipt_id=?",
+                )
+                .bind(&existing_receipt_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| ToolError {
+                    message: format!("load mutation replay policy: {error}"),
+                })?;
+                if replay_policy.as_deref() == Some("never_after_dispatch") {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let reopened = sqlx::query(
+                        "UPDATE side_effect_receipts
+                         SET status='started', observed_at=?
+                         WHERE id=? AND status IN ('committed','reconciled')",
+                    )
+                    .bind(now)
+                    .bind(&existing_receipt_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| ToolError {
+                        message: format!("reopen settled local receipt: {error}"),
+                    })?;
+                    let reopened_contract = sqlx::query(
+                        "UPDATE tool_recovery_contracts
+                         SET state='dispatching', dispatch_generation=dispatch_generation+1,
+                             dispatch_owner=?, dispatch_claim_epoch=?,
+                             dispatch_started_at=?, updated_at=?
+                         WHERE receipt_id=?
+                           AND state IN ('settled_committed','settled_reconciled')",
+                    )
+                    .bind(
+                        ctx.mutation_permit
+                            .as_ref()
+                            .map(|permit| permit.owner.clone()),
+                    )
+                    .bind(
+                        ctx.mutation_permit
+                            .as_ref()
+                            .map_or(0, |permit| permit.claim_epoch),
+                    )
+                    .bind(now)
+                    .bind(now)
+                    .bind(&existing_receipt_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| ToolError {
+                        message: format!("reopen settled local contract: {error}"),
+                    })?;
+                    if reopened.rows_affected() != 1 || reopened_contract.rows_affected() != 1 {
+                        return Err(ToolError {
+                            message: "settled local receipt changed before re-dispatch".into(),
+                        });
+                    }
+                    tx.commit().await.map_err(|error| ToolError {
+                        message: format!("commit local re-dispatch: {error}"),
+                    })?;
+                    return Ok(MutationAdmission::Dispatch {
+                        receipt_id: Some(existing_receipt_id),
+                        browser_execution: None,
+                    });
+                }
                 let summary_json: Option<String> = existing.get("summary_json");
                 let summary = summary_json
                     .as_deref()
@@ -4698,6 +4787,188 @@ mod tests {
         assert_eq!(
             state, "settled_committed",
             "a landed download must settle its receipt, not linger as unknown"
+        );
+    }
+
+    /// R4 boundary: the at-most-once guarantee is preserved for a repeat whose
+    /// effect is file-scoped. `bash` that names its destination file is planned
+    /// as `exact_if_unchanged`, and the receipt records the post-state of that
+    /// file — so answering the second identical call from it is a true
+    /// statement about the file, not a fake execution, and it is what stops a
+    /// forced reprompt from appending twice.
+    #[tokio::test]
+    async fn a_repeated_file_scoped_local_effect_keeps_at_most_once_execution() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let args = append_once_args();
+
+        for call_id in ["bash-append-scope-1", "bash-append-scope-2"] {
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let out = backend
+                .execute(&call, &args, &objective_ctx(dir.path()))
+                .await
+                .expect("a local append must not be fatal");
+            assert!(
+                !out.is_error,
+                "{call_id} must be a normal result: {}",
+                out.content
+            );
+        }
+
+        let log = std::fs::read_to_string(dir.path().join("effect.log")).unwrap();
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec!["once"],
+            "a file-scoped repeat must still run at most once: {log:?}"
+        );
+        let policy: String =
+            sqlx::query_scalar("SELECT replay_policy FROM tool_recovery_contracts LIMIT 1")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            policy, "exact_if_unchanged",
+            "the file-scoped plan is what keeps this replay truthful"
+        );
+    }
+
+    /// R4 boundary: requirement 4 — an external effect is still never executed
+    /// twice, and the second refusal is an explicit failure with its own
+    /// reason, not a receipt replay dressed up as `done`.
+    #[tokio::test]
+    async fn a_repeated_external_push_is_refused_both_times_and_never_replayed_as_done() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({"command": "git push origin main"});
+
+        for call_id in ["bash-external-push-1", "bash-external-push-2"] {
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let out = backend
+                .execute(&call, &args, &objective_ctx(dir.path()))
+                .await
+                .expect("a fenced external mutation is a result, not a fatal error");
+
+            assert_eq!(
+                out.status,
+                ToolExecutionStatus::Error,
+                "{call_id} must fail closed, never report completion: {}",
+                out.content
+            );
+            assert_eq!(
+                out.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("code"))
+                    .and_then(serde_json::Value::as_str),
+                Some("external_mutation_without_observation"),
+                "{call_id} must name the real reason: {}",
+                out.content
+            );
+            assert!(
+                !out.content.contains("未重复执行"),
+                "{call_id} must not be answered from a receipt: {}",
+                out.content
+            );
+        }
+
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            receipts, 0,
+            "an external push that never dispatched must leave no receipt to replay"
+        );
+    }
+
+    /// R4: re-running the exact same local command must run it again.
+    ///
+    /// A settled receipt for a command whose effect the workspace digest
+    /// observes is a *record of what already ran*, never a licence to answer
+    /// the second call with "already done". That replay made the agent believe
+    /// it had re-verified a fix while nothing had executed — and the
+    /// completion gate then either saw a missing re-check or, worse, read the
+    /// canned `done` as a passing test.
+    ///
+    /// The command is one of the two real shapes from the incident (a `node`
+    /// invocation), and it both prints a fresh value and leaves a uniquely
+    /// named marker, so a deduplicated second call cannot masquerade as a run.
+    #[tokio::test]
+    async fn re_running_the_same_local_command_executes_it_again() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let command = "node -e \"const fs=require('fs');\
+const n=Date.now();const r=Math.random().toString(36).slice(2);\
+fs.writeFileSync('rerun-'+n+'-'+r+'.mark','x');console.log(n+'-'+r)\"";
+        let args = serde_json::json!({ "command": command });
+        assert!(
+            native_requires_mutation_receipt("bash", &args, &ToolKind::Mutation),
+            "the local command must go through the receipt boundary at all"
+        );
+
+        let mut outputs = Vec::new();
+        for call_id in ["bash-local-rerun-1", "bash-local-rerun-2"] {
+            let call = call_with_args(call_id, "bash", &args);
+            register_tool_call(&backend, &call, &args).await;
+            let out = backend
+                .execute(&call, &args, &objective_ctx(dir.path()))
+                .await
+                .expect("a local command must never be fatal");
+            assert_eq!(
+                out.status,
+                ToolExecutionStatus::Done,
+                "{call_id} did not run: {}",
+                out.content
+            );
+            for text in [&out.content, &out.stdout] {
+                assert!(
+                    !text.contains("未重复执行"),
+                    "{call_id} was answered from a receipt instead of being executed: {text}"
+                );
+            }
+            assert!(
+                out.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("receipt_replayed"))
+                    .is_none(),
+                "{call_id} must be a real execution, not a receipt replay"
+            );
+            outputs.push(out.stdout.trim().to_string());
+        }
+
+        assert_ne!(
+            outputs[0], outputs[1],
+            "the second identical call was deduplicated instead of executed: {outputs:?}"
+        );
+
+        let markers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rerun-")
+            })
+            .count();
+        assert_eq!(
+            markers, 2,
+            "each call must have really executed the command once"
+        );
+
+        // Whatever the first run settled is a record, not an authority: the
+        // receipt that answered it may not be reused as a verdict.
+        let (receipts, replayed): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(observed_at > 0), 0)
+             FROM side_effect_receipts WHERE status IN ('committed','reconciled')",
+        )
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert!(
+            receipts >= 1 && replayed >= 1,
+            "the real executions must still settle their durable receipts"
         );
     }
 
