@@ -45,6 +45,26 @@ pub fn is_cancelled(cancel: Option<&Arc<AtomicBool>>) -> bool {
     cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
 }
 
+/// M30 — complete as soon as the run's cooperative stop flag is raised.
+///
+/// A tool already in flight is the one thing `is_cancelled` at the top of a
+/// round cannot stop: the round is past its checks and parked on the tool's
+/// future. Racing that future against this wait is what makes a stop reach
+/// *inside* the running command, so an unfinished call is recorded as cancelled
+/// and the process does not outlive the task. With no flag attached (non-chat
+/// runs) it never completes, and the race degenerates to a plain await.
+async fn wait_for_cancellation(cancel: Option<Arc<AtomicBool>>) {
+    let Some(flag) = cancel else {
+        return std::future::pending::<()>().await;
+    };
+    loop {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// The stable request id for a round's usage row: `"{usage_run_id}:{iteration}"`.
 /// ONE formula source ties the assistant-message row and the usage row so the
 /// INSERT-OR-IGNORE idempotency (retry/resume) keys identically.
@@ -2234,7 +2254,31 @@ pub async fn run_agent_loop(
                         }
                     }
                 } else {
-                    execution.await
+                    // M30: an in-flight tool must not outlive the task that owns
+                    // it. This arm used to `await` the tool to completion with no
+                    // cancellation check at all, so a command already running
+                    // when the Objective was declared over kept going and its
+                    // result landed *below* the closing statement. Race it
+                    // against the stop flag and end the batch exactly the way the
+                    // heartbeat arm above does: persist the unfinished calls as
+                    // cancelled, then stop the run at this boundary.
+                    tokio::select! {
+                        result = execution.as_mut() => result,
+                        _ = wait_for_cancellation(cancel.clone()) => {
+                            finish_cancelled_tool_batch(
+                                persistence.as_ref(),
+                                events.as_ref(),
+                                &tool_calls[tool_index..],
+                            )
+                            .await?;
+                            return Ok(run_outcome_for_terminal(
+                                &completion_gate,
+                                StopReason::Cancelled,
+                                (total_input_tokens, total_output_tokens),
+                                &last_final_text,
+                            ));
+                        }
+                    }
                 };
                 let duration_ms = tool_start.elapsed().as_millis() as u64;
                 let mut output = match exec_result {
