@@ -1636,22 +1636,19 @@ async fn reattach_inner(
     Ok(workspace)
 }
 
-/// Does this workspace still hold work that a fresh checkout would lose?
-///
-/// Uncommitted edits always count. Commits beyond the recorded base count only
-/// when nobody has delivered them yet — `objective_work_is_already_delivered`
-/// settles that separately, so a merged or already-pushed branch is not pulled
-/// forward again.
-fn workspace_carries_unlanded_work(worktree_path: &Path, base_sha: &str) -> bool {
-    if !worktree_path.is_dir() {
-        return false;
-    }
-    if git(worktree_path, &["status", "--porcelain"])
-        .is_ok_and(|status| !status.trim().is_empty())
-    {
-        return true;
-    }
-    git(worktree_path, &["rev-parse", "HEAD"]).is_ok_and(|head| head != base_sha)
+/// Uncommitted edits (tracked or untracked) exist only in this worktree: no
+/// PR, merge, or push can have captured them, so they always carry forward.
+fn workspace_has_uncommitted_changes(worktree_path: &Path) -> bool {
+    worktree_path.is_dir()
+        && git(worktree_path, &["status", "--porcelain"])
+            .is_ok_and(|status| !status.trim().is_empty())
+}
+
+/// Commits beyond the recorded base. Whether they still need carrying depends
+/// on delivery, which `objective_work_is_already_delivered` settles.
+fn workspace_has_commits_beyond_base(worktree_path: &Path, base_sha: &str) -> bool {
+    worktree_path.is_dir()
+        && git(worktree_path, &["rev-parse", "HEAD"]).is_ok_and(|head| head != base_sha)
 }
 
 /// Has this Objective's work already left the machine — merged, or captured by
@@ -1708,7 +1705,8 @@ async fn objective_work_is_already_delivered(
 /// the cleanup sees a `cleanup_pending` row for the cancelled Objective or it
 /// sees an `active` row for the new one — never a workspace it may delete.
 ///
-/// A clean workspace, a delivered/merged one, or one whose directory is gone
+/// A clean workspace, one whose only work is already delivered/merged, or one
+/// whose directory is gone
 /// yields `None`: the caller provisions a fresh checkout rather than
 /// pretending anything was carried over.
 async fn inherit_stopped_predecessor_locked(
@@ -1744,10 +1742,13 @@ async fn inherit_stopped_predecessor_locked(
         {
             continue;
         }
-        if objective_work_is_already_delivered(pool, &row.objective_id).await? {
-            continue;
-        }
-        if !workspace_carries_unlanded_work(Path::new(&row.worktree_path), &row.base_sha) {
+        let worktree_path = Path::new(&row.worktree_path);
+        // Edits made after a PR was opened are on no PR yet: delivery only
+        // excuses committed work, never the uncommitted tail.
+        let carries_work = workspace_has_uncommitted_changes(worktree_path)
+            || (workspace_has_commits_beyond_base(worktree_path, &row.base_sha)
+                && !objective_work_is_already_delivered(pool, &row.objective_id).await?);
+        if !carries_work {
             continue;
         }
         let now = Utc::now().timestamp_millis();
@@ -1929,10 +1930,12 @@ pub async fn allocate_or_attach(
                 "legacy Objective already recorded side effects without a managed workspace; refusing to bind the user checkout"
             );
         }
-        let observed = refresh_source_base(seed)?;
+        // Inheriting needs no fresh base, so a flaky `git fetch` must not stop
+        // a stopped task from continuing in its own workspace.
         if let Some(inherited) = inherit_stopped_predecessor_locked(pool, &request).await? {
             return Ok(inherited);
         }
+        let observed = refresh_source_base(seed)?;
         allocate_new_locked(pool, request, observed).await
     }
     .await;
@@ -3052,6 +3055,8 @@ mod tests {
         .await
         .unwrap();
         std::fs::write(workspace_pr.worktree_path.join("pr.txt"), "on a PR\n").unwrap();
+        git(&workspace_pr.worktree_path, &["add", "pr.txt"]);
+        git(&workspace_pr.worktree_path, &["commit", "-m", "on a PR"]);
         sqlx::query(
             "UPDATE execution_workspaces
              SET canonical_pr_number=7, canonical_pr_url='https://example.invalid/pull/7'
@@ -3072,6 +3077,50 @@ mod tests {
             workspace_pr_b.worktree_path, workspace_pr.worktree_path,
             "a delivered change must not be carried forward"
         );
+    }
+
+    /// U24 (c3, review): a PR captures only what was committed and pushed. An
+    /// edit made after the PR opened lives in this worktree alone, so stopping
+    /// and continuing must carry it forward instead of starting fresh.
+    #[tokio::test]
+    async fn continuing_after_a_stop_keeps_edits_made_after_the_pr_opened() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-pr-edit-a", "objective-pr-edit-b"]).await;
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-pr-edit-a", "process-a"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace_a.worktree_path.join("on-pr.txt"), "delivered\n").unwrap();
+        git(&workspace_a.worktree_path, &["add", "on-pr.txt"]);
+        git(&workspace_a.worktree_path, &["commit", "-m", "delivered"]);
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET canonical_pr_number=9, canonical_pr_url='https://example.invalid/pull/9'
+             WHERE objective_id='objective-pr-edit-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        std::fs::write(
+            workspace_a.worktree_path.join("review-fix.txt"),
+            "made after the PR opened\n",
+        )
+        .unwrap();
+        cancel_objective(&pool, "objective-pr-edit-a").await;
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-pr-edit-b", "process-b"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            workspace_b.worktree_path, workspace_a.worktree_path,
+            "an uncommitted edit is on no PR yet and must not be dropped"
+        );
+        assert!(workspace_b.worktree_path.join("review-fix.txt").is_file());
     }
 
     /// U24 (d): the stopped Objective left nothing behind, so a clean workspace
