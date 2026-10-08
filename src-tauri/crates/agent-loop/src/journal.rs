@@ -185,6 +185,23 @@ pub trait Persistence: Send + Sync {
     /// Insert one `usage_events` row. Returns `true` when a NEW row was written
     /// (so the caller can gate its usage-recorded emits); anonymous → `Ok(false)`.
     async fn record_usage(&self, row: UsageRow<'_>) -> PersistResult<bool>;
+
+    /// Record one completion-gate rejection together with its structured
+    /// blocker list (R1).
+    ///
+    /// The verdict is the only place that says *why* a turn was judged
+    /// incomplete. Without it the `objective_events` rows carried an empty
+    /// `detail_json` and no `objective_evidence` rows, so neither the user nor
+    /// the next agent could tell which check was allegedly missing. Default
+    /// no-op keeps headless surfaces compatible; the SQLite surface writes it.
+    async fn record_completion_gate_verdict(
+        &self,
+        _root_turn_id: Option<&str>,
+        _verdict: &str,
+        _blockers_json: &str,
+    ) -> PersistResult<()> {
+        Ok(())
+    }
 }
 
 /// The run's stopping condition. `may_continue` is polled between rounds.
