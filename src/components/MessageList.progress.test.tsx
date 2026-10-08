@@ -370,14 +370,14 @@ describe("MessageList structured progress and result", () => {
     );
 
     expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent("已完成");
-    fireEvent.click(screen.getByRole("button", { name: "查看证据" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看改动" }));
     expect(onOpenEvidence).toHaveBeenCalledWith("assistant");
-    expect(screen.queryByText("等待与失败边界")).not.toBeInTheDocument();
+    expect(screen.queryByText("改动的文件")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "结果摘要" }));
     expect(screen.getByRole("status")).toHaveTextContent("完成 3/3 个计划步骤");
   });
 
-  it("does not mark a completed plan green when the same turn has failure evidence", () => {
+  it("does not claim a plan is done when the same turn has a boundary failure", () => {
     const failed = messages(true);
     failed[1] = {
       ...failed[1],
@@ -386,22 +386,18 @@ describe("MessageList structured progress and result", () => {
 
     render(<MessageList messages={failed} streaming={false} cwd={null} />);
 
-    expect(screen.getByTestId("turn-result-snapshot")).toHaveAttribute(
-      "data-status-tone",
-      "warning",
-    );
-    expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent(
-      "已执行，证据待复核",
-    );
-    expect(screen.getByTestId("turn-result-snapshot")).not.toHaveTextContent(
-      "需要你处理",
-    );
+    const card = screen.getByTestId("turn-result-snapshot");
+    expect(card).toHaveAttribute("data-verdict", "incomplete");
+    expect(card).toHaveTextContent("还没做完");
+    expect(card).not.toHaveTextContent("已完成");
+    expect(card).not.toHaveTextContent("证据");
+    expect(card).not.toHaveTextContent("需要你处理");
     expect(screen.getByTestId("failure-resolution-card")).toHaveAccessibleName("失败证据");
     expect(screen.queryByText("需要处理")).not.toBeInTheDocument();
   });
 
   it.each([
-    ["system", "系统继续处理", false],
+    ["system", "系统处理中", false],
     ["external", "外部等待", false],
     ["user", "需要你处理", true],
   ] as const)("keeps failure evidence neutral when next action owner is %s", (owner, label, userOwned) => {
