@@ -6185,6 +6185,15 @@ impl ObjectiveStore {
             .await;
         let work = self.collect_preserved_work(current).await;
         let goal = current.requested_acceptance.clone();
+        // U1b: when the change is already delivered and the only thing the
+        // system could not establish is that the checks were rerun, telling the
+        // user "这件事没做成" is false. State the delivery and name what is
+        // unconfirmed instead.
+        if let Some(delivered) = self.delivered_unverified(current, decision, &work).await {
+            return Some(crate::agent::failure_summary::build_delivered_unverified_report(
+                &goal, &work, &delivered,
+            ));
+        }
         match crate::agent::failure_summary::build_failure_report(
             &goal,
             attempts.clone(),
@@ -6250,6 +6259,106 @@ impl ObjectiveStore {
             work.pr_state = Some(delivery_state_label(&status).to_string());
         }
         work
+    }
+
+    /// U1b: `Some(delivery)` only when the failure that ended this Objective was
+    /// the completion gate refusing to confirm the checks *and* the work already
+    /// landed somewhere the user can open. Everything else keeps the honest
+    /// failure terminal unchanged.
+    async fn delivered_unverified(
+        &self,
+        current: &ObjectiveSnapshot,
+        decision: &DecisionEnvelope,
+        work: &crate::agent::failure_summary::PreservedWork,
+    ) -> Option<crate::agent::failure_summary::DeliveredUnverified> {
+        let gate = self.latest_completion_gate_verdict(&current.id).await;
+        let verification_was_the_gap = gate
+            .as_ref()
+            .is_some_and(|verdict| verdict.0 == COMPLETION_EVIDENCE_INCOMPLETE)
+            || decision.failure_code.as_deref() == Some(COMPLETION_EVIDENCE_INCOMPLETE)
+            || current.failure_code.as_deref() == Some(COMPLETION_EVIDENCE_INCOMPLETE);
+        if !verification_was_the_gap {
+            return None;
+        }
+        let reference = self.delivered_reference(current, work).await?;
+        Some(crate::agent::failure_summary::DeliveredUnverified {
+            reference,
+            checks: gate.map(|verdict| verdict.1).unwrap_or_default(),
+        })
+    }
+
+    /// The delivery that already landed for this Objective: a canonical PR when
+    /// one is recorded, otherwise commits the execution workspace already
+    /// carries beyond its baseline. `None` means nothing has been delivered, so
+    /// the failure terminal must stay a real failure.
+    async fn delivered_reference(
+        &self,
+        current: &ObjectiveSnapshot,
+        work: &crate::agent::failure_summary::PreservedWork,
+    ) -> Option<String> {
+        if let Some(url) = work.pr_url.as_deref() {
+            return Some(
+                pull_request_reference(url).unwrap_or_else(|| "已经开好的 PR".to_string()),
+            );
+        }
+        let session_id = current.session_id.as_deref()?;
+        let view = crate::agent::execution_workspace::latest_for_session(&self.pool, session_id)
+            .await
+            .ok()
+            .flatten()?;
+        let root = std::path::PathBuf::from(&view.worktree_path);
+        if workspace_commits_ahead(&root, &view.base_sha) <= 0 {
+            return None;
+        }
+        Some(match work.branch.as_deref() {
+            Some(branch) if !branch.is_empty() => format!("分支 {branch}"),
+            _ => "当前工作区".to_string(),
+        })
+    }
+
+    /// The latest completion-gate verdict for this Objective: the verdict plus
+    /// the structured unmet checks, as written by R1 into
+    /// `objective_events.detail_json`. Best-effort and schema-tolerant, exactly
+    /// like the ledger reads beside it: a database without the table simply has
+    /// no verdict to report.
+    async fn latest_completion_gate_verdict(
+        &self,
+        objective_id: &str,
+    ) -> Option<(String, Vec<crate::agent::failure_summary::UnmetCheck>)> {
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail_json FROM objective_events
+             WHERE objective_id=? AND event_type='completion_gate_verdict'
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(objective_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()?;
+        let parsed: serde_json::Value = serde_json::from_str(&detail).ok()?;
+        let verdict = parsed
+            .get("verdict")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if verdict.is_empty() {
+            return None;
+        }
+        let checks = parsed
+            .get("blockers")
+            .and_then(serde_json::Value::as_array)
+            .map(|blockers| {
+                blockers
+                    .iter()
+                    .map(|blocker| crate::agent::failure_summary::UnmetCheck {
+                        message: json_string(blocker, "message"),
+                        check: json_optional_string(blocker, "check"),
+                        command: json_optional_string(blocker, "command"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((verdict, checks))
     }
 
     /// The PR a previous delivery attempt already opened, when both the schema
@@ -6350,6 +6459,69 @@ fn workspace_changes(
     }
     let total = changes.len() as i64;
     (changes, total)
+}
+
+/// Commits the execution workspace already carries beyond its baseline (U1b).
+/// Read-only, and a missing or non-repository path counts as zero: a delivery
+/// claim is only ever made on positive evidence.
+fn workspace_commits_ahead(root: &std::path::Path, base_sha: &str) -> i64 {
+    use crate::util::no_window::NoWindow;
+    use std::process::Command;
+    if base_sha.trim().is_empty() || !root.is_dir() {
+        return 0;
+    }
+    let output = Command::new("git")
+        .no_window()
+        .arg("-C")
+        .arg(root)
+        .args(["rev-list", "--count", &format!("{base_sha}..HEAD")])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// `PR #572` for a GitHub pull-request URL, matching the wording the run's own
+/// delivery reference uses (U1b). `None` for anything that is not one.
+fn pull_request_reference(text: &str) -> Option<String> {
+    for marker in ["/pull/", "/pulls/"] {
+        let mut offset = 0;
+        while let Some(index) = text[offset..].find(marker) {
+            let start = offset + index + marker.len();
+            let digits: String = text[start..]
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() {
+                return Some(format!("PR #{digits}"));
+            }
+            offset = start;
+        }
+    }
+    None
+}
+
+/// `detail_json` string field, absent or mistyped fields collapsing to empty.
+fn json_string(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `detail_json` optional string field, with blank values treated as absent.
+fn json_optional_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 /// User-facing wording for a delivery run status.
@@ -12301,7 +12473,20 @@ CREATE TABLE objectives (
                 .await
                 .unwrap();
         assert_eq!(visible_final.0, "assistant");
-        assert!(visible_final.1.contains("这件事没做成"));
+        // U1b: this Objective parked with a canonical PR already open, and the
+        // only unconfirmed thing is that the checks were rerun. The honest
+        // terminal states that fact — denying the work would be false.
+        assert!(
+            visible_final.1.contains("改动已交付到 PR #411"),
+            "{}",
+            visible_final.1
+        );
+        assert!(
+            !visible_final.1.contains("这件事没做成"),
+            "a delivered change must not be reported as not done: {}",
+            visible_final.1
+        );
+        crate::agent::failure_summary::assert_no_internal_vocabulary(&visible_final.1).unwrap();
         assert!(
             !visible_final.1.contains(TECHNICAL_RECOVERY_EXHAUSTED),
             "the visible failure report must not expose an internal reason code"
@@ -12622,6 +12807,174 @@ CREATE TABLE objectives (
             distinct_notices, notice_count,
             "each settled turn points at its own report instead of reusing a stale one"
         );
+    }
+
+    /// U1b (2026-10-08). A change that already reached a PR, where the only gap
+    /// is that the completion gate could not confirm the checks were rerun, must
+    /// be reported as delivered with the specific unmet checks — never as
+    /// "这件事没做成".
+    #[tokio::test]
+    async fn a_delivered_change_with_unconfirmed_checks_is_reported_as_delivered() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        crate::agent::delivery_run::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-u1b-delivered").await;
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objective_events
+             (id, objective_id, revision, event_type, status, decision_type, domain,
+              failure_code, detail_json, created_at)
+             VALUES ('event-u1b-verdict', ?, 3, 'completion_gate_verdict', 'active',
+                     'apply_recommended', 'chat', ?, ?, ?)",
+        )
+        .bind(&current.id)
+        .bind(COMPLETION_EVIDENCE_INCOMPLETE)
+        .bind(
+            serde_json::json!({
+                "verdict": "completion_evidence_incomplete",
+                "outcome_count": 3,
+                "blockers": [{
+                    "kind": "failed_verification",
+                    "message": "修改后没有重跑测试",
+                    "check": "check X",
+                    "command": "cargo test --lib",
+                }],
+            })
+            .to_string(),
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, objective_id, run_kind, requested_ceiling, reached_ceiling, stage,
+              status, canonical_pr_url, canonical_pr_number, last_observed_at,
+              last_progress_at, app_version, app_build, process_instance,
+              created_at, updated_at)
+             VALUES ('run-u1b-delivered', ?, 'deliver_changes', 'pr_only', 'pr_only',
+                     'delivery', 'waiting', ?, 572, ?, ?, '1.82.5', 'u1b-build',
+                     'u1b-process', ?, ?)",
+        )
+        .bind(&current.id)
+        .bind("https://github.com/BumStill/CodeFactory/pull/572")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, objective_id, updated_at)
+             VALUES (?, ?, 'waiting_system', ?, ?)",
+        )
+        .bind(current.root_turn_id.as_deref().unwrap())
+        .bind(format!("session-{}", current.id))
+        .bind(&current.id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let signature = "sha256:u1b-delivered-checks";
+        while current.failure_code.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED) {
+            current = route_technical_failure(
+                &store,
+                &current,
+                COMPLETION_EVIDENCE_INCOMPLETE,
+                signature,
+            )
+            .await;
+        }
+        assert_parked_system_incident(&current);
+
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE session_id=?
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(format!("session-{}", current.id))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(content.contains("PR #572"), "{content}");
+        assert!(content.contains("check X"), "{content}");
+        assert!(!content.contains("没做成"), "{content}");
+        assert!(!content.contains("目标没有达成"), "{content}");
+        crate::agent::failure_summary::assert_no_internal_vocabulary(&content).unwrap();
+    }
+
+    /// U1b negative control: the same verification gap with nothing delivered
+    /// keeps the existing honest failure terminal word for word.
+    #[tokio::test]
+    async fn an_undelivered_verification_gap_keeps_the_honest_failure_wording() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "objective-u1b-undelivered").await;
+        sqlx::query(
+            "INSERT INTO objective_events
+             (id, objective_id, revision, event_type, status, decision_type, domain,
+              failure_code, detail_json, created_at)
+             VALUES ('event-u1b-undelivered', ?, 3, 'completion_gate_verdict', 'active',
+                     'apply_recommended', 'chat', ?, ?, ?)",
+        )
+        .bind(&current.id)
+        .bind(COMPLETION_EVIDENCE_INCOMPLETE)
+        .bind(
+            serde_json::json!({
+                "verdict": "completion_evidence_incomplete",
+                "outcome_count": 3,
+                "blockers": [{
+                    "kind": "failed_verification",
+                    "message": "修改后没有重跑测试",
+                    "check": "check X",
+                    "command": "cargo test --lib",
+                }],
+            })
+            .to_string(),
+        )
+        .bind(Utc::now().timestamp_millis())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, objective_id, updated_at)
+             VALUES (?, ?, 'waiting_system', ?, ?)",
+        )
+        .bind(current.root_turn_id.as_deref().unwrap())
+        .bind(format!("session-{}", current.id))
+        .bind(&current.id)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let signature = "sha256:u1b-undelivered-checks";
+        while current.failure_code.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED) {
+            current = route_technical_failure(
+                &store,
+                &current,
+                COMPLETION_EVIDENCE_INCOMPLETE,
+                signature,
+            )
+            .await;
+        }
+        assert_parked_system_incident(&current);
+
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE session_id=?
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(format!("session-{}", current.id))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(content.contains("这件事没做成"), "{content}");
+        assert!(!content.contains("改动已交付到"), "{content}");
     }
 
     async fn exhausted_reprompt_compatibility_fixture(

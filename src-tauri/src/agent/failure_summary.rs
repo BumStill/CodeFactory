@@ -56,6 +56,40 @@ pub struct PreservedWork {
     pub pr_state: Option<String>,
 }
 
+/// One check the system could not confirm was rerun and passed (U1b). Gathered
+/// from the structured blockers R1 persists with every completion-gate verdict.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnmetCheck {
+    /// Plain-language sentence naming what is still unconfirmed.
+    pub message: String,
+    /// The named check, when the blocker carried one.
+    pub check: Option<String>,
+    /// The exact command that produced the unmet evidence.
+    pub command: Option<String>,
+}
+
+/// Work that already reached delivery while the checks could not be confirmed
+/// (U1b). `reference` is `PR #572` for a canonical pull request, or a branch
+/// description when the work only exists as commits in the workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliveredUnverified {
+    pub reference: String,
+    pub checks: Vec<UnmetCheck>,
+}
+
+/// How much of the unmet-check detail one rendering attempt keeps. The builder
+/// walks these from richest to safest so a check label or command that would
+/// leak internal vocabulary degrades the detail instead of the whole message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckDetail {
+    /// Message plus the named check and the exact command.
+    Full,
+    /// The blocker message alone.
+    MessagesOnly,
+    /// No per-check lines at all.
+    None,
+}
+
 /// Everything the report needs, gathered before rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailureReport {
@@ -67,6 +101,9 @@ pub struct FailureReport {
 
 /// How many changed files are listed before the rest are summarised.
 pub const MAX_LISTED_FILES: usize = 10;
+
+/// How many unmet checks are listed before the rest are counted.
+pub const MAX_LISTED_CHECKS: usize = 6;
 
 /// Words that must never reach the user-facing message.
 pub const BANNED_INTERNAL_WORDS: [&str; 10] = [
@@ -236,6 +273,163 @@ pub fn render_failure_report(report: &FailureReport) -> String {
     out.trim_end().to_string()
 }
 
+/// One bullet for an unmet check, at the requested level of detail.
+fn render_unmet_check(check: &UnmetCheck, detail: CheckDetail) -> String {
+    let message = check.message.trim();
+    let named = check
+        .check
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let command = check
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut line = match (message.is_empty(), named) {
+        (false, _) => message.to_string(),
+        (true, Some(named)) => format!("检查 {named} 没有重跑并通过"),
+        (true, None) => "有一项检查没有重跑并通过".to_string(),
+    };
+    if detail == CheckDetail::Full {
+        let mut parts = Vec::new();
+        if !message.is_empty() {
+            if let Some(named) = named {
+                parts.push(format!("检查 {named}"));
+            }
+        }
+        if let Some(command) = command {
+            parts.push(format!("命令 `{command}`"));
+        }
+        if !parts.is_empty() {
+            line = format!("{line}（{}）", parts.join("；"));
+        }
+    }
+    format!("- {line}")
+}
+
+/// `改动已交付到PR #411` reads like a typo: a Latin reference needs a space
+/// between it and the surrounding Chinese, while a Chinese one (分支 …) must
+/// not collect stray spaces.
+fn join_reference(prefix: &str, reference: &str, suffix: &str) -> String {
+    let mut out = String::from(prefix);
+    if reference.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        out.push(' ');
+    }
+    out.push_str(reference);
+    if !suffix.is_empty() && reference.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+        out.push(' ');
+    }
+    out.push_str(suffix);
+    out
+}
+
+/// U1b: render the terminal for a change that is already delivered, where the
+/// only thing the system could not establish is that the checks were rerun and
+/// passed. It states the delivery as a fact and names what is unconfirmed — it
+/// must never tell the user the task did not get done.
+fn render_delivered_unverified_report(
+    goal: &str,
+    work: &PreservedWork,
+    delivered: &DeliveredUnverified,
+    detail: CheckDetail,
+    include_goal: bool,
+) -> String {
+    let mut out = String::new();
+    let reference = delivered.reference.trim();
+    let reference = if reference.is_empty() {
+        "已记录的工作区"
+    } else {
+        reference
+    };
+    let _ = writeln!(
+        out,
+        "{}",
+        join_reference(
+            "改动已交付到",
+            reference,
+            "；系统未能确认下面这些检查已重跑并通过："
+        )
+    );
+    match detail {
+        CheckDetail::Full | CheckDetail::MessagesOnly => {
+            if delivered.checks.is_empty() {
+                let _ = writeln!(out, "- 系统没有留下具体的未满足检查记录。");
+            } else {
+                for check in delivered.checks.iter().take(MAX_LISTED_CHECKS) {
+                    let _ = writeln!(out, "{}", render_unmet_check(check, detail));
+                }
+            }
+        }
+        CheckDetail::None => {
+            let _ = writeln!(out, "- 系统没有留下具体的未满足检查记录。");
+        }
+    }
+    let _ = writeln!(out);
+
+    if include_goal {
+        let goal = goal.trim();
+        if !goal.is_empty() {
+            let _ = writeln!(out, "这次要做的事：{goal}");
+            let _ = writeln!(out);
+        }
+    }
+
+    let _ = writeln!(out, "改动本身已经落地，没有丢掉：");
+    if let Some(location) = work.location.as_deref() {
+        if let Some(branch) = work.branch.as_deref() {
+            let _ = writeln!(out, "- 改动都在 {location}（分支 {branch}），没有丢掉。");
+        } else {
+            let _ = writeln!(out, "- 改动都在 {location}，没有丢掉。");
+        }
+    }
+    if let Some(pr_url) = work.pr_url.as_deref() {
+        match work.pr_state.as_deref() {
+            Some(state) if !state.is_empty() => {
+                let _ = writeln!(out, "- 已经开好的 PR：{pr_url}（{state}）");
+            }
+            _ => {
+                let _ = writeln!(out, "- 已经开好的 PR：{pr_url}");
+            }
+        }
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "下一步：");
+    let _ = writeln!(
+        out,
+        "- {}",
+        join_reference("在", reference, "里核对上面这些检查，确认通过后合并；")
+    );
+    let _ = writeln!(out, "- 直接回一句「继续」，我会重新跑这些检查并把结果写给你。");
+    out.trim_end().to_string()
+}
+
+/// Build the U1b terminal from already-collected structured data. Detail is
+/// dropped step by step — never the fact of the delivery — so a check label or
+/// command that would leak internal vocabulary cannot push the user back to a
+/// "not done" message.
+pub fn build_delivered_unverified_report(
+    goal: &str,
+    work: &PreservedWork,
+    delivered: &DeliveredUnverified,
+) -> String {
+    for (detail, include_goal) in [
+        (CheckDetail::Full, true),
+        (CheckDetail::MessagesOnly, true),
+        (CheckDetail::None, true),
+        (CheckDetail::None, false),
+    ] {
+        let text = render_delivered_unverified_report(goal, work, delivered, detail, include_goal);
+        if assert_no_internal_vocabulary(&text).is_ok() {
+            return text;
+        }
+    }
+    // Unreachable while the fixed copy above stays user-safe; returning the
+    // safest rendering keeps the caller from falling back to a false denial.
+    render_delivered_unverified_report("", work, delivered, CheckDetail::None, false)
+}
+
 /// Build a report from already-collected structured data, then assert the
 /// banned-vocabulary rule before anyone can store it.
 pub fn build_failure_report(
@@ -388,6 +582,68 @@ mod tests {
         ]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].attempts, 5);
+    }
+
+    fn delivered_sample() -> (PreservedWork, DeliveredUnverified) {
+        (
+            PreservedWork {
+                branch: Some("codefactory/u1b-terminal".to_string()),
+                location: Some("工作区".to_string()),
+                total_changed_files: 2,
+                pr_url: Some("https://github.com/BumStill/CodeFactory/pull/572".to_string()),
+                pr_state: Some("等待合并".to_string()),
+                ..PreservedWork::default()
+            },
+            DeliveredUnverified {
+                reference: "PR #572".to_string(),
+                checks: vec![UnmetCheck {
+                    message: "修改后没有重跑测试".to_string(),
+                    check: Some("check X".to_string()),
+                    command: Some("cargo test --lib".to_string()),
+                }],
+            },
+        )
+    }
+
+    /// U1b: a change that already reached a PR, whose only gap is that the gate
+    /// could not confirm the checks were rerun, must not be reported as "not
+    /// done". The terminal names the delivery and the missing checks.
+    #[test]
+    fn delivered_but_unverified_reports_the_delivery_and_the_missing_checks() {
+        let (work, delivered) = delivered_sample();
+        let text = build_delivered_unverified_report("把导出改成流式写入", &work, &delivered);
+        assert!(text.contains("PR #572"), "{text}");
+        assert!(text.contains("check X"), "{text}");
+        assert!(text.contains("cargo test --lib"), "{text}");
+        assert!(!text.contains("没做成"), "{text}");
+        assert!(!text.contains("目标没有达成"), "{text}");
+        assert_no_internal_vocabulary(&text).unwrap();
+    }
+
+    /// U1b negative control: with nothing delivered, the same verification gap
+    /// keeps the existing honest failure wording.
+    #[test]
+    fn undelivered_verification_gap_keeps_the_honest_failure_wording() {
+        let text =
+            build_failure_report("把导出改成流式写入", vec![], PreservedWork::default()).unwrap();
+        assert!(text.contains("这件事没做成：把导出改成流式写入"), "{text}");
+        assert!(!text.contains("改动已交付到"), "{text}");
+    }
+
+    /// U1b: a check label or command that would leak internal vocabulary has to
+    /// degrade to safe copy, instead of dropping the user back into "没做成".
+    #[test]
+    fn delivered_report_degrades_instead_of_leaking_vocabulary() {
+        let (work, mut delivered) = delivered_sample();
+        delivered.checks = vec![UnmetCheck {
+            message: "命令里带了不该给用户看的词".to_string(),
+            check: Some("recovery check".to_string()),
+            command: Some("cargo test --test recovery_generation".to_string()),
+        }];
+        let text = build_delivered_unverified_report("", &work, &delivered);
+        assert!(text.contains("PR #572"), "{text}");
+        assert!(!text.contains("没做成"), "{text}");
+        assert_no_internal_vocabulary(&text).unwrap();
     }
 
     /// U21 (2026-10-07). The provider episode fence that U21 keeps (an
