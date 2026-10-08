@@ -334,6 +334,47 @@ impl ProviderRecoveryStore {
             return Ok(ProviderMutation::Applied(existing));
         }
 
+        // U23/R8 (2026-10-08): this permit is current, so any request an older
+        // Objective revision left `in_flight`/`streaming`/`unknown` has no live
+        // owner — its writer is fenced by revision. When that request never
+        // started a side effect and no receipt is unresolved, it is the same
+        // effect-free leftover `reconcile_stale_effect_free_attempts` settles;
+        // settle it here, in the opening transaction, instead of waiting for a
+        // sweep that skips Objectives with an active run. A lock-failed response
+        // commit left exactly this behind and blocked every Chat-domain resume.
+        sqlx::query(
+            "UPDATE provider_route_attempts
+             SET status='failed_replayable',
+                 failure_class=CASE WHEN status='unknown'
+                     THEN 'provider_transport' ELSE 'process_restart' END,
+                 failure_code=CASE
+                     WHEN output_started<>0
+                         THEN 'provider_stream_interrupted_no_side_effect'
+                     WHEN status='unknown'
+                         THEN 'provider_transport_failed_before_output'
+                     ELSE 'provider_process_restarted_before_output' END,
+                 observed_at=?, completed_at=?
+             WHERE objective_id=? AND binding_id=? AND objective_revision<?
+               AND status IN ('in_flight', 'streaming', 'unknown')
+               AND side_effect_started=0
+               AND side_effect_receipt_id IS NULL
+               AND id=(
+                   SELECT latest.id FROM provider_route_attempts latest
+                   WHERE latest.episode_id=provider_route_attempts.episode_id
+                   ORDER BY latest.attempt_order DESC LIMIT 1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM side_effect_receipts receipt
+                   WHERE receipt.objective_id=provider_route_attempts.objective_id
+                     AND receipt.status IN ('started', 'unknown'))",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(&permit.objective_id)
+        .bind(&permit.binding_id)
+        .bind(permit.objective_revision)
+        .execute(&mut *tx)
+        .await?;
+
         // A new Objective revision may supersede an older live episode only
         // when durable evidence proves that its last request is replay-safe.
         // Partial/in-flight/unknown/side-effect state stays observation-only and

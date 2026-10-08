@@ -1168,6 +1168,16 @@ async fn reap_active_objectives_whose_run_control_settled(
                   WHERE control.objective_id = objective.id
                     AND control.status IN ('completed', 'cancelled')
                     AND COALESCE(control.settled_at, control.updated_at) < ?)
+            -- A multi-turn Objective always has settled controls from earlier
+            -- runs; only the absence of any live run proves nobody owns it.
+            -- Controls are matched by session too, because a run registers its
+            -- control before it is bound to an Objective.
+            AND NOT EXISTS (
+                  SELECT 1 FROM chat_run_controls live
+                  WHERE live.status IN ('active', 'cancel_requested')
+                    AND (live.objective_id = objective.id
+                         OR (objective.session_id IS NOT NULL
+                             AND live.session_id = objective.session_id)))
           ORDER BY objective.created_at
           LIMIT 8",
     )
@@ -1568,6 +1578,24 @@ mod tests {
         .bind(healthy.revision)
         .bind(now - 300_000)
         .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A multi-turn Objective always carries settled controls from its
+        // earlier runs. Those prove nothing about the run that is live now.
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id, objective_revision,
+              status, created_process_instance, settled_at, created_at, updated_at)
+             VALUES ('run-healthy-earlier', 'session-healthy', 'turn-healthy', ?, ?, 'completed',
+                     'test-process', ?, ?, ?)",
+        )
+        .bind(&healthy.id)
+        .bind(healthy.revision)
+        .bind(now - 400_000)
+        .bind(now - 500_000)
+        .bind(now - 400_000)
         .execute(&pool)
         .await
         .unwrap();
