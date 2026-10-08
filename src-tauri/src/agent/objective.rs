@@ -187,6 +187,15 @@ const RECOVERY_BACKOFF_CAP_MS: i64 = 5 * 60 * 1_000;
 /// that the same error happened once a day for a week.
 const SIGNATURE_RECOVERY_WINDOW_MS: i64 = 30 * 60 * 1_000;
 
+/// M30: how long a settlement waits for the live run it just told to stop to
+/// reach its next boundary. Deliberately short — it is a courtesy window that
+/// lets the loop stop its in-flight command and flush its last message before
+/// the terminal state is written, not a deadline the settlement depends on.
+/// Commands themselves are killed at the boundary, so a run that is mid-tool
+/// still stops here, and one that somehow does not is caught by the durable
+/// settlement watermark on `messages` instead of by waiting longer.
+const LIVE_RUN_STOP_GRACE_MS: u64 = 2_000;
+
 /// A provider endpoint that keeps answering "unavailable" is not the kind of
 /// transient condition the growing ladder was built for. Waiting it out only
 /// shows "等待中" for twelve minutes while nothing can change until the user
@@ -4452,6 +4461,142 @@ impl ObjectiveStore {
         Ok(decision)
     }
 
+    /// M30 — "once a task has been declared over, nothing may keep running
+    /// behind it, and the closing statement must be the last word".
+    ///
+    /// Background settlement (the incident controller, convergence, the
+    /// delivery supervisor) used to open its transaction, write the terminal
+    /// Objective status, the `objective_failed` turn projection and the closing
+    /// statement, and only *then* — by omission — leave the run alone. The
+    /// settled turn went out while `chat_run_controls` was still `active`, so
+    /// nobody told the running `AgentLoop` to stop: an in-flight command ran to
+    /// completion and its result landed *below* the closing statement, and a
+    /// command with an external side effect kept writing after the user had
+    /// been told the task was over.
+    ///
+    /// Order matters, and this is the only place that can enforce it, because
+    /// it runs before the settlement transaction opens:
+    ///
+    /// 1. request the durable stop (`cancel_requested_at`) for every `active`
+    ///    run of this Objective,
+    /// 2. raise the process-local cooperative flag the loop and its in-flight
+    ///    tool actually observe (a durable row alone stops nothing),
+    /// 3. give the run a bounded window to reach its next boundary, so its
+    ///    in-flight tool is stopped and its last message is written while the
+    ///    turn is still open,
+    /// 4. and only then let the caller write the terminal state and the closing
+    ///    statement.
+    ///
+    /// Best-effort by construction: it is a stop *request*, so it never fails a
+    /// settlement, and the bounded wait can never deadlock recovery. The
+    /// no-late-output guarantee does not rest on this timing — `messages` writes
+    /// are gated by the durable settlement watermark — so a run that is somehow
+    /// still alive past the window is still stopped, just later.
+    async fn request_live_run_stop_before_settlement(&self, objective_id: &str, terminal: bool) {
+        if !terminal {
+            return;
+        }
+        let has_controls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='chat_run_controls'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+        if has_controls != 1 {
+            return;
+        }
+        let has_cancel_column: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('chat_run_controls')
+             WHERE name='cancel_requested_at'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+        if has_cancel_column != 1 {
+            return;
+        }
+        let run_instance_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT run_instance_id FROM chat_run_controls
+             WHERE objective_id=? AND status='active'",
+        )
+        .bind(objective_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        if run_instance_ids.is_empty() {
+            return;
+        }
+        let now = Utc::now().timestamp_millis();
+        // Step 1: the durable half. `cancel_requested_at` is what the run's next
+        // boundary reads and what a restarted process reconciles against.
+        let _ = sqlx::query(
+            "UPDATE chat_run_controls
+             SET status='cancel_requested',
+                 cancel_requested_at=COALESCE(cancel_requested_at, ?),
+                 updated_at=?
+             WHERE objective_id=? AND status='active'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(objective_id)
+        .execute(&self.pool)
+        .await;
+        // Step 2: the process-local half, without which the durable row is a
+        // note nobody is reading.
+        let mut told_to_stop = false;
+        for run_instance_id in &run_instance_ids {
+            if crate::request_chat_run_stop(run_instance_id) {
+                told_to_stop = true;
+            }
+        }
+        // Step 3: a bounded wait for that boundary, when this process actually
+        // owns the flag. Two independent signals end it — the run's control
+        // being dropped, or the run having written its own terminal
+        // run-control row — whichever the loop reaches first.
+        if told_to_stop {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(LIVE_RUN_STOP_GRACE_MS);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                if run_instance_ids
+                    .iter()
+                    .all(|run_instance_id| !crate::chat_run_is_live(run_instance_id))
+                {
+                    break;
+                }
+                let still_cancelling: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM chat_run_controls
+                     WHERE objective_id=? AND status='cancel_requested'",
+                )
+                .bind(objective_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
+                if still_cancelling == 0 {
+                    break;
+                }
+            }
+        }
+        // Step 4: hand the run control back to the settlement. The stop is
+        // recorded — `cancel_requested_at` stays as the audit fact — but a
+        // *pending* `cancel_requested` status would fence this very settlement:
+        // the durable-cancellation guard refuses every non-cancelled decision
+        // while a chat run control still shows a stop outstanding. The run has
+        // been told to stop and has had its bounded window, so the request is no
+        // longer outstanding and the terminal write below owns the real final
+        // status of both the Objective and its run control.
+        let _ = sqlx::query(
+            "UPDATE chat_run_controls
+             SET status='active', updated_at=?
+             WHERE objective_id=? AND status='cancel_requested'",
+        )
+        .bind(now)
+        .bind(objective_id)
+        .execute(&self.pool)
+        .await;
+    }
+
     async fn apply_decision_inner(
         &self,
         expected_revision: i64,
@@ -4476,6 +4621,22 @@ impl ObjectiveStore {
         // deadlocks recovery into a timeout.
         let decision = self.bound_system_recovery(decision).await?;
         decision.validate(&current)?;
+        // M30: an Objective that something other than its own agent loop is
+        // about to end must stop the live run FIRST. Runs before the
+        // transaction opens — a deterministic pool may allow a single
+        // connection, and this needs the pool itself.
+        //
+        // Gated on `permit.is_none()`: the agent loop's own settlement holds the
+        // mutation permit for the turn it is committing, and stopping a run that
+        // is already finishing its own turn is both pointless and wrong — it
+        // would flip the live run control to `cancel_requested` on a completion
+        // commit. Only an outside actor (incident controller, convergence,
+        // delivery supervisor) has no permit and needs the stop.
+        self.request_live_run_stop_before_settlement(
+            &decision.objective_id,
+            decision.status.is_terminal() && permit.is_none(),
+        )
+        .await;
         let now = Utc::now().timestamp_millis();
         let process_instance = current_process_instance();
         let completed_at = decision.status.is_terminal().then_some(now);
@@ -11809,6 +11970,81 @@ CREATE TABLE objectives (
         assert!(
             *delays.last().unwrap() >= 30_000,
             "by the fourth repeat the retry must be minutes away, got {delays:?}",
+        );
+    }
+
+    /// M30(a)(d): declaring a task over must stop its live run first — the
+    /// durable `cancel_requested_at` plus the process-local flag the running
+    /// loop actually observes — and a settlement that is *not* ending the task
+    /// must not stop anything.
+    #[tokio::test]
+    async fn terminal_settlement_requests_the_live_run_stop_first() {
+        let pool = pool().await;
+        let objective = recovery_ceiling_objective(&pool, "objective-m30").await;
+        let now = Utc::now().timestamp_millis();
+        let run_instance_id = format!("run-m30-{}", uuid::Uuid::new_v4());
+        // The half the running AgentLoop reads, registered exactly the way a
+        // real chat run registers itself.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::register_chat_run_stop_flag(&run_instance_id, &cancel);
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id,
+              objective_revision, status, created_process_instance,
+              created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'active', 'process-m30', ?, ?)",
+        )
+        .bind(&run_instance_id)
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(objective.root_turn_id.as_deref().unwrap())
+        .bind(&objective.id)
+        .bind(objective.revision)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+
+        store
+            .request_live_run_stop_before_settlement("objective-m30", false)
+            .await;
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "a settlement that is not ending the task must not stop a live run"
+        );
+        let untouched: String =
+            sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id=?")
+                .bind(&run_instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(untouched, "active");
+
+        store
+            .request_live_run_stop_before_settlement("objective-m30", true)
+            .await;
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "the live run must be told to stop; a durable row nobody reads stops nothing"
+        );
+        let (status, cancel_requested_at): (String, Option<i64>) = sqlx::query_as(
+            "SELECT status, cancel_requested_at FROM chat_run_controls
+             WHERE run_instance_id=?",
+        )
+        .bind(&run_instance_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            cancel_requested_at.is_some(),
+            "(d) a settled run must carry cancel_requested_at"
+        );
+        assert_eq!(
+            status, "active",
+            "the pending-cancel status is handed back with the stop already carried \
+             out, so the durable-cancellation fence cannot refuse the terminal write; \
+             the request itself survives as cancel_requested_at"
         );
     }
 
