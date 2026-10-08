@@ -1636,6 +1636,155 @@ async fn reattach_inner(
     Ok(workspace)
 }
 
+/// Does this workspace still hold work that a fresh checkout would lose?
+///
+/// Uncommitted edits always count. Commits beyond the recorded base count only
+/// when nobody has delivered them yet — `objective_work_is_already_delivered`
+/// settles that separately, so a merged or already-pushed branch is not pulled
+/// forward again.
+fn workspace_carries_unlanded_work(worktree_path: &Path, base_sha: &str) -> bool {
+    if !worktree_path.is_dir() {
+        return false;
+    }
+    if git(worktree_path, &["status", "--porcelain"])
+        .is_ok_and(|status| !status.trim().is_empty())
+    {
+        return true;
+    }
+    git(worktree_path, &["rev-parse", "HEAD"]).is_ok_and(|head| head != base_sha)
+}
+
+/// Has this Objective's work already left the machine — merged, or captured by
+/// a canonical delivery PR? Then there is nothing left to carry forward.
+async fn objective_work_is_already_delivered(
+    pool: &SqlitePool,
+    objective_id: &str,
+) -> Result<bool> {
+    let recorded_pr: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT canonical_pr_number FROM execution_workspaces WHERE objective_id=?",
+    )
+    .bind(objective_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if recorded_pr.flatten().is_some() {
+        return Ok(true);
+    }
+    let has_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_table == 0 {
+        return Ok(false);
+    }
+    let merged: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_runs
+         WHERE objective_id=? AND canonical_pr_number IS NOT NULL
+           AND (reached_ceiling='merged' OR status='merged')",
+    )
+    .bind(objective_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    Ok(merged > 0)
+}
+
+/// U24: a session whose previous Objective was **stopped** must continue in
+/// that Objective's workspace.
+///
+/// Stopping used to terminate the Objective and park its workspace for
+/// closeout, while the next message in the same session created a new
+/// Objective with a brand-new checkout — silently dropping every uncommitted
+/// change, even though the UI promised the opposite ("停止后续生成不会撤销已经完成的修改"
+/// and "直接回一句「继续」…就可以接着做"). The failure path already reactivates the
+/// same Objective, so only the stop path needed to carry the workspace over.
+///
+/// The hand-off re-keys the existing row to the new Objective instead of
+/// copying files: same worktree, same branch, same base — uncommitted edits,
+/// commits, and untracked files all survive with no merge step that could
+/// conflict or half-apply. Callers hold `ALLOCATION_LOCK` and the repository
+/// allocation lock, which is exactly the lock the cleanup pass takes, so either
+/// the cleanup sees a `cleanup_pending` row for the cancelled Objective or it
+/// sees an `active` row for the new one — never a workspace it may delete.
+///
+/// A clean workspace, a delivered/merged one, or one whose directory is gone
+/// yields `None`: the caller provisions a fresh checkout rather than
+/// pretending anything was carried over.
+async fn inherit_stopped_predecessor_locked(
+    pool: &SqlitePool,
+    request: &ExecutionWorkspaceRequest,
+) -> Result<Option<ExecutionWorkspace>> {
+    let Some(session_id) = request.session_id.as_deref() else {
+        return Ok(None);
+    };
+    let candidates: Vec<WorkspaceRow> = sqlx::query_as::<_, WorkspaceRow>(
+        "SELECT workspace.id, workspace.objective_id, workspace.session_id,
+                workspace.repo_identity, workspace.repo_root, workspace.git_common_dir,
+                workspace.worktree_path, workspace.worktree_identity,
+                workspace.branch_name, workspace.base_ref, workspace.base_sha,
+                workspace.head_sha, workspace.state, workspace.lease_owner
+         FROM execution_workspaces AS workspace
+         JOIN objectives ON objectives.id=workspace.objective_id
+         WHERE workspace.session_id=?
+           AND workspace.objective_id<>?
+           AND workspace.state IN ('allocating', 'active', 'delivering', 'cleanup_pending')
+           AND objectives.status='cancelled'
+         ORDER BY workspace.updated_at DESC
+         LIMIT 5",
+    )
+    .bind(session_id)
+    .bind(&request.objective_id)
+    .fetch_all(pool)
+    .await?;
+
+    for row in candidates {
+        if row.worktree_identity.as_deref().is_none_or(str::is_empty)
+            || row.head_sha.as_deref().is_none_or(str::is_empty)
+        {
+            continue;
+        }
+        if objective_work_is_already_delivered(pool, &row.objective_id).await? {
+            continue;
+        }
+        if !workspace_carries_unlanded_work(Path::new(&row.worktree_path), &row.base_sha) {
+            continue;
+        }
+        let now = Utc::now().timestamp_millis();
+        let handed_over = sqlx::query(
+            "UPDATE execution_workspaces
+             SET objective_id=?, state='active', failure_code=NULL, failure_detail=NULL,
+                 lease_owner=?, lease_expires_at=?, updated_at=?
+             WHERE id=? AND objective_id=?
+               AND state IN ('allocating', 'active', 'delivering', 'cleanup_pending')",
+        )
+        .bind(&request.objective_id)
+        .bind(&request.process_instance)
+        .bind(now + 120_000)
+        .bind(now)
+        .bind(&row.id)
+        .bind(&row.objective_id)
+        .execute(pool)
+        .await?;
+        if handed_over.rows_affected() != 1 {
+            // Lost the race with a cleanup pass or another process: never
+            // attach to a workspace somebody else owns.
+            continue;
+        }
+        let inherited = load_workspace(pool, &request.objective_id)
+            .await?
+            .ok_or_else(|| anyhow!("inherited managed workspace disappeared during hand-off"))?;
+        tracing::info!(
+            objective_id = %request.objective_id,
+            inherited_from = %row.objective_id,
+            branch = %inherited.branch_name,
+            "continued Objective inherited the stopped Objective's managed workspace"
+        );
+        return Ok(Some(reattach_inner(pool, inherited, &request.process_instance).await?));
+    }
+    Ok(None)
+}
+
 async fn allocate_new_locked(
     pool: &SqlitePool,
     request: ExecutionWorkspaceRequest,
@@ -1781,6 +1930,9 @@ pub async fn allocate_or_attach(
             );
         }
         let observed = refresh_source_base(seed)?;
+        if let Some(inherited) = inherit_stopped_predecessor_locked(pool, &request).await? {
+            return Ok(inherited);
+        }
         allocate_new_locked(pool, request, observed).await
     }
     .await;
@@ -2697,5 +2849,357 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(closed, 1);
+    }
+
+    async fn pool_with_objectives(objective_ids: &[&str]) -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'active'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for objective_id in objective_ids {
+            sqlx::query("INSERT INTO objectives(id) VALUES (?)")
+                .bind(objective_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        ensure_schema(&pool).await.unwrap();
+        pool
+    }
+
+    fn request_for_session(
+        root: &Path,
+        container: &Path,
+        objective_id: &str,
+        session_id: &str,
+        process_instance: &str,
+    ) -> ExecutionWorkspaceRequest {
+        ExecutionWorkspaceRequest {
+            objective_id: objective_id.into(),
+            session_id: Some(session_id.into()),
+            source_cwd: root.to_path_buf(),
+            workspace_container: container.to_path_buf(),
+            process_instance: process_instance.into(),
+        }
+    }
+
+    /// Exactly what the stop path does: the Objective becomes `cancelled` and
+    /// its workspace is handed to the closeout lifecycle in the same
+    /// transaction.
+    async fn cancel_objective(pool: &SqlitePool, objective_id: &str) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE objectives SET status='cancelled' WHERE id=?")
+            .bind(objective_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        mark_objective_terminal_in_tx(
+            &mut tx,
+            objective_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn workspace_state_of(pool: &SqlitePool, objective_id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT state FROM execution_workspaces WHERE objective_id=?")
+            .bind(objective_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+    }
+
+    /// U24 (a): the user stops a task that has uncommitted work, then sends
+    /// another message in the same session. The next Objective must continue in
+    /// the same worktree/branch instead of starting over in an empty checkout.
+    #[tokio::test]
+    async fn continuing_after_a_stop_inherits_the_uncommitted_workspace() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-stop-a", "objective-stop-b"]).await;
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-stop-a", "process-a"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace_a.worktree_path.join("draft.txt"), "half done\n").unwrap();
+        cancel_objective(&pool, "objective-stop-a").await;
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-stop-b", "process-b"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workspace_b.worktree_path, workspace_a.worktree_path,
+            "the continued Objective must reuse the stopped Objective's worktree"
+        );
+        assert_eq!(workspace_b.branch_name, workspace_a.branch_name);
+        assert_eq!(workspace_b.objective_id, "objective-stop-b");
+        assert_eq!(
+            std::fs::read_to_string(workspace_b.worktree_path.join("draft.txt")).unwrap(),
+            "half done\n",
+            "the uncommitted change must be inside the continued workspace"
+        );
+        assert_eq!(
+            workspace_state_of(&pool, "objective-stop-b").await.as_deref(),
+            Some("active")
+        );
+        assert_eq!(
+            workspace_state_of(&pool, "objective-stop-a").await,
+            None,
+            "the workspace belongs to the continued Objective now"
+        );
+    }
+
+    /// U24 (b) regression guard: after a *failure* the same Objective is
+    /// reactivated and keeps its workspace; a different Objective must not
+    /// steal it, and the failure path must not be re-routed through the
+    /// stop-and-inherit rule.
+    #[tokio::test]
+    async fn a_failed_objective_keeps_its_workspace_and_others_do_not_inherit_it() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-failed-a", "objective-failed-b"]).await;
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-failed-a", "process-a"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace_a.worktree_path.join("draft.txt"), "failed mid-flight\n").unwrap();
+        sqlx::query("UPDATE objectives SET status='failed' WHERE id='objective-failed-a'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resumed = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-failed-a", "process-b"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed.worktree_path, workspace_a.worktree_path);
+        assert_eq!(resumed.objective_id, "objective-failed-a");
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-failed-b", "process-c"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            workspace_b.worktree_path, workspace_a.worktree_path,
+            "an unrelated Objective must not inherit a failed Objective's workspace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_a.worktree_path.join("draft.txt")).unwrap(),
+            "failed mid-flight\n"
+        );
+    }
+
+    /// U24 (c): the stopped Objective's work was already delivered, so there is
+    /// nothing to carry over — the next Objective gets a clean workspace.
+    #[tokio::test]
+    async fn continuing_after_a_delivered_stop_starts_fresh() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&[
+            "objective-delivered-a",
+            "objective-delivered-b",
+            "objective-pr-a",
+            "objective-pr-b",
+        ])
+        .await;
+
+        // (c1) merged: the closeout already proved the merge.
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-delivered-a", "process-a"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace_a.worktree_path.join("shipped.txt"), "shipped\n").unwrap();
+        git(&workspace_a.worktree_path, &["add", "shipped.txt"]);
+        git(&workspace_a.worktree_path, &["commit", "-m", "shipped"]);
+        record_terminal_merge_receipt(&pool, &workspace_a).await;
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-delivered-b", "process-b"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(workspace_b.worktree_path, workspace_a.worktree_path);
+
+        // (c2) cancelled but its work already rides on a delivery PR.
+        let workspace_pr = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-pr-a", "process-c"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace_pr.worktree_path.join("pr.txt"), "on a PR\n").unwrap();
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET canonical_pr_number=7, canonical_pr_url='https://example.invalid/pull/7'
+             WHERE objective_id='objective-pr-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        cancel_objective(&pool, "objective-pr-a").await;
+
+        let workspace_pr_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-pr-b", "process-d"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            workspace_pr_b.worktree_path, workspace_pr.worktree_path,
+            "a delivered change must not be carried forward"
+        );
+    }
+
+    /// U24 (d): the stopped Objective left nothing behind, so a clean workspace
+    /// is provisioned instead of reusing an empty worktree.
+    #[tokio::test]
+    async fn continuing_after_a_clean_stop_starts_fresh() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-clean-a", "objective-clean-b"]).await;
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-clean-a", "process-a"),
+        )
+        .await
+        .unwrap();
+        cancel_objective(&pool, "objective-clean-a").await;
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-clean-b", "process-b"),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(workspace_b.worktree_path, workspace_a.worktree_path);
+        assert_eq!(
+            workspace_state_of(&pool, "objective-clean-a").await.as_deref(),
+            Some("cleanup_pending"),
+            "an empty stopped workspace stays with the closeout lifecycle"
+        );
+    }
+
+    /// U24 (e): once the workspace is handed to the continued Objective, the
+    /// cleanup pass must not close it out from under the running turn.
+    #[tokio::test]
+    async fn cleanup_does_not_touch_a_workspace_handed_to_a_continued_objective() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-hand-a", "objective-hand-b"]).await;
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-hand-a", "process-a"),
+        )
+        .await
+        .unwrap();
+        let draft = workspace_a.worktree_path.join("draft.txt");
+        std::fs::write(&draft, "still working\n").unwrap();
+        cancel_objective(&pool, "objective-hand-a").await;
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-hand-b", "process-b"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(workspace_b.worktree_path, workspace_a.worktree_path);
+
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process").await.unwrap();
+
+        assert_eq!(outcome.scanned, 0);
+        assert_eq!(outcome.closed, 0);
+        assert_eq!(outcome.preserved, 0);
+        assert!(workspace_b.worktree_path.join("draft.txt").is_file());
+        assert_eq!(std::fs::read_to_string(&draft).unwrap(), "still working\n");
+        assert_eq!(
+            workspace_state_of(&pool, "objective-hand-b").await.as_deref(),
+            Some("active")
+        );
+    }
+
+    /// U24 (f): two sessions continuing at the same time each inherit their own
+    /// stopped workspace — never the other session's.
+    #[tokio::test]
+    async fn concurrent_continues_never_inherit_another_sessions_workspace() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&[
+            "objective-one-a",
+            "objective-one-b",
+            "objective-two-a",
+            "objective-two-b",
+        ])
+        .await;
+        let workspace_one_a = allocate_or_attach(
+            &pool,
+            request_for_session(&root, &container, "objective-one-a", "session-one", "process-a"),
+        )
+        .await
+        .unwrap();
+        let workspace_two_a = allocate_or_attach(
+            &pool,
+            request_for_session(&root, &container, "objective-two-a", "session-two", "process-b"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace_one_a.worktree_path.join("one.txt"), "session one\n").unwrap();
+        std::fs::write(workspace_two_a.worktree_path.join("two.txt"), "session two\n").unwrap();
+        cancel_objective(&pool, "objective-one-a").await;
+        cancel_objective(&pool, "objective-two-a").await;
+
+        let (one_b, two_b) = tokio::join!(
+            allocate_or_attach(
+                &pool,
+                request_for_session(
+                    &root,
+                    &container,
+                    "objective-one-b",
+                    "session-one",
+                    "process-c"
+                ),
+            ),
+            allocate_or_attach(
+                &pool,
+                request_for_session(
+                    &root,
+                    &container,
+                    "objective-two-b",
+                    "session-two",
+                    "process-d"
+                ),
+            ),
+        );
+        let one_b = one_b.unwrap();
+        let two_b = two_b.unwrap();
+
+        assert_eq!(one_b.worktree_path, workspace_one_a.worktree_path);
+        assert_eq!(two_b.worktree_path, workspace_two_a.worktree_path);
+        assert_ne!(one_b.worktree_path, two_b.worktree_path);
+        assert!(one_b.worktree_path.join("one.txt").is_file());
+        assert!(!one_b.worktree_path.join("two.txt").exists());
+        assert!(two_b.worktree_path.join("two.txt").is_file());
+        assert!(!two_b.worktree_path.join("one.txt").exists());
     }
 }
