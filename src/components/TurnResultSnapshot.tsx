@@ -239,7 +239,7 @@ export function TurnResultSnapshot({
             }
           : {
               tone: "neutral",
-              label: "系统继续处理",
+              label: "系统处理中",
               icon: CircleDashed,
               iconClass: "text-gray-500",
               borderClass: "border-l-border",

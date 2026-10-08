@@ -397,7 +397,7 @@ describe("MessageList structured progress and result", () => {
   });
 
   it.each([
-    ["system", "系统继续处理", false],
+    ["system", "系统处理中", false],
     ["external", "外部等待", false],
     ["user", "需要你处理", true],
   ] as const)("keeps failure evidence neutral when next action owner is %s", (owner, label, userOwned) => {

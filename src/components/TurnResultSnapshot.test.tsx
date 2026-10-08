@@ -212,7 +212,7 @@ describe("TurnResultSnapshot", () => {
     );
 
     const result = screen.getByTestId("turn-result-snapshot");
-    expect(result).toHaveTextContent("系统继续处理");
+    expect(result).toHaveTextContent("系统处理中");
     expect(result).not.toHaveTextContent("需要处理");
     expect(result).toHaveTextContent("等待 CI 检查完成");
   });
