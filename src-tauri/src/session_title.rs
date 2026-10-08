@@ -26,8 +26,15 @@ pub(crate) const SESSION_TITLE_UPDATED_EVENT: &str = "session-title-updated";
 const MAX_INPUT_CHARS: usize = 2_000;
 const MAX_ASSISTANT_CHARS: usize = 800;
 const MAX_TITLE_CHARS: usize = 40;
-const MAX_TITLE_OUTPUT_TOKENS: u32 = 256;
+/// A thinking route spends its ceiling on hidden reasoning before it writes a
+/// single visible character. The title itself is short, so the ceiling exists
+/// to survive that reasoning, not to bound the answer.
+const MAX_TITLE_OUTPUT_TOKENS: u32 = 1_536;
 const TITLE_DEADLINE: Duration = Duration::from_secs(12);
+/// One bounded retry when a title request fails for a transient reason. A
+/// Provider hiccup (or a transient `database is locked`) must not cost the
+/// session its name for good.
+const TITLE_RETRY_DELAY: Duration = Duration::from_millis(400);
 const TITLE_JOB_LEASE_MS: i64 = 60_000;
 
 static CODE_FENCE_RE: Lazy<Regex> =
@@ -202,6 +209,8 @@ fn strip_title_prefix(mut title: &str) -> &str {
     const PREFIXES: &[&str] = &[
         "会话标题：",
         "会话标题:",
+        "最终标题：",
+        "最终标题:",
         "标题：",
         "标题:",
         "Title:",
@@ -284,8 +293,50 @@ fn copies_prompt_prefix(title: &str, prompt: &str) -> bool {
     })
 }
 
-pub(crate) fn normalize_generated_title(raw: &str, prompt: &str) -> Option<String> {
-    let first_line = raw.lines().find(|line| !line.trim().is_empty())?.trim();
+/// Why a Provider answer could not become a title.
+///
+/// Persisted as `session_title_attempts.failure_code` so a later diagnosis can
+/// tell the categories apart WITHOUT ever storing what the model wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TitleRejection {
+    /// The model produced nothing usable at all (no visible text, no trace).
+    EmptyOutput,
+    /// Visible output was empty; only a reasoning trace came back.
+    ReasoningOnly,
+    /// The answer was a filler acknowledgement ("继续", "ok").
+    LowInformation,
+    /// The answer carried a path, URL, credential or code shape.
+    Sensitive,
+    /// The answer echoed the request instead of summarizing it.
+    CopiesPrompt,
+}
+
+impl TitleRejection {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            TitleRejection::EmptyOutput => "empty_output",
+            TitleRejection::ReasoningOnly => "reasoning_only",
+            TitleRejection::LowInformation => "low_information",
+            TitleRejection::Sensitive => "sensitive",
+            TitleRejection::CopiesPrompt => "copies_prompt",
+        }
+    }
+}
+
+/// A transient failure keeps the placeholder lifecycle open for one retry; a
+/// missing credential is terminal until the user repairs it.
+fn is_transient_title_failure(error: &str) -> bool {
+    !(error.contains("AUTH_") || error.contains("CREDENTIAL_"))
+}
+
+pub(crate) fn normalize_generated_title_with_reason(
+    raw: &str,
+    prompt: &str,
+) -> Result<String, TitleRejection> {
+    let Some(first_line) = raw.lines().find(|line| !line.trim().is_empty()) else {
+        return Err(TitleRejection::EmptyOutput);
+    };
+    let first_line = first_line.trim();
     let first_line = first_line.trim_matches(|c| {
         matches!(
             c,
@@ -299,15 +350,57 @@ pub(crate) fn normalize_generated_title(raw: &str, prompt: &str) -> Option<Strin
         c.is_whitespace() || c.is_ascii_punctuation() || "，。！？；：、…“”「」《》".contains(c)
     });
     let title: String = normalized.graphemes(true).take(MAX_TITLE_CHARS).collect();
-    if title.is_empty()
-        || is_low_information(&title)
-        || contains_sensitive_shape(&title)
-        || copies_prompt_prefix(&title, prompt)
-    {
-        None
+    if title.is_empty() {
+        Err(TitleRejection::EmptyOutput)
+    } else if is_low_information(&title) {
+        Err(TitleRejection::LowInformation)
+    } else if contains_sensitive_shape(&title) {
+        Err(TitleRejection::Sensitive)
+    } else if copies_prompt_prefix(&title, prompt) {
+        Err(TitleRejection::CopiesPrompt)
     } else {
-        Some(title)
+        Ok(title)
     }
+}
+
+pub(crate) fn normalize_generated_title(raw: &str, prompt: &str) -> Option<String> {
+    normalize_generated_title_with_reason(raw, prompt).ok()
+}
+
+/// Resolve a Provider answer into a title by reading the field that actually
+/// carries it.
+///
+/// A thinking route can leave `content` empty and answer inside its reasoning
+/// trace. The visible answer always wins; the trace is consulted only when the
+/// visible answer carries no usable title, and its LAST non-empty line is tried
+/// first because a reasoning trace ends with its conclusion.
+pub(crate) fn title_from_model_output(
+    content: &str,
+    reasoning: Option<&str>,
+    prompt: &str,
+) -> Result<String, TitleRejection> {
+    let visible = normalize_generated_title_with_reason(content, prompt);
+    let visible_rejection = match visible {
+        Ok(title) => return Ok(title),
+        Err(rejection) => rejection,
+    };
+    let Some(reasoning) = reasoning.filter(|value| !value.trim().is_empty()) else {
+        return Err(visible_rejection);
+    };
+    let mut lines: Vec<&str> = reasoning
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines.reverse();
+    for line in lines {
+        if let Ok(title) = normalize_generated_title_with_reason(line, prompt) {
+            return Ok(title);
+        }
+    }
+    Err(match visible_rejection {
+        TitleRejection::EmptyOutput => TitleRejection::ReasoningOnly,
+        other => other,
+    })
 }
 
 fn safe_local_fallback(prompt: &str) -> String {
@@ -636,25 +729,47 @@ pub(crate) fn spawn_title_generation(
         let started_at = Instant::now();
         let attempt_endpoint = route.endpoint_name.clone();
         let attempt_model = route.model_id.clone();
-        let generated = generate_bounded_text(
-            route,
+        let mut generated = generate_bounded_text(
+            route.clone(),
             &session_id,
             title_messages(input.clone()),
             MAX_TITLE_OUTPUT_TOKENS,
             TITLE_DEADLINE,
         )
         .await;
+        // A transient Provider failure (overload, reset connection, a busy DB
+        // while recording the answer) must not cost the session its name. One
+        // bounded retry keeps the placeholder lifecycle honest without turning
+        // metadata generation into an unbounded retry loop.
+        if let Err(error) = generated.as_ref() {
+            if is_transient_title_failure(error) {
+                tracing::debug!("session title generation retrying after transient failure");
+                tokio::time::sleep(TITLE_RETRY_DELAY).await;
+                generated = generate_bounded_text(
+                    route,
+                    &session_id,
+                    title_messages(input.clone()),
+                    MAX_TITLE_OUTPUT_TOKENS,
+                    TITLE_DEADLINE,
+                )
+                .await;
+            }
+        }
         let (title, source, failure_code) = match generated {
             Ok(output) => {
                 record_title_usage(&app, &db, &session_id, &lease_id, &output).await;
-                match normalize_generated_title(&output.text, &input) {
-                    Some(title) => (title, TITLE_SOURCE_GENERATED, None),
-                    None => {
-                        tracing::warn!("session title generation rejected: invalid_output");
+                match title_from_model_output(&output.text, output.reasoning.as_deref(), &input) {
+                    Ok(title) => (title, TITLE_SOURCE_GENERATED, None),
+                    Err(rejection) => {
+                        // Only the category is recorded — never the model's text.
+                        tracing::warn!(
+                            "session title generation rejected: {}",
+                            rejection.code()
+                        );
                         (
                             safe_local_fallback(&user_message),
                             TITLE_SOURCE_FALLBACK,
-                            Some("invalid_output"),
+                            Some(rejection.code()),
                         )
                     }
                 }
@@ -788,6 +903,125 @@ mod tests {
     fn low_information_first_message_waits_for_visible_context() {
         assert!(prepared_title_input("继续", None).is_none());
         assert!(prepared_title_input("继续", Some("已定位到会话标题只是原文截断")).is_some());
+    }
+
+    #[test]
+    fn model_answer_is_read_from_the_field_that_carries_it() {
+        // The real deepseek-v4-flash shape: `content` comes back empty and the
+        // answer sits in the reasoning trace that the thinking route produced.
+        let deepseek_reasoning = concat!(
+            "用户想给 CodeFactory 的会话起名。\n",
+            "首条消息包含 session 和 名字 两个关键词。\n",
+            "标题：会话自动命名优化"
+        );
+        assert_eq!(
+            title_from_model_output(
+                "",
+                Some(deepseek_reasoning),
+                "首条用户消息：新建 session 的名字，要自动总结合理",
+            )
+            .as_deref(),
+            Ok("会话自动命名优化")
+        );
+        // A visible answer always wins over the trace.
+        assert_eq!(
+            title_from_model_output(
+                "界面体验优化",
+                Some("标题：完全不同的东西"),
+                "完全不同的用户需求",
+            )
+            .as_deref(),
+            Ok("界面体验优化")
+        );
+        // Whitespace-only content is still an empty visible answer.
+        assert_eq!(
+            title_from_model_output("   \n\n", Some("最终标题：登录问题排查"), "完全不同").as_deref(),
+            Ok("登录问题排查")
+        );
+    }
+
+    #[test]
+    fn every_rejection_category_maps_to_its_own_code() {
+        let copying_prompt = "请你先仔细阅读下面的背景信息不要马上改代码";
+        let cases: [( &str, Option<&str>, &str, &str); 6] = [
+            ("", None, "完全不同的用户需求", "empty_output"),
+            ("   \n\n", None, "完全不同的用户需求", "empty_output"),
+            ("", Some("继续\nok"), "完全不同的用户需求", "reasoning_only"),
+            ("继续", None, "完全不同的用户需求", "low_information"),
+            ("撤销 AKIAIOSFODNN7EXAMPLE 密钥", None, "完全不同的用户需求", "sensitive"),
+            (copying_prompt, None, "请你先仔细阅读下面的背景信息不要马上改代码。我发现标题有问题", "copies_prompt"),
+        ];
+        for (content, reasoning, prompt, expected) in cases {
+            let rejection = title_from_model_output(content, reasoning, prompt)
+                .expect_err(&format!("{content:?} must be rejected"));
+            assert_eq!(rejection.code(), expected, "content={content:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_codes_round_trip_through_attempt_telemetry() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE session_title_attempts (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL, model TEXT NOT NULL,
+                status TEXT NOT NULL, failure_code TEXT,
+                duration_ms INTEGER NOT NULL, created_at INTEGER NOT NULL
+             )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let categories = [
+            TitleRejection::EmptyOutput,
+            TitleRejection::ReasoningOnly,
+            TitleRejection::LowInformation,
+            TitleRejection::Sensitive,
+            TitleRejection::CopiesPrompt,
+        ];
+        for (index, rejection) in categories.iter().enumerate() {
+            record_title_attempt(
+                &db,
+                &format!("attempt-{index}"),
+                "session-1",
+                "fixture",
+                "deepseek-v4-flash",
+                "fallback",
+                Some(rejection.code()),
+                Duration::from_millis(5),
+            )
+            .await;
+        }
+        let stored: Vec<String> = sqlx::query_scalar(
+            "SELECT failure_code FROM session_title_attempts ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored,
+            vec![
+                "empty_output".to_string(),
+                "reasoning_only".to_string(),
+                "low_information".to_string(),
+                "sensitive".to_string(),
+                "copies_prompt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_credential_failures_are_terminal() {
+        assert!(is_transient_title_failure("PROVIDER_ERROR: overloaded"));
+        assert!(is_transient_title_failure("SESSION_TITLE_TIMEOUT"));
+        assert!(is_transient_title_failure("database is locked"));
+        assert!(!is_transient_title_failure("AUTH_MISSING: custom has no configured credential"));
+        assert!(!is_transient_title_failure("CREDENTIAL_ACCESS_REQUIRED: custom (Unavailable)"));
     }
 
     #[test]

@@ -44,12 +44,21 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 export function useStickyAutoScroll(
   conversationKey: string | null,
   contentSignal?: unknown,
+  /**
+   * "bottom" (default) follows a conversation's newest message. "top" is the
+   * start page: it is read from its own beginning, so nothing may pull it down
+   * and it must not inherit the previous session's scroll offset.
+   */
+  mode: "bottom" | "top" = "bottom",
 ) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const [scrollerMounted, setScrollerMounted] = useState(false);
   const [pinned, setPinned] = useState(true);
   const pinnedRef = useRef(true);
   pinnedRef.current = pinned;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  const prevModeRef = useRef(mode);
 
   // True iff content has grown since the user scrolled away from the
   // bottom. Drives the "↓ New content" pulse on the floating jump button
@@ -152,7 +161,7 @@ export function useStickyAutoScroll(
   const stickToBottomIfPinned = useCallback(() => {
     const el = scrollerRef.current;
     if (!el || !pinnedRef.current) return;
-    programmaticScrollTo(el.scrollHeight);
+    programmaticScrollTo(modeRef.current === "top" ? 0 : el.scrollHeight);
   }, [programmaticScrollTo]);
 
   // User-scroll handler: detects whether the user has navigated away from
@@ -170,6 +179,17 @@ export function useStickyAutoScroll(
       if (positionMatches && insideWindow) return;
 
       const newTop = el.scrollTop;
+      if (modeRef.current === "top") {
+        // On the start page the user is "pinned" while they stay at the top.
+        // Measuring from the bottom here would let a short page yank itself
+        // back down while the user reads the resume list.
+        const nearTop = newTop < 40;
+        if (nearTop !== pinnedRef.current) {
+          pinnedRef.current = nearTop;
+          setPinned(nearTop);
+        }
+        return;
+      }
       // Direction. "still" treated as "down" because the user is
       // probably done scrolling; we want to re-pin generously.
       const scrollingUp = newTop < lastUserScrollTop.current - 1;
@@ -270,22 +290,36 @@ export function useStickyAutoScroll(
   // conversation identity changes. The double-RAF mirrors the late-layout
   // logic above for shiki / markdown.
   useLayoutEffect(() => {
-    if (prevKeyRef.current === conversationKey) return;
+    const keyChanged = prevKeyRef.current !== conversationKey;
+    const modeChanged = prevModeRef.current !== mode;
+    if (!keyChanged && !modeChanged) return;
     prevKeyRef.current = conversationKey;
-    if (!scrollerRef.current) return;
+    prevModeRef.current = mode;
+    const element = scrollerRef.current;
+    if (!element) return;
     pinnedRef.current = true;
-    newContentBaseline.current = scrollerRef.current.scrollHeight;
+    newContentBaseline.current = element.scrollHeight;
     pinLossContentSignal.current = contentSignalRef.current;
     pinLossBottom.current = Math.max(
       0,
-      scrollerRef.current.scrollHeight - scrollerRef.current.clientHeight,
+      element.scrollHeight - element.clientHeight,
     );
     setPinned(true);
+    if (mode === "top") {
+      // The start page opens at its own top. This is the only reset that can
+      // undo the previous conversation's offset, because React reuses the same
+      // scroll box across the swap.
+      ignoreScrollUntil.current = Date.now() + 80;
+      element.scrollTop = 0;
+      lastSetScrollTop.current = 0;
+      lastUserScrollTop.current = 0;
+      return;
+    }
     requestAnimationFrame(() => {
       stickToBottomIfPinned();
       requestAnimationFrame(stickToBottomIfPinned);
     });
-  }, [conversationKey, stickToBottomIfPinned]);
+  }, [conversationKey, mode, stickToBottomIfPinned]);
 
   const jumpToBottom = useCallback(() => {
     const el = scrollerRef.current;

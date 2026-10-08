@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { FolderOpen, Folder, Clock, ArrowRight, RotateCcw } from "lucide-react";
+import { FolderOpen, Folder, Clock, ArrowRight } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useChatStore } from "../stores/chat";
 import { WelcomeUsageCard } from "./WelcomeUsageCard";
@@ -78,15 +78,13 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
   const { sessions, activeSession, draftSession, activeModel } = useChatStore();
 
   const scopeCwd = draftSession ? draftSession.cwd : activeSession?.cwd ?? null;
-  // While drafting, the project tiles re-scope this blank conversation. The
-  // "resume" list is kept visually and verbally separate below, because
-  // conflating the two is what used to drop users into old history.
-  const scopedSessions = scopeCwd
-    ? (sessions ?? []).filter((s) => s.cwd === scopeCwd && s.id !== activeSession?.id)
-    : [];
+  // One resume list, capped short. The per-project "接着上次说" shortcut that
+  // used to live here was a second, unlabelled way back into old history — the
+  // exact mis-click this page must not offer — and it duplicated the first row
+  // of this list. A start page starts something; history is one explicit list.
   const recentSessions = (sessions ?? [])
     .filter((s) => s.id !== activeSession?.id)
-    .slice(0, 4);
+    .slice(0, 3);
 
   const browseForProject = async () => {
     const dir = await openDialog({ directory: true, title: "选择项目目录" });
@@ -122,6 +120,34 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
           anonymous={activeSession?.kind === "anonymous"}
           onOpenUsage={onOpenUsage}
         />
+
+        {/* Resume — deliberately the only path back into old history, and it
+            says so. It sits directly under the usage card, i.e. as far from the
+            composer as this page allows: as the LAST block it butted up against
+            the input box, where a stray click silently opened an old session
+            instead of starting the new one the user asked for. */}
+        {onOpenSession && recentSessions.length > 0 && (
+          <div className="space-y-1.5">
+            <div className="text-note text-gray-600 font-semibold px-1 flex items-center gap-1.5">
+              <Clock size={14} />
+              继续之前的会话
+            </div>
+            {recentSessions.map((s) => (
+              <button
+                key={s.id}
+                onClick={() => onOpenSession(s.id)}
+                className="w-full text-left rounded border border-border bg-surface-1 hover:bg-surface-2 px-3 py-1.5 transition-colors"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="text-label text-gray-300 truncate flex-1">{s.title || "未命名"}</span>
+                  <span className="max-w-[140px] truncate font-mono text-caption text-gray-600" title={s.cwd}>
+                    {s.kind === "quick" ? "独立任务" : folderName(s.cwd)}
+                  </span>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* One quiet line, not a question you must answer first. A blank
             conversation is always valid; attaching a folder is an option the
@@ -178,49 +204,6 @@ export function WelcomeScreen({ onUsePrompt, onOpenUsage, onOpenSession, onPickP
             ))}
           </div>
         </section>
-
-        {/* Resume — deliberately the only path back into old history, and it
-            says so. Everything above starts something new. */}
-        {onOpenSession && (scopedSessions.length > 0 || recentSessions.length > 0) && (
-          <div className="space-y-2">
-            <div className="text-note text-gray-600 font-semibold px-1 flex items-center gap-1.5">
-              <Clock size={14} />
-              继续之前的会话
-            </div>
-            {scopedSessions.length > 0 && (
-              <button
-                onClick={() => onOpenSession(scopedSessions[0].id)}
-                className="w-full rounded border border-border bg-surface-1 px-3 py-2 text-left transition-colors hover:bg-surface-2"
-              >
-                <div className="flex items-center gap-2">
-                  <RotateCcw size={14} className="shrink-0 text-accent" />
-                  <span className="min-w-0 flex-1 truncate text-label text-gray-200">
-                    接着上次说：{scopedSessions[0].title || "未命名会话"}
-                  </span>
-                  <span className="shrink-0 text-caption text-gray-600">
-                    {folderName(scopedSessions[0].cwd)}
-                  </span>
-                </div>
-              </button>
-            )}
-            <div className="space-y-1">
-              {recentSessions.map((s) => (
-                <button
-                  key={s.id}
-                  onClick={() => onOpenSession(s.id)}
-                  className="w-full text-left rounded border border-border bg-surface-1 hover:bg-surface-2 px-3 py-1.5 transition-colors"
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="text-label text-gray-300 truncate flex-1">{s.title || "未命名"}</span>
-                    <span className="max-w-[140px] truncate font-mono text-caption text-gray-600" title={s.cwd}>
-                      {s.kind === "quick" ? "独立任务" : folderName(s.cwd)}
-                    </span>
-                  </div>
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
