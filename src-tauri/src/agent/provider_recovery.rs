@@ -471,7 +471,7 @@ impl ProviderRecoveryStore {
     ) -> Result<ProviderMutation<ProviderAttemptSnapshot>> {
         permit.validate()?;
         validate_attempt_spec(spec)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         if !permit_is_current(&mut tx, permit, now).await? {
             return Ok(ProviderMutation::Fenced);
         }
@@ -658,7 +658,7 @@ impl ProviderRecoveryStore {
             bail!("empty provider output chunks are not checkpoints");
         }
         permit.validate()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         if !permit_is_current(&mut tx, permit, now).await? {
             return Ok(ProviderMutation::Fenced);
         }
@@ -944,7 +944,7 @@ impl ProviderRecoveryStore {
         validate_identifier("failure_class", failure_class)?;
         validate_identifier("failure_code", failure_code)?;
         permit.validate()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         if !permit_is_current(&mut tx, permit, now).await? {
             return Ok(ProviderMutation::Fenced);
         }
@@ -1245,7 +1245,7 @@ impl ProviderRecoveryStore {
     ) -> Result<ProviderMutation<ProviderAttemptSnapshot>> {
         validate_digest("response_digest", response_digest)?;
         permit.validate()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         if !permit_is_current(&mut tx, permit, now).await? {
             return Ok(ProviderMutation::Fenced);
         }

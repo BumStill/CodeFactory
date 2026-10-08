@@ -16,12 +16,21 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::objective::{
-    ClaimedRemediation, ObjectiveSnapshot, ObjectiveStore, RecoveryDomain,
-    STALLED_ACTIVE_OBJECTIVE_MS,
+    ClaimedRemediation, DecisionEnvelope, DecisionRouter, ObjectiveSnapshot, ObjectiveStatus,
+    ObjectiveStore, RecoveryDomain, RouteSignal, STALLED_ACTIVE_OBJECTIVE_MS,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const LEASE_MS: i64 = 60_000;
+/// How long an Objective whose owning run control has already settled is left
+/// alone before the supervisor reaps it.
+///
+/// A settled run control is the authoritative statement that no live turn owns
+/// this Objective any more, so there is nothing left to wait for — the grace is
+/// only there to outlast a normal completion whose decision write is still in
+/// flight. With [`POLL_INTERVAL`] this bounds "active with no owner" to about
+/// half a minute rather than "until the next app restart".
+const ORPHANED_RUN_CONTROL_GRACE_MS: i64 = 30_000;
 /// The stalled-Objective sweep is a table scan, and nothing it looks for can
 /// change in five seconds. Run it on its own slow cadence inside the same loop:
 /// once every 60 polls, i.e. every five minutes.
@@ -1125,6 +1134,111 @@ async fn publish_committed_terminal_transition(app: AppHandle, objective: Object
     }
 }
 
+/// R7 (U23): the backstop for an Objective whose owning turn already ended.
+///
+/// The 2026-10-08 SQLite lock collisions wrote the failure detail and then lost
+/// the decision that schedules recovery. The result was `objectives` still
+/// `active` with `next_observation_at IS NULL` while `chat_run_controls` had
+/// already settled `completed` — an Objective no actor owns, so no poll could
+/// ever see it and only a restart would have noticed. This sweep runs on every
+/// supervisor poll and hands it straight back to the ordinary recovery ladder.
+///
+/// The condition is deliberately narrow: it needs the run control to be
+/// *settled* (not merely absent) and the Objective to have no lease, no live
+/// remediation and no scheduled observation. A running turn always fails at
+/// least one of those, so a healthy session is never touched.
+async fn reap_active_objectives_whose_run_control_settled(
+    pool: &SqlitePool,
+    store: &ObjectiveStore,
+    settled_before_ms: i64,
+) -> anyhow::Result<Vec<ObjectiveSnapshot>> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT objective.id
+           FROM objectives objective
+          WHERE objective.status = 'active'
+            AND objective.lease_owner IS NULL
+            AND objective.next_observation_at IS NULL
+            AND NOT EXISTS (
+                  SELECT 1 FROM objective_remediations remediation
+                  WHERE remediation.objective_id = objective.id
+                    AND remediation.status NOT IN
+                        ('completed', 'cancelled', 'superseded'))
+            AND EXISTS (
+                  SELECT 1 FROM chat_run_controls control
+                  WHERE control.objective_id = objective.id
+                    AND control.status IN ('completed', 'cancelled')
+                    AND COALESCE(control.settled_at, control.updated_at) < ?)
+          ORDER BY objective.created_at
+          LIMIT 8",
+    )
+    .bind(settled_before_ms)
+    .fetch_all(pool)
+    .await?;
+
+    let mut reaped = Vec::new();
+    for id in ids {
+        let Some(current) = store.get(&id).await? else {
+            continue;
+        };
+        // Re-check under the current revision: a turn that woke up between the
+        // scan and here must keep running.
+        if current.status != ObjectiveStatus::Active {
+            continue;
+        }
+        let decision = DecisionRouter::route(
+            &current,
+            RouteSignal::TechnicalFailure {
+                domain: current.domain,
+                failure_code: super::objective::OBJECTIVE_PROGRESS_STALLED.into(),
+                // Distinguishable from the plain stall signature so the record
+                // says *why* the sweep believed nothing owned this Objective.
+                failure_signature: format!(
+                    "{}:{}:run_control_settled",
+                    super::objective::OBJECTIVE_PROGRESS_STALLED,
+                    current.id
+                ),
+                next_observation_at: chrono::Utc::now().timestamp_millis() + 5_000,
+                resume_cursor: current
+                    .resume_cursor
+                    .clone()
+                    .or_else(|| current.root_turn_id.clone()),
+            },
+        )?;
+        reaped.push(apply_decision_with_contention_retry(store, current.revision, decision).await?);
+    }
+    Ok(reaped)
+}
+
+/// Apply a recovery decision, retrying in place when the SQLite write lock
+/// collides. A lost decision here is exactly what creates the orphan state this
+/// module exists to clean up, so the reaper must not become another source of
+/// it.
+async fn apply_decision_with_contention_retry(
+    store: &ObjectiveStore,
+    revision: i64,
+    decision: DecisionEnvelope,
+) -> anyhow::Result<ObjectiveSnapshot> {
+    let mut attempt = 0_u32;
+    loop {
+        match store.apply_decision(revision, decision.clone()).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error)
+                if crate::storage::db::is_contention_anyhow(&error)
+                    && attempt + 1 < crate::storage::db::CONTENTION_ATTEMPTS =>
+            {
+                attempt += 1;
+                tracing::warn!(
+                    attempt,
+                    "orphaned-Objective reap collided with the SQLite write lock; \
+                     retrying in place: {error:#}"
+                );
+                tokio::time::sleep(crate::storage::db::contention_backoff(attempt)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
     let owner = format!(
         "objective-supervisor:{}:{}",
@@ -1215,6 +1329,29 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             // failed. Sweep for those separately and hand each one to the
             // ordinary recovery ladder, which can resume it or, failing that,
             // settle it into a fault the user can actually see.
+            // R7 (U23): every poll, ahead of the slow stall sweep. An Objective
+            // whose owning run control already settled cannot be waiting for
+            // anything, so it is reaped within ORPHANED_RUN_CONTROL_GRACE_MS
+            // instead of sitting invisible until a restart.
+            match reap_active_objectives_whose_run_control_settled(
+                &pool,
+                &store,
+                chrono::Utc::now().timestamp_millis() - ORPHANED_RUN_CONTROL_GRACE_MS,
+            )
+            .await
+            {
+                Ok(reaped) => {
+                    for objective in reaped {
+                        tracing::warn!(
+                            objective_id = %objective.id,
+                            domain = ?objective.domain,
+                            "reaped an active Objective whose run control had already settled: \
+                             no owner, no live remediation, no scheduled observation"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "orphaned-Objective sweep failed"),
+            }
             polls_since_stall_sweep += 1;
             if polls_since_stall_sweep >= STALL_SWEEP_EVERY_POLLS {
                 polls_since_stall_sweep = 0;
@@ -1310,6 +1447,166 @@ mod tests {
             binding_id: None,
             resource_generation: None,
         }
+    }
+
+    /// R7 (U23). Build the exact 2026-10-08 limbo: the failure detail was written,
+    /// the decision that schedules recovery was lost to the SQLite write lock, and
+    /// `chat_run_controls` had already settled `completed`. `chat_turn_state` is
+    /// deliberately *fresh*, so this also pins that the backstop does not depend
+    /// on the turn looking stale — the UI said "running" the whole time. The
+    /// supervisor sweep must reap it without any restart.
+    #[tokio::test]
+    async fn supervisor_reaps_an_active_objective_whose_run_control_already_settled() {
+        let root = std::env::temp_dir().join(format!("codefactory-u23-r7-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = crate::storage::db::connect(&format!(
+            "sqlite:{}",
+            root.join("r7.db").display()
+        ))
+        .await
+        .expect("open the production-configured database");
+        let store = ObjectiveStore::new(pool.clone());
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // `chat_turn_state` owns a session; give it one, exactly as the app would.
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('session-orphan', 'orphan', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let orphan = store
+            .create(CreateObjective {
+                id: "objective-orphan".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-orphan".into()),
+                root_turn_id: Some("turn-orphan".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        // The lost decision: still active, no lease, nothing scheduled.
+        sqlx::query(
+            "UPDATE objectives
+             SET lease_owner=NULL, next_observation_at=NULL, updated_at=?, last_progress_at=?
+             WHERE id=?",
+        )
+        .bind(now - 600_000)
+        .bind(now - 600_000)
+        .bind(&orphan.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, revision, phase, status, recovery_attempt,
+              started_at, updated_at)
+             VALUES ('turn-orphan', 'session-orphan', 1, 'executing', 'active', 0, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id, objective_revision,
+              status, created_process_instance, settled_at, created_at, updated_at)
+             VALUES ('run-orphan', 'session-orphan', 'turn-orphan', ?, ?, 'completed',
+                     'test-process', ?, ?, ?)",
+        )
+        .bind(&orphan.id)
+        .bind(orphan.revision)
+        .bind(now - 60_000)
+        .bind(now - 300_000)
+        .bind(now - 60_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Control: a session whose run control is still live must be untouched.
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('session-healthy', 'healthy', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let healthy = store
+            .create(CreateObjective {
+                id: "objective-healthy".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-healthy".into()),
+                root_turn_id: Some("turn-healthy".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE objectives
+             SET lease_owner=NULL, next_observation_at=NULL, recovery_owner=NULL
+             WHERE id=?",
+        )
+        .bind(&healthy.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id, objective_revision,
+              status, created_process_instance, created_at, updated_at)
+             VALUES ('run-healthy', 'session-healthy', 'turn-healthy', ?, ?, 'active',
+                     'test-process', ?, ?)",
+        )
+        .bind(&healthy.id)
+        .bind(healthy.revision)
+        .bind(now - 300_000)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reaped = reap_active_objectives_whose_run_control_settled(
+            &pool,
+            &store,
+            now - ORPHANED_RUN_CONTROL_GRACE_MS,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reaped.iter().map(|objective| objective.id.clone()).collect::<Vec<_>>(),
+            vec![orphan.id.clone()],
+            "only the Objective whose run control already settled is reaped"
+        );
+        assert!(
+            reaped[0].next_observation_at.is_some(),
+            "the reaped Objective is scheduled again instead of staying invisible"
+        );
+        assert!(
+            !(reaped[0].status == ObjectiveStatus::Active && reaped[0].recovery_owner.is_none()),
+            "it must never be left active with no owner"
+        );
+
+        let healthy_after = store.get(&healthy.id).await.unwrap().unwrap();
+        assert_eq!(
+            healthy_after.status,
+            ObjectiveStatus::Active,
+            "a live run control keeps its Objective running"
+        );
+        assert!(
+            healthy_after.next_observation_at.is_none() && healthy_after.recovery_owner.is_none(),
+            "the healthy session is untouched by the backstop"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     async fn claimed_chat_objective(

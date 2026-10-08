@@ -9,6 +9,19 @@ mod auth_recovery;
 #[path = "../src/agent/provider_recovery.rs"]
 mod provider_recovery;
 
+// `provider_recovery` takes its write lock through the shared entry point. This
+// crate includes production modules directly rather than linking the library,
+// so it has to expose that module under the same path the production code uses
+// — and it exposes the *real* implementation, not a test double, so these tests
+// exercise the shipping lock discipline.
+#[path = "../src/storage/write_lock.rs"]
+mod storage_write_lock;
+mod storage {
+    pub mod db {
+        pub use crate::storage_write_lock::*;
+    }
+}
+
 use auth_recovery::{
     AuthCapabilityProbe, AuthCapabilityStatus, AuthObservationSource, AuthRecoveryDisposition,
     AuthRecoveryStore,
