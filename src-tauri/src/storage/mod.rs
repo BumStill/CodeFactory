@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod db;
 pub mod tasks;
+pub mod write_lock;
 
 use serde::{Deserialize, Serialize};
 

@@ -1406,7 +1406,16 @@ pub(crate) async fn settle_headless_chat_objective_from_outcome(
 /// generic loop error, so the recovery ladder and the failed terminal can tell
 /// them apart.
 fn chat_failure_code_for_error(error_text: &str) -> &'static str {
-    if error_text.contains("PROVIDER_DURABLE_IDENTITY_MISMATCH") {
+    if crate::storage::db::is_lock_contention_message(error_text) {
+        // U23: parallel sessions colliding on SQLite's write lock is a local
+        // storage condition, not an agent failure. Classifying it as
+        // `agent_loop_error` made it enter the recovery ladder and burn
+        // recovery budget (and marked the first turn failed, which is what made
+        // auto-naming give up permanently). The write path already retried in
+        // place, so reaching here means it genuinely kept colliding and the
+        // user needs the honest reason.
+        crate::storage::db::LOCAL_STORE_CONTENDED
+    } else if error_text.contains("PROVIDER_DURABLE_IDENTITY_MISMATCH") {
         // U18/R3: reconciliation could not name a resume target, so this is
         // deterministic, not transient. `bound_system_recovery` settles it
         // as the failure terminal on the first occurrence — no second
@@ -1493,17 +1502,35 @@ async fn settle_chat_objective_from_error(
         // readable. Keep a bounded, redacted copy so the next person to meet
         // this failure_code can tell what it actually was. Best-effort: a
         // diagnostic must never be able to block the decision it describes.
-        if let Err(error) = store
-            .record_failure_detail(
-                objective_id,
-                RecoveryDomain::Chat,
-                failure_code,
-                &failure_signature,
-                error_text,
-            )
-            .await
-        {
-            tracing::warn!("failed to record chat failure detail: {error}");
+        // R6 (U23): a diagnostic write must never be the thing that loses the
+        // decision, but it must also never block it — so this one keeps its
+        // best-effort contract while gaining the same bounded in-place retry.
+        let mut detail_attempt = 0_u32;
+        loop {
+            match store
+                .record_failure_detail(
+                    objective_id,
+                    RecoveryDomain::Chat,
+                    failure_code,
+                    &failure_signature,
+                    error_text,
+                )
+                .await
+            {
+                Ok(()) => break,
+                Err(error)
+                    if crate::storage::db::is_contention_anyhow(&error)
+                        && detail_attempt + 1 < crate::storage::db::CONTENTION_ATTEMPTS =>
+                {
+                    detail_attempt += 1;
+                    tokio::time::sleep(crate::storage::db::contention_backoff(detail_attempt))
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!("failed to record chat failure detail: {error}");
+                    break;
+                }
+            }
         }
         RouteSignal::TechnicalFailure {
             domain: RecoveryDomain::Chat,
@@ -1515,15 +1542,52 @@ async fn settle_chat_objective_from_error(
     };
     let decision = DecisionRouter::route(&current, signal)
         .map_err(|error| AppError::Other(error.to_string()))?;
-    let revised = match mutation_permit {
-        Some(permit) => {
-            store
-                .apply_claimed_decision(current.revision, decision, permit)
-                .await
+    // R6 (U23): this write is what schedules the next recovery step. When it was
+    // lost to the SQLite write lock, the Objective stayed `active` with nothing
+    // scheduled and no owner — the limbo the 2026-10-08 sessions got stuck in,
+    // where the failure detail existed but no `decision_applied` ever followed
+    // it. Retry it in place with bounded backoff before surrendering it; if all
+    // attempts are lost the supervisor's orphan sweep (R7) still owns picking
+    // the Objective back up, so the turn can never become invisible.
+    let revised = {
+        let mut attempt = 0_u32;
+        loop {
+            let outcome = match mutation_permit {
+                Some(permit) => {
+                    store
+                        .apply_claimed_decision(current.revision, decision.clone(), permit)
+                        .await
+                }
+                None => store.apply_decision(current.revision, decision.clone()).await,
+            };
+            match outcome {
+                Ok(revised) => break revised,
+                Err(error)
+                    if crate::storage::db::is_contention_anyhow(&error)
+                        && attempt + 1 < crate::storage::db::CONTENTION_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    tracing::warn!(
+                        objective_id = %objective_id,
+                        attempt,
+                        "chat settlement decision write collided with the SQLite write lock; \
+                         retrying in place: {error:#}"
+                    );
+                    tokio::time::sleep(crate::storage::db::contention_backoff(attempt)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        objective_id = %objective_id,
+                        "chat settlement decision could not be written after \
+                         {CONTENTION_ATTEMPTS} attempts; the Objective supervisor's orphan \
+                         sweep must pick this Objective up: {error:#}",
+                        CONTENTION_ATTEMPTS = crate::storage::db::CONTENTION_ATTEMPTS,
+                    );
+                    return Err(AppError::Other(error.to_string()));
+                }
+            }
         }
-        None => store.apply_decision(current.revision, decision).await,
-    }
-    .map_err(|error| AppError::Other(error.to_string()))?;
+    };
     project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
     Ok(revised)
 }
@@ -1564,10 +1628,28 @@ async fn recover_chat_settlement_failure(
         },
     )
     .map_err(|error| AppError::Other(error.to_string()))?;
-    let revised = store
-        .apply_decision(expected_revision, decision)
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?;
+    let revised = {
+        let mut attempt = 0_u32;
+        loop {
+            match store.apply_decision(expected_revision, decision.clone()).await {
+                Ok(revised) => break revised,
+                Err(error)
+                    if crate::storage::db::is_contention_anyhow(&error)
+                        && attempt + 1 < crate::storage::db::CONTENTION_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    tracing::warn!(
+                        objective_id = %objective_id,
+                        attempt,
+                        "chat settlement-failure decision write collided with the SQLite write \
+                         lock; retrying in place: {error:#}"
+                    );
+                    tokio::time::sleep(crate::storage::db::contention_backoff(attempt)).await;
+                }
+                Err(error) => return Err(AppError::Other(error.to_string())),
+            }
+        }
+    };
     project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
     Ok(revised)
 }
@@ -3623,6 +3705,31 @@ mod tests {
         assert_eq!(
             chat_failure_code_for_error("something unrelated broke"),
             "agent_loop_error"
+        );
+    }
+
+    /// U23 (R4). A SQLite write-lock collision that survives the in-place retry
+    /// is a local storage condition, not an agent failure. Reporting it as
+    /// `agent_loop_error` put it on the recovery ladder and burned recovery
+    /// budget — and marking the first turn failed is what made auto-naming give
+    /// up permanently.
+    #[test]
+    fn sqlite_write_lock_collisions_are_local_contention_not_loop_errors() {
+        for text in [
+            "provider output checkpoint failed: error returned from database: (code: 5) database is locked",
+            "provider failure receipt failed: error returned from database: (code: 517) database is locked",
+            "persist mutation tool attribution: database is locked",
+            "prepare provider attempt: SQLITE_BUSY",
+        ] {
+            assert_eq!(
+                chat_failure_code_for_error(text),
+                crate::storage::db::LOCAL_STORE_CONTENDED,
+                "{text}"
+            );
+        }
+        assert_ne!(
+            chat_failure_code_for_error("something unrelated broke"),
+            crate::storage::db::LOCAL_STORE_CONTENDED
         );
     }
     use crate::config::settings::{ApiStyle, Endpoint};
