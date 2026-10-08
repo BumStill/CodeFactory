@@ -9,6 +9,19 @@ mod auth_recovery;
 #[path = "../src/agent/provider_recovery.rs"]
 mod provider_recovery;
 
+// `provider_recovery` takes its write lock through the shared entry point. This
+// crate includes production modules directly rather than linking the library,
+// so it has to expose that module under the same path the production code uses
+// — and it exposes the *real* implementation, not a test double, so these tests
+// exercise the shipping lock discipline.
+#[path = "../src/storage/write_lock.rs"]
+mod storage_write_lock;
+mod storage {
+    pub mod db {
+        pub use crate::storage_write_lock::*;
+    }
+}
+
 use auth_recovery::{
     AuthCapabilityProbe, AuthCapabilityStatus, AuthObservationSource, AuthRecoveryDisposition,
     AuthRecoveryStore,
@@ -1324,4 +1337,71 @@ async fn dangling_streaming_attempt_without_a_live_owner_is_reconciled() {
             .unwrap(),
         ProviderMutation::Applied(_)
     ));
+}
+
+/// U23/R8 (2026-10-08, production): a SQLite write lock made the response
+/// commit fail after the stream had emitted text, so the attempt stayed
+/// `streaming` with no side effect and no live owner. The failure was routed to
+/// the Chat domain, whose resume path never reconciles provider attempts, and
+/// the supervisor sweep skipped the Objective whenever its remediation run was
+/// active — so every resume died on PROVIDER_EPISODE_UNRECONCILED until the
+/// ladder ran out. The next revision's permit is proof that the older owner is
+/// fenced, so opening its episode settles that effect-free attempt itself.
+#[tokio::test]
+async fn next_revision_open_settles_an_effect_free_stream_its_dead_owner_left_behind() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(&permit, &attempt("attempt-torn", "episode-1", "a"), NOW + 1)
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "attempt-torn", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .append_partial_output(&permit, "attempt-torn", "half a reply", NOW + 3)
+        .await
+        .unwrap();
+    let before: String =
+        sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='attempt-torn'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(before, "failed_replayable", "the owner died before settling it");
+
+    sqlx::query("UPDATE objectives SET revision=5 WHERE id='objective-opaque'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE objective_remediations SET attempt_index=8 WHERE id='remediation-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next_permit = ProviderOwnerPermit::remediation(
+        "objective-opaque",
+        5,
+        "binding-1",
+        3,
+        "remediation-1",
+        "provider-owner",
+        8,
+    );
+    let mut next_episode = episode();
+    next_episode.id = "episode-2".into();
+    let opened = store
+        .open_episode(&next_permit, &next_episode, NOW + 4)
+        .await
+        .expect("an effect-free stream left by a fenced owner must not block the next revision");
+    assert!(matches!(opened, ProviderMutation::Applied(_)));
+    let (status, code): (String, String) = sqlx::query_as(
+        "SELECT status, COALESCE(failure_code, '') FROM provider_route_attempts WHERE id='attempt-torn'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "failed_replayable");
+    assert_eq!(code, "provider_stream_interrupted_no_side_effect");
 }
