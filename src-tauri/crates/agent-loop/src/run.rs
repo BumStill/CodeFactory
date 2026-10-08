@@ -2984,6 +2984,15 @@ pub async fn run_agent_loop(
                     name: None,
                     reasoning_content: None,
                 });
+                let blockers_json =
+                    codefactory_agent_core::completion_gate_blockers_json(&evidence);
+                persistence
+                    .record_completion_gate_verdict(
+                        root_turn_id.as_deref(),
+                        "completion_evidence_incomplete",
+                        &blockers_json,
+                    )
+                    .await?;
                 events.emit(crate::types::StreamEvent::CompletionGateAction {
                     kind: "evidence_needed".into(),
                     detail: evidence.blockers.join("; "),
@@ -3083,6 +3092,14 @@ pub async fn run_agent_loop(
                 Some("completion_evidence_incomplete"),
             )
             .await?;
+            let blockers_json = codefactory_agent_core::completion_gate_blockers_json(&evidence);
+            persistence
+                .record_completion_gate_verdict(
+                    root_turn_id.as_deref(),
+                    "completion_evidence_incomplete",
+                    &blockers_json,
+                )
+                .await?;
             events.emit(crate::policy::iteration_ceiling_terminal_event(
                 &evidence,
                 finalization,

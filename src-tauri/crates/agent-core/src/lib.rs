@@ -2486,6 +2486,17 @@ pub struct CompletionEvidence {
     pub delivery_reached_ceiling: Option<String>,
     pub completed: bool,
     pub blockers: Vec<String>,
+    /// Structured form of `blockers`: the same reasons with the check, command,
+    /// tool-call sequence and missing evidence spelled out. Persisted to
+    /// `objective_events.detail_json` and used to build specific messages.
+    #[serde(default)]
+    pub blockers_structured: Vec<CompletionBlocker>,
+    /// Delivery already observed in this run (a created PR, or a workspace
+    /// commit). When this is set the remaining gap is verification evidence
+    /// only, and the terminal summary must say so instead of claiming the goal
+    /// was not achieved.
+    #[serde(default)]
+    pub delivery_artifact: Option<DeliveryArtifact>,
 }
 
 /// Returns true only when an executed tool materially advances the shared
@@ -2890,10 +2901,69 @@ impl VerificationScope {
         verification_scope(&outcome.command, outcome.working_directory.as_deref())
     }
 
+    /// Package/target selectors WIDEN the run: `-p a -p b` runs two crates'
+    /// tests, so a superset of `-p` values is the broader run.
+    fn additive_selectors(&self) -> BTreeSet<String> {
+        self.selectors
+            .iter()
+            .filter(|selector| {
+                ADDITIVE_SELECTOR_FLAGS
+                    .iter()
+                    .any(|flag| selector.starts_with(flag))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A positional test name NARROWS the run: adding `agent::objective` runs a
+    /// subset of what the same command ran without it.
+    fn subtractive_selectors(&self) -> BTreeSet<String> {
+        self.selectors
+            .iter()
+            .filter(|selector| {
+                !ADDITIVE_SELECTOR_FLAGS
+                    .iter()
+                    .any(|flag| selector.starts_with(flag))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// `None` means every package/target (a workspace-wide run); `Some(set)`
+    /// means exactly those packages.
+    fn additive_scope(&self) -> Option<BTreeSet<String>> {
+        let workspace_wide = self
+            .configuration
+            .iter()
+            .any(|flag| flag.starts_with("--workspace"));
+        let additive = self.additive_selectors();
+        if workspace_wide || additive.is_empty() {
+            None
+        } else {
+            Some(additive)
+        }
+    }
+
+    fn additive_covers(&self, failed: &Self) -> bool {
+        match (self.additive_scope(), failed.additive_scope()) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(wider), Some(narrower)) => narrower.is_subset(&wider),
+        }
+    }
+
+    /// Does a later run of `self` close an earlier failure of `failed`?
+    ///
+    /// "Same or broader" is decided on the normalized check, not on the raw
+    /// command string: the same runner with the same or wider selectors, no
+    /// extra restrictions, and a configuration that is at least as broad.
+    /// `--workspace` (or no `-p` at all) covers any single-crate run, while a
+    /// single test name is genuinely narrower and must never count as covering
+    /// the whole set.
     fn covers(&self, failed: &Self) -> bool {
-        if self.family != failed.family
+        if !runner_family_covers(&self.family, &failed.family)
             || self.working_directory != failed.working_directory
-            || self.configuration != failed.configuration
+            || !configuration_covers(&self.configuration, &failed.configuration)
             || !self.restrictions.is_subset(&failed.restrictions)
         {
             return false;
@@ -2901,7 +2971,33 @@ impl VerificationScope {
         if self.family == "exact" || self.family.starts_with("executable:") {
             return self.exact_command == failed.exact_command;
         }
-        self.selectors.is_empty() || self.selectors.is_superset(&failed.selectors)
+        self.additive_covers(failed)
+            && self.subtractive_selectors().is_subset(&failed.subtractive_selectors())
+    }
+
+    /// A human- and agent-readable name for the check this scope describes.
+    fn describe(&self) -> String {
+        let detail = |values: &BTreeSet<String>| {
+            values
+                .iter()
+                .map(|value| {
+                    // `-p:name` reads better as `-p name`; keep `a::b` intact.
+                    if value.starts_with('-') {
+                        value.replacen(':', " ", 1)
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        if self.family == "exact" || self.family.starts_with("executable:") {
+            return format!("`{}`", self.exact_command);
+        }
+        let mut parts = vec![self.family.clone()];
+        parts.extend(detail(&self.selectors));
+        parts.extend(detail(&self.restrictions));
+        parts.extend(detail(&self.configuration));
+        format!("`{}` in {}", parts.join(" "), self.working_directory)
     }
 
     fn is_strictly_narrower_than(&self, failed: &Self) -> bool {
@@ -2941,6 +3037,48 @@ impl VerificationScope {
 #[derive(Debug, Clone)]
 struct FailedVerification {
     scope: VerificationScope,
+    /// The exact command that failed, so the rejection can name it.
+    command: String,
+    /// The tool-call sequence the failure was recorded at.
+    sequence: u64,
+}
+
+/// One structured reason a completion verdict was "not yet complete".
+///
+/// The verdict used to reach the user and the audit trail as a generic
+/// sentence, with an empty `objective_events.detail_json`, so nobody could tell
+/// which check was allegedly missing. Every rejection now carries the check,
+/// the command that produced the unmet evidence, the sequence it happened at,
+/// and the evidence that would close it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionBlocker {
+    /// Stable machine kind, e.g. `failed_verification`.
+    pub kind: String,
+    /// Specific, actionable sentence naming the check.
+    pub message: String,
+    /// The check this is about, when it names one.
+    #[serde(default)]
+    pub check: Option<String>,
+    /// The exact command that produced the unmet evidence.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// The tool-call sequence the failure was recorded at.
+    #[serde(default)]
+    pub failed_at_sequence: Option<u64>,
+    /// What evidence would close this blocker.
+    #[serde(default)]
+    pub missing_evidence: String,
+}
+
+/// Delivery already observed in the run, used to keep the terminal summary
+/// factual instead of telling the user nothing got done when a PR exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryArtifact {
+    /// `pull_request` or `commit`.
+    pub kind: String,
+    /// `PR #562`, or a short description for a workspace commit.
+    pub reference: String,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2984,6 +3122,7 @@ pub struct CompletionGate {
     delivery_completion_satisfied: bool,
     delivery_requested_ceiling: Option<String>,
     delivery_reached_ceiling: Option<String>,
+    delivery_artifact: Option<DeliveryArtifact>,
 }
 
 impl Default for CompletionGate {
@@ -3131,6 +3270,7 @@ impl CompletionGate {
             delivery_completion_satisfied: false,
             delivery_requested_ceiling: None,
             delivery_reached_ceiling: None,
+            delivery_artifact: None,
         }
     }
 
@@ -3222,8 +3362,17 @@ impl CompletionGate {
         {
             self.missing_test_runner = None;
         }
-        if matches!(outcome.kind, ToolKind::Mutation) && outcome.succeeded() {
-            self.last_mutation_sequence = Some(outcome.sequence);
+        // R4: remember that delivery already happened, and do not let it reopen
+        // the verification floor. Publishing a PR is not a source mutation:
+        // re-arming "verification must be later than the last change" *after*
+        // the PR is what made a finished, delivered task look unverified even
+        // though its real verification had already run before the delivery.
+        match detect_delivery_artifact(outcome) {
+            Some(artifact) => self.delivery_artifact = Some(artifact),
+            None if matches!(outcome.kind, ToolKind::Mutation) && outcome.succeeded() => {
+                self.last_mutation_sequence = Some(outcome.sequence);
+            }
+            None => {}
         }
         if matches!(outcome.kind, ToolKind::BackgroundServiceStart) {
             self.last_service_start_sequence = Some(outcome.sequence);
@@ -3270,6 +3419,8 @@ impl CompletionGate {
                 self.failed_verifications
                     .retain(|failed| !failed_scope.covers(&failed.scope));
                 self.failed_verifications.push(FailedVerification {
+                    command: outcome.command.clone(),
+                    sequence: outcome.sequence,
                     scope: failed_scope,
                 });
             }
@@ -3334,18 +3485,40 @@ impl CompletionGate {
 
     pub fn evidence(&self) -> CompletionEvidence {
         let mut blockers = Vec::new();
+        let mut blockers_structured: Vec<CompletionBlocker> = Vec::new();
         if self.delivery_completion_required && !self.delivery_completion_satisfied {
-            blockers.push(format!(
+            let message = format!(
                 "delivery completion arbitration is still open: reached {} but objective requires {}",
                 self.delivery_reached_ceiling.as_deref().unwrap_or("unknown"),
                 self.delivery_requested_ceiling.as_deref().unwrap_or("unknown")
-            ));
-        }
-        if !self.failed_verifications.is_empty() {
-            blockers.push(
-                "rerun every unresolved failed check at the same or broader scope after the repair; unrelated or narrower green checks cannot close these failures"
-                    .to_owned(),
             );
+            blockers_structured.push(CompletionBlocker {
+                kind: "delivery_completion_open".into(),
+                message: message.clone(),
+                check: None,
+                command: None,
+                failed_at_sequence: None,
+                missing_evidence:
+                    "a delivery result at the ceiling the objective requested".into(),
+            });
+            blockers.push(message);
+        }
+        for failed in &self.failed_verifications {
+            let check = failed.scope.describe();
+            let message = format!(
+                "check {check} failed at #{} and has not been rerun at the same or broader scope since; rerun `{}` — or a broader command that covers it — after the repair",
+                failed.sequence, failed.command
+            );
+            blockers_structured.push(CompletionBlocker {
+                kind: "failed_verification".into(),
+                message: message.clone(),
+                check: Some(check),
+                command: Some(failed.command.clone()),
+                failed_at_sequence: Some(failed.sequence),
+                missing_evidence: "a passing rerun of the same check at the same or broader scope after the repair"
+                    .into(),
+            });
+            blockers.push(message);
         }
         if self.scope_narrowing_sequence.is_some() {
             blockers.push(
@@ -3516,6 +3689,25 @@ impl CompletionGate {
             }
         }
 
+        // Every remaining unmet requirement also gets a structured entry so the
+        // persisted verdict is complete, not just the two categories above.
+        for message in &blockers {
+            if blockers_structured
+                .iter()
+                .any(|blocker| &blocker.message == message)
+            {
+                continue;
+            }
+            blockers_structured.push(CompletionBlocker {
+                kind: "unmet_requirement".into(),
+                message: message.clone(),
+                check: None,
+                command: None,
+                failed_at_sequence: None,
+                missing_evidence: message.clone(),
+            });
+        }
+
         CompletionEvidence {
             require_action: self.require_action,
             outcome_count: self.outcome_count,
@@ -3569,6 +3761,8 @@ impl CompletionGate {
             delivery_reached_ceiling: self.delivery_reached_ceiling.clone(),
             completed: blockers.is_empty(),
             blockers,
+            blockers_structured,
+            delivery_artifact: self.delivery_artifact.clone(),
         }
     }
 
@@ -3579,8 +3773,280 @@ impl CompletionGate {
     }
 }
 
+/// The structured blocker list of a verdict, ready to persist into
+/// `objective_events.detail_json` (R1). Empty string when there is nothing to
+/// record, so a caller can skip the write without parsing.
+pub fn completion_gate_blockers_json(evidence: &CompletionEvidence) -> String {
+    if evidence.blockers_structured.is_empty() {
+        return String::new();
+    }
+    serde_json::json!({
+        "verdict": "completion_evidence_incomplete",
+        "outcome_count": evidence.outcome_count,
+        "blockers": evidence.blockers_structured,
+    })
+    .to_string()
+}
+
+/// `PR #562` for any GitHub pull-request URL printed by a command.
+fn pull_request_reference(text: &str) -> Option<String> {
+    for candidate in ["/pull/", "/pulls/"] {
+        let mut offset = 0;
+        while let Some(index) = text[offset..].find(candidate) {
+            let start = offset + index + candidate.len();
+            let digits: String = text[start..]
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() {
+                return Some(format!("PR #{digits}"));
+            }
+            offset = start;
+        }
+    }
+    None
+}
+
+/// Delivery already landed in this run: a created/merged PR, or a commit.
+fn detect_delivery_artifact(outcome: &ToolOutcome) -> Option<DeliveryArtifact> {
+    let command = outcome.command.to_ascii_lowercase();
+    let pr = || {
+        pull_request_reference(&outcome.stdout)
+            .or_else(|| pull_request_reference(&outcome.stderr))
+            .map(|reference| DeliveryArtifact {
+                kind: "pull_request".to_owned(),
+                reference,
+                sequence: outcome.sequence,
+            })
+    };
+    if command.contains("gh pr create") || command.contains("gh pr merge") {
+        return pr();
+    }
+    if let Some(artifact) = pr() {
+        return Some(artifact);
+    }
+    if outcome.succeeded()
+        && command.contains("git commit")
+        && !command.contains("--dry-run")
+    {
+        return Some(DeliveryArtifact {
+            kind: "commit".to_owned(),
+            reference: "已提交到当前分支的提交（工作区已有 commit）".to_owned(),
+            sequence: outcome.sequence,
+        });
+    }
+    None
+}
+
+/// Collapse a command to single spaces so two spellings of the same check that
+/// differ only in whitespace compare equal.
+fn collapse_command_whitespace(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `true` for a shell redirection token (`2>&1`, `&>/dev/null`, `>out.txt`,
+/// `<in.txt`). Redirections change what is printed, never what is checked.
+fn is_shell_redirection_token(word: &str) -> bool {
+    let word = word.trim_matches(['\'', '"']);
+    if word.is_empty() {
+        return false;
+    }
+    let stripped = word.trim_start_matches(|character: char| {
+        character.is_ascii_digit() || character == '&'
+    });
+    stripped.starts_with('>') || stripped.starts_with('<')
+}
+
+/// `true` for a redirection operator whose target is a separate token
+/// (`> out.txt`, `2>> log`, `< in.txt`).
+fn is_bare_redirection_operator(word: &str) -> bool {
+    matches!(
+        word,
+        ">" | ">>" | "<" | "1>" | "1>>" | "2>" | "2>>" | "&>" | "&>>"
+    )
+}
+
+/// Flags that change only how a check reports, never which checks run. The task
+/// brief calls these out explicitly: a rerun with `--no-fail-fast` is the same
+/// check as the one that failed without it.
+const REPORTING_ONLY_FLAGS: &[&str] = &[
+    "--no-fail-fast",
+    "-q",
+    "--quiet",
+    "-v",
+    "--verbose",
+    "--nocapture",
+    "--timings",
+];
+
+/// Reporting-only flags that consume the following token (`--color always`).
+const REPORTING_ONLY_VALUE_FLAGS: &[&str] = &["--color", "--message-format", "--reporter", "--format"];
+
+/// Remove redirections (and the file names they consume) and reporting-only
+/// flags from a command, so `… 2>&1 | tail -30` keeps only the check itself.
+fn strip_shell_redirections(command: &str) -> String {
+    let mut kept = Vec::new();
+    let mut skip_target = false;
+    for word in command.split_whitespace() {
+        if skip_target {
+            skip_target = false;
+            continue;
+        }
+        if is_bare_redirection_operator(word) {
+            skip_target = true;
+            continue;
+        }
+        if is_shell_redirection_token(word) {
+            continue;
+        }
+        if REPORTING_ONLY_FLAGS.contains(&word) {
+            continue;
+        }
+        let inline_value = REPORTING_ONLY_VALUE_FLAGS
+            .iter()
+            .find(|flag| word.starts_with(**flag) && word.len() > flag.len());
+        if inline_value.is_some() {
+            continue;
+        }
+        if REPORTING_ONLY_VALUE_FLAGS.contains(&word) {
+            skip_target = true;
+            continue;
+        }
+        kept.push(word);
+    }
+    kept.join(" ")
+}
+
+/// Drop the output-shaping tail of a pipeline (`| tail -30`, `| head`,
+/// `| grep -v x`, `| tee log`) and every redirection, keeping the head.
+fn strip_verification_output_wrapping(segment: &str) -> String {
+    let head = split_shell_syntax(segment, true)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    head.split_whitespace()
+        .filter(|word| !is_shell_redirection_token(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Map runner aliases that are the same check onto one canonical spelling.
+///
+/// `node scripts/cargo-shared.mjs test` and `cargo test` are the same runner
+/// with the same flags; without this the shared-cache wrapper every local
+/// session uses would look like a different check from the plain one CI runs,
+/// and neither could ever close the other's failure ticket.
+fn canonicalize_verification_runner(command: &str) -> String {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let shared_script = |word: &&str| word.ends_with("cargo-shared.mjs");
+    if words.len() >= 2 && words[0].eq_ignore_ascii_case("node") && shared_script(&words[1]) {
+        let mut canonical = vec!["cargo"];
+        canonical.extend_from_slice(&words[2..]);
+        return canonical.join(" ");
+    }
+    if words.first().is_some_and(shared_script) {
+        let mut canonical = vec!["cargo"];
+        canonical.extend_from_slice(&words[1..]);
+        return canonical.join(" ");
+    }
+    collapse_command_whitespace(command)
+}
+
+/// Normalize a verification command into the check it actually runs.
+///
+/// A rerun that resolves an earlier failure is usually spelled differently:
+/// `echo 3 && pnpm test 2>&1 | tail -30 ; echo EXIT=$?` instead of `pnpm test`.
+/// Comparing raw command strings made each of those a brand-new check, so the
+/// original failure ticket stayed open forever and the completion gate kept
+/// ruling finished work incomplete. The orchestrator used to *instruct* agents
+/// to number their commands to dodge the receipt dedup, which produced exactly
+/// those variants; that workaround is no longer needed.
+///
+/// Shell wrappers that only report, arm the shell, or capture an exit code are
+/// dropped, as is the `cd <dir>` prefix (the scope resolves the effective
+/// directory separately).
+fn normalize_verification_command(command: &str) -> String {
+    // Strip redirections from the WHOLE command first. The segment splitter also
+    // breaks on `&`, so `2>&1` would otherwise split into `2>` and `1` and the
+    // stray `1` would read as a second check.
+    let without_redirections = strip_shell_redirections(command);
+    let mut kept = Vec::new();
+    for segment in shell_verification_segments(&without_redirections) {
+        let payload = strip_verification_output_wrapping(&execution_payload(&segment));
+        let words = payload.split_whitespace().collect::<Vec<_>>();
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let executable = first
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(first)
+            .to_ascii_lowercase();
+        // `cd` is directory bookkeeping, not verification.
+        if matches!(executable.as_str(), "cd") {
+            continue;
+        }
+        // Report-only noise: `echo …`, `printf …`, `set -e`, `true`, `:` and
+        // the exit-code capture that follows a real check.
+        if matches!(
+            executable.as_str(),
+            "echo" | "printf" | "set" | "true" | ":" | "exit"
+        ) {
+            continue;
+        }
+        // A numeric leftover from a split redirection is not a command.
+        if executable.chars().all(|character| character.is_ascii_digit()) {
+            continue;
+        }
+        if payload.is_empty() {
+            continue;
+        }
+        kept.push(payload);
+    }
+    if kept.is_empty() {
+        return collapse_command_whitespace(&without_redirections);
+    }
+    canonicalize_verification_runner(&kept.join(" && "))
+}
+
+/// Package/target selectors. Adding one widens the run instead of narrowing it.
+const ADDITIVE_SELECTOR_FLAGS: &[&str] = &["-p:", "--package:", "--test:", "--bin:", "--example:"];
+
+/// Configuration flags that describe the *shape* of the artifact under test
+/// rather than the breadth of the run. A debug run cannot cover a failed
+/// release run, and a different target is a different binary.
+const BUILD_SHAPE_FLAGS: &[&str] = &["--release", "--profile", "--target"];
+
+fn configuration_covers(wider: &BTreeSet<String>, narrower: &BTreeSet<String>) -> bool {
+    let build_shape = |flags: &BTreeSet<String>| {
+        flags
+            .iter()
+            .filter(|flag| {
+                BUILD_SHAPE_FLAGS
+                    .iter()
+                    .any(|known| flag.starts_with(known))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    };
+    build_shape(wider) == build_shape(narrower) && narrower.is_subset(wider)
+}
+
+/// Runner families where one command demonstrably runs the checks of another.
+/// `pnpm test` on this repository runs the whole vitest suite, so it covers any
+/// single vitest file.
+fn runner_family_covers(wider: &str, narrower: &str) -> bool {
+    if wider == narrower {
+        return true;
+    }
+    matches!(
+        (wider, narrower),
+        ("javascript:test", "vitest") | ("javascript:test", "jest")
+    )
+}
+
 fn verification_scope(command: &str, working_directory: Option<&str>) -> VerificationScope {
-    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalize_verification_command(command);
     let tokens = normalized
         .split(|character: char| {
             !(character.is_ascii_alphanumeric()
@@ -6271,7 +6737,7 @@ mod tests {
         assert!(evidence
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("every unresolved failed check")));
+            .any(|blocker| blocker.contains("has not been rerun at the same or broader scope")));
 
         let mut repaired = outcome(3, ToolKind::Verification, 0);
         repaired.command = "cargo test worker::tests::original_behavior".to_owned();
@@ -8454,5 +8920,187 @@ mod tests {
         gate.record(&project_tests);
 
         assert!(gate.evidence().completed);
+    }
+
+    fn scope_signature(command: &str) -> String {
+        let scope = verification_scope(command, None);
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            scope.family,
+            scope.working_directory,
+            scope.selectors.iter().cloned().collect::<Vec<_>>().join(","),
+            scope.restrictions.iter().cloned().collect::<Vec<_>>().join(","),
+            scope.configuration.iter().cloned().collect::<Vec<_>>().join(","),
+            scope.exact_command,
+        )
+    }
+
+    /// R2: every spelling of one check must read as the same check.
+    ///
+    /// The orchestrator used to *instruct* agents to number their commands to
+    /// dodge the receipt dedup, which produced exactly these variants and left
+    /// the original failure ticket open forever.
+    #[test]
+    fn equivalent_reruns_are_the_same_check() {
+        let table: &[(&str, &str)] = &[
+            (
+                "cargo test -p codefactory-agent-core",
+                "echo 3 && cargo test -p codefactory-agent-core 2>&1 | tail -30",
+            ),
+            (
+                "cargo test -p codefactory-agent-core",
+                "set -e; cargo test -p codefactory-agent-core ; echo EXIT=$?",
+            ),
+            (
+                "cargo test -p codefactory-agent-core",
+                "node scripts/cargo-shared.mjs test -p codefactory-agent-core",
+            ),
+            (
+                "cargo test -p codefactory-agent-core",
+                "cargo test -p codefactory-agent-core --no-fail-fast | grep -v warning",
+            ),
+            ("pnpm test", "pnpm test 2>&1 | tail -30 ; echo EXIT=$?"),
+            ("pnpm test", "echo 7 && pnpm test"),
+        ];
+        for (left, right) in table {
+            assert_eq!(
+                scope_signature(left),
+                scope_signature(right),
+                "{left} and {right} must be judged the same check"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leading_cd_does_not_change_the_check_itself() {
+        let plain = verification_scope("cargo test -p codefactory", None);
+        let prefixed = verification_scope("cd src-tauri && cargo test -p codefactory", None);
+        assert_eq!(prefixed.family, "cargo:test");
+        assert_eq!(prefixed.exact_command, plain.exact_command);
+        assert_eq!(prefixed.selectors, plain.selectors);
+    }
+
+    /// R2/R3: a genuinely narrower scope must not be judged as covering the set.
+    #[test]
+    fn a_narrower_run_does_not_cover_a_broader_failure() {
+        let broad = verification_scope("cargo test -p codefactory", None);
+        let narrow = verification_scope("cargo test -p codefactory agent::objective", None);
+        assert!(broad.covers(&narrow));
+        assert!(!narrow.covers(&broad));
+
+        let whole_suite = verification_scope("pnpm test", None);
+        let one_file = verification_scope("pnpm exec vitest run src/foo.test.ts", None);
+        assert!(whole_suite.covers(&one_file));
+        assert!(!one_file.covers(&whole_suite));
+
+        // A different build shape is a different artifact.
+        let release = verification_scope("cargo test --release", None);
+        let debug = verification_scope("cargo test", None);
+        assert!(!release.covers(&debug));
+        assert!(!debug.covers(&release));
+    }
+
+    /// R3: the U18 trajectory — an early narrower failure, a repair, then a
+    /// broader full run that passes, then delivery. Before the fix the narrow
+    /// failure ticket outlived the green full `cargo test --workspace`, so the
+    /// gate ruled a finished, delivered task incomplete.
+    #[test]
+    fn broader_pass_closes_an_earlier_narrower_failure_and_delivery_completes() {
+        let mut gate = CompletionGate::new(true);
+
+        let mut narrow = outcome(1, ToolKind::Verification, 101);
+        narrow.command = "cargo test -p codefactory --lib agent::objective".to_owned();
+        narrow.stdout = "test result: FAILED. 3 passed; 1 failed".to_owned();
+        gate.record(&narrow);
+        let rejected = gate.evidence();
+        assert!(!rejected.completed);
+        assert!(rejected
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("agent::objective")));
+
+        let mut repair = outcome(2, ToolKind::Mutation, 0);
+        repair.command = "write_file src-tauri/crates/agent-core/src/lib.rs".to_owned();
+        gate.record(&repair);
+
+        let mut broader = outcome(3, ToolKind::Verification, 0);
+        broader.command = "cargo test --workspace --no-fail-fast".to_owned();
+        broader.stdout = "test result: ok. 1646 passed; 0 failed".to_owned();
+        gate.record(&broader);
+
+        let mut delivery = outcome(4, ToolKind::Mutation, 0);
+        delivery.command = "gh pr create --title t --body b".to_owned();
+        delivery.stdout = "https://github.com/BumStill/CodeFactory/pull/562".to_owned();
+        gate.record(&delivery);
+
+        let accepted = gate.evidence();
+        assert!(
+            accepted.completed,
+            "a delivered task whose full suite passed must be complete; blockers: {:?}",
+            accepted.blockers
+        );
+        assert_eq!(
+            accepted
+                .delivery_artifact
+                .as_ref()
+                .map(|artifact| artifact.reference.as_str()),
+            Some("PR #562")
+        );
+    }
+
+    /// R1: a rejection persists a structured blocker list, not just a sentence.
+    #[test]
+    fn rejection_persists_a_structured_blocker_list() {
+        let mut gate = CompletionGate::new(true);
+
+        let mut failed = outcome(4, ToolKind::Verification, 1);
+        failed.command = "cargo test -p codefactory agent::objective".to_owned();
+        gate.record(&failed);
+
+        let evidence = gate.evidence();
+        assert!(!evidence.completed);
+        assert!(!evidence.blockers.is_empty());
+        assert!(!evidence.blockers_structured.is_empty());
+
+        let persisted = completion_gate_blockers_json(&evidence);
+        let parsed: serde_json::Value = serde_json::from_str(&persisted).expect("valid json");
+        assert_eq!(parsed["verdict"], "completion_evidence_incomplete");
+        let blockers = parsed["blockers"].as_array().expect("blockers array");
+        let failed_check = blockers
+            .iter()
+            .find(|blocker| blocker["kind"] == "failed_verification")
+            .expect("the failed check is recorded structurally");
+        assert_eq!(failed_check["failed_at_sequence"], 4);
+        assert_eq!(failed_check["command"], "cargo test -p codefactory agent::objective");
+        assert!(failed_check["check"]
+            .as_str()
+            .expect("check name")
+            .contains("agent::objective"));
+        assert!(!failed_check["missing_evidence"]
+            .as_str()
+            .expect("missing evidence")
+            .is_empty());
+        // The agent-facing message names the check and the sequence.
+        let message = failed_check["message"].as_str().expect("message");
+        assert!(message.contains("#4"), "{message}");
+        assert!(message.contains("agent::objective"), "{message}");
+    }
+
+    /// R1: the gate must be able to close the ticket with a rerun, not demand
+    /// the impossible.
+    #[test]
+    fn an_equivalent_rerun_closes_the_failure_ticket() {
+        let mut gate = CompletionGate::new(true);
+
+        let mut failed = outcome(1, ToolKind::Verification, 1);
+        failed.command = "pnpm test 2>&1 | tail -20".to_owned();
+        gate.record(&failed);
+        assert!(!gate.evidence().completed);
+
+        let mut rerun = outcome(2, ToolKind::Verification, 0);
+        rerun.command = "echo 5 && pnpm test".to_owned();
+        gate.record(&rerun);
+
+        assert!(gate.evidence().completed, "{:?}", gate.evidence().blockers);
     }
 }
