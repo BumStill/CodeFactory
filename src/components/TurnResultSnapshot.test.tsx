@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// M31 rewrote the card's contract: the verdict comes from the backend's
+// authoritative objective status, and the card never speaks internal
+// control-loop vocabulary. The assertions below were updated to that spec —
+// the previous "证据待复核 / 当前边界" wording is exactly what the task removed.
+
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { PlanStep, TurnPlan } from "../lib/chatPlan";
@@ -48,11 +53,12 @@ function withNextActionOwner(
 }
 
 describe("TurnResultSnapshot", () => {
-  it("forms a completed result footer with evidence and summary controls", () => {
+  it("forms a completed result footer with changes and summary controls", () => {
     render(
       <TurnResultSnapshot
         plan={plan}
         evidence={summarizeTurnEvidence(tools)}
+        objectiveStatus="completed"
         durationMs={80_000}
       />,
     );
@@ -62,21 +68,21 @@ describe("TurnResultSnapshot", () => {
     expect(screen.getByText("已完成")).toBeInTheDocument();
     expect(screen.getByText(/3\/3/)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "查看证据" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看改动" }));
     expect(screen.getByText("src/App.tsx")).toBeInTheDocument();
     expect(screen.getByText(/pnpm test/)).toBeInTheDocument();
     expect(screen.getByText("等待 · 等待 CI")).toBeInTheDocument();
-    expect(screen.getByText("没有失败操作证据")).toBeInTheDocument();
+    expect(screen.getByText("没有失败的操作")).toBeInTheDocument();
 
     expect(screen.queryByRole("button", { name: "执行过程" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "结果摘要" }));
     expect(screen.getByRole("status")).toHaveTextContent(
-      "完成 3/3 个计划步骤；修改 1 个文件；记录 1 项验证操作；没有失败证据。",
+      "完成 3/3 个计划步骤；改动 1 个文件；运行 1 项检查；没有失败的操作。",
     );
   });
 
-  it("reports completed execution with failed evidence as evidence review, not user action", () => {
+  it("keeps a completed objective completed even when a tool call failed mid-turn", () => {
     const completedPlan: TurnPlan = {
       ...plan,
       steps: Array.from({ length: 6 }, (_, index): PlanStep => ({
@@ -101,16 +107,17 @@ describe("TurnResultSnapshot", () => {
             isError: true,
           },
         ])}
+        objectiveStatus="completed"
         durationMs={80_000}
       />,
     );
 
     const result = screen.getByTestId("turn-result-snapshot");
-    expect(result).toHaveAttribute("data-status-tone", "warning");
-    expect(result).toHaveTextContent("已执行，证据待复核");
+    expect(result).toHaveAttribute("data-status-tone", "success");
+    expect(result).toHaveTextContent("已完成");
     expect(result).toHaveTextContent("6/6");
     expect(result).not.toHaveTextContent("需要处理");
-    expect(result.querySelector(".lucide-circle-check-big")).toBeNull();
+    expect(result.querySelector("[class*='text-status-success']")).not.toBeNull();
   });
 
   it("does not claim failed writes as changed files or failed commands as verification", () => {
@@ -140,12 +147,13 @@ describe("TurnResultSnapshot", () => {
     expect(evidence.failureCount).toBe(2);
   });
 
-  it("opens the shared evidence pane without also expanding inline evidence", () => {
+  it("opens the shared changes pane without also expanding inline detail", () => {
     const onOpenEvidence = vi.fn();
     render(
       <TurnResultSnapshot
         plan={plan}
         evidence={summarizeTurnEvidence(tools)}
+        objectiveStatus="completed"
         durationMs={80_000}
         onOpenEvidence={onOpenEvidence}
         evidenceControlsId="workspace-auxiliary-pane"
@@ -153,16 +161,16 @@ describe("TurnResultSnapshot", () => {
       />,
     );
 
-    const trigger = screen.getByRole("button", { name: "查看证据" });
+    const trigger = screen.getByRole("button", { name: "查看改动" });
     expect(trigger).toHaveAttribute("aria-haspopup", "dialog");
     expect(trigger).toHaveAttribute("aria-controls", "workspace-auxiliary-pane");
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     fireEvent.click(trigger);
     expect(onOpenEvidence).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("等待与失败边界")).not.toBeInTheDocument();
+    expect(screen.queryByText("改动的文件")).not.toBeInTheDocument();
   });
 
-  it("counts a turn-boundary failure consistently in evidence and summary", () => {
+  it("says a turn boundary failure did not finish without internal wording", () => {
     render(
       <TurnResultSnapshot
         plan={plan}
@@ -172,14 +180,17 @@ describe("TurnResultSnapshot", () => {
       />,
     );
 
-    expect(screen.getByTestId("turn-result-snapshot")).toHaveTextContent(
-      "已执行，证据待复核",
-    );
-    fireEvent.click(screen.getByRole("button", { name: "查看证据" }));
-    expect(screen.getByText("1 项失败或中断证据")).toBeInTheDocument();
-    expect(screen.queryByText("没有失败操作证据")).not.toBeInTheDocument();
+    const result = screen.getByTestId("turn-result-snapshot");
+    expect(result).toHaveAttribute("data-verdict", "incomplete");
+    expect(result).toHaveTextContent("还没做完");
+    expect(result).not.toHaveTextContent("证据");
+    expect(result).toHaveTextContent("这次没有全部做完");
+    // The boundary failure is a turn-level signal, not a failed tool call, so
+    // the tool list stays honest about there being none.
+    fireEvent.click(screen.getByRole("button", { name: "查看改动" }));
+    expect(screen.getByText("没有失败的操作")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "结果摘要" }));
-    expect(screen.getByText(/1 项失败证据/)).toBeInTheDocument();
+    expect(screen.getByText(/没有失败的操作。/)).toBeInTheDocument();
   });
 
   it("fails safe for legacy waiting data without assigning work to the user", () => {
@@ -279,27 +290,36 @@ describe("TurnResultSnapshot", () => {
       {
         id: "secret-edit",
         name: "edit_file",
-        args: JSON.stringify({ path: "fixtures/token=SECRET-private.ts" }),
+        args: JSON.stringify({ path: "fixtures/key=PLAINTEXTMARKER1" }),
         status: "done",
         result: "ok",
       },
       {
         id: "secret-test",
         name: "bash",
-        args: JSON.stringify({ command: "API_KEY=sk-secret-value pnpm test" }),
+        args: JSON.stringify({ command: "API_KEY=PLAINTEXTMARKER2 pnpm test" }),
         status: "done",
         result: "passed",
       },
     ]);
 
+    const serialized = JSON.stringify(evidence);
+    expect(serialized).not.toContain("PLAINTEXTMARKER1");
+    expect(serialized).not.toContain("PLAINTEXTMARKER2");
+    expect(serialized).toContain("[redacted]");
+
     render(
-      <TurnResultSnapshot plan={plan} evidence={evidence} durationMs={1_000} />,
+      <TurnResultSnapshot
+        plan={plan}
+        evidence={evidence}
+        objectiveStatus="completed"
+        durationMs={1_000}
+      />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "查看证据" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看改动" }));
 
     const snapshot = screen.getByTestId("turn-result-snapshot");
-    expect(snapshot).not.toHaveTextContent(/SECRET|sk-secret-value/);
-    expect(snapshot).toHaveTextContent("token=[redacted]");
-    expect(snapshot).toHaveTextContent("API_KEY=[redacted] pnpm test");
+    expect(snapshot).not.toHaveTextContent(/PLAINTEXTMARKER/);
+    expect(snapshot).toHaveTextContent("[redacted]");
   });
 });
