@@ -3279,6 +3279,12 @@ mod tests {
         .await
         .unwrap();
 
+        // U21 (2026-10-07): the owner is gone and this attempt emitted text but
+        // never started a side effect, so the startup reconcile now settles it
+        // as replay-safe. Pre-U21 it stayed `streaming` forever, the recovery
+        // drained as `provider_partial_output_unresolved`, and
+        // `require_provider_resume_evidence` refused every later resume with
+        // `ObserveOnlyPartial` — the dead session in the incident report.
         assert_eq!(
             reconcile_provider_recovery_on_startup(&pool).await.unwrap(),
             1
@@ -3288,15 +3294,22 @@ mod tests {
         assert_eq!(current.domain, RecoveryDomain::Provider);
         assert_eq!(
             current.failure_code.as_deref(),
-            Some("provider_partial_output_unresolved")
+            Some("provider_retry_safe_after_restart")
         );
-        assert!(
-            require_provider_resume_evidence(&pool, &objective.id, false)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("ObserveOnlyPartial")
-        );
+        let (attempt_status, failure_code): (String, String) = sqlx::query_as(
+            "SELECT status, COALESCE(failure_code, '') FROM provider_route_attempts
+             WHERE id='attempt-provider-startup-partial'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempt_status, "failed_replayable");
+        assert_eq!(failure_code, "provider_stream_interrupted_no_side_effect");
+        assert!(matches!(
+            provider.observe(&objective.id).await.unwrap(),
+            crate::agent::provider_recovery::ProviderRecoveryDisposition::RetrySafe { attempt_id, .. }
+                if attempt_id == "attempt-provider-startup-partial"
+        ));
     }
 
     /// Production-shaped restart boundary for an unattended coding turn:

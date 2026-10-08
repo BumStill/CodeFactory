@@ -12,6 +12,25 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
+/// U21 (2026-10-07). The durable reason recorded when a model attempt was cut
+/// off after it started streaming but before it started any side effect. Such a
+/// request is replay-safe, so this is an observation note, not a fence: the
+/// episode admission proof and the startup reconcile both treat it as retryable.
+/// The SQL in this module inlines the same literal.
+pub const PROVIDER_STREAM_INTERRUPTED_NO_SIDE_EFFECT: &str =
+    "provider_stream_interrupted_no_side_effect";
+
+/// U21 (2026-10-07). Leading marker of the episode admission refusal. After U21
+/// that refusal only remains when the prior request started a side effect (or
+/// left a receipt) that is still unresolved; the chat runner classifies it by
+/// this marker so the failed terminal can name that reason. The same literal is
+/// `objective::PROVIDER_EPISODE_UNRECONCILED` in lower case.
+pub const PROVIDER_EPISODE_FENCE_MARKER: &str = "PROVIDER_EPISODE_UNRECONCILED";
+
+/// The transport's generic "we cannot prove anything from our own side" code.
+/// It is superseded by the durable no-side-effect proof in `record_failure`.
+const PROVIDER_EXTERNAL_STATE_UNCERTAIN: &str = "provider_external_state_uncertain";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderMutation<T> {
     Applied(T),
@@ -365,10 +384,18 @@ impl ProviderRecoveryStore {
             // monotonic across model rounds. Recovery safety is therefore
             // decided by the latest request plus exact side-effect receipts,
             // not by historical output that is already in chat history.
+            //
+            // U21 (2026-10-07): the latest request's own `output_started` is no
+            // longer part of the proof either. A stream that was cut off after
+            // emitting text but before any side effect (`failed_replayable`,
+            // reason `provider_stream_interrupted_no_side_effect`) has nothing
+            // external to protect, and requiring a zero-output latch here is
+            // what turned one network glitch into a permanently dead session.
+            // An attempt with an unproven side effect still fails this proof on
+            // the side-effect clause and via its `unknown` status.
             let replay_safe = prior.get::<i64, _>("side_effect_started") == 0
                 && prior.get::<i64, _>("unresolved_receipt_count") == 0
                 && settled_receipts_prove_history
-                && prior.get::<i64, _>("attempt_output_started") == 0
                 && prior.get::<i64, _>("attempt_side_effect_started") == 0
                 && matches!(
                     attempt_status.as_deref(),
@@ -376,7 +403,7 @@ impl ProviderRecoveryStore {
                 );
             if !replay_safe {
                 bail!(
-                    "prior provider episode is not proven replay-safe; observe/reconcile before a new Objective revision"
+                    "{PROVIDER_EPISODE_FENCE_MARKER}: prior provider episode is not proven replay-safe; observe/reconcile before a new Objective revision"
                 );
             }
             sqlx::query(
@@ -472,8 +499,10 @@ impl ProviderRecoveryStore {
             let status: String = row.get("status");
             let output_started: i64 = row.get("output_started");
             let side_effect_started: i64 = row.get("side_effect_started");
-            let may_retry =
-                status == "failed_replayable" && output_started == 0 && side_effect_started == 0;
+            // U21: a settled interrupted stream — `failed_replayable` with
+            // output but no side effect — must not fence its own episode. Only
+            // an unproven side effect may do that.
+            let may_retry = status == "failed_replayable" && side_effect_started == 0;
             let may_continue_same_owner = status == "response_committed"
                 && output_started != 0
                 && side_effect_started == 0
@@ -949,9 +978,25 @@ impl ProviderRecoveryStore {
         // the machine yet, so making these failures non-replayable is a
         // follow-up that must add that state first — the transport's
         // `DETERMINISTIC_REJECTION_CODE` remains informational metadata.
-        let replay_is_proven = !attempt.output_started
-            && !attempt.side_effect_started
-            && attempt.side_effect_receipt_id.is_none();
+        let replay_is_proven =
+            !attempt.side_effect_started && attempt.side_effect_receipt_id.is_none();
+        // U21 (2026-10-07). A model response is text. An attempt that started
+        // output but never started a side effect has no external mutation to
+        // protect, so replaying it can cost one extra paid call and nothing
+        // more; waiting for a "reconcile" that can never exist just switched
+        // the whole session off. Production hit that in three sessions, always
+        // on `output_started=1, side_effect_started=0`, each time rescued only
+        // by the user typing another message. The proof is therefore about side
+        // effects, and the transport's generic uncertainty code is replaced by
+        // the honest reason below.
+        let failure_code = if replay_is_proven
+            && attempt.output_started
+            && failure_code == PROVIDER_EXTERNAL_STATE_UNCERTAIN
+        {
+            PROVIDER_STREAM_INTERRUPTED_NO_SIDE_EFFECT
+        } else {
+            failure_code
+        };
         let status = if replay_is_proven {
             "failed_replayable"
         } else {
@@ -1535,10 +1580,11 @@ impl ProviderRecoveryStore {
     }
 
     /// A provider POST has no external mutation semantics of its own. After
-    /// its chat-run owner is durably retired, a latest in-flight or transport-
-    /// unknown attempt with no observed bytes, no tool intent, and no
-    /// unresolved tool receipt may be replayed at least once. Any partial
-    /// output or uncertain receipt keeps the attempt fenced and observation-only.
+    /// its chat-run owner is durably retired, a latest in-flight, streaming or
+    /// transport-unknown attempt with no tool intent and no unresolved tool
+    /// receipt may be replayed at least once. Partial output alone no longer
+    /// fences it (U21: a model response is text); an uncertain side effect or
+    /// receipt still keeps the attempt fenced and observation-only.
     pub async fn reconcile_stale_effect_free_in_flight(&self, now: i64) -> Result<u64> {
         self.reconcile_stale_effect_free_attempts(None, now).await
     }
@@ -1564,8 +1610,11 @@ impl ProviderRecoveryStore {
              SET status='failed_replayable',
                  failure_class=CASE WHEN status='unknown'
                      THEN 'provider_transport' ELSE 'process_restart' END,
-                 failure_code=CASE WHEN status='unknown'
-                     THEN 'provider_transport_failed_before_output'
+                 failure_code=CASE
+                     WHEN output_started<>0
+                         THEN 'provider_stream_interrupted_no_side_effect'
+                     WHEN status='unknown'
+                         THEN 'provider_transport_failed_before_output'
                      ELSE 'provider_process_restarted_before_output' END,
                  observed_at=?, completed_at=?
              WHERE id IN (
@@ -1576,8 +1625,7 @@ impl ProviderRecoveryStore {
                  JOIN objective_bindings binding
                    ON binding.id=attempt.binding_id
                   AND binding.objective_id=attempt.objective_id
-                 WHERE attempt.status IN ('in_flight', 'unknown')
-                   AND attempt.output_started=0
+                 WHERE attempt.status IN ('in_flight', 'streaming', 'unknown')
                    AND attempt.side_effect_started=0
                    AND attempt.side_effect_receipt_id IS NULL
                    AND objective.status IN ('active', 'waiting_system')
@@ -1586,9 +1634,6 @@ impl ProviderRecoveryStore {
                        SELECT latest.id FROM provider_route_attempts latest
                        WHERE latest.episode_id=attempt.episode_id
                        ORDER BY latest.attempt_order DESC LIMIT 1)
-                   AND NOT EXISTS (
-                       SELECT 1 FROM provider_output_checkpoints checkpoint
-                       WHERE checkpoint.attempt_id=attempt.id)
                    AND NOT EXISTS (
                        SELECT 1 FROM chat_run_controls control
                        WHERE control.objective_id=objective.id

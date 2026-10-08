@@ -1402,6 +1402,31 @@ pub(crate) async fn settle_headless_chat_objective_from_outcome(
     .await
 }
 
+/// Separate the chat runner's failures that have a known meaning from the
+/// generic loop error, so the recovery ladder and the failed terminal can tell
+/// them apart.
+fn chat_failure_code_for_error(error_text: &str) -> &'static str {
+    if error_text.contains("PROVIDER_DURABLE_IDENTITY_MISMATCH") {
+        // U18/R3: reconciliation could not name a resume target, so this is
+        // deterministic, not transient. `bound_system_recovery` settles it
+        // as the failure terminal on the first occurrence — no second
+        // attempt with the same signature.
+        crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
+    } else if error_text.contains(crate::agent::provider_recovery::PROVIDER_EPISODE_FENCE_MARKER) {
+        // U21: the prior model request started a side effect that is still
+        // unresolved. It keeps the ordinary bounded ladder — the tool side may
+        // still reconcile that receipt — but ends with a reason the user can read.
+        crate::agent::objective::PROVIDER_EPISODE_UNRECONCILED
+    } else if matches!(
+        crate::agent::failover::classify_provider_failure(error_text),
+        crate::agent::failover::ProviderFailureClass::EndpointUnavailable
+    ) {
+        crate::agent::objective::PROVIDER_ENDPOINT_UNAVAILABLE
+    } else {
+        "agent_loop_error"
+    }
+}
+
 async fn settle_chat_objective_from_error(
     db: &sqlx::SqlitePool,
     app: &AppHandle,
@@ -1430,6 +1455,26 @@ async fn settle_chat_objective_from_error(
             current.revision
         )));
     }
+    if error_text.contains("PROVIDER_DURABLE_IDENTITY_SUPERSEDED") {
+        // U18/R3: this remediation belongs to a turn the Objective already
+        // replaced (the user's message took over and moved the live turn).
+        // Superseding the queued remediation — instead of creating a fresh one
+        // for the same stale turn — is what stops the session from looping on
+        // PROVIDER_DURABLE_IDENTITY_MISMATCH until the budget is gone. The live
+        // turn is the user's and keeps running on its own.
+        sqlx::query(
+            "UPDATE objective_remediations SET status='superseded',
+               lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE objective_id=?
+               AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(Utc::now().timestamp_millis())
+        .bind(objective_id)
+        .execute(db)
+        .await?;
+        project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
+        return Ok(current);
+    }
     let signal = if auth_expired {
         RouteSignal::AuthorizationRequired {
             domain: RecoveryDomain::Auth,
@@ -1442,14 +1487,7 @@ async fn settle_chat_objective_from_error(
         // loop error. The generic class earns the growing transient ladder;
         // this one cannot improve on its own, so it converges fast to a settled
         // state the user can act on instead of showing "等待中" for minutes.
-        let failure_code = if matches!(
-            crate::agent::failover::classify_provider_failure(error_text),
-            crate::agent::failover::ProviderFailureClass::EndpointUnavailable
-        ) {
-            crate::agent::objective::PROVIDER_ENDPOINT_UNAVAILABLE
-        } else {
-            "agent_loop_error"
-        };
+        let failure_code = chat_failure_code_for_error(error_text);
         let failure_signature = format!("sha256:{:x}", Sha256::digest(error_text.as_bytes()));
         // The signature makes repeats countable; it does not make them
         // readable. Keep a bounded, redacted copy so the next person to meet
@@ -3560,6 +3598,33 @@ fn select_chat_mode(
 mod tests {
     use super::*;
     use crate::agent::failover::{ActiveRouteState, EndpointHealthRegistry};
+
+    /// U21 (2026-10-07). The provider episode fence reaches the chat runner
+    /// wrapped by the transport ("open provider episode: …"). It must be
+    /// classified as its own failure code so the failed terminal can explain
+    /// it, instead of folding into the generic `agent_loop_error`.
+    #[test]
+    fn provider_episode_fence_is_classified_by_its_marker() {
+        let wrapped = format!(
+            "open provider episode: {}: prior provider episode is not proven replay-safe; \
+             observe/reconcile before a new Objective revision",
+            crate::agent::provider_recovery::PROVIDER_EPISODE_FENCE_MARKER
+        );
+        assert_eq!(
+            chat_failure_code_for_error(&wrapped),
+            crate::agent::objective::PROVIDER_EPISODE_UNRECONCILED
+        );
+        assert_eq!(
+            chat_failure_code_for_error(
+                "PROVIDER_DURABLE_IDENTITY_MISMATCH: remediation session/root changed"
+            ),
+            crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
+        );
+        assert_eq!(
+            chat_failure_code_for_error("something unrelated broke"),
+            "agent_loop_error"
+        );
+    }
     use crate::config::settings::{ApiStyle, Endpoint};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::time::Duration;

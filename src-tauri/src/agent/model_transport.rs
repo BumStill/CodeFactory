@@ -432,12 +432,55 @@ impl RoutedDesktopModelTransport {
             })?;
             let session_id: Option<String> = row.get("session_id");
             let objective_root: Option<String> = row.get("active_root_turn_id");
-            if session_id.as_deref() != Some(self.session_id.as_str())
-                || objective_root.as_deref() != Some(root_turn_id)
-            {
+            if session_id.as_deref() != Some(self.session_id.as_str()) {
                 return Err(TransportError::Fatal(
-                    "PROVIDER_DURABLE_IDENTITY_MISMATCH: remediation session/root changed".into(),
+                    "PROVIDER_DURABLE_IDENTITY_MISSING: remediation session changed".into(),
                 ));
+            }
+            if objective_root.as_deref() != Some(root_turn_id) {
+                // U18/R3: `root_turn_id` here is the session's latest user
+                // turn, but the Objective's live turn is its own
+                // `COALESCE(resume_cursor, root_turn_id)`. They diverge exactly
+                // when a user message superseded this system remediation. The
+                // old code fataled the same way every retry, burning the whole
+                // recovery budget on a deterministic error. Reconcile instead:
+                // ask the Objective which turn is live, and only an
+                // undecidable identity stops the run.
+                let active_root = objective_root.clone().unwrap_or_default();
+                let has_turn_state: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='chat_turn_state'",
+                )
+                .fetch_one(&self.db)
+                .await
+                .map_err(|error| provider_transport_error("reconcile remediation turn", error))?;
+                let superseded = if has_turn_state == 1 && !active_root.is_empty() {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM chat_turn_state turn
+                         JOIN objectives objective ON objective.id=turn.objective_id
+                         WHERE turn.objective_id=? AND turn.root_turn_id=?
+                           AND turn.session_id=?
+                           AND turn.status NOT IN ('completed','cancelled')
+                           AND objective.status NOT IN
+                               ('completed','cancelled','failed','legacy_orphan')",
+                    )
+                    .bind(&permit.objective_id)
+                    .bind(&active_root)
+                    .bind(self.session_id.as_str())
+                    .fetch_one(&self.db)
+                    .await
+                    .map_err(|error| {
+                        provider_transport_error("reconcile remediation turn", error)
+                    })?
+                        == 1
+                } else {
+                    false
+                };
+                return Err(TransportError::Fatal(if superseded {
+                    "PROVIDER_DURABLE_IDENTITY_SUPERSEDED: remediation superseded by the objective's current turn".into()
+                } else {
+                    "PROVIDER_DURABLE_IDENTITY_MISMATCH: remediation session/root changed".into()
+                }));
             }
             return Ok(Some(ProviderOwnerPermit::remediation(
                 &permit.objective_id,
@@ -3467,7 +3510,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_partial_sse_restart_is_checkpointed_and_never_posts_again() {
+    /// U21 (2026-10-07). A process that died mid-stream used to leave the
+    /// attempt `streaming` with no live owner, and every later resume died on
+    /// "prior provider episode is not proven replay-safe" with that same
+    /// signature. The stream is only text and no side effect had started, so the
+    /// reconciled attempt is replay-safe and the resume issues the next request.
+    async fn durable_partial_sse_restart_is_settled_replayable_and_resumes() {
         use crate::agent::objective::{
             CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
         };
@@ -3603,7 +3651,7 @@ mod tests {
             binding_id: claim.binding_id,
             resource_generation: claim.resource_generation,
         };
-        let (must_not_post_url, must_not_post_hits) = serve_responses(vec![(
+        let (resume_url, resume_hits) = serve_responses(vec![(
             "200 OK",
             "text/event-stream",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"duplicate\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
@@ -3616,7 +3664,7 @@ mod tests {
                 super::super::failover::RouteCandidatePlan::new(openai_candidate(
                     "durable-provider",
                     "durable-model",
-                    must_not_post_url,
+                    resume_url,
                 )),
                 super::super::failover::EndpointHealthRegistry::new(
                     std::time::Duration::from_secs(120),
@@ -3635,8 +3683,12 @@ mod tests {
         resumed
             .complete(&[], &tools, &RoundOptions::default())
             .await
-            .expect_err("partial output may not be replayed after restart");
-        assert_eq!(must_not_post_hits.load(Ordering::SeqCst), 0);
+            .expect("an interrupted stream with no side effect must be replayable");
+        assert_eq!(
+            resume_hits.load(Ordering::SeqCst),
+            1,
+            "the resumed attempt must actually issue the new request"
+        );
     }
 
     #[tokio::test]
