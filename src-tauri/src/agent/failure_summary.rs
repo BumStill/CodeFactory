@@ -119,6 +119,9 @@ pub fn plain_failure_reason(failure_code: Option<&str>) -> String {
         "context_compaction_exhausted" => "可用的对话上下文已经用完",
         "run_budget_exhausted" => "这一轮可用的执行预算已经用完",
         "agent_loop_error" => "执行过程本身出错",
+        "local_store_contended" => {
+            "多个会话同时写本地数据时一直互相冲突，已经按退避重试过仍没能写入"
+        }
         "delivery_identity_conflict" => "交付身份与已有记录冲突",
         "platform_incident" => "运行环境出现了持续问题",
         "test_failure" | "verification_failed" => "修改后测试没有通过",

@@ -2,9 +2,11 @@
 use chrono::Utc;
 use sqlx::{
     migrate::MigrateDatabase,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    Row, Sqlite, SqlitePool, Transaction,
 };
+use std::str::FromStr;
+use std::time::Duration;
 
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
@@ -143,6 +145,59 @@ pub(crate) fn process_identity_is_live(pid: u32, expected_start_token: Option<&s
     }
 }
 
+// The write-transaction entry point and its contention vocabulary live in a
+// dependency-free module (`storage::write_lock`) so the integration tests that
+// include production modules via `#[path]` reuse the *same* implementation the
+// app ships instead of a weaker test double. Re-exported here because
+// `storage::db` is the path every caller already uses.
+pub use super::write_lock::{
+    begin_write, contention_backoff, is_lock_contention, is_lock_contention_message, retry_write,
+    BUSY_TIMEOUT, CONTENTION_ATTEMPTS, LOCAL_STORE_CONTENDED,
+};
+
+/// Contention test for callers whose write goes through a store API that wraps
+/// its driver error in `anyhow` (the Objective store). Without this the caller
+/// only sees a rendered message string, which is exactly how a lost decision
+/// write used to look like an ordinary agent failure.
+pub fn is_contention_anyhow(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<sqlx::Error>()
+        .map(is_lock_contention)
+        .unwrap_or(false)
+        || is_lock_contention_message(&format!("{error:#}"))
+}
+
+/// The explicit per-connection configuration for the production pool.
+///
+/// Every field here is a pragma SQLite does *not* default the way the app
+/// needs, and it must hold for **every** connection in the pool, not just the
+/// one that happened to run a startup `PRAGMA`. `SqliteConnectOptions` is
+/// applied by sqlx on each new connection, which is the only way to guarantee
+/// that.
+fn pool_connect_options(
+    db_path: &str,
+) -> std::result::Result<SqliteConnectOptions, sqlx::Error> {
+    Ok(SqliteConnectOptions::from_str(db_path)?
+        .create_if_missing(true)
+        // WAL: readers never block the writer and the writer never blocks
+        // readers, which is what lets a monitoring `sqlite3` reader coexist
+        // with a live turn. Pinned so a future default change cannot silently
+        // move the app to a journal mode where that is false.
+        .journal_mode(SqliteJournalMode::Wal)
+        // FULL, the sqlx default this pool always ran with. NORMAL would save an
+        // fsync per commit, but it lets a machine-level power loss drop the
+        // last committed transactions — and side-effect receipts are what stop
+        // a push or publish from being dispatched twice after a crash. Lock
+        // contention is handled by IMMEDIATE writes and in-place retry, not by
+        // weakening durability.
+        .synchronous(SqliteSynchronous::Full)
+        // ON for every connection: without it `ON DELETE CASCADE` ownership
+        // (session → plan history, tasks → attempts) is silently not enforced
+        // on any connection that missed a one-off startup PRAGMA.
+        .foreign_keys(true)
+        .busy_timeout(BUSY_TIMEOUT))
+}
+
 pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     if !sqlx::Sqlite::database_exists(db_path)
         .await
@@ -150,9 +205,14 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     {
         sqlx::Sqlite::create_database(db_path).await?;
     }
+    // Configuring through `connect_with` (not a follow-up `PRAGMA`) is what
+    // makes journal mode / sync / FK / busy timeout apply to every pooled
+    // connection: sqlx runs these pragmas as part of each connection's
+    // handshake, and a failure to apply them fails the connect instead of
+    // being swallowed.
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(db_path)
+        .connect_with(pool_connect_options(db_path)?)
         .await?;
 
     // sqlx file-based migrations first — they handle the cases where a
@@ -167,10 +227,10 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     // Idempotent schema sync — see ensure_schema doc-comment for the why.
     ensure_schema(&pool).await?;
 
-    // Enable FK enforcement (SQLite disables it by default).
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(&pool)
-        .await?;
+    // Foreign keys need no follow-up PRAGMA here: `foreign_keys(true)` in
+    // `pool_connect_options` turns them on for every connection in the pool,
+    // including the four the previous single-shot `PRAGMA foreign_keys = ON`
+    // could never reach.
     Ok(pool)
 }
 
@@ -1676,6 +1736,7 @@ mod tests {
     use super::*;
     use crate::util::no_window::NoWindow;
     use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::ConnectOptions;
 
     /// The WAL sidecars must be gone once the pool is closed, every single time.
     ///
@@ -2753,5 +2814,499 @@ mod tests {
 
         // Idempotent: a second pass is a no-op, so it can run on every boot.
         assert_eq!(backfill_session_activity_time(&pool).await.unwrap(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // U23 — parallel sessions must not interrupt each other on the SQLite
+    // write lock. These use a real temp-file database in WAL mode (never
+    // `:memory:`, which shares one connection and cannot reproduce the
+    // cross-connection lock behaviour at all).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A real on-disk WAL database plus the URL the app hands to `connect`.
+    /// Returns the pool and the directory so the caller can clean it up.
+    async fn temp_file_pool() -> (SqlitePool, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("codefactory-u23-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("u23.db");
+        let url = format!("sqlite:{}", db_path.display());
+        let pool = connect(&url).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS u23_counter (
+                 id INTEGER PRIMARY KEY CHECK(id = 1),
+                 n  INTEGER NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO u23_counter(id, n) VALUES (1, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        (pool, root)
+    }
+
+    async fn counter(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT n FROM u23_counter WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The control: this is the shape the app shipped for years, and it is what
+    /// produced the two production failures on 2026-10-08. A deferred
+    /// transaction reads first (taking a WAL read snapshot) and writes later; if
+    /// any other connection commits in between, the write upgrade fails
+    /// **immediately** — `busy_timeout` deliberately does not apply to
+    /// `SQLITE_BUSY_SNAPSHOT`.
+    ///
+    /// If this ever stops failing, the green result of the test below stops
+    /// proving anything: it would mean the harness can no longer see the bug.
+    #[tokio::test]
+    async fn deferred_read_then_write_still_collides_between_connections() {
+        let (pool, root) = temp_file_pool().await;
+
+        let mut deferred = pool.begin().await.unwrap();
+        // Read first — this is what pins the snapshot.
+        let _: i64 = sqlx::query_scalar("SELECT n FROM u23_counter WHERE id = 1")
+            .fetch_one(&mut *deferred)
+            .await
+            .unwrap();
+
+        // A second connection (a parallel session) commits in between.
+        let sibling = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                pool_connect_options(&format!("sqlite:{}", root.join("u23.db").display()))
+                    .expect("parse connect options"),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+            .execute(&sibling)
+            .await
+            .unwrap();
+
+        let error = sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+            .execute(&mut *deferred)
+            .await
+            .expect_err("a deferred read-then-write must not be allowed to upgrade");
+        assert!(
+            is_lock_contention(&error),
+            "expected SQLITE_BUSY/BUSY_SNAPSHOT contention, got: {error}"
+        );
+
+        drop(deferred);
+        sibling.close().await;
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The fix. N sessions each run the *same* read-then-write transaction shape
+    /// concurrently against one database. Before `begin_write` this reproduced
+    /// code 517 (or code 5 once the busy timeout expired) and lost writes; with
+    /// it every transaction completes and every write lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_read_then_write_transactions_all_land() {
+        const SESSIONS: i64 = 8;
+        const ROUNDS: i64 = 12;
+
+        let (pool, root) = temp_file_pool().await;
+        let mut sessions = Vec::new();
+        for _ in 0..SESSIONS {
+            let pool = pool.clone();
+            sessions.push(tokio::spawn(async move {
+                for _ in 0..ROUNDS {
+                    // BEGIN IMMEDIATE: the write lock is taken before the read,
+                    // so a parallel commit can never invalidate our snapshot.
+                    let mut tx = begin_write(&pool)
+                        .await
+                        .expect("a parallel session must not lose the write lock");
+                    let _: i64 = sqlx::query_scalar("SELECT n FROM u23_counter WHERE id = 1")
+                        .fetch_one(&mut *tx)
+                        .await
+                        .expect("read inside the write transaction");
+                    sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+                        .execute(&mut *tx)
+                        .await
+                        .expect("write inside the write transaction");
+                    tx.commit().await.expect("commit");
+                }
+            }));
+        }
+        for session in sessions {
+            session.await.expect("no session panicked");
+        }
+
+        assert_eq!(
+            counter(&pool).await,
+            SESSIONS * ROUNDS,
+            "every read-then-write round must have landed exactly once"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An external read-only observer (the user's `sqlite3` CLI, a monitoring
+    /// script) periodically holds a read snapshot. Writers share the WAL with
+    /// readers by design, so this must never make a write fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_read_only_observer_never_fails_a_writer() {
+        const ROUNDS: i64 = 25;
+
+        let (pool, root) = temp_file_pool().await;
+        let observer = SqliteConnectOptions::from_str(&format!(
+            "sqlite:{}",
+            root.join("u23.db").display()
+        ))
+        .unwrap()
+        .read_only(true)
+        .busy_timeout(Duration::from_secs(2));
+
+        let observer_task = tokio::spawn(async move {
+            let mut connection = observer.connect().await.unwrap();
+            for _ in 0..ROUNDS {
+                // Hold a read snapshot across the writer's commit window.
+                sqlx::query("BEGIN").execute(&mut connection).await.unwrap();
+                let _: i64 = sqlx::query_scalar("SELECT n FROM u23_counter WHERE id = 1")
+                    .fetch_one(&mut connection)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(3)).await;
+                sqlx::query("COMMIT")
+                    .execute(&mut connection)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        for _ in 0..ROUNDS {
+            let mut tx = begin_write(&pool)
+                .await
+                .expect("an external reader must never fail a writer");
+            sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+                .execute(&mut *tx)
+                .await
+                .expect("write while a reader holds a snapshot");
+            tx.commit().await.expect("commit while a reader holds a snapshot");
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        observer_task.await.unwrap();
+
+        assert_eq!(counter(&pool).await, ROUNDS);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A writer that holds the write lock briefly must make a parallel session
+    /// *wait*, not fail. This is the "retry in place" contract at the acquisition
+    /// boundary: nothing is surfaced to the agent while the lock is only busy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn begin_write_waits_for_a_contended_writer_instead_of_failing() {
+        let (pool, root) = temp_file_pool().await;
+
+        let holder_pool = pool.clone();
+        let holder = tokio::spawn(async move {
+            let mut tx = holder_pool.begin().await.unwrap();
+            sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tx.commit().await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let started = std::time::Instant::now();
+        let mut tx = begin_write(&pool)
+            .await
+            .expect("a busy-but-live writer must not surface as an error");
+        let waited = started.elapsed();
+        sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        holder.await.unwrap();
+
+        assert!(
+            waited >= Duration::from_millis(150),
+            "the second writer must have waited for the lock, waited only {waited:?}"
+        );
+        assert_eq!(counter(&pool).await, 2, "both writes must land");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The old code ran `PRAGMA foreign_keys = ON` once, on whichever connection
+    /// the pool happened to hand back. Every connection in the pool must carry
+    /// the app's pragmas, because a connection that missed them silently skips
+    /// `ON DELETE CASCADE` and can block on a 5s timeout.
+    #[tokio::test]
+    async fn every_pooled_connection_carries_the_configured_pragmas() {
+        let (pool, root) = temp_file_pool().await;
+
+        // Hold every connection the pool owns at once (deferred BEGIN does not
+        // take the write lock), so each query below runs on a distinct one.
+        let mut held = Vec::new();
+        for index in 0..5 {
+            held.push(
+                pool.begin()
+                    .await
+                    .unwrap_or_else(|error| panic!("pin pooled connection {index}: {error}")),
+            );
+        }
+
+        let mut observed = Vec::new();
+        for tx in held.iter_mut() {
+            let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(&mut **tx)
+                .await
+                .unwrap();
+            let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+                .fetch_one(&mut **tx)
+                .await
+                .unwrap();
+            let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&mut **tx)
+                .await
+                .unwrap();
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&mut **tx)
+                .await
+                .unwrap();
+            observed.push((foreign_keys, busy_timeout, journal_mode, synchronous));
+        }
+        for tx in held {
+            tx.rollback().await.unwrap();
+        }
+
+        assert_eq!(observed.len(), 5, "all five connections were pinned");
+        for (foreign_keys, busy_timeout, journal_mode, synchronous) in observed {
+            assert_eq!(
+                foreign_keys, 1,
+                "foreign key enforcement must be on per connection"
+            );
+            assert_eq!(
+                busy_timeout,
+                BUSY_TIMEOUT.as_millis() as i64,
+                "each connection must carry the explicit busy timeout"
+            );
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            // SQLITE_SYNC_FULL = 2.
+            assert_eq!(synchronous, 2, "FULL: receipts must survive a power loss");
+        }
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Table-driven: the rendered messages of the two production failures must
+    /// be recognised as local storage contention, and unrelated text must not.
+    /// The chat runner turns this predicate into the `local_store_contended`
+    /// failure code instead of `agent_loop_error`.
+    #[test]
+    fn busy_lock_messages_are_classified_as_local_contention() {
+        for message in [
+            "provider output checkpoint failed: error returned from database: (code: 5) database is locked",
+            "provider failure receipt failed: error returned from database: (code: 517) database is locked",
+            "database is locked",
+            "SQLITE_BUSY",
+            "sqlite3.SqliteError: database table is locked",
+            "a session could not write: DatabaseTableIsLocked",
+        ] {
+            assert!(
+                is_lock_contention_message(message),
+                "must classify as local contention: {message}"
+            );
+        }
+        for message in [
+            "something unrelated broke",
+            "provider request rejected: HTTP (code: 500)",
+            "open provider episode: prior provider episode is not proven replay-safe",
+            "",
+        ] {
+            assert!(
+                !is_lock_contention_message(message),
+                "must NOT classify as local contention: {message}"
+            );
+        }
+    }
+
+    /// R6 (U23): a write that survives the busy timeout is retried in place, with
+    /// backoff, before it is ever surfaced — and a retry that succeeds must
+    /// return the operation's own result rather than a synthetic one. The
+    /// contention error here is a driver error carrying the rendered message,
+    /// which is exactly how a wrapped store error arrives.
+    #[tokio::test]
+    async fn retry_write_retries_a_contended_operation_in_place() {
+        let contended = || sqlx::Error::Protocol("error returned from database: database is locked".into());
+        assert!(
+            is_lock_contention(&contended()),
+            "the injected error must be recognised as contention"
+        );
+
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_write(|| async {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if attempt < 3 {
+                Err(contended())
+            } else {
+                Ok(attempt)
+            }
+        })
+        .await;
+
+        assert_eq!(result.expect("the third attempt must succeed"), 3);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the operation must be replayed until it is no longer contended"
+        );
+    }
+
+    /// The failure classification for a *driver* error is the code, not the
+    /// rendered text: `SQLITE_BUSY` (5) and `SQLITE_BUSY_SNAPSHOT` (517) are
+    /// both contention, and neither is an agent-loop error.
+    #[tokio::test]
+    async fn driver_busy_codes_are_contention_not_agent_errors() {
+        let (pool, root) = temp_file_pool().await;
+        let mut deferred = pool.begin().await.unwrap();
+        let _: i64 = sqlx::query_scalar("SELECT n FROM u23_counter WHERE id = 1")
+            .fetch_one(&mut *deferred)
+            .await
+            .unwrap();
+        let sibling = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                pool_connect_options(&format!("sqlite:{}", root.join("u23.db").display()))
+                    .expect("parse connect options"),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+            .execute(&sibling)
+            .await
+            .unwrap();
+        let error = sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+            .execute(&mut *deferred)
+            .await
+            .expect_err("deferred upgrade must fail");
+
+        let code = match &error {
+            sqlx::Error::Database(database) => database
+                .code()
+                .and_then(|code| code.parse::<i32>().ok())
+                .unwrap_or_default(),
+            other => panic!("expected a driver error, got {other}"),
+        };
+        assert_eq!(
+            code, 517,
+            "a deferred read-then-write upgrade is SQLITE_BUSY_SNAPSHOT"
+        );
+        assert!(is_lock_contention(&error));
+        assert!(is_lock_contention_message(&error.to_string()));
+
+        drop(deferred);
+        sibling.close().await;
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The measured BEFORE number, on the exact same parallel shape as the test
+    /// above (8 sessions × 12 read-then-write rounds) but with the connection
+    /// configuration the app actually shipped: `SqlitePoolOptions::new()
+    /// .max_connections(5).connect(url)` and therefore sqlx's plain default
+    /// 5-second busy timeout. Writes are lost and the collisions are real.
+    ///
+    /// It is written as a test rather than a one-off measurement so the green
+    /// result of the fix stays meaningful: if this ever stops failing, the
+    /// harness has stopped being able to see the bug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn before_the_fix_the_same_parallel_shape_lost_writes() {
+        const SESSIONS: i64 = 8;
+        const ROUNDS: i64 = 12;
+
+        let root = std::env::temp_dir().join(format!("codefactory-u23-before-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite:{}", root.join("u23.db").display());
+        // The pre-fix production configuration, verbatim: sqlx's own defaults
+        // (`SqlitePoolOptions::new().max_connections(5)`), never our pinned
+        // pragmas. Only `create_if_missing` is set, because the file does not
+        // exist yet and the shipped code created it through
+        // `sqlx::Sqlite::create_database` first.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(
+                SqliteConnectOptions::from_str(&url)
+                    .expect("parse the url")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS u23_counter (
+                 id INTEGER PRIMARY KEY CHECK(id = 1), n INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO u23_counter(id, n) VALUES (1, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let mut sessions = Vec::new();
+        for _ in 0..SESSIONS {
+            let pool = pool.clone();
+            let failures = failures.clone();
+            sessions.push(tokio::spawn(async move {
+                for _ in 0..ROUNDS {
+                    // The shipped shape: deferred, read first, upgrade later.
+                    let mut tx = pool.begin().await.unwrap();
+                    let _: i64 = sqlx::query_scalar("SELECT n FROM u23_counter WHERE id = 1")
+                        .fetch_one(&mut *tx)
+                        .await
+                        .unwrap();
+                    if sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
+                        .execute(&mut *tx)
+                        .await
+                        .is_err()
+                    {
+                        failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        drop(tx);
+                        continue;
+                    }
+                    if tx.commit().await.is_err() {
+                        failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }));
+        }
+        for session in sessions {
+            session.await.unwrap();
+        }
+
+        let landed = counter(&pool).await;
+        let failures = failures.load(std::sync::atomic::Ordering::SeqCst);
+        println!(
+            "U23 before/after — BEFORE: {failures} of {} read-then-write rounds lost, \
+             {landed} writes landed",
+            SESSIONS * ROUNDS
+        );
+        assert!(
+            failures > 0,
+            "the pre-fix configuration must lose at least one write under {SESSIONS} parallel \
+             sessions; if it does not, this harness can no longer see the bug the fix addresses"
+        );
+        assert!(
+            landed < SESSIONS * ROUNDS,
+            "the pre-fix configuration must not land every write"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
