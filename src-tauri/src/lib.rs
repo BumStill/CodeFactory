@@ -38,6 +38,75 @@ use util::no_window::NoWindow;
 
 pub type PendingPermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 
+/// M30: process-local stop flags keyed by `run_instance_id`.
+///
+/// The cooperative stop signal for a chat run lives in an `Arc<AtomicBool>`
+/// owned by the command that started it, so only that command could raise it.
+/// A background actor (the incident controller, convergence, the delivery
+/// supervisor) holds nothing but the durable identity, and that is exactly the
+/// gap M30 names: it could write `chat_run_controls.status='completed'` and the
+/// closing statement while the flag stayed `false` and the loop kept running.
+///
+/// The registry is the missing handle. It is keyed by the same opaque
+/// `run_instance_id` the durable row uses, so a background settlement can raise
+/// the flag the running `AgentLoop` and its in-flight tool actually observe.
+/// Weak references on purpose: a finished run drops its control and leaves
+/// nothing behind, and a dead entry also tells us the run is over.
+static CHAT_RUN_STOP_FLAGS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<AtomicBool>>>,
+> = std::sync::OnceLock::new();
+
+fn chat_run_stop_flags()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<AtomicBool>>> {
+    CHAT_RUN_STOP_FLAGS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lock_chat_run_stop_flags()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<String, std::sync::Weak<AtomicBool>>> {
+    // A poisoned registry must not turn recovery into a panic: the flags are a
+    // best-effort cooperative signal and the durable `cancel_requested_at` is
+    // the authority. Recover the guard and keep going.
+    chat_run_stop_flags()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Publish a run's stop flag so a background settlement can reach it.
+pub fn register_chat_run_stop_flag(run_instance_id: &str, cancel: &Arc<AtomicBool>) {
+    let mut flags = lock_chat_run_stop_flags();
+    // Drop dead entries while we hold the lock; the registry must not grow
+    // without bound across a long-lived desktop session.
+    flags.retain(|_, weak| weak.strong_count() > 0);
+    flags.insert(run_instance_id.to_string(), Arc::downgrade(cancel));
+}
+
+/// Raise the cooperative stop flag for `run_instance_id`.
+///
+/// Returns `true` only when a live flag in THIS process was actually raised —
+/// i.e. the run really is still here and is now being told to stop. A `false`
+/// means the process-local half is already gone (the run finished, or another
+/// process owns it), which callers treat as "nothing to wait for".
+pub fn request_chat_run_stop(run_instance_id: &str) -> bool {
+    let flags = lock_chat_run_stop_flags();
+    let Some(weak) = flags.get(run_instance_id) else {
+        return false;
+    };
+    let Some(cancel) = weak.upgrade() else {
+        return false;
+    };
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    true
+}
+
+/// Is a live stop flag still registered for this run in this process? A live
+/// flag is how a caller tells "the run is still unwinding" from "it is done".
+pub fn chat_run_is_live(run_instance_id: &str) -> bool {
+    let flags = lock_chat_run_stop_flags();
+    flags
+        .get(run_instance_id)
+        .is_some_and(|weak| weak.upgrade().is_some())
+}
+
 /// Process-local handle for one chat runner. The flag remains the cooperative
 /// AgentLoop stop signal; SQLite owns the exact root/opaque-Objective identity.
 #[derive(Debug)]
@@ -49,18 +118,24 @@ pub struct ChatRunControl {
 
 impl ChatRunControl {
     pub fn pending() -> Self {
-        Self {
-            run_instance_id: uuid::Uuid::new_v4().to_string(),
-            cancel: Arc::new(AtomicBool::new(false)),
-            durable: true,
-        }
+        Self::with_durability(true)
     }
 
     pub fn ephemeral() -> Self {
+        Self::with_durability(false)
+    }
+
+    fn with_durability(durable: bool) -> Self {
+        let run_instance_id = uuid::Uuid::new_v4().to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // M30: every chat run is reachable from its durable `run_instance_id`,
+        // so a background settlement can stop it without holding the command's
+        // handle.
+        register_chat_run_stop_flag(&run_instance_id, &cancel);
         Self {
-            run_instance_id: uuid::Uuid::new_v4().to_string(),
-            cancel: Arc::new(AtomicBool::new(false)),
-            durable: false,
+            run_instance_id,
+            cancel,
+            durable,
         }
     }
 }
