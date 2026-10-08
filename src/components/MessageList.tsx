@@ -379,13 +379,29 @@ export function MessageList({
         tailTool?.result?.length ?? 0,
         tailMessage.completionState ?? "",
       ].join(":");
+  // Rows the conversation actually shows. Computed before the branch below so
+  // the start page is decided by "there is nothing to show", not by a raw
+  // message count: a session whose history is still loading — or one whose
+  // history holds only tool/system rows — used to fall through to the message
+  // branch and paint an empty page.
+  const visible = messages.filter(
+    (m) =>
+      m.role !== "tool" &&
+      m.completionState !== "rejected_candidate" &&
+      (m.role !== "system" || m.completionState === "turn_notice"),
+  );
+  const showingStartPage = visible.length === 0;
   const {
     scrollerRef,
     pinned,
     hasNewContent,
     jumpToBottom,
     prepareForPrepend,
-  } = useStickyAutoScroll(resolvedConversationKey, contentSignal);
+  } = useStickyAutoScroll(
+    resolvedConversationKey,
+    contentSignal,
+    showingStartPage ? "top" : "bottom",
+  );
   const conversationKeyRef = useRef(resolvedConversationKey);
   conversationKeyRef.current = resolvedConversationKey;
   const loadOlder = useCallback(async () => {
@@ -404,7 +420,7 @@ export function MessageList({
     });
   }, [onLoadOlder, prepareForPrepend, scrollerRef]);
 
-  if (messages.length === 0) {
+  if (showingStartPage) {
     return (
       <div className="relative flex-1 min-h-0">
         {/* Same containment as the message branch below: the wrapper owns the
@@ -412,7 +428,13 @@ export function MessageList({
             block child here sizes to its own content instead, spills past the
             wrapper, and — because the wrapper is positioned and the composer is
             not — paints on top of the composer, burying the input. */}
-        <div className="absolute inset-0 overflow-y-auto">
+        {/* The ref matters as much as the containment: React reuses this box
+            across the start-page/conversation swap, so the previous
+            conversation's scroll offset survives into it. Registering the
+            scroller is what lets the hook reset the start page to its own top
+            (`mode="top"`) instead of opening half-scrolled with the usage card
+            cut off above the fold. */}
+        <div ref={scrollerRef} className="absolute inset-0 overflow-y-auto">
           <WelcomeScreen
             onUsePrompt={onUsePrompt}
             onOpenUsage={onOpenUsage}
@@ -434,12 +456,6 @@ export function MessageList({
     );
   }
 
-  const visible = messages.filter(
-    (m) =>
-      m.role !== "tool" &&
-      m.completionState !== "rejected_candidate" &&
-      (m.role !== "system" || m.completionState === "turn_notice"),
-  );
   let latestUserIndex = -1;
   let latestAssistantIndex = -1;
   visible.forEach((message, index) => {

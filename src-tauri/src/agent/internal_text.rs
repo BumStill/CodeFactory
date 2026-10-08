@@ -20,6 +20,10 @@ use crate::openrouter::types::{ChatMessage, Usage};
 
 pub(crate) struct InternalTextOutput {
     pub(crate) text: String,
+    /// Hidden reasoning trace when the route answered with one. Thinking routes
+    /// can leave `text` empty and put the whole answer here, so the title path
+    /// reads this field instead of declaring the attempt invalid.
+    pub(crate) reasoning: Option<String>,
     pub(crate) usage: Option<Usage>,
     pub(crate) endpoint_name: String,
     pub(crate) model_id: String,
@@ -77,6 +81,10 @@ pub(crate) async fn generate_bounded_text(
             api_style: route_for_request.api_style.clone(),
             cancel: None,
             max_output_tokens: Some(max_output_tokens),
+            // App-owned metadata is not a chat turn: paying for (and being
+            // truncated by) hidden reasoning is what made every title request
+            // through a thinking route return an empty answer.
+            thinking_disabled: true,
             retry_response_body: crate::http_util::RetryResponseBody::Redact,
             provider_attempt: None,
         };
@@ -94,6 +102,7 @@ pub(crate) async fn generate_bounded_text(
     .map_err(|_| "SESSION_TITLE_TIMEOUT".to_string())??;
     Ok(InternalTextOutput {
         text: response.text,
+        reasoning: response.reasoning,
         usage: response.usage,
         endpoint_name: route.endpoint_name,
         model_id: route.model_id,
