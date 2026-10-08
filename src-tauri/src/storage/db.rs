@@ -184,11 +184,13 @@ fn pool_connect_options(
         // with a live turn. Pinned so a future default change cannot silently
         // move the app to a journal mode where that is false.
         .journal_mode(SqliteJournalMode::Wal)
-        // NORMAL is the documented pairing for WAL: a committed transaction
-        // survives an application crash, and only a machine-level power loss
-        // can drop the tail. It also removes one fsync per commit, which
-        // shortens exactly the lock hold times this change is about.
-        .synchronous(SqliteSynchronous::Normal)
+        // FULL, the sqlx default this pool always ran with. NORMAL would save an
+        // fsync per commit, but it lets a machine-level power loss drop the
+        // last committed transactions — and side-effect receipts are what stop
+        // a push or publish from being dispatched twice after a crash. Lock
+        // contention is handled by IMMEDIATE writes and in-place retry, not by
+        // weakening durability.
+        .synchronous(SqliteSynchronous::Full)
         // ON for every connection: without it `ON DELETE CASCADE` ownership
         // (session → plan history, tasks → attempts) is silently not enforced
         // on any connection that missed a one-off startup PRAGMA.
@@ -3092,8 +3094,8 @@ mod tests {
                 "each connection must carry the explicit busy timeout"
             );
             assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-            // SQLITE_SYNC_NORMAL = 1.
-            assert_eq!(synchronous, 1);
+            // SQLITE_SYNC_FULL = 2.
+            assert_eq!(synchronous, 2, "FULL: receipts must survive a power loss");
         }
 
         pool.close().await;
