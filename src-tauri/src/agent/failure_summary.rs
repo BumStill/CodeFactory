@@ -74,6 +74,11 @@ pub struct UnmetCheck {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeliveredUnverified {
     pub reference: String,
+    /// True when the work is on a pull request. Commits that only exist on a
+    /// local branch have not left the machine, so they are never called
+    /// "delivered" — the headline says where they are and that nothing was
+    /// pushed yet.
+    pub on_pull_request: bool,
     pub checks: Vec<UnmetCheck>,
 }
 
@@ -342,15 +347,20 @@ fn render_delivered_unverified_report(
     } else {
         reference
     };
-    let _ = writeln!(
-        out,
-        "{}",
+    let headline = if delivered.on_pull_request {
         join_reference(
             "改动已交付到",
             reference,
-            "；系统未能确认下面这些检查已重跑并通过："
+            "；系统未能确认下面这些检查已重跑并通过：",
         )
-    );
+    } else {
+        join_reference(
+            "改动已经提交在本机的",
+            reference,
+            "上（还没推送，也没有开 PR）；系统未能确认下面这些检查已重跑并通过：",
+        )
+    };
+    let _ = writeln!(out, "{headline}");
     match detail {
         CheckDetail::Full | CheckDetail::MessagesOnly => {
             if delivered.checks.is_empty() {
@@ -596,6 +606,7 @@ mod tests {
             },
             DeliveredUnverified {
                 reference: "PR #572".to_string(),
+                on_pull_request: true,
                 checks: vec![UnmetCheck {
                     message: "修改后没有重跑测试".to_string(),
                     check: Some("check X".to_string()),
@@ -617,6 +628,24 @@ mod tests {
         assert!(text.contains("cargo test --lib"), "{text}");
         assert!(!text.contains("没做成"), "{text}");
         assert!(!text.contains("目标没有达成"), "{text}");
+        assert_no_internal_vocabulary(&text).unwrap();
+    }
+
+    /// U1b (review): commits that only exist on a local branch have not left
+    /// the machine. Calling them "delivered" would trade one false claim for
+    /// another, so the headline says where they are and that nothing was pushed.
+    #[test]
+    fn local_commits_are_not_called_delivered() {
+        let (mut work, mut delivered) = delivered_sample();
+        work.pr_url = None;
+        work.pr_state = None;
+        delivered.reference = "分支 codefactory/u1b-terminal".to_string();
+        delivered.on_pull_request = false;
+        let text = build_delivered_unverified_report("把导出改成流式写入", &work, &delivered);
+        assert!(!text.contains("已交付"), "{text}");
+        assert!(text.contains("分支 codefactory/u1b-terminal"), "{text}");
+        assert!(text.contains("还没推送"), "{text}");
+        assert!(!text.contains("没做成"), "{text}");
         assert_no_internal_vocabulary(&text).unwrap();
     }
 

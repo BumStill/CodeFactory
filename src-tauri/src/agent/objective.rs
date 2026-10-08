@@ -6283,6 +6283,7 @@ impl ObjectiveStore {
         let reference = self.delivered_reference(current, work).await?;
         Some(crate::agent::failure_summary::DeliveredUnverified {
             reference,
+            on_pull_request: work.pr_url.is_some(),
             checks: gate.map(|verdict| verdict.1).unwrap_or_default(),
         })
     }
