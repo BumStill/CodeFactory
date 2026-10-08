@@ -221,6 +221,55 @@ impl Persistence for SqlitePersistence {
         Ok(())
     }
 
+    /// R1: persist one completion-gate rejection with its structured blockers
+    /// into `objective_events.detail_json`.
+    ///
+    /// Best-effort by construction: an anonymous run, a missing root turn, an
+    /// unprojected Objective, or an empty blocker list all return `Ok(())`.
+    /// This records a diagnosis of a verdict the loop already made; failing to
+    /// write it must never be able to change that verdict.
+    async fn record_completion_gate_verdict(
+        &self,
+        root_turn_id: Option<&str>,
+        verdict: &str,
+        blockers_json: &str,
+    ) -> PersistResult<()> {
+        if self.anonymous || blockers_json.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(root_turn_id) = root_turn_id else {
+            return Ok(());
+        };
+        let objective_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT objective_id FROM chat_turn_state WHERE root_turn_id=?",
+        )
+        .bind(root_turn_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(perr)?
+        .flatten()
+        .filter(|value| !value.is_empty());
+        let Some(objective_id) = objective_id else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO objective_events
+             (id, objective_id, revision, event_type, status, decision_type,
+              domain, failure_code, detail_json, created_at)
+             SELECT ?, id, revision, 'completion_gate_verdict', status,
+                    decision_type, 'chat', ?, ?, ? FROM objectives WHERE id=?",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(verdict)
+        .bind(blockers_json)
+        .bind(Utc::now().timestamp_millis())
+        .bind(&objective_id)
+        .execute(&self.db)
+        .await
+        .map_err(perr)?;
+        Ok(())
+    }
+
     async fn update_turn_activity(&self, update: &TurnActivityUpdate) -> PersistResult<i64> {
         if self.anonymous {
             return Ok(0);

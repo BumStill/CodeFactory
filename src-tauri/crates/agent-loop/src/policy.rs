@@ -18,7 +18,8 @@ use crate::run::{FinalizationPolicy, TurnCapability};
 use crate::types::{StreamEvent, ToolDefinition};
 use codefactory_agent_core::{
     build_completion_recovery_prompt, classify_command,
-    evaluate_budget_command_with_time_in_directory, CompletionEvidence, CompletionGate,
+    evaluate_budget_command_with_time_in_directory, CompletionBlocker, CompletionEvidence,
+    CompletionGate, DeliveryArtifact,
     PolicyDecision, ProgressTracker, ToolKind, ToolOutcome,
 };
 use std::path::Path;
@@ -281,11 +282,55 @@ pub fn completion_finalization(
 /// of work they never did. The unmet checks ship with the warning rather than
 /// going to the log alone, because a user staring at a stopped turn otherwise
 /// has no way to tell what the gate wanted.
+///
+/// The run's delivery reference, when delivery already landed and nothing else
+/// is still open against it.
+///
+/// A turn whose remaining gap IS delivery has not delivered anything, so an
+/// open `delivery_completion_open` blocker disqualifies the reference.
+fn delivered_reference(evidence: &CompletionEvidence) -> Option<String> {
+    let artifact = evidence.delivery_artifact.as_ref()?;
+    let delivery_open = evidence
+        .blockers_structured
+        .iter()
+        .any(|blocker| blocker.kind == "delivery_completion_open");
+    (!delivery_open).then(|| artifact.reference.clone())
+}
+
+/// R4: the changes are already delivered (a PR exists, or the workspace has
+/// commits) and the only remaining gap is verification evidence. The summary
+/// must state that fact and name the specific checks.
+///
+/// The blanket "本轮任务未完成，目标未达成" wording was *lying* here: the U18
+/// session had just reported a completed task with an open PR and a green full
+/// suite when the gate ruled it incomplete three times and then told the user
+/// nothing had been achieved.
+pub fn delivered_but_unverified_summary(
+    evidence: &CompletionEvidence,
+    delivered: &str,
+) -> String {
+    let mut summary = format!(
+        "改动已交付到{delivered}；系统未能确认以下检查已按要求重跑并通过，因此本轮的自动验收没有闭环："
+    );
+    for blocker in evidence.blockers_structured.iter().take(6) {
+        summary.push_str("\n- ");
+        summary.push_str(&blocker.message);
+    }
+    if evidence.blockers_structured.is_empty() {
+        summary.push_str("\n- 未记录到具体的未满足检查。");
+    }
+    summary.push_str("\n改动本身已经落地，可在对应的 PR 里继续核对以上检查。");
+    summary
+}
+
 pub fn unverified_release_warning(evidence: &CompletionEvidence) -> String {
     tracing::info!(
         "releasing chat turn with unverified blockers: {}",
         evidence.blockers.join("; ")
     );
+    if let Some(delivered) = delivered_reference(evidence) {
+        return delivered_but_unverified_summary(evidence, &delivered);
+    }
     let cause = if evidence.last_mutation_sequence.is_some() {
         "修改后仍有检查未复验，或失败检查尚未修复并重跑"
     } else {
@@ -354,11 +399,23 @@ pub fn segment_checkpoint_decision(
     if evidence.completed {
         return SegmentCheckpointDecision::Complete;
     }
+    // R5: a segment checkpoint is not a completion verdict. While the evidence
+    // ledger is still materially advancing, another segment is the right answer
+    // — the 2026-09-29 16:18/16:20 sessions were ruled failures twice within
+    // six minutes of starting, while the work was still underway.
+    //
+    // The safety cap is deliberately unchanged: a checkpoint with no material
+    // progress keeps the old stop, so a loop that is going in circles is still
+    // cut off at the cap.
+    let retryable = matches!(
+        policy,
+        FinalizationPolicy::ReleaseWithWarning | FinalizationPolicy::BlockOnIncomplete
+    );
+    if retryable && (material_progress || stalled_segments_before + 1 < MAX_STALLED_CHAT_SEGMENTS) {
+        return SegmentCheckpointDecision::Continue;
+    }
     if !matches!(policy, FinalizationPolicy::ReleaseWithWarning) {
         return SegmentCheckpointDecision::Terminal;
-    }
-    if material_progress || stalled_segments_before + 1 < MAX_STALLED_CHAT_SEGMENTS {
-        return SegmentCheckpointDecision::Continue;
     }
     SegmentCheckpointDecision::Pause(
         "连续两个执行段未取得可验证进展，已停止自动重试以避免原地循环。\
@@ -1779,6 +1836,83 @@ mod tests {
         // The eval sidecar is the most unattended surface there is; leaving it
         // out is what broke the headless finalization round after #260.
         assert!(completion_ready_applies(FinalizationPolicy::Benchmark));
+    }
+
+    /// R5: a segment checkpoint must not cut off a task that is still making
+    /// material progress — the 2026-09-29 16:18/16:20 sessions were ruled
+    /// failures twice within six minutes of starting, mid-work.
+    #[test]
+    fn checkpoint_keeps_a_progressing_task_alive() {
+        for policy in [
+            FinalizationPolicy::ReleaseWithWarning,
+            FinalizationPolicy::BlockOnIncomplete,
+        ] {
+            assert_eq!(
+                segment_checkpoint_decision(
+                    &evidence(false, &["check X has not been rerun"]),
+                    policy,
+                    true,
+                    0,
+                ),
+                SegmentCheckpointDecision::Continue,
+                "{policy:?} must continue while the evidence ledger advances"
+            );
+        }
+        // The safety cap is unchanged: no progress still stops.
+        assert_eq!(
+            segment_checkpoint_decision(
+                &evidence(false, &["same blocker"]),
+                FinalizationPolicy::BlockOnIncomplete,
+                false,
+                MAX_STALLED_CHAT_SEGMENTS,
+            ),
+            SegmentCheckpointDecision::Terminal
+        );
+        // The eval sidecar keeps its terminal semantics.
+        assert_eq!(
+            segment_checkpoint_decision(
+                &evidence(false, &["same blocker"]),
+                FinalizationPolicy::Benchmark,
+                true,
+                0,
+            ),
+            SegmentCheckpointDecision::Terminal
+        );
+    }
+
+    /// R4: a delivered turn must report the PR and the specific unmet check,
+    /// never the blanket "the goal was not achieved" wording.
+    #[test]
+    fn a_delivered_turn_reports_the_pr_and_the_specific_check() {
+        let mut delivered = evidence(
+            false,
+            &["check `cargo:test -p codefactory` failed at #4"],
+        );
+        delivered.delivery_artifact = Some(DeliveryArtifact {
+            kind: "pull_request".into(),
+            reference: "PR #562".into(),
+            sequence: 9,
+        });
+        delivered.blockers_structured = vec![CompletionBlocker {
+            kind: "failed_verification".into(),
+            message: "check `cargo:test -p codefactory` failed at #4 and has not been rerun at the same or broader scope since; rerun `cargo test -p codefactory` after the repair".into(),
+            check: Some("`cargo:test -p codefactory` in .".into()),
+            command: Some("cargo test -p codefactory".into()),
+            failed_at_sequence: Some(4),
+            missing_evidence: "a passing rerun at the same or broader scope".into(),
+        }];
+
+        let summary = unverified_release_warning(&delivered);
+        assert!(summary.contains("PR #562"), "{summary}");
+        assert!(summary.contains("codefactory"), "{summary}");
+        assert!(!summary.contains("本轮任务未完成"), "{summary}");
+        assert!(!summary.contains("未达成"), "{summary}");
+
+        // Without a delivery artifact the honest failure notice is unchanged.
+        let mut undelivered = evidence(false, &["check X still missing"]);
+        undelivered.blockers_structured = delivered.blockers_structured.clone();
+        let plain = unverified_release_warning(&undelivered);
+        assert!(plain.contains("本轮任务未完成"), "{plain}");
     }
 }
 
