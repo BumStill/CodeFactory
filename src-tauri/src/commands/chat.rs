@@ -2894,6 +2894,32 @@ pub async fn send_message(
     let fallback_title_job = completion_title_job.clone();
     let title_cancel_flag = tracked_cancel_flag.clone();
     tokio::spawn(async move {
+        /// The turn's visible conclusion, used to name a session whose first
+        /// user message is too thin to name on its own. Shared by the success
+        /// and the failure path so a failed turn still gets a real name when it
+        /// managed to write one.
+        async fn latest_visible_assistant_summary(
+            db: &sqlx::SqlitePool,
+            session_id: &str,
+        ) -> Option<String> {
+            match sqlx::query_scalar::<_, String>(
+                "SELECT content FROM messages
+                 WHERE session_id = ? AND role = 'assistant'
+                   AND (completion_state IS NULL OR completion_state = '')
+                   AND TRIM(content) <> ''
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_optional(db)
+            .await
+            {
+                Ok(summary) => summary,
+                Err(error) => {
+                    tracing::warn!("session title assistant summary lookup failed: {error}");
+                    None
+                }
+            }
+        }
         let db_for_error = db.clone();
         let session_for_error = session_id_clone.clone();
         let loop_result = supervise_chat_task(async move {
@@ -2925,25 +2951,7 @@ pub async fn send_message(
         if loop_result.is_ok() && !title_cancel_flag.load(Ordering::SeqCst) {
             if let Some((title_route, needs_summary, title_user_message)) = completion_title_job {
                 let assistant_summary = if needs_summary {
-                    match sqlx::query_scalar::<_, String>(
-                        "SELECT content FROM messages
-                         WHERE session_id = ? AND role = 'assistant'
-                           AND (completion_state IS NULL OR completion_state = '')
-                           AND TRIM(content) <> ''
-                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                    )
-                    .bind(&session_for_error)
-                    .fetch_optional(&db_for_error)
-                    .await
-                    {
-                        Ok(summary) => summary,
-                        Err(error) => {
-                            tracing::warn!(
-                                "session title assistant summary lookup failed: {error}"
-                            );
-                            None
-                        }
-                    }
+                    latest_visible_assistant_summary(&db_for_error, &session_for_error).await
                 } else {
                     None
                 };
@@ -2957,15 +2965,32 @@ pub async fn send_message(
             }
         }
         if loop_result.is_err() && !title_cancel_flag.load(Ordering::SeqCst) {
-            if let Some((title_route, needs_summary, title_user_message)) = fallback_title_job {
-                if !needs_summary {
+            if let Some((title_route, _needs_summary, title_user_message)) = fallback_title_job {
+                // A failed primary turn is not a reason to abandon the session's
+                // name. Try once from the first user message (plus the turn's
+                // visible conclusion when it wrote one) — the same input the
+                // success path would use — and spend the local category
+                // fallback only when that attempt cannot even start. A transient
+                // failure, including the `database is locked` that resumes by
+                // itself, must never burn the placeholder for good.
+                let assistant_summary =
+                    latest_visible_assistant_summary(&db_for_error, &session_for_error).await;
+                let fallback_user_message = title_user_message.clone();
+                if !spawn_title_generation(
+                    app_clone.clone(),
+                    db_for_error.clone(),
+                    session_for_error.clone(),
+                    title_route.clone(),
+                    title_user_message,
+                    assistant_summary,
+                ) {
                     apply_local_title_fallback(
                         &app_clone,
                         &db_for_error,
                         &session_for_error,
                         &title_route,
-                        &title_user_message,
-                        "primary_turn_failed",
+                        &fallback_user_message,
+                        "primary_turn_not_finished",
                     )
                     .await;
                 }

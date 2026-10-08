@@ -62,6 +62,12 @@ pub(super) struct DesktopModelTransport {
     /// Internal sidecars such as session-title generation need a strict output
     /// ceiling. `None` preserves the interactive transport's existing limits.
     pub(super) max_output_tokens: Option<u32>,
+    /// Metadata sidecars must not pay for provider reasoning. A thinking route
+    /// spends the whole output ceiling on hidden reasoning and returns an empty
+    /// `content`, which is exactly how every session title generated through a
+    /// DeepSeek thinking route was rejected. When set, the DeepSeek thinking
+    /// patch is omitted so the request answers directly instead of thinking.
+    pub(super) thinking_disabled: bool,
     /// Metadata prompts must not be echoed from transient Provider bodies into
     /// logs or retry events. Interactive requests retain their diagnostics.
     pub(super) retry_response_body: crate::http_util::RetryResponseBody,
@@ -732,6 +738,7 @@ impl RoutedDesktopModelTransport {
             api_style: route.api_style.clone(),
             cancel: self.cancel.clone(),
             max_output_tokens: None,
+            thinking_disabled: false,
             retry_response_body: crate::http_util::RetryResponseBody::Include,
             provider_attempt,
         })
@@ -1188,9 +1195,12 @@ impl DesktopModelTransport {
         // OpenRouter) enable thinking and tune its strength through
         // `reasoning_effort` (low|high|max). Attach only for DeepSeek routes —
         // other OpenAI-compatible providers keep their exact payload.
-        if let Some(patch) =
-            deepseek_reasoning_body_patch(&self.base_url, &self.model_id, reasoning_effort)
-        {
+        if let Some(patch) = provider_reasoning_patch(
+            self.thinking_disabled,
+            &self.base_url,
+            &self.model_id,
+            reasoning_effort,
+        ) {
             if let Some(obj) = body.as_object_mut() {
                 if let Some(extra) = patch.as_object() {
                     for (k, v) in extra {
@@ -1475,6 +1485,23 @@ fn deepseek_reasoning_body_patch(
         "thinking": { "type": "enabled" },
         "reasoning_effort": normalize_deepseek_reasoning_effort(reasoning_effort),
     }))
+}
+
+fn provider_reasoning_patch(
+    thinking_disabled: bool,
+    base_url: &str,
+    model_id: &str,
+    reasoning_effort: &str,
+) -> Option<serde_json::Value> {
+    if thinking_disabled {
+        // DeepSeek enables thinking by default when the field is omitted
+        // (https://api-docs.deepseek.com/guides/thinking_mode/), so a metadata
+        // sidecar has to say "disabled" out loud; leaving the patch off would
+        // still spend the small title budget on hidden reasoning.
+        return is_deepseek_route(base_url, model_id)
+            .then(|| serde_json::json!({ "thinking": { "type": "disabled" } }));
+    }
+    deepseek_reasoning_body_patch(base_url, model_id, reasoning_effort)
 }
 
 /// DeepSeek thinking-mode error markers.
@@ -2573,9 +2600,30 @@ mod tests {
             api_style: ApiStyle::Openai,
             cancel: None,
             max_output_tokens: None,
+            thinking_disabled: false,
             retry_response_body: crate::http_util::RetryResponseBody::Include,
             provider_attempt: None,
         }
+    }
+
+    #[test]
+    fn metadata_requests_turn_provider_thinking_off() {
+        let base = "https://api.deepseek.com/v1";
+        let chat_turn = provider_reasoning_patch(false, base, "deepseek-v4-flash", "low")
+            .expect("an interactive turn keeps the provider's thinking route");
+        assert_eq!(chat_turn["thinking"]["type"], "enabled");
+        let metadata = provider_reasoning_patch(true, base, "deepseek-v4-flash", "low")
+            .expect("DeepSeek thinks by default, so the sidecar must disable it explicitly");
+        assert_eq!(
+            metadata,
+            serde_json::json!({ "thinking": { "type": "disabled" } }),
+            "a metadata sidecar must not spend its output ceiling on hidden reasoning"
+        );
+        assert!(
+            provider_reasoning_patch(false, "https://api.openai.com/v1", "gpt-5.6-sol", "low")
+                .is_none(),
+            "non-DeepSeek routes keep their exact payload"
+        );
     }
 
     #[test]

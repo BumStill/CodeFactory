@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { ArrowRight, Loader2 } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import { invoke } from "../lib/tauri";
 import { useSettingsStore } from "../stores/settings";
 import { formatUsageTokens } from "./TokenUsageHeatmap";
@@ -12,6 +12,10 @@ interface Props {
   anonymous: boolean;
   onOpenUsage?: () => void;
 }
+
+/** A local usage read that never answers must not hold the start page in a
+ *  loading state forever; it degrades to a quiet unavailable note instead. */
+const LOAD_TIMEOUT_MS = 8_000;
 
 export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
   const settings = useSettingsStore((state) => state.settings);
@@ -26,12 +30,21 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
       return;
     }
     try {
-      setDashboard(await invoke<UsageDashboard>("get_usage_dashboard", {
-        rangeDays: 28,
-        timezoneOffsetMinutes,
-      }));
+      const result = await Promise.race([
+        invoke<UsageDashboard>("get_usage_dashboard", {
+          rangeDays: 28,
+          timezoneOffsetMinutes,
+        }),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error("USAGE_LOAD_TIMEOUT")), LOAD_TIMEOUT_MS);
+        }),
+      ]);
+      setDashboard(result);
       setFailed(false);
     } catch {
+      // The start page must never be left spinning: an unanswered or slow
+      // local read degrades to a quiet "暂不可用" instead of an endless loader
+      // that keeps the first impression of a new session in limbo.
       setFailed(true);
     }
   }, [anonymous, timezoneOffsetMinutes]);
@@ -107,7 +120,7 @@ export function WelcomeUsageCard({ anonymous, onOpenUsage }: Props) {
       ) : failed ? (
         <p className="text-label text-gray-400">用量统计暂不可用</p>
       ) : (
-        <p className="inline-flex items-center gap-1.5 text-label text-gray-400"><Loader2 size={14} className="animate-spin motion-reduce:animate-none" />正在读取本机用量</p>
+        <p aria-busy="true" className="text-label text-gray-500">正在读取本机用量…</p>
       )}
     </section>
   );
