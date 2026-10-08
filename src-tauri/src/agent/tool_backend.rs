@@ -1345,9 +1345,17 @@ impl DesktopToolBackend {
             }
         }
 
-        let mut tx = self.db.begin().await.map_err(|error| ToolError {
-            message: format!("begin mutation preflight: {error}"),
-        })?;
+        // U23: this preflight reads the objective/binding rows and then writes
+        // the tool-call attribution in the same transaction. Started as a
+        // deferred transaction it hit `SQLITE_BUSY_SNAPSHOT` (code 517) whenever
+        // a parallel session committed in between, which surfaced as a failed
+        // `persist mutation tool attribution`. `begin_write` takes the write
+        // lock up front and retries bounded contention in place.
+        let mut tx = crate::storage::db::begin_write(&self.db)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("begin mutation preflight: {error}"),
+            })?;
         let objective_id = if is_task {
             sqlx::query_scalar::<_, Option<String>>(
                 "SELECT objective_id FROM task_runs WHERE id=?",
