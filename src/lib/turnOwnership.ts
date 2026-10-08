@@ -15,6 +15,10 @@ type ObjectiveStatus = NonNullable<
 export const SYSTEM_RELEASED_OBJECTIVE_STATUSES: readonly ObjectiveStatus[] = [
   "waiting_core_input",
   "completed",
+  // `failed` is terminal: the system has stopped, so the next move is the
+  // user's. Without it here the composer kept offering to stop a turn that
+  // was already over.
+  "failed",
   "cancelled",
   "legacy_orphan",
 ];

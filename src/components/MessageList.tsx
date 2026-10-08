@@ -1336,6 +1336,7 @@ const MessageRow = memo(function MessageRow({
           <TurnResultSnapshot
             plan={msg.plan}
             evidence={evidence}
+            objectiveStatus={msg.turnActivity?.objectiveStatus ?? null}
             turnBoundaryFailure={turnBoundaryFailure}
             durationMs={msg.durationMs ?? null}
             onOpenEvidence={

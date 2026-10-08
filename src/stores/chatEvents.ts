@@ -27,7 +27,7 @@ export interface TurnActivityState {
   updatedAt: number;
   terminalReason: string | null;
   objectiveId?: string;
-  objectiveStatus?: "active" | "waiting_system" | "waiting_core_input" | "waiting_authorization" | "waiting_business_decision" | "completed" | "cancelled" | "legacy_orphan";
+  objectiveStatus?: "active" | "waiting_system" | "waiting_core_input" | "waiting_authorization" | "waiting_business_decision" | "completed" | "failed" | "cancelled" | "legacy_orphan";
   isCurrentObjectiveTurn?: boolean;
   recoveryOwner?: string | null;
   nextObservationAt?: number | null;
