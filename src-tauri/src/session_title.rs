@@ -463,7 +463,7 @@ async fn compare_and_set_title(
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE sessions SET title = ?, title_source = ?
-         WHERE id = ? AND title_source = 'placeholder'",
+         WHERE id = ? AND title_source IN ('placeholder', 'fallback')",
     )
     .bind(title)
     .bind(source)
@@ -473,10 +473,18 @@ async fn compare_and_set_title(
     Ok(result.rows_affected() == 1)
 }
 
-async fn session_is_placeholder(db: &SqlitePool, session_id: &str) -> Result<bool, sqlx::Error> {
+/// True while the session title is still owned by the automatic lifecycle and
+/// may be replaced by a (better) model-generated title. `fallback` is the local
+/// title written at admission time (CF-TTL-R2), so it must stay replaceable;
+/// only `generated`/`manual` titles are terminal.
+async fn session_title_is_replaceable(
+    db: &SqlitePool,
+    session_id: &str,
+) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
-            SELECT 1 FROM sessions WHERE id = ? AND title_source = 'placeholder'
+            SELECT 1 FROM sessions
+            WHERE id = ? AND title_source IN ('placeholder', 'fallback')
          )",
     )
     .bind(session_id)
@@ -710,7 +718,7 @@ pub(crate) fn spawn_title_generation(
                 return;
             }
         };
-        match session_is_placeholder(&db, &session_id).await {
+        match session_title_is_replaceable(&db, &session_id).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::debug!("session title generation discarded: no_longer_placeholder");
@@ -1203,16 +1211,16 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(session_is_placeholder(&db, "auto").await.unwrap());
-        assert!(!session_is_placeholder(&db, "manual").await.unwrap());
-        assert!(!session_is_placeholder(&db, "missing").await.unwrap());
+        assert!(session_title_is_replaceable(&db, "auto").await.unwrap());
+        assert!(!session_title_is_replaceable(&db, "manual").await.unwrap());
+        assert!(!session_title_is_replaceable(&db, "missing").await.unwrap());
 
         assert!(
             compare_and_set_title(&db, "auto", "会话命名优化", "generated")
                 .await
                 .unwrap()
         );
-        assert!(!session_is_placeholder(&db, "auto").await.unwrap());
+        assert!(!session_title_is_replaceable(&db, "auto").await.unwrap());
         assert!(
             !compare_and_set_title(&db, "manual", "迟到标题", "generated")
                 .await
@@ -1230,6 +1238,197 @@ mod tests {
                 ("manual".into(), "我的标题".into(), "manual".into(), 9),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn generated_title_replaces_early_fallback_but_never_manual_title() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, title_source TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions VALUES ('fallback', '修复登录流程', 'fallback'),
+                                        ('manual', '人工名称', 'manual')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        assert!(compare_and_set_title(&db, "fallback", "登录问题修复", "generated")
+            .await
+            .unwrap());
+        assert!(!compare_and_set_title(&db, "manual", "迟到标题", "generated")
+            .await
+            .unwrap());
+        let title: String = sqlx::query_scalar("SELECT title FROM sessions WHERE id='fallback'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(title, "登录问题修复");
+    }
+
+    // CF-TTL-R2: the title written at admission is a `fallback`, not a terminal
+    // title — the naming job must still be allowed to run for it, and a manual
+    // rename must stay terminal.
+    #[tokio::test]
+    async fn admission_fallback_stays_replaceable_but_manual_is_terminal() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, title_source TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions VALUES ('admitted', '登录问题排查', 'fallback'),
+                                        ('named', '会话命名优化', 'generated'),
+                                        ('renamed', '手工名称', 'manual')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        assert!(session_title_is_replaceable(&db, "admitted").await.unwrap());
+        assert!(!session_title_is_replaceable(&db, "named").await.unwrap());
+        assert!(!session_title_is_replaceable(&db, "renamed").await.unwrap());
+
+        assert!(
+            compare_and_set_title(&db, "admitted", "登录失败修复", "generated")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !compare_and_set_title(&db, "renamed", "迟到标题", "generated")
+                .await
+                .unwrap()
+        );
+        let renamed: String = sqlx::query_scalar("SELECT title FROM sessions WHERE id='renamed'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(renamed, "手工名称");
+    }
+
+    // CF-TTL-R4: several sessions admitted at the same moment must each stop
+    // showing the placeholder within the R1 budget (10s), independently of how
+    // long the primary turn runs, and one session's lifecycle must never touch
+    // another session's title.
+    #[tokio::test]
+    async fn parallel_session_admission_titles_every_session_within_budget() {
+        const SESSIONS: usize = 6;
+        const BUDGET: Duration = Duration::from_secs(10);
+
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, title_source TEXT NOT NULL
+             )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        for index in 0..SESSIONS {
+            sqlx::query("INSERT INTO sessions VALUES (?, ?, ?)")
+                .bind(format!("s{index}"))
+                .bind(PLACEHOLDER_TITLE)
+                .bind(TITLE_SOURCE_PLACEHOLDER)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        // The last one was renamed by hand right before the burst.
+        sqlx::query("UPDATE sessions SET title = ?, title_source = ? WHERE id = ?")
+            .bind("手工名称")
+            .bind(TITLE_SOURCE_MANUAL)
+            .bind("s5")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let mut handles = Vec::new();
+        for index in 0..SESSIONS {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                let session_id = format!("s{index}");
+                // Admission: the first message lands and the safe local fallback
+                // must be persisted before the (long) primary turn is awaited.
+                let prompt = format!("修复第 {index} 个模块的登录失败问题 token=super-secret");
+                let fallback = safe_local_fallback(&prompt);
+                if session_id == "s5" {
+                    // A hand-renamed title is never overwritten automatically.
+                    assert!(!session_title_is_replaceable(&db, &session_id).await.unwrap());
+                    assert!(!compare_and_set_title(
+                        &db,
+                        &session_id,
+                        &fallback,
+                        TITLE_SOURCE_FALLBACK
+                    )
+                    .await
+                    .unwrap());
+                    return;
+                }
+                assert!(compare_and_set_title(
+                    &db,
+                    &session_id,
+                    &fallback,
+                    TITLE_SOURCE_FALLBACK
+                )
+                .await
+                .unwrap());
+                // The naming job settles later and may replace the fallback.
+                assert!(session_title_is_replaceable(&db, &session_id).await.unwrap());
+                let generated = format!("模块{index}登录修复");
+                assert!(compare_and_set_title(
+                    &db,
+                    &session_id,
+                    &generated,
+                    TITLE_SOURCE_GENERATED
+                )
+                .await
+                .unwrap());
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let elapsed = started.elapsed();
+        assert!(elapsed < BUDGET, "titles took {elapsed:?}");
+
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT id, title, title_source FROM sessions ORDER BY id")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        for (id, title, _) in &rows {
+            assert_ne!(title, PLACEHOLDER_TITLE, "{id} still shows the placeholder");
+            assert!(!title.contains("super-secret"), "{id} leaked a secret");
+            assert!(!title.contains('/'), "{id} leaked a path");
+        }
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, _, source)| source == TITLE_SOURCE_GENERATED)
+                .count(),
+            SESSIONS - 1
+        );
+        let manual: Vec<_> = rows
+            .iter()
+            .filter(|(_, _, source)| source == TITLE_SOURCE_MANUAL)
+            .collect();
+        assert_eq!(manual.len(), 1);
+        assert_eq!(manual[0].0, "s5");
+        assert_eq!(manual[0].1, "手工名称");
     }
 
     #[tokio::test]
