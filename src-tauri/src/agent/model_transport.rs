@@ -2412,6 +2412,66 @@ mod tests {
             reasoning_content: None,
         }
     }
+    /// CF-TRS-R4 (U29): one tool definition must be offered identically to
+    /// ChatGPT (Responses), a DeepSeek-style OpenAI-compatible endpoint and
+    /// Anthropic. The offer is the only place a model could change which tool
+    /// ran or how its arguments are read, so it is asserted at the real wire
+    /// boundary of all three shapes rather than on a hand-built struct.
+    #[test]
+    fn one_tool_keeps_its_name_and_schema_across_all_three_api_shapes() {
+        let defs = vec![deepseek_tool()];
+
+        // ChatGPT / Responses: the tools array this module actually sends.
+        let responses_tools: Vec<serde_json::Value> = defs
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "parameters": tool.function.parameters,
+                })
+            })
+            .collect();
+        let responses = build_chatgpt_responses_body(
+            "gpt-5",
+            "instructions".into(),
+            Vec::new(),
+            responses_tools,
+            false,
+            "low",
+            None,
+        );
+
+        // DeepSeek / OpenAI-compatible chat completions: the definition is the payload.
+        let openai = serde_json::to_value(&defs).unwrap();
+
+        // Anthropic: the converter this crate sends for that style.
+        let anthropic = crate::agent::anthropic_client::openai_tools_to_anthropic(&defs);
+
+        let names = [
+            responses["tools"][0]["name"].as_str().unwrap().to_string(),
+            openai[0]["function"]["name"].as_str().unwrap().to_string(),
+            anthropic[0]["name"].as_str().unwrap().to_string(),
+        ];
+        assert_eq!(
+            names,
+            ["read_file", "read_file", "read_file"],
+            "the same tool must reach every endpoint under the same name"
+        );
+        let schemas = [
+            responses["tools"][0]["parameters"].clone(),
+            openai[0]["function"]["parameters"].clone(),
+            anthropic[0]["input_schema"].clone(),
+        ];
+        assert!(
+            schemas
+                .iter()
+                .all(|schema| *schema == defs[0].function.parameters),
+            "the arguments schema must not drift between endpoint shapes"
+        );
+    }
+
     fn call(id: &str, name: &str, args: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
