@@ -90,6 +90,17 @@ impl RouteCandidatePlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderFailureClass {
+    /// U25: the request never reached a verdict — the network path itself
+    /// (DNS, TCP connect, TLS, read timeout, reset) or an anonymous gateway
+    /// error answered instead. Nothing here says the request was wrong, so the
+    /// objective waits this out instead of concluding that the task cannot be
+    /// done. Measured on 2026-10-08: DeepSeek's transport failed for ~3 minutes
+    /// and recovered on its own, while two sessions had already been declared
+    /// failed after ~60 seconds.
+    TransportUnreachable,
+    /// The endpoint *answered*, and the answer was a refusal: the model does not
+    /// exist, is deprecated, or the service says it is switched off. Waiting
+    /// never changes that from this machine, so this keeps the short path.
     EndpointUnavailable,
     RateLimited,
     AuthExpired,
@@ -105,7 +116,8 @@ impl ProviderFailureClass {
     pub fn permits_endpoint_failover(self) -> bool {
         matches!(
             self,
-            Self::EndpointUnavailable
+            Self::TransportUnreachable
+                | Self::EndpointUnavailable
                 | Self::RateLimited
                 | Self::CredentialUnavailable
                 | Self::QuotaExceeded
@@ -158,12 +170,36 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
     {
         return ProviderFailureClass::RateLimited;
     }
-    if codefactory_agent_loop::context::is_provider_overloaded(message) {
+    // U25 — the endpoint answered, and the answer was a refusal. The model is
+    // gone (404 "model not found"), deprecated, or the service says an explicit
+    // circuit is open. No amount of waiting from this machine changes any of
+    // these, so they keep converging on the short path instead of holding the
+    // user in "等待中".
+    if lower.contains("model not found")
+        || lower.contains("model_not_found")
+        || lower.contains("model does not exist")
+        || lower.contains("no such model")
+        || lower.contains("does not support the model")
+        || lower.contains("model has been deprecated")
+        || lower.contains("model is deprecated")
+        || lower.contains("deprecated")
+        || lower.contains("model unavailable")
+        || lower.contains("model is unavailable")
+        || lower.contains("model_unavailable")
+        || (lower.contains("model")
+            && (lower.contains("is unavailable")
+                || lower.contains("not available")
+                || lower.contains("no longer available")))
+        || lower.contains("biscuit_baker_service_me_circuit_open")
+        || lower.contains("circuit_open")
+    {
         return ProviderFailureClass::EndpointUnavailable;
     }
-    if lower.contains("biscuit_baker_service_me_circuit_open")
-        || lower.contains("circuit_open")
-        || lower.contains("http 408")
+    // U25 — nothing answered: the transport itself failed. A bare 502/503/504
+    // (no explicit body saying what is unavailable) lands here too, because a
+    // gateway with nothing useful to say is a transport condition as far as this
+    // machine can tell.
+    if lower.contains("http 408")
         || lower.contains("http 409")
         || lower.contains("http 425")
         || lower.contains("http 500")
@@ -174,9 +210,31 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
         || lower.contains("timeout")
         || lower.contains("connection refused")
         || lower.contains("connection reset")
+        || lower.contains("connection closed before message completed")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
         || lower.contains("error sending request")
         || lower.contains("error decoding response body")
+        || lower.contains("dns error")
+        || lower.contains("dns failure")
+        || lower.contains("failed to lookup address")
+        || lower.contains("no address found")
+        || lower.contains("name or service not known")
+        || lower.contains("network is unreachable")
+        || lower.contains("network unreachable")
+        || lower.contains("tls handshake")
+        || lower.contains("tlsv1")
+        || lower.contains("certificate verify failed")
+        || lower.contains("ssl error")
     {
+        return ProviderFailureClass::TransportUnreachable;
+    }
+    // U25: an explicit overload statement ("our servers are overloaded", "try
+    // again later", an upstream 529) is checked *after* the transport signals,
+    // because the provider SDK's matcher also fires on a bare "503 Service
+    // Unavailable" with no body — and a gateway saying nothing is a transport
+    // condition, not a statement about the task. This keeps its short path.
+    if codefactory_agent_loop::context::is_provider_overloaded(message) {
         return ProviderFailureClass::EndpointUnavailable;
     }
     ProviderFailureClass::Fatal
@@ -366,7 +424,10 @@ impl ActiveRouteState {
             from.model_id.clone(),
             reason.to_string(),
         ));
-        if classify_provider_failure(reason) == ProviderFailureClass::EndpointUnavailable {
+        if matches!(
+            classify_provider_failure(reason),
+            ProviderFailureClass::EndpointUnavailable | ProviderFailureClass::TransportUnreachable
+        ) {
             self.health.mark_unavailable(&from.endpoint_name);
         }
 
@@ -403,7 +464,10 @@ impl ActiveRouteState {
                 reason.to_string(),
             ));
         }
-        if classify_provider_failure(reason) == ProviderFailureClass::EndpointUnavailable {
+        if matches!(
+            classify_provider_failure(reason),
+            ProviderFailureClass::EndpointUnavailable | ProviderFailureClass::TransportUnreachable
+        ) {
             self.health.mark_unavailable(&current.endpoint_name);
         }
     }
@@ -482,6 +546,7 @@ fn concise_reason(reason: &str) -> String {
 
 fn failure_code(reason: &str) -> &'static str {
     match classify_provider_failure(reason) {
+        ProviderFailureClass::TransportUnreachable => "TRANSPORT_UNREACHABLE",
         ProviderFailureClass::EndpointUnavailable => "ENDPOINT_UNAVAILABLE",
         ProviderFailureClass::RateLimited => "RATE_LIMITED",
         ProviderFailureClass::AuthExpired => "AUTH_EXPIRED",
@@ -546,6 +611,86 @@ mod tests {
                 "zero-output transient overload must enter the safe recovery policy"
             );
         }
+    }
+
+    /// U25. The classification table that decides whether an outage is waited
+    /// out or taken as a verdict.
+    ///
+    /// `error sending request` is the exact text DeepSeek produced on
+    /// 2026-10-08 for ~3 minutes, and it was classified as if the endpoint had
+    /// refused: the objective gave up in about a minute while the network was
+    /// already recovering on its own.
+    #[test]
+    fn transient_transport_failures_are_separated_from_explicit_refusals() {
+        for transport in [
+            "HTTP error: error sending request for url (https://api.deepseek.com/chat/completions)",
+            "connection refused",
+            "dns error: failed to lookup address information",
+            "operation timed out",
+            "connection reset by peer",
+            "HTTP 502 Bad Gateway",
+            "HTTP 503 Service Unavailable",
+            "HTTP 504 Gateway Timeout",
+            "tls handshake failure",
+        ] {
+            assert_eq!(
+                classify_provider_failure(transport),
+                ProviderFailureClass::TransportUnreachable,
+                "{transport} is a network condition, not a verdict about the task"
+            );
+        }
+
+        for refusal in [
+            r#"HTTP 404 Not Found: {"error":{"message":"model not found"}}"#,
+            r#"HTTP 503 Service Unavailable: {"code":"biscuit_baker_service_me_circuit_open"}"#,
+            "The model gpt-4o has been deprecated and is unavailable",
+        ] {
+            assert_eq!(
+                classify_provider_failure(refusal),
+                ProviderFailureClass::EndpointUnavailable,
+                "{refusal} is the endpoint explicitly refusing"
+            );
+        }
+
+        // Both are still routable: the difference is how long the objective
+        // waits, not whether another route may be tried.
+        assert!(ProviderFailureClass::TransportUnreachable.permits_endpoint_failover());
+        assert!(ProviderFailureClass::EndpointUnavailable.permits_endpoint_failover());
+        assert_ne!(
+            ProviderFailureClass::TransportUnreachable,
+            ProviderFailureClass::EndpointUnavailable
+        );
+    }
+
+    /// U25 requirement 3. A user who pinned one model must never be moved off it
+    /// silently; automatic routing may use a second route it was given.
+    #[test]
+    fn an_outage_switches_routes_only_when_the_policy_offered_another_one() {
+        let outage = "HTTP error: error sending request for url (https://api.deepseek.com/chat/completions)";
+
+        // `fixed`: the plan holds exactly the model the user chose.
+        let pinned = ActiveRouteState::from_plan_with_health(
+            RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro")),
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        assert!(
+            pinned.advance_after_failure(outage).is_none(),
+            "a pinned model must not be swapped out silently"
+        );
+        assert_eq!(pinned.current().model_id, "deepseek-v4-pro");
+
+        // `auto` / `prefer`: a usable candidate route exists, so it is used.
+        let mut plan = RouteCandidatePlan::new_automatic(route("deepseek", "deepseek-v4-pro"));
+        plan.push_fallback(route("chatgpt", "gpt-5.5"));
+        let automatic = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        let change = automatic
+            .advance_after_failure(outage)
+            .expect("a usable candidate route exists");
+        assert_eq!(change.to_endpoint, "chatgpt");
+        assert_eq!(automatic.current().endpoint_name, "chatgpt");
     }
 
     #[test]
@@ -674,7 +819,7 @@ mod tests {
         assert_eq!(attempts[0].status, "failed");
         assert_eq!(
             attempts[0].failure_code.as_deref(),
-            Some("ENDPOINT_UNAVAILABLE")
+            Some("TRANSPORT_UNREACHABLE")
         );
         assert_eq!(attempts[1].endpoint, "deepseek");
         assert_eq!(attempts[1].status, "succeeded");
