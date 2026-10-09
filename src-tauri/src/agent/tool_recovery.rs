@@ -8,7 +8,7 @@
 use anyhow::{anyhow, bail, Result};
 use codefactory_agent_loop::tool::MutationPermit;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::path::{Component, Path, PathBuf};
 
 use super::objective::{ClaimedRemediation, ObjectiveStore};
@@ -98,8 +98,10 @@ impl ToolRecoveryStore {
                         "root_turn_id": root_turn_id,
                     })
                     .to_string(),
-                    precondition_digest: session_plan_digest(&self.pool, session_id, root_turn_id)
-                        .await?,
+                    precondition_digest: {
+                        let mut conn = self.pool.acquire().await?;
+                        session_plan_digest(&mut conn, session_id, root_turn_id).await?
+                    },
                 })
             }
             "delegate_tasks" | "dispatch_parallel_tasks" => {
@@ -110,7 +112,10 @@ impl ToolRecoveryStore {
                     resource_kind: "session_tasks",
                     replay_policy: "exact_if_unchanged",
                     safe_locator_json: serde_json::json!({"session_id": session_id}).to_string(),
-                    precondition_digest: session_tasks_digest(&self.pool, session_id).await?,
+                    precondition_digest: {
+                        let mut conn = self.pool.acquire().await?;
+                        session_tasks_digest(&mut conn, session_id).await?
+                    },
                 })
             }
             "bash" => {
@@ -326,49 +331,67 @@ impl ToolRecoveryStore {
             return Ok(false);
         }
 
-        let now = chrono::Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
-        let contract = sqlx::query(
-            "UPDATE tool_recovery_contracts
-             SET state='cancelled', postcondition_digest=?,
-                 observation_count=observation_count+1, observed_at=?,
-                 settled_at=?, updated_at=?, dispatch_owner=NULL,
-                 dispatch_claim_epoch=0, dispatch_generation=0,
-                 dispatch_started_at=NULL
-             WHERE receipt_id=? AND state IN ('dispatching','unknown','observed_unchanged')",
+        cancel_no_effect_in_tx(
+            &mut tx,
+            receipt_id,
+            &current,
+            "typed_command_rejected",
+            failure_code,
         )
-        .bind(&current)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .bind(receipt_id)
-        .execute(&mut *tx)
         .await?;
-        if contract.rows_affected() != 1 {
-            bail!("rejected Tool recovery contract changed before cancellation");
-        }
-        let receipt = sqlx::query(
-            "UPDATE side_effect_receipts
-             SET status='cancelled', summary_json=?, observed_at=?
-             WHERE id=? AND status IN ('started','unknown')",
-        )
-        .bind(
-            serde_json::json!({
-                "status": "cancelled",
-                "recovery": "typed_command_rejected",
-                "code": failure_code,
-            })
-            .to_string(),
-        )
-        .bind(now)
-        .bind(receipt_id)
-        .execute(&mut *tx)
-        .await?;
-        if receipt.rows_affected() != 1 {
-            bail!("rejected side-effect receipt changed before cancellation");
-        }
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// CF-TRS-R1/R2 (U29): settle a receipt as "no effect" on evidence only.
+    ///
+    /// A tool's own error text is never the evidence. The guarded resource is
+    /// re-observed and must still match the digest captured when the receipt was
+    /// opened, so a call that already changed the world keeps its `unknown`
+    /// receipt and the spec's counter-example keeps its full strength, while a
+    /// call that provably never landed stops fencing the Objective — `cancelled`
+    /// is not a fence status.
+    pub(crate) async fn settle_no_effect_foreground(
+        &self,
+        receipt_id: &str,
+        cwd: &Path,
+        recovery_label: &str,
+        failure_code: &str,
+    ) -> Result<bool> {
+        let Some(current) = self.unchanged_since_precondition(receipt_id, cwd).await? else {
+            return Ok(false);
+        };
+        let mut tx = self.pool.begin().await?;
+        cancel_no_effect_in_tx(&mut tx, receipt_id, &current, recovery_label, failure_code).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// The same evidence, inside a caller-owned transaction. The mutation fence
+    /// uses this so re-observing and settling cannot straddle two write
+    /// transactions.
+    pub(crate) async fn settle_no_effect_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        receipt_id: &str,
+        cwd: &Path,
+        recovery_label: &str,
+        failure_code: &str,
+    ) -> Result<bool> {
+        let Some(current) = unchanged_since_precondition_in(tx, receipt_id, cwd).await? else {
+            return Ok(false);
+        };
+        cancel_no_effect_in_tx(tx, receipt_id, &current, recovery_label, failure_code).await
+    }
+
+    async fn unchanged_since_precondition(
+        &self,
+        receipt_id: &str,
+        cwd: &Path,
+    ) -> Result<Option<String>> {
+        let mut conn = self.pool.acquire().await?;
+        unchanged_since_precondition_in(&mut conn, receipt_id, cwd).await
     }
 
     pub(crate) async fn reconcile_claimed(
@@ -764,7 +787,11 @@ fn tree_digest(root: &Path) -> Result<String> {
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
-async fn session_plan_digest(pool: &SqlitePool, session: &str, root: &str) -> Result<String> {
+async fn session_plan_digest(
+    conn: &mut SqliteConnection,
+    session: &str,
+    root: &str,
+) -> Result<String> {
     let rows = sqlx::query(
         "SELECT revision, plan_json, COALESCE(explanation,''), COALESCE(waiting_reason,''),
                 COALESCE(next_action_owner,''), COALESCE(change_reason,'')
@@ -772,7 +799,7 @@ async fn session_plan_digest(pool: &SqlitePool, session: &str, root: &str) -> Re
     )
     .bind(session)
     .bind(root)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(digest(rows.iter().map(|row| {
         format!(
@@ -787,13 +814,13 @@ async fn session_plan_digest(pool: &SqlitePool, session: &str, root: &str) -> Re
     })))
 }
 
-async fn session_tasks_digest(pool: &SqlitePool, session: &str) -> Result<String> {
+async fn session_tasks_digest(conn: &mut SqliteConnection, session: &str) -> Result<String> {
     let rows = sqlx::query(
         "SELECT id, title, description, status, cwd, COALESCE(parent_task_id,''), attempt_count
          FROM task_runs WHERE session_id=? ORDER BY id",
     )
     .bind(session)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     Ok(digest(rows.iter().map(|row| {
         format!(
@@ -809,8 +836,108 @@ async fn session_tasks_digest(pool: &SqlitePool, session: &str) -> Result<String
     })))
 }
 
-async fn snapshot_digest(
+/// `Some(digest)` only when the guarded resource is readable *and* still
+/// byte-identical to the state the receipt was opened against. Reads run on the
+/// caller's connection, so the mutation fence can use its own write transaction
+/// without waiting for a second pooled connection.
+async fn unchanged_since_precondition_in(
+    conn: &mut SqliteConnection,
+    receipt_id: &str,
+    cwd: &Path,
+) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT resource_kind, safe_locator_json, precondition_digest
+         FROM tool_recovery_contracts
+         WHERE receipt_id=?
+           AND state IN ('dispatching','unknown','observed_unchanged','still_unknown')",
+    )
+    .bind(receipt_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let kind: String = row.try_get("resource_kind")?;
+    let locator: String = row.try_get("safe_locator_json")?;
+    let precondition: String = row.try_get("precondition_digest")?;
+    let Some(current) = snapshot_digest_on(conn, cwd, &kind, &locator).await? else {
+        return Ok(None);
+    };
+    if current != precondition {
+        return Ok(None);
+    }
+    Ok(Some(current))
+}
+
+/// Record a write-ahead receipt whose guarded resource is provably untouched as
+/// `cancelled` ("no effect") instead of `unknown`. Shared by the typed-command
+/// rejection path and the evidence-backed paths above, so the SQL cannot drift
+/// and "no effect" always means the same thing.
+async fn cancel_no_effect_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    receipt_id: &str,
+    observed_digest: &str,
+    recovery_label: &str,
+    failure_code: &str,
+) -> Result<bool> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let contract = sqlx::query(
+        "UPDATE tool_recovery_contracts
+         SET state='cancelled', postcondition_digest=?,
+             observation_count=observation_count+1, observed_at=?,
+             settled_at=?, updated_at=?, dispatch_owner=NULL,
+             dispatch_claim_epoch=0, dispatch_generation=0,
+             dispatch_started_at=NULL
+         WHERE receipt_id=? AND state IN ('dispatching','unknown','observed_unchanged','still_unknown')",
+    )
+    .bind(observed_digest)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(receipt_id)
+    .execute(&mut **tx)
+    .await?;
+    if contract.rows_affected() != 1 {
+        return Ok(false);
+    }
+    let receipt = sqlx::query(
+        "UPDATE side_effect_receipts
+         SET status='cancelled', summary_json=?, observed_at=?
+         WHERE id=? AND status IN ('started','unknown')",
+    )
+    .bind(
+        serde_json::json!({
+            "status": "cancelled",
+            "recovery": recovery_label,
+            "code": failure_code,
+        })
+        .to_string(),
+    )
+    .bind(now)
+    .bind(receipt_id)
+    .execute(&mut **tx)
+    .await?;
+    if receipt.rows_affected() != 1 {
+        bail!("rejected side-effect receipt changed before cancellation");
+    }
+    Ok(true)
+}
+
+pub(crate) async fn snapshot_digest(
     pool: &SqlitePool,
+    cwd: &Path,
+    kind: &str,
+    locator: &str,
+) -> Result<Option<String>> {
+    let mut conn = pool.acquire().await?;
+    snapshot_digest_on(&mut conn, cwd, kind, locator).await
+}
+
+/// The same observation, on a caller-owned connection. The mutation fence must
+/// re-observe on its own transaction's connection: reading through the pool
+/// while a write transaction is open deadlocks until the pool acquire timeout.
+pub(crate) async fn snapshot_digest_on(
+    conn: &mut SqliteConnection,
     cwd: &Path,
     kind: &str,
     locator: &str,
@@ -840,13 +967,13 @@ async fn snapshot_digest(
             ) else {
                 return Ok(None);
             };
-            session_plan_digest(pool, session, root).await?
+            session_plan_digest(&mut *conn, session, root).await?
         }
         "session_tasks" => {
             let Some(session) = locator.get("session_id").and_then(|v| v.as_str()) else {
                 return Ok(None);
             };
-            session_tasks_digest(pool, session).await?
+            session_tasks_digest(&mut *conn, session).await?
         }
         _ => return Ok(None),
     };
