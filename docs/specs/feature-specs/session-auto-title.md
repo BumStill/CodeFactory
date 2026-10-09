@@ -25,7 +25,33 @@
 | CF-SAT-R9 | 匿名会话固定为“匿名会话”，不持久化、不发额外命名请求、不产生 title Usage；旧会话迁移为 `legacy` 且默认不回填。Provider 实际返回的用量写入 `model_usage_events`，surface 为稳定枚举 `session_title`；所有逻辑命名任务另写 `session_title_attempts` 的状态、稳定 failure code 和时延，二者均不含正文 | compatibility + usage | SQLite migration + usage reconciliation + anonymous negative test |
 | CF-SAT-R10 | 发布前必须完成中英文正常路径、低信息延迟重试、敏感输入、Provider 不支持/超时/非法输出、手动竞态、匿名、旧会话和所有标题 surface 的真实 App 验收；只通过 mock、HTTP 200 或单元测试不得声称完成 | end-to-end | CodeFactoryDev + packaged artifact + evidence pack |
 
-## Primary User Path
+## M40: a new session gets a meaningful title soon after its first message
+
+### Background and user decision
+The sidebar title is the only clue the user has for finding a session. A title must not depend on how long the first turn runs, and must not stay as a placeholder when the title service is slow or failing.
+
+### Decision
+Shortly after the first message is sent, the session gets a title that describes the task. If the model-generated title doesn't arrive in time, fall back immediately to a readable title derived from the first message, and replace it later if a better one arrives.
+
+### Requirements Traceability
+
+| Req ID | Requirement | Minimum evidence |
+| --- | --- | --- |
+| CF-TTL-R1 | Within 10 seconds of the first message being sent, the sidebar no longer shows "新会话", regardless of how long the first turn runs and whether the first turn is still running | Integration test: title arrives on time while the first turn runs for a long time |
+| CF-TTL-R2 | When title generation fails, times out, or is queued, immediately show a fallback title derived from the first message (readable, no file paths or internal IDs); a better generated title may replace it later | Table-driven tests: success / failure / timeout / slow success |
+| CF-TTL-R3 | Titles the user renamed by hand are never overwritten automatically | Test |
+| CF-TTL-R4 | When several sessions are created at once (e.g. 3–6 in parallel), every session still meets R1 | Concurrency test |
+
+### Applicable Harnesses
+Spec Harness; Viewport Harness (sidebar title, light/dark, very long titles truncated without overflow); AI Collaboration Harness.
+
+### Test matrix
+- Normal: title generated on time.
+- Edge: title service failing / timing out / slow; very long first turn; first message that is only a file path; several sessions created in parallel.
+- Hand-renamed titles are not overwritten.
+- Viewport: real-browser screenshots of the sidebar in each state.
+
+
 
 用户新建会话并在草稿中选择项目、模型和权限。发送首条实质消息后，会话以“新会话”物化，正文请求立即开始；正文回合结束且没有已排队的下一回合后，后台仅向该会话已经选择的 Provider 发送经过裁剪和脱敏的命名输入。合规结果通过 CAS 保存并同步到侧栏、顶栏、搜索、Welcome 和用量详情。用户可以随时手动改名，人工标题不会被迟到的自动结果覆盖。
 

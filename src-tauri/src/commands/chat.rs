@@ -2827,6 +2827,20 @@ pub async fn send_message(
         .first()
         .expect("route plan always has a primary")
         .clone();
+    // Persist a safe local fallback immediately after admitting the first
+    // message. Model naming still waits for the turn to settle and can replace
+    // this fallback through the title-source CAS.
+    if let Some(message) = title_user_message.as_deref() {
+        apply_local_title_fallback(
+            &app,
+            &db,
+            &session_id,
+            &primary_route,
+            message,
+            "awaiting_primary_turn",
+        )
+        .await;
+    }
     let endpoint_name = primary_route.endpoint_name.clone();
     let endpoint_for_error = endpoint_name.clone();
     let resolved_model = primary_route.model_id.clone();
