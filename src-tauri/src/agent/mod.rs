@@ -492,6 +492,18 @@ fn supports_structured_plan(has_app: bool, anonymous: bool) -> bool {
     has_app && !anonymous
 }
 
+fn exposes_delegate_tasks(
+    has_app: bool,
+    anonymous: bool,
+    execution_context: Option<&AgentExecutionContext>,
+) -> bool {
+    has_app
+        && !anonymous
+        && !execution_context.is_some_and(|context| {
+            context.task_id.is_some() || context.usage_surface == UsageSurface::Subagent
+        })
+}
+
 pub struct AgentLoop {
     /// None in a headless run (no Tauri frontend). Present for the desktop
     /// app. Slice 1's EventSink already carries the UI stream; this remains
@@ -1078,6 +1090,16 @@ impl AgentLoop {
         let mcp_tools = self.mcp_manager.list_all_tools().await;
         for mcp_tool in &mcp_tools {
             tool_defs.push(mcp_tool_to_definition(mcp_tool));
+        }
+        // Session-local task delegation depends on the live Tauri scheduler and
+        // a persisted project session. It is offered only for an interactive
+        // project session; anonymous, headless, and subagent runs cannot use it.
+        if !exposes_delegate_tasks(
+            self.app.is_some(),
+            self.anonymous,
+            self.execution_context.as_ref(),
+        ) {
+            tool_defs.retain(|definition| definition.function.name != "delegate_tasks");
         }
         let supports_plan = supports_structured_plan(self.app.is_some(), self.anonymous);
         if !supports_plan {
@@ -3044,6 +3066,25 @@ mod tests {
     // `completion_command_and_kind` (and its `ToolKind` result) moved to
     // agent-loop in slice 4.6; this test still exercises it via the re-export.
     use codefactory_agent_core::ToolKind;
+
+    #[test]
+    fn delegate_tasks_is_exposed_only_to_a_persisted_interactive_project_session() {
+        assert!(exposes_delegate_tasks(true, false, None));
+        assert!(!exposes_delegate_tasks(false, false, None));
+        assert!(!exposes_delegate_tasks(true, true, None));
+
+        let subagent = AgentExecutionContext {
+            usage_surface: UsageSurface::Subagent,
+            ..Default::default()
+        };
+        assert!(!exposes_delegate_tasks(true, false, Some(&subagent)));
+
+        let nested_task = AgentExecutionContext {
+            task_id: Some("synthetic-task".into()),
+            ..Default::default()
+        };
+        assert!(!exposes_delegate_tasks(true, false, Some(&nested_task)));
+    }
 
     #[test]
     fn structured_plan_is_exposed_only_to_persisted_desktop_chat() {

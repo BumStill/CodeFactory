@@ -2042,6 +2042,46 @@ impl DesktopToolBackend {
             }
         }
 
+        // CF-TRS-R5 (U29): a receipt an older build left `unknown` after a call
+        // that provably never landed must not fence this Objective forever.
+        // The historical row is not trusted or rewritten on a status code: the
+        // guarded resource is re-observed and must still match the digest
+        // captured when the receipt was opened. Bounded to this Objective's
+        // binding and to 8 rows per round, so a fence never becomes a scan, and
+        // `never_after_dispatch` contracts are excluded for the same reason as
+        // in `settle_mutation_receipt`.
+        let revisitable: Vec<String> = sqlx::query_scalar(
+            "SELECT receipt.id FROM side_effect_receipts receipt
+             JOIN tool_recovery_contracts contract ON contract.receipt_id = receipt.id
+             WHERE receipt.objective_id=? AND receipt.binding_id=?
+               AND receipt.status IN ('started','unknown')
+               AND contract.state IN ('dispatching','unknown','observed_unchanged','still_unknown')
+               AND contract.replay_policy <> 'never_after_dispatch'
+             ORDER BY receipt.created_at
+             LIMIT 8",
+        )
+        .bind(&objective_id)
+        .bind(&binding_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| ToolError {
+            message: format!("select revisitable uncertain receipts: {error}"),
+        })?;
+        for receipt in &revisitable {
+            super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
+                .settle_no_effect_in_tx(
+                    &mut tx,
+                    receipt,
+                    &ctx.working_directory,
+                    "observed_unchanged_no_effect",
+                    "reobserved_without_effect",
+                )
+                .await
+                .map_err(|error| ToolError {
+                    message: format!("re-observe uncertain receipt {receipt}: {error}"),
+                })?;
+        }
+
         // Name the oldest blocker, not just the count: a fence that reports
         // only "something is uncertain" makes every round of a loop look
         // identical, which is exactly why 2026-09-08 took a database audit to
@@ -2288,6 +2328,49 @@ impl DesktopToolBackend {
                 })?
             {
                 return Ok(());
+            }
+        }
+        // CF-TRS-R1/R2 (U29): a tool that failed or was refused without ever
+        // touching its guarded resource must settle as "no effect" instead of
+        // leaving an `unknown` receipt that fences every later edit. The tool's
+        // error text is not the evidence — `settle_no_effect_foreground`
+        // re-observes the guarded resource and only settles when it still
+        // matches the digest taken when the receipt was opened, so a call that
+        // did land keeps its `unknown` receipt.
+        // `never_after_dispatch` contracts stay excluded on purpose: for a
+        // general command the resource digest cannot prove that nothing escaped
+        // to the outside world, so those keep the conservative path.
+        if let Some(result) = result.filter(|result| result.is_error) {
+            let policy: Option<String> = sqlx::query_scalar(
+                "SELECT replay_policy FROM tool_recovery_contracts WHERE receipt_id=?",
+            )
+            .bind(receipt_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|error| ToolError {
+                message: format!("load receipt replay policy before settlement: {error}"),
+            })?;
+            if policy.as_deref() != Some("never_after_dispatch") {
+                let code = result
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("refused_before_execution");
+                if recovery
+                    .settle_no_effect_foreground(
+                        receipt_id,
+                        &ctx.working_directory,
+                        "observed_unchanged_no_effect",
+                        code,
+                    )
+                    .await
+                    .map_err(|error| ToolError {
+                        message: format!("settle a refused Tool receipt without effect: {error}"),
+                    })?
+                {
+                    return Ok(());
+                }
             }
         }
         if recovery
@@ -3234,6 +3317,289 @@ mod tests {
             .await
             .expect("read is not fatal");
         assert!(!out.is_error && out.content.contains("hello backend"));
+    }
+
+    fn u29_delegation_args() -> serde_json::Value {
+        serde_json::json!({
+            "tasks": [
+                {"id":"a","title":"A","description":"D","dependencies":[],"acceptance_criteria":["a"]},
+                {"id":"b","title":"B","description":"D","dependencies":[],"acceptance_criteria":["b"]}
+            ]
+        })
+    }
+
+    /// CF-TRS-R1/R2 (U29): every kind of refusal that happens *before* a tool can
+    /// touch anything must leave no unresolved receipt behind, and the next edit
+    /// must run. The 2026-10-09 GPT session died on exactly this: `delegate_tasks`
+    /// refused in 3 ms, its receipt stayed `unknown`, and from then on every
+    /// `edit_file` answered `external_state_uncertain` until the task was judged
+    /// exhausted two minutes in, without one line of code changed.
+    #[tokio::test]
+    async fn pre_execution_refusals_settle_as_no_effect_and_never_fence_the_next_edit() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = objective_ctx(dir.path());
+
+        // `opens_receipt` marks the kinds that reach the write-ahead receipt and
+        // only then refuse (a mutation-class tool refusing itself). The others are
+        // refused by the pre-flight gate before any receipt exists.
+        let refusals: [(&str, &str, serde_json::Value, bool); 5] = [
+            (
+                "tool_unavailable",
+                "delegate_tasks",
+                u29_delegation_args(),
+                false,
+            ),
+            (
+                "refused_after_dispatch",
+                "skill_delete",
+                serde_json::json!({"id": "u29-nonexistent-skill"}),
+                true,
+            ),
+            (
+                "invalid_parameters",
+                "edit_file",
+                serde_json::json!({"path": 7}),
+                false,
+            ),
+            (
+                "refused_by_policy",
+                "bash",
+                serde_json::json!({"command": "git push origin main"}),
+                false,
+            ),
+            (
+                "unknown_tool",
+                "no_such_tool_u29",
+                serde_json::json!({}),
+                false,
+            ),
+        ];
+
+        for (case, tool, args, opens_receipt) in refusals {
+            let settled_before: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM side_effect_receipts
+                 WHERE objective_id=? AND status='cancelled'",
+            )
+            .bind(TEST_OBJECTIVE_ID)
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+
+            let call = call_with_args(&format!("u29-{case}"), tool, &args);
+            register_tool_call(&backend, &call, &args).await;
+            let refused = backend
+                .execute(&call, &args, &ctx)
+                .await
+                .expect("a pre-execution refusal is a normal result, never a fatal error");
+            assert!(refused.is_error, "{case} must be reported as a refusal");
+
+            let unresolved: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM side_effect_receipts
+                 WHERE objective_id=? AND status IN ('started','unknown')",
+            )
+            .bind(TEST_OBJECTIVE_ID)
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+            assert_eq!(unresolved, 0, "{case} left an unresolved receipt behind");
+
+            let settled_after: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM side_effect_receipts
+                 WHERE objective_id=? AND status='cancelled'",
+            )
+            .bind(TEST_OBJECTIVE_ID)
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
+            assert_eq!(
+                settled_after - settled_before,
+                i64::from(opens_receipt),
+                "{case}: a refusal that opened a receipt must settle it as no effect"
+            );
+
+            // CF-TRS-R2: the very next edit runs, in the same task, with no
+            // "external state uncertain" wait.
+            let file = format!("target-{case}.txt");
+            let before = format!("before-{case}\n");
+            let after = format!("after-{case}\n");
+            tokio::fs::write(dir.path().join(&file), &before)
+                .await
+                .unwrap();
+            let edit_args = serde_json::json!({
+                "path": file,
+                "old_string": before.trim_end(),
+                "new_string": after.trim_end()
+            });
+            let edit = call_with_args(&format!("u29-edit-{case}"), "edit_file", &edit_args);
+            register_tool_call(&backend, &edit, &edit_args).await;
+            let result = backend
+                .execute(&edit, &edit_args, &ctx)
+                .await
+                .expect("the edit right after a refused tool must execute");
+            assert!(
+                !result.is_error,
+                "{case}: the next edit was still fenced: {}",
+                result.content
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(dir.path().join(&file))
+                    .await
+                    .unwrap(),
+                after,
+                "{case}: the edit after a refusal must land"
+            );
+        }
+    }
+
+    /// CF-TRS-R5 (U29): receipts an older build already left `unknown` after a
+    /// refusal must stop fencing the task — but only on re-observed evidence, and
+    /// the historical row is settled in place with the observation in its summary
+    /// rather than rewritten into a fake success or dropped.
+    #[tokio::test]
+    async fn historical_unknown_receipt_from_a_refusal_no_longer_fences_the_next_edit() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("stale.txt"), "before\n")
+            .await
+            .unwrap();
+        let ctx = objective_ctx(dir.path());
+
+        // A mutation-class tool that refused after its write-ahead receipt was
+        // opened — the shape the 2026-10-09 session was killed by. It is refused
+        // again here, then flipped back to `unknown` to re-create what the
+        // shipped build left in the database.
+        let args = serde_json::json!({"id": "u29-nonexistent-skill"});
+        let call = call_with_args("u29-historical-refusal", "skill_delete", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let refused = backend.execute(&call, &args, &ctx).await.unwrap();
+        assert!(refused.is_error);
+
+        // Re-create the shape the shipped build left behind: the receipt is
+        // `unknown` and the contract is what a failed pre-fix settle left —
+        // re-observed by the old code, but stuck, because nothing settled it.
+        let flipped = sqlx::query(
+            "UPDATE side_effect_receipts SET status='unknown'
+             WHERE objective_id=? AND status='cancelled'",
+        )
+        .bind(TEST_OBJECTIVE_ID)
+        .execute(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(flipped.rows_affected(), 1, "a receipt must exist to flip");
+        sqlx::query(
+            "UPDATE tool_recovery_contracts
+             SET state='observed_unchanged', dispatch_generation=1,
+                 dispatch_owner='u29-history', dispatch_claim_epoch=1,
+                 dispatch_started_at=?
+             WHERE receipt_id IN (
+                 SELECT id FROM side_effect_receipts WHERE objective_id=? AND status='unknown'
+             )",
+        )
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(TEST_OBJECTIVE_ID)
+        .execute(&backend.db)
+        .await
+        .unwrap();
+
+        let historical_id: String = sqlx::query_scalar(
+            "SELECT id FROM side_effect_receipts WHERE objective_id=? AND status='unknown'",
+        )
+        .bind(TEST_OBJECTIVE_ID)
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+
+        let edit_args = serde_json::json!({
+            "path": "stale.txt", "old_string": "before", "new_string": "after"
+        });
+        let edit = call_with_args("u29-historical-edit", "edit_file", &edit_args);
+        register_tool_call(&backend, &edit, &edit_args).await;
+        let result = backend
+            .execute(&edit, &edit_args, &ctx)
+            .await
+            .expect("a historical refusal receipt must not become a fatal handoff");
+        assert!(
+            !result.is_error,
+            "the historical unknown receipt still fenced the edit: {}",
+            result.content
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("stale.txt"))
+                .await
+                .unwrap(),
+            "after\n"
+        );
+
+        let (status, summary): (String, String) =
+            sqlx::query_as("SELECT status, summary_json FROM side_effect_receipts WHERE id=?")
+                .bind(&historical_id)
+                .fetch_one(&backend.db)
+                .await
+                .expect("the historical row must be settled with its evidence, not deleted");
+        assert_eq!(status, "cancelled");
+        assert!(summary.contains("observed_unchanged_no_effect"));
+        assert!(
+            summary.contains("reobserved_without_effect"),
+            "the settlement must record why it was safe to continue: {summary}"
+        );
+    }
+
+    /// The counter-example the spec protects: when the guarded resource really
+    /// changed, re-observation must NOT calm the receipt down, so the task still
+    /// stops for reconciliation. "No effect" is decided by evidence, never by a
+    /// status code or by the tool's own error text.
+    #[tokio::test]
+    async fn re_observation_never_clears_a_mutation_that_really_landed() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("landed.txt"), "before\n")
+            .await
+            .unwrap();
+        let ctx = objective_ctx(dir.path());
+
+        let first_args = serde_json::json!({
+            "path": "landed.txt", "old_string": "before", "new_string": "landed"
+        });
+        let first = call_with_args("u29-landed", "edit_file", &first_args);
+        register_tool_call(&backend, &first, &first_args).await;
+        let out = backend.execute(&first, &first_args, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+
+        // The effect landed and the guarded file now differs from the digest the
+        // receipt was opened against. Simulate the uncertainty an interrupted
+        // process leaves behind on top of that changed state.
+        sqlx::query("UPDATE side_effect_receipts SET status='unknown' WHERE objective_id=?")
+            .bind(TEST_OBJECTIVE_ID)
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE tool_recovery_contracts SET state='unknown'")
+            .execute(&backend.db)
+            .await
+            .unwrap();
+
+        let second_args = serde_json::json!({
+            "path": "landed.txt", "old_string": "landed", "new_string": "again"
+        });
+        let second = call_with_args("u29-landed-next", "edit_file", &second_args);
+        register_tool_call(&backend, &second, &second_args).await;
+        let blocked = backend
+            .execute(&second, &second_args, &ctx)
+            .await
+            .expect("uncertainty stays a system-owned waiting result");
+        assert!(
+            matches!(blocked.status, ToolExecutionStatus::Waiting),
+            "a landed mutation must still be reconciled before continuing: {:?}",
+            blocked
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join("landed.txt"))
+                .await
+                .unwrap(),
+            "landed\n",
+            "the fenced edit must not have run"
+        );
     }
 
     #[tokio::test]
@@ -5829,6 +6195,14 @@ fs.writeFileSync('rerun-'+n+'-'+r+'.mark','x');console.log(n+'-'+r)\"";
             .await
             .expect("uncertainty is a system-owned waiting result, not a fatal/user handoff");
         assert!(matches!(out.status, ToolExecutionStatus::Waiting));
+        let receipt_status: String = sqlx::query_scalar(
+            "SELECT status FROM side_effect_receipts WHERE objective_id=?",
+        )
+        .bind(TEST_OBJECTIVE_ID)
+        .fetch_one(&backend.db)
+        .await
+        .unwrap();
+        assert_eq!(receipt_status, "unknown", "uncertain receipt history must remain unchanged");
         assert_eq!(
             out.metadata
                 .as_ref()
