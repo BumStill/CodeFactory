@@ -145,6 +145,9 @@ pub fn plain_failure_reason(failure_code: Option<&str>) -> String {
     }
     let text = match code {
         "provider_endpoint_unavailable" => "所选模型服务一直连不上",
+        // U25: the transport never reached the service — the network path, not
+        // the model. The outage terminal adds how long and how many times.
+        "provider_transport_unreachable" => "网络或模型服务连不上，一直没能连上",
         "provider_route_unavailable" => "没有可用的模型线路",
         "provider_episode_unreconciled" => {
             "上一次模型回复中断时已经开始了一项改动，这项改动的结果一直没法确认，所以没有贸然重做"

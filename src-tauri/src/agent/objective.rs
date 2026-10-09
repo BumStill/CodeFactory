@@ -169,6 +169,13 @@ pub(crate) fn max_signature_attempts_for(failure_code: Option<&str>) -> i64 {
     if failure_code == Some(COMPLETION_EVIDENCE_INCOMPLETE) {
         return MAX_STAGNANT_COMPLETION_ATTEMPTS;
     }
+    if failure_code == Some(PROVIDER_TRANSPORT_UNREACHABLE) {
+        // U25: a network outage must not be charged like N independent failures
+        // of the same broken thing. The window (`TRANSPORT_OUTAGE_WINDOW_MS`)
+        // is what ends an outage; this ceiling only bounds real retries that ran
+        // once the path was up again.
+        return MAX_TRANSPORT_RECOVERY_ATTEMPTS;
+    }
     MAX_SIGNATURE_RECOVERY_ATTEMPTS
 }
 
@@ -204,6 +211,41 @@ const LIVE_RUN_STOP_GRACE_MS: u64 = 2_000;
 /// minute instead.
 pub const PROVIDER_ENDPOINT_UNAVAILABLE: &str = "provider_endpoint_unavailable";
 const DEAD_ENDPOINT_RETRY_MS: i64 = 10_000;
+
+/// U25 (2026-10-08). The transport never reached a verdict: DNS, TCP connect,
+/// TLS, a read timeout, a reset, or a gateway that answered nothing useful.
+/// Unlike `PROVIDER_ENDPOINT_UNAVAILABLE` this is a property of the *network
+/// path*, not an answer from the service, so it gets its own code and its own
+/// policy: wait it out, then say so honestly.
+pub const PROVIDER_TRANSPORT_UNREACHABLE: &str = "provider_transport_unreachable";
+
+/// How long one transport outage may last before the objective stops waiting
+/// and settles. Fifteen minutes is deliberately far past the events that
+/// motivate this: the 2026-10-08 DeepSeek outage recovered on its own after
+/// ~3 minutes, a Wi‑Fi switch or VPN reconnect is seconds, and a proxy restart
+/// is under a minute — while still being short enough that nobody is left
+/// watching "等待中" for an afternoon.
+const TRANSPORT_OUTAGE_WINDOW_MS: i64 = 15 * 60 * 1_000;
+
+/// How often the cheap reachability probe is repeated while the path is down.
+/// The probe is what keeps an outage from spending the recovery budget: a
+/// connect that still fails means there is nothing to retry yet, so no model
+/// turn runs and no attempt is charged.
+const TRANSPORT_PROBE_INTERVAL_MS: i64 = 20_000;
+const TRANSPORT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The growing ladder for the retries that *do* run (the path is reachable
+/// again but the turn still failed): 15s, 45s, 135s, then 4 minutes each. Eight
+/// of those span well over the window above, which is what "growing backoff for
+/// 10–15 minutes" needs; the window, not this ladder, is what ends an outage.
+const TRANSPORT_RETRY_BASE_MS: i64 = 15_000;
+const TRANSPORT_RETRY_FACTOR: i64 = 3;
+const TRANSPORT_RETRY_CAP_MS: i64 = 4 * 60 * 1_000;
+
+/// One outage is one failure, not N. The retry ceiling is raised for transport
+/// failures because the probe (not the ladder) is what turns an outage into a
+/// wait: these attempts are real turns that ran against a reachable service.
+const MAX_TRANSPORT_RECOVERY_ATTEMPTS: i64 = 8;
 
 /// Advance a session's activity time so the sidebar — which orders by
 /// `sessions.updated_at` and renders a relative time from it — does not bury a
@@ -361,15 +403,137 @@ pub(crate) async fn settle_superseded_chat_turns_in_tx(
 /// them choosing a reachable model.
 pub(crate) fn parked_incident_message(failure_code: Option<&str>) -> &'static str {
     if failure_code == Some(PROVIDER_ENDPOINT_UNAVAILABLE) {
-        return "当前模型端点连续不可用，本回合已停在安全边界。进度和上下文都已保留：\
-在输入框旁切换到另一个可用模型即可继续同一目标，无需重述需求。";
+        // The endpoint *answered* and refused (the model is gone or switched
+        // off), so picking another model is a real, honest next step — but it is
+        // an offer, not a demand: the system keeps observing routes on its own.
+        return "这条模型线路明确拒绝了请求（例如该模型已不可用）。本回合已停在安全边界，\
+进度和上下文都已保留：可以在输入框旁换成另一个可用模型继续同一目标，不必重述需求。";
+    }
+    if failure_code == Some(PROVIDER_TRANSPORT_UNREACHABLE) {
+        return "网络或模型服务连不上了，本回合已停在安全边界。进度和上下文都已保留：\
+网络或服务恢复后直接回一句「继续」，就会在原来的进度上接着做。";
     }
     "本回合的自动恢复已达到安全上限，已登记为系统故障。你不需要补充输入；CodeFactory 会在恢复策略或能力更新后续接同一目标。"
+}
+
+/// What to do about a transport outage on the next observation. Pure so the
+/// policy — wait, retry, or give up — is testable without a network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransportOutageAction {
+    /// Still unreachable, still inside the window: look again later. No model
+    /// turn runs and no recovery budget is spent.
+    Wait { delay_ms: i64 },
+    /// The path answers again (or there is nothing to probe): let the ordinary
+    /// retry ladder run.
+    Retry,
+    /// Unreachable for the whole window: settle honestly.
+    GiveUp {
+        unreachable_ms: i64,
+        attempts: i64,
+    },
+}
+
+pub(crate) fn transport_outage_action(
+    now: i64,
+    first_unreachable_at: i64,
+    attempts: i64,
+    probe_reachable: bool,
+) -> TransportOutageAction {
+    // A probe that answers means the outage is over, whatever the clock says:
+    // the retry that follows is a real attempt against a live path.
+    if probe_reachable {
+        return TransportOutageAction::Retry;
+    }
+    let unreachable_ms = now.saturating_sub(first_unreachable_at).max(0);
+    if unreachable_ms >= TRANSPORT_OUTAGE_WINDOW_MS {
+        return TransportOutageAction::GiveUp {
+            unreachable_ms,
+            attempts: attempts.max(1),
+        };
+    }
+    // Never step past the end of the window: the window is the answer, not
+    // something the probe interval is allowed to walk out of.
+    let remaining = TRANSPORT_OUTAGE_WINDOW_MS - unreachable_ms;
+    TransportOutageAction::Wait {
+        delay_ms: TRANSPORT_PROBE_INTERVAL_MS.min(remaining).max(1_000),
+    }
+}
+
+/// The host and port a failed request was aimed at, read back out of the
+/// transport error itself (`error sending request for url
+/// (https://api.deepseek.com/chat/completions)`). The recorded failure detail
+/// already carries that text, so the probe needs no new plumbing — and it
+/// probes the exact route that just failed rather than some generic endpoint.
+pub(crate) fn probe_target_from_error_text(text: &str) -> Option<(String, u16)> {
+    let scheme_end = text.find("://")?;
+    let rest = &text[scheme_end + 3..];
+    let host_end = rest
+        .find(|c: char| {
+            c == '/' || c == '"' || c == ')' || c == '?' || c == '\'' || c.is_whitespace()
+        })
+        .unwrap_or(rest.len());
+    let authority = &rest[..host_end];
+    if authority.is_empty() {
+        return None;
+    }
+    let default_port = if text[..scheme_end].eq_ignore_ascii_case("http") {
+        80
+    } else {
+        443
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.contains(']') => match port.parse::<u16>() {
+            Ok(port) => (host.to_string(), port),
+            Err(_) => (authority.to_string(), default_port),
+        },
+        _ => (authority.to_string(), default_port),
+    };
+    (!host.is_empty()).then_some((host, port))
+}
+
+/// The cheap check requirement 2 asks for: one TCP connect to the route that
+/// just failed. It never issues a model request, so a path that is still down
+/// costs a connection attempt instead of an attempt at the task.
+pub(crate) async fn probe_transport_reachability(host: &str, port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            TRANSPORT_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect((host, port))
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// The honest end of a transport outage, in plain language: how long the
+/// network or service was unreachable, how many times it was tried, that the
+/// work is kept, and how to pick it back up. Same banned-vocabulary guard as the
+/// failure summary — this is shown to users verbatim.
+pub(crate) fn transport_outage_terminal_message(unreachable_ms: i64, attempts: i64) -> String {
+    let minutes = (unreachable_ms.max(0) as f64 / 60_000.0).round().max(1.0) as i64;
+    format!(
+        "网络或模型服务连不上，已经连续连不上约 {minutes} 分钟，期间一共试了 {attempts} 次，都没能连上，\
+所以这件事先停在这里。已经做好的改动和对话内容都保留着，没有丢。\
+等网络或模型服务恢复正常后，直接回一句「继续」，就会在原来的进度上接着做。"
+    )
 }
 
 fn recovery_backoff_ms_for(failure_code: Option<&str>, prior_attempts: i64) -> i64 {
     if failure_code == Some(PROVIDER_ENDPOINT_UNAVAILABLE) {
         return DEAD_ENDPOINT_RETRY_MS;
+    }
+    if failure_code == Some(PROVIDER_TRANSPORT_UNREACHABLE) {
+        // U25: a transient transport condition needs room to clear, so it keeps
+        // a growing ladder — but a bounded one, because the outage window above
+        // is what decides when waiting has gone on long enough.
+        let mut delay = TRANSPORT_RETRY_BASE_MS;
+        for _ in 0..prior_attempts.clamp(0, 8) {
+            delay = delay.saturating_mul(TRANSPORT_RETRY_FACTOR);
+            if delay >= TRANSPORT_RETRY_CAP_MS {
+                return TRANSPORT_RETRY_CAP_MS;
+            }
+        }
+        return delay.min(TRANSPORT_RETRY_CAP_MS);
     }
     recovery_backoff_ms(prior_attempts)
 }
@@ -584,6 +748,7 @@ impl ObjectiveSnapshot {
             // Routing a decision is not itself user activity; callers that
             // settle state left by an earlier process mark it `as_convergence()`.
             settlement_origin: SettlementOrigin::Live,
+            transport_probe_wait: false,
         }
     }
 
@@ -703,6 +868,12 @@ pub struct DecisionEnvelope {
     /// `sessions.updated_at` — see `SettlementOrigin`.
     #[serde(default)]
     pub settlement_origin: SettlementOrigin,
+    /// U25: this wait is a transport outage that is *still* unreachable, so it
+    /// must not queue a remediation. A queued remediation is a charged recovery
+    /// attempt plus a full model turn aimed at a path we just proved is down;
+    /// the cheap probe replaces both until the path answers again.
+    #[serde(default)]
+    pub transport_probe_wait: bool,
 }
 
 /// Whether settling a decision is user-visible activity.
@@ -4374,6 +4545,162 @@ impl ObjectiveStore {
     /// a `CapabilityRestored` route lands an `apply_recommended` decision, and
     /// permission authorization inserts its remediation directly with the
     /// `resume_authorized_action` strategy and no decision row at all.
+    /// U25: what a transport outage does on the next observation. The decision
+    /// is either kept waiting (no model turn, no attempt charged) or settled as
+    /// the honest failure once the window is over.
+    async fn bound_transport_outage(
+        &self,
+        mut decision: DecisionEnvelope,
+    ) -> anyhow::Result<DecisionEnvelope> {
+        let now = Utc::now().timestamp_millis();
+        let (first_unreachable_at, attempts, error_text) = self
+            .transport_outage_series(&decision.objective_id, PROVIDER_TRANSPORT_UNREACHABLE)
+            .await?;
+        let probe_reachable = match error_text
+            .as_deref()
+            .and_then(probe_target_from_error_text)
+        {
+            Some((host, port)) => probe_transport_reachability(&host, port).await,
+            // Nothing to probe means nothing to learn from waiting here; keep
+            // the ordinary ladder rather than inventing a wait with no signal.
+            None => true,
+        };
+        match transport_outage_action(
+            now,
+            first_unreachable_at.unwrap_or(now),
+            attempts,
+            probe_reachable,
+        ) {
+            TransportOutageAction::Retry => Ok(decision),
+            TransportOutageAction::Wait { delay_ms } => {
+                // Keep the owner and the remediation identity the router minted:
+                // a system wait is only valid with all three, and the identity is
+                // what lets the next observation be recognised as the *same*
+                // outage rather than a fresh failure. No remediation row is
+                // inserted for this decision (see `transport_probe_wait`), so
+                // nothing is claimable and no model turn runs while the path is
+                // still down.
+                decision.decision_type = DecisionType::Waiting;
+                decision.status = ObjectiveStatus::WaitingSystem;
+                decision.request_key = None;
+                decision.next_observation_at = Some(now + delay_ms);
+                decision.next_action_authorized = false;
+                decision.requires_user_action = false;
+                decision.transport_probe_wait = true;
+                Ok(decision)
+            }
+            TransportOutageAction::GiveUp {
+                unreachable_ms,
+                attempts,
+            } => {
+                let text = transport_outage_terminal_message(unreachable_ms, attempts);
+                self.record_transport_outage_terminal(
+                    &decision.objective_id,
+                    unreachable_ms,
+                    attempts,
+                    &text,
+                )
+                .await;
+                // U3's failed terminal, reached honestly: the objective stays
+                // `failed` with a code that explains itself. No new intermediate
+                // state is invented for the user to decode.
+                decision.decision_type = DecisionType::FailedInternal;
+                decision.status = ObjectiveStatus::Failed;
+                decision.failure_code = Some(PROVIDER_TRANSPORT_UNREACHABLE.into());
+                decision.request_key = None;
+                decision.remediation_id = None;
+                decision.next_observation_at = None;
+                decision.next_action_authorized = false;
+                decision.requires_user_action = false;
+                decision.recovery_owner = Some(OBJECTIVE_INCIDENT_CONTROLLER.into());
+                Ok(decision)
+            }
+        }
+    }
+
+    /// The one durable series a transport outage forms: (first seen, attempts,
+    /// the error text that names the route). Grouped by failure *code*, not by
+    /// error text — the text carries a fresh URL and timing per run, and
+    /// counting per signature would turn one outage into N independent failures.
+    async fn transport_outage_series(
+        &self,
+        objective_id: &str,
+        failure_code: &str,
+    ) -> anyhow::Result<(Option<i64>, i64, Option<String>)> {
+        let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT created_at, detail_json FROM objective_events
+             WHERE objective_id=? AND event_type='technical_failure_detail'
+               AND failure_code=?
+             ORDER BY created_at ASC, rowid ASC",
+        )
+        .bind(objective_id)
+        .bind(failure_code)
+        .fetch_all(&self.pool)
+        .await?;
+        let first = rows.first().map(|(created_at, _)| *created_at);
+        let attempts = rows.len() as i64;
+        let error_text = rows.first().and_then(|(_, detail)| {
+            detail
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|value| {
+                    value
+                        .get("error_text")
+                        .and_then(|text| text.as_str())
+                        .map(str::to_string)
+                })
+        });
+        Ok((first, attempts.max(1), error_text))
+    }
+
+    /// Durable, plain-language record of how an outage ended. Best-effort like
+    /// every other diagnostic here: it must never be the thing that loses the
+    /// decision it describes.
+    async fn record_transport_outage_terminal(
+        &self,
+        objective_id: &str,
+        unreachable_ms: i64,
+        attempts: i64,
+        message: &str,
+    ) {
+        if crate::agent::failure_summary::assert_no_internal_vocabulary(message).is_err() {
+            tracing::error!(
+                objective_id = %objective_id,
+                "transport outage terminal message failed the user-safe vocabulary guard"
+            );
+        }
+        let detail = serde_json::json!({
+            "unreachable_ms": unreachable_ms,
+            "attempts": attempts,
+            "message": message,
+        })
+        .to_string();
+        let _ = sqlx::query(
+            "INSERT INTO objective_events
+             (id, objective_id, revision, event_type, status, decision_type,
+              domain, failure_code, detail_json, created_at)
+             SELECT ?, id, revision, 'transport_outage_terminal', status,
+                    decision_type, 'chat', ?, ?, ? FROM objectives WHERE id=?
+               AND NOT EXISTS (
+                 SELECT 1 FROM objective_events
+                 WHERE objective_id=? AND event_type='transport_outage_terminal'
+               )",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(PROVIDER_TRANSPORT_UNREACHABLE)
+        .bind(detail)
+        .bind(Utc::now().timestamp_millis())
+        .bind(objective_id)
+        .bind(objective_id)
+        .execute(&self.pool)
+        .await;
+    }
+
+    /// How long a repeating failure signature may keep being re-observed before
+    /// the objective admits it is not making progress and settles. Deterministic
+    /// verdicts (an unreconcilable turn identity) settle on the first
+    /// occurrence; a transport outage is decided earlier still, by the window in
+    /// [`Self::bound_transport_outage`].
     async fn bound_system_recovery(
         &self,
         mut decision: DecisionEnvelope,
@@ -4382,6 +4709,13 @@ impl ObjectiveStore {
             && decision.failure_code.as_deref() == Some(UPDATE_SAFE_POINT_PENDING)
         {
             return Ok(decision);
+        }
+        if decision.failure_code.as_deref() == Some(PROVIDER_TRANSPORT_UNREACHABLE) {
+            // U25: a network or service outage is not a verdict about the task.
+            // Wait it out with a cheap reachability probe — and give up honestly
+            // once the window is over — before the ordinary ladder gets a chance
+            // to spend the recovery budget on a path that is simply down.
+            return self.bound_transport_outage(decision).await;
         }
         if decision.failure_code.as_deref() == Some(CHAT_IDENTITY_UNRECONCILABLE) {
             // U18/R3: the remediation's turn identity cannot be reconciled with
@@ -6037,6 +6371,7 @@ impl ObjectiveStore {
 
         if decision.status == ObjectiveStatus::WaitingSystem
             && !decision.is_parked_system_incident()
+            && !decision.transport_probe_wait
         {
             let strategy = if decision.domain == RecoveryDomain::Update
                 && decision.failure_code.as_deref() == Some(UPDATE_SAFE_POINT_PENDING)
@@ -11834,8 +12169,298 @@ CREATE TABLE objectives (
 
         let dead = parked_incident_message(Some(PROVIDER_ENDPOINT_UNAVAILABLE));
         assert!(!dead.contains("你不需要补充输入"), "{dead}");
-        assert!(dead.contains("切换到另一个可用模型"), "{dead}");
+        assert!(
+            !dead.contains("切换到另一个可用模型"),
+            "U25: switching models is an offer, not a demand the system hands back: {dead}"
+        );
+        assert!(dead.contains("换成另一个可用模型"), "{dead}");
         assert!(dead.contains("进度和上下文都已保留"), "{dead}");
+
+        // U25: the transport case says what can actually be done about it —
+        // wait for the network, then pick the same task back up.
+        let transport = parked_incident_message(Some(PROVIDER_TRANSPORT_UNREACHABLE));
+        assert!(!transport.contains("你不需要补充输入"), "{transport}");
+        assert!(!transport.contains("换"), "no model switch is needed: {transport}");
+        assert!(transport.contains("继续"), "{transport}");
+    }
+
+    /// U25: seed the durable failure series a transport outage leaves behind —
+    /// the same row `record_failure_detail` writes when a turn dies with
+    /// `error sending request for url (…)`.
+    async fn seed_transport_failure(
+        pool: &SqlitePool,
+        objective_id: &str,
+        url: &str,
+        created_at: i64,
+    ) {
+        let detail = serde_json::json!({
+            "failure_signature": "sha256:transport",
+            "error_text": format!("HTTP error: error sending request for url ({url})"),
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO objective_events
+             (id, objective_id, revision, event_type, status, decision_type,
+              domain, failure_code, detail_json, created_at)
+             SELECT ?, id, revision, 'technical_failure_detail', status,
+                    decision_type, 'chat', ?, ?, ? FROM objectives WHERE id=?",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(PROVIDER_TRANSPORT_UNREACHABLE)
+        .bind(detail)
+        .bind(created_at)
+        .bind(objective_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A local listening socket the probe can reach: the outage is over. No
+    /// external network is involved.
+    fn reachable_local_route() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (
+            listener,
+            format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        )
+    }
+
+    /// A local port nobody listens on: `connect` is refused at once, so the
+    /// probe cannot reach it. Still no external network.
+    fn unreachable_local_route() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/v1/chat/completions")
+    }
+
+    async fn route_transport_failure(
+        store: &ObjectiveStore,
+        current: &ObjectiveSnapshot,
+    ) -> ObjectiveSnapshot {
+        let issued = Utc::now().timestamp_millis();
+        let decision = DecisionRouter::route(
+            current,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: PROVIDER_TRANSPORT_UNREACHABLE.into(),
+                failure_signature: "sha256:transport".into(),
+                next_observation_at: issued + 5_000,
+                resume_cursor: current.resume_cursor.clone(),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(current.revision, decision)
+            .await
+            .unwrap()
+    }
+
+    async fn queued_remediations(pool: &SqlitePool, objective_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_remediations
+             WHERE objective_id=? AND status IN ('queued','waiting')",
+        )
+        .bind(objective_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// U25 policy table: wait inside the window, retry the moment the path
+    /// answers, give up only once the window is over.
+    #[test]
+    fn transport_outage_policy_waits_then_settles_only_after_the_window() {
+        let now = 1_700_000_000_000_i64;
+        assert_eq!(
+            transport_outage_action(now, now - 20_000, 1, false),
+            TransportOutageAction::Wait {
+                delay_ms: TRANSPORT_PROBE_INTERVAL_MS
+            }
+        );
+        // Three minutes in — the 2026-10-08 DeepSeek outage: still waiting, not
+        // a verdict about the task.
+        assert!(matches!(
+            transport_outage_action(now, now - 180_000, 3, false),
+            TransportOutageAction::Wait { .. }
+        ));
+        // The path answers again: retry, whatever the clock says.
+        assert_eq!(
+            transport_outage_action(now, now - 180_000, 3, true),
+            TransportOutageAction::Retry
+        );
+        // Still down after the window: settle, with how long and how often.
+        assert_eq!(
+            transport_outage_action(now, now - TRANSPORT_OUTAGE_WINDOW_MS - 1_000, 7, false),
+            TransportOutageAction::GiveUp {
+                unreachable_ms: TRANSPORT_OUTAGE_WINDOW_MS + 1_000,
+                attempts: 7,
+            }
+        );
+        // The probe interval never steps past the end of the window.
+        let remaining = 5_000;
+        assert_eq!(
+            transport_outage_action(now, now - (TRANSPORT_OUTAGE_WINDOW_MS - remaining), 2, false),
+            TransportOutageAction::Wait { delay_ms: remaining }
+        );
+        assert!(
+            MAX_TRANSPORT_RECOVERY_ATTEMPTS > MAX_SIGNATURE_RECOVERY_ATTEMPTS,
+            "one outage must not be charged like the ordinary ladder"
+        );
+        assert_eq!(
+            max_signature_attempts_for(Some(PROVIDER_TRANSPORT_UNREACHABLE)),
+            MAX_TRANSPORT_RECOVERY_ATTEMPTS
+        );
+        assert_eq!(
+            recovery_backoff_ms_for(Some(PROVIDER_TRANSPORT_UNREACHABLE), 0),
+            TRANSPORT_RETRY_BASE_MS
+        );
+        assert!(
+            recovery_backoff_ms_for(Some(PROVIDER_TRANSPORT_UNREACHABLE), 5) > 60_000,
+            "the transport ladder has to grow, not repeat a flat interval"
+        );
+        assert_eq!(
+            recovery_backoff_ms_for(Some(PROVIDER_ENDPOINT_UNAVAILABLE), 5),
+            DEAD_ENDPOINT_RETRY_MS,
+            "an explicit refusal keeps the short path"
+        );
+    }
+
+    #[test]
+    fn the_probe_targets_the_route_that_just_failed() {
+        assert_eq!(
+            probe_target_from_error_text(
+                "HTTP error: error sending request for url (https://api.deepseek.com/chat/completions)"
+            ),
+            Some(("api.deepseek.com".to_string(), 443))
+        );
+        assert_eq!(
+            probe_target_from_error_text(
+                "error sending request for url (http://127.0.0.1:8123/v1/chat/completions)"
+            ),
+            Some(("127.0.0.1".to_string(), 8123))
+        );
+        assert_eq!(probe_target_from_error_text("connection reset by peer"), None);
+    }
+
+    /// The probe is the cheap check that replaces a model turn: a local socket
+    /// answers, a closed local port does not. Both are synthetic and local.
+    #[tokio::test]
+    async fn the_probe_answers_for_a_live_socket_and_not_for_a_closed_port() {
+        let (listener, _url) = reachable_local_route();
+        let port = listener.local_addr().unwrap().port();
+        assert!(probe_transport_reachability("127.0.0.1", port).await);
+        drop(listener);
+        assert!(!probe_transport_reachability("127.0.0.1", port).await);
+    }
+
+    /// U25 requirement 2: while the path is still down, the objective waits and
+    /// spends nothing — no model turn, no charged attempt.
+    #[tokio::test]
+    async fn a_path_that_is_still_down_waits_without_spending_an_attempt() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-transport-still-down").await;
+        let url = unreachable_local_route();
+        let now = Utc::now().timestamp_millis();
+        for offset in [60_000_i64, 30_000] {
+            seed_transport_failure(&pool, &current.id, &url, now - offset).await;
+        }
+
+        let after = route_transport_failure(&store, &current).await;
+
+        assert_eq!(after.status, ObjectiveStatus::WaitingSystem, "the task is not over");
+        assert_eq!(
+            after.failure_code.as_deref(),
+            Some(PROVIDER_TRANSPORT_UNREACHABLE)
+        );
+        assert_ne!(after.failure_code.as_deref(), Some(TECHNICAL_RECOVERY_EXHAUSTED));
+        assert_eq!(
+            queued_remediations(&pool, &after.id).await,
+            0,
+            "a path that is still down must not queue a charged attempt"
+        );
+        let next_observation: i64 = after.next_observation_at.unwrap();
+        assert!(
+            next_observation > Utc::now().timestamp_millis(),
+            "the objective must come back to look again"
+        );
+    }
+
+    /// U25 requirement 2 and 3: three minutes of transport failure, then the
+    /// network returns. The objective must not be failed, and it resumes into a
+    /// real retry rather than exhausting anything.
+    #[tokio::test]
+    async fn a_three_minute_outage_that_recovers_does_not_fail_the_objective() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-transport-recovers").await;
+        let (listener, url) = reachable_local_route();
+        let now = Utc::now().timestamp_millis();
+        // The outage started three minutes ago, with several failed attempts,
+        // and is over now: exactly the 2026-10-08 shape.
+        for offset in [180_000_i64, 150_000, 120_000, 60_000] {
+            seed_transport_failure(&pool, &current.id, &url, now - offset).await;
+        }
+
+        let after = route_transport_failure(&store, &current).await;
+        drop(listener);
+
+        assert_ne!(
+            after.status,
+            ObjectiveStatus::Failed,
+            "a one-minute network loss is not every approach having failed"
+        );
+        assert_ne!(after.failure_code.as_deref(), Some(TECHNICAL_RECOVERY_EXHAUSTED));
+        assert_eq!(
+            queued_remediations(&pool, &after.id).await,
+            1,
+            "the recovered path must resume into a real retry"
+        );
+    }
+
+    /// U25 requirement 4: an outage that outlasts the window settles honestly,
+    /// saying how long it was unreachable and how many times it was tried, and
+    /// using no internal vocabulary.
+    #[tokio::test]
+    async fn an_outage_past_the_window_settles_with_long_and_honest_wording() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-transport-window").await;
+        let url = unreachable_local_route();
+        let now = Utc::now().timestamp_millis();
+        for offset in [16 * 60_000_i64, 10 * 60_000, 3 * 60_000, 30_000] {
+            seed_transport_failure(&pool, &current.id, &url, now - offset).await;
+        }
+
+        let after = route_transport_failure(&store, &current).await;
+
+        assert_eq!(after.status, ObjectiveStatus::Failed);
+        assert_eq!(
+            after.failure_code.as_deref(),
+            Some(PROVIDER_TRANSPORT_UNREACHABLE),
+            "the settled reason must explain itself"
+        );
+        assert!(!after.requires_user_action);
+
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail_json FROM objective_events
+             WHERE objective_id=? AND event_type='transport_outage_terminal'
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(&after.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("16 分钟"), "how long: {message}");
+        assert!(message.contains("4 次"), "how many times: {message}");
+        assert!(message.contains("保留"), "progress is kept: {message}");
+        assert!(message.contains("继续"), "how to go on: {message}");
+        crate::agent::failure_summary::assert_no_internal_vocabulary(message).unwrap();
+        assert_eq!(value["attempts"].as_i64(), Some(4));
     }
 
     #[tokio::test]
