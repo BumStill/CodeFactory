@@ -23,7 +23,7 @@ import { FileArtifactCard, isDocumentPath } from "./FileArtifactCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
-import { formatDuration, formatElapsedClock, useNowTick } from "../lib/duration";
+import { formatElapsedClock, useNowTick } from "../lib/duration";
 import { formatUsageTokens } from "./TokenUsageHeatmap";
 import { TurnProgress } from "./TurnProgress";
 import {
@@ -31,7 +31,7 @@ import {
   rootTurnIdForMessage,
   systemOwnsObjective,
 } from "../lib/turnOwnership";
-import { humanWaitingReason } from "../lib/waitingReason";
+import { statusBannerView } from "../lib/statusBanner";
 import {
   summarizeTurnEvidence,
   TurnResultSnapshot,
@@ -825,53 +825,39 @@ function ActiveTurnProgress({
 }) {
   const nowMs = useNowTick(true);
   if (!plan) {
-    const waitingReason = humanWaitingReason(activity?.waitingReason);
-    const systemOwned = activity?.objectiveStatus === "active" || activity?.objectiveStatus === "waiting_system";
-    const nextObservation = activity?.nextObservationAt
-      ? Math.max(0, activity.nextObservationAt - nowMs)
-      : null;
+    // CF-RSB-R1..R4: one pure view decides what the banner may say. Internal
+    // control-loop identifiers, owners and meaningless "0ms" hints never reach
+    // the screen; a settled turn renders no banner at all.
+    const banner = statusBannerView({ activity, startedAt, nowMs });
+    if (!banner) return null;
     return (
       <div
         role="status"
         data-testid="turn-activity-progress"
-        data-status-tone={waitingReason ? "warning" : "progress"}
+        data-status-tone={banner.tone}
         className={`flex max-w-[min(34rem,calc(100vw-2rem))] items-center gap-2 rounded-full border bg-surface-2/95 px-3 py-1.5 text-caption shadow-lg backdrop-blur ${
-          waitingReason
+          banner.tone === "warning"
             ? "border-status-warning/35 text-status-warning"
             : "border-border text-gray-300"
         }`}
       >
-        {waitingReason ? (
+        {banner.tone === "warning" ? (
           <AlertTriangle size={14} aria-hidden="true" className="shrink-0" />
         ) : (
           <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-status-progress motion-reduce:animate-none" />
         )}
-        <span className="truncate">
-          {systemOwned ? "系统仍在处理 · 恢复中" : activity?.label || "正在处理任务"}
-        </span>
-        {systemOwned && activity?.recoveryOwner && (
-          <span className="max-w-[12rem] truncate text-gray-400">
-            · {activity.recoveryOwner}
+        <span className="truncate">{banner.text}</span>
+        {banner.detail && (
+          <span className="max-w-[18rem] truncate text-gray-400">
+            · {banner.detail}
           </span>
         )}
-        {systemOwned && activity?.label && (
-          <span className="max-w-[16rem] truncate text-gray-400">
-            · {activity.label}
-          </span>
-        )}
-        {waitingReason && (
-          <span className="max-w-[18rem] truncate text-status-warning/80">
-            · {waitingReason}
-          </span>
-        )}
-        {systemOwned && nextObservation !== null && (
+        {banner.waitHint && (
           <span className="shrink-0 text-gray-500">
-            · 下次观察 {formatDuration(nextObservation)} 后
+            · {banner.waitHint}
           </span>
         )}
-        <span className="shrink-0 text-gray-600">
-          {formatDuration(Math.max(0, nowMs - startedAt))}
-        </span>
+        <span className="shrink-0 text-gray-600">{banner.elapsed}</span>
       </div>
     );
   }
