@@ -1428,6 +1428,15 @@ fn chat_failure_code_for_error(error_text: &str) -> &'static str {
         crate::agent::objective::PROVIDER_EPISODE_UNRECONCILED
     } else if matches!(
         crate::agent::failover::classify_provider_failure(error_text),
+        crate::agent::failover::ProviderFailureClass::TransportUnreachable
+    ) {
+        // U25: nothing answered — DNS, connect, TLS, a read timeout, a reset, or
+        // an anonymous 502–504. That is a property of the network path, not a
+        // verdict on the task, so it gets its own code and its own wait-it-out
+        // policy instead of the endpoint's flat ~10s convergence.
+        crate::agent::objective::PROVIDER_TRANSPORT_UNREACHABLE
+    } else if matches!(
+        crate::agent::failover::classify_provider_failure(error_text),
         crate::agent::failover::ProviderFailureClass::EndpointUnavailable
     ) {
         crate::agent::objective::PROVIDER_ENDPOINT_UNAVAILABLE
