@@ -338,6 +338,18 @@ impl ProviderAttemptRuntime {
         &self,
         error: &TransportError,
     ) -> std::result::Result<ProviderFailureAction, TransportError> {
+        self.settle_failure_with_failover(error, false).await
+    }
+
+    /// U30: `endpoint_failover_available` says the caller proved that this turn
+    /// streamed no output, latched no side effect, and has a different currently
+    /// usable endpoint to continue on. The failure must then stay endpoint-scoped
+    /// instead of escalating into an objective-level wait.
+    async fn settle_failure_with_failover(
+        &self,
+        error: &TransportError,
+        endpoint_failover_available: bool,
+    ) -> std::result::Result<ProviderFailureAction, TransportError> {
         let text = error.message();
         let overloaded = codefactory_agent_loop::context::is_provider_overloaded(text);
         let explicit_response = text.to_ascii_lowercase().contains("http ")
@@ -374,6 +386,7 @@ impl ProviderAttemptRuntime {
                 failure_class,
                 failure_code,
                 replayable,
+                endpoint_failover_available,
                 chrono::Utc::now().timestamp_millis(),
             )
             .await
@@ -1783,6 +1796,15 @@ impl ModelTransport for RoutedDesktopModelTransport {
             let opts = downgraded_options.as_ref().unwrap_or(opts);
             let route = self.route_state.current();
             let output_started = Arc::new(AtomicBool::new(false));
+            // U30: whether an endpoint-scoped failure on this round may continue
+            // on the next configured endpoint. It requires a different usable
+            // endpoint AND a turn that produced nothing a switch would duplicate;
+            // failures after the POST additionally require `output_started` to
+            // still be false, so partial streamed output is never replayed
+            // elsewhere.
+            let endpoint_failover_available = self.route_state.has_available_fallback()
+                && !self.turn_uncommitted_output.load(Ordering::SeqCst)
+                && !self.turn_uncommitted_side_effect.load(Ordering::SeqCst);
             let provider_attempt = self
                 .prepare_provider_attempt(&route, messages, tools, opts)
                 .await?;
@@ -1803,7 +1825,10 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     let action = match provider_attempt.as_ref() {
                         Some(attempt) => {
                             attempt
-                                .settle_failure(&TransportError::Retryable(reason.clone()))
+                                .settle_failure_with_failover(
+                                    &TransportError::Retryable(reason.clone()),
+                                    endpoint_failover_available,
+                                )
                                 .await?
                         }
                         None => ProviderFailureAction::RetrySafe,
@@ -1892,7 +1917,11 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     let action = match provider_attempt.as_ref() {
                         Some(attempt) => {
                             attempt
-                                .settle_failure(&TransportError::Retryable(reason.clone()))
+                                .settle_failure_with_failover(
+                                    &TransportError::Retryable(reason.clone()),
+                                    endpoint_failover_available
+                                        && !output_started.load(Ordering::SeqCst),
+                                )
                                 .await?
                         }
                         None => ProviderFailureAction::RetrySafe,
@@ -3872,5 +3901,458 @@ mod tests {
         assert!(matches!(error, TransportError::Retryable(_)));
         assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
         assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+    }
+
+    // ── U30 (2026-10-09): prefer mode falls back to the next model when the
+    // preferred one is unavailable ─────────────────────────────────────────
+    //
+    // Production session dd3779b3 (policy `prefer`): chatgpt.com answered
+    // `error sending request for url (https://chatgpt.com/backend-api/codex/responses)`
+    // six times, `model_route_attempts` held six chatgpt rows and zero deepseek
+    // or openrouter rows, and the near-finished work died as
+    // `technical_recovery_exhausted`. A POST that was admitted but never reached
+    // a verdict was recorded as an `unknown` attempt, which settled the whole
+    // objective into `DurableWaiting` — and `begin_attempt` fences an episode
+    // whose previous attempt is `unknown`, so every later generation could only
+    // ever retry the SAME endpoint.
+
+    /// A closed loopback port: the request is refused, so the provider never
+    /// reaches a verdict. This is the exact production signature above.
+    fn unreachable_base_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind dead endpoint");
+        let base_url = format!("http://{}", listener.local_addr().expect("dead addr"));
+        drop(listener);
+        base_url
+    }
+
+    /// Like `serve_responses`, but also captures the raw request text so a test
+    /// can prove WHICH conversation the fallback endpoint actually received.
+    fn serve_captured_responses(
+        responses: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind capturing fixture");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fixture_hits = hits.clone();
+        let fixture_captured = captured.clone();
+        std::thread::spawn(move || {
+            for (status, content_type, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept fixture request");
+                fixture_hits.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 64 * 1024];
+                let read = stream.read(&mut request).unwrap_or(0);
+                fixture_captured
+                    .lock()
+                    .expect("capture mutex")
+                    .push(String::from_utf8_lossy(&request[..read]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write fixture response");
+            }
+        });
+        (base_url, hits, captured)
+    }
+
+    const OPENAI_OK: (&str, &str, &str) = (
+        "200 OK",
+        "text/event-stream",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+    );
+
+    /// U30 / CF-PFB-R1 + R5. A preferred endpoint that cannot be reached must
+    /// not park the whole objective in a wait that only the preferred endpoint
+    /// can ever leave: the same task continues on the next configured endpoint.
+    #[tokio::test]
+    async fn prefer_mode_continues_on_the_fallback_when_the_preferred_endpoint_is_unreachable() {
+        let (pool, objective) = durable_foreground_fixture("prefer-fallback").await;
+        let session_id = objective.session_id.clone().expect("fixture session");
+        // The user's real configuration for this session: prefer.
+        sqlx::query("UPDATE sessions SET model_policy='prefer' WHERE id=?")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (fallback_url, fallback_hits) = serve_responses(vec![OPENAI_OK, OPENAI_OK]);
+
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "chatgpt",
+            "gpt-6-luna",
+            unreachable_base_url(),
+        ));
+        plan.push_fallback(openai_candidate(
+            "deepseek",
+            "deepseek-v4-pro",
+            fallback_url,
+        ));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: session_id.clone(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+
+        let response = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect("prefer mode must continue on the next available endpoint");
+
+        assert!(
+            fallback_hits.load(Ordering::SeqCst) >= 1,
+            "the fallback endpoint must actually serve the turn"
+        );
+        let change = response
+            .route_change
+            .expect("the switch must be recorded for the user");
+        assert_eq!(change.from_endpoint, "chatgpt");
+        assert_eq!(change.to_endpoint, "deepseek");
+        assert!(
+            change.notice.contains("已自动切换到") && change.notice.contains("任务继续执行"),
+            "the switch must be stated in plain words: {}",
+            change.notice
+        );
+
+        // Observation Harness: the durable ledger traces BOTH endpoints, and
+        // only the endpoint that really answered is recorded as succeeded.
+        let ledger: Vec<(String, String)> = sqlx::query_as(
+            "SELECT endpoint, status FROM provider_route_attempts ORDER BY attempt_order",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ledger,
+            vec![
+                ("chatgpt".to_string(), "failed_replayable".to_string()),
+                ("deepseek".to_string(), "response_committed".to_string()),
+            ],
+            "both endpoints must be traced, the unreachable one closed replay-safe"
+        );
+        assert!(
+            matches!(
+                ProviderRecoveryStore::new(pool.clone())
+                    .observe(&objective.id)
+                    .await
+                    .unwrap(),
+                super::super::provider_recovery::ProviderRecoveryDisposition::NoEpisode
+                    | super::super::provider_recovery::ProviderRecoveryDisposition::ReadyToAttempt { .. }
+                    | super::super::provider_recovery::ProviderRecoveryDisposition::RetrySafe { .. }
+                    | super::super::provider_recovery::ProviderRecoveryDisposition::ResponseCheckpoint { .. }
+            ),
+            "a served turn must not leave the objective durably waiting"
+        );
+
+        // R5: usage attribution follows the endpoint that actually answered.
+        let attempts = transport.route_state.attempt_snapshots(true);
+        assert_eq!(attempts.last().map(|a| a.endpoint.as_str()), Some("deepseek"));
+    }
+
+    /// U30 / CF-PFB-R1. The production interception: an endpoint that answers
+    /// "overloaded" burns the strict three-attempt budget and then parks the
+    /// whole OBJECTIVE in a wait whose episode identity is the candidate
+    /// snapshot — so only the same endpoint could ever leave it. With a usable
+    /// fallback configured the task must continue there instead.
+    #[tokio::test]
+    async fn prefer_mode_switches_instead_of_burning_the_overload_budget() {
+        const OVERLOADED: (&str, &str, &str) = (
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":{"message":"Service Unavailable","code":"overloaded"}}"#,
+        );
+        let (pool, objective) = durable_foreground_fixture("prefer-overload").await;
+        let session_id = objective.session_id.clone().expect("fixture session");
+        sqlx::query("UPDATE sessions SET model_policy='prefer' WHERE id=?")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (primary_url, primary_hits) = serve_responses(vec![OVERLOADED, OVERLOADED, OVERLOADED]);
+        let (fallback_url, fallback_hits) = serve_responses(vec![OPENAI_OK, OPENAI_OK]);
+
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "chatgpt",
+            "gpt-6-luna",
+            primary_url,
+        ));
+        plan.push_fallback(openai_candidate(
+            "deepseek",
+            "deepseek-v4-pro",
+            fallback_url,
+        ));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: session_id.clone(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+
+        let response = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect("an overloaded preferred endpoint must not park a fallback-enabled task");
+
+        assert!(primary_hits.load(Ordering::SeqCst) >= 1);
+        assert!(
+            fallback_hits.load(Ordering::SeqCst) >= 1,
+            "the overloaded preferred endpoint must hand the turn to deepseek"
+        );
+        assert_eq!(
+            response
+                .route_change
+                .expect("the switch is user-visible")
+                .to_endpoint,
+            "deepseek"
+        );
+        let waiting_episodes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_route_episodes WHERE status='waiting'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            waiting_episodes, 0,
+            "a switched-over turn must not leave a durably waiting objective"
+        );
+    }
+
+    /// U30 / CF-PFB-R2. Waiting is still correct — but only once every
+    /// configured endpoint has been tried and none of them can serve the turn.
+    #[tokio::test]
+    async fn prefer_mode_waits_only_after_every_endpoint_is_unavailable() {
+        let (pool, objective) = durable_foreground_fixture("prefer-all-down").await;
+        let session_id = objective.session_id.clone().expect("fixture session");
+        sqlx::query("UPDATE sessions SET model_policy='prefer' WHERE id=?")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "chatgpt",
+            "gpt-6-luna",
+            unreachable_base_url(),
+        ));
+        plan.push_fallback(openai_candidate(
+            "deepseek",
+            "deepseek-v4-pro",
+            unreachable_base_url(),
+        ));
+        plan.push_fallback(openai_candidate(
+            "openrouter",
+            "gpt-6-luna",
+            unreachable_base_url(),
+        ));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: session_id.clone(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+
+        let error = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect_err("with every endpoint down the objective waits, it does not fail");
+
+        assert!(
+            matches!(error, TransportError::Retryable(_)),
+            "an unavailable fleet is a wait, not a terminal failure: {error}"
+        );
+        // CF-PFB-R2 asks for a plain-language state that names the models that
+        // were tried and says the system will keep re-observing — not an internal
+        // sentinel and not "recovery exhausted".
+        let message = error.to_string();
+        assert!(
+            message.contains("重新观测可用路由"),
+            "the user must be told the system keeps watching for recovery: {message}"
+        );
+        for tried_model in ["ChatGPT", "DeepSeek", "OpenRouter"] {
+            assert!(
+                message.contains(tried_model),
+                "the state must say which models were tried ({tried_model}): {message}"
+            );
+        }
+        let tried: Vec<String> =
+            sqlx::query_scalar("SELECT endpoint FROM provider_route_attempts ORDER BY attempt_order")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tried, vec!["chatgpt", "deepseek", "openrouter"]);
+        for handoff in ["回复继续", "点击重试", "technical_recovery_exhausted"] {
+            assert!(
+                !error.to_string().contains(handoff),
+                "technical recovery stays system-owned: {error}"
+            );
+        }
+    }
+
+    /// U30 / CF-PFB-R1 + R4. The switch happens mid-conversation, after a tool
+    /// call, and the fallback endpoint receives that same conversation.
+    #[tokio::test]
+    async fn prefer_mode_carries_an_in_progress_tool_conversation_across_the_switch() {
+        let (pool, objective) = durable_foreground_fixture("prefer-midturn").await;
+        let session_id = objective.session_id.clone().expect("fixture session");
+        sqlx::query("UPDATE sessions SET model_policy='prefer' WHERE id=?")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (fallback_url, fallback_hits, captured) = serve_captured_responses(vec![OPENAI_OK]);
+
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "chatgpt",
+            "gpt-6-luna",
+            unreachable_base_url(),
+        ));
+        plan.push_fallback(openai_candidate(
+            "deepseek",
+            "deepseek-v4-pro",
+            fallback_url,
+        ));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: session_id.clone(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+        let mut assistant_with_tool_call = cm("assistant", "让我先读这个文件。");
+        assistant_with_tool_call.tool_calls = Some(vec![call("call-1", "read_file", "{\"path\":\"a.rs\"}")]);
+        assistant_with_tool_call.reasoning_content = Some("内部推理：需要先读文件".into());
+        let history = vec![
+            cm("user", "修一下 a.rs"),
+            assistant_with_tool_call,
+            tool_cm("call-1", "TOOL_RESULT_U30_SENTINEL"),
+        ];
+
+        transport
+            .complete(&history, &[], &RoundOptions::default())
+            .await
+            .expect("the in-progress turn continues on the fallback");
+
+        assert!(fallback_hits.load(Ordering::SeqCst) >= 1);
+        let bodies = captured.lock().expect("capture mutex").clone();
+        let request = bodies.last().expect("the fallback received the request");
+        for carried in [
+            "TOOL_RESULT_U30_SENTINEL",
+            "修一下 a.rs",
+            "read_file",
+        ] {
+            assert!(
+                request.contains(carried),
+                "the fallback must receive the conversation already in progress ({carried} missing): {request}"
+            );
+        }
+    }
+
+    /// U30 / CF-PFB-R6. Fixed mode is a pin, not a preference: a single-candidate
+    /// plan keeps waiting on exactly the model the user chose.
+    #[tokio::test]
+    async fn fixed_mode_never_switches_endpoints_when_the_pinned_one_is_unreachable() {
+        let (pool, objective) = durable_foreground_fixture("fixed-pin").await;
+        let session_id = objective.session_id.clone().expect("fixture session");
+        sqlx::query("UPDATE sessions SET model_policy='fixed' WHERE id=?")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: session_id.clone(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                    "deepseek",
+                    "deepseek-v4-pro",
+                    unreachable_base_url(),
+                )),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+
+        let error = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect_err("a pinned model must not be swapped out silently");
+
+        assert!(matches!(error, TransportError::Retryable(_)));
+        assert_eq!(
+            transport.route_state.current().endpoint_name,
+            "deepseek",
+            "fixed mode must stay on the user's chosen model"
+        );
+        assert!(
+            !transport.route_state.has_available_fallback(),
+            "a pinned plan offers no fallback candidate"
+        );
     }
 }
