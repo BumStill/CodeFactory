@@ -11,6 +11,8 @@ import { useChatStore } from "../stores/chat";
 import type { ToolCallState } from "../stores/chat";
 import { invoke } from "../lib/tauri";
 import { DiffViewer, parseUnifiedDiffResult } from "./DiffViewer";
+import { ToolLineStatsBadge } from "./LineChangeStats";
+import { toolCallLineStats, toolLineStatsLabel } from "../lib/editLineStats";
 import { useAppNavigationStore } from "../stores/appNavigation";
 
 interface Props {
@@ -176,10 +178,10 @@ function summarizeArgs(name: string, raw: string): string | null {
       case "write":
         return args.path ?? null;
       case "edit_file":
-      case "edit": {
-        const len = (args.old_string ?? "").length;
-        return args.path ? `${args.path} (${len}b → ${(args.new_string ?? "").length}b)` : null;
-      }
+      case "edit":
+        // Line counts ("+X −Y") belong next to the path, not a character
+        // count of the arguments — see LineChangeStats.
+        return args.path ?? null;
       case "bash":
       case "exec":
         return args.command ?? null;
@@ -382,6 +384,14 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
 
   const { icon: Icon, iconClass } = styleForTool(tc.name);
   const summary = summarizeArgs(tc.name, tc.args ?? "");
+  // A call that never landed changed nothing: a denied or failed edit must
+  // not advertise "+0 −4" as if it had touched the file.
+  const toolSucceeded = tc.status === "done" && !tc.isError;
+  const lineStats = useMemo(
+    () => (toolSucceeded ? toolCallLineStats(tc.name, tc.args ?? "", tc.result) : null),
+    [toolSucceeded, tc.name, tc.args, tc.result],
+  );
+  const lineStatsLabel = lineStats ? toolLineStatsLabel(lineStats) : null;
   const isTestMod = isTestPathFromArgs(tc.name, tc.args ?? "");
   const knowledgeSources = useMemo(
     () => (open ? parseKnowledgeSources(tc.name, tc.result) : []),
@@ -443,7 +453,7 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
     <div className={`my-0.5 w-fit max-w-full text-note leading-5 ${shellClass}`} data-tool-status={tc.status}>
       <button
         data-density={needsAttention ? "attention" : "compact"}
-        aria-label={`${toolLabel(tc.name)}${summary ? ` · ${summary}` : ""}`}
+        aria-label={`${toolLabel(tc.name)}${summary ? ` · ${summary}` : ""}${lineStatsLabel ? ` · ${lineStatsLabel}` : ""}`}
         className={`inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-lg px-1.5 text-left transition-colors hover:bg-surface-3/55 ${
           needsAttention ? "py-0.5" : "py-0"
         }`}
@@ -460,7 +470,8 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
         {summary && (
           <span className="min-w-0 truncate font-mono text-note text-gray-600">· {summary}</span>
         )}
-        <span className="ml-auto shrink-0">{statusIcon}</span>
+        {lineStats ? <ToolLineStatsBadge stats={lineStats} /> : null}
+        <span className={`shrink-0 ${lineStats ? "ml-1" : "ml-auto"}`}>{statusIcon}</span>
       </button>
 
       {/* A failed call must explain itself without a click: surface the
