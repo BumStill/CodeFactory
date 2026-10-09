@@ -1810,6 +1810,158 @@ fn local_takeover_identity_conflict_observation(
     }
 }
 
+/// Reconcile a legitimate forward advance of the delivery head during takeover.
+///
+/// When the base branch moves mid-delivery the agent is explicitly told to merge
+/// the latest base into the same managed branch, re-verify, and redeliver. The
+/// managed HEAD therefore advances (a merge commit, or the agent's own commits on
+/// top) while the durable `expected_head_sha` still names the pre-merge commit.
+/// That is an identity *revision*, not a conflict, as long as the observed head
+/// is a real descendant of the durable head in the same repo/worktree/branch.
+/// Record the receipted revision and rewrite `claimed` so the read-only takeover
+/// then observes the new head and the same delivery continues against the same
+/// objective, branch and PR.
+///
+/// Returns `false` when this is not a legitimate advance (history rewritten,
+/// branch switched, different repo/worktree, or no advance at all) or when a
+/// concurrent actor already owns the conclusion. Those stay untouched so the
+/// takeover still reports the genuine conflict and fails closed.
+async fn reconcile_claimed_forward_advance_identity(
+    db: &sqlx::SqlitePool,
+    claimed: &mut delivery_run::ClaimedRecovery,
+    process: &ProcessIdentity,
+) -> Result<bool> {
+    let cwd = std::path::PathBuf::from(&claimed.workspace_path);
+    let (repo, _) = delivery::resolve_delivery_repo(
+        &cwd,
+        Some(&claimed.base_branch),
+        Some(&claimed.head_branch),
+    )
+    .map_err(crate::errors::AppError::Other)?;
+    // A branch switch is never a forward advance of the managed run.
+    if repo.branch != claimed.head_branch {
+        return Ok(false);
+    }
+    let observed =
+        delivery::capture_delivery_identity(&repo).map_err(crate::errors::AppError::Other)?;
+    if observed.head_sha == claimed.expected_head_sha {
+        return Ok(false);
+    }
+    // Same repo/worktree and a real descendant is required. Anything else (a
+    // reset, a force-push/rewrite, or a foreign worktree) is a genuine conflict
+    // that must keep failing closed.
+    if observed.repo_identity != claimed.repo_identity
+        || observed.worktree_identity != claimed.worktree_identity
+        || !delivery_is_forward_advance(&cwd, &claimed.expected_head_sha, &observed.head_sha)?
+    {
+        return Ok(false);
+    }
+
+    // Actor race guard: if the durable run already advanced to the observed head
+    // (the agent's concurrent redelivery concluded the same revision), or the
+    // lease is no longer ours (a newer claim epoch owns the run), yield instead
+    // of writing a second conclusion. Exactly one actor concludes.
+    let current_state: Option<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT expected_head_sha, lease_owner, claim_epoch FROM delivery_runs WHERE id=?",
+    )
+    .bind(&claimed.run_id)
+    .fetch_optional(db)
+    .await?;
+    if let Some((durable_head, lease_owner, claim_epoch)) = current_state {
+        if durable_head == observed.head_sha
+            || lease_owner.as_deref() != Some(process.instance_id.as_str())
+            || claim_epoch != claimed.claim_epoch
+        {
+            return Ok(false);
+        }
+    }
+
+    let prepared = PreparedDurableRun {
+        id: claimed.run_id.clone(),
+        process: process.clone(),
+        claim_epoch: claimed.claim_epoch,
+        objective_id: claimed.objective_id.clone(),
+        workspace_path: cwd.clone(),
+        worktree_identity: claimed.worktree_identity.clone(),
+        repo_identity: claimed.repo_identity.clone(),
+        change_set_digest: claimed.change_set_digest.clone(),
+        expected_head_sha: claimed.expected_head_sha.clone(),
+        head_branch: claimed.head_branch.clone(),
+    };
+    let Some(revision) = build_delivery_identity_revision(
+        &prepared,
+        &observed.repo_identity,
+        &observed.worktree_identity,
+        &observed.head_sha,
+        &observed.change_set_digest,
+    )?
+    else {
+        return Ok(false);
+    };
+    let observation = DeliveryObservation {
+        head_branch: claimed.head_branch.clone(),
+        stage: "takeover_identity_revision".into(),
+        status: claimed.status.clone(),
+        wait_class: None,
+        next_action: Some("deliver".into()),
+        reached_ceiling: claimed.reached_ceiling.clone(),
+        expected_head_sha: observed.head_sha.clone(),
+        canonical_pr_number: claimed.canonical_pr_number,
+        canonical_pr_url: claimed.canonical_pr_url.clone(),
+        // A pre-existing PR may still point at the pre-merge head until the
+        // normal push rung runs. Do not pretend the advance is already remote.
+        canonical_head_sha: None,
+        failure_signature: None,
+        core_input: None,
+        identity_revision: Some(revision),
+    };
+    let recorded = delivery_run::record_delivery_observation(
+        db,
+        &claimed.run_id,
+        process,
+        claimed.claim_epoch,
+        &observation,
+        chrono::Utc::now().timestamp_millis(),
+        DELIVERY_LEASE_TTL_MS,
+    )
+    .await;
+    let recorded = match recorded {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            // The fenced write can lose to a newer owner (lease stolen or a
+            // newer claim epoch) between the pre-check and the write. That is a
+            // yield, not a conflict: re-read ownership and, if another actor now
+            // owns the run, let it conclude. Only a genuine write failure that
+            // leaves us the owner propagates.
+            let current_state: Option<(String, Option<String>, i64)> = sqlx::query_as(
+                "SELECT expected_head_sha, lease_owner, claim_epoch FROM delivery_runs WHERE id=?",
+            )
+            .bind(&claimed.run_id)
+            .fetch_optional(db)
+            .await?;
+            let yielded = current_state.is_some_and(|(head, owner, epoch)| {
+                head == observed.head_sha
+                    || owner.as_deref() != Some(process.instance_id.as_str())
+                    || epoch != claimed.claim_epoch
+            });
+            if yielded {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+    };
+    if !recorded {
+        // The fenced write lost to a newer owner; yield to it.
+        return Ok(false);
+    }
+    claimed.expected_head_sha = observed.head_sha;
+    claimed.change_set_digest = observed.change_set_digest;
+    claimed.stage = "takeover_identity_revision".into();
+    claimed.failure_signature = None;
+    claimed.stage_attempt = 0;
+    Ok(true)
+}
+
 async fn reconcile_receipted_branch_update_head<R: delivery::DeliveryRemote>(
     db: &sqlx::SqlitePool,
     claimed: &mut delivery_run::ClaimedRecovery,
@@ -2347,6 +2499,28 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
                 return Ok(());
             }
         };
+    // The base branch moving mid-delivery is exactly the action the system
+    // asked for: the agent merges the latest base into the same managed branch
+    // and redelivers. The managed HEAD therefore advances (a merge commit, or
+    // the agent's own commits on top) while the durable expected head still
+    // names the pre-merge commit. That is an identity revision, not a conflict.
+    // Reconcile it before the read-only takeover observes the workspace, so a
+    // legitimate advance across a moved base never parks the run as
+    // `delivery_identity_conflict`. Genuine conflicts (rewrite, branch switch,
+    // foreign commit, canonical PR mismatch) are not reconciled here and still
+    // fail closed below.
+    if let Err(error) =
+        reconcile_claimed_forward_advance_identity(&db, &mut claimed, &process).await
+    {
+        tracing::warn!(
+            run_id = %claimed.run_id,
+            claim_epoch = claimed.claim_epoch,
+            %error,
+            "delivery takeover could not reconcile a forward advance; remaining observe-only"
+        );
+        record_or_park_local_takeover_identity_conflict(&db, &claimed, &process).await?;
+        return Ok(());
+    }
     if let Err(error) =
         reconcile_receipted_branch_update_head(&db, &mut claimed, &process, remote).await
     {
@@ -4885,6 +5059,498 @@ mod tests {
         );
         assert_eq!(observation.expected_head_sha, "abc");
         assert_eq!(observation.canonical_pr_number, Some(411));
+    }
+
+    /// A synthetic repo + fake remote for the "base advanced mid-delivery" case:
+    /// a bare origin, `main`, and a managed feature branch with one committed
+    /// change. `origin/main` can then be advanced and merged into the managed
+    /// branch exactly as the delivery instruction tells the agent to do.
+    fn u22_base_advanced_repo() -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "codefactory-u22-base-advanced-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let origin = root.join("origin.git");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&origin).unwrap();
+        recovery_git(&origin, &["init", "--bare", "-q"]);
+        std::fs::create_dir_all(&worktree).unwrap();
+        recovery_git(&worktree, &["init", "-q"]);
+        recovery_git(&worktree, &["config", "user.name", "Fixture"]);
+        recovery_git(
+            &worktree,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(worktree.join("README.md"), "# fixture\n").unwrap();
+        recovery_git(&worktree, &["add", "README.md"]);
+        recovery_git(&worktree, &["commit", "-q", "-m", "chore: base"]);
+        recovery_git(&worktree, &["branch", "-M", "main"]);
+        recovery_git(
+            &worktree,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        recovery_git(&worktree, &["push", "-q", "-u", "origin", "main"]);
+        recovery_git(&worktree, &["checkout", "-q", "-b", "fix/u22-base-advanced"]);
+        std::fs::write(worktree.join("work.txt"), "the change\n").unwrap();
+        recovery_git(&worktree, &["add", "work.txt"]);
+        recovery_git(&worktree, &["commit", "-q", "-m", "feat: the change"]);
+        (root, worktree)
+    }
+
+    /// Advance `origin/main` by one commit (the mid-delivery base move) and merge
+    /// it into the managed branch, producing a merge commit whose first parent
+    /// is the pre-merge head. Returns the resulting (post-merge) HEAD.
+    fn u22_advance_base_and_merge(worktree: &std::path::Path) -> String {
+        let main_tip = recovery_git(worktree, &["rev-parse", "origin/main"]);
+        let tree = recovery_git(worktree, &["rev-parse", "origin/main^{tree}"]);
+        let advanced = recovery_git(
+            worktree,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &main_tip,
+                "-m",
+                "chore: main advances",
+            ],
+        );
+        let refspec = format!("+{advanced}:refs/heads/main");
+        recovery_git(worktree, &["push", "-q", "origin", &refspec]);
+        recovery_git(worktree, &["fetch", "-q", "origin"]);
+        recovery_git(
+            worktree,
+            &[
+                "merge",
+                "-q",
+                "--no-edit",
+                "-m",
+                "Merge branch 'main' into feature",
+                "origin/main",
+            ],
+        );
+        recovery_git(worktree, &["rev-parse", "HEAD"])
+    }
+
+    async fn u22_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                delivery_run_id TEXT,
+                status TEXT NOT NULL,
+                failure_code TEXT,
+                recovery_owner TEXT,
+                remediation_id TEXT,
+                next_observation_at INTEGER,
+                requires_user_action INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    async fn u22_seed_objective(pool: &sqlx::SqlitePool, run_id: &str, objective_id: &str) {
+        sqlx::query(
+            "INSERT INTO objectives (id, delivery_run_id, status, updated_at)
+             VALUES (?, ?, 'active', 0)",
+        )
+        .bind(objective_id)
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn u22_create_run(
+        pool: &sqlx::SqlitePool,
+        worktree: &std::path::Path,
+        run_id: &str,
+        objective_id: &str,
+        expected_head_sha: &str,
+        canonical_pr: Option<(i64, &str)>,
+    ) -> i64 {
+        let (repo, _) = delivery::resolve_delivery_repo(
+            worktree,
+            Some("main"),
+            Some("fix/u22-base-advanced"),
+        )
+        .unwrap();
+        let observed = delivery::capture_delivery_identity(&repo).unwrap();
+        let run = NewDeliveryRun {
+            id: run_id.into(),
+            objective_id: objective_id.into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: worktree.to_string_lossy().into_owned(),
+            worktree_identity: observed.worktree_identity,
+            repo_identity: observed.repo_identity,
+            base_branch: "main".into(),
+            head_branch: "fix/u22-base-advanced".into(),
+            change_set_digest: observed.change_set_digest,
+            expected_head_sha: expected_head_sha.into(),
+            canonical_pr_number: canonical_pr.map(|(number, _)| number),
+            canonical_pr_url: canonical_pr.map(|(_, url)| url.to_string()),
+            canonical_head_sha: None,
+            requested_ceiling: "pr_only".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let owner = ProcessIdentity::new(&format!("u22-owner-{run_id}"), "test", "test");
+        let now = chrono::Utc::now().timestamp_millis();
+        delivery_run::create_delivery_run(pool, &run, &owner, now, 90_000)
+            .await
+            .unwrap()
+    }
+
+    async fn u22_expire_and_claim(
+        pool: &sqlx::SqlitePool,
+        run_id: &str,
+        process: &ProcessIdentity,
+    ) -> delivery_run::ClaimedRecovery {
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        delivery_run::plan_startup_recovery(pool, process, now + 1, 90_000)
+            .await
+            .unwrap()
+            .claimed
+            .into_iter()
+            .next()
+            .expect("the expired authorized run is claimed once")
+    }
+
+    async fn u22_identity_revision_count(pool: &sqlx::SqlitePool, run_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM delivery_identity_revisions WHERE run_id=?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn u22_run_state(
+        pool: &sqlx::SqlitePool,
+        run_id: &str,
+    ) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT expected_head_sha, wait_class, failure_code FROM delivery_runs WHERE id=?",
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn u22_snapshot(claimed: &delivery_run::ClaimedRecovery) -> DeliveryIdentitySnapshot {
+        DeliveryIdentitySnapshot {
+            repo_identity: claimed.repo_identity.clone(),
+            worktree_identity: claimed.worktree_identity.clone(),
+            head_sha: claimed.expected_head_sha.clone(),
+            change_set_digest: claimed.change_set_digest.clone(),
+        }
+    }
+
+    /// A read-only provider observer whose canonical PR has moved to a foreign
+    /// head: the advance is legitimate locally, but the PR head is not ours.
+    struct ForeignPrHeadRemote {
+        foreign_head: String,
+    }
+
+    impl delivery::DeliveryRemote for ForeignPrHeadRemote {
+        fn capabilities(&self) -> delivery::DeliveryCapabilities {
+            delivery::DeliveryCapabilities {
+                review: true,
+                ..delivery::DeliveryCapabilities::default()
+            }
+        }
+
+        async fn open_or_get_pr(
+            &self,
+            _title: &str,
+            _body: &str,
+            _head: &str,
+            _base: &str,
+            _expected_head_sha: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<delivery::DeliveryPr, String> {
+            Err("takeover observation is read-only".into())
+        }
+
+        async fn ci_status(&self, _sha: &str) -> std::result::Result<delivery::CiStatus, String> {
+            Err("takeover observation does not inspect CI".into())
+        }
+
+        async fn merge_pr(
+            &self,
+            _number: u64,
+            _method: crate::config::settings::MergeMethod,
+            _commit_message: Option<&delivery::MergeCommitMessage>,
+            _expected_head: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<delivery::MergeRequestResult, String> {
+            Err("takeover observation must never merge".into())
+        }
+
+        async fn trigger_release(
+            &self,
+            _head_sha: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<String, String> {
+            Err("takeover observation must never release".into())
+        }
+
+        async fn observe_merge(
+            &self,
+            _number: u64,
+            _expected_head: &str,
+        ) -> std::result::Result<delivery::MergeObservation, String> {
+            Ok(delivery::MergeObservation::HeadChanged {
+                actual_head: self.foreign_head.clone(),
+            })
+        }
+    }
+
+    /// (a) A base branch that moves mid-delivery is merged into the same managed
+    /// branch by the agent. Takeover must read that as an identity revision and
+    /// continue the same delivery — never as `delivery_identity_conflict`.
+    #[tokio::test]
+    async fn base_advanced_mid_delivery_is_an_identity_revision_not_a_conflict() {
+        let (fixture_root, worktree) = u22_base_advanced_repo();
+        let pool = u22_pool().await;
+        let run_id = "u22-base-advanced-run";
+        let objective_id = "objective-u22-base-advanced";
+        u22_seed_objective(&pool, run_id, objective_id).await;
+        let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
+        assert!(u22_create_run(&pool, &worktree, run_id, objective_id, &pre_merge_head, None).await > 0);
+
+        let merged_head = u22_advance_base_and_merge(&worktree);
+        assert_ne!(merged_head, pre_merge_head);
+        assert!(
+            delivery_is_forward_advance(&worktree, &pre_merge_head, &merged_head).unwrap(),
+            "merging the moved base must be a real descendant advance"
+        );
+        let persisted: String =
+            sqlx::query_scalar("SELECT expected_head_sha FROM delivery_runs WHERE id=?")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted, pre_merge_head, "the durable head still names the pre-merge commit");
+
+        let takeover = ProcessIdentity::new("u22-takeover", "test", "test");
+        let mut claimed = u22_expire_and_claim(&pool, run_id, &takeover).await;
+        let reconciled =
+            reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
+                .await
+                .unwrap();
+        assert!(
+            reconciled,
+            "a merge of the moved base is an identity revision, not a conflict"
+        );
+        assert_eq!(claimed.expected_head_sha, merged_head);
+        assert_eq!(claimed.failure_signature, None);
+        assert!(
+            should_resume_claimed_delivery(&claimed),
+            "the same delivery must continue on the same objective/branch/PR"
+        );
+
+        assert_eq!(u22_identity_revision_count(&pool, run_id).await, 1);
+        let (head, wait_class, failure_code) = u22_run_state(&pool, run_id).await;
+        assert_eq!(head, merged_head);
+        assert_ne!(wait_class.as_deref(), Some("delivery_identity_conflict"));
+        assert_ne!(failure_code.as_deref(), Some("delivery_identity_conflict"));
+
+        // The read-only takeover then accepts the receipted head and proceeds.
+        let proceeds = delivery::observe_delivery_takeover_with_receipted_parent(
+            &worktree,
+            Some("main"),
+            "fix/u22-base-advanced",
+            &u22_snapshot(&claimed),
+            None,
+            None,
+            None,
+            Option::<&ForeignPrHeadRemote>::None,
+        )
+        .await;
+        assert!(
+            proceeds.is_ok(),
+            "takeover must observe the revised head instead of parking a conflict: {proceeds:?}"
+        );
+        std::fs::remove_dir_all(fixture_root).ok();
+    }
+
+    /// (b) The managed branch reset to an unrelated commit is history rewritten,
+    /// not an advance: still an identity conflict and still fail closed.
+    #[tokio::test]
+    async fn a_branch_reset_to_an_unrelated_commit_still_fails_closed() {
+        let (fixture_root, worktree) = u22_base_advanced_repo();
+        let pool = u22_pool().await;
+        let run_id = "u22-branch-reset-run";
+        let objective_id = "objective-u22-branch-reset";
+        u22_seed_objective(&pool, run_id, objective_id).await;
+        let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
+        u22_create_run(&pool, &worktree, run_id, objective_id, &pre_merge_head, None).await;
+
+        let tree = recovery_git(&worktree, &["rev-parse", "HEAD^{tree}"]);
+        let unrelated = recovery_git(&worktree, &["commit-tree", &tree, "-m", "unrelated"]);
+        recovery_git(&worktree, &["reset", "-q", "--hard", &unrelated]);
+        assert!(
+            !delivery_is_forward_advance(&worktree, &pre_merge_head, &unrelated).unwrap(),
+            "a reset to an unrelated commit is not a forward advance"
+        );
+
+        let takeover = ProcessIdentity::new("u22-takeover", "test", "test");
+        let mut claimed = u22_expire_and_claim(&pool, run_id, &takeover).await;
+        let reconciled =
+            reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
+                .await
+                .unwrap();
+        assert!(!reconciled, "a rewritten history is never reconciled as a revision");
+        assert_eq!(claimed.expected_head_sha, pre_merge_head);
+        assert_eq!(u22_identity_revision_count(&pool, run_id).await, 0);
+
+        let observation = delivery::observe_delivery_takeover_with_receipted_parent(
+            &worktree,
+            Some("main"),
+            "fix/u22-base-advanced",
+            &u22_snapshot(&claimed),
+            None,
+            None,
+            None,
+            Option::<&ForeignPrHeadRemote>::None,
+        )
+        .await;
+        assert!(
+            observation.is_err(),
+            "a rewritten identity must still fail closed during takeover: {observation:?}"
+        );
+
+        record_or_park_local_takeover_identity_conflict(&pool, &claimed, &takeover)
+            .await
+            .unwrap();
+        let (_, wait_class, _) = u22_run_state(&pool, run_id).await;
+        assert_eq!(wait_class.as_deref(), Some("delivery_identity_conflict"));
+        std::fs::remove_dir_all(fixture_root).ok();
+    }
+
+    /// (c) A legitimate local advance whose canonical PR head moved to a foreign
+    /// commit still fails closed.
+    #[tokio::test]
+    async fn a_foreign_head_on_the_canonical_pr_still_fails_closed() {
+        let (fixture_root, worktree) = u22_base_advanced_repo();
+        let pool = u22_pool().await;
+        let run_id = "u22-foreign-pr-head-run";
+        let objective_id = "objective-u22-foreign-pr-head";
+        u22_seed_objective(&pool, run_id, objective_id).await;
+        let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
+        u22_create_run(
+            &pool,
+            &worktree,
+            run_id,
+            objective_id,
+            &pre_merge_head,
+            Some((42, "https://example.invalid/pull/42")),
+        )
+        .await;
+
+        let merged_head = u22_advance_base_and_merge(&worktree);
+        let takeover = ProcessIdentity::new("u22-takeover", "test", "test");
+        let mut claimed = u22_expire_and_claim(&pool, run_id, &takeover).await;
+        assert!(reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
+            .await
+            .unwrap());
+        assert_eq!(claimed.expected_head_sha, merged_head);
+
+        let remote = ForeignPrHeadRemote {
+            foreign_head: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+        };
+        let observation = delivery::observe_delivery_takeover_with_receipted_parent(
+            &worktree,
+            Some("main"),
+            "fix/u22-base-advanced",
+            &u22_snapshot(&claimed),
+            Some(42),
+            Some("https://example.invalid/pull/42"),
+            None,
+            Some(&remote),
+        )
+        .await;
+        assert!(
+            observation.is_err(),
+            "a canonical PR that moved to a foreign head must fail closed: {observation:?}"
+        );
+        std::fs::remove_dir_all(fixture_root).ok();
+    }
+
+    /// (d) The system takeover of the old run and the agent's redelivery happen
+    /// concurrently: whichever writer loses the fenced lease yields, so there is
+    /// exactly one conclusion — the continued delivery.
+    #[tokio::test]
+    async fn takeover_and_redelivery_converge_on_one_conclusion() {
+        let (fixture_root, worktree) = u22_base_advanced_repo();
+        let pool = u22_pool().await;
+        let run_id = "u22-race-run";
+        let objective_id = "objective-u22-race";
+        u22_seed_objective(&pool, run_id, objective_id).await;
+        let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
+        let owner_epoch =
+            u22_create_run(&pool, &worktree, run_id, objective_id, &pre_merge_head, None).await;
+        let merged_head = u22_advance_base_and_merge(&worktree);
+
+        // The agent's redelivery claims the run first and concludes the revision.
+        let agent = ProcessIdentity::new("u22-agent-redelivery", "test", "test");
+        let mut agent_claim = u22_expire_and_claim(&pool, run_id, &agent).await;
+        assert!(
+            reconcile_claimed_forward_advance_identity(&pool, &mut agent_claim, &agent)
+                .await
+                .unwrap()
+        );
+        assert_eq!(agent_claim.expected_head_sha, merged_head);
+
+        // The old takeover still believes the run is at the pre-merge head under
+        // the stale epoch. It must yield instead of writing a second conclusion.
+        let stale_owner = ProcessIdentity::new("u22-owner-stale", "test", "test");
+        let mut stale = agent_claim.clone();
+        stale.claim_epoch = owner_epoch;
+        stale.expected_head_sha = pre_merge_head.clone();
+        let reconciled =
+            reconcile_claimed_forward_advance_identity(&pool, &mut stale, &stale_owner)
+                .await
+                .unwrap();
+        assert!(
+            !reconciled,
+            "the stale epoch must yield to the actor that already owns the conclusion"
+        );
+
+        assert_eq!(
+            u22_identity_revision_count(&pool, run_id).await,
+            1,
+            "exactly one conclusion is written"
+        );
+        let (head, wait_class, failure_code) = u22_run_state(&pool, run_id).await;
+        assert_eq!(head, merged_head, "the one conclusion is the continued delivery");
+        assert_ne!(wait_class.as_deref(), Some("delivery_identity_conflict"));
+        assert_ne!(failure_code.as_deref(), Some("delivery_identity_conflict"));
+        std::fs::remove_dir_all(fixture_root).ok();
     }
 
     #[tokio::test]
