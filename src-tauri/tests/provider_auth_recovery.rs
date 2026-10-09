@@ -246,6 +246,7 @@ async fn latches_are_per_attempt_not_copied_from_the_whole_run() {
             "endpoint_unavailable",
             "ENDPOINT_UNAVAILABLE",
             true,
+            false,
             NOW + 3,
         )
         .await
@@ -763,6 +764,7 @@ async fn durable_overload_wait_reopens_only_after_its_observation_deadline() {
                 "provider_overload",
                 "provider_overloaded",
                 true,
+                false,
                 NOW + ordinal * 3 + 2,
             )
             .await
@@ -836,6 +838,7 @@ async fn admitted_no_output_failure_is_replay_safe_not_external_state_uncertain(
             "attempt-no-output",
             "provider_transport",
             "provider_external_state_uncertain",
+            false,
             false,
             NOW + 3,
         )
@@ -967,6 +970,7 @@ async fn deterministic_rejection_settles_replayable_without_unknown_status() {
             "provider_rejected",
             "provider_request_deterministic_rejected",
             false,
+            false,
             NOW + 3,
         )
         .await
@@ -1038,6 +1042,7 @@ async fn interrupted_stream_without_side_effect_is_settled_replayable_and_resume
             "attempt-torn",
             "provider_transport",
             "provider_external_state_uncertain",
+            false,
             false,
             NOW + 4,
         )
@@ -1178,6 +1183,7 @@ async fn interrupted_stream_with_a_started_side_effect_is_still_not_replayed() {
             "attempt-side-effect",
             "provider_transport",
             "provider_external_state_uncertain",
+            false,
             false,
             NOW + 5,
         )

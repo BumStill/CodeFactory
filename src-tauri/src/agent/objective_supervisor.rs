@@ -3993,6 +3993,7 @@ mod tests {
                 "provider_auth",
                 "provider_auth_unavailable",
                 true,
+                false,
                 now + 2,
             )
             .await

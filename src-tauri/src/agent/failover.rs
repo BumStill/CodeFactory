@@ -406,6 +406,24 @@ impl ActiveRouteState {
             .collect()
     }
 
+    /// U30: is there a *different* endpoint this run could move to right now?
+    ///
+    /// Deliberately the same predicate [`Self::advance_after_failure`] uses —
+    /// forward-only, not already failed, and not inside the endpoint cooldown —
+    /// so "a fallback is available" can never disagree with what advancing
+    /// would actually do. A `fixed` plan holds exactly the model the user
+    /// pinned, so this is `false` there and a pinned model is never swapped out.
+    pub fn has_available_fallback(&self) -> bool {
+        let inner = self.inner.lock().expect("active route mutex poisoned");
+        let current_index = inner.current_index;
+        ((current_index + 1)..inner.candidates.len()).any(|index| {
+            !inner.failed_indices.contains(&index)
+                && self
+                    .health
+                    .is_available(&inner.candidates[index].endpoint_name)
+        })
+    }
+
     pub fn take_initial_route_change(&self) -> Option<RouteChange> {
         self.inner
             .lock()
@@ -424,10 +442,11 @@ impl ActiveRouteState {
             from.model_id.clone(),
             reason.to_string(),
         ));
-        if matches!(
-            classify_provider_failure(reason),
-            ProviderFailureClass::EndpointUnavailable | ProviderFailureClass::TransportUnreachable
-        ) {
+        // U30: every class that permits endpoint failover — unreachable, model
+        // gone, sign-in expired, rate limited, quota used up — also puts this
+        // endpoint into the cooldown, so the task does not keep hammering a
+        // preferred endpoint whose quota is spent before it resets.
+        if classify_provider_failure(reason).permits_endpoint_failover() {
             self.health.mark_unavailable(&from.endpoint_name);
         }
 
@@ -464,10 +483,7 @@ impl ActiveRouteState {
                 reason.to_string(),
             ));
         }
-        if matches!(
-            classify_provider_failure(reason),
-            ProviderFailureClass::EndpointUnavailable | ProviderFailureClass::TransportUnreachable
-        ) {
+        if classify_provider_failure(reason).permits_endpoint_failover() {
             self.health.mark_unavailable(&current.endpoint_name);
         }
     }
@@ -843,5 +859,114 @@ mod tests {
         assert_eq!(change.to_endpoint, "deepseek");
         assert!(change.notice().contains("已自动切换到"));
         assert!(state.take_initial_route_change().is_none());
+    }
+
+    // ── U30 (2026-10-09) ───────────────────────────────────────────────────
+    // Prefer mode: when the preferred endpoint is unavailable the same task
+    // continues on the next one. Production session dd3779b3 showed six
+    // chatgpt attempts, zero deepseek/openrouter attempts and a lost task.
+
+    /// CF-PFB-R1. Every unavailability kind the spec lists still leaves the
+    /// same turn a route out, in the user's order.
+    #[test]
+    fn every_unavailability_kind_still_offers_the_next_endpoint() {
+        let cases = [
+            (
+                "cannot connect",
+                "HTTP error: error sending request for url (https://chatgpt.com/backend-api/codex/responses)",
+            ),
+            ("timeout", "HTTP error: operation timed out"),
+            ("502", "HTTP 502 Bad Gateway"),
+            ("503", "HTTP 503 Service Unavailable"),
+            ("504", "HTTP 504 Gateway Timeout"),
+            ("sign-in expired", "HTTP 401 Unauthorized: auth_expired"),
+            ("rate limited", "HTTP 429 Too Many Requests: rate limit"),
+            ("quota used up", "insufficient_quota: quota exceeded"),
+        ];
+        for (label, reason) in cases {
+            let health = EndpointHealthRegistry::new(Duration::from_secs(120));
+            let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-6-luna"));
+            plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+            plan.push_fallback(route("openrouter", "gpt-6-luna"));
+            let state = ActiveRouteState::from_plan_with_health(plan, health);
+
+            assert!(
+                state.has_available_fallback(),
+                "{label}: prefer mode must offer the next endpoint"
+            );
+            let change = state
+                .advance_after_failure(reason)
+                .unwrap_or_else(|| panic!("{label}: the task must continue on deepseek"));
+            assert_eq!(change.from_endpoint, "chatgpt", "{label}");
+            assert_eq!(change.to_endpoint, "deepseek", "{label}");
+            assert_eq!(state.current().model_id, "deepseek-v4-pro", "{label}");
+        }
+    }
+
+    /// CF-PFB-R2 + R3. Fall back only while something is actually available,
+    /// and do not keep hitting an endpoint whose quota is spent.
+    #[test]
+    fn a_cooled_down_endpoint_is_not_offered_again_within_its_window() {
+        let health = EndpointHealthRegistry::new(Duration::from_secs(120));
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-6-luna"));
+        plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+        plan.push_fallback(route("openrouter", "gpt-6-luna"));
+        let state = ActiveRouteState::from_plan_with_health(plan.clone(), health.clone());
+
+        state
+            .advance_after_failure("insufficient_quota: quota exceeded")
+            .expect("deepseek takes over");
+        assert!(
+            !health.is_available("chatgpt"),
+            "a spent quota must cool the endpoint down instead of retrying it"
+        );
+        assert!(
+            state.has_available_fallback(),
+            "openrouter is still available"
+        );
+        state
+            .advance_after_failure("HTTP 503 Service Unavailable")
+            .expect("openrouter takes over");
+        assert!(
+            !state.has_available_fallback(),
+            "every endpoint was tried and cooled down"
+        );
+        assert!(
+            state.advance_after_failure("HTTP 503 Service Unavailable").is_none(),
+            "an exhausted fleet waits for recovery instead of looping"
+        );
+
+        // R3: the user's preferred endpoint is tried again on a new turn, and
+        // is usable again once its window has passed.
+        let cooled = ActiveRouteState::from_plan_with_health(plan, health);
+        assert_eq!(
+            cooled.current().endpoint_name,
+            "chatgpt",
+            "a new turn goes back to the preferred endpoint"
+        );
+        let recovered = ActiveRouteState::from_plan_with_health(
+            {
+                let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-6-luna"));
+                plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+                plan
+            },
+            EndpointHealthRegistry::new(Duration::from_secs(0)),
+        );
+        assert!(recovered.has_available_fallback());
+    }
+
+    /// CF-PFB-R6. Fixed mode is a pin: one candidate, no fallback, ever.
+    #[test]
+    fn a_pinned_plan_never_offers_a_fallback() {
+        let state = ActiveRouteState::from_plan_with_health(
+            RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro")),
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+
+        assert!(!state.has_available_fallback());
+        assert!(state
+            .advance_after_failure("HTTP 503 Service Unavailable")
+            .is_none());
+        assert_eq!(state.current().endpoint_name, "deepseek");
     }
 }

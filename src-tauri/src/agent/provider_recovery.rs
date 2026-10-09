@@ -980,6 +980,14 @@ impl ProviderRecoveryStore {
         // Deterministic client-side rejections are excluded from that proof by
         // their failure code instead of by this hint.
         _: bool,
+        // U30: true when this turn has a DIFFERENT, currently usable endpoint to
+        // continue on and nothing was streamed or mutated yet. An endpoint-scoped
+        // failure must then not escalate into an objective-level wait: that wait
+        // is keyed to the objective (the episode identity is the candidate
+        // snapshot, not the endpoint), so only the same endpoint could ever leave
+        // it again — production 2026-10-09, session dd3779b3, six chatgpt
+        // attempts, zero deepseek/openrouter attempts, task lost.
+        endpoint_failover_available: bool,
         now: i64,
     ) -> Result<ProviderMutation<OverloadBudgetDecision>> {
         validate_identifier("failure_class", failure_class)?;
@@ -1088,7 +1096,12 @@ impl ProviderRecoveryStore {
             ));
         }
 
-        let decision = if failure_class == "provider_overload" {
+        // U30: with another endpoint available the strict three-attempt overload
+        // budget is not the right ceiling — the task is not out of options, it is
+        // on the wrong endpoint. The route plan already bounds how many endpoints
+        // one turn may try (each endpoint at most once, then the fleet is
+        // exhausted and the existing wait applies), so advancing cannot loop.
+        let decision = if failure_class == "provider_overload" && !endpoint_failover_available {
             let failed_attempts: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM provider_route_attempts
                  WHERE episode_id=? AND status='failed_replayable'
