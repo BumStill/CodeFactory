@@ -4271,11 +4271,26 @@ mod tests {
     // whose previous attempt is `unknown`, so every later generation could only
     // ever retry the SAME endpoint.
 
-    /// A closed loopback port: the request is refused, so the provider never
-    /// reaches a verdict. This is the exact production signature above.
+    /// A loopback fixture that always refuses requests at the HTTP layer.
+    /// It owns its ephemeral port for the lifetime of the fixture, preventing a
+    /// parallel test server from accidentally serving this endpoint's traffic.
     fn unreachable_base_url() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind dead endpoint");
         let base_url = format!("http://{}", listener.local_addr().expect("dead addr"));
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response);
+            }
+        });
+        base_url
+    }
+
+    /// A genuinely closed loopback port, kept separate for tests that need
+    /// connection-refused semantics rather than an HTTP fixture response.
+    fn closed_loopback_port() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind closed endpoint");
+        let base_url = format!("http://{}", listener.local_addr().expect("closed addr"));
         drop(listener);
         base_url
     }

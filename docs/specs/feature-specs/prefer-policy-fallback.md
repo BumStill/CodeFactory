@@ -1,5 +1,12 @@
 # Prefer 模式回落（U30）
 
+## Test isolation (U32)
+
+| Req ID | Requirement | Minimum evidence |
+| CF-PFB-R7 | Model-routing tests don't affect each other's results: any subset, any order, any degree of parallelism produces the same outcome (including the Windows CI environment) | The full `--lib` model_transport tests run 20 times in a row (including shuffled order / multi-threaded) without a single failure; record the command and results in the PR |
+| CF-PFB-R8 | If the production code holds endpoint state that can be shared across sessions (e.g. availability/cooldown), keep the semantics the product needs, but tests must be able to isolate it; also state in the PR whether sharing across sessions is intended product behaviour and why | PR explanation + tests |
+| CF-PFB-R9 | The two failing tests above, and the PRs they block (#589, #590), pass on the combined state of the latest main | Combined local run + CI results |
+
 ## Background and user decision
 "Prefer" means use the user's chosen model first and automatically switch to the next one when it can't be used, so the work isn't interrupted. The user picked the order and doesn't want to watch over or step in by hand.
 

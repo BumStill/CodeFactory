@@ -710,6 +710,17 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_health_registries_are_isolated_between_tests() {
+        let first = EndpointHealthRegistry::new(Duration::from_secs(120));
+        let second = EndpointHealthRegistry::new(Duration::from_secs(120));
+
+        first.mark_unavailable("shared-provider-name");
+
+        assert!(!first.is_available("shared-provider-name"));
+        assert!(second.is_available("shared-provider-name"));
+    }
+
+    #[test]
     fn route_candidate_debug_redacts_credentials() {
         let candidate = route("deepseek", "deepseek-v4-pro");
         let rendered = format!("{candidate:?}");

@@ -17,6 +17,26 @@
 
 Merging ≠ releasing. Ten merges can become one release.
 
+## Green PRs queue themselves
+
+Several PRs often finish at the same time. Rather than each one being babysat
+through "catch up to main → rerun CI → merge", a green PR **enters a queue** and
+the system merges them one at a time, in order, verifying each against *latest
+main + the PRs ahead of it*. Nobody updates a branch by hand.
+
+The default branch's required-check ruleset keeps its strict up-to-date policy:
+that is exactly what guarantees every commit on `main` passed the required
+checks on its own content. The queue performs the catch-up itself — it automates
+the manual step, it does not relax the gate.
+
+This repo has no GitHub-native merge queue (personal-account repositories cannot
+use `merge_group`), so `.github/workflows/merge-queue.yml` drives the equivalent
+in `scripts/merge-queue.mjs`: on completion of the required-check workflows and on
+a short schedule it merges armed, green PRs in order, each on its combined state.
+A failed PR leaves the queue with a plain-language reason and the rest continue;
+a stopped task clears its PR's arm marker, so nothing merges in the background
+after the session ends.
+
 ## Why
 
 Auto-releasing on every merge produces:
