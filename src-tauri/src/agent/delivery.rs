@@ -1340,10 +1340,14 @@ pub trait DeliveryRemote {
         std::future::ready(Ok(OpenPrObservation::Unsupported))
     }
     /// Converge governance metadata on an existing PR without replacing its
-    /// identity. Called only when the desired body differs from the live body.
+    /// identity. Called when the desired title and/or body differ from the live
+    /// PR. `title` is `None` when only the body must converge and the live title
+    /// has to be preserved, and `Some` when the live title must be replaced with
+    /// the agent's latest delivery intent.
     fn update_pr_body(
         &self,
         _number: u64,
+        _title: Option<&str>,
         _body: &str,
         _head: &str,
         _base: &str,
@@ -4394,17 +4398,26 @@ pub async fn deliver<R: DeliveryRemote>(
             }
         }
     }
-    let mut pr_title = prior_receipt
-        .as_ref()
-        .and_then(|receipt| receipt.pr_title.clone())
-        .or_else(|| opts.title.clone())
-        .unwrap_or_else(|| {
-            generate_commit_message(&repo.root, &repo.branch, None)
-                .lines()
-                .next()
-                .unwrap_or(&repo.branch)
-                .to_string()
-        });
+    // The PR title/body come from the agent's latest intent first (this call's
+    // `title`/`body`, or the durable intent a background takeover replayed into
+    // `opts`), then from the last applied receipt. The intent wins so a resend
+    // with a corrected title/body can converge an already-open PR instead of
+    // being frozen into whatever was opened first.
+    let intent_title = opts
+        .title
+        .clone()
+        .or_else(|| prior_receipt.as_ref().and_then(|receipt| receipt.pr_title.clone()));
+    let intent_body = opts
+        .body
+        .clone()
+        .or_else(|| prior_receipt.as_ref().and_then(|receipt| receipt.pr_body.clone()));
+    let mut pr_title = intent_title.clone().unwrap_or_else(|| {
+        generate_commit_message(&repo.root, &repo.branch, None)
+            .lines()
+            .next()
+            .unwrap_or(&repo.branch)
+            .to_string()
+    });
     // The title may have come from session context rather than from this
     // branch. Never let it claim a bigger release than the commits justify.
     let commit_slot = branch_commit_slot(&repo.root, &repo.default_branch, &repo.branch);
@@ -4412,13 +4425,9 @@ pub async fn deliver<R: DeliveryRemote>(
         outcome.steps.push(StepResult::ok("pr_title", note));
         pr_title = corrected;
     }
-    let requested_pr_body = prior_receipt
-        .as_ref()
-        .and_then(|receipt| receipt.pr_body.clone())
-        .or_else(|| opts.body.clone())
-        .unwrap_or_else(|| {
-            "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".to_string()
-        });
+    let requested_pr_body = intent_body.clone().unwrap_or_else(|| {
+        "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".to_string()
+    });
     let mut pr_body = match reconcile_readme_contract_body(
         &repo.root,
         &repo.remote,
@@ -4477,6 +4486,21 @@ pub async fn deliver<R: DeliveryRemote>(
             return finish(outcome, &repo.branch);
         }
 
+        // No placeholder PRs. A managed delivery branch
+        // (`codefactory/objective-<hash>…`) derives a degenerate `objective
+        // <id>` title; opening a PR under it hides what the change is and fails
+        // the scenario/governance gate. That title may never become a PR title,
+        // so refuse instead of inventing one.
+        if intent_title.is_none() && is_managed_objective_placeholder_title(&pr_title) {
+            return outcome.blocked_at(StepResult::blocked(
+                "pr_metadata",
+                format!(
+                    "deliver_changes 未提供真实 PR 标题：解析出的标题 `{pr_title}` 只是受管 objective 占位，\
+系统不会用它开 PR。请携带真实的 title 与 body 重新调用；body 必须包含 `Scenario-Test:` 声明与两行 `README-Update`。"
+                ),
+            ));
+        }
+
         // ── Open (or reuse) PR/MR ───────────────────────────────────────────
         // Guard against a misdirected delivery: this tool has no branch
         // argument, so a caller whose working directory drifted would otherwise
@@ -4531,12 +4555,31 @@ pub async fn deliver<R: DeliveryRemote>(
         };
         let pr_number = remote_pr.number;
         let pr_url = remote_pr.url;
-        pr_title = remote_pr.title;
+        // Keep the agent's intended title; if the live PR carries a different
+        // one (e.g. it was opened earlier with an `objective <id>` placeholder)
+        // the block below converges it instead of adopting the stale value.
+        let pr_title_changed = opts.title.is_some() && remote_pr.title.trim() != pr_title.trim();
+        if opts.title.is_none() {
+            // No explicit title intent on this call: the live PR title stays
+            // authoritative, exactly as before this change.
+            pr_title = remote_pr.title.clone();
+        }
+        // The desired body: this call's explicit intent when it named one, else
+        // the live PR body converged with the README audit fields. Comparing
+        // against the live body (not only against "was a field repaired") is
+        // what lets a resend replace a placeholder body with the agent's. Only
+        // an explicit per-call body overrides the live body — a carried-over
+        // receipt must never overwrite a maintainer's edit.
+        let desired_body_source = if opts.body.is_some() {
+            requested_pr_body.clone()
+        } else {
+            remote_pr.body.clone()
+        };
         let reconciled_body = match reconcile_readme_contract_body(
             &repo.root,
             &repo.remote,
             &repo.default_branch,
-            &remote_pr.body,
+            &desired_body_source,
         ) {
             Ok(reconciled) => reconciled,
             Err(error) => {
@@ -4546,13 +4589,15 @@ pub async fn deliver<R: DeliveryRemote>(
                 ))
             }
         };
-        if reconciled_body.changed {
+        let pr_body_changed = reconciled_body.body != remote_pr.body;
+        if pr_body_changed || pr_title_changed {
             if let Err(step) = verify_mutation_permit(opts, "update_pr_body").await {
                 return outcome.blocked_on_uncertain_side_effect(step);
             }
             if let Err(error) = remote
                 .update_pr_body(
                     pr_number,
+                    pr_title_changed.then_some(pr_title.as_str()),
                     &reconciled_body.body,
                     &repo.branch,
                     &repo.default_branch,
@@ -4563,12 +4608,18 @@ pub async fn deliver<R: DeliveryRemote>(
             {
                 return outcome.blocked_at(StepResult::blocked(
                     "pr",
-                    format!("PR #{pr_number} 正文缺少有效 README 审计字段，自动补齐失败: {error}"),
+                    format!(
+                        "PR #{pr_number} 的标题/正文未收敛到交付意图，自动更新失败: {error}"
+                    ),
                 ));
             }
             outcome.steps.push(StepResult::ok(
                 "pr_body",
-                format!("已保留原正文并补齐 PR #{pr_number} 的 README 决策和理由"),
+                if pr_title_changed {
+                    format!("已把 PR #{pr_number} 的标题/正文收敛到交付意图并补齐 README 审计字段")
+                } else {
+                    format!("已保留原正文并补齐 PR #{pr_number} 的 README 决策和理由")
+                },
             ));
         }
         pr_body = reconciled_body.body;
@@ -4729,6 +4780,7 @@ pub async fn deliver<R: DeliveryRemote>(
             if let Err(error) = remote
                 .update_pr_body(
                     pr_number,
+                    None,
                     &reconciled_body.body,
                     &repo.branch,
                     &repo.default_branch,
@@ -5810,6 +5862,7 @@ impl DeliveryRemote for HookRemote {
     async fn update_pr_body(
         &self,
         number: u64,
+        title: Option<&str>,
         body: &str,
         head: &str,
         base: &str,
@@ -5824,14 +5877,26 @@ impl DeliveryRemote for HookRemote {
         .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
         let rung = "provider_pr_body_update";
         let number_text = number.to_string();
-        let operation_key =
-            external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
+        let title_text = title.unwrap_or("");
+        let operation_key = external_operation_key(
+            rung,
+            &[
+                &number_text,
+                title_text,
+                body,
+                head,
+                base,
+                expected_head_sha,
+            ],
+        );
         let evidence = json!({
             "pr_number": number,
             "head": head,
             "base": base,
             "expected_head_sha": expected_head_sha,
             "body_digest": external_operation_key("body", &[body]),
+            "title_digest": external_operation_key("title", &[title_text]),
+            "title_update_requested": title.is_some(),
         })
         .to_string();
         let intent = match begin_or_reuse_external_mutation(
@@ -5862,11 +5927,15 @@ impl DeliveryRemote for HookRemote {
             }
         };
         let result = (|| {
-            let value = self.run_json(json!({
+            let mut payload = json!({
                 "action": "update_pr_body",
                 "number": number,
                 "body": body,
-            }))?;
+            });
+            if let Some(title) = title {
+                payload["title"] = json!(title);
+            }
+            let value = self.run_json(payload)?;
             let _response: HookOkResponse = serde_json::from_value(value).map_err(|e| {
                 format!(
                     "delivery provider hook '{}' update PR response invalid: {e}",
@@ -6393,14 +6462,19 @@ fn gh_pr_create_args(title: &str, body: &str, head: &str, base: &str) -> Vec<Str
     ]
 }
 
-fn gh_pr_edit_body_args(number: u64, body: &str) -> Vec<String> {
-    vec![
+fn gh_pr_edit_args(number: u64, title: Option<&str>, body: &str) -> Vec<String> {
+    let mut args = vec![
         "pr".into(),
         "edit".into(),
         number.to_string(),
-        "--body".into(),
-        body.into(),
-    ]
+    ];
+    if let Some(title) = title {
+        args.push("--title".into());
+        args.push(title.into());
+    }
+    args.push("--body".into());
+    args.push(body.into());
+    args
 }
 
 /// Map GitHub's `mergeStateStatus` onto the wait-vs-deadlock distinction.
@@ -6501,6 +6575,24 @@ fn branch_commit_slot(root: &Path, base: &str, branch: &str) -> u8 {
     git(root, &["log", "--format=%s", &format!("{base}..{branch}")])
         .map(|log| log.lines().map(conventional_slot).max().unwrap_or(0))
         .unwrap_or(0)
+}
+
+/// The managed delivery branch (`codefactory/objective-<hash>…`) derives a
+/// degenerate `<branch tail>` title such as
+/// `objective 9477e76a…`. U19 reported exactly that title reaching a real PR;
+/// it carries no description of the change and must never become a PR title.
+fn is_managed_objective_placeholder_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    let rest = trimmed
+        .strip_prefix("objective ")
+        .or_else(|| trimmed.strip_prefix("objective-"));
+    match rest {
+        Some(rest) => {
+            let rest = rest.trim();
+            rest.len() >= 7 && rest.chars().all(|c| c.is_ascii_hexdigit())
+        }
+        None => false,
+    }
 }
 
 fn merge_readiness_from_state(state: &str) -> MergeReadiness {
@@ -7038,6 +7130,7 @@ impl DeliveryRemote for GhCliRemote {
     async fn update_pr_body(
         &self,
         number: u64,
+        title: Option<&str>,
         body: &str,
         head: &str,
         base: &str,
@@ -7052,14 +7145,26 @@ impl DeliveryRemote for GhCliRemote {
         .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
         let rung = "provider_pr_body_update";
         let number_text = number.to_string();
-        let operation_key =
-            external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
+        let title_text = title.unwrap_or("");
+        let operation_key = external_operation_key(
+            rung,
+            &[
+                &number_text,
+                title_text,
+                body,
+                head,
+                base,
+                expected_head_sha,
+            ],
+        );
         let evidence = json!({
             "pr_number": number,
             "head": head,
             "base": base,
             "expected_head_sha": expected_head_sha,
             "body_digest": external_operation_key("body", &[body]),
+            "title_digest": external_operation_key("title", &[title_text]),
+            "title_update_requested": title.is_some(),
         })
         .to_string();
         let intent = match begin_or_reuse_external_mutation(
@@ -7089,7 +7194,7 @@ impl DeliveryRemote for GhCliRemote {
                 return Ok(());
             }
         };
-        match self.gh(&gh_pr_edit_body_args(number, body)) {
+        match self.gh(&gh_pr_edit_args(number, title, body)) {
             Ok(_) => {
                 if let Err(error) = self
                     .observe_open_pr(head, base)
@@ -7656,6 +7761,7 @@ impl DeliveryRemote for EitherRemote {
     async fn update_pr_body(
         &self,
         number: u64,
+        title: Option<&str>,
         body: &str,
         head: &str,
         base: &str,
@@ -7664,20 +7770,52 @@ impl DeliveryRemote for EitherRemote {
     ) -> Result<(), String> {
         match self {
             EitherRemote::Hook(r) => {
-                r.update_pr_body(number, body, head, base, expected_head_sha, mutation_permit)
-                    .await
+                r.update_pr_body(
+                    number,
+                    title,
+                    body,
+                    head,
+                    base,
+                    expected_head_sha,
+                    mutation_permit,
+                )
+                .await
             }
             EitherRemote::Gh(r) => {
-                r.update_pr_body(number, body, head, base, expected_head_sha, mutation_permit)
-                    .await
+                r.update_pr_body(
+                    number,
+                    title,
+                    body,
+                    head,
+                    base,
+                    expected_head_sha,
+                    mutation_permit,
+                )
+                .await
             }
             EitherRemote::Github(r) => {
-                r.update_pr_body(number, body, head, base, expected_head_sha, mutation_permit)
-                    .await
+                r.update_pr_body(
+                    number,
+                    title,
+                    body,
+                    head,
+                    base,
+                    expected_head_sha,
+                    mutation_permit,
+                )
+                .await
             }
             EitherRemote::Gitlab(r) => {
-                r.update_pr_body(number, body, head, base, expected_head_sha, mutation_permit)
-                    .await
+                r.update_pr_body(
+                    number,
+                    title,
+                    body,
+                    head,
+                    base,
+                    expected_head_sha,
+                    mutation_permit,
+                )
+                .await
             }
         }
     }
@@ -8319,6 +8457,7 @@ impl DeliveryRemote for GitlabRemote {
     async fn update_pr_body(
         &self,
         number: u64,
+        title: Option<&str>,
         body: &str,
         head: &str,
         base: &str,
@@ -8333,14 +8472,26 @@ impl DeliveryRemote for GitlabRemote {
         .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
         let rung = "provider_pr_body_update";
         let number_text = number.to_string();
-        let operation_key =
-            external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
+        let title_text = title.unwrap_or("");
+        let operation_key = external_operation_key(
+            rung,
+            &[
+                &number_text,
+                title_text,
+                body,
+                head,
+                base,
+                expected_head_sha,
+            ],
+        );
         let evidence = json!({
             "pr_number": number,
             "head": head,
             "base": base,
             "expected_head_sha": expected_head_sha,
             "body_digest": external_operation_key("body", &[body]),
+            "title_digest": external_operation_key("title", &[title_text]),
+            "title_update_requested": title.is_some(),
         })
         .to_string();
         let intent = match begin_or_reuse_external_mutation(
@@ -8370,7 +8521,7 @@ impl DeliveryRemote for GitlabRemote {
                 return Ok(());
             }
         };
-        match crate::git_remote::gitlab::update_pr_body(&self.client, &self.repo, number, body)
+        match crate::git_remote::gitlab::update_pr_body(&self.client, &self.repo, number, title, body)
             .await
         {
             Ok(()) => {
@@ -8707,6 +8858,7 @@ impl DeliveryRemote for GithubRemote {
     async fn update_pr_body(
         &self,
         number: u64,
+        title: Option<&str>,
         body: &str,
         head: &str,
         base: &str,
@@ -8721,14 +8873,26 @@ impl DeliveryRemote for GithubRemote {
         .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
         let rung = "provider_pr_body_update";
         let number_text = number.to_string();
-        let operation_key =
-            external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
+        let title_text = title.unwrap_or("");
+        let operation_key = external_operation_key(
+            rung,
+            &[
+                &number_text,
+                title_text,
+                body,
+                head,
+                base,
+                expected_head_sha,
+            ],
+        );
         let evidence = json!({
             "pr_number": number,
             "head": head,
             "base": base,
             "expected_head_sha": expected_head_sha,
             "body_digest": external_operation_key("body", &[body]),
+            "title_digest": external_operation_key("title", &[title_text]),
+            "title_update_requested": title.is_some(),
         })
         .to_string();
         let intent = match begin_or_reuse_external_mutation(
@@ -8758,7 +8922,7 @@ impl DeliveryRemote for GithubRemote {
                 return Ok(());
             }
         };
-        match crate::git_remote::github::update_pr_body(&self.client, &self.repo, number, body)
+        match crate::git_remote::github::update_pr_body(&self.client, &self.repo, number, title, body)
             .await
         {
             Ok(()) => {
@@ -9549,7 +9713,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            gh_pr_edit_body_args(7, "updated body"),
+            gh_pr_edit_args(7, None, "updated body"),
             vec!["pr", "edit", "7", "--body", "updated body"]
         );
         let merge_message = MergeCommitMessage {
@@ -10561,7 +10725,7 @@ else:
         assert_eq!(pr.number, 42);
         assert_eq!(pr.body, "body");
         remote
-            .update_pr_body(42, "body", "feat/x", "main", &head, Some(&permit))
+            .update_pr_body(42, None, "body", "feat/x", "main", &head, Some(&permit))
             .await
             .expect("an exact live body/head must reuse the committed receipt without replay");
         assert!(!remote.rerun_ci(&head, Some(&permit)).await.unwrap());
@@ -10634,7 +10798,7 @@ else:
             .expect_err("a committed PR receipt cannot bless current remote drift");
         assert!(error.contains("no longer matches"));
         let body_error = remote
-            .update_pr_body(42, "body", "feat/x", "main", &head, Some(&permit))
+            .update_pr_body(42, None, "body", "feat/x", "main", &head, Some(&permit))
             .await
             .expect_err("a foreign PR head must block before a body mutation is prepared");
         assert!(body_error.contains("foreign head"), "{body_error}");
@@ -11120,6 +11284,7 @@ else:
         async fn update_pr_body(
             &self,
             number: u64,
+            title: Option<&str>,
             body: &str,
             head: &str,
             base: &str,
@@ -11134,8 +11299,18 @@ else:
             .ok_or_else(|| "canonical PR is absent; no body update was dispatched".to_string())?;
             let rung = "provider_pr_body_update";
             let number_text = number.to_string();
-            let operation_key =
-                external_operation_key(rung, &[&number_text, body, head, base, expected_head_sha]);
+            let title_text = title.unwrap_or("");
+            let operation_key = external_operation_key(
+                rung,
+                &[
+                    &number_text,
+                    title_text,
+                    body,
+                    head,
+                    base,
+                    expected_head_sha,
+                ],
+            );
             let evidence = json!({
                 "pr_number": number,
                 "head": head,
@@ -11172,9 +11347,9 @@ else:
             };
             self.calls.update_pr_body.fetch_add(1, Ordering::SeqCst);
             let mut remote = self.calls.remote_pr_text.lock().unwrap();
-            let title = remote
-                .as_ref()
-                .map(|(title, _)| title.clone())
+            let title = title
+                .map(str::to_string)
+                .or_else(|| remote.as_ref().map(|(title, _)| title.clone()))
                 .unwrap_or_else(|| "fix: existing PR".into());
             *remote = Some((title, body.to_string()));
             drop(remote);
@@ -11729,6 +11904,7 @@ else:
         let error = remote
             .update_pr_body(
                 42,
+                None,
                 "desired",
                 "feat/x",
                 "main",
@@ -11975,6 +12151,119 @@ else:
         assert!(body.contains("Existing context that must be preserved."));
         assert!(body.contains("README-Update: reviewed"));
         assert!(body.contains("README-Update-Reason:"));
+    }
+
+    #[tokio::test]
+    async fn a_managed_objective_placeholder_title_never_opens_a_pr() {
+        // The U19 defect: a managed branch derives the title
+        // `objective <hash>`, which then reached a real PR. With no title
+        // intent the delivery must refuse instead of opening that PR.
+        let root = feature_branch_repo("placeholder-pr-title");
+        git(
+            &root,
+            &[
+                "branch",
+                "-m",
+                "codefactory/objective-0123456789abcdef0123456789abcdef",
+            ],
+        )
+        .unwrap();
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert!(
+            out.steps.iter().any(|step| step.step == "pr_metadata"),
+            "a placeholder PR title must be refused explicitly: {:?}",
+            out.steps
+        );
+        assert_eq!(
+            calls.open_pr.load(Ordering::SeqCst),
+            0,
+            "no placeholder PR may be dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resend_converges_an_already_open_placeholder_pr_title_and_body() {
+        // The agent's latest intent wins: an open PR that carries the old
+        // placeholder title is renamed to the agent's title and its body is
+        // converged, instead of adopting the stale remote value.
+        let root = feature_branch_repo("pr-title-converge");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "fix: seed feature"]).unwrap();
+        let calls = stub_calls();
+        *calls.remote_pr_text.lock().unwrap() = Some((
+            "objective 0123456789abcdef0123456789abcdef".into(),
+            "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".into(),
+        ));
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: Some((7, "https://example/pr/7".into())),
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::PrOnly,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                title: Some("fix(delivery): the title the agent asked for".into()),
+                body: Some(
+                    "Scenario-Test: E2E-001\n\nREADME-Update: reviewed\nREADME-Update-Reason: synthetic"
+                        .into(),
+                ),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
+        assert_eq!(calls.update_pr_body.load(Ordering::SeqCst), 1);
+        let (title, body) = calls.remote_pr_text.lock().unwrap().clone().unwrap();
+        assert_eq!(title, "fix(delivery): the title the agent asked for");
+        assert!(body.contains("Scenario-Test: E2E-001"), "{body}");
+    }
+
+    #[test]
+    fn managed_objective_branch_titles_are_recognised_as_placeholders() {
+        for placeholder in [
+            "objective 0123456789abcdef0123456789abcdef",
+            "objective-0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(is_managed_objective_placeholder_title(placeholder));
+        }
+        for real in [
+            "fix(delivery): the PR carries the title the agent asked for",
+            "x",
+            "objective but not a hash",
+        ] {
+            assert!(!is_managed_objective_placeholder_title(real), "{real}");
+        }
     }
 
     #[tokio::test]

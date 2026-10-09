@@ -938,6 +938,20 @@ async fn prepare_durable_run(
         .map(|requested| configured_ceiling.clamp_request(requested))
         .unwrap_or(configured_ceiling);
     let head_branch = repo.branch.clone();
+    // Record the agent's PR title/body intent on the durable run BEFORE
+    // admission, so a call that is subsequently blocked (a competing lease, an
+    // unresolved mutation, an expiring foreground turn) still leaves the real
+    // title/body behind for the background takeover. A `None` argument keeps any
+    // previously recorded intent.
+    let now = chrono::Utc::now().timestamp_millis();
+    delivery_run::record_delivery_pr_intent(
+        db,
+        &id,
+        args.get("title").and_then(Value::as_str),
+        args.get("body").and_then(Value::as_str),
+        now,
+    )
+    .await?;
     let run = NewDeliveryRun {
         id: id.clone(),
         objective_id,
@@ -965,7 +979,6 @@ async fn prepare_durable_run(
         next_action_authorized: true,
         autonomous_completion: autonomous_completion_from_args(args),
     };
-    let now = chrono::Utc::now().timestamp_millis();
     reconcile_advanced_delivery_run_identity(db, &repo.root, &run, &process, now).await?;
     let claim_epoch = delivery_run::create_delivery_run(db, &run, &process, now, 90_000).await?;
     Ok(Some(PreparedDurableRun {
@@ -2360,8 +2373,8 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
         change_set_digest: claimed.change_set_digest.clone(),
     };
     let mut opts = DeliverOpts {
-        title: None,
-        body: None,
+        title: claimed.pr_title_intent.clone(),
+        body: claimed.pr_body_intent.clone(),
         release_urgency: None,
         requested_ceiling: Some(requested_ceiling),
         extra_excludes: settings.delivery_exclude_globs.clone(),
@@ -4778,6 +4791,8 @@ mod tests {
             canonical_pr_number: Some(1),
             canonical_pr_url: Some("https://example.invalid/pr/1".into()),
             canonical_head_sha: Some("abc".into()),
+            pr_title_intent: None,
+            pr_body_intent: None,
             reached_ceiling: "pr_open".into(),
             stage: "ci".into(),
             status: status.into(),
@@ -4841,6 +4856,8 @@ mod tests {
             canonical_pr_number: Some(411),
             canonical_pr_url: Some("https://example.invalid/pull/411".into()),
             canonical_head_sha: Some("abc".into()),
+            pr_title_intent: None,
+            pr_body_intent: None,
             reached_ceiling: "pr_open".into(),
             stage: "takeover_reconciliation".into(),
             status: "platform_incident".into(),

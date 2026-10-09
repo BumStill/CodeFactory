@@ -108,6 +108,11 @@ pub struct ClaimedRecovery {
     pub canonical_pr_number: Option<i64>,
     pub canonical_pr_url: Option<String>,
     pub canonical_head_sha: Option<String>,
+    /// The agent's latest PR title/body intent, persisted before the call can be
+    /// blocked so a later background takeover opens the PR with the title and
+    /// body the agent asked for instead of an `objective <id>` placeholder.
+    pub pr_title_intent: Option<String>,
+    pub pr_body_intent: Option<String>,
     pub reached_ceiling: String,
     pub stage: String,
     pub status: String,
@@ -445,6 +450,11 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
             "reconciled_claim_epoch",
             "INTEGER NOT NULL DEFAULT 0 CHECK(reconciled_claim_epoch >= 0 AND reconciled_claim_epoch <= claim_epoch)",
         ),
+        // Nullable, idempotent additions (see `ensure_delivery_run_column`):
+        // existing rows keep `NULL` and therefore fall back to the prior
+        // receipt/placeholder behaviour instead of being rewritten.
+        ("pr_title_intent", "TEXT"),
+        ("pr_body_intent", "TEXT"),
     ] {
         ensure_delivery_run_column(pool, name, definition).await?;
     }
@@ -552,6 +562,37 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
            SELECT RAISE(ABORT, 'delivery requested ceiling is immutable');
          END",
     )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Persist the agent's latest PR title/body intent on a delivery run.
+///
+/// Recorded on the first authoritative `deliver_changes` call — before that
+/// call can be blocked or handed to a background takeover — so a later resume
+/// opens the PR with the title/body the agent asked for instead of falling back
+/// to the `objective <id>` placeholder. A `None` argument preserves the
+/// previously recorded value, so a resume that carries no intent never erases
+/// one.
+pub async fn record_delivery_pr_intent(
+    pool: &SqlitePool,
+    run_id: &str,
+    pr_title: Option<&str>,
+    pr_body: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE delivery_runs
+         SET pr_title_intent=COALESCE(?, pr_title_intent),
+             pr_body_intent=COALESCE(?, pr_body_intent),
+             updated_at=?
+         WHERE id=?",
+    )
+    .bind(pr_title)
+    .bind(pr_body)
+    .bind(now)
+    .bind(run_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -2607,7 +2648,7 @@ pub async fn plan_startup_recovery(
                 expected_head_sha, canonical_pr_number, canonical_pr_url, canonical_head_sha, stage, status,
                 wait_class, next_action, next_action_authorized, failure_signature,
                 stage_attempt, progress_revision, requested_ceiling, reached_ceiling, autonomous_completion,
-                claim_epoch
+                claim_epoch, pr_title_intent, pr_body_intent
          FROM delivery_runs
          WHERE {NON_TERMINAL_PREDICATE}
            AND next_action_authorized=1
@@ -2690,6 +2731,8 @@ pub async fn plan_startup_recovery(
             canonical_pr_number: row.try_get("canonical_pr_number")?,
             canonical_pr_url: row.try_get("canonical_pr_url")?,
             canonical_head_sha: row.try_get("canonical_head_sha")?,
+            pr_title_intent: row.try_get("pr_title_intent")?,
+            pr_body_intent: row.try_get("pr_body_intent")?,
             reached_ceiling: row.try_get("reached_ceiling")?,
             stage,
             status,
@@ -2723,6 +2766,61 @@ mod tests {
             .unwrap();
         ensure_schema(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn pr_intent_is_persisted_and_survives_a_startup_claim() {
+        // U19 requirement 1: the agent's title/body must be durable on the run
+        // before the call can be blocked, so the background takeover opens the
+        // PR with the agent's metadata instead of an `objective <id>`
+        // placeholder. This asserts the exact record -> claim round trip the
+        // takeover path performs.
+        let pool = pool().await;
+        let process = ProcessIdentity::new("foreground", "1.82.7", "18207");
+        let now = 1_000;
+        create_delivery_run(
+            &pool,
+            &foreground_admission_fixture("pr-intent-run"),
+            &process,
+            now,
+            90_000,
+        )
+        .await
+        .unwrap();
+
+        record_delivery_pr_intent(
+            &pool,
+            "pr-intent-run",
+            Some("fix(delivery): the PR carries the title the agent asked for"),
+            Some("Scenario-Test: E2E-001\n\nREADME-Update: reviewed"),
+            now,
+        )
+        .await
+        .unwrap();
+        // A later call that carries no intent must not erase the recorded one.
+        record_delivery_pr_intent(&pool, "pr-intent-run", None, None, now).await.unwrap();
+
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=0 WHERE id='pr-intent-run'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let takeover = ProcessIdentity::new("takeover", "1.82.7", "18207");
+        let plan = plan_startup_recovery(&pool, &takeover, now + 1_000, 90_000)
+            .await
+            .unwrap();
+        let claimed = plan
+            .claimed
+            .iter()
+            .find(|claim| claim.run_id == "pr-intent-run")
+            .expect("the expired run must be claimed by the takeover");
+        assert_eq!(
+            claimed.pr_title_intent.as_deref(),
+            Some("fix(delivery): the PR carries the title the agent asked for"),
+        );
+        assert_eq!(
+            claimed.pr_body_intent.as_deref(),
+            Some("Scenario-Test: E2E-001\n\nREADME-Update: reviewed"),
+        );
     }
 
     #[tokio::test]
