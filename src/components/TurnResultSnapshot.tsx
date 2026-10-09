@@ -16,6 +16,8 @@ import { planProgress } from "../lib/chatPlan";
 import { formatDuration } from "../lib/duration";
 import type { ToolCallState } from "../stores/chatEvents";
 import { humanWaitingReason } from "../lib/waitingReason";
+import { lineStatsText, toolCallLineStats } from "../lib/editLineStats";
+import { LineChangeStats } from "./LineChangeStats";
 
 const MAX_EVIDENCE_ITEMS = 20;
 
@@ -28,6 +30,9 @@ export interface TurnPullRequest {
 export interface TurnEvidenceSummary {
   operationCount: number;
   changedFileCount: number;
+  /** Lines added and removed by this turn's successful edits, in total. */
+  addedLines: number;
+  removedLines: number;
   verificationCount: number;
   changedFiles: string[];
   verificationCommands: string[];
@@ -100,6 +105,8 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
   const verificationKeys = new Set<string>();
   let truncated = false;
   let failureCount = 0;
+  let addedLines = 0;
+  let removedLines = 0;
   let pullRequest: TurnPullRequest | null = null;
   for (const tool of toolCalls) {
     const args = parseArgs(tool.args);
@@ -116,6 +123,17 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
       ) {
         changedFileKeys.add(args.path);
         truncated = pushUniqueBounded(changedFiles, redactEvidenceText(args.path)) || truncated;
+      }
+    }
+    // The turn total counts only edits that actually landed: a failed,
+    // denied or cancelled edit contributes nothing.
+    if (succeeded) {
+      const stats = toolCallLineStats(tool.name, tool.args ?? "", tool.result);
+      if (stats?.kind === "edit") {
+        addedLines += stats.added;
+        removedLines += stats.removed;
+      } else if (stats?.kind === "write" && stats.newFile) {
+        addedLines += stats.added;
       }
     }
     if (succeeded && tool.name === "bash" && typeof args.command === "string") {
@@ -138,6 +156,8 @@ export function summarizeTurnEvidence(toolCalls: ToolCallState[]): TurnEvidenceS
   return {
     operationCount: toolCalls.length,
     changedFileCount: changedFileKeys.size,
+    addedLines,
+    removedLines,
     verificationCount: verificationKeys.size,
     changedFiles,
     verificationCommands,
@@ -273,6 +293,12 @@ export function TurnResultSnapshot({
         ? "这次没有全部做完。回复「继续」可以接着做。"
         : null);
 
+  const totalLineChange = evidence.addedLines > 0 || evidence.removedLines > 0;
+  const openChanges = () => {
+    if (onOpenEvidence) onOpenEvidence();
+    else setResultOpen((value) => !value);
+  };
+
   const summary = [
     planTracked ? `完成 ${progress.completed}/${progress.total} 个计划步骤` : null,
     `改动 ${evidence.changedFileCount} 个文件`,
@@ -309,13 +335,7 @@ export function TurnResultSnapshot({
             aria-haspopup={onOpenEvidence ? "dialog" : undefined}
             aria-controls={onOpenEvidence ? evidenceControlsId : undefined}
             aria-expanded={onOpenEvidence ? evidenceOpen : resultOpen}
-            onClick={() => {
-              if (onOpenEvidence) {
-                onOpenEvidence();
-              } else {
-                setResultOpen((value) => !value);
-              }
-            }}
+            onClick={openChanges}
             className="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-note text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
           >
             查看改动
@@ -335,6 +355,24 @@ export function TurnResultSnapshot({
           </button>
         </div>
       </div>
+
+      {/* How much this turn changed, in one line — the question the user
+          actually asked. Nothing changed ⇒ nothing to say. */}
+      {totalLineChange && (
+        <button
+          type="button"
+          data-testid="turn-line-summary"
+          aria-label={`查看改动 · 本次改了 ${evidence.changedFileCount} 个文件 ${lineStatsText({ added: evidence.addedLines, removed: evidence.removedLines })}`}
+          aria-haspopup={onOpenEvidence ? "dialog" : undefined}
+          aria-controls={onOpenEvidence ? evidenceControlsId : undefined}
+          aria-expanded={onOpenEvidence ? evidenceOpen : resultOpen}
+          onClick={openChanges}
+          className="flex min-h-11 w-full items-center gap-2 border-t border-border/50 px-3 py-1.5 text-left text-note text-gray-400 transition-colors hover:bg-surface-3 hover:text-gray-200 lg:min-h-9"
+        >
+          <span>本次改了 {evidence.changedFileCount} 个文件</span>
+          <LineChangeStats stats={{ added: evidence.addedLines, removed: evidence.removedLines }} />
+        </button>
+      )}
 
       {noteText && (
         <p role="status" className="border-t border-border/50 bg-status-warning-soft px-3 py-2 text-note leading-5 text-status-warning">
