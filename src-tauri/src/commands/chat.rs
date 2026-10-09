@@ -1415,11 +1415,13 @@ fn chat_failure_code_for_error(error_text: &str) -> &'static str {
         // place, so reaching here means it genuinely kept colliding and the
         // user needs the honest reason.
         crate::storage::db::LOCAL_STORE_CONTENDED
-    } else if error_text.contains("PROVIDER_DURABLE_IDENTITY_MISMATCH") {
-        // U18/R3: reconciliation could not name a resume target, so this is
-        // deterministic, not transient. `bound_system_recovery` settles it
-        // as the failure terminal on the first occurrence — no second
-        // attempt with the same signature.
+    } else if error_text.contains("PROVIDER_DURABLE_IDENTITY_MISMATCH")
+        || error_text.contains("PROVIDER_DURABLE_IDENTITY_MISSING")
+    {
+        // U27 / CF-WSC-R8: a durable identity failure is deterministic for the
+        // current recovery claim. Replaying it cannot restore a missing binding
+        // and must converge to the same honest terminal instead of consuming
+        // the system recovery budget repeatedly.
         crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
     } else if error_text.contains(crate::agent::provider_recovery::PROVIDER_EPISODE_FENCE_MARKER) {
         // U21: the prior model request started a side effect that is still
@@ -3735,6 +3737,26 @@ mod tests {
                 "PROVIDER_DURABLE_IDENTITY_MISMATCH: remediation session/root changed"
             ),
             crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
+        );
+        assert_eq!(
+            chat_failure_code_for_error(
+                "PROVIDER_DURABLE_IDENTITY_MISSING: remediation binding disappeared"
+            ),
+            crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE,
+            "a missing durable binding must settle instead of scheduling repeated recovery"
+        );
+        assert_eq!(
+            chat_failure_code_for_error(
+                "PROVIDER_DURABLE_IDENTITY_MISSING: expected one active chat binding, found 0"
+            ),
+            crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
+        );
+        assert_eq!(
+            chat_failure_code_for_error(
+                "PROVIDER_DURABLE_IDENTITY_MISSING: remediation binding disappeared"
+            ),
+            crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE,
+            "a missing persisted recovery binding must not enter transient retries"
         );
         assert_eq!(
             chat_failure_code_for_error("something unrelated broke"),

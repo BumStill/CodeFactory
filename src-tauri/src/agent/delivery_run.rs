@@ -557,6 +557,138 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// U27 / CF-WSC-R7: the delivery record the previous attempt wrote names the
+/// previous workspace. After the user continues the session, the continuation
+/// runs in a fresh workspace directory for the same objective, repo and branch,
+/// and the process that wrote the record is gone (an app restart). Rebinding
+/// that record to the current workspace keeps the continuation deliverable;
+/// leaving it stale made every delivery refuse with "identity collision" until
+/// the user restarted the app. Only the workspace side of the identity may move,
+/// only while the objective already names this run, and only while no live
+/// mutation-capable lease holds the record — anything else stays fail-closed.
+async fn rebind_stale_workspace_identity(
+    pool: &SqlitePool,
+    run: &NewDeliveryRun,
+    process: &ProcessIdentity,
+    now: i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let existing = sqlx::query(
+        "SELECT objective_id, run_kind, session_id, task_id, workspace_path,
+                worktree_identity, repo_identity, base_branch, head_branch,
+                change_set_digest, expected_head_sha, requested_ceiling, status,
+                lease_owner, lease_expires_at, claim_epoch, reconciled_claim_epoch
+         FROM delivery_runs WHERE id=?",
+    )
+    .bind(&run.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    let status: String = existing.try_get("status")?;
+    if matches!(
+        status.as_str(),
+        "completed" | "failed" | "cancelled" | "rejected"
+    ) {
+        return Ok(false);
+    }
+    // Every non-workspace identity field must be identical, or this is a
+    // genuine conflict that has to stay refused before any side effect.
+    let scope_matches = existing.try_get::<String, _>("objective_id")? == run.objective_id
+        && existing.try_get::<String, _>("run_kind")? == run.run_kind
+        && existing.try_get::<Option<String>, _>("session_id")? == run.session_id
+        && existing.try_get::<Option<String>, _>("task_id")? == run.task_id
+        && existing.try_get::<String, _>("repo_identity")? == run.repo_identity
+        && existing.try_get::<String, _>("base_branch")? == run.base_branch
+        && existing.try_get::<String, _>("head_branch")? == run.head_branch
+        && existing.try_get::<String, _>("requested_ceiling")? == run.requested_ceiling;
+    let previous_workspace: String = existing.try_get("workspace_path")?;
+    let previous_worktree: String = existing.try_get("worktree_identity")?;
+    let previous_head: String = existing.try_get("expected_head_sha")?;
+    let previous_digest: String = existing.try_get("change_set_digest")?;
+    let workspace_moved = previous_workspace != run.workspace_path
+        || previous_worktree != run.worktree_identity;
+    // A stale record blocks delivery in two shapes, both of which mean "the same
+    // job moved on, the record did not": the continuation runs in a fresh
+    // workspace, or the in-progress change set advanced while the expected head
+    // stayed put (files staged or edited after the previous attempt was
+    // refused). A moved *head* is not handled here — that belongs to the
+    // receipt-backed identity revision with a proven forward advance.
+    let change_set_moved = previous_head == run.expected_head_sha
+        && previous_digest != run.change_set_digest;
+    if !scope_matches || !(workspace_moved || change_set_moved) {
+        return Ok(false);
+    }
+    let owner: Option<String> = existing.try_get("lease_owner")?;
+    let expires_at: Option<i64> = existing.try_get("lease_expires_at")?;
+    let claim_epoch: i64 = existing.try_get("claim_epoch")?;
+    let reconciled_claim_epoch: i64 = existing.try_get("reconciled_claim_epoch")?;
+    let foreign_live_lease = owner.as_deref() != Some(process.instance_id.as_str())
+        && expires_at.is_some_and(|value| value > now);
+    if foreign_live_lease && lease_authorizes_mutation(claim_epoch, reconciled_claim_epoch) {
+        return Ok(false);
+    }
+    // Rebinding must never create a second writable run for one objective, so
+    // the objective has to already name this run.
+    let objectives_exist: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='objectives'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if objectives_exist == 1 {
+        let pointer: Option<String> =
+            sqlx::query_scalar("SELECT delivery_run_id FROM objectives WHERE id=?")
+                .bind(&run.objective_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+        if pointer.as_deref() != Some(run.id.as_str()) {
+            return Ok(false);
+        }
+    }
+    sqlx::query(
+        "UPDATE delivery_runs
+         SET workspace_path=?, worktree_identity=?, change_set_digest=?,
+             expected_head_sha=?, next_action=?, updated_at=?
+         WHERE id=? AND status NOT IN ('completed','failed','cancelled','rejected')",
+    )
+    .bind(&run.workspace_path)
+    .bind(&run.worktree_identity)
+    .bind(&run.change_set_digest)
+    .bind(&run.expected_head_sha)
+    .bind(&run.next_action)
+    .bind(now)
+    .bind(&run.id)
+    .execute(&mut *tx)
+    .await?;
+    let detail = serde_json::json!({
+        "previous_workspace": previous_workspace,
+        "previous_worktree": previous_worktree,
+        "previous_change_set_digest": previous_digest,
+        "workspace": run.workspace_path,
+        "worktree": run.worktree_identity,
+        "change_set_digest": run.change_set_digest,
+        "reason": if workspace_moved {
+            "session_continued_in_a_new_workspace"
+        } else {
+            "in_progress_change_set_advanced"
+        },
+    });
+    insert_mutation_intent_event(
+        &mut tx,
+        &run.id,
+        "delivery_run_rebound_workspace",
+        &detail.to_string(),
+        &process.instance_id,
+        now,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Persists a newly-authoritative delivery run and its initial audit event.
 /// Legacy/imported rows may lack source identity so they can be represented and
 /// failed closed, but new product writes must always carry either a chat-turn
@@ -616,6 +748,10 @@ pub async fn create_delivery_run(
                 .into(),
         ));
     }
+
+    // U27 / CF-WSC-R7: a continuation in a fresh workspace must re-reconcile the
+    // record the previous attempt left behind instead of refusing forever.
+    rebind_stale_workspace_identity(pool, run, process, now).await?;
 
     let mut tx = pool.begin().await?;
     let inserted = sqlx::query(
@@ -2799,6 +2935,274 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(live_owner.as_deref(), Some("process-old"));
+    }
+
+    /// U27 / CF-WSC-R7: a delivery record left by the previous attempt must not
+    /// block delivery after the user continues the session. The continuation
+    /// works in a fresh workspace directory for the same objective, repo and
+    /// branch, and the process that wrote the record is gone (the app was
+    /// restarted). The stale record is re-reconciled against the current
+    /// workspace instead of being refused forever with "identity collision" and
+    /// asking the user to restart the app.
+    #[tokio::test]
+    async fn a_continued_workspace_rebinds_a_stale_delivery_run() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS objectives (
+                id TEXT PRIMARY KEY,
+                delivery_run_id TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                updated_at INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives(id, delivery_run_id)
+             VALUES ('objective-continued', 'delivery-continued')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        fn run(workspace: &str, worktree: &str, digest: &str, head: &str) -> NewDeliveryRun {
+            NewDeliveryRun {
+                id: "delivery-continued".into(),
+                objective_id: "objective-continued".into(),
+                run_kind: "deliver_changes".into(),
+                session_id: Some("session-continued".into()),
+                root_turn_id: Some("turn-continued".into()),
+                task_segment_id: None,
+                task_id: None,
+                workspace_path: workspace.into(),
+                worktree_identity: worktree.into(),
+                repo_identity: "example.invalid/repo".into(),
+                base_branch: "main".into(),
+                head_branch: "codefactory/session-continued".into(),
+                change_set_digest: digest.into(),
+                expected_head_sha: head.into(),
+                canonical_pr_number: None,
+                canonical_pr_url: None,
+                canonical_head_sha: None,
+                requested_ceiling: "pr_only".into(),
+                reached_ceiling: "local".into(),
+                stage: "delivery".into(),
+                status: "running".into(),
+                wait_class: None,
+                next_action: Some("deliver".into()),
+                next_action_authorized: true,
+                autonomous_completion: true,
+            }
+        }
+        let previous = ProcessIdentity::new("process-previous", "1.82.8", "18280");
+        let restarted = ProcessIdentity::new("process-restarted", "1.82.9", "18290");
+        create_delivery_run(
+            &pool,
+            &run(
+                "/workspaces/previous",
+                "worktree:previous",
+                "digest-previous",
+                "head-previous",
+            ),
+            &previous,
+            100,
+            90_000,
+        )
+        .await
+        .unwrap();
+
+        // The continuation runs in a fresh workspace directory; only the
+        // workspace side of the identity moved.
+        let claim_epoch = create_delivery_run(
+            &pool,
+            &run(
+                "/workspaces/continued",
+                "worktree:continued",
+                "digest-continued",
+                "head-continued",
+            ),
+            &restarted,
+            200_000,
+            90_000,
+        )
+        .await
+        .expect("continuing in a fresh workspace must re-reconcile, not refuse delivery");
+        assert!(claim_epoch >= 1, "the continued run gets a live claim");
+        let (workspace, worktree, digest, owner): (String, String, String, String) = sqlx::query_as(
+            "SELECT workspace_path, worktree_identity, change_set_digest, lease_owner
+             FROM delivery_runs WHERE id='delivery-continued'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workspace, "/workspaces/continued");
+        assert_eq!(worktree, "worktree:continued");
+        assert_eq!(digest, "digest-continued");
+        assert_eq!(owner, "process-restarted");
+        let rebound: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_run_events
+             WHERE run_id='delivery-continued' AND event_kind='delivery_run_rebound_workspace'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rebound, 1, "the rebind is auditable");
+    }
+
+    /// The second shape of the same defect, hit live while delivering this very
+    /// PR: the record was written, then the in-progress change set moved (files
+    /// staged/edited) while the expected head stayed put. Delivery was refused
+    /// with "identity collision" forever. The same job must re-reconcile.
+    #[tokio::test]
+    async fn an_advanced_change_set_rebinds_a_stale_delivery_run() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS objectives (
+                id TEXT PRIMARY KEY,
+                delivery_run_id TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                updated_at INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives(id, delivery_run_id)
+             VALUES ('objective-digest', 'delivery-digest')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        fn run(digest: &str) -> NewDeliveryRun {
+            NewDeliveryRun {
+                id: "delivery-digest".into(),
+                objective_id: "objective-digest".into(),
+                run_kind: "deliver_changes".into(),
+                session_id: Some("session-digest".into()),
+                root_turn_id: Some("turn-digest".into()),
+                task_segment_id: None,
+                task_id: None,
+                workspace_path: "/workspaces/digest".into(),
+                worktree_identity: "worktree:digest".into(),
+                repo_identity: "example.invalid/repo".into(),
+                base_branch: "main".into(),
+                head_branch: "codefactory/session-digest".into(),
+                change_set_digest: digest.into(),
+                expected_head_sha: "head-unchanged".into(),
+                canonical_pr_number: None,
+                canonical_pr_url: None,
+                canonical_head_sha: None,
+                requested_ceiling: "pr_only".into(),
+                reached_ceiling: "local".into(),
+                stage: "delivery".into(),
+                status: "running".into(),
+                wait_class: None,
+                next_action: Some("deliver".into()),
+                next_action_authorized: true,
+                autonomous_completion: true,
+            }
+        }
+        let same_process = ProcessIdentity::new("process-digest", "1.82.10", "182100");
+        create_delivery_run(&pool, &run("digest-before"), &same_process, 100, 90_000)
+            .await
+            .unwrap();
+        create_delivery_run(
+            &pool,
+            &run("digest-after"),
+            &same_process,
+            200_000,
+            90_000,
+        )
+        .await
+        .expect("an advanced in-progress change set must re-reconcile, not refuse delivery");
+        let (digest, head): (String, String) = sqlx::query_as(
+            "SELECT change_set_digest, expected_head_sha FROM delivery_runs
+             WHERE id='delivery-digest'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(digest, "digest-after");
+        assert_eq!(head, "head-unchanged");
+    }
+
+    /// The rebind above must stay fail-closed: a change to the repo, objective,
+    /// branch or ceiling is a genuine conflict, not a continuation.
+    #[tokio::test]
+    async fn a_foreign_identity_still_collides_instead_of_rebinding() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS objectives (
+                id TEXT PRIMARY KEY,
+                delivery_run_id TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                updated_at INTEGER NOT NULL DEFAULT 0
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives(id, delivery_run_id)
+             VALUES ('objective-conflict', 'delivery-conflict')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        fn run(repo: &str, head_branch: &str) -> NewDeliveryRun {
+            NewDeliveryRun {
+                id: "delivery-conflict".into(),
+                objective_id: "objective-conflict".into(),
+                run_kind: "deliver_changes".into(),
+                session_id: Some("session-conflict".into()),
+                root_turn_id: Some("turn-conflict".into()),
+                task_segment_id: None,
+                task_id: None,
+                workspace_path: "/workspaces/conflict".into(),
+                worktree_identity: "worktree:conflict".into(),
+                repo_identity: repo.into(),
+                base_branch: "main".into(),
+                head_branch: head_branch.into(),
+                change_set_digest: "digest-conflict".into(),
+                expected_head_sha: "head-conflict".into(),
+                canonical_pr_number: None,
+                canonical_pr_url: None,
+                canonical_head_sha: None,
+                requested_ceiling: "pr_only".into(),
+                reached_ceiling: "local".into(),
+                stage: "delivery".into(),
+                status: "running".into(),
+                wait_class: None,
+                next_action: Some("deliver".into()),
+                next_action_authorized: true,
+                autonomous_completion: true,
+            }
+        }
+        let previous = ProcessIdentity::new("process-previous", "1.82.8", "18280");
+        let other = ProcessIdentity::new("process-other", "1.82.9", "18290");
+        create_delivery_run(
+            &pool,
+            &run("example.invalid/repo", "codefactory/session-conflict"),
+            &previous,
+            100,
+            90_000,
+        )
+        .await
+        .unwrap();
+        let error = create_delivery_run(
+            &pool,
+            &run("example.invalid/other-repo", "codefactory/other-branch"),
+            &other,
+            200_000,
+            90_000,
+        )
+        .await
+        .expect_err("a different repo/branch is a genuine identity conflict");
+        assert!(
+            error.to_string().contains("identity collision"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

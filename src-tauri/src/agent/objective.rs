@@ -14499,4 +14499,56 @@ CREATE TABLE objectives (
             "a terminal identity failure queues no remediation"
         );
     }
+
+    /// U27 / CF-WSC-R8: a deterministic identity signature must not burn the
+    /// recovery budget. The first occurrence settles the objective and queues no
+    /// remediation at all, so the repeated signature the production loop showed
+    /// has nothing to retry — and the user gets a plain-language reason that
+    /// says the workspace still holds their changes.
+    #[tokio::test]
+    async fn an_identity_failure_settles_once_and_never_queues_a_repeat() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-u27-identity-repeat").await;
+
+        let settled = route_technical_failure(
+            &store,
+            &current,
+            CHAT_IDENTITY_UNRECONCILABLE,
+            "sha256:identity-signature-repeats",
+        )
+        .await;
+        assert_eq!(settled.status, ObjectiveStatus::Failed);
+        assert_eq!(claimable_remediations(&pool, &settled.id).await, 0);
+
+        // The repeated signature the production loop showed (~every 5 minutes)
+        // has nothing to spend: the objective is already terminal — a further
+        // decision is refused outright ("terminal objective cannot accept
+        // another decision") — and no remediation was ever queued for the
+        // deterministic code, so no attempt index exists to grow.
+        let stored = store.get(&settled.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, ObjectiveStatus::Failed);
+        assert_eq!(stored.failure_code.as_deref(), Some(CHAT_IDENTITY_UNRECONCILABLE));
+        let queued: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations WHERE objective_id=?")
+                .bind(&stored.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            queued, 0,
+            "the deterministic signature queues no remediation to retry"
+        );
+        assert_eq!(claimable_remediations(&pool, &stored.id).await, 0);
+
+        let summary =
+            crate::agent::failure_summary::plain_failure_reason(stored.failure_code.as_deref());
+        crate::agent::failure_summary::assert_no_internal_vocabulary(&summary)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            summary.contains("工作区"),
+            "the reason must say where the user's work is: {summary}"
+        );
+    }
 }
