@@ -6769,6 +6769,15 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
+            "CREATE TABLE objectives (
+                id TEXT PRIMARY KEY,
+                delivery_run_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "CREATE TABLE chat_task_segments (
                 id TEXT PRIMARY KEY,
                 previous_segment_id TEXT
