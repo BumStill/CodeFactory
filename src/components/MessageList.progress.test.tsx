@@ -149,10 +149,13 @@ describe("MessageList structured progress and result", () => {
     );
 
     const progress = screen.getByTestId("turn-activity-progress");
-    expect(progress).toHaveTextContent(/系统仍在处理|恢复中/);
-    expect(progress).toHaveTextContent("系统恢复监督器");
-    expect(progress).toHaveTextContent("已切换到备用模型 route");
-    expect(progress).toHaveTextContent(/下次观察/);
+    // CF-RSB-R1/R5: the banner no longer names an internal recovery owner or
+    // echoes a raw backend label ("… route"); it states the plain state.
+    expect(progress).not.toHaveTextContent("系统恢复监督器");
+    expect(progress).not.toHaveTextContent("route");
+    // CF-RSB-R3: waiting is shown with a truthful estimate, not "0ms".
+    expect(progress).toHaveTextContent("等待");
+    expect(progress).toHaveTextContent("约 30 秒后重试");
     for (const forbiddenAction of [
       /继续执行/,
       /重试/,
