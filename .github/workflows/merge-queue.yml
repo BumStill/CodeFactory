@@ -1,0 +1,86 @@
+name: merge-queue
+
+# U31 — Repository merge queue.
+#
+# Green, armed PRs queue and merge one at a time, in order, each verified
+# against the combined state (latest main + the PRs ahead of it). Nobody updates
+# a branch by hand.
+#
+# GitHub's native merge queue is unavailable to this personal-account repo
+# (owner.type == "User"; GraphQL `repository.mergeQueue` is null), so this
+# workflow drives the equivalent orchestrator (scripts/merge-queue.mjs).
+#
+# This workflow is deliberately NOT a required status check: it is a background
+# merger, not a gate. Making it required would deadlock the queue. It does not
+# add, remove, or weaken any check in ruleset `main-pr-and-ci-gate`; the
+# orchestrator refuses to run (fail closed) if the live ruleset's required-check
+# set or strict up-to-date policy ever drifts.
+#
+# The file is read from the DEFAULT BRANCH (workflow_run/schedule semantics), so
+# a candidate PR cannot rewrite the queue to certify itself.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # sweep the queue every 10 minutes
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Plan the queue without merging anything"
+        type: boolean
+        default: false
+  workflow_run:
+    # React shortly after the required-check workflows finish.
+    workflows: [CI, governance-baseline, scenario-gate]
+    types: [completed]
+
+# One queue run at a time. Never cancel an in-flight run: a cancelled run could
+# leave a merge in an unknown state.
+concurrency:
+  group: merge-queue
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  checks: read
+
+jobs:
+  drain-queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout trusted queue tooling (default branch)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Require a write token
+        env:
+          MERGE_QUEUE_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          test -n "$MERGE_QUEUE_TOKEN" || {
+            echo "::error::merge queue needs a token with contents+pull-requests write"
+            exit 1
+          }
+
+      - name: Verify the queue logic (unit tests)
+        run: node --test scripts/merge-queue.test.mjs
+
+      - name: Plan the queue
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        run: node scripts/merge-queue.mjs plan --repo "$GITHUB_REPOSITORY"
+
+      - name: Drain the queue (merge in order)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        run: node scripts/merge-queue.mjs run --repo "$GITHUB_REPOSITORY"

@@ -1443,6 +1443,26 @@ pub trait DeliveryRemote {
         std::future::ready(Err("adapter cannot update a PR branch".to_string()))
     }
 
+    /// U31: arm a PR for the repository merge queue so the queue — not the tool's
+    /// own catch-up loop — performs the update-branch + re-verify + squash merge.
+    /// Default is unsupported so existing adapters stay source-compatible.
+    fn arm_merge_queue(
+        &self,
+        _number: u64,
+        _expected_head: &str,
+    ) -> impl std::future::Future<Output = Result<(), String>> {
+        std::future::ready(Err("adapter cannot arm the merge queue".into()))
+    }
+
+    /// U31: clear a PR's merge-queue arm. Called when a delivery task stops, so a
+    /// stopped task cannot keep merging in the background (M47).
+    fn clear_merge_queue_arm(
+        &self,
+        _number: u64,
+    ) -> impl std::future::Future<Output = Result<(), String>> {
+        std::future::ready(Err("adapter cannot clear the merge queue arm".into()))
+    }
+
     /// Run a provider-specific real-service assertion. Repositories should
     /// prefer the repository-owned HTTP assertion when possible.
     fn verify_live(
@@ -6576,6 +6596,52 @@ fn gh_pr_merge_args(
     args
 }
 
+/// U31 — the label that authorizes the repository merge queue to merge a PR.
+///
+/// The queue (`scripts/merge-queue.mjs`, `.github/workflows/merge-queue.yml`)
+/// only merges a PR carrying this label; a stopped delivery task clears it so
+/// nothing keeps merging in the background (M47, 2026-10-09). The delivery tool
+/// arms the PR when it hands a `ceiling: merged` run to the queue instead of
+/// looping on catch-up itself.
+pub const MERGE_QUEUE_ARM_LABEL: &str = "merge-queue: armed";
+
+/// `gh` args that create/refresh the queue label. `--force` makes it idempotent
+/// so arming never fails just because the label already exists.
+fn gh_ensure_merge_queue_label_args() -> Vec<String> {
+    vec![
+        "label".into(),
+        "create".into(),
+        MERGE_QUEUE_ARM_LABEL.into(),
+        "--force".into(),
+        "--color".into(),
+        "0e8a16".into(),
+        "--description".into(),
+        "Authorized for the repository merge queue (U31)".into(),
+    ]
+}
+
+/// `gh` args that arm a PR for the merge queue.
+fn gh_arm_merge_queue_args(number: u64) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "edit".into(),
+        number.to_string(),
+        "--add-label".into(),
+        MERGE_QUEUE_ARM_LABEL.into(),
+    ]
+}
+
+/// `gh` args that clear a PR's merge-queue arm (used when a task stops).
+fn gh_clear_merge_queue_arm_args(number: u64) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "edit".into(),
+        number.to_string(),
+        "--remove-label".into(),
+        MERGE_QUEUE_ARM_LABEL.into(),
+    ]
+}
+
 fn gh_workflow_run_args(workflow: &str, git_ref: &str, expected_head_sha: &str) -> Vec<String> {
     vec![
         "workflow".into(),
@@ -6897,6 +6963,18 @@ fn parse_gh_open_pr_state(raw: &str, head: &str, base: &str) -> Result<OpenPrObs
 }
 
 impl DeliveryRemote for GhCliRemote {
+    /// U31: arm the PR for the repository merge queue. Idempotent and
+    /// best-effort — arming must never fail a delivery that is otherwise ready.
+    async fn arm_merge_queue(&self, number: u64, _expected_head: &str) -> Result<(), String> {
+        let _ = self.gh(&gh_ensure_merge_queue_label_args());
+        self.gh(&gh_arm_merge_queue_args(number)).map(|_| ())
+    }
+
+    /// U31: clear the arm so a stopped task cannot keep merging (M47).
+    async fn clear_merge_queue_arm(&self, number: u64) -> Result<(), String> {
+        self.gh(&gh_clear_merge_queue_arm_args(number)).map(|_| ())
+    }
+
     fn capabilities(&self) -> DeliveryCapabilities {
         DeliveryCapabilities {
             review: true,
@@ -7377,6 +7455,10 @@ impl DeliveryRemote for GhCliRemote {
                 return observed_committed_merge_projection(&receipt, observation);
             }
         };
+        // U31: arm the PR for the repository merge queue before registering
+        // auto-merge, so a Queued hand-off is visible to the queue (which does
+        // the catch-up the tool would otherwise loop on). Best-effort.
+        let _ = self.arm_merge_queue(number, expected_head).await;
         if let Err(error) = self.gh(&gh_pr_merge_args(
             number,
             method,
@@ -9586,6 +9668,28 @@ mod tests {
                 "-f",
                 "expected_head_sha=abc123",
             ]
+        );
+        // U31: the merge-queue arm/disarm command lines (pure, no I/O).
+        assert_eq!(
+            gh_ensure_merge_queue_label_args(),
+            vec![
+                "label",
+                "create",
+                MERGE_QUEUE_ARM_LABEL,
+                "--force",
+                "--color",
+                "0e8a16",
+                "--description",
+                "Authorized for the repository merge queue (U31)",
+            ]
+        );
+        assert_eq!(
+            gh_arm_merge_queue_args(42),
+            vec!["pr", "edit", "42", "--add-label", MERGE_QUEUE_ARM_LABEL]
+        );
+        assert_eq!(
+            gh_clear_merge_queue_arm_args(42),
+            vec!["pr", "edit", "42", "--remove-label", MERGE_QUEUE_ARM_LABEL]
         );
     }
 

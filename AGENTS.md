@@ -47,6 +47,12 @@
 - 首次使用或 checkout 后运行：`git config core.hooksPath .githooks`。如果 hook 拦截，按提示 merge 最新默认分支，不要用重复 PR 或旧基线继续开发。
 - 只有用户明确批准紧急热修时才允许 `CODEFACTORY_SKIP_SYNC_GATE=1 git commit ...`，最终说明必须标记 `hotfix bypass` 并补回 PR+CI。
 
+## 合并队列（U31：绿了自动排队按序合并）
+- 绿且满足合并条件（必需检查全绿、governance 通过、交付已授权、无 hold）的 PR 自动进入队列，由仓库内队列**按序逐个**合并：每个都先并入最新 `main`，在"最新 main + 队列前方 PR"的组合状态上重跑必需检查，通过后 squash 合并；不再需要人工 update-branch 或手工触发重跑。
+- 实现：`scripts/merge-queue.mjs`（编排逻辑，测试 `pnpm test:merge-queue`）+ `.github/workflows/merge-queue.yml`（可信 runner，`schedule` / `workflow_run` 驱动）。GitHub 原生 merge queue 对个人账户仓库不可用（`owner.type=User`，GraphQL `mergeQueue` 返回 null），故使用该等价实现。
+- **不削弱门禁**：ruleset `main-pr-and-ci-gate` 的 strict up-to-date 与六个必需检查保持原样——正是它保证"落到 main 的每个提交都在其精确内容上过了必需检查"。队列启动时对 live ruleset 做 fail-closed 校验，任一必需检查缺失或 strict 关闭即拒绝运行（候选分支无法自我认证）。
+- 授权标记：交付工具在 `ceiling: merged` 时给 PR 打 `merge-queue: armed`；任务停止时清除该标记，停止后不会在后台继续合并（修复 M47）。失败 PR 带明文原因（哪个检查、失败什么）出队，其余继续合并。
+
 ## Worktree 生命周期与 Cargo 缓存
 - **Worktree 默认开发**：非平凡任务（任何会进 PR 的代码/配置/文档改动、发布/交付链、并行开发）强制在独立 worktree 中完成；主 checkout 只做验收与发版，禁止长期停留 WIP/半提交/未合并分支。完整分级与生命周期见 `docs/principles/worktree-default-development.md`。开始用 `pnpm worktree:start <branch-name>`，PR 合并后 `pnpm worktrees:closeout -- --path <worktree 绝对路径> --apply` 自动清理。
 - 创建或 checkout 新 worktree 后，版本化 `post-checkout` hook 会把缺失的 `src-tauri/target` 链接到共同缓存；已有本地 target 一律不自动替换。
@@ -188,6 +194,7 @@ Tauri 嵌进 dev 二进制的 `__info_plist` 只有 `CFBundleName` 和版本号�
 - `.github/workflows/governed-delivery.yml` 是手动触发的治理交付入口。
 - 改 CI、发布配置、生产配置、schema、依赖或删除数据前必须先说明风险。
 - 发布节奏遵循 `docs/principles/release-cadence.md`（持续合并、刻意发版、非 feat/fix 不单独发版）；`auto-release.yml` 是其参考实现。
+- 合并队列：`.github/workflows/merge-queue.yml` + `scripts/merge-queue.mjs` 让绿且授权的 PR 按序自动并入 `main`（见 `AGENTS.md` 的「合并队列」与 `docs/specs/feature-specs/merge-queue.md`）。
 
 Repository: `CodeFactory`
 
