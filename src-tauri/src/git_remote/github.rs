@@ -154,13 +154,15 @@ pub async fn update_pr_body(
     client: &RemoteGitClient,
     repo: &str,
     number: u64,
+    title: Option<&str>,
     body: &str,
 ) -> Result<(), String> {
+    let mut payload = serde_json::json!({ "body": body });
+    if let Some(title) = title {
+        payload["title"] = serde_json::Value::String(title.to_string());
+    }
     client
-        .patch(
-            &format!("/repos/{repo}/pulls/{number}"),
-            serde_json::json!({"body": body}),
-        )
+        .patch(&format!("/repos/{repo}/pulls/{number}"), payload)
         .await
         .map(|_| ())
 }
