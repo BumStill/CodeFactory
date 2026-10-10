@@ -57,3 +57,14 @@ placement) because it has no interface-side equivalent.
 Every **parsed** request is appended to `<app data dir>/dispatch-audit.log`
 (JSON lines, mode `0600`) before it is executed: timestamp, source, operation,
 session, project and the original text.
+
+### Entry-point routing
+`src-tauri/src/main.rs` is the E2E-001 trust root (a `DRIVER_FILES` member in
+`tools/governance/scenario_case_execution.py`): a normal PR must keep it
+byte-identical, and it must keep dispatching to the canonical unattended module
+first. The Rust client mode (`CodeFactory --dispatch '<json>'`), therefore, is
+**not** a new branch in `main.rs`; it is resolved at the top of the library app
+entry `lib.rs::run()` — the one place the frozen `main` falls through to — before
+any Tauri/GUI work. The socket client lives in `headless_dispatch::run_client_cli`.
+The documented, orchestrator-facing command remains `node scripts/dispatch-task.mjs`,
+which speaks the same protocol directly to the private socket.

@@ -2,10 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    // U34: a dispatch client invocation never starts the GUI.
-    if codefactory_lib::run_headless_dispatch_cli() {
-        return;
-    }
     if codefactory_lib::unattended_smoke_cli::run() {
         return;
     }
