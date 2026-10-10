@@ -2,11 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    // U34: a dispatch client invocation never starts the GUI.
-    if codefactory_lib::run_headless_dispatch_cli() {
+    if codefactory_lib::unattended_smoke_cli::run() {
         return;
     }
-    if codefactory_lib::unattended_smoke_cli::run() {
+    // U34: a dispatch client invocation never starts the GUI. It dispatches
+    // after the canonical unattended entry so the smoke-order contract holds.
+    if codefactory_lib::run_headless_dispatch_cli() {
         return;
     }
     if codefactory_lib::run_history_session_smoke_cli() {

@@ -44,6 +44,10 @@ pub mod unattended_smoke_cli {
 // The legacy symbol lets the pre-fix main compile, so the regression fails on
 // the observed dispatch order rather than a missing fixture symbol.
 pub fn run_unattended_long_task_smoke_cli() -> bool { unattended_smoke_cli::run() }
+// U34: the formal main also dispatches the local headless entry. The shim stays
+// silent and returns false, so every recorded smoke-order assertion below is
+// unchanged while the actual formal main still compiles.
+pub fn run_headless_dispatch_cli() -> bool { false }
 pub fn run_history_session_smoke_cli() -> bool { dispatch("history", "--history-session-smoke") }
 pub fn run_delivery_recovery_smoke_cli() -> bool { dispatch("delivery", "--delivery-recovery-smoke") }
 pub fn run_managed_workspace_cleanup_smoke_cli() -> bool { dispatch("cleanup", "--managed-workspace-cleanup-smoke") }
