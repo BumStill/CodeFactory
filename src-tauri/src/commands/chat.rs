@@ -272,6 +272,66 @@ pub(crate) async fn resolve_route_plan(
     for fallback in routes {
         plan.push_fallback(fallback);
     }
+
+    // CF-QUOTA: GPT stays the preference, but a subscription endpoint that has
+    // already burned its configured share of the current metering window hands
+    // this turn to the next usable candidate — leaving the user their own
+    // headroom. The endpoint is NOT marked unhealthy: the next turn's plan is
+    // rebuilt from a fresh ledger read, so the moment the window resets
+    // CodeFactory returns to it on its own.
+    if policy != "fixed" {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let ledger = crate::agent::quota_cap::shared_quota_ledger();
+        let budget = crate::agent::quota_cap::SubscriptionBudget::default();
+        let candidates = plan.candidates().to_vec();
+        for (index, candidate) in candidates.iter().enumerate() {
+            if !settings.endpoint_is_subscription(&candidate.endpoint_name) {
+                continue;
+            }
+            let cap = settings.quota_cap_for(&candidate.endpoint_name);
+            // The transport records server readings and locally-observed tokens
+            // under the route's base URL; a settings- or test-driven writer may
+            // use the endpoint name. Try both keys.
+            let Some(breach) = ledger
+                .evaluate(&candidate.endpoint_name, cap, budget, now_ms)
+                .or_else(|| ledger.evaluate(&candidate.base_url, cap, budget, now_ms))
+            else {
+                continue;
+            };
+            let alternative = candidates[index + 1..].iter().find(|later| {
+                if !settings.endpoint_is_subscription(&later.endpoint_name) {
+                    return true;
+                }
+                let later_cap = settings.quota_cap_for(&later.endpoint_name);
+                ledger
+                    .evaluate(&later.endpoint_name, later_cap, budget, now_ms)
+                    .or_else(|| ledger.evaluate(&later.base_url, later_cap, budget, now_ms))
+                    .is_none()
+            });
+            let Some(alternative) = alternative else {
+                // No endpoint to hand over to: say so honestly instead of
+                // silently eating the headroom the user asked us to keep.
+                let reset = breach
+                    .reset_hint(now_ms)
+                    .map(|hint| format!("，{hint}后会自动继续"))
+                    .unwrap_or_default();
+                return Err(AppError::Other(format!(
+                    "为避免用光订阅额度，{} 本{}已用 {}%，已暂停向它发送请求；当前没有其它可用端点{}。",
+                    crate::agent::failover::endpoint_label(&candidate.endpoint_name),
+                    breach.window.label(),
+                    breach.used_percent,
+                    reset,
+                )));
+            };
+            let notice = breach.handover_notice(
+                &crate::agent::failover::endpoint_label(&alternative.endpoint_name),
+                now_ms,
+            );
+            plan.skip_for_quota(&candidate.endpoint_name, notice);
+            break;
+        }
+    }
+
     Ok((plan, resolution.excluded))
 }
 
@@ -5584,6 +5644,92 @@ mod tests {
         let auto_state = ActiveRouteState::from_plan_with_health(auto_plan, auto_health);
         assert_eq!(auto_state.current().endpoint_name, "deepseek");
         assert!(auto_state.take_initial_route_change().is_some());
+    }
+
+    /// CF-QUOTA-R3 (integration). A subscription endpoint over its window cap
+    /// hands the turn to the next endpoint, and comes back on its own once the
+    /// window resets. R5: a pay-per-token fallback is never capped.
+    #[tokio::test]
+    async fn a_subscription_endpoint_over_its_window_cap_hands_over_and_returns_after_reset() {
+        use crate::agent::quota_cap::{
+            shared_quota_ledger, EndpointQuota, UsageSource, WindowUsage,
+        };
+
+        // A synthetic base URL so this test's ledger entry can never collide
+        // with another test driving the real ChatGPT endpoint through the
+        // process-wide ledger.
+        const QUOTA_TEST_BASE: &str = "https://chatgpt.example/quota-test";
+
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "quota-chatgpt".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.clear();
+        settings.endpoints.insert(
+            "quota-chatgpt".into(),
+            Endpoint {
+                base_url: QUOTA_TEST_BASE.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-5.5".into()),
+            },
+        );
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.example/v1".into(),
+                key_ref: Some("deepseek-secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        let ledger = shared_quota_ledger();
+        let now = chrono::Utc::now().timestamp_millis();
+        let server = |ratio: f64| EndpointQuota {
+            source: UsageSource::ServerReported,
+            five_hour: WindowUsage {
+                used_ratio: ratio,
+                resets_at_ms: Some(now + 1_800_000),
+            },
+            weekly: WindowUsage {
+                used_ratio: 0.2,
+                resets_at_ms: Some(now + 86_400_000),
+            },
+            observed_at_ms: now,
+        };
+
+        ledger.record_server_usage(QUOTA_TEST_BASE, server(0.85));
+        let (plan, _) = resolve_route_plan(&settings, "gpt-5.5", "prefer", false)
+            .await
+            .expect("plan builds");
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        assert_eq!(state.current().endpoint_name, "deepseek");
+        let change = state
+            .take_initial_route_change()
+            .expect("quota handover is announced");
+        assert_eq!(change.kind, crate::agent::failover::RouteChangeKind::QuotaCap);
+        assert!(change.notice().contains("已用 85%"), "{}", change.notice());
+        assert!(change.notice().contains("DeepSeek"), "{}", change.notice());
+
+        // Window reset → the very next plan comes back to the subscription
+        // endpoint with no switching notice at all.
+        ledger.record_server_usage(QUOTA_TEST_BASE, server(0.0));
+        let (reset_plan, _) = resolve_route_plan(&settings, "gpt-5.5", "prefer", false)
+            .await
+            .expect("plan builds");
+        let reset_state = ActiveRouteState::from_plan_with_health(
+            reset_plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        assert_eq!(reset_state.current().endpoint_name, "quota-chatgpt");
+        assert!(reset_state.take_initial_route_change().is_none());
+
+        ledger.clear(QUOTA_TEST_BASE);
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub(crate) mod permission_gateway;
 pub(crate) mod permission_intent;
 pub mod persistence;
 pub(crate) mod provider_recovery;
+pub mod quota_cap;
 pub mod scheduler;
 pub mod sse_buffer;
 pub mod subagent;

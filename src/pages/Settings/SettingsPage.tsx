@@ -38,6 +38,7 @@ import type {
 import { CHATGPT_DEFAULT_MODEL, CHATGPT_ENDPOINT_KEY } from "../../lib/chatgptModels";
 import { syncChatGptCatalog } from "../../stores/chatgptCatalog";
 import { UsageDashboardSection } from "../../components/UsageDashboardSection";
+import { SubscriptionQuotaSection } from "../../components/SubscriptionQuotaSection";
 
 export type SettingsTab = "capabilities" | "usage" | "endpoints" | "browser" | "general" | "hooks" | "remotes" | "appearance" | "about";
 
@@ -738,7 +739,10 @@ export function SettingsPage({
 
         {/* ── Usage & budgets ── */}
         {tab === "usage" && (
-          <UsageDashboardSection onOpenSession={onOpenSession} onOpenJobLog={onOpenJobLog} />
+          <>
+            <UsageDashboardSection onOpenSession={onOpenSession} onOpenJobLog={onOpenJobLog} />
+            <SubscriptionQuotaSection />
+          </>
         )}
 
         {/* ── Endpoints ── */}

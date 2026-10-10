@@ -46,6 +46,13 @@ impl std::fmt::Debug for RouteCandidate {
 pub struct RouteCandidatePlan {
     candidates: Vec<RouteCandidate>,
     initial_selection: InitialRouteSelection,
+    /// CF-QUOTA: endpoints this plan must not start on because they have reached
+    /// their configured share of the current metering window, paired with the
+    /// plain-language reason the session shows. A skip is a *preference* change,
+    /// not a health failure: it never marks the endpoint unavailable, so the
+    /// next turn (whose plan is rebuilt) brings it straight back once the window
+    /// resets.
+    quota_skips: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +68,7 @@ impl RouteCandidatePlan {
         Self {
             candidates: vec![primary],
             initial_selection: InitialRouteSelection::Preferred,
+            quota_skips: Vec::new(),
         }
     }
 
@@ -70,7 +78,25 @@ impl RouteCandidatePlan {
         Self {
             candidates: vec![primary],
             initial_selection: InitialRouteSelection::HealthAware,
+            quota_skips: Vec::new(),
         }
+    }
+
+    /// CF-QUOTA: record that `endpoint` has reached its configured share of the
+    /// current window and must hand the turn to the next usable candidate. The
+    /// `notice` is the exact sentence the session shows.
+    pub fn skip_for_quota(&mut self, endpoint: &str, notice: String) {
+        if self.quota_skips.iter().all(|(name, _)| name != endpoint) {
+            self.quota_skips.push((endpoint.to_string(), notice));
+        }
+    }
+
+    /// Whether `endpoint` was skipped because it reached its window cap.
+    pub fn quota_notice(&self, endpoint: &str) -> Option<&str> {
+        self.quota_skips
+            .iter()
+            .find(|(name, _)| name == endpoint)
+            .map(|(_, notice)| notice.as_str())
     }
 
     pub fn push_fallback(&mut self, candidate: RouteCandidate) {
@@ -300,6 +326,15 @@ pub fn shared_endpoint_health() -> &'static EndpointHealthRegistry {
     SHARED_ENDPOINT_HEALTH.get_or_init(|| EndpointHealthRegistry::new(DEFAULT_ENDPOINT_COOLDOWN))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteChangeKind {
+    /// The previous endpoint failed and a later candidate took over.
+    Unavailable,
+    /// CF-QUOTA: the previous endpoint reached its configured share of the
+    /// current metering window and handed the turn over to leave the user room.
+    QuotaCap,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteChange {
     pub from_endpoint: String,
@@ -307,6 +342,7 @@ pub struct RouteChange {
     pub to_endpoint: String,
     pub to_model: String,
     pub reason: String,
+    pub kind: RouteChangeKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -319,6 +355,13 @@ pub struct RouteAttemptSnapshot {
 
 impl RouteChange {
     pub fn notice(&self) -> String {
+        // A quota handover already carries its own plain-language sentence
+        // ("GPT 本五小时窗口已用 80%，为给你留余量已切到 DeepSeek，约 18:20 恢复。"),
+        // so it is shown verbatim instead of the generic "temporarily
+        // unavailable" line, which would misdescribe a deliberate handover.
+        if self.kind == RouteChangeKind::QuotaCap {
+            return self.reason.clone();
+        }
         format!(
             "{} / {} 暂时不可用，已自动切换到 {} / {}，任务继续执行。",
             endpoint_label(&self.from_endpoint),
@@ -329,7 +372,7 @@ impl RouteChange {
     }
 }
 
-fn endpoint_label(name: &str) -> String {
+pub(crate) fn endpoint_label(name: &str) -> String {
     match name.to_ascii_lowercase().as_str() {
         "chatgpt" => "ChatGPT".into(),
         "deepseek" => "DeepSeek".into(),
@@ -363,7 +406,7 @@ impl ActiveRouteState {
             !plan.candidates.is_empty(),
             "route candidate plan must contain a primary"
         );
-        let current_index = match plan.initial_selection {
+        let preferred_index = match plan.initial_selection {
             InitialRouteSelection::Preferred => 0,
             InitialRouteSelection::HealthAware => plan
                 .candidates
@@ -371,12 +414,44 @@ impl ActiveRouteState {
                 .position(|candidate| health.is_available(&candidate.endpoint_name))
                 .unwrap_or(0),
         };
+        // CF-QUOTA: an endpoint that has reached its window cap hands the turn
+        // to the next usable candidate — whichever selection mode put it first.
+        // This is a preference change, not a health failure: the endpoint stays
+        // healthy, so the very next turn (rebuilt from a fresh ledger read)
+        // returns to it as soon as the window resets.
+        let quota_notice = plan
+            .quota_notice(&plan.candidates[preferred_index].endpoint_name)
+            .map(str::to_string);
+        let current_index = if quota_notice.is_some() {
+            let quota_skips = &plan.quota_skips;
+            plan.candidates
+                .iter()
+                .enumerate()
+                .skip(preferred_index + 1)
+                .find(|(_, candidate)| {
+                    health.is_available(&candidate.endpoint_name)
+                        && quota_skips
+                            .iter()
+                            .all(|(name, _)| name != &candidate.endpoint_name)
+                })
+                .map(|(index, _)| index)
+                .unwrap_or(preferred_index)
+        } else {
+            preferred_index
+        };
         let initial_route_change = (current_index > 0).then(|| RouteChange {
             from_endpoint: plan.candidates[0].endpoint_name.clone(),
             from_model: plan.candidates[0].model_id.clone(),
             to_endpoint: plan.candidates[current_index].endpoint_name.clone(),
             to_model: plan.candidates[current_index].model_id.clone(),
-            reason: "端点处于临时冷却期".into(),
+            reason: quota_notice
+                .clone()
+                .unwrap_or_else(|| "端点处于临时冷却期".into()),
+            kind: if quota_notice.is_some() {
+                RouteChangeKind::QuotaCap
+            } else {
+                RouteChangeKind::Unavailable
+            },
         });
         Self {
             inner: Arc::new(Mutex::new(ActiveRouteInner {
@@ -464,6 +539,7 @@ impl ActiveRouteState {
             to_endpoint: to.endpoint_name,
             to_model: to.model_id,
             reason: reason.to_string(),
+            kind: RouteChangeKind::Unavailable,
         })
     }
 
@@ -978,6 +1054,66 @@ mod tests {
         assert!(state
             .advance_after_failure("HTTP 503 Service Unavailable")
             .is_none());
+        assert_eq!(state.current().endpoint_name, "deepseek");
+    }
+
+    /// CF-QUOTA-R3. A subscription endpoint that reached its window cap hands
+    /// the turn to the next candidate, and the session is told why in plain
+    /// language.
+    #[test]
+    fn quota_capped_primary_hands_the_turn_to_the_next_candidate() {
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+        plan.skip_for_quota(
+            "chatgpt",
+            "GPT 本五小时窗口已用 80%，为给你留余量已切到 DeepSeek，约 18:20 恢复。".into(),
+        );
+
+        let health = EndpointHealthRegistry::new(Duration::from_secs(120));
+        let state = ActiveRouteState::from_plan_with_health(plan, health.clone());
+        assert_eq!(state.current().endpoint_name, "deepseek");
+
+        let change = state
+            .take_initial_route_change()
+            .expect("handover is announced");
+        assert_eq!(change.kind, RouteChangeKind::QuotaCap);
+        assert_eq!(
+            change.notice(),
+            "GPT 本五小时窗口已用 80%，为给你留余量已切到 DeepSeek，约 18:20 恢复。"
+        );
+        // A quota handover is a preference change, not a health failure: the
+        // endpoint stays healthy and the next turn returns to it.
+        assert!(health.is_available("chatgpt"));
+    }
+
+    /// CF-QUOTA-R5. With nowhere to hand over to, the plan keeps the capped
+    /// endpoint so the caller can report the honest reason instead of the
+    /// constructor silently inventing an endpoint.
+    #[test]
+    fn quota_capped_primary_without_an_alternative_stays_put() {
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        plan.skip_for_quota("chatgpt", "GPT 本五小时窗口已用 80%。".into());
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        assert_eq!(state.current().endpoint_name, "chatgpt");
+        assert!(state.take_initial_route_change().is_none());
+    }
+
+    /// CF-QUOTA-R3. A handover never lands on another endpoint that is itself
+    /// over its cap.
+    #[test]
+    fn a_quota_handover_never_lands_on_another_capped_endpoint() {
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        plan.push_fallback(route("chatgpt-alt", "gpt-5.5"));
+        plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+        plan.skip_for_quota("chatgpt", "GPT 本五小时窗口已用 80%。".into());
+        plan.skip_for_quota("chatgpt-alt", "GPT 本每周窗口已用 80%。".into());
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         assert_eq!(state.current().endpoint_name, "deepseek");
     }
 }
