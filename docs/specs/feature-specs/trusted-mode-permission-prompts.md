@@ -24,7 +24,7 @@ Spec Harness; Viewport Harness (approval prompt, waiting state, light/dark); AI 
 - Trusted mode: in-workspace delete/overwrite/run → no prompt.
 - Counter-examples (any mode): outside the workspace, main checkout, `..` escape, symlink escape, credentials, system settings, pushing directly to the default branch → still confirmed/refused.
 - Standard mode: existing behaviour unchanged.
-- Nobody responds: wait long → approve later → continue; deny → the task explains plainly and stops that action.
+- Nobody responds: the request stays open for a long time; once approved later, the task proceeds on its own; deny → the task explains plainly and stops that action.
 - Viewport: prompt in trusted / standard mode, waiting state, light/dark.
 
 ## Primary User Path
