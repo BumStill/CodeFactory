@@ -132,6 +132,65 @@ describe("SessionSidebar", () => {
     }
   });
 
+  // CF-HDE-R11（M53）：转圈与顶部提示同源。一个已经结算的回合留下的 `streaming`
+  // 残留不再让这一行永远转下去；真正在跑（服务器说在跑）时仍然转。
+  it("does not keep spinning on a settled turn's leftover streaming flag", () => {
+    const previousRuntime = fakeChatState.runtime;
+    fakeChatState.runtime = {
+      q1: {
+        streaming: true,
+        messages: [
+          { id: "root", role: "user", content: "旧任务", createdAt: 1 },
+          {
+            id: "assistant",
+            role: "assistant",
+            content: "结束了",
+            rootTurnId: "root",
+            createdAt: 2,
+            turnSettledAt: 3,
+            turnActivity: { objectiveStatus: "failed", terminalReason: "exhausted" },
+          },
+        ],
+      },
+    };
+    try {
+      render(
+        <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+      );
+      expect(screen.queryByLabelText("运行中")).not.toBeInTheDocument();
+    } finally {
+      fakeChatState.runtime = previousRuntime;
+    }
+  });
+
+  it("still spins while the current turn is genuinely in flight", () => {
+    const previousRuntime = fakeChatState.runtime;
+    fakeChatState.runtime = {
+      q1: {
+        streaming: true,
+        messages: [
+          { id: "root", role: "user", content: "在跑", createdAt: 1 },
+          {
+            id: "assistant",
+            role: "assistant",
+            content: "正在做",
+            rootTurnId: "root",
+            createdAt: 2,
+            turnActivity: { objectiveStatus: "active", rootTurnId: "root" },
+          },
+        ],
+      },
+    };
+    try {
+      render(
+        <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
+      );
+      expect(screen.getByLabelText("运行中")).toBeInTheDocument();
+    } finally {
+      fakeChatState.runtime = previousRuntime;
+    }
+  });
+
   it("surfaces running activity when its project is collapsed", () => {
     const previousSessions = fakeChatState.sessions;
     fakeChatState.sessions = fakeChatState.sessions.map((session) =>
