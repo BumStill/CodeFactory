@@ -6,6 +6,7 @@
 //! behavior. It accepts exactly one resolved route: metadata generation must
 //! never fail over to a Provider the user did not select for that session.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -87,6 +88,10 @@ pub(crate) async fn generate_bounded_text(
             thinking_disabled: true,
             retry_response_body: crate::http_util::RetryResponseBody::Redact,
             provider_attempt: None,
+            // U33: metadata sidecars never fall back on an endpoint, so the
+            // per-round tool-call latch is inert here — but the field is part of
+            // the shared transport shape.
+            round_side_effect_started: Arc::new(AtomicBool::new(false)),
         };
         let options = RoundOptions {
             require_tool: false,

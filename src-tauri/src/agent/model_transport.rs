@@ -74,6 +74,12 @@ pub(super) struct DesktopModelTransport {
     /// Present only for Objective-bound interactive/recovery work. It owns the
     /// exact write-ahead provider attempt and fences every POST/output/commit.
     pub(super) provider_attempt: Option<ProviderAttemptRuntime>,
+    /// U33 / CF-PFB-R11. Set the moment this round's wire carries a tool call,
+    /// even if the stream then breaks before the response is committed. The
+    /// OpenAI-compatible parser only assembles `tool_calls` into the final
+    /// response, so a truncated stream would otherwise look like plain text and
+    /// be re-sent elsewhere after a side effect may already have got going.
+    pub(super) round_side_effect_started: Arc<AtomicBool>,
 }
 
 pub(super) struct RoutedDesktopModelTransport {
@@ -131,6 +137,12 @@ enum ProviderFailureAction {
 struct TrackingEventSink {
     delegate: Arc<dyn EventSink>,
     output_started: Arc<AtomicBool>,
+    /// U33 / CF-PFB-R10. Whether THIS round put a tool call (or its result) on
+    /// the wire. Plain text on the wire is re-sendable: replaying it costs one
+    /// extra paid call and nothing else. A tool call is not — it may already
+    /// have started something outside the conversation — so only this flag,
+    /// never `output_started`, is allowed to keep the cautious path (R11).
+    round_side_effect_started: Arc<AtomicBool>,
     turn_uncommitted_output: Arc<AtomicBool>,
     turn_uncommitted_side_effect: Arc<AtomicBool>,
 }
@@ -150,6 +162,7 @@ impl EventSink for TrackingEventSink {
                 event,
                 StreamEvent::ToolCallStart { .. } | StreamEvent::ToolResult { .. }
             ) {
+                self.round_side_effect_started.store(true, Ordering::SeqCst);
                 self.turn_uncommitted_side_effect.store(true, Ordering::SeqCst);
             }
         }
@@ -364,7 +377,14 @@ impl ProviderAttemptRuntime {
         let deterministic = is_deterministic_request_rejection(text);
         let replayable =
             (!self.post_admitted.load(Ordering::SeqCst) || explicit_response) && !deterministic;
-        let (failure_class, failure_code) = if overloaded {
+        let (failure_class, failure_code) = if is_quota_exhausted(text) {
+            // U33 / M51: the endpoint answered, and the answer was "your quota
+            // is used up". Checked before the overload arm, because
+            // `is_provider_overloaded` also matches a bare "429" and would
+            // otherwise charge a long, known reset window against the transient
+            // three-attempt budget.
+            ("provider_quota_exhausted", "provider_quota_exhausted")
+        } else if overloaded {
             ("provider_overload", "provider_overloaded")
         } else if text.to_ascii_lowercase().contains("auth")
             || text.contains("401")
@@ -775,6 +795,7 @@ impl RoutedDesktopModelTransport {
         &self,
         route: &RouteCandidate,
         output_started: Arc<AtomicBool>,
+        round_side_effect_started: Arc<AtomicBool>,
         provider_attempt: Option<ProviderAttemptRuntime>,
     ) -> std::result::Result<DesktopModelTransport, TransportError> {
         let api_key = if matches!(route.api_style, ApiStyle::Chatgpt) {
@@ -820,6 +841,7 @@ impl RoutedDesktopModelTransport {
             events: Arc::new(TrackingEventSink {
                 delegate: self.events.clone(),
                 output_started,
+                round_side_effect_started: round_side_effect_started.clone(),
                 turn_uncommitted_output: self.turn_uncommitted_output.clone(),
                 turn_uncommitted_side_effect: self.turn_uncommitted_side_effect.clone(),
             }),
@@ -833,6 +855,7 @@ impl RoutedDesktopModelTransport {
             thinking_disabled: false,
             retry_response_body: crate::http_util::RetryResponseBody::Include,
             provider_attempt,
+            round_side_effect_started,
         })
     }
 }
@@ -1146,6 +1169,10 @@ impl DesktopModelTransport {
                                     .unwrap_or("")
                                     .to_string();
                                 if !call_id.is_empty() && !name.is_empty() {
+                                    // U33 / CF-PFB-R11: same rule as the
+                                    // OpenAI-compatible parser — a function call
+                                    // seen on the wire blocks a later re-send.
+                                    self.round_side_effect_started.store(true, Ordering::SeqCst);
                                     tool_calls.push(ToolCall {
                                         id: call_id,
                                         r#type: "function".into(),
@@ -1464,6 +1491,13 @@ impl DesktopModelTransport {
                     }
                     if let Some(tcs) = delta.tool_calls {
                         for tc in tcs {
+                            if tc.id.is_some() || tc.function.is_some() {
+                                // U33 / CF-PFB-R11: a tool call on the wire is the
+                                // point past which re-sending this request on
+                                // another endpoint is no longer obviously safe,
+                                // even if the stream breaks here.
+                                self.round_side_effect_started.store(true, Ordering::SeqCst);
+                            }
                             let e = tc_map.entry(tc.index).or_default();
                             if let Some(id) = tc.id {
                                 e.0 = id;
@@ -1640,6 +1674,21 @@ const DEEPSEEK_THINKING_REASONING_MARKER: &str =
 ///     2026-09-14);
 ///   * context overflow — providers report it as `invalid_request_error` and the
 ///     loop compacts the history and retries.
+/// U33 / M51 evidence (2026-10-10). "The subscription quota is used up until a
+/// known reset time" is a different condition from "the service is transiently
+/// overloaded": the former will not clear in the sixty seconds a transient
+/// retry budget allows, so charging it against that budget parks the session
+/// for hours and tells the user nothing.
+pub(crate) fn is_quota_exhausted(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("usage_limit_reached")
+        || lower.contains("usage limit reached")
+        || lower.contains("insufficient_quota")
+        || lower.contains("quota exceeded")
+        || lower.contains("exceeded your current quota")
+        || lower.contains("out of credits")
+}
+
 fn is_deterministic_request_rejection(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     if lower.contains("max_completion_tokens")
@@ -1875,12 +1924,19 @@ impl ModelTransport for RoutedDesktopModelTransport {
             let opts = downgraded_options.as_ref().unwrap_or(opts);
             let route = self.route_state.current();
             let output_started = Arc::new(AtomicBool::new(false));
+            // U33 / CF-PFB-R11. The side-effect state this round inherits from
+            // earlier rounds. Read BEFORE the stream starts, because the sink
+            // below also latches `turn_uncommitted_side_effect` for events that
+            // belong to *this* round.
+            let side_effect_before_round =
+                self.turn_uncommitted_side_effect.load(Ordering::SeqCst);
+            let round_side_effect_started = Arc::new(AtomicBool::new(false));
             // U30: whether an endpoint-scoped failure on this round may continue
             // on the next configured endpoint. It requires a different usable
             // endpoint AND a turn that produced nothing a switch would duplicate;
-            // failures after the POST additionally require `output_started` to
-            // still be false, so partial streamed output is never replayed
-            // elsewhere.
+            // failures after the POST additionally require that no tool call
+            // started on this round's wire, so partial streamed output is never
+            // replayed elsewhere once it may have begun to act (R11).
             let endpoint_failover_available = self.route_state.has_available_fallback()
                 && !self.turn_uncommitted_output.load(Ordering::SeqCst)
                 && !self.turn_uncommitted_side_effect.load(Ordering::SeqCst);
@@ -1888,7 +1944,12 @@ impl ModelTransport for RoutedDesktopModelTransport {
                 .prepare_provider_attempt(&route, messages, tools, opts)
                 .await?;
             let transport = match self
-                .transport_for(&route, output_started.clone(), provider_attempt.clone())
+                .transport_for(
+                    &route,
+                    output_started.clone(),
+                    round_side_effect_started.clone(),
+                    provider_attempt.clone(),
+                )
                 .await
             {
                 Ok(transport) => transport,
@@ -1999,7 +2060,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                                 .settle_failure_with_failover(
                                     &TransportError::Retryable(reason.clone()),
                                     endpoint_failover_available
-                                        && !output_started.load(Ordering::SeqCst),
+                                        && !round_side_effect_started.load(Ordering::SeqCst),
                                 )
                                 .await?
                         }
@@ -2023,13 +2084,17 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         });
                         continue;
                     }
-                    // A provider can fail after yielding visible SSE. Replaying
-                    // on another model would mix answers and can duplicate tool
-                    // intent, so fail visibly without switching.
-                    if output_started.load(Ordering::SeqCst)
-                        || self.turn_uncommitted_output.load(Ordering::SeqCst)
-                        || self.turn_uncommitted_side_effect.load(Ordering::SeqCst)
-                    {
+                    // U33 / CF-PFB-R10 + R11. The reply broke off partway. What
+                    // decides between "re-send the same request on the next
+                    // endpoint" and "stop and reconcile" is whether anything
+                    // outside the conversation may already have started — a tool
+                    // call on this round's wire, or a side effect latched before
+                    // this round began. Visible plain text is neither: replaying
+                    // it costs one extra paid call and nothing more, which is far
+                    // cheaper than the hours of parked waiting this replaced
+                    // (production 2026-10-09, session ab2d7b0f: three
+                    // TRANSPORT_UNREACHABLE retries, zero deepseek attempts).
+                    if round_side_effect_started.load(Ordering::SeqCst) || side_effect_before_round {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
                     }
@@ -2771,6 +2836,7 @@ mod tests {
             thinking_disabled: false,
             retry_response_body: crate::http_util::RetryResponseBody::Include,
             provider_attempt: None,
+            round_side_effect_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2933,6 +2999,33 @@ mod tests {
             stream
                 .write_all(response.as_bytes())
                 .expect("write truncated response");
+            // Deliberately omit the terminal zero-length chunk.
+        });
+        (base_url, hits)
+    }
+
+    /// U33 / CF-PFB-R11 counter-example fixture: the stream carries a tool call
+    /// and *then* breaks. Re-sending this request on another endpoint could
+    /// duplicate an action, so this must keep the cautious path.
+    fn serve_truncated_chunked_sse_with_tool_call() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tool-call fixture");
+        let base_url = format!("http://{}", listener.local_addr().expect("fixture addr"));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let fixture_hits = hits.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept tool-call request");
+            fixture_hits.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 16 * 1024];
+            let _ = stream.read(&mut request);
+            let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-partial-1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\"\"}}]},\"finish_reason\":null}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write truncated tool-call response");
             // Deliberately omit the terminal zero-length chunk.
         });
         (base_url, hits)
@@ -3843,20 +3936,26 @@ mod tests {
         assert_eq!(c_hits.load(Ordering::SeqCst), 2);
     }
 
+    /// U33 / CF-PFB-R10. A reply that breaks off partway after emitting only
+    /// plain text has touched nothing outside the conversation, so the same
+    /// request is re-sendable: it must continue on the next configured endpoint
+    /// instead of parking the objective for hours (production 2026-10-09,
+    /// session ab2d7b0f — three TRANSPORT_UNREACHABLE retries, zero deepseek
+    /// attempts, ~2 hours parked).
     #[tokio::test]
-    async fn routed_transport_does_not_switch_after_visible_partial_sse() {
+    async fn routed_transport_switches_after_a_text_only_partial_sse() {
         let (primary_url, primary_hits) = serve_truncated_chunked_sse();
         let (fallback_url, fallback_hits) = serve_responses(vec![(
             "200 OK",
             "text/event-stream",
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"wrong-replay\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"carried-by-fallback\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
         )]);
         let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
             "partial-primary",
             "a",
             primary_url,
         ));
-        plan.push_fallback(openai_candidate("must-not-run", "b", fallback_url));
+        plan.push_fallback(openai_candidate("fallback", "b", fallback_url));
         let transport = RoutedDesktopModelTransport {
             http: test_client(),
             events: Arc::new(super::super::events::CollectingEventSink::new()),
@@ -3886,18 +3985,90 @@ mod tests {
             },
         }];
 
+        let response = transport
+            .complete(&[], &tools, &RoundOptions::default())
+            .await
+            .expect("a text-only broken stream is re-sendable, not a reason to park");
+
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback_hits.load(Ordering::SeqCst),
+            1,
+            "the request must be re-sent on the next endpoint"
+        );
+        assert_eq!(
+            transport.route_state.current().endpoint_name,
+            "fallback",
+            "the task continues on the fallback"
+        );
+        assert_eq!(response.text, "carried-by-fallback");
+        let change = response
+            .route_change
+            .expect("the switch must be stated to the user");
+        assert_eq!(change.from_endpoint, "partial-primary");
+        assert_eq!(change.to_endpoint, "fallback");
+    }
+
+    /// U33 / CF-PFB-R11 (counter-example). Once a tool call has appeared on the
+    /// wire, re-sending the identical request elsewhere could duplicate an
+    /// action, so the cautious path is kept: no switch, visible retryable
+    /// failure — exactly the behaviour R11 forbids weakening.
+    #[tokio::test]
+    async fn routed_transport_does_not_switch_after_a_partial_sse_that_started_a_tool_call() {
+        let (primary_url, primary_hits) = serve_truncated_chunked_sse_with_tool_call();
+        let (fallback_url, fallback_hits) = serve_responses(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"must-not-run\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "tool-primary",
+            "a",
+            primary_url,
+        ));
+        plan.push_fallback(openai_candidate("must-not-run", "b", fallback_url));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: "partial-tool-test".into(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: unused_provider_db(),
+            root_turn_id: None,
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: false,
+        };
+        let tools = vec![ToolDefinition {
+            r#type: "function".into(),
+            function: codefactory_agent_loop::types::FunctionDefinition {
+                name: "noop".into(),
+                description: "test".into(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }];
+
         let error = transport
             .complete(&[], &tools, &RoundOptions::default())
             .await
-            .expect_err("truncated stream is visible failure");
+            .expect_err("a broken stream that already carried a tool call is not replayable");
 
         assert!(matches!(error, TransportError::Retryable(_)));
         assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
         assert_eq!(
-            transport.route_state.current().endpoint_name,
-            "partial-primary"
+            fallback_hits.load(Ordering::SeqCst),
+            0,
+            "a tool call may already have started: the request must not be replayed"
         );
+        assert_eq!(transport.route_state.current().endpoint_name, "tool-primary");
     }
 
     #[tokio::test]
@@ -4533,6 +4704,101 @@ mod tests {
                 .expect("the switch is user-visible")
                 .to_endpoint,
             "deepseek"
+        );
+        let waiting_episodes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_route_episodes WHERE status='waiting'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            waiting_episodes, 0,
+            "a switched-over turn must not leave a durably waiting objective"
+        );
+    }
+
+    /// U33 / M51 (2026-10-10). The subscription quota ran out mid-turn
+    /// (`usage_limit_reached`, a 300-minute reset window). Treated as a
+    /// transient overload, this burned the strict three-attempt budget and
+    /// parked the objective for hours with zero fallback attempts. With a usable
+    /// fallback it must simply continue there — and it must NOT be recorded as
+    /// transient overload, so the reset window is never charged that budget.
+    #[tokio::test]
+    async fn prefer_mode_switches_instead_of_waiting_out_a_used_up_quota() {
+        const QUOTA_EXHAUSTED: (&str, &str, &str) = (
+            "429 Too Many Requests",
+            "application/json",
+            r#"{"error":{"message":"You've hit your usage limit. usage_limit_reached","type":"usage_limit_reached","code":"usage_limit_reached"}}"#,
+        );
+        let (pool, objective) = durable_foreground_fixture("prefer-quota").await;
+        let session_id = objective.session_id.clone().expect("fixture session");
+        sqlx::query("UPDATE sessions SET model_policy='prefer' WHERE id=?")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (primary_url, primary_hits) =
+            serve_responses(vec![QUOTA_EXHAUSTED, QUOTA_EXHAUSTED, QUOTA_EXHAUSTED]);
+        let (fallback_url, fallback_hits) = serve_responses(vec![OPENAI_OK, OPENAI_OK]);
+
+        let mut plan = super::super::failover::RouteCandidatePlan::new(openai_candidate(
+            "chatgpt",
+            "gpt-6.1-sol",
+            primary_url,
+        ));
+        plan.push_fallback(openai_candidate(
+            "deepseek",
+            "deepseek-v4-pro",
+            fallback_url,
+        ));
+        let transport = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: session_id.clone(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                plan,
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: objective.root_turn_id.clone(),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+
+        let response = transport
+            .complete(&[], &[], &RoundOptions::default())
+            .await
+            .expect("an exhausted quota must not park a fallback-enabled task");
+
+        assert!(primary_hits.load(Ordering::SeqCst) >= 1);
+        assert!(
+            fallback_hits.load(Ordering::SeqCst) >= 1,
+            "the quota-exhausted preferred endpoint must hand the turn to deepseek"
+        );
+        assert_eq!(
+            response
+                .route_change
+                .expect("the switch is user-visible")
+                .to_endpoint,
+            "deepseek"
+        );
+        let (failure_class, failure_code): (String, String) = sqlx::query_as(
+            "SELECT failure_class, failure_code FROM provider_route_attempts
+             WHERE status='failed_replayable' ORDER BY attempt_order LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (failure_class.as_str(), failure_code.as_str()),
+            ("provider_quota_exhausted", "provider_quota_exhausted"),
+            "a long, known reset window must not be charged the transient overload budget"
         );
         let waiting_episodes: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM provider_route_episodes WHERE status='waiting'")
