@@ -41,6 +41,71 @@ fn command_failure_metadata(
     })
 }
 
+/// CF-BLD-R7/R3: the admissions a heavy build must pass before it starts.
+///
+/// `Ok(None)` for an ordinary command; `Ok(Some(permit))` once a build slot is
+/// held; `Err(sentence)` when the disk guard says the build cannot honestly
+/// start — the sentence is what the user sees, in plain words.
+async fn heavy_build_admission(
+    ctx: &ExecCtx,
+    command: &str,
+) -> std::result::Result<Option<crate::build_cache::HeavyBuildPermit>, String> {
+    if !crate::build_cache::HeavyBuildLimiter::is_heavy_build_command(command) {
+        return Ok(None);
+    }
+    let limiter = crate::build_cache::heavy_build_limiter();
+    if let Some(label) = limiter.status_label().await {
+        emit_build_status(ctx, "waiting", &label);
+    }
+    let permit = limiter.acquire().await;
+    let Some(container) = workspace_cache_container(ctx) else {
+        // A plain working directory, not a managed workspace: the slot is still
+        // respected, there is simply no cache to reclaim here.
+        emit_build_status(ctx, "admitted", "已获得编译空位");
+        return Ok(Some(permit));
+    };
+    // Never reclaim the cache this build is about to write into.
+    let keep = vec![crate::build_cache::task_cache_root(&ctx.cwd)];
+    let log = crate::build_cache::AuditLog::new(crate::build_cache::audit_log_path(&container));
+    let outcome =
+        crate::build_cache::guard_before_build(&container, &keep, "bash_heavy_build", Some(&log));
+    if !outcome.admitted() {
+        return Err(outcome.user_message());
+    }
+    emit_build_status(ctx, "admitted", &outcome.user_message());
+    Ok(Some(permit))
+}
+
+/// The managed-workspace container this process owns, when there is one.
+#[cfg(not(test))]
+fn workspace_cache_container(ctx: &ExecCtx) -> Option<std::path::PathBuf> {
+    let data = ctx.app.as_ref()?.path().app_data_dir().ok()?;
+    Some(data.join("execution-workspaces"))
+}
+
+#[cfg(test)]
+fn workspace_cache_container(_ctx: &ExecCtx) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Tell the user (and the UI) what the build is doing: waiting for a slot, or
+/// admitted with how much room is left.
+fn emit_build_status(ctx: &ExecCtx, state: &str, message: &str) {
+    #[cfg(not(test))]
+    if let Some(app) = ctx.app.as_ref() {
+        let _ = app.emit(
+            "build_cache_status",
+            serde_json::json!({
+                "state": state,
+                "message": message,
+                "session_id": ctx.session_id,
+            }),
+        );
+    }
+    #[cfg(test)]
+    let _ = (ctx, state, message);
+}
+
 fn bounded_stream(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     if text.len() <= OUTPUT_LIMIT {
@@ -270,6 +335,16 @@ async fn execute_inner(
         )));
     }
     let risk = policy.risk();
+
+    // ── CF-BLD-R7 + CF-BLD-R3 in the real build path ─────────────────────────
+    // A heavy build takes one of the machine's build slots — queueing, visibly,
+    // when none is free — and may only start when there is room on disk. Both
+    // are user-visible states, not silent waits, and the permit is held for as
+    // long as the build runs.
+    let _heavy_build_permit = match heavy_build_admission(ctx, &a.command).await {
+        Ok(permit) => permit,
+        Err(message) => return Ok(ToolOutput::err(&message)),
+    };
 
     let sandbox_mode = ctx
         .settings

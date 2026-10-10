@@ -719,6 +719,284 @@ pub fn task_cache_size(workspace: &Path) -> u64 {
     .unwrap_or(0)
 }
 
+// ── Runtime wiring: CF-BLD-R2/R3/R7/R8 in the live build path ────────────────
+//
+// Everything above is a pure planner. Everything below is what the running app
+// calls, so the behaviours exist outside the unit tests: a real shell-tool
+// invocation queues behind one machine-wide heavy-build bound, and the app's
+// own supervisor reclaims a finished task's cache instead of waiting for the
+// disk to fill up and a build to die half-way through.
+
+/// One heavy-build limiter per process (CF-BLD-R7). Every shell-tool invocation
+/// queues behind the same bound, so "at most N heavy builds at once" is a
+/// property of this machine, not of whichever code path happened to start one.
+static HEAVY_BUILDS: std::sync::OnceLock<Arc<HeavyBuildLimiter>> = std::sync::OnceLock::new();
+
+pub fn heavy_build_limiter() -> Arc<HeavyBuildLimiter> {
+    Arc::clone(HEAVY_BUILDS.get_or_init(|| HeavyBuildLimiter::new(configured_max_heavy_builds())))
+}
+
+fn env_gib(name: &str, default_gib: u64) -> u64 {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .map(|value| (value * GIB) as u64)
+        .unwrap_or((default_gib as f64 * GIB) as u64)
+}
+
+/// Total ceiling for every cache CodeFactory owns (CF-BLD-R1).
+pub fn configured_budget_bytes() -> u64 {
+    env_gib(
+        "CODEFACTORY_BUILD_CACHE_BUDGET_GB",
+        DEFAULT_BUDGET_BYTES / (1024 * 1024 * 1024),
+    )
+}
+
+/// Free-space floor checked before a task or a heavy build starts (CF-BLD-R3).
+pub fn configured_free_space_floor_bytes() -> u64 {
+    env_gib(
+        "CODEFACTORY_BUILD_CACHE_FLOOR_GB",
+        DEFAULT_FREE_SPACE_FLOOR_BYTES / (1024 * 1024 * 1024),
+    )
+}
+
+/// Heavy builds allowed at once, machine-wide (CF-BLD-R7).
+pub fn configured_max_heavy_builds() -> usize {
+    std::env::var("CODEFACTORY_MAX_HEAVY_BUILDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_HEAVY_BUILDS)
+}
+
+/// How long a cache with no live owner row at all may sit before R8 drops it.
+/// Long on purpose: an orphan is a crashed task, and a crashed task is still
+/// resumable for far longer than a finished one.
+pub const ORPHAN_IDLE_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Where every removal is recorded (CF-BLD-R10). Kept beside the caches it
+/// describes; `scan_root` ignores it because it is not a cache directory.
+pub fn audit_log_path(container: &Path) -> PathBuf {
+    container.join("build-cache-audit.jsonl")
+}
+
+/// Every cache under the managed-workspace container, with its task as owner.
+///
+/// The container holds one directory per task; each task's own cache lives in
+/// `.codefactory-cache/` inside it. Only directories CodeFactory created are
+/// ever measured (CF-BLD-R8), and the task directory itself is never touched —
+/// removing it belongs to the workspace closeout, not to the build cache.
+pub fn scan_workspace_container(container: &Path) -> Vec<CacheEntry> {
+    let mut entries = Vec::new();
+    let read = match std::fs::read_dir(container) {
+        Ok(read) => read,
+        Err(_) => return entries,
+    };
+    for workspace in read.flatten() {
+        let path = workspace.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let owner = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned);
+        entries.extend(scan_root(
+            &task_cache_root(&path),
+            |_| owner.clone(),
+            now_unix(),
+            IN_USE_STALE_AFTER,
+        ));
+    }
+    entries
+}
+
+/// What one maintenance pass did. Also what the occupancy panel reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceOutcome {
+    pub scanned: usize,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub reclaimed_bytes: u64,
+    pub evicted_bytes: u64,
+    pub protected_bytes: u64,
+    pub overflow_bytes: u64,
+    pub removed: Vec<PathBuf>,
+}
+
+/// Everything a maintenance pass needs to decide. The caller owns the database
+/// question ("which tasks ended?"); this stays filesystem-only and testable.
+pub struct MaintenanceRequest<'a> {
+    pub container: &'a Path,
+    /// Workspace ids whose task reached a terminal state (CF-BLD-R2).
+    pub ended_owners: &'a [String],
+    /// Workspace ids with no live row at all; dropped only once idle past
+    /// `idle_before_unix` (CF-BLD-R8 backlog), never while they look resumable.
+    pub orphan_owners: &'a [String],
+    /// A zero here disables the orphan idle rule.
+    pub idle_before_unix: u64,
+    pub limit_bytes: u64,
+    pub trigger: &'a str,
+}
+
+/// Run R2, then the R8 backlog rule, then R1 — in that order, so the ceiling
+/// only counts what actually survived.
+pub fn maintain(request: &MaintenanceRequest<'_>, log: Option<&AuditLog>) -> MaintenanceOutcome {
+    let entries = scan_workspace_container(request.container);
+    maintain_entries(&entries, request, log)
+}
+
+/// The same pass over an already-scanned set, so tests can drive synthetic
+/// directories without touching a real workspace container.
+pub fn maintain_entries(
+    entries: &[CacheEntry],
+    request: &MaintenanceRequest<'_>,
+    log: Option<&AuditLog>,
+) -> MaintenanceOutcome {
+    let before_bytes: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    let protected_bytes: u64 = entries.iter().filter(|e| e.in_use).map(|e| e.bytes).sum();
+    let mut removed: Vec<PathBuf> = Vec::new();
+    let mut reclaimed_bytes = 0u64;
+    let mut evicted_bytes = 0u64;
+
+    // R2 — a finished task's cache is dead weight now, not a budget question.
+    let ended = plan_task_reclaim(entries, request.ended_owners);
+    reclaimed_bytes = reclaimed_bytes.saturating_add(apply_plan(&ended, request.trigger, log));
+    removed.extend(ended.evict.iter().map(|entry| entry.path.clone()));
+
+    // R8 backlog — an orphan nobody can resume and nobody touched for a long
+    // time. A live task's cache is never a candidate, however idle it looks.
+    if request.idle_before_unix > 0 {
+        let orphans: Vec<CacheEntry> = entries
+            .iter()
+            .filter(|entry| !removed.contains(&entry.path))
+            .filter(|entry| !entry.in_use)
+            .filter(|entry| {
+                entry.owner.as_ref().is_some_and(|owner| {
+                    request.orphan_owners.iter().any(|candidate| candidate == owner)
+                })
+            })
+            .filter(|entry| entry.last_used_unix < request.idle_before_unix)
+            .cloned()
+            .collect();
+        if !orphans.is_empty() {
+            let freed = orphans.iter().map(|entry| entry.bytes).sum();
+            let plan = EvictionPlan {
+                reason: EvictionReason::Upgrade,
+                evict: lru_order(orphans),
+                freed_bytes: freed,
+                kept_bytes: before_bytes.saturating_sub(freed),
+                overflow_bytes: 0,
+                protected_bytes,
+            };
+            reclaimed_bytes =
+                reclaimed_bytes.saturating_add(apply_plan(&plan, request.trigger, log));
+            removed.extend(plan.evict.iter().map(|entry| entry.path.clone()));
+        }
+    }
+
+    // R1 — the survivors answer to the ceiling.
+    let survivors: Vec<CacheEntry> = entries
+        .iter()
+        .filter(|entry| !removed.contains(&entry.path))
+        .cloned()
+        .collect();
+    let budget = plan_eviction(&survivors, request.limit_bytes, EvictionReason::OverBudget);
+    evicted_bytes = evicted_bytes.saturating_add(apply_plan(&budget, request.trigger, log));
+    removed.extend(budget.evict.iter().map(|entry| entry.path.clone()));
+
+    let after_bytes =
+        before_bytes.saturating_sub(reclaimed_bytes.saturating_add(evicted_bytes));
+    MaintenanceOutcome {
+        scanned: entries.len(),
+        before_bytes,
+        after_bytes,
+        reclaimed_bytes,
+        evicted_bytes,
+        protected_bytes,
+        overflow_bytes: after_bytes.saturating_sub(request.limit_bytes),
+        removed,
+    }
+}
+
+/// CF-BLD-R8: the pass that runs once as the app comes up — ended tasks first,
+/// then the long-orphaned backlog, then the ceiling.
+pub fn startup_sweep(
+    container: &Path,
+    ended_owners: &[String],
+    orphan_owners: &[String],
+    log: Option<&AuditLog>,
+) -> MaintenanceOutcome {
+    let request = MaintenanceRequest {
+        container,
+        ended_owners,
+        orphan_owners,
+        idle_before_unix: now_unix().saturating_sub(ORPHAN_IDLE_SECS),
+        limit_bytes: configured_budget_bytes(),
+        trigger: "startup",
+    };
+    maintain(&request, log)
+}
+
+/// CF-BLD-R3 in the live path: free idle caches when the disk is short, and say
+/// plainly how much was cleaned and how much is still missing.
+///
+/// `keep` is the cache the caller is about to build into. Reclaiming is never
+/// allowed to delete the very target directory this build is starting with.
+pub fn guard_before_build(
+    container: &Path,
+    keep: &[PathBuf],
+    trigger: &str,
+    log: Option<&AuditLog>,
+) -> DiskGuardOutcome {
+    let floor = configured_free_space_floor_bytes();
+    let probe = container.to_path_buf();
+    guard_disk_space(
+        move || free_bytes(&probe),
+        floor,
+        |missing| reclaim_until(container, keep, missing, trigger, log),
+    )
+}
+
+/// Drop least-recently-used caches until at least `target` bytes are free.
+/// In-use caches, and anything under `keep`, are never candidates: a build in
+/// flight must never be the thing deleted to make room for another one.
+pub fn reclaim_until(
+    container: &Path,
+    keep: &[PathBuf],
+    target: u64,
+    trigger: &str,
+    log: Option<&AuditLog>,
+) -> u64 {
+    let entries: Vec<CacheEntry> = scan_workspace_container(container)
+        .into_iter()
+        .filter(|entry| !keep.iter().any(|prefix| entry.path.starts_with(prefix)))
+        .collect();
+    let total: u64 = entries.iter().map(|entry| entry.bytes).sum();
+    let plan = plan_eviction(
+        &entries,
+        total.saturating_sub(target),
+        EvictionReason::DiskPressure,
+    );
+    apply_plan(&plan, trigger, log)
+}
+
+/// Live occupancy for the panel and the background entry point (CF-BLD-R4).
+pub async fn current_report(container: &Path, limiter: &HeavyBuildLimiter) -> BuildCacheReport {
+    let entries = scan_workspace_container(container);
+    BuildCacheReport {
+        total_bytes: entries.iter().map(|entry| entry.bytes).sum(),
+        budget_bytes: configured_budget_bytes(),
+        entries,
+        heavy_builds_running: limiter.running().await,
+        heavy_builds_waiting: limiter.waiting().await,
+        heavy_build_limit: limiter.limit(),
+        heavy_build_status: limiter.status_label().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,5 +1293,177 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(limiter.running().await, 0);
+    }
+
+    // ── CF-BLD-R2/R3/R8: the runtime maintenance pass ────────────────────────
+
+    fn request<'a>(
+        container: &'a Path,
+        ended: &'a [String],
+        orphans: &'a [String],
+        idle_before: u64,
+        limit: u64,
+    ) -> MaintenanceRequest<'a> {
+        MaintenanceRequest {
+            container,
+            ended_owners: ended,
+            orphan_owners: orphans,
+            idle_before_unix: idle_before,
+            limit_bytes: limit,
+            trigger: "test",
+        }
+    }
+
+    #[test]
+    fn r2_runtime_pass_reclaims_ended_tasks_and_leaves_live_and_in_use_caches_alone() {
+        let root = temp_dir("r2-runtime");
+        let live = owned(&root, "cargo-target-live", 4096, 1_700_000_000, false, "task-live");
+        let busy = owned(&root, "cargo-target-busy", 4096, 1_700_000_000, true, "task-done");
+        let done = owned(&root, "cargo-target-done", 8192, 1_700_000_000, false, "task-done");
+        let entries = vec![live.clone(), busy.clone(), done.clone()];
+        let ended = vec!["task-done".to_string()];
+        let none: Vec<String> = Vec::new();
+
+        let outcome = maintain_entries(&entries, &request(&root, &ended, &none, 0, u64::MAX), None);
+
+        assert_eq!(
+            outcome.removed,
+            vec![done.path.clone()],
+            "only the ended task's idle cache is reclaimed"
+        );
+        assert_eq!(outcome.reclaimed_bytes, 8192);
+        assert!(!done.path.exists());
+        assert!(
+            busy.path.exists(),
+            "an ended task's cache survives while a live builder still holds it"
+        );
+        assert!(
+            live.path.exists(),
+            "a task that can still continue keeps its cache"
+        );
+    }
+
+    #[test]
+    fn r8_orphan_backlog_drops_only_caches_idle_past_the_window() {
+        let root = temp_dir("r8-orphan");
+        let old = owned(&root, "cargo-target-old", 4096, 1_000, false, "task-gone");
+        let fresh = owned(&root, "cargo-target-fresh", 4096, 9_000, false, "task-gone");
+        let live_idle = owned(&root, "cargo-target-live", 4096, 1_000, false, "task-live");
+        let entries = vec![old.clone(), fresh.clone(), live_idle.clone()];
+        let ended: Vec<String> = Vec::new();
+        let orphans = vec!["task-gone".to_string()];
+
+        let outcome = maintain_entries(&entries, &request(&root, &ended, &orphans, 5_000, u64::MAX), None);
+
+        assert_eq!(outcome.removed, vec![old.path.clone()]);
+        assert!(
+            fresh.path.exists(),
+            "an orphan touched inside the idle window is still resumable"
+        );
+        assert!(
+            live_idle.path.exists(),
+            "a live task's cache is never an orphan candidate, however idle"
+        );
+    }
+
+    #[test]
+    fn r1_still_applies_to_what_survives_the_runtime_pass() {
+        let root = temp_dir("r1-after-runtime");
+        let a = owned(&root, "cargo-target-a", 4096, 1_000, false, "task-live");
+        let b = owned(&root, "cargo-target-b", 4096, 2_000, false, "task-live");
+        let ended: Vec<String> = Vec::new();
+        let none: Vec<String> = Vec::new();
+
+        let outcome =
+            maintain_entries(&[a.clone(), b.clone()], &request(&root, &ended, &none, 0, 4096), None);
+
+        assert_eq!(outcome.evicted_bytes, 4096);
+        assert_eq!(outcome.after_bytes, 4096);
+        assert_eq!(outcome.overflow_bytes, 0);
+        assert!(
+            a.path.exists() ^ b.path.exists(),
+            "the ceiling drops caches until the survivors fit"
+        );
+    }
+
+    #[test]
+    fn scan_and_reclaim_touch_only_a_tasks_own_cache_directory() {
+        let container = temp_dir("container");
+        for owner in ["task-one", "task-two"] {
+            let cache_root = task_cache_root(&container.join(owner));
+            fs::create_dir_all(&cache_root).unwrap();
+            let target = cache_root.join("cargo-target-test");
+            fs::create_dir_all(target.join("debug/deps")).unwrap();
+            fs::write(target.join("debug/deps/blob"), vec![5u8; 4096]).unwrap();
+        }
+        // A sibling the app did not create must never be measured or removed.
+        let source = container.join("task-one").join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("main.rs"), b"fn main(){}").unwrap();
+
+        let scanned = scan_workspace_container(&container);
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(scanned.iter().map(|entry| entry.bytes).sum::<u64>(), 8192);
+        assert!(scanned.iter().all(|entry| entry.owner.is_some()));
+
+        let freed = reclaim_until(&container, &[], 4096, "test", None);
+        assert_eq!(freed, 4096);
+        assert_eq!(scan_workspace_container(&container).len(), 1);
+        assert!(
+            source.join("main.rs").exists(),
+            "the task's own source is never a build-cache candidate"
+        );
+    }
+
+    #[test]
+    fn reclaim_never_deletes_the_cache_the_current_build_is_starting_into() {
+        let container = temp_dir("keep");
+        for owner in ["task-one", "task-two"] {
+            let cache_root = task_cache_root(&container.join(owner));
+            fs::create_dir_all(&cache_root).unwrap();
+            let target = cache_root.join("cargo-target-test");
+            fs::create_dir_all(target.join("debug/deps")).unwrap();
+            fs::write(target.join("debug/deps/blob"), vec![5u8; 4096]).unwrap();
+        }
+        let mine = task_cache_root(&container.join("task-one"));
+
+        // Ask for more room than exists: the guard may clear every other task
+        // but must never touch the directory this build is about to write into.
+        let freed = reclaim_until(&container, std::slice::from_ref(&mine), 64 * 1024, "test", None);
+
+        assert_eq!(freed, 4096, "only the other task's cache is reclaimable");
+        assert!(mine.join("cargo-target-test").exists(), "the current build's cache is kept");
+        assert!(!task_cache_root(&container.join("task-two")).join("cargo-target-test").exists());
+    }
+
+    #[test]
+    fn runtime_defaults_match_the_documented_budget() {
+        assert_eq!(DEFAULT_BUDGET_BYTES, 60 * 1024 * 1024 * 1024);
+        if std::env::var("CODEFACTORY_BUILD_CACHE_BUDGET_GB").is_err() {
+            assert_eq!(configured_budget_bytes(), DEFAULT_BUDGET_BYTES);
+        }
+        if std::env::var("CODEFACTORY_BUILD_CACHE_FLOOR_GB").is_err() {
+            assert_eq!(configured_free_space_floor_bytes(), DEFAULT_FREE_SPACE_FLOOR_BYTES);
+        }
+        if std::env::var("CODEFACTORY_MAX_HEAVY_BUILDS").is_err() {
+            assert_eq!(configured_max_heavy_builds(), DEFAULT_MAX_HEAVY_BUILDS);
+        }
+    }
+
+    #[tokio::test]
+    async fn report_serialises_occupancy_and_heavy_build_state() {
+        let container = temp_dir("report");
+        let limiter = HeavyBuildLimiter::new(1);
+
+        let report = current_report(&container, &limiter).await;
+
+        assert_eq!(report.total_bytes, 0);
+        assert_eq!(report.budget_bytes, configured_budget_bytes());
+        assert_eq!(report.heavy_build_limit, 1);
+        assert!(report.heavy_build_status.is_none());
+        let rendered = serde_json::to_value(&report).unwrap();
+        for field in ["total_bytes", "budget_bytes", "entries", "heavy_builds_running"] {
+            assert!(rendered.get(field).is_some(), "report must carry {field}");
+        }
     }
 }
