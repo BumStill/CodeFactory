@@ -58,6 +58,11 @@
 - 创建或 checkout 新 worktree 后，版本化 `post-checkout` hook 会把缺失的 `src-tauri/target` 链接到共同缓存；已有本地 target 一律不自动替换。
 - PR 通过 GitHub squash 合并后，执行者必须从其他 checkout 运行 `pnpm worktrees:closeout -- --path <自己的绝对路径> --apply`，由 GitHub 已合并 PR 判定后删除目录和本地分支；不得用 `merge-base` 否定 squash 合并。
 - 长会话优先使用 `pnpm cargo:shared -- <cargo arguments>`（可在仓库任意目录运行，`--` 可省略）；裸 Cargo 在新 worktree 中也必须落到共同 target，不得形成新的独占 `src-tauri/target`。
+- **编译缓存有上限（CF-BUILD）**：`.codefactory-cache` 下的编译目录（共享 `cargo-target` 与任务专属 `cargo-target-*`）受统一上限约束，默认 60 GiB，按「最久未使用」淘汰；正在构建的目录（`.codefactory-in-use` 心跳标记未过期）永不删除；闲置超过 14 天的目录无条件回收。规则实现在 `scripts/build-cache-budget.mjs`（与运行时 `src-tauri/src/build_cache.rs` 同语义）。
+  - 查看占用：`pnpm build-cache`；立刻按上限清理：`pnpm build-cache:enforce`；改上限：`CODEFACTORY_BUILD_CACHE_BUDGET_GB=<GB> pnpm cargo:shared ...`。
+  - `pnpm cargo:shared` 每次构建前自动执行一次预算检查，并设置 `CARGO_INCREMENTAL=0`：增量产物按 worktree 路径分桶，在共享缓存里只写不复用（曾是 410 GB 里最大的一块），共享缓存因此只保留可跨任务复用的第三方依赖与最终产物。
+  - 每次淘汰/回收都追加到 `.codefactory-cache/build-cache-audit.jsonl`（时间、路径、大小、原因、触发者），可追溯。
+  - 规则不得被绕过：不要手动 `rm -rf` 或另起共享目录；新增共享缓存目录时必须接入 `looksLikeManagedCache` 的命名约定与同一预算入口。
 
 ## 验证与测试
 - 行为或代码修改前必须先写独立测试或可执行验收，并先看到失败。
