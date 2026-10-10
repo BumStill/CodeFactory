@@ -48,7 +48,13 @@ import { parseVerification, verificationSummary } from "../../lib/verification";
 import { currentTurnOwnership } from "../../lib/turnOwnership";
 import { useDesktopMenuBridge } from "../../lib/useDesktopMenuBridge";
 import { useDesktopDispatchBridge } from "../../lib/useDesktopDispatchBridge";
-import type { DispatchApproval } from "../../lib/desktopDispatch";
+import {
+  dispatchSend,
+  dispatchSetModel,
+  dispatchSetPermission,
+  dispatchStatus,
+  dispatchStop,
+} from "../../lib/dispatchActions";
 
 type WorkspaceBrowserSession = BrowserSession & {
   status?: string | null;
@@ -375,64 +381,29 @@ export function WorkspacePage({
         await composerRef.current?.sendText(message);
         return { session_id: session.id, model: session.model_id };
       },
-      send: async ({ sessionId, message }) => {
-        const store = useChatStore.getState();
-        if (store.activeSession?.id !== sessionId) await onOpenSession(sessionId);
-        await composerRef.current?.sendText(message);
-        return { session_id: sessionId };
-      },
-      setPermission: async ({ sessionId, mode }) => {
-        const store = useChatStore.getState();
-        if (store.activeSession?.id !== sessionId) await onOpenSession(sessionId);
-        await store.updateActiveSessionPermissionMode(mode);
-        return { session_id: sessionId, permission_mode: mode };
-      },
-      setModel: async ({ sessionId, model }) => {
-        const store = useChatStore.getState();
-        const target = sessionId ?? store.activeSession?.id;
-        if (!target) throw new Error("no session is open to change the model on");
-        const session = await invoke<{ id: string; model_id: string }>("update_session_model", {
-          sessionId: target,
-          modelId: model,
-        });
-        if (store.activeSession?.id === session.id) store.setModel(session.model_id);
-        return { session_id: session.id, model: session.model_id };
-      },
+      send: async ({ sessionId, message, mode }) => dispatchSend({ sessionId, message, mode }),
+      setPermission: async ({ sessionId, mode }) => dispatchSetPermission({ sessionId, mode }),
+      setModel: async ({ sessionId, model }) => dispatchSetModel({ sessionId, model }),
       switchSession: async ({ sessionId }) => {
         await onOpenSession(sessionId);
         return { session_id: sessionId };
       },
-      stop: async ({ sessionId }) => {
-        const store = useChatStore.getState();
-        const target = sessionId ?? store.activeSession?.id ?? undefined;
-        const stopped = await store.cancelStream(target);
-        if (stopped) setDurableTurnActive(false);
-        return { stopped };
-      },
+      stop: async ({ sessionId }) => dispatchStop({ sessionId }),
       listApprovals: async () => {
-        return invoke<DispatchApproval[]>("list_pending_approvals");
+        const store = useChatStore.getState();
+        return Object.entries(store.runtime).flatMap(([sessionId, runtime]) => {
+          const pending = runtime?.pendingPermission;
+          return pending
+            ? [{ approvalId: pending.intentId, toolName: pending.toolName, sessionId }]
+            : [];
+        });
       },
       resolveApproval: async ({ approvalId, approve }) => {
         // 一次只处理一条:高危操作仍然要编排方明确选"批"或"拒",没有批量放行。
         await invoke("respond_to_permission", { intentId: approvalId, allow: approve });
         return { approval_id: approvalId, approved: approve };
       },
-      status: async ({ sessionId }) => {
-        const store = useChatStore.getState();
-        const session = store.sessions.find((candidate) => candidate.id === sessionId);
-        if (!session) throw new Error(`unknown session ${sessionId}`);
-        return {
-          session_id: session.id,
-          title: session.title,
-          cwd: session.cwd,
-          permission_mode: session.permission_mode,
-          model: session.model_id,
-          objective_state:
-            sessionId === store.activeSession?.id && turnInFlight ? "running" : "idle",
-          latest_reply: null,
-          pr_number: null,
-        };
-      },
+      status: async ({ sessionId }) => dispatchStatus({ sessionId }),
     },
   });
   const draftProjects = useMemo(() => recentProjects(sessions ?? []), [sessions]);
@@ -1003,6 +974,7 @@ export function WorkspacePage({
             streaming={streaming}
             turnActive={turnInFlight}
             turnExecutionActive={turnExecutionActive}
+            sessionIsRunning={activeSession?.is_running === true}
             cwd={activeCwd}
             conversationKey={activeSession?.id ?? activeDraft?.id ?? sessionId}
             hasOlderHistory={hasOlderHistory}

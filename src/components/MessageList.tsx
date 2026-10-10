@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { UrlTransform } from "react-markdown";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -32,6 +32,7 @@ import {
   systemOwnsObjective,
 } from "../lib/turnOwnership";
 import { statusBannerView } from "../lib/statusBanner";
+import { sessionTurnState } from "../lib/sessionTurnState";
 import {
   summarizeTurnEvidence,
   TurnResultSnapshot,
@@ -58,6 +59,9 @@ interface Props {
    * turn. Kept separate from durable ownership so stale activity snapshots do
    * not look live after a restart. */
   turnExecutionActive?: boolean;
+  /** CF-HDE-R11：服务器权威的"这个会话此刻真的在跑"（`sessions.is_running`）。
+   *  顶部提示必须和 status（R9）同源，不能停在过期的"等待自动重试"（M53）。 */
+  sessionIsRunning?: boolean;
   /** Working directory of the active session. */
   cwd?: string | null;
   /** Called when the user picks an example prompt from the welcome screen. */
@@ -342,6 +346,7 @@ export function MessageList({
   streaming,
   turnActive = streaming,
   turnExecutionActive = streaming,
+  sessionIsRunning = false,
   onUsePrompt,
   onOpenUsage,
   onOpenSession,
@@ -359,6 +364,12 @@ export function MessageList({
   externalJobs = [],
 }: Props) {
   const resolvedConversationKey = conversationKey ?? messages[0]?.id ?? null;
+  // CF-HDE-R11（M53）：顶部提示与派单 status（R9）读**同一个**真实来源，所以
+  // 不可能一个说"正在执行"、另一个还停在"等待自动重试"。
+  const turnState = useMemo(
+    () => sessionTurnState({ streaming, sessionIsRunning, messages }),
+    [streaming, sessionIsRunning, messages],
+  );
   const tailMessage = messages[messages.length - 1];
   const tailSegment = tailMessage?.segments?.[tailMessage.segments.length - 1];
   const tailTool = tailMessage?.toolCalls?.[tailMessage.toolCalls.length - 1];
@@ -587,6 +598,7 @@ export function MessageList({
               startedAt={activeProgressMessage.createdAt}
               timingProfile={timingProfile}
               externalJobs={externalJobs}
+              systemRunning={turnState.running}
             />
           </div>
         )}
@@ -816,19 +828,22 @@ function ActiveTurnProgress({
   startedAt,
   timingProfile,
   externalJobs,
+  systemRunning = false,
 }: {
   plan?: UIMessage["plan"];
   activity?: UIMessage["turnActivity"];
   startedAt: number;
   timingProfile: TurnTimingProfile | null;
   externalJobs: ExternalJobState[];
+  /** CF-HDE-R11: R9 的同一份真实状态——这一轮此刻是否真的在跑。 */
+  systemRunning?: boolean;
 }) {
   const nowMs = useNowTick(true);
   if (!plan) {
     // CF-RSB-R1..R4: one pure view decides what the banner may say. Internal
     // control-loop identifiers, owners and meaningless "0ms" hints never reach
     // the screen; a settled turn renders no banner at all.
-    const banner = statusBannerView({ activity, startedAt, nowMs });
+    const banner = statusBannerView({ activity, startedAt, nowMs, systemRunning });
     if (!banner) return null;
     return (
       <div

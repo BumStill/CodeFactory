@@ -15,6 +15,7 @@ import type {
 } from "../lib/tauri";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { turnPlanFromEvent } from "../lib/chatPlan";
+import { currentTurnOwnership } from "../lib/turnOwnership";
 import {
   markPermissionResponse,
   reduceChatStreamEvent,
@@ -182,6 +183,8 @@ interface ChatStore {
   sendMessage: (content: string, sessionId?: string, rootTurnId?: string) => Promise<void>;
   /** Send right now if idle, enqueue if streaming, or materialize an active draft. */
   sendOrQueue: (content: string) => Promise<"sent" | "queued" | "full" | "failed">;
+  /** CF-HDE-R0/R8: queue a message for ONE named session (no UI switch). */
+  enqueueMessage: (sessionId: string, content: string) => "queued" | "full" | "unknown";
   /** Remove a queued message (active session) before it fires. */
   removeFromQueue: (id: string) => void;
   /** Empty the active session's queue without sending. */
@@ -199,7 +202,7 @@ interface ChatStore {
   /** Steer the in-flight run: the message reaches the model at its next round
    *  boundary instead of waiting out the whole turn. Shows immediately as
    *  pending; `steer_applied` confirms it actually landed. */
-  steerRun: (content: string) => Promise<void>;
+  steerRun: (content: string, sessionId?: string) => Promise<void>;
   clearVisibleConversation: () => void;
   updateActiveSessionModel: (modelId: string) => Promise<void>;
   updateActiveSessionModelConfig: (config: {
@@ -208,6 +211,12 @@ interface ChatStore {
     policy: "fixed" | "prefer" | "auto";
   }) => Promise<void>;
   updateActiveSessionPermissionMode: (mode: PermissionMode) => Promise<void>;
+  /** CF-HDE-R0: set ONE named session's permission mode without switching the
+   *  interface to it. */
+  updateSessionPermissionMode: (
+    sessionId: string,
+    mode: PermissionMode,
+  ) => Promise<Session>;
   updateActiveSessionReasoningEffort: (effort: ReasoningEffort | null) => Promise<void>;
   exitAnonymous: () => void;
 
@@ -236,6 +245,24 @@ function findSession(s: ChatStore, id: string): Session | undefined {
 
 function isChatRunBusyError(error: unknown): boolean {
   return String(error).includes("CHAT_RUN_BUSY");
+}
+
+/**
+ * CF-HDE-R7（M56 根因）：这个会话此刻是不是**真的**还有一轮在跑。
+ *
+ * 只看 `runtime.streaming` 会把一个已经结算的回合留下的残留当成"还在跑"，于是
+ * 新消息既发不出去（`sendMessage` 直接 return），也排不出去（`sendOrQueue` 把它
+ * 塞进一个永远不会排空的队列）——真机上表现就是入口回 ok、消息永远不进会话。
+ * 权威证据是服务器给的 `session.is_running`，或者这一轮**尚未被释放**（没有
+ * settlement、objective 也没有到终态）。
+ */
+function turnInFlight(
+  session: Session | null | undefined,
+  runtime: SessionRuntime | undefined,
+): boolean {
+  if (!session || !runtime?.streaming) return false;
+  if (session.is_running === true) return true;
+  return !currentTurnOwnership(runtime.messages).released;
 }
 
 /** Selector: the id of whatever conversation is currently open — a draft or a
@@ -598,7 +625,26 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const target = sessionId ? findSession(get(), sessionId) : get().activeSession;
     if (!target) return;
     const id = target.id;
-    if (get().runtime[id]?.streaming) return;
+    // CF-HDE-R0/R7：只按 session_id 寻址，且只把"真正还在跑"的那一轮当作阻塞。
+    const prior = get().runtime[id];
+    if (turnInFlight(target, prior)) return;
+    if (prior?.streaming) {
+      // 这一轮已经结算，只剩界面残留的 streaming：先释放它，否则新消息会被
+      // 无声吞掉（M56：入口回 ok，消息永远不进会话）。
+      set((s) => {
+        const prev = s.runtime[id];
+        if (!prev) return {};
+        const _streamingMsgId = { ...s._streamingMsgId };
+        delete _streamingMsgId[id];
+        return {
+          runtime: {
+            ...s.runtime,
+            [id]: { ...prev, streaming: false, revision: prev.revision + 1 },
+          },
+          _streamingMsgId,
+        };
+      });
+    }
 
     const isAnon = target.kind === "anonymous";
 
@@ -833,7 +879,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (!active) return "sent";
     const id = active.id;
     const rt = get().runtime[id];
-    if (!rt || !rt.streaming) {
+    // CF-HDE-R7：一个已经结算的旧回合残留不该让新消息排队。
+    if (!turnInFlight(active, rt)) {
       await get().sendMessage(text, id, crypto.randomUUID());
       return "sent";
     }
@@ -861,6 +908,58 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     return "queued";
   },
 
+  /**
+   * CF-HDE-R0/R8：把一条消息排进**指定会话**的待发队列。
+   *
+   * 队列本来就住在 `runtime[sessionId].queue` 里（每个会话一份），但这个入口
+   * 以前只能通过"界面当前显示的会话"到达——真机上就是发给 A 的消息被冲进了 B
+   * （14:43:41 那次）。按 session_id 寻址之后，跨会话串台在结构上不可能发生。
+   */
+  enqueueMessage: (sessionId, content) => {
+    const text = content.trim();
+    if (!text) return "unknown";
+    const session = findSession(get(), sessionId);
+    if (!session) return "unknown";
+    if ((get().runtime[sessionId]?.queue.length ?? 0) >= QUEUE_MAX) return "full";
+    set((s) => {
+      const prev = s.runtime[sessionId] ?? freshRuntime();
+      return {
+        runtime: {
+          ...s.runtime,
+          [sessionId]: {
+            ...prev,
+            queue: [
+              ...prev.queue,
+              {
+                id: crypto.randomUUID(),
+                content: text,
+                enqueuedAt: Date.now(),
+                rootTurnId: crypto.randomUUID(),
+              },
+            ],
+          },
+        },
+      };
+    });
+    return "queued";
+  },
+
+  /**
+   * CF-HDE-R0：改**指定会话**的权限模式。走的是界面权限选择器同一条命令
+   * （`update_session_permission_mode`），所以审计事件和 `updated_at` 一样会写；
+   * 不同的是界面不会被切到那个会话。
+   */
+  updateSessionPermissionMode: async (sessionId, mode) => {
+    const updated = await invoke<Session>("update_session_permission_mode", {
+      sessionId,
+      mode,
+    });
+    set((state) => ({
+      activeSession: state.activeSession?.id === updated.id ? updated : state.activeSession,
+      sessions: state.sessions.map((item) => item.id === updated.id ? updated : item),
+    }));
+    return updated;
+  },
   removeFromQueue: (qid) => {
     const id = get().activeSession?.id;
     if (!id) return;
@@ -1155,9 +1254,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
   },
 
-  steerRun: async (content) => {
+  steerRun: async (content, sessionId) => {
     const text = content.trim();
-    const id = get().activeSession?.id;
+    // CF-HDE-R0：插话也必须按 session_id 寻址——派单入口可能正在给后台会话
+    // 插话，而界面显示的是另一个会话。
+    const id = sessionId ?? get().activeSession?.id;
     if (!text || !id) return;
     // Only a streaming chat turn confirms delivery (`steer_applied`) and only
     // it can recover an undelivered steer at its terminal state. When the
