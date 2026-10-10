@@ -272,6 +272,66 @@ pub(crate) async fn resolve_route_plan(
     for fallback in routes {
         plan.push_fallback(fallback);
     }
+
+    // CF-QUOTA: GPT stays the preference, but a subscription endpoint that has
+    // already burned its configured share of the current metering window hands
+    // this turn to the next usable candidate — leaving the user their own
+    // headroom. The endpoint is NOT marked unhealthy: the next turn's plan is
+    // rebuilt from a fresh ledger read, so the moment the window resets
+    // CodeFactory returns to it on its own.
+    if policy != "fixed" {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let ledger = crate::agent::quota_cap::shared_quota_ledger();
+        let budget = crate::agent::quota_cap::SubscriptionBudget::default();
+        let candidates = plan.candidates().to_vec();
+        for (index, candidate) in candidates.iter().enumerate() {
+            if !settings.endpoint_is_subscription(&candidate.endpoint_name) {
+                continue;
+            }
+            let cap = settings.quota_cap_for(&candidate.endpoint_name);
+            // The transport records server readings and locally-observed tokens
+            // under the route's base URL; a settings- or test-driven writer may
+            // use the endpoint name. Try both keys.
+            let Some(breach) = ledger
+                .evaluate(&candidate.endpoint_name, cap, budget, now_ms)
+                .or_else(|| ledger.evaluate(&candidate.base_url, cap, budget, now_ms))
+            else {
+                continue;
+            };
+            let alternative = candidates[index + 1..].iter().find(|later| {
+                if !settings.endpoint_is_subscription(&later.endpoint_name) {
+                    return true;
+                }
+                let later_cap = settings.quota_cap_for(&later.endpoint_name);
+                ledger
+                    .evaluate(&later.endpoint_name, later_cap, budget, now_ms)
+                    .or_else(|| ledger.evaluate(&later.base_url, later_cap, budget, now_ms))
+                    .is_none()
+            });
+            let Some(alternative) = alternative else {
+                // No endpoint to hand over to: say so honestly instead of
+                // silently eating the headroom the user asked us to keep.
+                let reset = breach
+                    .reset_hint(now_ms)
+                    .map(|hint| format!("，{hint}后会自动继续"))
+                    .unwrap_or_default();
+                return Err(AppError::Other(format!(
+                    "为避免用光订阅额度，{} 本{}已用 {}%，已暂停向它发送请求；当前没有其它可用端点{}。",
+                    crate::agent::failover::endpoint_label(&candidate.endpoint_name),
+                    breach.window.label(),
+                    breach.used_percent,
+                    reset,
+                )));
+            };
+            let notice = breach.handover_notice(
+                &crate::agent::failover::endpoint_label(&alternative.endpoint_name),
+                now_ms,
+            );
+            plan.skip_for_quota(&candidate.endpoint_name, notice);
+            break;
+        }
+    }
+
     Ok((plan, resolution.excluded))
 }
 
@@ -947,9 +1007,10 @@ pub async fn is_chat_running(
          WHERE objective.session_id=? AND objective.root_turn_id IS NOT NULL
            AND objective.status IN ('active','waiting_system')
            AND NOT (objective.status='waiting_system'
-                    AND objective.failure_code='technical_recovery_exhausted')",
+                    AND objective.failure_code IN ('technical_recovery_exhausted', ?))",
     )
     .bind(session_id)
+    .bind(crate::agent::objective::DELIVERED_AWAITING_CI)
     .fetch_one(&pool)
     .await?;
     Ok(system_owned > 0)
@@ -1182,6 +1243,16 @@ fn chat_turn_projection(
             "objective_failed",
             "这件事没做成，已把试过的办法和保留下来的改动写给你",
         ),
+        ObjectiveStatus::WaitingSystem
+            if objective.failure_code.as_deref()
+                == Some(crate::agent::objective::DELIVERED_AWAITING_CI) =>
+        {
+            (
+                "finalizing",
+                "delivery_awaiting_ci",
+                "改动已交付，等待检查结果",
+            )
+        }
         ObjectiveStatus::WaitingSystem => ("recovering", "system_recovery", "系统正在恢复并续接"),
         ObjectiveStatus::WaitingCoreInput => ("waiting", "core_input_required", "需要补充核心输入"),
         ObjectiveStatus::WaitingAuthorization => {
@@ -1378,6 +1449,30 @@ async fn apply_chat_objective_outcome(
         terminal_reason.as_deref(),
     )
     .map_err(|error| AppError::Other(error.to_string()))?;
+    // CF-TRUTH-R3/R4: an ownership handoff (or any other internal interruption)
+    // must not be recorded as the user pressing stop. The run only counts as a
+    // user cancellation when a durable stop request exists for this session; with
+    // no such record the truthful decision is the recoverable system
+    // interruption, which the next owner continues and which says so in the
+    // conversation.
+    let decision = if decision.decision_type == crate::agent::objective::DecisionType::Cancelled {
+        let session_id = current.session_id.clone().unwrap_or_default();
+        let stop_requested = store
+            .has_durable_stop_request(&session_id, current.created_at)
+            .await;
+        if stop_requested {
+            decision
+        } else {
+            crate::agent::objective::decision_for_interrupted_run(
+                &current,
+                outcome,
+                terminal_reason.as_deref(),
+            )
+            .map_err(|error| AppError::Other(error.to_string()))?
+        }
+    } else {
+        decision
+    };
     match mutation_permit {
         Some(permit) => {
             store
@@ -5232,6 +5327,19 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // The durable intent the stop click writes before the crash; CF-TRUTH-R3
+        // requires it before a crash-left control row counts as a user stop.
+        sqlx::query(
+            "INSERT INTO chat_session_cancel_intents
+             (session_id, status, requested_at, settled_at, updated_at)
+             VALUES (?, 'requested', ?, NULL, ?)",
+        )
+        .bind(waiting.session_id.as_deref().unwrap())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let store = ObjectiveStore::new(pool.clone());
         assert_eq!(store.consume_pending_chat_cancellations().await.unwrap(), 1);
@@ -5546,6 +5654,92 @@ mod tests {
         let auto_state = ActiveRouteState::from_plan_with_health(auto_plan, auto_health);
         assert_eq!(auto_state.current().endpoint_name, "deepseek");
         assert!(auto_state.take_initial_route_change().is_some());
+    }
+
+    /// CF-QUOTA-R3 (integration). A subscription endpoint over its window cap
+    /// hands the turn to the next endpoint, and comes back on its own once the
+    /// window resets. R5: a pay-per-token fallback is never capped.
+    #[tokio::test]
+    async fn a_subscription_endpoint_over_its_window_cap_hands_over_and_returns_after_reset() {
+        use crate::agent::quota_cap::{
+            shared_quota_ledger, EndpointQuota, UsageSource, WindowUsage,
+        };
+
+        // A synthetic base URL so this test's ledger entry can never collide
+        // with another test driving the real ChatGPT endpoint through the
+        // process-wide ledger.
+        const QUOTA_TEST_BASE: &str = "https://chatgpt.example/quota-test";
+
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "quota-chatgpt".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.clear();
+        settings.endpoints.insert(
+            "quota-chatgpt".into(),
+            Endpoint {
+                base_url: QUOTA_TEST_BASE.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-5.5".into()),
+            },
+        );
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.example/v1".into(),
+                key_ref: Some("deepseek-secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        let ledger = shared_quota_ledger();
+        let now = chrono::Utc::now().timestamp_millis();
+        let server = |ratio: f64| EndpointQuota {
+            source: UsageSource::ServerReported,
+            five_hour: WindowUsage {
+                used_ratio: ratio,
+                resets_at_ms: Some(now + 1_800_000),
+            },
+            weekly: WindowUsage {
+                used_ratio: 0.2,
+                resets_at_ms: Some(now + 86_400_000),
+            },
+            observed_at_ms: now,
+        };
+
+        ledger.record_server_usage(QUOTA_TEST_BASE, server(0.85));
+        let (plan, _) = resolve_route_plan(&settings, "gpt-5.5", "prefer", false)
+            .await
+            .expect("plan builds");
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        assert_eq!(state.current().endpoint_name, "deepseek");
+        let change = state
+            .take_initial_route_change()
+            .expect("quota handover is announced");
+        assert_eq!(change.kind, crate::agent::failover::RouteChangeKind::QuotaCap);
+        assert!(change.notice().contains("已用 85%"), "{}", change.notice());
+        assert!(change.notice().contains("DeepSeek"), "{}", change.notice());
+
+        // Window reset → the very next plan comes back to the subscription
+        // endpoint with no switching notice at all.
+        ledger.record_server_usage(QUOTA_TEST_BASE, server(0.0));
+        let (reset_plan, _) = resolve_route_plan(&settings, "gpt-5.5", "prefer", false)
+            .await
+            .expect("plan builds");
+        let reset_state = ActiveRouteState::from_plan_with_health(
+            reset_plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        assert_eq!(reset_state.current().endpoint_name, "quota-chatgpt");
+        assert!(reset_state.take_initial_route_change().is_none());
+
+        ledger.clear(QUOTA_TEST_BASE);
     }
 
     #[test]

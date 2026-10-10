@@ -774,11 +774,35 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
         return ToolKind::Verification;
     }
 
+    let executable_segments = shell_verification_segments(&shell_command)
+        .iter()
+        .flat_map(|statement| shell_pipeline_segments(statement))
+        .map(|segment| execution_payload(&segment).to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let governance_check = executable_segments.iter().any(|segment| {
+        let words = segment.split_whitespace().collect::<Vec<_>>();
+        matches!(words.first().copied(), Some("python" | "python3" | "node" | "bash" | "sh"))
+            && words.get(1).is_some_and(|script| {
+                let name = script.rsplit('/').next().unwrap_or(script);
+                name.starts_with("validate_") || name.starts_with("verify-") || name.starts_with("verify_")
+            })
+    });
     if shell_test_command
         || structured_shell_assertion
         || case_assertion
-        || contains_any(
-            &lower,
+        || invokes_project_test_command(&lower)
+        || executable_segments.iter().any(|segment| {
+            let words = segment.split_whitespace().collect::<Vec<_>>();
+            let payload = match words.as_slice() {
+                ["pnpm" | "npm" | "yarn", "exec", rest @ ..] => rest.join(" "),
+                ["npx", rest @ ..] => rest.join(" "),
+                _ => segment.clone(),
+            };
+            contains_any_at_start(&payload, &["vitest", "jest", "tsc --noemit", "tsc -p", "tsc -b"])
+        })
+        || governance_check
+        || executable_segments.iter().any(|segment| contains_any_at_start(
+            segment,
             &[
                 "pytest",
                 "unittest",
@@ -806,7 +830,7 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
                 "mvn test",
                 "gradle test",
             ],
-        )
+        ))
     {
         return ToolKind::Verification;
     }
@@ -3506,8 +3530,8 @@ impl CompletionGate {
         for failed in &self.failed_verifications {
             let check = failed.scope.describe();
             let message = format!(
-                "check {check} failed at #{} and has not been rerun at the same or broader scope since; rerun `{}` — or a broader command that covers it — after the repair",
-                failed.sequence, failed.command
+                "检查 {check} 没有通过；修复后请重跑 `{}`，或运行覆盖这项检查的完整命令并确认通过。",
+                failed.command
             );
             blockers_structured.push(CompletionBlocker {
                 kind: "failed_verification".into(),
@@ -6737,7 +6761,7 @@ mod tests {
         assert!(evidence
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("has not been rerun at the same or broader scope")));
+            .any(|blocker| blocker.contains("修复后请重跑")));
 
         let mut repaired = outcome(3, ToolKind::Verification, 0);
         repaired.command = "cargo test worker::tests::original_behavior".to_owned();
@@ -7232,6 +7256,45 @@ mod tests {
 
         let completed = gate.evidence();
         assert!(completed.completed, "blockers: {:?}", completed.blockers);
+    }
+
+    #[test]
+    fn cf_gate_exploration_never_opens_a_failed_check() {
+        for command in [
+            "cat package.json && ls vitest.config* && grep -rn lightModeAudit src",
+            "cat .tmp-tests/m37-pr-body.md && cat src/components/MessageList.tsx",
+            "find . -name '*pytest*' && head vitest.config.ts",
+            "grep -rn 'cargo test' docs && cat verify.py",
+        ] {
+            assert_eq!(classify_command(command, 30000), ToolKind::ReadOnly, "{command}");
+            let mut gate = CompletionGate::new(true);
+            let mut failed = outcome(1, classify_command(command, 30000), 1);
+            failed.command = command.into();
+            gate.record(&failed);
+            assert!(gate.evidence().failed_verification_fingerprint.is_none(), "{command}");
+            let mut check = outcome(2, ToolKind::Verification, 0);
+            check.command = "cargo test".into();
+            gate.record(&check);
+            assert!(gate.evidence().completed, "{:?}", gate.evidence().blockers);
+        }
+    }
+
+    #[test]
+    fn cf_gate_real_checks_still_block_with_plain_instructions() {
+        for command in ["cargo test", "pnpm build", "python3 tools/governance/validate_repo_governance_baseline.py", "cat package.json && pnpm test"] {
+            assert_eq!(classify_command(command, 30000), ToolKind::Verification, "{command}");
+            let mut gate = CompletionGate::new(true);
+            let mut failed = outcome(1, classify_command(command, 30000), 1);
+            failed.command = command.into();
+            gate.record(&failed);
+            let evidence = gate.evidence();
+            let blocker = evidence.blockers_structured.iter().find(|b| b.kind == "failed_verification").expect(command);
+            assert!(blocker.message.contains("没有通过"), "{}", blocker.message);
+            assert!(blocker.message.contains(command));
+            for internal in ["scope", "sequence", "fingerprint", "arbitration", "objective", "recovery"] {
+                assert!(!blocker.message.contains(internal));
+            }
+        }
     }
 
     #[test]
@@ -9080,9 +9143,9 @@ mod tests {
             .as_str()
             .expect("missing evidence")
             .is_empty());
-        // The agent-facing message names the check and the sequence.
+        // CF-GATE-R2: user copy names the check and rerun, not a tool sequence.
         let message = failed_check["message"].as_str().expect("message");
-        assert!(message.contains("#4"), "{message}");
+        assert!(message.contains("修复后请重跑"), "{message}");
         assert!(message.contains("agent::objective"), "{message}");
     }
 

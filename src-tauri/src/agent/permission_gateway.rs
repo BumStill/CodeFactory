@@ -48,6 +48,14 @@ const PERMISSION_WAIT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const PERMISSION_WAIT: Duration = Duration::from_millis(250);
 
+/// CF-TPP-R4: how long an unanswered prompt stays answerable instead of being
+/// voided. A user who stepped away for a while comes back to a request they can
+/// still approve — the task continues rather than failing.
+#[cfg(not(test))]
+const PERMISSION_LATE_WAIT: Duration = Duration::from_secs(30 * 60);
+#[cfg(test)]
+const PERMISSION_LATE_WAIT: Duration = Duration::from_millis(250);
+
 pub(crate) struct DesktopPermissionGateway {
     pub(super) settings: Arc<tokio::sync::RwLock<Settings>>,
     pub(super) db: SqlitePool,
@@ -98,12 +106,22 @@ impl PermissionGateway for DesktopPermissionGateway {
             return outcome;
         }
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
+        // CF-TPP-R1 only ever widens the shell gate for `full_access` (trusted)
+        // sessions, and only for actions the workspace-local proof accepts.
+        // Anything else — including "we could not resolve the workspace root" —
+        // keeps the existing confirmation.
+        let workspace_root = if policy.full_access {
+            self.managed_workspace_root().await
+        } else {
+            None
+        };
         match decide_permission_for_call(
             &policy,
             &tool_call.function.name,
             args,
             bash_command,
             self.browser_read_granted,
+            workspace_root.as_deref(),
         ) {
             PermissionDecision::Allow => PermissionOutcome::Allow,
             PermissionDecision::Ask => {
@@ -272,7 +290,7 @@ impl DesktopPermissionGateway {
             .as_ref()
             .map(|intent| intent.intent_id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
         let registry_collision = {
             use std::collections::hash_map::Entry;
             let mut pending = self.pending_permissions.lock().await;
@@ -301,11 +319,12 @@ impl DesktopPermissionGateway {
             });
         }
 
+        let args_for_reemit = args.clone();
         self.events.emit(StreamEvent::PermissionRequest {
             intent_id: intent_id.clone(),
             tool_call_id: tc.id.clone(),
             tool_name: tc.function.name.clone(),
-            args,
+            args: args_for_reemit.clone(),
             expires_at,
         });
         {
@@ -318,8 +337,51 @@ impl DesktopPermissionGateway {
         }
 
         let started = std::time::Instant::now();
-        let response =
-            await_permission_response(receiver, self.cancel.as_ref(), PERMISSION_WAIT).await;
+        // CF-TPP-R4 / CF-TPP-R5: the prompt window closing is not a decision.
+        // Keep the request owned, visible and answerable for a much longer
+        // window instead of voiding it, and never record it as a user choice.
+        let mut response =
+            await_permission_response(&mut receiver, self.cancel.as_ref(), PERMISSION_WAIT).await;
+        if matches!(response, PermissionResponse::TimedOut) {
+            tracing::info!(
+                intent_id,
+                "permission prompt is still unanswered; keeping it waiting for the user"
+            );
+            // Keep the durable request answerable: the prompt clock closing is
+            // not a decision, so the recorded deadline moves with the window.
+            if let Some(key) = durable_intent.as_ref().map(|intent| intent.prompt_key()) {
+                let late_expires_at = expires_at + PERMISSION_LATE_WAIT.as_millis() as i64;
+                if let Err(error) = PermissionIntentStore::new(self.db.clone())
+                    .extend_pending(&key, late_expires_at, chrono::Utc::now().timestamp_millis())
+                    .await
+                {
+                    tracing::warn!(%error, "permission waiting window could not be extended");
+                }
+            }
+            // Re-publish the exact same intent (same id, later expiry) so a
+            // user who left the screen, or switched to another session, still
+            // sees the request when they come back — CF-TPP-R6.
+            self.events.emit(StreamEvent::PermissionRequest {
+                intent_id: intent_id.clone(),
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.function.name.clone(),
+                args: args_for_reemit.clone(),
+                expires_at: expires_at + PERMISSION_LATE_WAIT.as_millis() as i64,
+            });
+            let settings = self.settings.read().await;
+            crate::notify::send(
+                &settings,
+                crate::notify::NotifyEvent::PermissionWaiting,
+                format!(
+                    "工具 {} 仍在等待你的批准；无人应答不会记成你拒绝，回到电脑后批准即可继续。",
+                    tc.function.name
+                ),
+            );
+            drop(settings);
+            response =
+                await_permission_response(&mut receiver, self.cancel.as_ref(), PERMISSION_LATE_WAIT)
+                    .await;
+        }
         let duration_ms = started.elapsed().as_millis() as u64;
         self.pending_permissions.lock().await.remove(&intent_id);
         let intent_store = PermissionIntentStore::new(self.db.clone());
@@ -350,7 +412,7 @@ impl DesktopPermissionGateway {
             PermissionResponse::TimedOut => {
                 persist_interruption(&intent_store, intent_key.as_ref(), PermissionIntentStatus::TimedOut).await;
                 PermissionOutcome::Deny(PermissionDenial {
-                content: "Permission request timed out after 60 seconds without a user decision. This was not a user denial. The requested action was not executed; do not substitute another source as equivalent evidence.".to_string(),
+                content: "No one answered this permission request before it expired, so it was recorded as not answered — that is not a user denial. The requested action was not executed; do not substitute another source as equivalent evidence.".to_string(),
                 reason: PermissionDenialReason::TimedOut,
                 duration_ms,
             })
@@ -368,6 +430,18 @@ impl DesktopPermissionGateway {
                 PermissionOutcome::Cancelled
             }
         }
+    }
+
+    /// The session's own managed workspace root, when one is recorded. `None`
+    /// keeps every existing confirmation: an unknown root can never widen the
+    /// automatic-allow rule.
+    async fn managed_workspace_root(&self) -> Option<std::path::PathBuf> {
+        let view = super::execution_workspace::latest_for_session(&self.db, &self.session_id)
+            .await
+            .ok()
+            .flatten()?;
+        let path = std::path::PathBuf::from(view.worktree_path);
+        path.is_dir().then_some(path)
     }
 
     async fn resolve_scope(&self) -> anyhow::Result<PermissionScope> {
@@ -755,6 +829,61 @@ mod tests {
 
         let denied = authorize_with_response(gateway, "trusted-follow-up", "click", false).await;
         assert_denied_for(denied, PermissionDenialReason::DeniedByUser);
+    }
+
+    /// CF-TPP-R4: a user who steps away and comes back can still approve, and
+    /// nothing already done is undone. The prompt window closing must not turn
+    /// into a denial, a cancellation, or a lost request.
+    #[tokio::test]
+    async fn late_approval_after_the_prompt_window_still_continues() {
+        let gateway = durable_test_gateway().await;
+        let (tool_call, args) = browser_call("late-approval", "click");
+        let task_gateway = gateway.clone();
+        let authorization =
+            tokio::spawn(async move { task_gateway.authorize(&tool_call, &args, None).await });
+        let intent = wait_for_durable_intent(&gateway).await;
+
+        // Nobody answers for longer than the first prompt window.
+        tokio::time::sleep(PERMISSION_WAIT + Duration::from_millis(150)).await;
+        assert!(
+            gateway
+                .pending_permissions
+                .lock()
+                .await
+                .contains_key(&intent.intent_id),
+            "an unanswered request must stay owned and answerable, not be voided"
+        );
+        let status: String = sqlx::query_scalar("SELECT status FROM permission_intents WHERE intent_id=?")
+            .bind(&intent.intent_id)
+            .fetch_one(&gateway.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "pending",
+            "an unanswered request stays pending — it is never recorded as a user decision"
+        );
+        assert_ne!(status, "cancelled");
+
+        // The user comes back and approves through the same durable path the
+        // real command uses: record the exact decision, then wake the waiter.
+        let store = PermissionIntentStore::new(gateway.db.clone());
+        store
+            .record_user_response(
+                &intent.prompt_key(),
+                PermissionPromptResponse::Allow,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .expect("a late approval is still an admissible decision");
+        take_pending_sender(&gateway)
+            .await
+            .send(true)
+            .expect("permission receiver remains live");
+        assert_eq!(
+            authorization.await.expect("authorization task"),
+            PermissionOutcome::Allow,
+            "a late approval must still let the task continue"
+        );
     }
 
     #[tokio::test]

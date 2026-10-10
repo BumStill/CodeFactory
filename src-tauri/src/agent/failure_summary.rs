@@ -54,6 +54,27 @@ pub struct PreservedWork {
     pub total_changed_files: i64,
     pub pr_url: Option<String>,
     pub pr_state: Option<String>,
+    /// Fresh git observations; None means observation failed or was not run.
+    pub commits_ahead: Option<i64>,
+    pub unpushed_commits: Option<i64>,
+}
+
+impl PreservedWork {
+    pub fn change_status(&self) -> &'static str {
+        if self.pr_url.is_some() {
+            "已开 PR"
+        } else if self.commits_ahead.is_some_and(|n| n > 0) {
+            match self.unpushed_commits {
+                Some(0) => "改动已推送",
+                Some(n) if n > 0 => "改动已经提交在本机（还没推送）",
+                _ => "改动已提交，无法确认是否已推送",
+            }
+        } else if self.commits_ahead == Some(0) && self.total_changed_files > 0 {
+            "改动仅在工作区，未提交"
+        } else {
+            "无法确认改动的提交和推送状态"
+        }
+    }
 }
 
 /// One check the system could not confirm was rerun and passed (U1b). Gathered
@@ -253,6 +274,7 @@ pub fn render_failure_report(report: &FailureReport) -> String {
     let _ = writeln!(out);
 
     let _ = writeln!(out, "保留下来的成果：");
+    let _ = writeln!(out, "- {}。", report.work.change_status());
     if let Some(location) = report.work.location.as_deref() {
         if let Some(branch) = report.work.branch.as_deref() {
             let _ = writeln!(out, "- 改动都在 {location}（分支 {branch}），没有丢掉。");
@@ -364,11 +386,7 @@ fn render_delivered_unverified_report(
             "；系统未能确认下面这些检查已重跑并通过：",
         )
     } else {
-        join_reference(
-            "改动已经提交在本机的",
-            reference,
-            "上（还没推送，也没有开 PR）；系统未能确认下面这些检查已重跑并通过：",
-        )
+        format!("{}；系统未能确认下面这些检查已重跑并通过：", work.change_status())
     };
     let _ = writeln!(out, "{headline}");
     match detail {
@@ -525,6 +543,7 @@ mod tests {
                 total_changed_files: 2,
                 pr_url: Some("https://example.test/pull/1".to_string()),
                 pr_state: Some("等待合并".to_string()),
+                ..PreservedWork::default()
             },
         }
     }
@@ -624,6 +643,38 @@ mod tests {
         assert_eq!(merged[0].attempts, 5);
     }
 
+    #[test]
+    fn cf_gate_unobserved_git_state_never_claims_a_commit() {
+        let work = PreservedWork { branch: Some("synthetic-branch".into()), total_changed_files: 1, ..Default::default() };
+        let delivered = DeliveredUnverified { reference: "分支 synthetic-branch".into(), ..Default::default() };
+        let text = build_delivered_unverified_report("合成任务", &work, &delivered);
+        assert!(!text.contains("已经提交"), "{text}");
+        assert!(text.contains("无法确认"), "{text}");
+    }
+
+    #[test]
+    fn cf_gate_four_git_states_are_honest_in_both_reports() {
+        for (commits, unpushed, pr, expected) in [
+            (0, 0, false, "改动仅在工作区，未提交"),
+            (1, 1, false, "改动已经提交在本机（还没推送）"),
+            (1, 0, false, "改动已推送"),
+            (1, 0, true, "已开 PR"),
+        ] {
+            let work = PreservedWork {
+                commits_ahead: Some(commits), unpushed_commits: Some(unpushed),
+                total_changed_files: 1,
+                pr_url: pr.then(|| "https://example.test/pull/42".into()),
+                ..Default::default()
+            };
+            let failure = build_failure_report("合成任务", vec![], work.clone()).unwrap();
+            assert!(failure.contains(expected), "{failure}");
+            let delivery = DeliveredUnverified { reference: "PR #42".into(), on_pull_request: pr, ..Default::default() };
+            let summary = build_delivered_unverified_report("合成任务", &work, &delivery);
+            assert!(summary.contains(if pr { "改动已交付到 PR #42" } else { expected }), "{summary}");
+            assert_no_internal_vocabulary(&summary).unwrap();
+        }
+    }
+
     fn delivered_sample() -> (PreservedWork, DeliveredUnverified) {
         (
             PreservedWork {
@@ -669,6 +720,8 @@ mod tests {
         let (mut work, mut delivered) = delivered_sample();
         work.pr_url = None;
         work.pr_state = None;
+        work.commits_ahead = Some(1);
+        work.unpushed_commits = Some(1);
         delivered.reference = "分支 codefactory/u1b-terminal".to_string();
         delivered.on_pull_request = false;
         let text = build_delivered_unverified_report("把导出改成流式写入", &work, &delivered);

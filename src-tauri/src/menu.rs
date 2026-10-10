@@ -98,6 +98,7 @@ pub struct SessionMenuHandles {
     pub send_input: MenuItem<Wry>,
     pub send_clipboard: MenuItem<Wry>,
     pub stop_run: MenuItem<Wry>,
+    pub clean_build_cache: MenuItem<Wry>,
     pub switch_items: Vec<CheckMenuItem<Wry>>,
     pub switch_sessions: Vec<Option<String>>,
     pub permission_items: Vec<(String, CheckMenuItem<Wry>)>,
@@ -183,7 +184,8 @@ pub fn event_for_menu_id(menu_id: &str, clipboard: Option<String>) -> Option<Ses
         spec::ACTION_NEW_SESSION
         | spec::ACTION_FOCUS_INPUT
         | spec::ACTION_SEND_INPUT
-        | spec::ACTION_STOP_RUN => Some(SessionMenuEvent::action(action)),
+        | spec::ACTION_STOP_RUN
+        | spec::ACTION_CLEAN_BUILD_CACHE => Some(SessionMenuEvent::action(action)),
         _ => None,
     }
 }
@@ -245,10 +247,13 @@ pub fn install(app: &AppHandle<Wry>) -> tauri::Result<()> {
     let send_input = take(&mut by_id, spec::ACTION_SEND_INPUT);
     let send_clipboard = take(&mut by_id, spec::ACTION_SEND_CLIPBOARD);
     let stop_run = take(&mut by_id, spec::ACTION_STOP_RUN);
+    let clean_build_cache = take(&mut by_id, spec::ACTION_CLEAN_BUILD_CACHE);
     session_menu.append(&focus_input)?;
     session_menu.append(&send_input)?;
     session_menu.append(&send_clipboard)?;
     session_menu.append(&stop_run)?;
+    session_menu.append(&PredefinedMenuItem::separator(app)?)?;
+    session_menu.append(&clean_build_cache)?;
 
     let menu = match Menu::default(app) {
         Ok(menu) => menu,
@@ -267,6 +272,7 @@ pub fn install(app: &AppHandle<Wry>) -> tauri::Result<()> {
             send_input,
             send_clipboard,
             stop_run,
+            clean_build_cache,
             switch_items,
             switch_sessions: vec![None; SWITCH_SLOTS],
             permission_items,
@@ -279,6 +285,8 @@ pub fn install(app: &AppHandle<Wry>) -> tauri::Result<()> {
 ///
 /// `session.switch` 需要把槽位下标换成真实会话 id,这一步只有拿着句柄才能做。
 pub fn handle_menu_event(app: &AppHandle<Wry>, menu_id: &str) {
+    // CF-BLD-R4: 与其它菜单项一样,只派发事件;前端用和界面按钮完全相同
+    // 的那条命令(`build_cache_cleanup`)执行,避免第二套业务实现。
     let mut event = match event_for_menu_id(menu_id, None) {
         Some(event) => event,
         None => return,

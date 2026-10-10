@@ -30,4 +30,21 @@ Spec Harness; Compatibility Harness (existing workspace data in the old format m
 - Cleanup: a cleanup pass runs at the same moment as the continue (must not delete it out from under the continuing task).
 
 ## Implementation Notes
-This task implements only CF-WSC-R6, CF-WSC-R7, and CF-WSC-R8. CF-WSC-R1–R5 are explicitly deferred to a separate task.
+The spec is delivered by two tasks against the same Requirements Traceability table.
+
+- U27 (`fix(workspace): replace #590 and stabilize Windows continuation test`, #595) implements CF-WSC-R6, CF-WSC-R7 and CF-WSC-R8.
+- U26 (this task) implements CF-WSC-R1, CF-WSC-R2, CF-WSC-R3, CF-WSC-R4 and CF-WSC-R5.
+
+U26 scope notes (no requirement is changed by these notes):
+
+- The hand-over introduced by U24 for a *stopped* Objective is widened to every terminal
+  Objective state (`completed`, `cancelled`, `failed`) and now keys the carry-forward
+  decision on "the work reached a merge", not on "a PR number is recorded somewhere".
+  An open, not-yet-merged PR is unfinished work under CF-WSC-R1/R5.
+- CF-WSC-R3 is carried by the hand-over keeping the exact worktree, branch and recorded
+  canonical PR binding, plus the existing delivery rule that an already-open PR for the
+  same head is reused instead of duplicated. U26 adds the test that proves it end to end;
+  it does not change the requirement.
+- CF-WSC-R4 is surfaced through the managed-workspace status the product already renders
+  (`ExecutionWorkspaceView.failure_code` / `failure_detail`, shown in the workspace view),
+  and its wording is asserted against `failure_summary::assert_no_internal_vocabulary`.

@@ -25,6 +25,7 @@ mod ai_text;
 mod benchmark;
 mod benchmark_consistency;
 mod browser;
+mod build_cache;
 mod codex_auth;
 mod commands;
 mod config;
@@ -46,6 +47,7 @@ mod storage;
 mod tools;
 mod trajectory;
 mod util;
+pub mod window_state;
 
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -1474,6 +1476,7 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("app data dir unavailable");
             std::fs::create_dir_all(&data_dir)?;
+            crate::window_state::restore_and_track_main_window(app)?;
 
             // Before anything else can panic: a stripped release binary with
             // `panic = "abort"` leaves a crash report that names no symbols and
@@ -1712,6 +1715,10 @@ pub fn run() {
                 data_dir.join("execution-workspaces"),
                 process_instance.clone(),
             );
+            agent::execution_workspace::spawn_build_cache_supervisor(
+                objective_pool.clone(),
+                data_dir.join("execution-workspaces"),
+            );
             app.manage(commands::terminal::TerminalState::new());
 
             let browser_reclaim_pool = objective_pool.clone();
@@ -1783,6 +1790,7 @@ pub fn run() {
             commands::dispatch::dispatch_reply,
             commands::settings::get_settings,
             commands::settings::save_settings,
+            commands::settings::subscription_quota_status,
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
             commands::update_safety::reserve_update_install,
@@ -1807,6 +1815,8 @@ pub fn run() {
             commands::benchmark::import_benchmark_results,
             commands::benchmark::benchmark_consistency_report,
             commands::browser_sessions::list_browser_sessions,
+            commands::build_cache::build_cache_report,
+            commands::build_cache::build_cache_cleanup,
             commands::browser_sessions::close_browser_session,
             commands::browser_sessions::browser_bridge_pairing,
             commands::browser_sessions::browser_extension_prepare,

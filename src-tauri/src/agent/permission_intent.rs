@@ -1284,6 +1284,36 @@ impl PermissionIntentStore {
             .transpose()
     }
 
+    /// CF-TPP-R4: keep an unanswered request answerable for a longer window
+    /// instead of voiding it. Only a still-pending prompt may be extended, and
+    /// an already-decided prompt is never revived.
+    pub(crate) async fn extend_pending(
+        &self,
+        key: &PermissionPromptKey,
+        expires_at: i64,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE permission_intents
+             SET expires_at=?, updated_at=?
+             WHERE intent_id=? AND objective_id=? AND objective_revision=?
+               AND binding_id=? AND resource_generation=? AND action_signature=?
+               AND prompt_generation=? AND status='pending'",
+        )
+        .bind(expires_at)
+        .bind(now)
+        .bind(&key.intent_id)
+        .bind(&key.objective_id)
+        .bind(key.objective_revision)
+        .bind(&key.binding_id)
+        .bind(key.resource_generation)
+        .bind(&key.action_signature)
+        .bind(key.prompt_generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     /// Persist an exact user decision. A late answer loses to expiry and may
     /// not revive an old prompt generation.
     pub(crate) async fn record_user_response(

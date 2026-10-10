@@ -40,6 +40,9 @@ function mkHandlers(over: Partial<DesktopMenuHandlers> = {}): DesktopMenuHandler
     sendComposer: vi.fn(),
     sendText: vi.fn(),
     stopRun: vi.fn(),
+    // CF-BLD-R4: the menu bar's "清理编译缓存" item needs a handler like every
+    // other item; it calls the same command the panel's button calls.
+    cleanBuildCache: vi.fn(),
     ...over,
   };
 }

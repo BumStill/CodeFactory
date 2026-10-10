@@ -13,10 +13,10 @@ use std::future::Future;
 use super::ToolExecutionStatus;
 use super::{ExecCtx, ToolOutput};
 use crate::agent::delivery::{
-    self, DeliverOpts, DeliveryIdentitySnapshot, DeliveryMutationBegin,
+    self, DeliverOpts, DeliveryIdentitySnapshot, DeliveryMode, DeliveryMutationBegin,
     DeliveryMutationCommittedReceipt, DeliveryMutationIntentToken, DeliveryMutationPermit,
     DeliveryMutationPermitVerifier, DeliveryRemote, LocalCommitIntentEvidence, MergeObservation,
-    OpenPrObservation, ReleaseUrgency,
+    OpenPrObservation, ReleaseOnlyTiming, ReleaseUrgency,
 };
 use crate::agent::delivery_run::{
     self, ActiveDeliveryLease, CoreInputRequest, DeliveryIdentityRevision, DeliveryLeaseMode,
@@ -73,6 +73,18 @@ pub fn definition() -> ToolDefinition {
                         "type": "string",
                         "description": "Optional guard: the branch you believe you are delivering. This tool has no branch argument — it delivers whatever branch the working directory is on. When resuming a specific PR, pass its head branch here; if the working directory is somewhere else the call stops before touching anything instead of opening a second PR for unrelated work."
                     },
+                    "release_only": {
+                        "type": "boolean",
+                        "description": "Release the exact current default-branch head without staging, pushing, or opening a PR. Use only for an explicit release task with no changes of its own."
+                    },
+                    "release_force": {
+                        "type": "boolean",
+                        "description": "Request a release-only release even though the batch since the last tag has no feat/fix. Still refused while a Release-Urgency: hold trailer is present, and requires release_force_approved=true from the same authorization."
+                    },
+                    "release_force_approved": {
+                        "type": "boolean",
+                        "description": "Set true only when the user explicitly approved releasing a batch with no feat/fix in THIS authorization. Release-Urgency: hold can never be bypassed."
+                    },
                     "autonomous_completion": {
                         "type": "boolean",
                         "description": "Defaults true once deliver_changes is authorized, so technical waits survive restart and apply the recommended recovery without asking the user to continue. Set false only when the user explicitly limited unattended continuation; it never expands authority or bypasses release/test/signing gates."
@@ -113,7 +125,46 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             .map(String::from),
         expected_identity: None,
         mutation_permit: None,
+        release_force: args
+            .get("release_force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        release_force_approved: args
+            .get("release_force_approved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        delivery_mode: if args
+            .get("release_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            DeliveryMode::ReleaseOnly
+        } else {
+            DeliveryMode::Changes
+        },
+        release_only_timing: ReleaseOnlyTiming::default(),
     };
+
+    // `CF-REL-R1`: a release-only call makes no local change, so it does not
+    // enter the durable "deliver my own changes" machine at all — no durable
+    // run, no lease, no branch, no PR. It also refuses a request that would
+    // smuggle mutation options into a release.
+    if opts.delivery_mode == DeliveryMode::ReleaseOnly {
+        if opts.title.is_some() || opts.body.is_some() {
+            return Ok(ToolOutput::err(
+                "release_only=true 不接受 title/body：本次没有要交付的改动，title/body 属于 commit/PR 内容。",
+            ));
+        }
+        let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
+        let outcome = delivery::deliver_release_only(
+            &ctx.cwd,
+            &opts,
+            remote.as_ref(),
+            None,
+        )
+        .await;
+        return Ok(tool_output_for_outcome(&outcome));
+    }
 
     let mut durable = match prepare_durable_run(
         &args,
@@ -161,6 +212,10 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         .as_ref()
         .and_then(|run| ctx.db.as_ref().map(|db| run.mutation_permit(db)));
 
+    let mut lease_guard = durable.as_ref().and_then(|run| ctx.db.as_ref().map(|db| DeliveryLeaseGuard {
+        db: db.clone(), id: run.id.clone(), process: run.process.clone(), epoch: run.claim_epoch, released: false,
+    }));
+    let result = async {
     let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
 
     loop {
@@ -195,11 +250,48 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             return Ok(tool_output_for_outcome(&outcome));
         }
 
-        // A waiting delivery remains one in-flight tool call. The shared loop
-        // keeps emitting its 30s heartbeat and can cancel by dropping this
-        // future; no extra model request or user "continue" is required.
-        let retry_after_ms = outcome.retry_after_ms.unwrap_or(30_000).clamp(1, 60_000);
-        tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms)).await;
+        // Waiting is a durable handoff, not an in-flight mutation lease.
+        return Ok(tool_output_for_outcome(&outcome));
+    }
+    }.await;
+    if let Some(guard) = lease_guard.as_mut() {
+        guard.release("invocation_return").await?;
+    }
+    result
+}
+
+struct DeliveryLeaseGuard {
+    db: sqlx::SqlitePool,
+    id: String,
+    process: ProcessIdentity,
+    epoch: i64,
+    released: bool,
+}
+
+impl DeliveryLeaseGuard {
+    async fn release(&mut self, reason: &str) -> Result<()> {
+        delivery_run::release_delivery_lease(&self.db, &self.id, &self.process, self.epoch,
+            chrono::Utc::now().timestamp_millis(), reason).await?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for DeliveryLeaseGuard {
+    fn drop(&mut self) {
+        if self.released { return; }
+        let db = self.db.clone();
+        let id = self.id.clone();
+        let process = self.process.clone();
+        let epoch = self.epoch;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = delivery_run::release_delivery_lease(&db, &id, &process, epoch,
+                    chrono::Utc::now().timestamp_millis(), "invocation_dropped").await {
+                    tracing::error!(run_id=%id, %error, "delivery lease cleanup failed; TTL recovery remains active");
+                }
+            });
+        }
     }
 }
 
@@ -2547,6 +2639,7 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
             change_set_digest: claimed.change_set_digest.clone(),
         }),
         mutation_permit: None,
+        ..DeliverOpts::default()
     };
     let mut prepared = PreparedDurableRun {
         id: claimed.run_id.clone(),
@@ -3106,6 +3199,12 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
     }
     out.push_str(&format!("\n{}", outcome.summary));
     if outcome.final_state == "blocked" || outcome.final_state == "waiting" {
+        out.push_str(&format!("\n卡在哪一步: {}\n在等什么: {}\n谁能解开: {}\n已保留提交: {}；分支: {}；PR: {}\n",
+            outcome.stage, outcome.next_action.as_deref().unwrap_or(&outcome.summary),
+            if outcome.recovery_class == delivery::RecoveryClass::CoreInputRequired { "用户提供上述外部核心输入" } else { "系统恢复执行器在条件满足后续接原交付" },
+            outcome.commit_sha.as_deref().unwrap_or("本次尚无提交证据"),
+            outcome.branch.as_deref().unwrap_or("本次尚无分支证据"),
+            outcome.pr_url.as_deref().unwrap_or("本次尚无 PR 证据")));
         out.push_str(
             "\n\n注意:本次交付没有达到请求边界；只能报告上面明确列出的已完成步骤。\
 即使之后查询发现仓库出现了新的合并或发布,那也是其他执行器(并行 agent 或自动化流水线)\
@@ -4479,6 +4578,18 @@ mod tests {
         assert_ne!(first.instance_id, second.instance_id);
         assert!(first.instance_id.contains(":delivery:"));
         assert!(second.instance_id.contains(":delivery:"));
+    }
+
+    #[test]
+    fn cf_lease_stalled_report_names_owner_and_preserved_state() {
+        let mut stalled = outcome("waiting");
+        stalled.stage = "base_sync".into();
+        stalled.branch = Some("synthetic-feature".into());
+        stalled.commit_sha = Some("synthetic-head".into());
+        let report = render_report(&stalled);
+        assert!(report.contains("base_sync"));
+        assert!(report.contains("谁能解开"));
+        assert!(report.contains("synthetic-head"));
     }
 
     fn outcome(final_state: &str) -> DeliveryOutcome {
