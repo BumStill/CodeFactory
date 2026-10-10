@@ -41,6 +41,13 @@ pub const DISPATCH_SOURCE: &str = "local_task_entry";
 /// Permission modes the app accepts (mirrors `menu_spec::PERMISSION_MODES`).
 pub const PERMISSION_MODES: [&str; 3] = ["safe", "standard", "trusted"];
 
+/// Delivery directions a `send` may take (CF-HDE-R8). Mirrors the interface's
+/// Enter (`steer`) / ⌘Enter (`queue`) semantics, and `desktopDispatch.ts`'s
+/// `DISPATCH_SEND_MODES`. Absent means `steer` — the interface's unmodified
+/// Enter. Accepting one more value here widens nothing: the destination is
+/// still decided by the interface against the same turn-admission rules.
+pub const SEND_MODES: [&str; 2] = ["steer", "queue"];
+
 /// Largest request line we will read, so a hostile client cannot make the
 /// server allocate unbounded memory over the socket.
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -69,9 +76,16 @@ pub enum Request {
         delivery_authorized: bool,
     },
     /// CF-HDE-R1: send a message to an existing session.
+    ///
+    /// CF-HDE-R8: `mode` chooses the direction when a run is already in flight
+    /// — `steer` interjects into it (the interface's Enter), `queue` defers to
+    /// after it (the interface's ⌘Enter). Absent defaults to `steer`. When the
+    /// session is idle both mean "start the next turn now".
     Send {
         session_id: String,
         message: String,
+        #[serde(default)]
+        mode: Option<String>,
         delivery_authorized: bool,
     },
     /// CF-HDE-R1: set the session's permission mode.
@@ -109,6 +123,15 @@ pub enum Request {
     /// talked into deleting a cache by the wording of a message.
     CleanBuildCache {},
 }
+
+/// Failure codes the interface may hand back through `Response::error`
+/// (CF-HDE-R0 / R7). `not_found` is how a request whose `session_id` cannot be
+/// located fails — never by silently falling back to whatever the interface is
+/// showing; `delivery_failed` is how a `send` that could not actually start a
+/// turn fails instead of reporting ok. Kept in one testable place so the
+/// protocol's vocabulary cannot drift between the two languages.
+pub const INTERFACE_ERROR_CODES: [&str; 4] =
+    ["invalid_request", "denied", "not_found", "delivery_failed"];
 
 /// A machine-readable failure. `code` is stable so a client can branch on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +223,17 @@ fn require_permission_mode(mode: &str) -> Result<(), ErrorBody> {
     }
 }
 
+fn require_send_mode(mode: &str) -> Result<(), ErrorBody> {
+    if SEND_MODES.contains(&mode) {
+        Ok(())
+    } else {
+        Err(ErrorBody::invalid(format!(
+            "mode must be one of {}",
+            SEND_MODES.join(", ")
+        )))
+    }
+}
+
 /// Field-level validation shared by the socket server and the CLI client, so a
 /// bad request is refused before it reaches the app regardless of direction.
 pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
@@ -223,10 +257,14 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
         Request::Send {
             session_id,
             message,
+            mode,
             ..
         } => {
             require_non_empty("session_id", session_id)?;
             require_non_empty("message", message)?;
+            if let Some(mode) = mode {
+                require_send_mode(mode)?;
+            }
         }
         Request::SetPermission {
             session_id,
@@ -350,6 +388,7 @@ impl AuditEntry {
                 session_id,
                 message,
                 delivery_authorized,
+                ..
             } => {
                 entry.session_id = Some(session_id.clone());
                 entry.message = Some(message.clone());
@@ -1125,6 +1164,39 @@ mod tests {
         assert!(parse_request(r#"{"operation":"tcp://127.0.0.1:1234"}"#).is_err());
         assert!(parse_request("").is_err());
         assert!(parse_request("not json at all").is_err());
+    }
+
+    #[test]
+    fn send_mode_is_a_closed_set_and_defaults_to_steer() {
+        // CF-HDE-R8: `mode` is optional (absent = the interface's plain Enter,
+        // i.e. steer), and an unknown direction is refused rather than guessed —
+        // guessing wrong means the user thinks they interjected and they queued.
+        let absent = parse_request(&send_json("go", Some(false)))
+            .expect("send without mode stays legal");
+        assert!(matches!(absent, Request::Send { mode: None, .. }));
+        for mode in SEND_MODES {
+            let raw = format!(
+                r#"{{"operation":"send","session_id":"s-1","message":"go","delivery_authorized":false,"mode":"{mode}"}}"#
+            );
+            let request = parse_request(&raw).expect("a known mode is accepted");
+            assert!(matches!(request, Request::Send { mode: Some(_), .. }));
+        }
+        let bogus = r#"{"operation":"send","session_id":"s-1","message":"go","delivery_authorized":false,"mode":"shout"}"#;
+        let error = parse_request(bogus).expect_err("an unknown direction must be refused");
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn interface_error_codes_are_stable_and_round_trip() {
+        // CF-HDE-R0 / R7: the interface reports these codes back over the same
+        // Response envelope, so they must deserialize here byte-for-byte.
+        for code in INTERFACE_ERROR_CODES {
+            let raw = format!(r#"{{"code":"{code}","message":"x"}}"#);
+            let body: ErrorBody = serde_json::from_str(&raw).expect("a known code round-trips");
+            assert_eq!(body.code, code);
+        }
+        assert_eq!(ErrorBody::not_found("x").code, "not_found");
+        assert_eq!(ErrorBody::internal("x").code, "internal");
     }
 
     #[test]

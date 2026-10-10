@@ -32,6 +32,10 @@ const OPERATIONS = new Set([
 
 const PERMISSION_MODES = new Set(["safe", "standard", "trusted"]);
 
+/// CF-HDE-R8：`send` 的方向。省略即 `steer`（界面不加修饰键按 Enter 的语义）。
+/// 只有这两个取值——猜错方向等于用户以为在插话、其实在排队。
+const SEND_MODES = new Set(["steer", "queue"]);
+
 const MESSAGE_OPERATIONS = new Set(["create_and_send", "send"]);
 
 function fail(code, message) {
@@ -59,6 +63,11 @@ function validate(request) {
   }
   if (operation === "set_permission" && !PERMISSION_MODES.has(request.permission_mode)) {
     fail("invalid_request", "permission_mode must be safe, standard or trusted");
+  }
+  // CF-HDE-R8: 只有 steer（插话引导当前执行）/ queue（本轮结束后再发）两种方向。
+  // 省略则按 steer 处理，与原生侧的 `SEND_MODES` 是同一套取值。
+  if (operation === "send" && request.mode !== undefined && !SEND_MODES.has(request.mode)) {
+    fail("invalid_request", "mode must be steer or queue");
   }
   if (operation === "resolve_approval" && typeof request.approve !== "boolean") {
     fail("invalid_request", "approve must be explicit");

@@ -20,9 +20,28 @@
 /** 事件名，必须与 `headless_dispatch.rs` 的 `DISPATCH_REQUEST_EVENT` 一致。 */
 export const DISPATCH_REQUEST_EVENT = "dispatch:request";
 
+import { isDispatchRequestError } from "./dispatchErrors";
+
 /** 权限模式，与 `headless_dispatch.rs` / `menu_spec.rs` 一致。 */
 export const DISPATCH_PERMISSION_MODES = ["safe", "standard", "trusted"] as const;
 export type DispatchPermissionMode = (typeof DISPATCH_PERMISSION_MODES)[number];
+
+/**
+ * `send` 往哪个方向送一条消息（CF-HDE-R8），与界面键位一一对应：
+ *   * `steer` = 界面里不加修饰键按 Enter —— 插话引导当前执行；
+ *   * `queue` = 界面里按 ⌘/Ctrl+Enter —— 这一轮结束之后再发。
+ * 与 `headless_dispatch.rs` 的 `SEND_MODES` 必须逐字一致。
+ */
+export const DISPATCH_SEND_MODES = ["steer", "queue"] as const;
+export type DispatchSendMode = (typeof DISPATCH_SEND_MODES)[number];
+
+/**
+ * 默认 `steer`。理由是它就是界面默认键位的语义：用户不加修饰键按 Enter 时
+ * 想要的是"现在就按我说的调整"，而不是"等它忙完再说"。空闲会话下 `steer` 与
+ * `queue` 都表现为立即开始新的一轮，所以默认取更主动的那个不会让空闲派单
+ * 变成排队。
+ */
+export const DEFAULT_DISPATCH_SEND_MODE: DispatchSendMode = "steer";
 
 /** 原生侧发过来的请求负载。 */
 export interface DispatchRequestEvent {
@@ -33,7 +52,7 @@ export interface DispatchRequestEvent {
 
 /** 结构化失败，`code` 与原生侧稳定取值一致。 */
 export interface DispatchError {
-  code: "invalid_request" | "denied" | "not_found" | "internal";
+  code: "invalid_request" | "denied" | "not_found" | "delivery_failed" | "internal";
   message: string;
 }
 
@@ -63,6 +82,7 @@ export interface DispatchHandlers {
   send: (input: {
     sessionId: string;
     message: string;
+    mode: DispatchSendMode;
     deliveryAuthorized: boolean;
   }) => Promise<unknown>;
   setPermission: (input: { sessionId: string; mode: DispatchPermissionMode }) => Promise<unknown>;
@@ -114,6 +134,18 @@ function requiredPermissionMode(value: unknown): DispatchPermissionMode {
 }
 
 /**
+ * `send` 的方向值。缺省由调用方补成 `steer`（见 `DEFAULT_DISPATCH_SEND_MODE`）；
+ * 一旦显式给出就必须是这两个之一 —— 猜错方向等于用户以为在插话、其实在排队。
+ */
+function requiredSendMode(value: unknown): DispatchSendMode {
+  const mode = requiredString(value, "mode");
+  if (!(DISPATCH_SEND_MODES as readonly string[]).includes(mode)) {
+    throw new Error(`mode must be one of ${DISPATCH_SEND_MODES.join(", ")}`);
+  }
+  return mode as DispatchSendMode;
+}
+
+/**
  * 校验 + 翻译 + 派发。原生请求的完整前端入口。
  *
  * 纯函数（处理器由调用方注入），因此每条 CF-HDE-R6 能力都能在单测里断言
@@ -143,6 +175,10 @@ export async function applyDispatchRequest(
         result = await handlers.send({
           sessionId: requiredString(body.session_id, "session_id"),
           message: requiredString(body.message, "message"),
+          mode:
+            body.mode === undefined
+              ? DEFAULT_DISPATCH_SEND_MODE
+              : requiredSendMode(body.mode),
           deliveryAuthorized: requiredDeliveryAuthorization(body.delivery_authorized),
         });
         break;
@@ -196,6 +232,11 @@ export async function applyDispatchRequest(
     }
     return { ok: true, result: result ?? null };
   } catch (error) {
+    // 结构化的执行失败（会话不存在、送达失败）原样上报，绝不塌成一句人话：
+    // 编排方靠 code 区分"没有这个会话"与"内部错误"（CF-HDE-R0 / R7）。
+    if (isDispatchRequestError(error)) {
+      return { ok: false, error: { code: error.code, message: error.message } };
+    }
     const message = error instanceof Error ? error.message : String(error);
     // 校验失败与执行失败都是 fail-closed：请求没有被执行，客户端必须知道。
     return /must be|unsupported/.test(message)
