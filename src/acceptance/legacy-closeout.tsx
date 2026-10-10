@@ -15,7 +15,7 @@ const pending = { intentId: "synthetic-approval", toolCallId: "synthetic-call", 
   if (cmd === "get_message_page") return { messages: [], has_more: false };
   return false;
 }};
-useChatStore.setState({ sessions, activeSession: sessions[0], runtime: { A: { ...freshRuntime(), pendingPermission: pending }, B: freshRuntime() }, loadSessions: async () => {} });
+useChatStore.setState({ sessions, activeSession: sessions[0], runtime: { A: { ...freshRuntime(), pendingPermission: pending }, B: freshRuntime() }, loadSessions: async () => sessions });
 function App() {
   const current = useChatStore(s => s.activeSession);
   const request = useChatStore(s => activeRuntime(s).pendingPermission);
