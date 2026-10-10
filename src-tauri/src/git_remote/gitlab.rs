@@ -168,13 +168,18 @@ pub async fn update_pr_body(
     client: &RemoteGitClient,
     project: &str,
     number: u64,
+    title: Option<&str>,
     body: &str,
 ) -> Result<(), String> {
     let encoded = encode_repo(project);
+    let mut payload = serde_json::json!({ "description": body });
+    if let Some(title) = title {
+        payload["title"] = serde_json::Value::String(title.to_string());
+    }
     client
         .put(
             &format!("/projects/{encoded}/merge_requests/{number}"),
-            serde_json::json!({"description": body}),
+            payload,
         )
         .await
         .map(|_| ())
