@@ -264,11 +264,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   _modelsRequestId: 0,
 
   beginDraft: ({ cwd = null, anonymous = false } = {}) => {
+    const settings = useSettingsStore.getState().settings;
+    const modelId = settings?.endpoints[settings.default_endpoint]?.active_model
+      || settings?.default_model || get().activeModel;
     const draft: DraftSession = {
       id: crypto.randomUUID(),
       cwd,
       anonymous,
-      modelId: get().activeModel,
+      modelId,
       permissionMode: "standard",
       text: "",
     };
@@ -276,6 +279,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // slow round-trip can never land history on top of this new blank page.
     set((state) => ({
       activeSession: null,
+      activeModel: modelId,
       draftSession: draft,
       _selectionRequestId: state._selectionRequestId + 1,
     }));
@@ -891,7 +895,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
-  setModel: (modelId) => set({ activeModel: modelId }),
+  setModel: (modelId) => set((state) => ({
+    activeModel: modelId,
+    draftSession: state.draftSession ? { ...state.draftSession, modelId } : null,
+  })),
 
   updateActiveSessionModel: async (modelId) => {
     const activeSession = get().activeSession;

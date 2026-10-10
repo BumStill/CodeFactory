@@ -404,55 +404,16 @@ pub(crate) fn title_from_model_output(
 }
 
 fn safe_local_fallback(prompt: &str) -> String {
-    // This fallback only selects from fixed, non-sensitive labels and never
-    // copies prompt text into the title. Classify the local raw prompt so an
-    // aggressively redacted URL/token cannot erase adjacent topic keywords.
-    let lower = prompt.to_ascii_lowercase();
-    let title = if (lower.contains("session") || lower.contains("会话"))
-        && (lower.contains("标题") || lower.contains("名字") || lower.contains("命名"))
-    {
-        "会话命名优化"
-    } else if lower.contains("登录") || lower.contains("认证") || lower.contains("auth") {
-        "登录问题排查"
-    } else if lower.contains("ci")
-        || lower.contains("构建")
-        || lower.contains("编译")
-        || lower.contains("测试")
-    {
-        "CI 与构建问题排查"
-    } else if lower.contains("界面")
-        || lower.contains("布局")
-        || lower.contains("sidebar")
-        || lower.contains("ui")
-        || lower.contains("ux")
-    {
-        "界面体验优化"
-    } else if lower.contains("文档") || lower.contains("readme") {
-        "文档内容整理"
-    } else if lower.contains("图片")
-        || lower.contains("截图")
-        || lower.contains("附件")
-        || lower.contains("上传")
-    {
-        "图片与附件分析"
-    } else if lower.contains("性能") || lower.contains("卡顿") || lower.contains("slow") {
-        "性能问题排查"
-    } else if lower.contains("错误")
-        || lower.contains("失败")
-        || lower.contains("报错")
-        || lower.contains("bug")
-    {
-        "问题原因排查"
-    } else if lower.contains("代码")
-        || lower.contains("实现")
-        || lower.contains("重构")
-        || lower.contains("refactor")
-    {
-        "代码实现与优化"
+    // Preserve the first message's topic only after the metadata privacy filter.
+    let redacted = redact_metadata_text(prompt, MAX_INPUT_CHARS);
+    let cleaned = redacted.replace("<redacted>", " ");
+    let collapsed = WHITESPACE_RE.replace_all(cleaned.trim(), " ");
+    let title: String = collapsed.graphemes(true).take(MAX_TITLE_CHARS).collect();
+    if title.is_empty() || is_low_information(&title) || contains_sensitive_shape(&title) {
+        PLACEHOLDER_TITLE.into()
     } else {
-        PLACEHOLDER_TITLE
-    };
-    title.into()
+        title
+    }
 }
 
 async fn compare_and_set_title(
@@ -1091,22 +1052,31 @@ mod tests {
     }
 
     #[test]
-    fn fallback_is_safe_and_never_returns_the_prompt_prefix() {
-        assert_eq!(
-            safe_local_fallback("新建 session 的名字，需要自动总结"),
-            "会话命名优化"
-        );
-        assert_eq!(
-            safe_local_fallback("登录失败 token=super-secret"),
-            "登录问题排查"
-        );
-        assert_eq!(safe_local_fallback("谈谈今天"), PLACEHOLDER_TITLE);
-        assert_eq!(
-            safe_local_fallback(
-                "排查联系qa@example.com处理https://private.example继续以及AKIAIOSFODNN7EXAMPLE配置导致的登录问题"
-            ),
-            "登录问题排查"
-        );
+    fn provisional_titles_preserve_distinct_redacted_first_message_topics() {
+        let prompts = ["修复支付回调测试失败", "修复搜索分页测试失败", "整理桌面快捷键文档"];
+        let titles: Vec<String> = prompts.iter().map(|prompt| safe_local_fallback(prompt)).collect();
+        for (prompt, title) in prompts.iter().zip(&titles) {
+            assert_eq!(title, prompt);
+            assert!(title.graphemes(true).count() <= MAX_TITLE_CHARS);
+        }
+        assert_eq!(titles.iter().collect::<HashSet<_>>().len(), prompts.len());
+        let private = safe_local_fallback("修复支付回调 token=super-secret");
+        assert!(private.contains("支付回调"));
+        assert!(!private.contains("super-secret"));
+        assert!(safe_local_fallback(&"验证中文分页边界".repeat(20)).graphemes(true).count() <= MAX_TITLE_CHARS);
+    }
+
+    #[test]
+    fn fallback_preserves_topic_without_sensitive_metadata() {
+        assert_eq!(safe_local_fallback("新建 session 的名字，需要自动总结"), "新建 session 的名字，需要自动总结");
+        let title = safe_local_fallback("登录失败 token=super-secret");
+        assert!(title.contains("登录失败"));
+        assert!(!title.contains("super-secret"));
+        assert_eq!(safe_local_fallback("谈谈今天"), "谈谈今天");
+        let title = safe_local_fallback("排查联系qa@example.com处理https://private.example继续以及AKIAIOSFODNN7EXAMPLE配置导致的登录问题");
+        for secret in ["qa@example.com", "private.example", "AKIAIOSFODNN7EXAMPLE"] {
+            assert!(!title.contains(secret), "{title}");
+        }
     }
 
     #[test]
