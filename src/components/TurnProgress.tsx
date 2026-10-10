@@ -72,6 +72,11 @@ export function TurnProgress({
   const rawWaitingReason = activityWaitingReason || plan.waitingReason;
   const effectiveWaitingReason = humanWaitingReason(rawWaitingReason);
   const waiting = Boolean(effectiveWaitingReason);
+  // A step count is only meaningful once the agent actually tracked steps. An
+  // all-pending plan reads "已完成 0/5 0% · 来自 5 个计划步骤" while the turn is
+  // visibly editing files, so a count that was never started is not shown
+  // (same rule as `planTracked` in TurnResultSnapshot).
+  const planTracked = plan.steps.some((step) => step.status !== "pending");
   // A stopped turn has no remaining time to quote. Only a wait that will end
   // by itself (a build, a long command) keeps its estimate.
   const stopped = isTerminalWaitingReason(rawWaitingReason);
@@ -93,35 +98,48 @@ export function TurnProgress({
         )}
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-note">
-            <span className="shrink-0 font-medium text-gray-200">
-              已完成 {progress.completed}/{progress.total}
-            </span>
-            <span className="shrink-0 tabular-nums text-gray-400">
-              {progress.percent}%
-            </span>
-            <span className="shrink-0 text-caption text-gray-600">
-              来自 {progress.total} 个计划步骤
-            </span>
+            {planTracked && (
+              <>
+                <span className="shrink-0 font-medium text-gray-200">
+                  已完成 {progress.completed}/{progress.total}
+                </span>
+                <span className="shrink-0 tabular-nums text-gray-400">
+                  {progress.percent}%
+                </span>
+                <span className="shrink-0 text-caption text-gray-600">
+                  来自 {progress.total} 个计划步骤
+                </span>
+              </>
+            )}
             <span className="ml-auto inline-flex shrink-0 items-center gap-1 text-caption text-gray-500 tabular-nums">
               <Clock3 size={14} aria-hidden="true" />
               {formatDuration(elapsedMs)}
             </span>
           </div>
-          <div className="mt-1 grid min-w-0 grid-cols-2 gap-2 text-label text-gray-400">
-            <span className="truncate">
-              {progress.current ? `当前 · ${progress.current.title}` : "当前 · 正在整理执行路线"}
-            </span>
-            <span className="truncate">
-              {progress.next ? `下一步 · ${progress.next.title}` : "下一步 · 待计划更新"}
-            </span>
-          </div>
-          {(activityLabel || effectiveWaitingReason) && (
+          {planTracked ? (
+            <div className="mt-1 grid min-w-0 grid-cols-2 gap-2 text-label text-gray-400">
+              <span className="truncate">
+                {progress.current ? `当前 · ${progress.current.title}` : "当前 · 正在整理执行路线"}
+              </span>
+              <span className="truncate">
+                {progress.next ? `下一步 · ${progress.next.title}` : "下一步 · 待计划更新"}
+              </span>
+            </div>
+          ) : (
+            // No tracked steps yet: the honest content is what the turn is
+            // doing right now, plus the elapsed time above.
+            <p className="mt-1 min-w-0 truncate text-label text-gray-400">
+              当前 · {activityLabel ?? "正在执行任务"}
+            </p>
+          )}
+          {((planTracked && activityLabel) || effectiveWaitingReason) && (
             <p
               role="status"
-              className={`mt-1 truncate text-caption ${effectiveWaitingReason ? "text-status-warning" : "text-gray-500"}`}
+              className={`mt-1 truncate text-caption ${waiting ? "text-status-warning" : "text-gray-500"}`}
             >
-              {activityLabel ?? effectiveWaitingReason}
-              {activityLabel && effectiveWaitingReason ? ` · ${effectiveWaitingReason}` : ""}
+              {planTracked && activityLabel ? activityLabel : null}
+              {planTracked && activityLabel && effectiveWaitingReason ? " · " : ""}
+              {effectiveWaitingReason ?? ""}
             </p>
           )}
           {((estimate && !stopped) || linkedExternalJob) && (
@@ -138,21 +156,23 @@ export function TurnProgress({
               )}
             </div>
           )}
-          <div
-            role="progressbar"
-            aria-label={`任务进度，来自 ${progress.total} 个计划步骤`}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={progress.percent}
-            className="mt-1.5 h-1 overflow-hidden rounded-full bg-surface-3"
-          >
+          {planTracked && (
             <div
-              className={`h-full rounded-full transition-[width] duration-300 motion-reduce:transition-none ${
-                waiting ? "bg-status-warning" : "bg-status-progress"
-              }`}
-              style={{ width: `${progress.percent}%` }}
-            />
-          </div>
+              role="progressbar"
+              aria-label={`任务进度，来自 ${progress.total} 个计划步骤`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={progress.percent}
+              className="mt-1.5 h-1 overflow-hidden rounded-full bg-surface-3"
+            >
+              <div
+                className={`h-full rounded-full transition-[width] duration-300 motion-reduce:transition-none ${
+                  waiting ? "bg-status-warning" : "bg-status-progress"
+                }`}
+                style={{ width: `${progress.percent}%` }}
+              />
+            </div>
+          )}
         </div>
         <button
           type="button"

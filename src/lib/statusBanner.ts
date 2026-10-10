@@ -170,7 +170,7 @@ export function statusBannerView(input: StatusBannerInput): StatusBannerView | n
       : null;
 
   const tone: StatusBannerTone =
-    userAction || (reason != null && reason.trim() !== "") ? "warning" : "progress";
+    userAction || humanWaitingReason(reason) != null ? "warning" : "progress";
 
   return {
     tone,

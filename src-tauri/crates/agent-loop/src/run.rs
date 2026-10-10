@@ -360,6 +360,14 @@ pub struct LoopServices {
     pub steer: Arc<dyn crate::services::SteerInbox>,
 }
 
+/// M37: the completion gate rerunning its checks before a turn may end is
+/// normal background work, not something the user has to act on. It publishes a
+/// plain-words label and *no* waiting reason: a waiting reason is what flips the
+/// conversation bar's tone to warning, and the prose that used to sit here
+/// ("验证证据不足") leaked completion-gate vocabulary onto the screen.
+const COMPLETION_CHECKPOINT_ACTIVITY_LABEL: &str = "正在补跑检查";
+const COMPLETION_CHECKPOINT_ACTIVITY_WAITING_REASON: Option<&str> = None;
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_turn_activity(
     persistence: &dyn Persistence,
@@ -3004,8 +3012,8 @@ pub async fn run_agent_loop(
                     "recovering",
                     "active",
                     "verification",
-                    "正在补充缺失验证",
-                    Some("验证证据不足"),
+                    COMPLETION_CHECKPOINT_ACTIVITY_LABEL,
+                    COMPLETION_CHECKPOINT_ACTIVITY_WAITING_REASON,
                     None,
                 )
                 .await?;
@@ -6793,5 +6801,36 @@ mod tests {
         assert!(!resolved.is_chatgpt);
         assert_eq!(resolved.session_id, "session");
         assert_eq!(resolved.usage_run_id, "run");
+    }
+
+    /// M37: the segment checkpoint that continues because the evidence is still
+    /// incomplete is normal background work. Publishing a waiting reason is
+    /// exactly what flips the conversation bar's tone to a warning, so this
+    /// checkpoint must publish none, and its label must stay in plain words.
+    #[test]
+    fn completion_checkpoint_activity_is_not_a_warning() {
+        assert!(
+            COMPLETION_CHECKPOINT_ACTIVITY_WAITING_REASON.is_none(),
+            "the completion checkpoint must not publish a waiting reason"
+        );
+        let label = COMPLETION_CHECKPOINT_ACTIVITY_LABEL;
+        assert!(!label.trim().is_empty(), "the checkpoint needs a real label");
+        // Mirrors the UI's internal-vocabulary guard plus the completion-gate
+        // wording this task names.
+        for banned in [
+            "证据",
+            "复核",
+            "不足",
+            "gate",
+            "evidence",
+            "objective",
+            "remediation",
+            "recovery",
+        ] {
+            assert!(
+                !label.to_lowercase().contains(&banned.to_lowercase()),
+                "checkpoint label leaks internal vocabulary: {banned}"
+            );
+        }
     }
 }

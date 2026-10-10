@@ -26,19 +26,42 @@ const TERMINAL_WAITING_REASONS = new Set([
   "run_budget_exhausted",
 ]);
 
+/// Reasons that describe the system's own background work — the completion
+/// gate rerunning its checks before the turn may end. Nothing here asks the
+/// user to do anything, so it must not raise the alarm tone, and the phrase
+/// behind it must not reach the screen at all. `"验证证据不足"` is the prose a
+/// pre-M37 build wrote into this field; it is kept here so an already-open
+/// session stops showing it.
+const ADVISORY_WAITING_REASONS = new Set([
+  "验证证据不足",
+  "completion_evidence_incomplete",
+]);
+
 const INTERNAL_CODE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/;
 
 function isInternalCode(reason: string): boolean {
   return INTERNAL_CODE.test(reason);
 }
 
+/// True when the reason only describes the system's own background work, so
+/// the UI keeps its neutral tone instead of raising a warning.
+export function isAdvisoryWaitingReason(
+  reason: string | null | undefined,
+): boolean {
+  const trimmed = reason?.trim();
+  if (!trimmed) return false;
+  return ADVISORY_WAITING_REASONS.has(trimmed);
+}
+
 /// The sentence to show for a waiting reason. Human text passes through
-/// untouched; internal codes never reach the screen.
+/// untouched; internal codes and the system's own background work never reach
+/// the screen.
 export function humanWaitingReason(
   reason: string | null | undefined,
 ): string | null {
   const trimmed = reason?.trim();
   if (!trimmed) return null;
+  if (isAdvisoryWaitingReason(trimmed)) return null;
   const label = WAITING_REASON_LABELS[trimmed];
   if (label) return label;
   if (isInternalCode(trimmed)) return "执行已停止，当前结论已交还给你";
@@ -52,5 +75,7 @@ export function isTerminalWaitingReason(
 ): boolean {
   const trimmed = reason?.trim();
   if (!trimmed) return false;
+  // An advisory reason means the turn is still working, not that it ended.
+  if (isAdvisoryWaitingReason(trimmed)) return false;
   return TERMINAL_WAITING_REASONS.has(trimmed) || isInternalCode(trimmed);
 }
