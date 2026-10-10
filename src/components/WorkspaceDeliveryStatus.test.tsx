@@ -23,6 +23,18 @@ const delivered: UIMessage[] = [{
 }];
 
 describe("WorkspaceDeliveryStatus", () => {
+  it.each(["merged", "closed"])("prioritizes %s over an old failed CI", async (state) => {
+    mocks.invoke.mockResolvedValue({
+      remote_available: true,
+      pr: { number: 175, title: "Synthetic PR", state, draft: false, head_branch: "feat/test", base_branch: "main", head_sha: "abc", merge_commit_sha: state === "merged" ? "def" : null, url: "https://github.com/acme/repo/pull/175" },
+      ci_status: "failure", release: null, error: null,
+    });
+    render(<WorkspaceDeliveryStatus cwd="/repo" currentBranch="feat/test" messages={[]} />);
+    const status = await screen.findByRole("button", { name: new RegExp(state === "merged" ? "已合并" : "已关闭") });
+    expect(status).toHaveTextContent(state === "merged" ? "已合并" : "已关闭");
+    expect(status).not.toHaveTextContent("CI 失败");
+    expect(status).not.toHaveAttribute("data-status-tone", "danger");
+  });
   beforeEach(() => mocks.invoke.mockReset());
 
   it("restores the session PR reference after the local worktree has returned to main", () => {

@@ -441,6 +441,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           historyTruncated: page.truncated ?? false,
         },
       );
+      hydrated.pendingPermission = currentRuntime?.pendingPermission ?? null;
       if (staleStreamingRevision != null && currentRuntime) {
         hydrated.queue = currentRuntime.queue;
         hydrated.localMessages = localMessages;

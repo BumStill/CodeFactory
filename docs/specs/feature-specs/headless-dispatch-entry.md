@@ -97,6 +97,7 @@ which speaks the same protocol directly to the private socket.
 | Req ID | 需求 | 最低证据 |
 | --- | --- | --- |
 | CF-HDE-R0 | **作用对象必须正确（最高优先）**：所有带 session_id 的操作（send / stop / set_permission / set_model / status / resolve_approval）只作用于该 session_id 指定的会话，与界面当前显示哪个会话无关；不存在或无法定位时返回 not_found，绝不退回「当前会话」。待发队列必须按会话隔离，绝不能把 A 的消息冲进 B | 集成测试：界面显示 B 时对 A 执行 send / stop / set_permission / set_model，断言只有 A 收到或停止、B 毫无变化；复现 14:30 与 14:42 两条时序 |
+| CF-HDE-R12 | **待审批全量可见**：`list_approvals` 列出所有会话里所有待审批的请求（含 bash 等工具权限），带会话 id、工具名、参数摘要、过期时间；`resolve_approval` 仍然一次只处理一条，并且走同一套权限规则 | 集成测试：多个会话各有待审批时全部列出，批准或拒绝只影响指定那一条 |
 | CF-HDE-R7 | **送达如实回报**：`send` 的应答必须明确是「已送达并开始处理」还是「已排队及排在什么之后」。发给空闲会话时，一定立即开始新的一轮，不能因为界面残留的旧回合状态而挂起；挂起超过有界时间要回报失败，不能回报 ok | 集成测试：空闲会话、残留回合状态、运行中三种情况各自的应答与实际落库一致 |
 | CF-HDE-R8 | **插话与排队可选**：`send` 支持「插话引导当前执行」和「本轮结束后再发」两种方式（默认值自定并说明理由），与界面上 Enter / ⌘Enter 的语义一致 | 测试：两种方式行为与界面一致 |
 | CF-HDE-R9 | **状态可信且够用**：`status` 返回的 objective_state 与真实执行情况一致（例如在模型调用就不能显示等待重试）；latest_reply 给出最近一条回复的摘要；pr_number 取自交付记录；另外返回最近一次模型调用的上下文大小（token 数），供编排方判断是回原会话追加还是另开新会话 | 测试：断言各字段与库内事实一致 |

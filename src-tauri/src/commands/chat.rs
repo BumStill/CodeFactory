@@ -336,6 +336,16 @@ pub(crate) async fn resolve_route_plan(
 }
 
 #[tauri::command]
+pub async fn list_pending_approvals(
+    state: State<'_, AppState>,
+) -> Result<Vec<super::pending_approvals::PendingApproval>, AppError> {
+    let pool = state.db.read().await.clone();
+    super::pending_approvals::list_pending(&pool)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))
+}
+
+#[tauri::command]
 pub async fn respond_to_permission(
     app: AppHandle,
     intent_id: String,

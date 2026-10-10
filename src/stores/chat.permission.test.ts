@@ -73,6 +73,18 @@ beforeEach(() => {
 });
 
 describe("respondPermission — session permission mode", () => {
+  it("retains the exact pending approval after switching away and back", async () => {
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "get_session") return { ...session, id: args?.sessionId };
+      if (cmd === "get_message_page") return { messages: [], has_more: false };
+      return false;
+    });
+    const pending = useChatStore.getState().runtime.A.pendingPermission;
+    await useChatStore.getState().selectSession("B");
+    await useChatStore.getState().selectSession("A");
+    expect(useChatStore.getState().activeSession?.id).toBe("A");
+    expect(useChatStore.getState().runtime.A.pendingPermission).toEqual(pending);
+  });
   it("persists trusted mode on the current session, then responds allow", async () => {
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "update_session_permission_mode") {

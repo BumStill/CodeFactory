@@ -23,6 +23,8 @@ pub mod mcp;
 pub mod memory;
 pub mod models;
 pub mod objective_health;
+// 后台审批列表与前端会话缓存解耦。
+pub mod pending_approvals;
 pub mod preferences;
 pub mod session;
 #[cfg(test)]

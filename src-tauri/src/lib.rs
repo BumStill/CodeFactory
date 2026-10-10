@@ -1879,6 +1879,7 @@ pub fn run() {
             commands::chat_progress::get_turn_timing_profile,
             commands::chat::send_message,
             commands::chat::send_message_anonymous,
+            commands::chat::list_pending_approvals,
             commands::chat::respond_to_permission,
             commands::chat::cancel_chat,
             commands::chat::is_chat_running,
