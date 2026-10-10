@@ -151,6 +151,26 @@ pub const MAX_SIGNATURE_RECOVERY_ATTEMPTS: i64 = 5;
 /// The verdict "you finished, but the evidence does not support it".
 pub const COMPLETION_EVIDENCE_INCOMPLETE: &str = "completion_evidence_incomplete";
 
+/// Private system-owned continuation instruction for an unfinished objective.
+/// It is supplied to the recovery model call, never persisted as a chat message.
+pub const INCOMPLETE_OBJECTIVE_CONTINUATION_PROMPT: &str =
+    "目标还没完成，继续做，不要只汇报进度；完成实现并运行验证后再结束。";
+
+/// CF-MSP-R4: the continuation instruction handed to the model when a turn ended
+/// without a real blocker — the only failure code that means "you claimed to be
+/// done and the evidence does not support it". A genuine blocker keeps the
+/// honest failure terminal and gets no injected prompt.
+///
+/// The instruction is *derived*, never persisted: the resume path pushes it onto
+/// the in-memory model history only, so it can never surface in the user's
+/// conversation or in a rebuilt history.
+pub fn incomplete_objective_continuation_prompt(
+    failure_code: Option<&str>,
+) -> Option<&'static str> {
+    (failure_code == Some(COMPLETION_EVIDENCE_INCOMPLETE))
+        .then_some(INCOMPLETE_OBJECTIVE_CONTINUATION_PROMPT)
+}
+
 /// A completion verdict that saw no new evidence cannot improve by being asked
 /// again: the model already answered, the arbiter already refused it, and
 /// nothing between two identical rounds changed. Every further round costs the
@@ -14620,5 +14640,75 @@ CREATE TABLE objectives (
             summary.contains("工作区"),
             "the reason must say where the user's work is: {summary}"
         );
+    }
+}
+
+/// CF-MSP-R4: the model-facing continuation instruction for a turn that ended
+/// with no real blocker. Kept out of the main module's tests so the only thing
+/// asserted here is the prompt's own contract.
+#[cfg(test)]
+mod msp_continuation_prompt_tests {
+    use super::*;
+
+    /// The prompt must tell the model the goal is unfinished, that it should
+    /// keep working, and that a progress report is not a finished turn.
+    #[test]
+    fn msp_r4_continuation_prompt_says_continue_and_do_not_only_report() {
+        let prompt = incomplete_objective_continuation_prompt(Some(COMPLETION_EVIDENCE_INCOMPLETE))
+            .expect("an unfinished objective gets a continuation prompt");
+        assert!(
+            prompt.contains("目标还没完成"),
+            "must say the goal is unfinished: {prompt}"
+        );
+        assert!(
+            prompt.contains("继续做"),
+            "must tell the model to continue: {prompt}"
+        );
+        assert!(
+            prompt.contains("不要只汇报进度"),
+            "must forbid a progress-only reply: {prompt}"
+        );
+        assert!(
+            prompt.contains("验证"),
+            "must require running verification before ending: {prompt}"
+        );
+    }
+
+    /// A real blocker keeps the honest failure terminal. Only the "finished
+    /// without evidence" verdict earns another automatic round.
+    #[test]
+    fn msp_r4_only_an_unfinished_objective_gets_a_continuation_prompt() {
+        assert_eq!(incomplete_objective_continuation_prompt(None), None);
+        assert_eq!(
+            incomplete_objective_continuation_prompt(Some(TECHNICAL_RECOVERY_EXHAUSTED)),
+            None
+        );
+        assert_eq!(
+            incomplete_objective_continuation_prompt(Some("run_blocked")),
+            None
+        );
+        assert_eq!(
+            incomplete_objective_continuation_prompt(Some(COMPLETION_EVIDENCE_INCOMPLETE)),
+            Some(INCOMPLETE_OBJECTIVE_CONTINUATION_PROMPT)
+        );
+    }
+
+    /// The instruction is plain model-facing wording. It must not leak internal
+    /// failure codes or gate jargon, because the same module owns both the
+    /// user-visible terminal text and this prompt.
+    #[test]
+    fn msp_r4_continuation_prompt_uses_plain_language() {
+        let prompt = INCOMPLETE_OBJECTIVE_CONTINUATION_PROMPT;
+        for jargon in [
+            "completion_evidence_incomplete",
+            "technical_recovery",
+            "failure_code",
+            "remediation",
+        ] {
+            assert!(
+                !prompt.contains(jargon),
+                "the injected prompt must stay plain instruction, found {jargon}"
+            );
+        }
     }
 }

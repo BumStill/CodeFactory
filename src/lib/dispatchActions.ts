@@ -22,7 +22,7 @@ import { invoke } from "./tauri";
 import { useChatStore, type SessionRuntime } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
 import { deliveryReferenceFromMessages } from "./deliveryReference";
-import { DispatchRequestError, describeError } from "./dispatchErrors";
+import { DispatchRequestError } from "./dispatchErrors";
 import { sessionTurnState, type SessionTurnState } from "./sessionTurnState";
 import type { DispatchSendMode } from "./desktopDispatch";
 import type { ModelInfo, PermissionMode, Session } from "./tauri";
@@ -247,10 +247,36 @@ export async function dispatchSetPermission(input: {
   return { session_id: updated.id, permission_mode: updated.permission_mode };
 }
 
+async function resolveConfiguredModel(modelId: string): Promise<{ endpoint: string; model: ModelInfo }> {
+  const settings = useSettingsStore.getState().settings;
+  if (!settings) {
+    throw new DispatchRequestError("invalid_request", "settings are not loaded");
+  }
+  const endpointNames = Object.keys(settings.endpoints ?? {});
+  const preferred = settings.default_endpoint?.trim();
+  const ordered = preferred
+    ? [preferred, ...endpointNames.filter((name) => name !== preferred)]
+    : endpointNames;
+  const unavailable: string[] = [];
+  for (const endpoint of ordered) {
+    try {
+      const models = await invoke<ModelInfo[]>("list_models", { endpointName: endpoint });
+      const model = Array.isArray(models) ? models.find((candidate) => candidate.id === modelId) : undefined;
+      if (model) return { endpoint, model };
+    } catch {
+      unavailable.push(endpoint);
+    }
+  }
+  const detail = unavailable.length > 0 ? `; unavailable endpoints: ${unavailable.join(", ")}` : "";
+  throw new DispatchRequestError(
+    "invalid_request",
+    `no configured endpoint serves ${modelId}${detail}; refusing to substitute another model`,
+  );
+}
+
 /**
- * CF-HDE-R10：带 session_id 时改那个会话的模型（端点保持该会话自己的）；
- * 省略时设置**新会话的默认模型**，并且端点与模型必须配套——验不过就 fail-closed，
- * 绝不写出"端点是 deepseek、默认模型是 gpt"这种错配。
+ * CF-MSP-R1/R2：模型 ID 先解析为唯一的已配置端点，再原子地写入配套配置。
+ * 带 session_id 时端点与模型一起更新；省略时端点 active_model、全局默认和草稿投影一致。
  */
 export async function dispatchSetModel(input: {
   sessionId?: string;
@@ -259,11 +285,15 @@ export async function dispatchSetModel(input: {
   | { scope: "session"; session_id: string; model: string; endpoint: string | null }
   | { scope: "default"; model: string; endpoint: string }
 > {
-  if (input.sessionId) {
-    const session = requireSession(input.sessionId);
+  const session = input.sessionId ? requireSession(input.sessionId) : null;
+  const resolved = await resolveConfiguredModel(input.model);
+  if (session) {
     if (session.kind === "anonymous" || session.kind === "quick") {
-      // 这些会话没有数据库行可写（匿名会话永不落库），只更新内存投影。
-      const updated: Session = { ...session, model_id: input.model };
+      const updated: Session = {
+        ...session,
+        endpoint_id: resolved.endpoint,
+        model_id: input.model,
+      };
       useChatStore.setState((state) => ({
         sessions: state.sessions.map((item) => (item.id === updated.id ? updated : item)),
         activeSession: state.activeSession?.id === updated.id ? updated : state.activeSession,
@@ -271,9 +301,11 @@ export async function dispatchSetModel(input: {
       }));
       return { scope: "session", session_id: updated.id, model: updated.model_id, endpoint: updated.endpoint_id ?? null };
     }
-    const updated = await invoke<Session>("update_session_model", {
+    const updated = await invoke<Session>("update_session_model_config", {
       sessionId: session.id,
+      endpointId: resolved.endpoint,
       modelId: input.model,
+      policy: session.model_policy ?? "prefer",
     });
     useChatStore.setState((state) => ({
       sessions: state.sessions.map((item) => (item.id === updated.id ? updated : item)),
@@ -288,39 +320,25 @@ export async function dispatchSetModel(input: {
     };
   }
 
-  // 默认模型：走界面选择器同一条路（端点自己的 active_model + 全局默认）。
-  const settings = useSettingsStore.getState().settings;
-  const endpoint = settings?.default_endpoint?.trim();
-  if (!settings || !endpoint) {
-    throw new DispatchRequestError(
-      "invalid_request",
-      "no endpoint is configured to set a default model on",
-    );
-  }
-  let models: ModelInfo[];
-  try {
-    models = await invoke<ModelInfo[]>("list_models", { endpointName: endpoint });
-  } catch (error) {
-    throw new DispatchRequestError(
-      "internal",
-      `could not verify that endpoint ${endpoint} serves ${input.model}: ${describeError(error)}`,
-    );
-  }
-  if (!Array.isArray(models) || !models.some((model) => model.id === input.model)) {
-    throw new DispatchRequestError(
-      "invalid_request",
-      `endpoint ${endpoint} does not serve ${input.model}; refusing to pair endpoint and default model silently`,
-    );
-  }
-  await invoke("set_endpoint_active_model", { endpointName: endpoint, modelId: input.model });
-  // 走界面模型选择器同一条保存路径（`useSettingsStore().save`）。
+  const settings = useSettingsStore.getState().settings!;
+  await invoke("set_endpoint_active_model", {
+    endpointName: resolved.endpoint,
+    modelId: input.model,
+  });
   await useSettingsStore.getState().save({
     ...settings,
-    default_endpoint: endpoint,
+    default_endpoint: resolved.endpoint,
     default_model: input.model,
+    endpoints: {
+      ...settings.endpoints,
+      [resolved.endpoint]: {
+        ...settings.endpoints[resolved.endpoint],
+        active_model: input.model,
+      },
+    },
   });
   useChatStore.getState().setModel(input.model);
-  return { scope: "default", model: input.model, endpoint };
+  return { scope: "default", model: input.model, endpoint: resolved.endpoint };
 }
 
 /**
