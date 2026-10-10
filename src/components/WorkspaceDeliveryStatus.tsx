@@ -13,12 +13,12 @@ import {
   XCircle,
 } from "lucide-react";
 import { invoke } from "../lib/tauri";
+// 解析规则住在 `lib/deliveryReference.ts`：派单入口的 status（CF-HDE-R9）也要
+// 返回 pr_number，两处必须读同一份实现，界面与入口才不会各说各话。
+import { deliveryReferenceFromMessages } from "../lib/deliveryReference";
+export { deliveryReferenceFromMessages } from "../lib/deliveryReference";
+export type { DeliveryReference } from "../lib/deliveryReference";
 import type { UIMessage } from "../stores/chat";
-
-export interface DeliveryReference {
-  branch: string;
-  prNumber: number;
-}
 
 interface DeliveryPr {
   number: number;
@@ -63,23 +63,6 @@ interface Props {
   onCloseDetails?: () => void;
   deliveryState?: WorkspaceDeliveryState;
   onDeliveryStateChange?: (state: WorkspaceDeliveryState) => void;
-}
-
-/** Last successful delivery call is a compatibility fallback for conversations
- * created before session_delivery_refs existed. New calls persist this relation
- * in SQLite, so it survives returning the checkout to main. */
-export function deliveryReferenceFromMessages(messages: UIMessage[]): DeliveryReference | null {
-  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
-    const calls = messages[messageIndex].toolCalls ?? [];
-    for (let callIndex = calls.length - 1; callIndex >= 0; callIndex -= 1) {
-      const call = calls[callIndex];
-      if (call.name !== "deliver_changes" || !call.result) continue;
-      const branch = call.result.match(/^分支:\s*(.+)$/m)?.[1]?.trim();
-      const prNumber = Number(call.result.match(/(?:PR\s*#|\/pull\/)(\d+)/)?.[1] ?? 0);
-      if (branch && prNumber > 0) return { branch, prNumber };
-    }
-  }
-  return null;
 }
 
 export function WorkspaceDeliveryStatus({

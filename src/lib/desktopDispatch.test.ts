@@ -10,11 +10,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   applyDispatchRequest,
   dispatchReplyArgs,
+  DEFAULT_DISPATCH_SEND_MODE,
   DISPATCH_PERMISSION_MODES,
   DISPATCH_REQUEST_EVENT,
+  DISPATCH_SEND_MODES,
   type DispatchHandlers,
   type DispatchRequestEvent,
 } from "./desktopDispatch";
+import { DispatchRequestError } from "./dispatchErrors";
 
 function request(operation: string, body: Record<string, unknown> = {}): DispatchRequestEvent {
   return { request_id: "req-1", operation, request: body };
@@ -194,6 +197,66 @@ describe("本地派单入口的前端路由", () => {
       ok: false,
       error: { code: "invalid_request", message: "nope" },
     });
+  });
+});
+
+describe("CF-HDE-R0 / R7：结构化失败原样上报", () => {
+  it("会话定位不到时回复 not_found，而不是塌成 internal", async () => {
+    const handlers = stubHandlers();
+    handlers.send = async () => {
+      throw new DispatchRequestError("not_found", "unknown session s-9");
+    };
+    const outcome = await applyDispatchRequest(
+      request("send", { session_id: "s-9", message: "go", delivery_authorized: false }),
+      handlers,
+    );
+    expect(outcome).toEqual({
+      ok: false,
+      error: { code: "not_found", message: "unknown session s-9" },
+    });
+  });
+
+  it("送达失败时回复 delivery_failed，绝不回 ok", async () => {
+    const handlers = stubHandlers();
+    handlers.send = async () => {
+      throw new DispatchRequestError("delivery_failed", "session s-1 did not start a new turn");
+    };
+    const outcome = await applyDispatchRequest(
+      request("send", { session_id: "s-1", message: "go", delivery_authorized: false }),
+      handlers,
+    );
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok ? null : outcome.error.code).toBe("delivery_failed");
+  });
+});
+
+describe("CF-HDE-R8：send 的方向（steer / queue）", () => {
+  it("省略 mode 时默认 steer（界面不加修饰键按 Enter 的语义）", async () => {
+    const handlers = stubHandlers();
+    await applyDispatchRequest(
+      request("send", { session_id: "s-1", message: "go", delivery_authorized: false }),
+      handlers,
+    );
+    const call = handlers.calls.find((name) => name === "send");
+    expect(call).toBe("send");
+    expect(DEFAULT_DISPATCH_SEND_MODE).toBe("steer");
+  });
+
+  it("显式 mode 只有两个合法取值，猜错方向会被拒绝", async () => {
+    const handlers = stubHandlers();
+    for (const mode of DISPATCH_SEND_MODES) {
+      const outcome = await applyDispatchRequest(
+        request("send", { session_id: "s-1", message: "go", delivery_authorized: false, mode }),
+        handlers,
+      );
+      expect(outcome.ok, `mode=${mode} 应该被接受`).toBe(true);
+    }
+    const bad = await applyDispatchRequest(
+      request("send", { session_id: "s-1", message: "go", delivery_authorized: false, mode: "shout" }),
+      handlers,
+    );
+    expect(bad.ok).toBe(false);
+    expect(bad.ok ? null : bad.error.code).toBe("invalid_request");
   });
 });
 
