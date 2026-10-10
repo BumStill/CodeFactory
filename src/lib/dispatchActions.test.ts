@@ -477,6 +477,29 @@ describe("CF-HDE-R10 · 默认模型可设", () => {
     expect(useChatStore.getState().activeModel).toBe("v4-pro");
   });
 
+  it("CF-MSP-R1：入口设置默认模型后，端点的当前模型与默认模型一致（新会话取的就是设置值）", async () => {
+    seed({});
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_models") return [{ id: "v4-max", name: "v4-max", context_length: 64_000 }];
+      if (cmd === "save_settings") return (args as { newSettings: Settings }).newSettings;
+      return undefined;
+    });
+    await dispatchSetModel({ model: "v4-max" });
+    const saved = invokeMock.mock.calls.find(([cmd]) => cmd === "save_settings")?.[1] as {
+      newSettings: Settings;
+    };
+    // M60：入口只改 default_model，端点的 active_model 仍是旧值，于是"设置了
+    // 默认"和"新会话实际用的"不一致。三者必须成对落盘。
+    expect(saved.newSettings.default_model).toBe("v4-max");
+    expect(saved.newSettings.default_endpoint).toBe("deepseek");
+    expect(saved.newSettings.endpoints.deepseek.active_model).toBe("v4-max");
+    // stores/chat.ts 的新会话取模型顺序：先看端点的 active_model，再看全局默认。
+    const newSessionModel =
+      saved.newSettings.endpoints[saved.newSettings.default_endpoint]?.active_model
+      ?? saved.newSettings.default_model;
+    expect(newSessionModel).toBe("v4-max");
+  });
+
   it("模型不属于当前端点：fail-closed 报错，不做静默错配", async () => {
     seed({});
     invokeMock.mockImplementation(async (cmd: string) => {
@@ -490,20 +513,37 @@ describe("CF-HDE-R10 · 默认模型可设", () => {
     expect(useChatStore.getState().activeModel).toBe("m");
   });
 
-  it("带 session_id 时改的是那个会话的模型，且不切换界面", async () => {
+  it("带 session_id 时跨端点解析模型并成对更新，且不切换界面", async () => {
     seed({});
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "update_session_model") {
-        return { ...sessionA, model_id: (args as { modelId: string }).modelId };
+      if (cmd === "list_models") {
+        return (args as { endpointName: string }).endpointName === "chatgpt"
+          ? [{ id: "gpt-6.1-sol", name: "gpt-6.1-sol", context_length: 64_000 }]
+          : [{ id: "v4-pro", name: "v4-pro", context_length: 64_000 }];
+      }
+      if (cmd === "update_session_model_config") {
+        const input = args as { endpointId: string; modelId: string };
+        return { ...sessionA, endpoint_id: input.endpointId, model_id: input.modelId };
       }
       return undefined;
     });
-    const result = await dispatchSetModel({ sessionId: "A", model: "v4-pro" });
-    expect(invokeMock).toHaveBeenCalledWith("update_session_model", {
+    useSettingsStore.setState((state) => ({
+      settings: {
+        ...state.settings!,
+        endpoints: {
+          ...state.settings!.endpoints,
+          chatgpt: { base_url: "https://chatgpt.com/backend-api/codex", api_style: "chatgpt" },
+        },
+      },
+    }));
+    const result = await dispatchSetModel({ sessionId: "A", model: "gpt-6.1-sol" });
+    expect(invokeMock).toHaveBeenCalledWith("update_session_model_config", {
       sessionId: "A",
-      modelId: "v4-pro",
+      endpointId: "chatgpt",
+      modelId: "gpt-6.1-sol",
+      policy: "prefer",
     });
-    expect(result).toMatchObject({ scope: "session", session_id: "A" });
+    expect(result).toMatchObject({ scope: "session", session_id: "A", endpoint: "chatgpt", model: "gpt-6.1-sol" });
     expect(useChatStore.getState().activeSession?.id).toBe("B");
     expect(useChatStore.getState().activeModel).toBe("m");
   });
