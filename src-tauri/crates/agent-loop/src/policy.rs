@@ -466,6 +466,28 @@ pub fn completion_recovery_attempts_after_tool_batch(
     attempts
 }
 
+/// CF-MSP-R3: only a round that changed nothing spends the technical recovery
+/// budget. A rejected final response that still produced a fresh mutation or a
+/// fresh passing verification is progress, not a recovery: charging it let a
+/// genuinely advancing task run a productive sequence straight into
+/// `technical_recovery_exhausted` (the 2026-10-10 report burned 16 minutes of
+/// improving rounds that way, tests going from 3 failing to 50 passing).
+///
+/// The ceiling still exists. Every round that changed nothing still increments,
+/// so a model that keeps re-answering without doing any work is bounded exactly
+/// as before; progress can never reach the limit by itself, which is what the
+/// spec's "有进展的多轮不触发 exhausted" requires.
+pub fn completion_recovery_attempts_after_rejection(
+    attempts: u32,
+    material_progress: bool,
+) -> u32 {
+    if material_progress {
+        attempts
+    } else {
+        attempts.saturating_add(1)
+    }
+}
+
 pub fn completion_recovery_attempts_after_steer(attempts: u32) -> u32 {
     // A steer may refine or authorize the objective, but it must never mint a
     // fresh set of recovery rounds for the same root turn.
@@ -1602,6 +1624,49 @@ mod tests {
     fn steer_never_refills_the_turn_recovery_budget() {
         assert_eq!(completion_recovery_attempts_after_steer(0), 0);
         assert_eq!(completion_recovery_attempts_after_steer(1), 1);
+    }
+
+    /// CF-MSP-R3: a round that made real progress must not spend the technical
+    /// recovery budget, and only a round that changed nothing may.
+    #[test]
+    fn msp_r3_progress_rounds_do_not_spend_the_recovery_budget() {
+        // Continuously productive rounds never reach the limit: 200 reversals
+        // of a "made progress" round stay at zero.
+        let mut attempts = 0_u32;
+        for _ in 0..200 {
+            attempts = completion_recovery_attempts_after_rejection(attempts, true);
+        }
+        assert_eq!(
+            attempts, 0,
+            "a round with new valid work is progress, not a recovery"
+        );
+
+        // A productive round in the middle does not refund earlier stagnation.
+        let charged = completion_recovery_attempts_after_rejection(2, false);
+        assert_eq!(charged, 3, "a no-progress round still counts");
+        assert_eq!(
+            completion_recovery_attempts_after_rejection(charged, true),
+            charged,
+            "progress keeps the already-spent total without adding to it"
+        );
+
+        // Consecutive no-progress rounds still stop at the limit; progress is
+        // never a way to loop forever.
+        let limit = 3_u32;
+        let mut attempts = 0_u32;
+        let mut rounds = 0_u32;
+        while completion_finalization(
+            &evidence(false, &["x"]),
+            attempts,
+            FinalizationPolicy::BlockOnIncomplete,
+            limit,
+        ) != CompletionFinalization::Blocked(completion_blocked_message(&evidence(false, &["x"])))
+        {
+            attempts = completion_recovery_attempts_after_rejection(attempts, false);
+            rounds += 1;
+            assert!(rounds < 50, "no-progress rounds must still hit the limit");
+        }
+        assert_eq!(attempts, limit);
     }
 
     #[test]

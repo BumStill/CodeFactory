@@ -1010,6 +1010,10 @@ pub async fn run_agent_loop(
     let mut blocker_terminal_reason: Option<String> = None;
     let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
+    // CF-MSP-R3: the evidence as of the previous rejected final response. A
+    // round that advanced it did real work and must not be charged as a
+    // recovery, so the budget only bounds rounds that changed nothing.
+    let mut last_recovery_evidence = completion_gate.evidence();
     // The last delivery failure we saw, as `{code}|{stage}|{reached}|{sha}`.
     // Repair is judged by whether this CHANGES, not by how many tries have
     // happened — a count cannot tell "fixing it" from "spinning".
@@ -1657,7 +1661,17 @@ pub async fn run_agent_loop(
                         // usage on the wire every round emits it now (b14) —
                         // the tool-batch path calls this at its own end.
                         events.round_ended().await;
-                        completion_recovery_attempts += 1;
+                        let recovery_progress =
+                            codefactory_agent_core::completion_evidence_made_progress(
+                                &last_recovery_evidence,
+                                &evidence,
+                            );
+                        completion_recovery_attempts =
+                            crate::policy::completion_recovery_attempts_after_rejection(
+                                completion_recovery_attempts,
+                                recovery_progress,
+                            );
+                        last_recovery_evidence = evidence.clone();
                         require_tool_next = true;
                         // Make the rejection visible instead of silently looping:
                         // collapse the rejected candidate in the UI, persist the

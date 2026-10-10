@@ -3412,7 +3412,25 @@ async fn resume_chat_objective_inner(
     .bind(&session_id)
     .fetch_one(&db)
     .await?;
-    let history = crate::storage::load_agent_history(&db, &session_id).await?;
+    let mut history = crate::storage::load_agent_history(&db, &session_id).await?;
+    if let Some(continuation) = crate::agent::objective::incomplete_objective_continuation_prompt(
+        objective.failure_code.as_deref(),
+    ) {
+        history.push(crate::storage::Message {
+            id: format!("system-continuation:{}:{}", objective.id, objective.revision),
+            session_id: session_id.clone(),
+            role: "system".into(),
+            content: continuation.into(),
+            endpoint_id: None,
+            model_id: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls: None,
+            reasoning_content: None,
+            completion_state: None,
+            created_at: chrono::Utc::now().timestamp_millis(),
+        });
+    }
     let turn_settings = settings_for_session_route(
         &settings_snapshot,
         session.endpoint_id.as_deref(),
