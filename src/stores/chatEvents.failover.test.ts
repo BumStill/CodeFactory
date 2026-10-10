@@ -2,6 +2,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  MAX_WAIT_BEFORE_NEXT_ATTEMPT_MINUTES,
+  modelRouteExhaustedGuidance,
   presentChatInvocationError,
   reduceChatStreamEvent,
   type ChatEventState,
@@ -114,6 +116,18 @@ describe("model route failover stream events", () => {
     );
     expect(settled.streaming).toBe(false);
     expect(settled.messages[0].content).toBe(next.messages[0].content);
+  });
+
+  // U33 / CF-PFB-R12. The wait has an upper bound, so the user is told when the
+  // next attempt happens instead of being left in an indefinite "等待中".
+  it("names when the next attempt happens, bounded to five minutes", () => {
+    const guidance = modelRouteExhaustedGuidance(new Date(2026, 9, 10, 10, 29, 0));
+
+    expect(MAX_WAIT_BEFORE_NEXT_ATTEMPT_MINUTES).toBe(5);
+    expect(guidance).toContain("系统将按退避策略重新观测可用路由");
+    expect(guidance).toContain("10:34");
+    expect(guidance).toContain("本地时间");
+    expect(guidance).not.toMatch(/重试|继续执行|回到对话/);
   });
 
   it("normalizes a pre-stream invoke rejection into the same actionable state", () => {

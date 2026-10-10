@@ -518,6 +518,20 @@ pub(crate) fn transport_outage_terminal_message(unreachable_ms: i64, attempts: i
     )
 }
 
+/// U33 / CF-PFB-R12. The longest a still-recovering session may sit without any
+/// attempt. Every wait this app schedules is clamped to it, so "no attempt for
+/// more than five minutes" is a defect by construction rather than a promise.
+/// Five minutes is deliberately five times the transport probe interval and
+/// above the transport ladder's cap, so the clamp only ever bites a schedule
+/// that was already walking away from the user (production 2026-10-09 saw gaps
+/// of ~40 minutes between retries on one parked objective).
+pub(crate) const MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS: i64 = 5 * 60 * 1_000;
+
+/// U33 / CF-PFB-R12. Clamp a proposed observation time to the bound above.
+pub(crate) fn bounded_next_observation_at(now: i64, proposed_at: i64) -> i64 {
+    proposed_at.min(now.saturating_add(MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS))
+}
+
 fn recovery_backoff_ms_for(failure_code: Option<&str>, prior_attempts: i64) -> i64 {
     if failure_code == Some(PROVIDER_ENDPOINT_UNAVAILABLE) {
         return DEAD_ENDPOINT_RETRY_MS;
@@ -6407,10 +6421,16 @@ impl ObjectiveStore {
                 .ok_or_else(|| anyhow!("waiting_system next observation missing"))?;
             // Only a *repeat* backs off. The first occurrence keeps whatever the
             // caller asked for, so ordinary recovery stays as responsive as it
-            // was and nothing that observes immediately is delayed.
+            // was and nothing that observes immediately is delayed. U33/R12: the
+            // backoff ladder is clamped, so a parked session always gets an
+            // attempt within MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS.
             let scheduled_observation = if prior_attempts > 0 {
-                requested_observation
-                    .max(now + recovery_backoff_ms_for(decision.failure_code.as_deref(), prior_attempts))
+                bounded_next_observation_at(
+                    now,
+                    requested_observation.max(
+                        now + recovery_backoff_ms_for(decision.failure_code.as_deref(), prior_attempts),
+                    ),
+                )
             } else {
                 requested_observation
             };
@@ -12324,6 +12344,42 @@ CREATE TABLE objectives (
             recovery_backoff_ms_for(Some(PROVIDER_ENDPOINT_UNAVAILABLE), 5),
             DEAD_ENDPOINT_RETRY_MS,
             "an explicit refusal keeps the short path"
+        );
+    }
+
+    /// U33 / CF-PFB-R12. "No attempt for more than N minutes is a defect" has to
+    /// hold for every schedule this module can produce, not just the transport
+    /// one — so the bound is asserted against the whole ladder, and against a
+    /// proposal that tried to walk an hour out.
+    #[test]
+    fn no_wait_schedule_may_exceed_the_upper_bound() {
+        let now = 1_777_000_000_000_i64;
+        assert_eq!(
+            bounded_next_observation_at(now, now + 60 * 60 * 1_000),
+            now + MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS,
+            "a proposed wait an hour out is clamped to the bound"
+        );
+        assert_eq!(
+            bounded_next_observation_at(now, now + 20_000),
+            now + 20_000,
+            "an ordinary short wait is left exactly as asked"
+        );
+        for prior in 0..12 {
+            for code in [
+                Some(PROVIDER_TRANSPORT_UNREACHABLE),
+                Some(PROVIDER_ENDPOINT_UNAVAILABLE),
+                None,
+            ] {
+                let delay = recovery_backoff_ms_for(code, prior);
+                assert!(
+                    delay <= MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS,
+                    "the backoff ladder may never exceed the wait bound ({code:?}, prior={prior}, delay={delay})"
+                );
+            }
+        }
+        assert!(
+            TRANSPORT_PROBE_INTERVAL_MS <= MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS,
+            "the outage probe must be more frequent than the bound"
         );
     }
 
