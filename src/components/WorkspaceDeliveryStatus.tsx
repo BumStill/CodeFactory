@@ -195,7 +195,7 @@ export function WorkspaceDeliveryStatus({
   const pr = snapshot?.pr;
   const ci = ciLabel(snapshot?.ci_status);
   const summary = deliverySummary(pr, ci, snapshot?.release ?? null, unavailable, snapshot);
-  const statusTone = snapshot?.ci_status.startsWith("failure")
+  const statusTone = pr?.state === "open" && snapshot?.ci_status.startsWith("failure")
     ? "danger"
     : unavailable
       ? "warning"
@@ -336,6 +336,8 @@ function deliveryVisibleSummary(pr: DeliveryPr | null | undefined, snapshot: Del
   if (unavailable) return "远程状态不可用";
   if (!snapshot) return "读取中…";
   if (!pr) return "未关联 PR";
+  if (pr.state === "closed") return "已关闭";
+  if (pr.state === "merged" && snapshot.ci_status !== "success") return "已合并 · 待发布";
   if (snapshot.ci_status.startsWith("failure")) return "CI 失败";
   if (snapshot.ci_status.includes("running") || snapshot.ci_status.includes("pending")) return "CI 运行中";
   if (pr.state === "merged") return snapshot.release ? "未验证上线" : "待发布";
@@ -347,6 +349,8 @@ function deliverySummary(pr: DeliveryPr | null | undefined, ci: string, release:
   if (unavailable) return "远程状态不可用";
   if (!snapshot) return "读取交付状态…";
   if (!pr) return "未关联 PR";
+  if (pr.state === "closed") return "已关闭";
+  if (pr.state === "merged" && snapshot.ci_status !== "success") return "已合并 · 待发布";
   if (snapshot.ci_status.startsWith("failure")) return "CI 失败";
   if (snapshot.ci_status.includes("running") || snapshot.ci_status.includes("pending")) return "CI 运行中";
   if (pr.state === "merged") return release ? `${ci} · 已合并 · ${release.tag} · 未验证上线` : `${ci} · 已合并 · 待发布`;

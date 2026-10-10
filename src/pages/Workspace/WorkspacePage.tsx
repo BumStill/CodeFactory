@@ -48,6 +48,7 @@ import { parseVerification, verificationSummary } from "../../lib/verification";
 import { currentTurnOwnership } from "../../lib/turnOwnership";
 import { useDesktopMenuBridge } from "../../lib/useDesktopMenuBridge";
 import { useDesktopDispatchBridge } from "../../lib/useDesktopDispatchBridge";
+import type { DispatchApproval } from "../../lib/desktopDispatch";
 
 type WorkspaceBrowserSession = BrowserSession & {
   status?: string | null;
@@ -409,13 +410,7 @@ export function WorkspacePage({
         return { stopped };
       },
       listApprovals: async () => {
-        const store = useChatStore.getState();
-        return Object.entries(store.runtime).flatMap(([sessionId, runtime]) => {
-          const pending = runtime?.pendingPermission;
-          return pending
-            ? [{ approvalId: pending.intentId, toolName: pending.toolName, sessionId }]
-            : [];
-        });
+        return invoke<DispatchApproval[]>("list_pending_approvals");
       },
       resolveApproval: async ({ approvalId, approve }) => {
         // 一次只处理一条:高危操作仍然要编排方明确选"批"或"拒",没有批量放行。

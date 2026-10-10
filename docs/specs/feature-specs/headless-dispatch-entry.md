@@ -68,3 +68,29 @@ entry `lib.rs::run()` — the one place the frozen `main` falls through to — b
 any Tauri/GUI work. The socket client lives in `headless_dispatch::run_client_cli`.
 The documented, orchestrator-facing command remains `node scripts/dispatch-task.mjs`,
 which speaks the same protocol directly to the private socket.
+
+## 第二阶段（2026-10-10，补齐实测缺口）
+
+### Requirements Traceability
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| CF-HDE-R0 | **作用对象必须正确（最高优先）**：所有带 session_id 的操作（send / stop / set_permission / set_model / status / resolve_approval）只作用于该 session_id 指定的会话，与界面当前显示哪个会话无关；不存在或无法定位时返回 not_found，绝不退回「当前会话」。待发队列必须按会话隔离，绝不能把 A 的消息冲进 B | 集成测试：界面显示 B 时对 A 执行 send / stop，断言只有 A 收到或停止、B 毫无变化；复现 14:30 与 14:42 两条时序 |
+| CF-HDE-R12 | **待审批全量可见**：`list_approvals` 列出所有会话里所有待审批的请求（含 bash 等工具权限），带会话 id、工具名、参数摘要、过期时间；`resolve_approval` 仍然一次只处理一条，并且走同一套权限规则 | 集成测试：多个会话各有待审批时全部列出，批准或拒绝只影响指定那一条 |
+| CF-HDE-R7 | **送达如实回报**：`send` 的应答必须明确是「已送达并开始处理」还是「已排队及排在什么之后」。发给空闲会话时，一定立即开始新的一轮，不能因为界面残留的旧回合状态而挂起；挂起超过有界时间要回报失败，不能回报 ok | 集成测试：空闲会话、残留回合状态、运行中三种情况各自的应答与实际落库一致 |
+| CF-HDE-R8 | **插话与排队可选**：`send` 支持「插话引导当前执行」和「本轮结束后再发」两种方式（默认值自定并说明理由），与界面上 Enter / ⌘Enter 的语义一致 | 测试：两种方式行为与界面一致 |
+| CF-HDE-R9 | **状态可信且够用**：`status` 返回的 objective_state 与真实执行情况一致（例如在模型调用就不能显示等待重试）；latest_reply 给出最近一条回复的摘要；pr_number 取自交付记录；另外返回最近一次模型调用的上下文大小（token 数），供编排方判断是回原会话追加还是另开新会话 | 测试：断言各字段与库内事实一致 |
+| CF-HDE-R10 | **默认模型可设**：`set_model` 省略 session_id 时，设置新会话的默认模型（端点与模型保持配套，不能出现「端点是 deepseek、默认模型是 gpt」这类错配），与文档一致 | 测试 + 文档 |
+| CF-HDE-R11 | **界面状态同源**（M53）：顶部状态提示与会话列表的转圈，和 R9 用同一个真实来源，不再停在过期的「等待自动重试」 | 组件测试 + 真浏览器截图（light/dark） |
+
+### Applicable Harnesses
+Spec Harness；Compatibility Harness；Observation Harness；Viewport Harness（R11）；AI Collaboration Harness。本任务碰安全边界：沿用第一阶段的威胁模型，PR 写明新增字段没有放宽任何关卡。
+
+### 测试矩阵
+- R0：界面显示 B，对 A 执行 send / stop / set_permission / set_model；对不存在的会话执行同样操作。
+- `send`：空闲会话、残留旧回合状态的会话（复现 M56）、运行中会话 × 插话 / 排队两种方式。
+- `status`：运行中、等待、已结束、开过 PR 的会话。
+- `set_model`：带 session_id 和不带 session_id 两种。
+
+### 约束
+- 不开网络端口；不绕过任何关卡；交付授权仍然只认结构化字段。

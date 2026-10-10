@@ -206,13 +206,13 @@ export function PermissionDialog({
             <Check size={14} />
             仅允许一次
           </button>
-          <button
+          {!trusted && <button
             onClick={onAllowFullAccess}
             className="inline-flex min-h-11 items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 text-label text-amber-900 dark:text-amber-100 hover:bg-amber-500/20 lg:min-h-9"
           >
             <Unlock size={14} />
             信任本会话并允许
-          </button>
+          </button>}
         </div>
       </div>
     </div>
