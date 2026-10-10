@@ -30,6 +30,7 @@ import type { Session, Settings } from "../lib/tauri";
 import type { UIMessage } from "../stores/chatEvents";
 import {
   DISPATCH_DELIVERY_AHEAD_CURRENT_RUN,
+  DISPATCH_STEER_PENDING_NOTE,
   dispatchSend,
   dispatchSetModel,
   dispatchSetPermission,
@@ -308,18 +309,82 @@ describe("CF-HDE-R8 · 插话与排队可选", () => {
     ],
   };
 
-  it("运行中 + steer：插话引导当前执行", async () => {
+  it("运行中 + steer：这一轮真的读到了才算 delivered", async () => {
     seed({ a: runningA });
-    const receipt = await dispatchSend({ sessionId: "A", message: "先改这个", mode: "steer" });
+    // 模拟这一轮在下一个回合边界读走了这条插话（`steer_applied` 清掉待处理标记）。
+    setTimeout(() => {
+      const st = useChatStore.getState();
+      const runtime = st.runtime.A;
+      useChatStore.setState({
+        runtime: {
+          ...st.runtime,
+          A: {
+            ...runtime,
+            messages: runtime.messages.map((m) => ({ ...m, steerPending: undefined })),
+          },
+        },
+      });
+    }, 5);
+    const receipt = await dispatchSend(
+      { sessionId: "A", message: "先改这个", mode: "steer" },
+      { steerAppliedTimeoutMs: 200 },
+    );
     expect(receipt.delivery).toEqual({ status: "delivered", into: "current_run" });
     expect(invokeMock).toHaveBeenCalledWith("queue_interjection", {
       sessionId: "A",
       message: "先改这个",
+      clientMessageId: expect.any(String),
     });
     const state = useChatStore.getState();
     expect(state.runtime.A.messages.some((m) => m.content === "先改这个")).toBe(true);
     expect(state.runtime.B.messages).toHaveLength(0);
     expect(state.activeSession?.id).toBe("B");
+  });
+
+  // CF-STOP-R4（M63，v1.84.0 真机）：这一轮卡在交付工具里等锁时，旧实现回报
+  // `delivered / current_run`，但模型要等下一次调用才读得到插话，而那一刻不会来。
+  // 现状是如实回报 `queued`：插话排在当前这一轮，当前工具调用返回后读取。
+  it("M63 时序：卡在工具里读不到时回报 queued，而不是 delivered", async () => {
+    seed({ a: runningA });
+    const receipt = await dispatchSend(
+      { sessionId: "A", message: "改用 chrome channel", mode: "steer" },
+      { steerAppliedTimeoutMs: 30 },
+    );
+    expect(receipt.delivery).toEqual({
+      status: "queued",
+      queue_position: 1,
+      ahead: DISPATCH_DELIVERY_AHEAD_CURRENT_RUN,
+      note: DISPATCH_STEER_PENDING_NOTE,
+    });
+    expect(receipt.delivery.status).not.toBe("delivered");
+    expect(invokeMock).toHaveBeenCalledWith("queue_interjection", {
+      sessionId: "A",
+      message: "改用 chrome channel",
+      clientMessageId: expect.any(String),
+    });
+  });
+
+  // 同一条消息不能因为停止后又续跑而落两遍：还没被读到之前不再送第二次。
+  it("同一条插话在还没被读到时只落一次", async () => {
+    seed({ a: runningA });
+    const first = await dispatchSend(
+      { sessionId: "A", message: "别提交", mode: "steer" },
+      { steerAppliedTimeoutMs: 30 },
+    );
+    const second = await dispatchSend(
+      { sessionId: "A", message: "别提交", mode: "steer" },
+      { steerAppliedTimeoutMs: 30 },
+    );
+
+    expect(first.delivery.status).toBe("queued");
+    expect(second.delivery.status).toBe("queued");
+    const interjectionCalls = invokeMock.mock.calls.filter(
+      ([cmd]) => cmd === "queue_interjection",
+    );
+    expect(interjectionCalls).toHaveLength(1);
+    expect(
+      useChatStore.getState().runtime.A.messages.filter((m) => m.content === "别提交"),
+    ).toHaveLength(1);
   });
 
   it("运行中 + queue：本轮结束后再发", async () => {

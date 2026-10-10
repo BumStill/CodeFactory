@@ -278,6 +278,20 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     .execute(pool)
     .await?;
 
+    // CF-STOP：会话级交付停止栅栏。停止之后这个会话名下**还没发生**的交付动作
+    // （推送 / 开 PR / 合并 / 发版）一律不再执行；背景见
+    // `docs/specs/feature-specs/stop-means-stop.md`。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS delivery_stop_fences (
+            session_id    TEXT PRIMARY KEY,
+            reason        TEXT NOT NULL,
+            pr_number     INTEGER,
+            stopped_at_ms INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // ── Tables that historic ad-hoc migrations created — fresh installs
     //    miss them and the corresponding command modules would crash on
     //    first use. CREATE IF NOT EXISTS is a no-op on existing DBs.

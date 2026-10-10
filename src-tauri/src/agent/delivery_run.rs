@@ -2635,6 +2635,48 @@ pub async fn record_delivery_observation(
     Ok(progressed)
 }
 
+/// CF-STOP-R3 — a stopped session's delivery is not the recovery loop's business.
+///
+/// The stop fence outranks the run's own status on purpose: if the process dies
+/// between "write the fence" and "persist stopped", the restart must still see
+/// the stop. Only an explicit resume (`agent::stop_fence::resume_delivery`,
+/// called by a user/orchestrator continue intent — never by recovery) puts the
+/// delivery back into the recoverable set.
+async fn park_delivery_runs_for_stopped_sessions(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    now: i64,
+) -> Result<()> {
+    // The fence table is created at startup by `storage::db`; a fresh database
+    // or a unit-test schema may not have it yet, so create it idempotently here
+    // too (same DDL as `agent::stop_fence::ensure_schema`).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS delivery_stop_fences (
+            session_id    TEXT PRIMARY KEY,
+            reason        TEXT NOT NULL,
+            pr_number     INTEGER,
+            stopped_at_ms INTEGER NOT NULL
+        )",
+    )
+    .execute(&mut **tx)
+    .await?;
+    let park_sql = format!(
+        "UPDATE delivery_runs
+         SET status='stopped', wait_class='stopped_by_user', next_action_authorized=0,
+             lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+         WHERE {NON_TERMINAL_PREDICATE}
+           AND session_id IS NOT NULL AND session_id <> ''
+           AND EXISTS (
+             SELECT 1 FROM delivery_stop_fences fence
+             WHERE fence.session_id = delivery_runs.session_id
+           )"
+    );
+    sqlx::query(&park_sql)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn park_delivery_runs_linked_to_exhausted_objectives(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     process: &ProcessIdentity,
@@ -2730,6 +2772,8 @@ pub async fn plan_startup_recovery(
 ) -> Result<StartupRecoveryPlan> {
     let mut tx = pool.begin().await?;
     park_delivery_runs_linked_to_exhausted_objectives(&mut tx, process, now).await?;
+    // CF-STOP-R3：用户/编排方停掉的会话，它的交付不再由后台恢复回路接手。
+    park_delivery_runs_for_stopped_sessions(&mut tx, now).await?;
 
     let missing_sql = format!(
         "SELECT id FROM delivery_runs
@@ -2878,7 +2922,78 @@ mod tests {
             .await
             .unwrap();
         ensure_schema(&pool).await.unwrap();
+        // CF-STOP：生产里这张表由 `storage::db` 建；这里补一次，让恢复用例能写下
+        // 停止栅栏（与 `plan_startup_recovery` 的幂等建表是同一份 DDL）。
+        crate::agent::stop_fence::ensure_schema(&pool).await.unwrap();
         pool
+    }
+
+    /// CF-STOP-R3 最低证据：被停止的会话，它的交付运行不会在重启后被恢复回路接手。
+    #[tokio::test]
+    async fn a_stopped_sessions_delivery_is_never_resumed_by_startup_recovery() {
+        let pool = pool().await;
+        insert_recovery_fixture(
+            &pool,
+            "stopped-session",
+            Some("session-stopped"),
+            Some("turn-stopped"),
+            "waiting",
+            99,
+        )
+        .await;
+        sqlx::query("UPDATE delivery_runs SET next_action_authorized=1 WHERE id='stopped-session'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 同一批里还有一个没被停止的等待运行时，用来证明恢复回路本身还在工作。
+        insert_recovery_fixture(
+            &pool,
+            "live-session",
+            Some("session-live"),
+            Some("turn-live"),
+            "waiting",
+            99,
+        )
+        .await;
+        sqlx::query("UPDATE delivery_runs SET next_action_authorized=1 WHERE id='live-session'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::agent::stop_fence::record_stop(&pool, "session-stopped", "user_stop", Some(584))
+            .await
+            .unwrap();
+
+        let plan = plan_startup_recovery(
+            &pool,
+            &ProcessIdentity::new("process-new", "1.84.0", "18400"),
+            100,
+            30,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            plan.claimed.iter().all(|run| run.run_id != "stopped-session"),
+            "停止过的会话不得被恢复回路接手: {:?}",
+            plan.claimed
+                .iter()
+                .map(|run| &run.run_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            plan.claimed.iter().any(|run| run.run_id == "live-session"),
+            "没有被停止的等待运行时仍然可以被恢复"
+        );
+        let (status, wait_class, authorized): (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT status, wait_class, next_action_authorized FROM delivery_runs
+             WHERE id='stopped-session'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "stopped");
+        assert_eq!(wait_class.as_deref(), Some("stopped_by_user"));
+        assert_eq!(authorized, 0, "停止后的运行不得再自动续跑");
     }
 
     #[tokio::test]
