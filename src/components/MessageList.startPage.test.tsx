@@ -19,7 +19,9 @@ vi.mock("../lib/tauri", () => ({
   invoke: vi.fn(() => Promise.reject(new Error("usage unavailable"))),
 }));
 vi.mock("../stores/settings", () => ({
-  useSettingsStore: () => ({ settings: null }),
+  useSettingsStore: Object.assign(() => ({ settings: null }), {
+    getState: () => ({ settings: null }),
+  }),
 }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => {}),
