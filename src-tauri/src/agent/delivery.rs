@@ -14650,7 +14650,7 @@ GITHUB.COM:
     // ── CF-TRUTH-R2: the delivery subject must be a real conventional title ──
 
     fn git_in(root: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
+        let status = std::process::Command::new("git").no_window()
             .arg("-C")
             .arg(root)
             .args(args)
@@ -14747,7 +14747,7 @@ GITHUB.COM:
         git_in(root, &["add", "."]);
         git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
         let base = String::from_utf8(
-            std::process::Command::new("git")
+            std::process::Command::new("git").no_window()
                 .arg("-C")
                 .arg(root)
                 .args(["rev-parse", "HEAD"])
@@ -14777,7 +14777,7 @@ GITHUB.COM:
             .expect("repository root")
             .to_path_buf();
         let plan = |revision_range: &str| -> serde_json::Value {
-            let output = std::process::Command::new("python3")
+            let output = std::process::Command::new("python3").no_window()
                 .arg(repo_root.join("tools/release/plan_release.py"))
                 .arg("--repo")
                 .arg(root)
