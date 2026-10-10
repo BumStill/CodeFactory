@@ -116,8 +116,28 @@ export interface TransportRetryState {
 }
 
 const MODEL_ROUTE_EXHAUSTED_PREFIX = "所有可用模型端点均不可用：";
-export const MODEL_ROUTE_EXHAUSTED_GUIDANCE =
-  "所有已配置且有凭据的模型端点都暂时不可用。目标与失败证据已保留；系统将按退避策略重新观测可用路由。";
+
+/** U33 / CF-PFB-R12. The upper bound the backend clamps every wait to, in
+ *  minutes. Kept in one place so the user-visible promise and the scheduler
+ *  bound cannot drift apart. */
+export const MAX_WAIT_BEFORE_NEXT_ATTEMPT_MINUTES = 5;
+
+/**
+ * U33 / CF-PFB-R12: the user-visible text for "every endpoint is unavailable".
+ * The wait has an upper bound, so the sentence names when the next attempt
+ * happens instead of leaving the user staring at an indefinite "等待中".
+ */
+export function modelRouteExhaustedGuidance(now: Date = new Date()): string {
+  const nextAttempt = new Date(
+    now.getTime() + MAX_WAIT_BEFORE_NEXT_ATTEMPT_MINUTES * 60_000,
+  );
+  const clock = `${String(nextAttempt.getHours()).padStart(2, "0")}:${String(
+    nextAttempt.getMinutes(),
+  ).padStart(2, "0")}`;
+  return `所有已配置且有凭据的模型端点都暂时不可用。目标与失败证据已保留；系统将按退避策略重新观测可用路由，最迟在 ${clock}（本地时间）之前再试一次，不需要你操作。`;
+}
+
+export const MODEL_ROUTE_EXHAUSTED_GUIDANCE = modelRouteExhaustedGuidance();
 
 export function isModelRouteExhaustedError(message: string): boolean {
   return message.startsWith(MODEL_ROUTE_EXHAUSTED_PREFIX);
