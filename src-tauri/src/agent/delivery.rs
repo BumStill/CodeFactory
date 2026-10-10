@@ -187,6 +187,13 @@ impl DeliveryOutcome {
                 }
                 RecoveryClass::None | RecoveryClass::WaitRetryable => false,
             },
+            "stopped" => {
+                // CF-STOP-R1: a stop is terminal for this delivery. It is not
+                // "recoverable" — recovery must never talk itself back into it.
+                !self.recoverable
+                    && self.recovery_class == RecoveryClass::None
+                    && self.retry_after_ms.is_none()
+            }
             _ => false,
         };
         valid.then_some(()).ok_or_else(|| {
@@ -195,6 +202,25 @@ impl DeliveryOutcome {
                 self.final_state, self.recoverable, self.recovery_class
             )
         })
+    }
+
+    /// CF-STOP-R1: the session was stopped, so nothing encoded here ever
+    /// happened. `self.steps` keeps what DID happen, and the summary says where
+    /// the run stopped and what stayed untouched.
+    fn stopped_at(mut self, stage: &str, reason: &str) -> Self {
+        let notice = crate::agent::stop_fence::stopped_delivery_notice(self.pr_number);
+        self.stage = stage.into();
+        self.code = "delivery_stopped".into();
+        self.recoverable = false;
+        self.recovery_class = RecoveryClass::None;
+        self.retry_after_ms = None;
+        self.next_action = Some(notice.clone());
+        self.reached_state = reached_state_from_steps(&self.steps);
+        self.steps
+            .push(StepResult::skipped(stage, format!("{notice}（停止原因：{reason}）")));
+        self.final_state = "stopped".into();
+        self.summary = notice;
+        self
     }
 
     fn blocked_at(mut self, step: StepResult) -> Self {
@@ -580,6 +606,20 @@ pub struct DeliverOpts {
     /// every local or external mutation rung. Non-durable/manual callers leave
     /// this unset and retain the legacy single-process behavior.
     pub mutation_permit: Option<DeliveryMutationPermit>,
+    /// CF-STOP-R1: the session-scoped stop state, read immediately before every
+    /// **not-yet-happened** action. A stop can arrive while this ladder is
+    /// parked waiting for CI (M47), so this is consulted on every rung rather
+    /// than once at entry. `None` = no stop source configured (tests, manual
+    /// single-process callers).
+    pub stop_gate: Option<Arc<dyn crate::agent::stop_fence::DeliveryStopGate>>,
+}
+
+/// CF-STOP-R1: is this delivery's session stopped? `None` = it may proceed.
+async fn stop_reason(opts: &DeliverOpts) -> Option<String> {
+    match opts.stop_gate.as_ref() {
+        Some(gate) => gate.stop_reason().await,
+        None => None,
+    }
 }
 
 async fn verify_mutation_permit(opts: &DeliverOpts, rung: &str) -> Result<(), StepResult> {
@@ -4127,6 +4167,11 @@ pub async fn deliver<R: DeliveryRemote>(
     }
 
     // ── Push ────────────────────────────────────────────────────────────────
+    // CF-STOP-R1: a stop that arrived after the commit but before the push ends
+    // the delivery here — the commit stays local, nothing is published.
+    if let Some(reason) = stop_reason(opts).await {
+        return outcome.stopped_at("push", &reason);
+    }
     if let Err(step) = verify_mutation_permit(opts, "git_push").await {
         return outcome.blocked_on_uncertain_side_effect(step);
     }
@@ -4562,6 +4607,10 @@ pub async fn deliver<R: DeliveryRemote>(
         let had_pr_receipt = prior_receipt
             .as_ref()
             .is_some_and(|receipt| receipt.state == "pr_open");
+        // CF-STOP-R1: 停止之后不再开新 PR。
+        if let Some(reason) = stop_reason(opts).await {
+            return outcome.stopped_at("pr", &reason);
+        }
         if let Err(step) = verify_mutation_permit(opts, "open_or_get_pr").await {
             return outcome.blocked_on_uncertain_side_effect(step);
         }
@@ -4692,6 +4741,11 @@ pub async fn deliver<R: DeliveryRemote>(
         if let Some(step) = ci_wait.mutation_permit_failure {
             return outcome.blocked_on_uncertain_side_effect(step);
         }
+        // CF-STOP-R1（M47）: 停止发生在等 CI 期间时，CI 的结果已经不重要——
+        // 这一轮不会再有合并。
+        if let Some(reason) = ci_wait.stop_reason {
+            return outcome.stopped_at("merge", &reason);
+        }
         for detail in ci_wait.recoveries {
             outcome.steps.push(StepResult::ok("ci_recovery", detail));
         }
@@ -4731,6 +4785,11 @@ pub async fn deliver<R: DeliveryRemote>(
         }
 
         // ── Merge ───────────────────────────────────────────────────────────
+        // CF-STOP-R1: 合并前的最后一次核对。CI 已经绿了也照样停下：停止之后
+        // "已经发生的不回滚，还没发生的绝不再做"。
+        if let Some(reason) = stop_reason(opts).await {
+            return outcome.stopped_at("merge", &reason);
+        }
         if let Err(step) = verify_mutation_permit(opts, "refresh_canonical_pr").await {
             return outcome.blocked_on_uncertain_side_effect(step);
         }
@@ -4977,6 +5036,10 @@ pub async fn deliver<R: DeliveryRemote>(
             pr_body: Some(release_policy.durable_body.clone()),
             release_detail: Some(release_target_envelope),
         };
+        // CF-STOP-R1：停止之后不再发版。
+        if let Some(reason) = stop_reason(opts).await {
+            return outcome.stopped_at("release", &reason);
+        }
         if let Err(step) = verify_mutation_permit(opts, "receipt_intent_release").await {
             return outcome.blocked_on_uncertain_side_effect(step);
         }
@@ -5394,6 +5457,9 @@ struct CiWaitOutcome {
     status: CiStatus,
     recoveries: Vec<String>,
     mutation_permit_failure: Option<StepResult>,
+    /// CF-STOP-R1: set when the session's stop fence appeared while this wait
+    /// was parked. The CI result is irrelevant then — nothing may be merged.
+    stop_reason: Option<String>,
 }
 
 fn ci_failure_is_retryable(detail: &str) -> bool {
@@ -5421,6 +5487,18 @@ async fn wait_for_ci<R: DeliveryRemote>(
     // snappy while slashing total calls on longer runs.
     let mut interval = 10u32;
     loop {
+        // CF-STOP-R1: this wait is the exact place M47 escaped through — the
+        // user stopped the session, the ladder kept polling, CI turned green,
+        // and the PR was merged minutes later. Read the stop fence before every
+        // poll, so a stop ends the wait instead of merely decorating it.
+        if let Some(reason) = stop_reason(opts).await {
+            return CiWaitOutcome {
+                status: CiStatus::Pending,
+                recoveries,
+                mutation_permit_failure: None,
+                stop_reason: Some(reason),
+            };
+        }
         match remote.ci_status(sha).await {
             Ok(CiStatus::Pending) => {}
             Ok(CiStatus::Failure(detail)) if ci_failure_is_retryable(&detail) && reruns < 1 => {
@@ -5429,6 +5507,7 @@ async fn wait_for_ci<R: DeliveryRemote>(
                         status: CiStatus::Failure(detail),
                         recoveries,
                         mutation_permit_failure: Some(step),
+                        stop_reason: None,
                     };
                 }
                 match remote.rerun_ci(sha, opts.mutation_permit.as_ref()).await {
@@ -5448,6 +5527,7 @@ async fn wait_for_ci<R: DeliveryRemote>(
                             )),
                             recoveries,
                             mutation_permit_failure: None,
+                            stop_reason: None,
                         }
                     }
                     Err(error) => {
@@ -5457,6 +5537,7 @@ async fn wait_for_ci<R: DeliveryRemote>(
                             )),
                             recoveries,
                             mutation_permit_failure: None,
+                            stop_reason: None,
                         }
                     }
                 }
@@ -5466,6 +5547,7 @@ async fn wait_for_ci<R: DeliveryRemote>(
                     status: other,
                     recoveries,
                     mutation_permit_failure: None,
+                    stop_reason: None,
                 }
             }
             Err(e) => {
@@ -5473,6 +5555,7 @@ async fn wait_for_ci<R: DeliveryRemote>(
                     status: CiStatus::Unavailable(e),
                     recoveries,
                     mutation_permit_failure: None,
+                    stop_reason: None,
                 }
             }
         }
@@ -5481,6 +5564,7 @@ async fn wait_for_ci<R: DeliveryRemote>(
                 status: CiStatus::Pending,
                 recoveries,
                 mutation_permit_failure: None,
+                stop_reason: None,
             };
         }
         let sleep_secs = interval.min(deadline - waited);
@@ -10912,6 +10996,7 @@ else:
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                stop_gate: None,
             },
             Some(&remote),
             Some("main"),
@@ -11159,6 +11244,9 @@ else:
         release_observation: Mutex<Option<ReleaseDispatchObservation>>,
         created_pr: Mutex<Option<DeliveryPr>>,
         branch_update_repo: Mutex<Option<PathBuf>>,
+        /// CF-STOP-R1: tripped by the first CI poll, so the stop arrives exactly
+        /// while the ladder is parked waiting for CI (the M47 timing).
+        stop_gate_on_ci: Mutex<Option<Arc<crate::agent::stop_fence::FlagStopGate>>>,
     }
 
     fn stub_calls() -> Arc<StubCalls> {
@@ -11366,6 +11454,10 @@ else:
         async fn ci_status(&self, sha: &str) -> Result<CiStatus, String> {
             self.calls.ci.fetch_add(1, Ordering::SeqCst);
             *self.calls.last_ci_sha.lock().unwrap() = Some(sha.to_string());
+            // The stop this test models arrives between two CI polls.
+            if let Some(gate) = self.calls.stop_gate_on_ci.lock().unwrap().take() {
+                gate.stop();
+            }
             if let Some(status) = self.calls.ci_sequence.lock().unwrap().pop_front() {
                 return Ok(status);
             }
@@ -13347,6 +13439,159 @@ Release-Urgency: hold"
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
+    // ── CF-STOP：停止之后，还没发生的动作一项都不做 ─────────────────────────
+    //
+    // M47（2026-10-09 17:12）：用户用菜单「停止当前执行」停掉会话，objective 变成
+    // cancelled；17:25，这次交付在 CI 变绿后照样自动 squash 合并了 #584。交付是一条
+    // 自己的长时间线，停止必须成为它在**每个后续动作前**都能读到的事实。
+
+    /// CF-STOP-R1 最低证据：停止发生在等 CI 期间，CI 随后变绿，PR 仍然不被合并，
+    /// 而且结论如实写明「PR #7 保持打开，没有合并」。
+    #[tokio::test]
+    async fn r1_a_stop_while_waiting_for_ci_never_merges_the_green_pr() {
+        let root = feature_branch_repo("stop-during-ci-wait");
+        let calls = stub_calls();
+        // 第一次轮询还"在跑"；停止就在这之后到达，随后 CI 才变绿。
+        *calls.ci_sequence.lock().unwrap() = VecDeque::from([CiStatus::Pending, CiStatus::Success]);
+        let gate = crate::agent::stop_fence::FlagStopGate::new("user_stop");
+        *calls.stop_gate_on_ci.lock().unwrap() = Some(gate.clone());
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughMerge,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                stop_gate: Some(gate),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "stopped", "{:?}", out.steps);
+        assert_eq!(out.code, "delivery_stopped");
+        assert!(!out.recoverable, "停止不是可恢复的等待");
+        assert_eq!(out.pr_number, Some(7));
+        // 已经发生的（提交 / 推送 / 开 PR）不回滚……
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 1);
+        // ……还没发生的（合并）一项都不做，CI 变绿也不行。
+        assert_eq!(
+            calls.merge.load(Ordering::SeqCst),
+            0,
+            "停止之后 CI 变绿，合并仍然不能发生"
+        );
+        assert!(
+            !out.steps.iter().any(|s| s.step == "merge" && s.status == "ok"),
+            "{:?}",
+            out.steps
+        );
+        assert!(
+            out.summary.contains("PR #7 保持打开，没有合并"),
+            "结论必须如实说明 PR 的处境: {}",
+            out.summary
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// CF-STOP-R1/R3：停止已经生效之后，一次没有显式继续的交付尝试也不会
+    /// 「悄悄恢复」——推送、开 PR、合并、发版全部不发生。
+    #[tokio::test]
+    async fn r3_a_stopped_session_never_silently_resumes_delivery() {
+        let root = feature_branch_repo("stop-no-silent-resume");
+        let origin = root.parent().unwrap().join("origin.git");
+        let calls = stub_calls();
+        let gate = crate::agent::stop_fence::FlagStopGate::new("user_stop");
+        gate.stop();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        for _ in 0..2 {
+            let out = deliver(
+                &root,
+                DeliveryCeiling::ThroughRelease,
+                MergeMethod::Squash,
+                5,
+                &DeliverOpts {
+                    stop_gate: Some(gate.clone()),
+                    ..DeliverOpts::default()
+                },
+                Some(&remote),
+                Some("main"),
+            )
+            .await;
+            assert_eq!(out.final_state, "stopped", "{:?}", out.steps);
+            assert!(out.summary.contains("明确发起"), "{}", out.summary);
+        }
+
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        assert!(
+            git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
+            "停止之后的任何一次交付尝试都不得推送"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// CF-STOP-R1：提交已经发生、推送还没发生时停止，只留下本地提交。
+    #[tokio::test]
+    async fn r1_a_stop_before_push_leaves_the_commit_unpublished() {
+        let root = feature_branch_repo("stop-before-push");
+        let origin = root.parent().unwrap().join("origin.git");
+        let calls = stub_calls();
+        let gate = crate::agent::stop_fence::FlagStopGate::new("user_stop");
+        gate.stop();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughMerge,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                stop_gate: Some(gate),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "stopped", "{:?}", out.steps);
+        assert_eq!(out.stage, "push");
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+        assert!(
+            git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
+            "停止在推送之前，远端不应出现这个分支"
+        );
+        assert!(out.summary.contains("不再执行还没发生的交付动作"), "{}", out.summary);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     // ── The ladder descends; it is never cancelled wholesale ────────────────
     //
     // 2026-07-30 field report: `deliver_changes` refused with "交付预检未通过:
@@ -14330,6 +14575,7 @@ Release-Urgency: hold"
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                stop_gate: None,
             },
             Some(&remote),
             Some("main"),
@@ -14369,6 +14615,7 @@ Release-Urgency: hold"
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                stop_gate: None,
             },
             Some(&remote),
             Some("main"),
@@ -14432,6 +14679,7 @@ Release-Urgency: hold"
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                stop_gate: None,
             },
             Some(&remote),
             Some("main"),
@@ -14461,6 +14709,7 @@ Release-Urgency: hold"
                 expect_branch: Some("feat/wt".into()),
                 expected_identity: None,
                 mutation_permit: None,
+                stop_gate: None,
             },
             Some(&remote),
             Some("main"),

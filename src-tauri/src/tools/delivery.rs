@@ -113,6 +113,7 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             .map(String::from),
         expected_identity: None,
         mutation_permit: None,
+        stop_gate: None,
     };
 
     let mut durable = match prepare_durable_run(
@@ -160,6 +161,15 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     opts.mutation_permit = durable
         .as_ref()
         .and_then(|run| ctx.db.as_ref().map(|db| run.mutation_permit(db)));
+    // CF-STOP-R1：把这次交付绑到**这个会话**的停止栅栏上。栅栏在每个"还没发生"
+    // 的动作前读一次，所以用户在交付等 CI 时按下的停止，会在下一个动作前生效
+    // （这正是 M47：停止十几分钟后 PR 仍被合并的那条路径）。
+    if let (Some(db), Some(session_id)) = (ctx.db.as_ref(), ctx.session_id.as_deref()) {
+        opts.stop_gate = Some(crate::agent::stop_fence::SessionStopGate::new(
+            db.clone(),
+            session_id,
+        ));
+    }
 
     let mut lease_guard = durable.as_ref().and_then(|run| ctx.db.as_ref().map(|db| DeliveryLeaseGuard {
         db: db.clone(), id: run.id.clone(), process: run.process.clone(), epoch: run.claim_epoch, released: false,
@@ -1143,6 +1153,10 @@ async fn persist_durable_outcome(
     let core_input = core_input_request_for_outcome(outcome);
     let status = match outcome.final_state.as_str() {
         "delivered" | "noop" => "awaiting_completion_arbitration",
+        // CF-STOP-R1: a stopped delivery is a deliberate terminal state, not a
+        // failure — no recovery path may pick it back up (see
+        // `plan_startup_recovery`'s candidate filter and the stop fence).
+        "stopped" => "stopped",
         "waiting" => "waiting",
         _ if core_input.is_some() => "core_input_required",
         _ if outcome.recoverable => "agent_action_required",
@@ -1197,8 +1211,11 @@ async fn persist_durable_outcome(
         canonical_pr_number: outcome.pr_number.map(|value| value as i64),
         canonical_pr_url: outcome.pr_url.clone(),
         canonical_head_sha: outcome.pr_number.map(|_| expected_head_sha),
-        failure_signature: (outcome.final_state != "delivered" && outcome.final_state != "noop")
-            .then(|| outcome.code.clone()),
+        failure_signature: (!matches!(
+            outcome.final_state.as_str(),
+            "delivered" | "noop" | "stopped"
+        ))
+        .then(|| outcome.code.clone()),
         core_input,
         identity_revision: identity_revision.clone(),
     };
@@ -2588,6 +2605,7 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
             change_set_digest: claimed.change_set_digest.clone(),
         }),
         mutation_permit: None,
+        stop_gate: None,
     };
     let mut prepared = PreparedDurableRun {
         id: claimed.run_id.clone(),

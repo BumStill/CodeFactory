@@ -33,6 +33,8 @@ pub(crate) mod permission_intent;
 pub mod persistence;
 pub(crate) mod provider_recovery;
 pub mod scheduler;
+/// CF-STOP：停止栅栏（「停止」真的停下）与 PR 侧的如实收尾。
+pub mod stop_fence;
 pub mod sse_buffer;
 pub mod subagent;
 mod tool_backend;
