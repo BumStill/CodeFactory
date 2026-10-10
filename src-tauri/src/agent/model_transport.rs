@@ -402,6 +402,68 @@ impl ProviderAttemptRuntime {
 }
 
 impl RoutedDesktopModelTransport {
+    /// U27 / CF-WSC-R6: a queued remediation whose binding row no longer exists
+    /// cannot be replayed. When the objective's session still has one live turn,
+    /// that turn owns the work now (the user continued the session, possibly
+    /// after an app restart), so the stale claim is *superseded* — reporting it
+    /// as a missing durable identity failed the continued session every few
+    /// minutes without a single step of progress. Without a live turn the claim
+    /// really is unidentifiable, and the caller keeps the fail-closed answer.
+    async fn stale_remediation_is_superseded_by_live_turn(
+        &self,
+        objective_id: &str,
+    ) -> std::result::Result<bool, TransportError> {
+        let row = sqlx::query(
+            "SELECT o.status AS objective_status,
+                    COALESCE(NULLIF(o.resume_cursor, ''), o.root_turn_id) AS active_root_turn_id
+             FROM objectives o WHERE o.id=?",
+        )
+        .bind(objective_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|error| provider_transport_error("reconcile stale remediation", error))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let objective_status: String = row.get("objective_status");
+        if matches!(
+            objective_status.as_str(),
+            "completed" | "cancelled" | "failed" | "legacy_orphan"
+        ) {
+            return Ok(false);
+        }
+        let active_root: Option<String> = row.get("active_root_turn_id");
+        let active_root = active_root.unwrap_or_default();
+        if active_root.is_empty() {
+            return Ok(false);
+        }
+        let has_turn_state: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='chat_turn_state'",
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|error| provider_transport_error("reconcile stale remediation", error))?;
+        if has_turn_state != 1 {
+            return Ok(false);
+        }
+        let live: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM chat_turn_state turn
+             JOIN objectives objective ON objective.id=turn.objective_id
+             WHERE turn.objective_id=? AND turn.root_turn_id=? AND turn.session_id=?
+               AND turn.status NOT IN ('completed','cancelled')
+               AND objective.status NOT IN
+                   ('completed','cancelled','failed','legacy_orphan')",
+        )
+        .bind(objective_id)
+        .bind(&active_root)
+        .bind(self.session_id.as_str())
+        .fetch_one(&self.db)
+        .await
+        .map_err(|error| provider_transport_error("reconcile stale remediation", error))?;
+        Ok(live == 1)
+    }
+
     async fn resolve_provider_owner(
         &self,
     ) -> std::result::Result<Option<ProviderOwnerPermit>, TransportError> {
@@ -443,12 +505,29 @@ impl RoutedDesktopModelTransport {
             .bind(resource_generation)
             .fetch_optional(&self.db)
             .await
-            .map_err(|error| provider_transport_error("resolve provider remediation", error))?
-            .ok_or_else(|| {
-                TransportError::Fatal(
-                    "PROVIDER_DURABLE_IDENTITY_MISSING: remediation binding disappeared".into(),
-                )
-            })?;
+            .map_err(|error| provider_transport_error("resolve provider remediation", error))?;
+            let row = match row {
+                Some(row) => row,
+                None => {
+                    // U27 / CF-WSC-R6: the binding row is gone. When the session
+                    // still has a live turn, that turn owns the work and this
+                    // claim is merely superseded — replaying it can never
+                    // succeed, so report that instead of failing the continued
+                    // session with a missing durable identity every few minutes.
+                    // Without a live turn the claim genuinely is unidentifiable.
+                    return Err(TransportError::Fatal(
+                        if self
+                            .stale_remediation_is_superseded_by_live_turn(&permit.objective_id)
+                            .await?
+                        {
+                            "PROVIDER_DURABLE_IDENTITY_SUPERSEDED: remediation superseded by the objective's current turn".into()
+                        } else {
+                            "PROVIDER_DURABLE_IDENTITY_MISSING: remediation binding disappeared"
+                                .into()
+                        },
+                    ));
+                }
+            };
             let session_id: Option<String> = row.get("session_id");
             let objective_root: Option<String> = row.get("active_root_turn_id");
             if session_id.as_deref() != Some(self.session_id.as_str()) {
@@ -2770,8 +2849,37 @@ mod tests {
             for (status, content_type, body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept fixture request");
                 fixture_hits.fetch_add(1, Ordering::SeqCst);
-                let mut request = [0_u8; 16 * 1024];
-                let _ = stream.read(&mut request);
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let mut expected_len = None;
+                loop {
+                    let read = stream.read(&mut chunk).expect("read fixture request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if expected_len.is_none() {
+                        if let Some(headers_end) = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..headers_end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            expected_len = Some(headers_end + 4 + content_length);
+                        }
+                    }
+                    if expected_len.is_some_and(|length| request.len() >= length) {
+                        break;
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -3441,6 +3549,222 @@ mod tests {
         assert!(error.to_string().contains("CONTEXT_RECOVERY_FENCED"));
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// U27 / CF-WSC-R6: after the app restarts between a task ending and the
+    /// user continuing the session, the queued remediation's binding row is
+    /// gone. Reporting that as an unreconcilable durable identity failed the
+    /// continued session every few minutes without a single step of progress.
+    /// The objective's live turn owns the session, so the stale claim is
+    /// superseded — and the continuation still resolves its own owner and issues
+    /// its real model request.
+    #[tokio::test]
+    async fn a_stale_remediation_after_restart_lets_the_continuation_run() {
+        let (pool, session_id, live_turn) = durable_reprompt_fixture("restart-continue").await;
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chat_turn_state (
+                root_turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO chat_turn_state(root_turn_id, session_id, status, objective_id)
+             VALUES (?, ?, 'active', 'reprompt-restart-continue-objective')",
+        )
+        .bind(&live_turn)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The interrupted attempt's binding is gone after the restart.
+        sqlx::query(
+            "INSERT INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('restart-vanished-binding', 'reprompt-restart-continue-objective', 'chat',
+                     'chat_root_turn', 'reprompt-restart-continue-root-original', 3,
+                     'sha256:restart-vanished',
+                     'reprompt-restart-continue-root-original', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objective_remediations
+             (id, objective_id, binding_id, domain, status, failure_code,
+              failure_signature, strategy, approach_index, attempt_index,
+              next_observation_at, created_at, updated_at)
+             VALUES ('restart-stale-remediation', 'reprompt-restart-continue-objective',
+                     'restart-vanished-binding', 'chat', 'claimed', 'agent_loop_error',
+                     'sha256:restart-stale', 'reconcile_then_resume', 0, 1, ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM objective_bindings WHERE id='restart-vanished-binding'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let stale = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id: session_id.clone(),
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                    "restart-provider",
+                    "restart-model",
+                    "http://127.0.0.1:1".to_string(),
+                )),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool.clone(),
+            root_turn_id: Some(live_turn.clone()),
+            mutation_permit: Some(codefactory_agent_loop::tool::MutationPermit {
+                objective_id: "reprompt-restart-continue-objective".into(),
+                remediation_id: "restart-stale-remediation".into(),
+                owner: "restarted-process".into(),
+                claim_epoch: 1,
+                binding_id: Some("restart-vanished-binding".into()),
+                resource_generation: Some(3),
+            }),
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+        let error = stale
+            .resolve_provider_owner()
+            .await
+            .expect_err("a remediation without its binding cannot own the provider")
+            .to_string();
+        assert!(
+            error.contains("PROVIDER_DURABLE_IDENTITY_SUPERSEDED"),
+            "a stale remediation whose live turn moved on is superseded, not a missing durable identity: {error}"
+        );
+        assert!(
+            !error.contains("PROVIDER_DURABLE_IDENTITY_MISSING"),
+            "the continuation must not be failed with a missing durable identity: {error}"
+        );
+
+        // Fail closed when there is no live turn to hand the work to.
+        sqlx::query("DELETE FROM chat_turn_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unavailable = stale
+            .resolve_provider_owner()
+            .await
+            .expect_err("without a live turn the missing binding stays fail-closed")
+            .to_string();
+        assert!(
+            unavailable.contains("PROVIDER_DURABLE_IDENTITY_MISSING"),
+            "a claim with no live turn must stay fail-closed: {unavailable}"
+        );
+        sqlx::query(
+            "INSERT OR REPLACE INTO chat_turn_state(root_turn_id, session_id, status, objective_id)
+             VALUES (?, ?, 'active', 'reprompt-restart-continue-objective')",
+        )
+        .bind(&live_turn)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The continuation itself must still run: resolve its own owner and
+        // issue a real provider request.
+        let (base_url, hits) = serve_responses(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-continued-1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"continued-after-restart.txt\\\",\\\"content\\\":\\\"continued after restart\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        )]);
+        let continued = RoutedDesktopModelTransport {
+            http: test_client(),
+            events: Arc::new(super::super::events::CollectingEventSink::new()),
+            session_id,
+            route_state: ActiveRouteState::from_plan_with_health(
+                super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                    "continued-provider",
+                    "continued-model",
+                    base_url,
+                )),
+                super::super::failover::EndpointHealthRegistry::new(
+                    std::time::Duration::from_secs(120),
+                ),
+            ),
+            cancel: None,
+            turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+            turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+            db: pool,
+            root_turn_id: Some(live_turn),
+            mutation_permit: None,
+            context_authorization: None,
+            anonymous: false,
+            durable_provider_required: true,
+        };
+        let response = continued
+            .complete(
+                &[],
+                &crate::tools::all_definitions(),
+                &RoundOptions::default(),
+            )
+            .await
+            .expect("the continued turn must run its model request instead of failing");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the continuation must actually issue its provider request"
+        );
+        // CF-WSC-R6's minimum evidence is a *successful tool call*, not just a
+        // model request: the round the continued turn just ran has to hand its
+        // tool call to the real dispatcher and leave an observable side effect
+        // in the continued workspace.
+        let tool_call = response
+            .tool_calls
+            .first()
+            .expect("the continued turn must surface the model's tool call")
+            .clone();
+        assert_eq!(tool_call.function.name, "write_file");
+        let workspace = std::env::temp_dir().join(format!(
+            "u27-continued-workspace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let context = crate::tools::ExecCtx::new(workspace.clone(), None);
+        let output = crate::tools::dispatch(
+            &tool_call.function.name,
+            serde_json::from_str(&tool_call.function.arguments)
+                .expect("the tool call arguments must be valid JSON"),
+            &context,
+        )
+        .await
+        .expect("the continued turn's tool call must execute");
+        assert!(
+            !output.is_error,
+            "the continued turn's tool call must succeed: {}",
+            output.content
+        );
+        assert!(
+            workspace.join("continued-after-restart.txt").exists(),
+            "the continued turn's tool call must leave a real side effect on disk"
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[tokio::test]

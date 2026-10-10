@@ -7,6 +7,7 @@ pub mod chat_progress;
 pub mod checkpoints;
 pub mod control_plane;
 pub mod costs;
+pub mod dispatch;
 pub mod document;
 pub mod evidence;
 pub mod evolution;
