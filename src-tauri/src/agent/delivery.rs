@@ -286,6 +286,9 @@ fn remote_error_is_retryable(detail: &str) -> bool {
         "timed out",
         "timeout",
         "temporarily unavailable",
+        "ssl_error_syscall",
+        "http 500",
+        "ssl connection",
         "connection reset",
         "connection refused",
         "dns",
@@ -1493,18 +1496,50 @@ fn dev_command(program: &str) -> Command {
     command
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let out = dev_command("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to spawn git: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T, String>, mut sleep: impl FnMut(u64)) -> Result<T, String> {
+    for attempt in 1..=3 {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if remote_error_is_retryable(&error) && attempt < 3 => {
+                tracing::warn!(step, attempt, "delivery network retry scheduled");
+                sleep(1 << (attempt - 1));
+            }
+            Err(error) => return Err(format!("交付卡在 {step}：已尝试 {attempt}/3 次；等待网络恢复，由系统续接。已有提交、分支和 PR 未删除；远端结果须重新核对。原因：{error}")),
+        }
     }
+    unreachable!()
+}
+
+fn bounded_delivery_output(command: &mut Command) -> Result<String, String> {
+    use std::io::Read;
+    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|error| format!("failed to spawn delivery command: {error}"))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
+    let err = std::thread::spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? { break status; }
+        if started.elapsed() >= std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("timeout：交付子进程超过 30 秒；等待网络或代理恢复，由系统重试；远端结果未知".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let stdout = out.join().map_err(|_| "delivery stdout reader failed")?.map_err(|e| e.to_string())?;
+    let stderr = err.join().map_err(|_| "delivery stderr reader failed")?.map_err(|e| e.to_string())?;
+    if status.success() { Ok(String::from_utf8_lossy(&stdout).trim().into()) }
+    else { Err(String::from_utf8_lossy(&stderr).trim().into()) }
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let network = matches!(args.first(), Some(&"fetch" | &"push" | &"ls-remote"));
+    let mut operation = || bounded_delivery_output(dev_command("git").arg("-C").arg(cwd).args(args));
+    if network {
+        retry_delivery_network(args[0], operation, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))
+    } else { operation() }
 }
 
 fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
@@ -6831,16 +6866,13 @@ pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
 
 impl GhCliRemote {
     fn gh(&self, args: &[String]) -> Result<String, String> {
-        let out = dev_command("gh")
-            .current_dir(&self.cwd)
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to spawn gh: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
+        let step = args.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
+        let operation = || bounded_delivery_output(dev_command("gh").current_dir(&self.cwd).args(args));
+        // Creation is reconciled by open_or_get_pr before redispatch. Never
+        // blindly replay an ambiguous external mutation here.
+        if args.get(1).is_some_and(|arg| matches!(arg.as_str(), "view" | "list" | "status")) || args.first().is_some_and(|arg| arg == "api") && !args.iter().any(|arg| arg == "--method" || arg == "-X" || arg == "-f" || arg == "-F") {
+            retry_delivery_network(&step, operation, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))
+        } else { operation() }
     }
 
     fn merge_observation(
@@ -7033,7 +7065,15 @@ impl DeliveryRemote for GhCliRemote {
             }
         };
         let result = (|| {
-            self.gh(&gh_pr_create_args(title, body, head, base))?;
+            retry_delivery_network("pr create", || {
+                // A failed create may already have committed remotely. Read
+                // the exact head/base projection before any retry.
+                let raw = self.gh(&["pr".into(), "list".into(), "--head".into(), head.into(), "--base".into(), base.into(), "--state".into(), "open".into(), "--json".into(), "number,url,title,body,headRefOid".into(), "--limit".into(), "1".into()])?;
+                if exact_open_pr_projection(parse_gh_open_pr_state(&raw, head, base)?, None, expected_head_sha)?.is_some() {
+                    return Ok(String::new());
+                }
+                self.gh(&gh_pr_create_args(title, body, head, base))
+            }, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))?;
             let created = self.gh(&[
                 "pr".into(),
                 "view".into(),
@@ -9300,6 +9340,37 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
+
+    #[test]
+    fn cf_lease_network_retry_budget_and_proxy_config() {
+        for step in ["fetch", "push", "pr view", "pr create"] {
+            let mut attempts = 0;
+            let mut delays = Vec::new();
+            let result = retry_delivery_network(step, || {
+                attempts += 1;
+                if attempts < 3 { Err("LibreSSL SSL_ERROR_SYSCALL".into()) } else { Ok("preserved".to_string()) }
+            }, |delay| delays.push(delay));
+            assert_eq!(result.unwrap(), "preserved");
+            assert_eq!(attempts, 3);
+            assert_eq!(delays, vec![1, 2]);
+            let error = retry_delivery_network(step, || Err::<String, _>("HTTP 503".into()), |_| {}).unwrap_err();
+            assert!(error.contains(step) && error.contains("3 次") && error.contains("未删除"));
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let config = fixture.path().join("gitconfig");
+        std::fs::write(&config, "[http]\n proxy = http://127.0.0.1:18080\n").unwrap();
+        let output = dev_command("git").env("GIT_CONFIG_GLOBAL", &config)
+            .env("HTTPS_PROXY", "http://127.0.0.1:18081")
+            .args(["config", "--global", "--get", "http.proxy"]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "http://127.0.0.1:18080");
+    }
+
+    #[test]
+    fn cf_lease_ssl_errors_are_transient() {
+        assert!(remote_error_is_retryable("LibreSSL SSL_ERROR_SYSCALL github.com:443"));
+        assert!(remote_error_is_retryable("HTTP 500 Internal Server Error"));
+    }
 
     #[test]
     fn production_gh_git_spawns_go_through_dev_command() {
