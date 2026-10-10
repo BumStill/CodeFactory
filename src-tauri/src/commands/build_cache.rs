@@ -40,13 +40,19 @@ pub async fn build_cache_cleanup(
 ) -> Result<MaintenanceOutcome, AppError> {
     let container = workspace_container(&app)?;
     let pool = state.db.read().await.clone();
-    let (ended_owners, orphan_owners) =
+    let (ended_owners, orphan_owners, protected_owners) =
         crate::agent::execution_workspace::cache_ownership(&pool, &container)
             .await
             .map_err(|error| AppError::Other(error.to_string()))?;
     let report = tauri::async_runtime::spawn_blocking(move || {
         let log = build_cache::AuditLog::new(build_cache::audit_log_path(&container));
-        build_cache::startup_sweep(&container, &ended_owners, &orphan_owners, Some(&log))
+        build_cache::startup_sweep(
+            &container,
+            &ended_owners,
+            &orphan_owners,
+            &protected_owners,
+            Some(&log),
+        )
     })
     .await
     .map_err(|error| AppError::Other(format!("build cache cleanup join failed: {error}")))?;

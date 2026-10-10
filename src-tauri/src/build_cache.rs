@@ -286,16 +286,36 @@ fn lru_order(mut candidates: Vec<CacheEntry>) -> Vec<CacheEntry> {
 
 /// Plan an eviction that brings the total back under `limit`.
 ///
-/// Least-recently-used first, and in-use caches are never candidates. When the
-/// remaining total still exceeds the limit — because everything left is in use
-/// — the plan reports the shortfall instead of silently giving up.
+/// Least-recently-used first. In-use caches are never candidates, and neither
+/// are the caches of tasks that can still continue (R1: "正在构建的缓存、所属任务
+/// 还能继续的缓存，一律不淘汰"). When the remaining total still exceeds the limit —
+/// because everything left is protected — the plan reports the shortfall
+/// instead of silently evicting work someone still needs.
 pub fn plan_eviction(entries: &[CacheEntry], limit: u64, reason: EvictionReason) -> EvictionPlan {
+    plan_eviction_protecting(entries, limit, reason, &[])
+}
+
+/// [`plan_eviction`] with explicit owner-level protection, so a cache whose
+/// task is resumable survives the ceiling exactly like one being built into.
+pub fn plan_eviction_protecting(
+    entries: &[CacheEntry],
+    limit: u64,
+    reason: EvictionReason,
+    protected_owners: &[String],
+) -> EvictionPlan {
+    let protected = |entry: &CacheEntry| {
+        entry.in_use
+            || entry
+                .owner
+                .as_ref()
+                .is_some_and(|owner| protected_owners.iter().any(|kept| kept == owner))
+    };
     let total: u64 = entries.iter().map(|e| e.bytes).sum();
-    let protected_bytes: u64 = entries.iter().filter(|e| e.in_use).map(|e| e.bytes).sum();
+    let protected_bytes: u64 = entries.iter().filter(|e| protected(e)).map(|e| e.bytes).sum();
     let mut evict = Vec::new();
     let mut freed_bytes = 0u64;
     if total > limit {
-        for entry in lru_order(entries.iter().filter(|e| !e.in_use).cloned().collect()) {
+        for entry in lru_order(entries.iter().filter(|e| !protected(e)).cloned().collect()) {
             if total - freed_bytes <= limit {
                 break;
             }
@@ -698,14 +718,42 @@ pub fn describe_entry(entry: &CacheEntry) -> String {
     )
 }
 
-/// Owner id of a managed-workspace cache path — the directory directly below
-/// `execution-workspaces/`. Returns `None` for shared caches.
+/// Owner id of a managed-workspace path — the *workspace* directory, expressed
+/// as its path relative to `execution-workspaces/`. Returns `None` for shared
+/// caches.
+///
+/// The live layout nests two levels
+/// (`execution-workspaces/<repo-prefix>/<workspace-prefix>/.codefactory-cache`),
+/// so the owner must be the whole relative workspace path. Taking only the
+/// first component reported every cache under a repo prefix as one owner, and a
+/// scan that stopped at the container's direct children could not see the
+/// caches at all — which is exactly why nothing was ever reclaimed. A trailing
+/// `.codefactory-cache` component (a cache root rather than a worktree path) is
+/// dropped, and older flat installs keep working.
 pub fn owner_from_workspace_path(path: &Path, container: &Path) -> Option<String> {
     let relative = path.strip_prefix(container).ok()?;
-    relative
+    path_to_owner(relative)
+}
+
+/// Normalise a path relative to the container into a stable owner id.
+fn path_to_owner(relative: &Path) -> Option<String> {
+    let mut parts: Vec<String> = relative
         .components()
-        .next()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => {
+                Some(name.to_string_lossy().into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    if parts.last().is_some_and(|last| last == ".codefactory-cache") {
+        parts.pop();
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
 }
 
 /// CF-BLD-R10: size of one task's own build cache, so "how much did this task
@@ -784,30 +832,79 @@ pub fn audit_log_path(container: &Path) -> PathBuf {
     container.join("build-cache-audit.jsonl")
 }
 
-/// Every cache under the managed-workspace container, with its task as owner.
+/// Every workspace directory below `container` that holds a
+/// `.codefactory-cache` tree, as `(owner, cache_root)`.
 ///
-/// The container holds one directory per task; each task's own cache lives in
-/// `.codefactory-cache/` inside it. Only directories CodeFactory created are
-/// ever measured (CF-BLD-R8), and the task directory itself is never touched —
-/// removing it belongs to the workspace closeout, not to the build cache.
-pub fn scan_workspace_container(container: &Path) -> Vec<CacheEntry> {
-    let mut entries = Vec::new();
-    let read = match std::fs::read_dir(container) {
-        Ok(read) => read,
-        Err(_) => return entries,
-    };
-    for workspace in read.flatten() {
-        let path = workspace.path();
-        if !path.is_dir() {
+/// Two layouts are live at once: the current nested one
+/// (`<container>/<repo-prefix>/<workspace-prefix>/.codefactory-cache`) and the
+/// older flat one (`<container>/<workspace>/.codefactory-cache`). The walk is
+/// bounded to exactly those two levels, so it never descends into a checkout's
+/// source tree.
+pub fn workspace_cache_roots(container: &Path) -> Vec<(String, PathBuf)> {
+    fn cache_root_of(dir: &Path) -> Option<PathBuf> {
+        let root = dir.join(".codefactory-cache");
+        root.is_dir().then_some(root)
+    }
+    fn child_dirs(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+    fn name_of(dir: &Path) -> Option<String> {
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+    }
+
+    let mut found = Vec::new();
+    for bucket in child_dirs(container) {
+        let Some(bucket_name) = name_of(&bucket) else {
+            continue;
+        };
+        // Flat layout: the container child is the workspace itself.
+        if let Some(root) = cache_root_of(&bucket) {
+            found.push((bucket_name, root));
             continue;
         }
-        let owner = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned);
+        // Nested layout: the container child is a repo bucket holding workspaces.
+        for workspace in child_dirs(&bucket) {
+            let Some(workspace_name) = name_of(&workspace) else {
+                continue;
+            };
+            if let Some(root) = cache_root_of(&workspace) {
+                found.push((format!("{bucket_name}/{workspace_name}"), root));
+            }
+        }
+    }
+    found
+}
+
+/// Owner ids of every workspace directory that holds a build cache. Used to
+/// spot caches with no workspace row at all (CF-BLD-R8 backlog).
+pub fn workspace_cache_owners(container: &Path) -> Vec<String> {
+    workspace_cache_roots(container)
+        .into_iter()
+        .map(|(owner, _)| owner)
+        .collect()
+}
+
+/// Every cache under the managed-workspace container, with its task as owner.
+///
+/// The container holds `<repo-bucket>/<workspace>/.codefactory-cache` (and, on
+/// older installs, `<workspace>/.codefactory-cache`); each task's own cache is
+/// what gets measured. Only directories CodeFactory created are ever measured
+/// (CF-BLD-R8), and the task directory itself is never touched — removing it
+/// belongs to the workspace closeout, not to the build cache.
+pub fn scan_workspace_container(container: &Path) -> Vec<CacheEntry> {
+    let mut entries = Vec::new();
+    for (owner, cache_root) in workspace_cache_roots(container) {
         entries.extend(scan_root(
-            &task_cache_root(&path),
-            |_| owner.clone(),
+            &cache_root,
+            |_| Some(owner.clone()),
             now_unix(),
             IN_USE_STALE_AFTER,
         ));
@@ -837,10 +934,34 @@ pub struct MaintenanceRequest<'a> {
     /// Workspace ids with no live row at all; dropped only once idle past
     /// `idle_before_unix` (CF-BLD-R8 backlog), never while they look resumable.
     pub orphan_owners: &'a [String],
+    /// Workspace ids whose task can still continue. R1 never evicts these: a
+    /// resumable task's cache is work in progress, not a budget candidate.
+    pub protected_owners: &'a [String],
     /// A zero here disables the orphan idle rule.
     pub idle_before_unix: u64,
     pub limit_bytes: u64,
     pub trigger: &'a str,
+}
+
+/// CF-BLD-R2: does a workspace row mean its task is over?
+///
+/// A workspace that is closed, incident-stopped or awaiting cleanup is over.
+/// The objective's own terminal state is consulted too, because an objective
+/// that already completed / failed / was cancelled cannot make the task
+/// runnable again — but a task that merely failed while its workspace is still
+/// open is resumable, and its cache stays (the spec's "所属任务还能继续的缓存，
+/// 一律不淘汰").
+pub fn workspace_is_ended(workspace_state: &str, objective_status: Option<&str>) -> bool {
+    let workspace_over = matches!(workspace_state, "closed" | "incident" | "cleanup_pending");
+    let objective_over = objective_status
+        .is_some_and(|status| matches!(status, "completed" | "failed" | "cancelled"));
+    match (workspace_over, objective_over) {
+        (true, _) => true,
+        // A terminal objective plus a workspace CF never reopens (not `active`)
+        // is a leaked allocation, not resumable work.
+        (false, true) => workspace_state != "active",
+        (false, false) => false,
+    }
 }
 
 /// Run R2, then the R8 backlog rule, then R1 — in that order, so the ceiling
@@ -858,7 +979,20 @@ pub fn maintain_entries(
     log: Option<&AuditLog>,
 ) -> MaintenanceOutcome {
     let before_bytes: u64 = entries.iter().map(|entry| entry.bytes).sum();
-    let protected_bytes: u64 = entries.iter().filter(|e| e.in_use).map(|e| e.bytes).sum();
+    // Protected means "a live builder holds it" or "its task can still
+    // continue" (CF-BLD-R1) — the same predicate the ceiling pass uses.
+    let is_protected = |entry: &CacheEntry| {
+        entry.in_use
+            || entry
+                .owner
+                .as_ref()
+                .is_some_and(|owner| request.protected_owners.iter().any(|kept| kept == owner))
+    };
+    let protected_bytes: u64 = entries
+        .iter()
+        .filter(|entry| is_protected(entry))
+        .map(|entry| entry.bytes)
+        .sum();
     let mut removed: Vec<PathBuf> = Vec::new();
     let mut reclaimed_bytes = 0u64;
     let mut evicted_bytes = 0u64;
@@ -875,6 +1009,14 @@ pub fn maintain_entries(
             .iter()
             .filter(|entry| !removed.contains(&entry.path))
             .filter(|entry| !entry.in_use)
+            .filter(|entry| {
+                !entry.owner.as_ref().is_some_and(|owner| {
+                    request
+                        .protected_owners
+                        .iter()
+                        .any(|kept| kept == owner)
+                })
+            })
             .filter(|entry| {
                 entry.owner.as_ref().is_some_and(|owner| {
                     request.orphan_owners.iter().any(|candidate| candidate == owner)
@@ -899,13 +1041,19 @@ pub fn maintain_entries(
         }
     }
 
-    // R1 — the survivors answer to the ceiling.
+    // R1 — the survivors answer to the ceiling, but a cache whose task can
+    // still continue is never a candidate.
     let survivors: Vec<CacheEntry> = entries
         .iter()
         .filter(|entry| !removed.contains(&entry.path))
         .cloned()
         .collect();
-    let budget = plan_eviction(&survivors, request.limit_bytes, EvictionReason::OverBudget);
+    let budget = plan_eviction_protecting(
+        &survivors,
+        request.limit_bytes,
+        EvictionReason::OverBudget,
+        request.protected_owners,
+    );
     evicted_bytes = evicted_bytes.saturating_add(apply_plan(&budget, request.trigger, log));
     removed.extend(budget.evict.iter().map(|entry| entry.path.clone()));
 
@@ -929,12 +1077,14 @@ pub fn startup_sweep(
     container: &Path,
     ended_owners: &[String],
     orphan_owners: &[String],
+    protected_owners: &[String],
     log: Option<&AuditLog>,
 ) -> MaintenanceOutcome {
     let request = MaintenanceRequest {
         container,
         ended_owners,
         orphan_owners,
+        protected_owners,
         idle_before_unix: now_unix().saturating_sub(ORPHAN_IDLE_SECS),
         limit_bytes: configured_budget_bytes(),
         trigger: "startup",
@@ -1325,6 +1475,7 @@ mod tests {
             container,
             ended_owners: ended,
             orphan_owners: orphans,
+            protected_owners: &[],
             idle_before_unix: idle_before,
             limit_bytes: limit,
             trigger: "test",
@@ -1509,5 +1660,139 @@ mod tests {
         for field in ["total_bytes", "budget_bytes", "entries", "heavy_builds_running"] {
             assert!(rendered.get(field).is_some(), "report must carry {field}");
         }
+    }
+
+    // ── CF-BLD-R2/R8 on the real (nested) workspace layout ───────────────────
+    //
+    // The live layout is
+    //   execution-workspaces/<repo-prefix>/<workspace-prefix>/.codefactory-cache
+    // — one level deeper than execution-workspaces/<workspace>/.codefactory-cache.
+    // A scan that only looks one level down finds nothing, which is how 17 task
+    // caches reached ~130 GB over a 60 GiB ceiling with no reclamation and no
+    // audit trail at all.
+
+    fn nested_workspace(container: &Path, repo: &str, workspace: &str) -> PathBuf {
+        let dir = container.join(repo).join(workspace);
+        let target = task_cache_root(&dir).join("cargo-target-stable");
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        fs::write(target.join("debug/deps/blob"), vec![3u8; 4096]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scan_finds_the_cache_below_a_nested_repo_workspace() {
+        let container = temp_dir("nested-scan");
+        nested_workspace(&container, "94eef8f7b2987cbf", "9836f5aa40c05ec34cd801fa");
+
+        let scanned = scan_workspace_container(&container);
+
+        assert_eq!(scanned.len(), 1, "nested task cache must be scanned: {scanned:?}");
+        assert_eq!(scanned[0].bytes, 4096);
+        assert_eq!(
+            scanned[0].owner.as_deref(),
+            Some("94eef8f7b2987cbf/9836f5aa40c05ec34cd801fa"),
+            "the owner is the workspace, not the repo bucket"
+        );
+    }
+
+    #[test]
+    fn owner_of_a_nested_worktree_is_the_workspace_path_not_the_repo_bucket() {
+        let container = PathBuf::from("/data/execution-workspaces");
+        let worktree = container.join("94eef8f7b2987cbf").join("9836f5aa40c05ec34cd801fa");
+        let expected = Some("94eef8f7b2987cbf/9836f5aa40c05ec34cd801fa".to_string());
+
+        assert_eq!(owner_from_workspace_path(&worktree, &container), expected);
+        assert_eq!(
+            owner_from_workspace_path(&task_cache_root(&worktree), &container),
+            expected
+        );
+    }
+
+    #[test]
+    fn nested_ended_workspace_cache_is_reclaimed_and_audited() {
+        let container = temp_dir("nested-reclaim");
+        nested_workspace(&container, "repo-a", "obj-ended");
+        nested_workspace(&container, "repo-a", "obj-live");
+        let ended = vec!["repo-a/obj-ended".to_string()];
+        let orphans: Vec<String> = Vec::new();
+        let log = AuditLog::new(audit_log_path(&container));
+
+        let outcome = maintain(
+            &request(&container, &ended, &orphans, 0, u64::MAX),
+            Some(&log),
+        );
+
+        assert_eq!(outcome.scanned, 2, "both nested caches must be seen");
+        assert_eq!(outcome.reclaimed_bytes, 4096);
+        assert!(
+            !task_cache_root(&container.join("repo-a").join("obj-ended"))
+                .join("cargo-target-stable")
+                .exists(),
+            "the ended task's cache is reclaimed"
+        );
+        assert!(
+            task_cache_root(&container.join("repo-a").join("obj-live"))
+                .join("cargo-target-stable")
+                .exists(),
+            "the still-running task keeps its cache"
+        );
+        let records = log.read_all();
+        assert_eq!(records.len(), 1, "R10: the reclaim is audited: {records:?}");
+        assert_eq!(records[0].reason, EvictionReason::TaskEnded);
+        assert_eq!(records[0].owner.as_deref(), Some("repo-a/obj-ended"));
+    }
+
+    #[test]
+    fn r1_never_evicts_the_cache_of_a_task_that_can_still_continue() {
+        let container = temp_dir("r1-protected");
+        let live_a = owned(&container, "cargo-target-live-a", 4096, 1_000, false, "repo-a/live");
+        let live_b = owned(&container, "cargo-target-live-b", 4096, 2_000, false, "repo-a/live");
+        let done = owned(&container, "cargo-target-done", 4096, 3_000, false, "repo-a/done");
+        let entries = vec![live_a.clone(), live_b.clone(), done.clone()];
+        let ended: Vec<String> = Vec::new();
+        let orphans: Vec<String> = Vec::new();
+        let protected = vec!["repo-a/live".to_string()];
+
+        // 12288 on disk against a 4096 ceiling. Only the ended task's idle cache
+        // may go; the resumable task's two caches survive and the pass says
+        // honestly how much it could not reclaim.
+        let outcome = maintain_entries(
+            &entries,
+            &MaintenanceRequest {
+                container: &container,
+                ended_owners: &ended,
+                orphan_owners: &orphans,
+                protected_owners: &protected,
+                idle_before_unix: 0,
+                limit_bytes: 4096,
+                trigger: "test",
+            },
+            None,
+        );
+
+        assert_eq!(outcome.evicted_bytes, 4096);
+        assert!(!done.path.exists(), "the idle ended cache answers the ceiling");
+        assert!(
+            live_a.path.exists() && live_b.path.exists(),
+            "a task that can still continue keeps its cache even over the ceiling"
+        );
+        assert_eq!(outcome.protected_bytes, 8192);
+        assert_eq!(outcome.overflow_bytes, 4096, "the shortfall is reported, not hidden");
+    }
+
+    #[test]
+    fn r2_ended_detection_covers_cancel_and_closeout_but_spares_resumable_work() {
+        // The two real-machine cases: workspace awaiting cleanup, objective
+        // cancelled.
+        assert!(workspace_is_ended("cleanup_pending", Some("cancelled")));
+        // Workspace lifecycle alone is conclusive.
+        assert!(workspace_is_ended("closed", None));
+        assert!(workspace_is_ended("incident", Some("failed")));
+        // A terminal objective that never got a usable workspace is a leak.
+        assert!(workspace_is_ended("allocating", Some("cancelled")));
+        // The 13 caches kept on the real machine: failed but still resumable.
+        assert!(!workspace_is_ended("active", Some("failed")));
+        assert!(!workspace_is_ended("active", None));
+        assert!(!workspace_is_ended("active", Some("running")));
     }
 }
