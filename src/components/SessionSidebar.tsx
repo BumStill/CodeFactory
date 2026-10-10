@@ -18,6 +18,7 @@
 //      re-opens an old one.
 //   2. Entering an existing conversation happens ONE way: clicking its row.
 //      Clicking a folder expands it, nothing more.
+import { sessionTurnState } from "../lib/sessionTurnState";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { sessionAccessibleName } from "../lib/sessionLabel";
 import {
@@ -197,7 +198,11 @@ export function SessionSidebar({
                   expanded={isExpanded(entry.project.cwd)}
                   running={entry.project.sessions.some(
                     (session) =>
-                      runtime[session.id]?.streaming === true || session.is_running === true,
+                      sessionTurnState({
+                        streaming: runtime[session.id]?.streaming === true,
+                        sessionIsRunning: session.is_running === true,
+                        messages: runtime[session.id]?.messages ?? [],
+                      }).running,
                   )}
                   waitingPermission={entry.project.sessions.some(
                     (session) => runtime[session.id]?.pendingPermission != null,
@@ -330,9 +335,15 @@ function SessionRow({
   onRename: (title: string) => void;
 }) {
   // Per-session streaming indicator: with concurrent sessions, any row may be
-  // mid-stream even when it's not the foreground one.
-  const streaming = useChatStore((s) => s.runtime?.[session.id]?.streaming ?? false);
-  const running = streaming || session.is_running === true;
+  // mid-stream even when it's not the foreground one. CF-HDE-R11: the spinner
+  // and the top banner read the SAME truth (M53) — a settled turn's leftover
+  // `streaming` flag must not keep the row spinning forever.
+  const runtime = useChatStore((s) => s.runtime?.[session.id]);
+  const running = sessionTurnState({
+    streaming: runtime?.streaming === true,
+    sessionIsRunning: session.is_running === true,
+    messages: runtime?.messages ?? [],
+  }).running;
   const waitingPermission = useChatStore(
     (s) => s.runtime?.[session.id]?.pendingPermission != null,
   );

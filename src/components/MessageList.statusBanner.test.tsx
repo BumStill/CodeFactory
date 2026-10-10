@@ -143,6 +143,36 @@ describe("session status banner speaks plain language (CF-RSB-R1..R4)", () => {
     expect(banner).not.toHaveTextContent("needs_business_decision");
   });
 
+  // CF-HDE-R11（M53）：头部提示与 status（R9）同源。真机里会话已在模型上连续
+  // 调用，旧实现因为一条陈旧的 `waiting_system` 投影一直显示"等待自动重试"。
+  it("a live stream never says it is waiting to retry (M53)", () => {
+    render(
+      <MessageList
+        messages={turn({ objectiveStatus: "waiting_system", nextObservationAt: Date.now() + 30_000, label: "正在调用模型" })}
+        streaming
+        cwd={null}
+      />,
+    );
+    const banner = screen.getByTestId("turn-activity-progress");
+    expect(banner).not.toHaveTextContent("等待");
+    expect(banner).not.toHaveTextContent("重试");
+    expect(banner).toHaveTextContent("正在调用模型");
+  });
+
+  it("a session the server says is running shows progress, not a settled projection", () => {
+    render(
+      <MessageList
+        messages={turn({ objectiveStatus: "waiting_system", nextObservationAt: Date.now() + 30_000, label: "正在调用模型" })}
+        streaming={false}
+        sessionIsRunning
+        cwd={null}
+      />,
+    );
+    const banner = screen.getByTestId("turn-activity-progress");
+    expect(banner).toHaveTextContent("正在调用模型");
+    expect(banner).not.toHaveTextContent("等待");
+  });
+
   it("follows one synthetic state transition: running -> waiting -> completed", () => {
     const running = turn({ objectiveStatus: "active", label: "正在执行命令" });
     const { rerender } = render(<MessageList messages={running} streaming cwd={null} />);
@@ -152,7 +182,7 @@ describe("session status banner speaks plain language (CF-RSB-R1..R4)", () => {
     rerender(
       <MessageList
         messages={turn({ objectiveStatus: "waiting_system", nextObservationAt: Date.now() + 30_000 })}
-        streaming
+        streaming={false}
         cwd={null}
       />,
     );
