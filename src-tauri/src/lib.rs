@@ -27,6 +27,7 @@ mod storage;
 mod tools;
 mod trajectory;
 mod util;
+pub mod window_state;
 
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -1446,6 +1447,7 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().expect("app data dir unavailable");
             std::fs::create_dir_all(&data_dir)?;
+            crate::window_state::restore_and_track_main_window(app)?;
 
             // Before anything else can panic: a stripped release binary with
             // `panic = "abort"` leaves a crash report that names no symbols and

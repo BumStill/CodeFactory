@@ -544,6 +544,9 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
           }}
           onPaste={onPaste}
           rows={1}
+          spellCheck={false}
+          autoCorrect="off"
+          autoCapitalize="off"
           placeholder={
             dragOver
               ? "松开以附加文件"
