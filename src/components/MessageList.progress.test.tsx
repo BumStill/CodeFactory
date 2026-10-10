@@ -82,8 +82,8 @@ describe("MessageList structured progress and result", () => {
               phase: "recovering",
               status: "active",
               kind: "verification",
-              label: "正在补充缺失验证",
-              waitingReason: "验证证据不足",
+              label: "正在补跑检查",
+              waitingReason: null,
               updatedAt: Date.now(),
               terminalReason: null,
             },
@@ -95,15 +95,52 @@ describe("MessageList structured progress and result", () => {
     );
 
     expect(screen.getByTestId("turn-activity-progress")).toHaveTextContent(
-      "正在补充缺失验证",
+      "正在补跑检查",
     );
-    expect(screen.getByTestId("turn-activity-progress")).toHaveTextContent(
-      "验证证据不足",
-    );
+    // M37: the completion gate rerunning its checks is normal background work.
+    // It must not read as a fault, and its internal wording must stay off screen.
     expect(screen.getByTestId("turn-activity-progress")).toHaveAttribute(
       "data-status-tone",
-      "warning",
+      "progress",
     );
+    expect(screen.getByTestId("turn-activity-progress")).not.toHaveTextContent(
+      "验证证据不足",
+    );
+  });
+
+  it("keeps the completion-gate wording off screen for an already-open session", () => {
+    // A pre-M37 build persisted the raw completion-gate prose in this field.
+    // Reloading that session must not resurrect the warning or the jargon.
+    render(
+      <MessageList
+        messages={[
+          { id: "user", role: "user", content: "检查并修复", createdAt: 1 },
+          {
+            id: "assistant",
+            role: "assistant",
+            content: "",
+            createdAt: Date.now() - 5_000,
+            turnActivity: {
+              rootTurnId: "user",
+              revision: 4,
+              phase: "recovering",
+              status: "active",
+              kind: "verification",
+              label: "正在补跑检查",
+              waitingReason: "验证证据不足",
+              updatedAt: Date.now(),
+              terminalReason: null,
+            },
+          },
+        ]}
+        streaming
+        cwd={null}
+      />,
+    );
+
+    const pill = screen.getByTestId("turn-activity-progress");
+    expect(pill).toHaveAttribute("data-status-tone", "progress");
+    expect(pill).not.toHaveTextContent("验证证据不足");
   });
 
   it("keeps a non-terminal system-owned objective visible after the stream closes", () => {

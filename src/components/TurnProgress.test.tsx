@@ -73,6 +73,90 @@ describe("TurnProgress", () => {
     expect(screen.queryByText(/预计还需/)).not.toBeInTheDocument();
   });
 
+  // M37: real progress only when the plan is actually tracked.
+  it("hides the step count and the percentage while the plan is not tracked", () => {
+    const untracked: TurnPlan = {
+      ...plan,
+      waitingReason: null,
+      steps: plan.steps.map((step) => ({ ...step, status: "pending" })),
+    };
+    render(
+      <TurnProgress plan={untracked} timingProfile={timing} externalJobs={[]} elapsedMs={449_000} />,
+    );
+
+    const bar = screen.getByTestId("turn-progress");
+    expect(bar).not.toHaveTextContent("0/4");
+    expect(bar).not.toHaveTextContent("0%");
+    expect(bar).not.toHaveTextContent(/个计划步骤/);
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    // Elapsed time and the current activity are the real content left.
+    expect(bar).toHaveTextContent("7m29s");
+    expect(bar).toHaveTextContent(/当前 · /);
+    expect(bar).toHaveAttribute("data-status-tone", "progress");
+  });
+
+  it("shows completed/total and the percentage once the plan is tracked", () => {
+    render(<TurnProgress plan={plan} timingProfile={timing} externalJobs={[]} elapsedMs={90_000} />);
+
+    expect(screen.getByTestId("turn-progress")).toHaveTextContent("已完成 2/4");
+    expect(screen.getByTestId("turn-progress")).toHaveTextContent("50%");
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
+  });
+
+  it("keeps the completion-gate verification stage off the warning tone", () => {
+    render(
+      <TurnProgress
+        plan={{ ...plan, waitingReason: null }}
+        timingProfile={timing}
+        externalJobs={[]}
+        elapsedMs={90_000}
+        activityLabel="正在补跑检查"
+        activityWaitingReason="验证证据不足"
+      />,
+    );
+
+    const bar = screen.getByTestId("turn-progress");
+    expect(bar).toHaveAttribute("data-status-tone", "progress");
+    expect(bar).not.toHaveTextContent("验证证据不足");
+    expect(bar).toHaveTextContent("正在补跑检查");
+    // The bar itself must not paint the warning colour either.
+    expect(bar.className).not.toContain("border-status-warning");
+  });
+
+  it.each([
+    ["authorization_required", /需要你先授权才能继续/],
+    ["needs_business_decision", /需要你先做一个决定才能继续/],
+    ["objective_failed", /这件事没做成/],
+  ] as const)("keeps a real warning for %s", (reason, expected) => {
+    render(<TurnProgress plan={{ ...plan, waitingReason: reason }} timingProfile={timing} externalJobs={[]} elapsedMs={90_000} />);
+
+    const bar = screen.getByTestId("turn-progress");
+    expect(bar).toHaveAttribute("data-status-tone", "warning");
+    expect(bar).toHaveTextContent(expected);
+  });
+
+  it.each([
+    ["untracked", { waitingReason: null, steps: plan.steps.map((step) => ({ ...step, status: "pending" as const })) }],
+    ["tracked", { waitingReason: null }],
+    ["verification stage", { waitingReason: null }],
+  ] as const)("never leaks internal vocabulary in the %s state", (label, patch) => {
+    render(
+      <TurnProgress
+        plan={{ ...plan, ...patch }}
+        timingProfile={timing}
+        externalJobs={[]}
+        elapsedMs={90_000}
+        activityLabel={label === "tracked" ? null : undefined}
+        activityWaitingReason="验证证据不足"
+      />,
+    );
+
+    const text = screen.getByTestId("turn-progress").textContent ?? "";
+    for (const word of ["证据", "复核", "当前边界", "恢复耗尽", "安全上限", "系统故障", "objective", "remediation", "recovery"]) {
+      expect(text.toLowerCase()).not.toContain(word.toLowerCase());
+    }
+  });
+
   it("shows the real status of a linked external job", () => {
     const externalPlan: TurnPlan = {
       ...plan,
