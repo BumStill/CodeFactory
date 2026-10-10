@@ -134,7 +134,7 @@ export function modelRouteExhaustedGuidance(now: Date = new Date()): string {
   const clock = `${String(nextAttempt.getHours()).padStart(2, "0")}:${String(
     nextAttempt.getMinutes(),
   ).padStart(2, "0")}`;
-  return `所有已配置且有凭据的模型端点都暂时不可用。目标与失败证据已保留；系统将按退避策略重新观测可用路由，最迟在 ${clock}（本地时间）之前再试一次，不需要你操作。`;
+  return `所有已配置且有凭据的模型端点都暂时不可用。目标与失败证据已保留；系统将按退避策略重新观测可用路由，最迟在 ${clock}（本地时间）之前自动重新尝试，不需要你操作。`;
 }
 
 export const MODEL_ROUTE_EXHAUSTED_GUIDANCE = modelRouteExhaustedGuidance();
