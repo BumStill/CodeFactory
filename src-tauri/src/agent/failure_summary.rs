@@ -148,6 +148,7 @@ pub fn plain_failure_reason(failure_code: Option<&str>) -> String {
         // U25: the transport never reached the service — the network path, not
         // the model. The outage terminal adds how long and how many times.
         "provider_transport_unreachable" => "网络或模型服务连不上，一直没能连上",
+        "chat_identity_unreconcilable" => "任务恢复时找不到原有会话记录；工作区里的改动仍保留，请从该会话继续处理",
         "provider_route_unavailable" => "没有可用的模型线路",
         "provider_episode_unreconciled" => {
             "上一次模型回复中断时已经开始了一项改动，这项改动的结果一直没法确认，所以没有贸然重做"
@@ -538,6 +539,14 @@ mod tests {
     fn rendered_report_never_leaks_internal_vocabulary() {
         let text = render_failure_report(&sample_report());
         assert_no_internal_vocabulary(&text).expect("report must be user-safe");
+    }
+
+    #[test]
+    fn durable_identity_failure_has_plain_language_without_internal_terms() {
+        let reason = plain_failure_reason(Some("chat_identity_unreconcilable"));
+        assert!(reason.contains("会话记录"), "{reason}");
+        assert!(reason.contains("工作区"), "{reason}");
+        assert_no_internal_vocabulary(&reason).expect("identity failure must be user-safe");
     }
 
     #[test]
