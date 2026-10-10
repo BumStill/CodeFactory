@@ -47,6 +47,7 @@ import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
 import { currentTurnOwnership } from "../../lib/turnOwnership";
 import { useDesktopMenuBridge } from "../../lib/useDesktopMenuBridge";
+import { useDesktopDispatchBridge } from "../../lib/useDesktopDispatchBridge";
 
 type WorkspaceBrowserSession = BrowserSession & {
   status?: string | null;
@@ -358,6 +359,84 @@ export function WorkspacePage({
       },
       stopRun: async () => {
         if (await cancelStream(sessionId)) setDurableTurnActive(false);
+      },
+    },
+  });
+  // 本地非界面派单入口(U34)。和菜单栏是同一个模式:原生侧只发信封(传输、
+  // 鉴权、审计、协议校验),业务语义落在这里、复用上面菜单和按钮已经在用的
+  // 同一批动作。区别只有一点:派单请求需要应答,编排方要拿到会话状态这类结果。
+  useDesktopDispatchBridge({
+    handlers: {
+      createAndSend: async ({ project, message, model, permissionMode }) => {
+        const store = useChatStore.getState();
+        const session = await store.createSession(project, model ?? store.activeModel);
+        if (permissionMode) await store.updateActiveSessionPermissionMode(permissionMode);
+        await composerRef.current?.sendText(message);
+        return { session_id: session.id, model: session.model_id };
+      },
+      send: async ({ sessionId, message }) => {
+        const store = useChatStore.getState();
+        if (store.activeSession?.id !== sessionId) await onOpenSession(sessionId);
+        await composerRef.current?.sendText(message);
+        return { session_id: sessionId };
+      },
+      setPermission: async ({ sessionId, mode }) => {
+        const store = useChatStore.getState();
+        if (store.activeSession?.id !== sessionId) await onOpenSession(sessionId);
+        await store.updateActiveSessionPermissionMode(mode);
+        return { session_id: sessionId, permission_mode: mode };
+      },
+      setModel: async ({ sessionId, model }) => {
+        const store = useChatStore.getState();
+        const target = sessionId ?? store.activeSession?.id;
+        if (!target) throw new Error("no session is open to change the model on");
+        const session = await invoke<{ id: string; model_id: string }>("update_session_model", {
+          sessionId: target,
+          modelId: model,
+        });
+        if (store.activeSession?.id === session.id) store.setModel(session.model_id);
+        return { session_id: session.id, model: session.model_id };
+      },
+      switchSession: async ({ sessionId }) => {
+        await onOpenSession(sessionId);
+        return { session_id: sessionId };
+      },
+      stop: async ({ sessionId }) => {
+        const store = useChatStore.getState();
+        const target = sessionId ?? store.activeSession?.id ?? undefined;
+        const stopped = await store.cancelStream(target);
+        if (stopped) setDurableTurnActive(false);
+        return { stopped };
+      },
+      listApprovals: async () => {
+        const store = useChatStore.getState();
+        return Object.entries(store.runtime).flatMap(([sessionId, runtime]) => {
+          const pending = runtime?.pendingPermission;
+          return pending
+            ? [{ approvalId: pending.intentId, toolName: pending.toolName, sessionId }]
+            : [];
+        });
+      },
+      resolveApproval: async ({ approvalId, approve }) => {
+        // 一次只处理一条:高危操作仍然要编排方明确选"批"或"拒",没有批量放行。
+        await invoke("respond_to_permission", { intentId: approvalId, allow: approve });
+        return { approval_id: approvalId, approved: approve };
+      },
+      status: async ({ sessionId }) => {
+        const store = useChatStore.getState();
+        const session = store.sessions.find((candidate) => candidate.id === sessionId);
+        if (!session) throw new Error(`unknown session ${sessionId}`);
+        return {
+          session_id: session.id,
+          title: session.title,
+          cwd: session.cwd,
+          permission_mode: session.permission_mode,
+          model: session.model_id,
+          objective_state:
+            sessionId === store.activeSession?.id && turnInFlight ? "running" : "idle",
+          latest_reply: null,
+          pr_number: null,
+        };
       },
     },
   });
