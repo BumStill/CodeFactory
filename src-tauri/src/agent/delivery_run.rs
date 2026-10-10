@@ -947,7 +947,7 @@ pub async fn create_delivery_run(
                 "delivery run id collision or source identity changed".into(),
             ));
         }
-        if took_over_observe_only_lease {
+        if took_over_observe_only_lease || (existing_owner.is_some() && !same_live_claim) {
             // Durable evidence that the foreground displaced an observe-only
             // holder: the supervisor's own epoch-16 claim is superseded here,
             // and the observer leaves on the epoch fence it already watches.
@@ -1224,6 +1224,26 @@ pub async fn reconcile_delivery_run_identity(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Release only this invocation's fenced claim, including terminal outcomes.
+pub async fn release_delivery_lease(
+    pool: &SqlitePool, run_id: &str, process: &ProcessIdentity,
+    claim_epoch: i64, now: i64, reason: &str,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let changed = sqlx::query("UPDATE delivery_runs SET lease_owner=NULL, lease_expires_at=NULL WHERE id=? AND lease_owner=? AND claim_epoch=?")
+        .bind(run_id).bind(&process.instance_id).bind(claim_epoch)
+        .execute(&mut *tx).await?.rows_affected() == 1;
+    if changed {
+        sqlx::query("INSERT INTO delivery_run_events (id, run_id, event_kind, stage, status, detail_json, process_instance, created_at) SELECT ?, id, 'lease_release', stage, status, ?, ?, ? FROM delivery_runs WHERE id=?")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(serde_json::json!({"reason": reason, "claim_epoch": claim_epoch}).to_string())
+            .bind(&process.instance_id).bind(now).bind(run_id)
+            .execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(changed)
 }
 
 /// Extend a live DeliveryRun lease without changing business progress. The
@@ -5720,6 +5740,35 @@ mod tests {
         create_delivery_run(pool, &run, process, now, lease_ttl)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cf_lease_release_all_outcomes_and_reclaim_are_audited() {
+        let pool = pool().await;
+        for status in ["running", "waiting", "failed", "completed"] {
+            let run = foreground_admission_fixture(&format!("lease-{status}"));
+            let owner = ProcessIdentity::new("synthetic-owner", "test", "test");
+            let epoch = create_delivery_run(&pool, &run, &owner, 100, 90).await.unwrap();
+            sqlx::query("UPDATE delivery_runs SET status=? WHERE id=?")
+                .bind(status).bind(&run.id).execute(&pool).await.unwrap();
+            assert!(release_delivery_lease(&pool, &run.id, &owner, epoch, 110, "invocation_return").await.unwrap());
+            let lease: Option<String> = sqlx::query_scalar("SELECT lease_owner FROM delivery_runs WHERE id=?")
+                .bind(&run.id).fetch_one(&pool).await.unwrap();
+            assert!(lease.is_none());
+            let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_run_events WHERE run_id=? AND event_kind='lease_release'")
+                .bind(&run.id).fetch_one(&pool).await.unwrap();
+            assert_eq!(events, 1);
+            assert!(!release_delivery_lease(&pool, &run.id, &owner, epoch, 111, "duplicate").await.unwrap());
+            if status == "running" || status == "waiting" {
+                create_delivery_run(&pool, &run, &ProcessIdentity::new("next-invocation", "test", "test"), 112, 90).await.unwrap();
+            }
+        }
+        let run = foreground_admission_fixture("residual-lock");
+        create_delivery_run(&pool, &run, &ProcessIdentity::new("dead-owner", "test", "test"), 100, 90).await.unwrap();
+        create_delivery_run(&pool, &run, &ProcessIdentity::new("replacement", "test", "test"), 191, 90).await.unwrap();
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_run_events WHERE run_id=? AND event_kind='lease_takeover'")
+            .bind(&run.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(events, 1);
     }
 
     fn foreground_admission_fixture(id: &str) -> NewDeliveryRun {
