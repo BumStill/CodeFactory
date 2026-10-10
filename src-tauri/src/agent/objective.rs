@@ -6587,6 +6587,8 @@ impl ObjectiveStore {
                 work.branch = Some(view.branch_name.clone());
                 work.changes = changes;
                 work.total_changed_files = total;
+                work.commits_ahead = workspace_git_count(&root, &format!("{}..HEAD", view.base_sha), false);
+                work.unpushed_commits = workspace_git_count(&root, "HEAD", true);
             }
         }
         if let Some((url, status)) = self.latest_delivery_pr(&current.id).await {
@@ -6800,6 +6802,18 @@ fn workspace_changes(
 /// Commits the execution workspace already carries beyond its baseline (U1b).
 /// Read-only, and a missing or non-repository path counts as zero: a delivery
 /// claim is only ever made on positive evidence.
+fn workspace_git_count(root: &std::path::Path, revision: &str, unpushed: bool) -> Option<i64> {
+    use crate::util::no_window::NoWindow;
+    let mut command = std::process::Command::new("git").no_window();
+    command.arg("-C").arg(root).args(["rev-list", "--count", revision]);
+    if unpushed {
+        command.args(["--not", "--remotes"]);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() { return None; }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
 fn workspace_commits_ahead(root: &std::path::Path, base_sha: &str) -> i64 {
     use crate::util::no_window::NoWindow;
     use std::process::Command;
