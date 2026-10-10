@@ -30,6 +30,7 @@ export const MENU_ACTION = {
   SEND_INPUT: "session.send",
   SEND_CLIPBOARD: "session.send-clipboard",
   STOP_RUN: "session.stop",
+  CLEAN_BUILD_CACHE: "session.clean-build-cache",
 } as const;
 
 export type MenuActionId = (typeof MENU_ACTION)[keyof typeof MENU_ACTION];
@@ -43,6 +44,7 @@ export const MENU_ACTION_IDS: MenuActionId[] = [
   MENU_ACTION.SEND_INPUT,
   MENU_ACTION.SEND_CLIPBOARD,
   MENU_ACTION.STOP_RUN,
+  MENU_ACTION.CLEAN_BUILD_CACHE,
 ];
 
 /** 菜单栏「权限模式」子菜单的三个模式,单选。 */
@@ -81,7 +83,8 @@ export type MenuIntent =
   | { kind: "focus-input" }
   | { kind: "send-composer" }
   | { kind: "send-text"; text: string }
-  | { kind: "stop-run" };
+  | { kind: "stop-run" }
+  | { kind: "clean-build-cache" };
 
 function isPermissionMode(value: string | undefined): value is PermissionMode {
   return !!value && (MENU_PERMISSION_MODES as string[]).includes(value);
@@ -120,6 +123,10 @@ export function resolveMenuIntent(event: DesktopMenuEvent, context: MenuContext)
     }
     case MENU_ACTION.STOP_RUN:
       return context.running ? { kind: "stop-run" } : null;
+    case MENU_ACTION.CLEAN_BUILD_CACHE:
+      // 与面板上的"一键清理"是同一条命令(CF-BLD-R4):任何时候都能点,
+      // 没有可清理的缓存时命令自己会如实回答,不需要先判断状态。
+      return { kind: "clean-build-cache" };
     default:
       // 未知动作不是"尽力而为"的理由:猜错的代价是用户以为点了没生效。
       return null;
@@ -137,6 +144,8 @@ export interface DesktopMenuHandlers {
   /** 把给定文本放进输入框并发送 —— 走和手工输入后发送完全相同的路径。 */
   sendText: (text: string) => void | Promise<void>;
   stopRun: () => void | Promise<void>;
+  /** 清理编译缓存。必须是与面板按钮相同的那条命令(CF-BLD-R4)。 */
+  cleanBuildCache: () => void | Promise<void>;
 }
 
 /** 执行一个意图。返回被执行的意图,便于测试断言"点了菜单 -> 调了哪个动作"。 */
@@ -165,6 +174,9 @@ export async function applyMenuIntent(
       break;
     case "stop-run":
       await handlers.stopRun();
+      break;
+    case "clean-build-cache":
+      await handlers.cleanBuildCache();
       break;
   }
   return intent;

@@ -42,6 +42,10 @@ pub const ACTION_SEND_CLIPBOARD: &str = "session.send-clipboard";
 /// 停止当前执行。
 pub const ACTION_STOP_RUN: &str = "session.stop";
 
+/// 清理编译缓存。走原生侧直接调用与界面按钮同一条 Rust 命令,
+/// 因此锁屏、窗口不在前台时同样可用(CF-BLD-R4 的后台入口)。
+pub const ACTION_CLEAN_BUILD_CACHE: &str = "session.clean-build-cache";
+
 /// 「切换会话」子菜单里最多放多少个会话。够用即可:再长的列表放进菜单也
 /// 找不到,而且原生菜单项是启动时一次性建好的,固定上限避免动态增删。
 pub const RECENT_SESSION_LIMIT: usize = 20;
@@ -93,6 +97,11 @@ pub const ACTION_ITEMS: &[MenuItemSpec] = &[
     MenuItemSpec {
         id: ACTION_STOP_RUN,
         label: "停止当前执行",
+        accelerator: None,
+    },
+    MenuItemSpec {
+        id: ACTION_CLEAN_BUILD_CACHE,
+        label: "清理编译缓存",
         accelerator: None,
     },
 ];

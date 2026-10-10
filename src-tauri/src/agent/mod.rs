@@ -37,6 +37,7 @@ pub mod sse_buffer;
 pub mod subagent;
 mod tool_backend;
 pub(crate) mod tool_recovery;
+mod trusted_workspace;
 pub(crate) mod update_recovery;
 pub mod user_context;
 pub mod verification;
@@ -160,12 +161,12 @@ where
 }
 
 async fn await_permission_response(
-    receiver: tokio::sync::oneshot::Receiver<bool>,
+    receiver: &mut tokio::sync::oneshot::Receiver<bool>,
     cancel: Option<&Arc<AtomicBool>>,
     max_wait: Duration,
 ) -> PermissionResponse {
     tokio::select! {
-        response = timeout(max_wait, receiver) => match response {
+        response = timeout(max_wait, &mut *receiver) => match response {
             Ok(Ok(true)) => PermissionResponse::Allow,
             Ok(Ok(false)) => PermissionResponse::DeniedByUser,
             Ok(Err(_)) => PermissionResponse::ChannelClosed,
@@ -2836,6 +2837,7 @@ fn decide_permission_for_call(
     args: &serde_json::Value,
     cmd: Option<&str>,
     browser_read_granted: bool,
+    workspace_root: Option<&std::path::Path>,
 ) -> PermissionDecision {
     if tool_name == "browser_session" {
         let Some(action) = args.get("action").and_then(serde_json::Value::as_str) else {
@@ -2910,6 +2912,23 @@ fn decide_permission_for_call(
     let base = decide_permission(policy, tool_name, cmd);
     if matches!(base, PermissionDecision::Deny(_)) {
         return base;
+    }
+    // CF-TPP-R1: in trusted mode, a destructive command whose whole effect is
+    // provably inside the session's own managed workspace is the loop the user
+    // already approved — deleting a directory the agent generated, overwriting
+    // its own files, re-running its own script — so it must not re-prompt.
+    // CF-TPP-R2: this is the only widening, it requires `full_access`, it needs
+    // a resolved workspace root, and `local_delete` answers `false` for every
+    // syntax it cannot prove (escapes, symlinks, credentials, `.git`, absolute
+    // paths, composition), so the default stays "ask".
+    if let (PermissionDecision::Ask, "bash") = (&base, tool_name) {
+        if policy.full_access {
+            if let (Some(root), Some(command)) = (workspace_root, cmd) {
+                if trusted_workspace::local_delete(root, command) {
+                    return PermissionDecision::Allow;
+                }
+            }
+        }
     }
     if tool_name == "skill_fetch" {
         let Some(source) = args.get("source").and_then(serde_json::Value::as_str) else {
@@ -3302,34 +3321,34 @@ mod tests {
 
     #[tokio::test]
     async fn pending_permission_is_released_by_chat_cancellation() {
-        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let (_sender, mut receiver) = tokio::sync::oneshot::channel();
         let cancel = Arc::new(AtomicBool::new(true));
 
         assert_eq!(
-            await_permission_response(receiver, Some(&cancel), Duration::from_secs(1)).await,
+            await_permission_response(&mut receiver, Some(&cancel), Duration::from_secs(1)).await,
             PermissionResponse::Cancelled
         );
     }
 
     #[tokio::test]
     async fn permission_response_preserves_user_denial_timeout_and_closed_channel() {
-        let (deny_sender, deny_receiver) = tokio::sync::oneshot::channel();
+        let (deny_sender, mut deny_receiver) = tokio::sync::oneshot::channel();
         deny_sender.send(false).unwrap();
         assert_eq!(
-            await_permission_response(deny_receiver, None, Duration::from_secs(1)).await,
+            await_permission_response(&mut deny_receiver, None, Duration::from_secs(1)).await,
             PermissionResponse::DeniedByUser
         );
 
-        let (_timeout_sender, timeout_receiver) = tokio::sync::oneshot::channel();
+        let (_timeout_sender, mut timeout_receiver) = tokio::sync::oneshot::channel();
         assert_eq!(
-            await_permission_response(timeout_receiver, None, Duration::from_millis(1)).await,
+            await_permission_response(&mut timeout_receiver, None, Duration::from_millis(1)).await,
             PermissionResponse::TimedOut
         );
 
-        let (closed_sender, closed_receiver) = tokio::sync::oneshot::channel();
+        let (closed_sender, mut closed_receiver) = tokio::sync::oneshot::channel();
         drop(closed_sender);
         assert_eq!(
-            await_permission_response(closed_receiver, None, Duration::from_secs(1)).await,
+            await_permission_response(&mut closed_receiver, None, Duration::from_secs(1)).await,
             PermissionResponse::ChannelClosed
         );
     }
@@ -4139,6 +4158,7 @@ mod tests {
                 &serde_json::json!({"source":"python-expert"}),
                 None,
                 false,
+                None,
             ),
             PermissionDecision::Allow,
             "backend-owned embedded registry ids follow the normal trusted mutation gate"
@@ -4155,11 +4175,136 @@ mod tests {
                     &serde_json::json!({"source":source}),
                     None,
                     false,
+                    None,
                 ),
                 PermissionDecision::Ask,
                 "external source {source} needs an exact-source confirmation even in trusted mode"
             );
         }
+    }
+
+    /// CF-TPP-R1 / CF-TPP-R2 at the exact seam the gateway calls.
+    #[test]
+    fn trusted_mode_skips_own_workspace_and_keeps_outside_prompts() {
+        let dir = std::env::temp_dir().join(format!("cf-m41-decide-{}", std::process::id()));
+        let root = dir.join("workspace");
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        std::fs::write(root.join("build.sh"), "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::write(root.join("notes.txt"), "draft\n").unwrap();
+
+        let trusted = permission_policy_for_mode("trusted");
+        let standard = permission_policy_for_mode("standard");
+        let args = serde_json::json!({});
+
+        // CF-TPP-R1: inside the session's own workspace, no prompt.
+        for command in [
+            "rm -rf generated",
+            "Remove-Item -Recurse -Force generated",
+            "rm -f notes.txt",
+            "bash build.sh",
+        ] {
+            assert_eq!(
+                decide_permission_for_call(
+                    &trusted,
+                    "bash",
+                    &args,
+                    Some(command),
+                    false,
+                    Some(&root),
+                ),
+                PermissionDecision::Allow,
+                "trusted mode must not prompt for its own workspace: {command}"
+            );
+        }
+
+        // CF-TPP-R2: outside the workspace, escapes, credentials, system
+        // settings and unknown syntax keep the existing gate. (`git push` is
+        // not asserted here: trusted mode already allowed it through
+        // `full_access` before this change, so claiming otherwise would assert
+        // a behaviour this patch does not own — see the PR's Spec Amendment.)
+        for command in [
+            "rm -rf ../checkout",
+            "rm -rf /tmp",
+            "rm -rf ~/Library",
+            "rm -rf .git",
+            "rm -rf generated/.env",
+            "reg delete HKCU",
+            "sudo rm -rf generated",
+            "rm -rf $HOME",
+            "rm -rf *",
+            "rm -rf generated; rm -rf ../checkout",
+            "rm -rf not-generated",
+        ] {
+            assert_ne!(
+                decide_permission_for_call(
+                    &trusted,
+                    "bash",
+                    &args,
+                    Some(command),
+                    false,
+                    Some(&root),
+                ),
+                PermissionDecision::Allow,
+                "must still ask or refuse: {command}"
+            );
+        }
+
+        // Standard mode is untouched, even with a known workspace root — every
+        // CF-TPP-R2 category still reaches the normal gate there.
+        for command in [
+            "rm -rf generated",
+            "rm -rf ../checkout",
+            "rm -rf .git",
+            "rm -rf generated/.env",
+            "reg delete HKCU",
+        ] {
+            assert_ne!(
+                decide_permission_for_call(
+                    &standard,
+                    "bash",
+                    &args,
+                    Some(command),
+                    false,
+                    Some(&root),
+                ),
+                PermissionDecision::Allow,
+                "standard mode keeps its confirmation: {command}"
+            );
+        }
+
+        // Commands the shell classifier has no opinion about at all (a
+        // credential-manager invocation, a plain `git push`) are already
+        // low-risk shell, so `bash` being on the allow list means neither mode
+        // confirms them today. That is pre-existing behaviour this patch does
+        // not own; it is reported as a Spec Amendment in the PR. What this
+        // patch does own is that the workspace-local proof never covers them.
+        for command in [
+            "git push origin main",
+            "git push origin master",
+            "security delete-generic-password",
+            "reg delete HKCU",
+        ] {
+            assert!(
+                !trusted_workspace::local_delete(&root, command),
+                "the workspace-local proof must never green-light: {command}"
+            );
+        }
+
+        // An unresolved workspace root can never widen the rule.
+        assert_eq!(
+            decide_permission_for_call(
+                &trusted,
+                "bash",
+                &args,
+                Some("rm -rf generated"),
+                false,
+                None,
+            ),
+            PermissionDecision::Ask,
+            "no workspace root means no automatic allow"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -4225,6 +4370,7 @@ mod tests {
                 &serde_json::json!({"action":"open","url":"https://example.com"}),
                 None,
                 false,
+                None,
             ),
             PermissionDecision::Allow
         );
@@ -4235,6 +4381,7 @@ mod tests {
                 &serde_json::json!({"action":"attach"}),
                 None,
                 true,
+                None,
             ),
             PermissionDecision::Allow
         );
@@ -4245,6 +4392,7 @@ mod tests {
                 &serde_json::json!({"action":"attach"}),
                 None,
                 false,
+                None,
             ),
             PermissionDecision::Ask
         );
@@ -4270,6 +4418,7 @@ mod tests {
                     &serde_json::json!({"action":action}),
                     None,
                     true,
+                    None,
                 ),
                 PermissionDecision::Ask,
                 "{action} must still require consent in trusted mode"

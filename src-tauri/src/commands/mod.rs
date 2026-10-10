@@ -2,6 +2,7 @@
 pub mod backup;
 pub mod benchmark;
 pub mod browser_sessions;
+pub mod build_cache;
 pub mod chat;
 pub mod chat_progress;
 pub mod checkpoints;
