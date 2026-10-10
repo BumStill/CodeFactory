@@ -30,14 +30,14 @@ vi.mock("../../stores/tasks", () => ({
   },
 }));
 vi.mock("../../stores/settings", () => ({
-  useSettingsStore: (selector?: (s: Record<string, unknown>) => unknown) => {
+  useSettingsStore: Object.assign((selector?: (s: Record<string, unknown>) => unknown) => {
     const state = {
       settings: { theme: "dark", permissions: { full_access: false } },
       setTheme: vi.fn(),
       save: vi.fn(),
     };
     return selector ? selector(state) : state;
-  },
+  }, { getState: () => ({ settings: null }) }),
 }));
 vi.mock("../../stores/git", () => ({
   useGitStore: (selector?: (s: Record<string, unknown>) => unknown) => {
