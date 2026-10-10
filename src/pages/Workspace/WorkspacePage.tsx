@@ -381,8 +381,9 @@ export function WorkspacePage({
   useDesktopDispatchBridge({
     handlers: {
       createAndSend: async ({ project, message, model, permissionMode }) => {
+        const selected = model ? await dispatchSetModel({ model }) : null;
         const store = useChatStore.getState();
-        const session = await store.createSession(project, model ?? store.activeModel);
+        const session = await store.createSession(project, selected?.model ?? store.activeModel);
         if (permissionMode) await store.updateActiveSessionPermissionMode(permissionMode);
         await composerRef.current?.sendText(message);
         return { session_id: session.id, model: session.model_id };

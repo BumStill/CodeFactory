@@ -30,6 +30,7 @@ import type { Session, Settings } from "../lib/tauri";
 import type { UIMessage } from "../stores/chatEvents";
 import {
   DISPATCH_DELIVERY_AHEAD_CURRENT_RUN,
+  DISPATCH_STEER_PENDING_NOTE,
   dispatchSend,
   dispatchSetModel,
   dispatchSetPermission,
@@ -308,18 +309,82 @@ describe("CF-HDE-R8 · 插话与排队可选", () => {
     ],
   };
 
-  it("运行中 + steer：插话引导当前执行", async () => {
+  it("运行中 + steer：这一轮真的读到了才算 delivered", async () => {
     seed({ a: runningA });
-    const receipt = await dispatchSend({ sessionId: "A", message: "先改这个", mode: "steer" });
+    // 模拟这一轮在下一个回合边界读走了这条插话（`steer_applied` 清掉待处理标记）。
+    setTimeout(() => {
+      const st = useChatStore.getState();
+      const runtime = st.runtime.A;
+      useChatStore.setState({
+        runtime: {
+          ...st.runtime,
+          A: {
+            ...runtime,
+            messages: runtime.messages.map((m) => ({ ...m, steerPending: undefined })),
+          },
+        },
+      });
+    }, 5);
+    const receipt = await dispatchSend(
+      { sessionId: "A", message: "先改这个", mode: "steer" },
+      { steerAppliedTimeoutMs: 200 },
+    );
     expect(receipt.delivery).toEqual({ status: "delivered", into: "current_run" });
     expect(invokeMock).toHaveBeenCalledWith("queue_interjection", {
       sessionId: "A",
       message: "先改这个",
+      clientMessageId: expect.any(String),
     });
     const state = useChatStore.getState();
     expect(state.runtime.A.messages.some((m) => m.content === "先改这个")).toBe(true);
     expect(state.runtime.B.messages).toHaveLength(0);
     expect(state.activeSession?.id).toBe("B");
+  });
+
+  // CF-STOP-R4（M63，v1.84.0 真机）：这一轮卡在交付工具里等锁时，旧实现回报
+  // `delivered / current_run`，但模型要等下一次调用才读得到插话，而那一刻不会来。
+  // 现状是如实回报 `queued`：插话排在当前这一轮，当前工具调用返回后读取。
+  it("M63 时序：卡在工具里读不到时回报 queued，而不是 delivered", async () => {
+    seed({ a: runningA });
+    const receipt = await dispatchSend(
+      { sessionId: "A", message: "改用 chrome channel", mode: "steer" },
+      { steerAppliedTimeoutMs: 30 },
+    );
+    expect(receipt.delivery).toEqual({
+      status: "queued",
+      queue_position: 1,
+      ahead: DISPATCH_DELIVERY_AHEAD_CURRENT_RUN,
+      note: DISPATCH_STEER_PENDING_NOTE,
+    });
+    expect(receipt.delivery.status).not.toBe("delivered");
+    expect(invokeMock).toHaveBeenCalledWith("queue_interjection", {
+      sessionId: "A",
+      message: "改用 chrome channel",
+      clientMessageId: expect.any(String),
+    });
+  });
+
+  // 同一条消息不能因为停止后又续跑而落两遍：还没被读到之前不再送第二次。
+  it("同一条插话在还没被读到时只落一次", async () => {
+    seed({ a: runningA });
+    const first = await dispatchSend(
+      { sessionId: "A", message: "别提交", mode: "steer" },
+      { steerAppliedTimeoutMs: 30 },
+    );
+    const second = await dispatchSend(
+      { sessionId: "A", message: "别提交", mode: "steer" },
+      { steerAppliedTimeoutMs: 30 },
+    );
+
+    expect(first.delivery.status).toBe("queued");
+    expect(second.delivery.status).toBe("queued");
+    const interjectionCalls = invokeMock.mock.calls.filter(
+      ([cmd]) => cmd === "queue_interjection",
+    );
+    expect(interjectionCalls).toHaveLength(1);
+    expect(
+      useChatStore.getState().runtime.A.messages.filter((m) => m.content === "别提交"),
+    ).toHaveLength(1);
   });
 
   it("运行中 + queue：本轮结束后再发", async () => {
@@ -412,6 +477,29 @@ describe("CF-HDE-R10 · 默认模型可设", () => {
     expect(useChatStore.getState().activeModel).toBe("v4-pro");
   });
 
+  it("CF-MSP-R1：入口设置默认模型后，端点的当前模型与默认模型一致（新会话取的就是设置值）", async () => {
+    seed({});
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_models") return [{ id: "v4-max", name: "v4-max", context_length: 64_000 }];
+      if (cmd === "save_settings") return (args as { newSettings: Settings }).newSettings;
+      return undefined;
+    });
+    await dispatchSetModel({ model: "v4-max" });
+    const saved = invokeMock.mock.calls.find(([cmd]) => cmd === "save_settings")?.[1] as {
+      newSettings: Settings;
+    };
+    // M60：入口只改 default_model，端点的 active_model 仍是旧值，于是"设置了
+    // 默认"和"新会话实际用的"不一致。三者必须成对落盘。
+    expect(saved.newSettings.default_model).toBe("v4-max");
+    expect(saved.newSettings.default_endpoint).toBe("deepseek");
+    expect(saved.newSettings.endpoints.deepseek.active_model).toBe("v4-max");
+    // stores/chat.ts 的新会话取模型顺序：先看端点的 active_model，再看全局默认。
+    const newSessionModel =
+      saved.newSettings.endpoints[saved.newSettings.default_endpoint]?.active_model
+      ?? saved.newSettings.default_model;
+    expect(newSessionModel).toBe("v4-max");
+  });
+
   it("模型不属于当前端点：fail-closed 报错，不做静默错配", async () => {
     seed({});
     invokeMock.mockImplementation(async (cmd: string) => {
@@ -425,20 +513,37 @@ describe("CF-HDE-R10 · 默认模型可设", () => {
     expect(useChatStore.getState().activeModel).toBe("m");
   });
 
-  it("带 session_id 时改的是那个会话的模型，且不切换界面", async () => {
+  it("带 session_id 时跨端点解析模型并成对更新，且不切换界面", async () => {
     seed({});
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "update_session_model") {
-        return { ...sessionA, model_id: (args as { modelId: string }).modelId };
+      if (cmd === "list_models") {
+        return (args as { endpointName: string }).endpointName === "chatgpt"
+          ? [{ id: "gpt-6.1-sol", name: "gpt-6.1-sol", context_length: 64_000 }]
+          : [{ id: "v4-pro", name: "v4-pro", context_length: 64_000 }];
+      }
+      if (cmd === "update_session_model_config") {
+        const input = args as { endpointId: string; modelId: string };
+        return { ...sessionA, endpoint_id: input.endpointId, model_id: input.modelId };
       }
       return undefined;
     });
-    const result = await dispatchSetModel({ sessionId: "A", model: "v4-pro" });
-    expect(invokeMock).toHaveBeenCalledWith("update_session_model", {
+    useSettingsStore.setState((state) => ({
+      settings: {
+        ...state.settings!,
+        endpoints: {
+          ...state.settings!.endpoints,
+          chatgpt: { base_url: "https://chatgpt.com/backend-api/codex", api_style: "chatgpt" },
+        },
+      },
+    }));
+    const result = await dispatchSetModel({ sessionId: "A", model: "gpt-6.1-sol" });
+    expect(invokeMock).toHaveBeenCalledWith("update_session_model_config", {
       sessionId: "A",
-      modelId: "v4-pro",
+      endpointId: "chatgpt",
+      modelId: "gpt-6.1-sol",
+      policy: "prefer",
     });
-    expect(result).toMatchObject({ scope: "session", session_id: "A" });
+    expect(result).toMatchObject({ scope: "session", session_id: "A", endpoint: "chatgpt", model: "gpt-6.1-sol" });
     expect(useChatStore.getState().activeSession?.id).toBe("B");
     expect(useChatStore.getState().activeModel).toBe("m");
   });

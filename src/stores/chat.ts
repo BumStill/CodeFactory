@@ -202,7 +202,11 @@ interface ChatStore {
   /** Steer the in-flight run: the message reaches the model at its next round
    *  boundary instead of waiting out the whole turn. Shows immediately as
    *  pending; `steer_applied` confirms it actually landed. */
-  steerRun: (content: string, sessionId?: string) => Promise<void>;
+  steerRun: (
+    content: string,
+    sessionId?: string,
+    clientMessageId?: string,
+  ) => Promise<void>;
   clearVisibleConversation: () => void;
   updateActiveSessionModel: (modelId: string) => Promise<void>;
   updateActiveSessionModelConfig: (config: {
@@ -1254,7 +1258,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
   },
 
-  steerRun: async (content, sessionId) => {
+  steerRun: async (content, sessionId, clientMessageId) => {
     const text = content.trim();
     // CF-HDE-R0：插话也必须按 session_id 寻址——派单入口可能正在给后台会话
     // 插话，而界面显示的是另一个会话。
@@ -1266,7 +1270,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // bubble would hang in "pending" forever with nothing to resolve it — the
     // input's own confirmation is the honest feedback there.
     if (!get().runtime[id]?.streaming) {
-      await invoke("queue_interjection", { sessionId: id, message: text });
+      await invoke("queue_interjection", {
+        sessionId: id,
+        message: text,
+        clientMessageId,
+      });
       return;
     }
     const msg: UIMessage = {
@@ -1296,7 +1304,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // exactly the reported symptom: 引导气泡一直在最下边.
     splitAssistantTurnAfterSteer(id, set);
     try {
-      await invoke("queue_interjection", { sessionId: id, message: text });
+      await invoke("queue_interjection", {
+        sessionId: id,
+        message: text,
+        clientMessageId,
+      });
     } catch (error) {
       // Never leave a bubble claiming to be on its way when it isn't — and
       // take the empty bubble the split opened for it with it.

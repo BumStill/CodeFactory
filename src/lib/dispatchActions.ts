@@ -22,7 +22,7 @@ import { invoke } from "./tauri";
 import { useChatStore, type SessionRuntime } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
 import { deliveryReferenceFromMessages } from "./deliveryReference";
-import { DispatchRequestError, describeError } from "./dispatchErrors";
+import { DispatchRequestError } from "./dispatchErrors";
 import { sessionTurnState, type SessionTurnState } from "./sessionTurnState";
 import type { DispatchSendMode } from "./desktopDispatch";
 import type { ModelInfo, PermissionMode, Session } from "./tauri";
@@ -33,6 +33,19 @@ export const DISPATCH_DELIVERY_TIMEOUT_MS = 4_000;
 /** `queued` 的 `ahead`：排在**当前这一轮**之后。 */
 export const DISPATCH_DELIVERY_AHEAD_CURRENT_RUN = "current_run";
 
+/**
+ * CF-STOP-R4（M63，v1.84.0）：插话的"真的被读到"确认窗口。
+ *
+ * 当前这一轮卡在工具调用里时，模型要等下一次调用才读得到插话——而那一刻可能
+ * 永远不来（停止、或者在交付工具里等锁）。所以 `steerRun` 返回（=消息进了这个
+ * 会话的插话队列）**不等于**送达；只有这一轮把它读走（`steer_applied` 清掉待
+ * 处理标记）才算 `delivered`。
+ */
+export const DISPATCH_STEER_APPLIED_TIMEOUT_MS = 4_000;
+
+/** 插话已交出、但这一轮还没读到时的如实说明。 */
+export const DISPATCH_STEER_PENDING_NOTE = "当前工具调用返回后读取";
+
 export interface DispatchDeliveryReceipt {
   status: "delivered" | "queued";
   /** `delivered` 时：进了新一轮，还是插进了当前这一轮。 */
@@ -41,6 +54,8 @@ export interface DispatchDeliveryReceipt {
   queue_position?: number;
   /** `queued` 时：排在什么之后。 */
   ahead?: string;
+  /** 补充说明（例如"当前工具调用返回后读取"）：不给客户端猜的余地。 */
+  note?: string;
 }
 
 export interface DispatchSendResult {
@@ -155,6 +170,33 @@ function classifyDelivery(input: {
 }
 
 /**
+ * CF-STOP-R4：这一轮里还挂着"已交出、还没被读到"的同类插话有几条。
+ *
+ * 它是 M63 的幂等闸门：同一条消息在还没被读走之前又送一次，只会多出一条永远
+ * 不会被区分开的重复行——所以第二次不再交出去，而是如实回报它已经在队列里。
+ */
+function pendingSteerCount(sessionId: string, content: string): number {
+  const text = content.trim();
+  return (runtimeOf(sessionId)?.messages ?? []).filter(
+    (message) => message.steerPending && message.content.trim() === text,
+  ).length;
+}
+
+/** 等到这一轮真的把插话读走（`steer_applied` 清掉待处理标记）。 */
+async function waitForSteerApplied(
+  sessionId: string,
+  content: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (pendingSteerCount(sessionId, content) === 0) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/**
  * CF-HDE-R8：运行中的会话往哪送。
  *   * `steer`（默认）= 界面按 Enter —— 插话引导当前执行；
  *   * `queue` = 界面按 ⌘/Ctrl+Enter —— 这一轮结束之后再发。
@@ -162,10 +204,12 @@ function classifyDelivery(input: {
  */
 export async function dispatchSend(
   input: { sessionId: string; message: string; mode: DispatchSendMode },
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; steerAppliedTimeoutMs?: number } = {},
 ): Promise<DispatchSendResult> {
   const session = requireSession(input.sessionId);
   const timeoutMs = options.timeoutMs ?? DISPATCH_DELIVERY_TIMEOUT_MS;
+  const steerAppliedTimeoutMs =
+    options.steerAppliedTimeoutMs ?? DISPATCH_STEER_APPLIED_TIMEOUT_MS;
   const before = runtimeOf(session.id);
   const state = sessionTurnStateOf(session);
 
@@ -190,14 +234,38 @@ export async function dispatchSend(
         },
       };
     }
-    await withDeadline(
-      useChatStore.getState().steerRun(input.message, session.id),
-      timeoutMs,
-      `session ${session.id} did not accept the interjection in time`,
+    // CF-STOP-R4（M63）：同一条消息不能因为停止后又续跑而落两遍。这一轮里已经
+    // 交出去、还没被读到的同类插话不再送第二次（后端按客户端消息 id 也会拒绝）。
+    const alreadyPending = pendingSteerCount(session.id, input.message);
+    if (alreadyPending === 0) {
+      const clientMessageId = crypto.randomUUID();
+      await withDeadline(
+        useChatStore.getState().steerRun(input.message, session.id, clientMessageId),
+        timeoutMs,
+        `session ${session.id} did not accept the interjection in time`,
+      );
+    }
+    // `steerRun` 成功只说明消息进了这个会话的插话队列。送达的证据是这一轮把它
+    // 读走（`steer_applied`）；拿不到就如实说"排在当前这一轮、当前工具返回后读取"。
+    const applied = await waitForSteerApplied(
+      session.id,
+      input.message,
+      steerAppliedTimeoutMs,
     );
+    if (applied && alreadyPending === 0) {
+      return {
+        session_id: session.id,
+        delivery: { status: "delivered", into: "current_run" },
+      };
+    }
     return {
       session_id: session.id,
-      delivery: { status: "delivered", into: "current_run" },
+      delivery: {
+        status: "queued",
+        queue_position: Math.max(pendingSteerCount(session.id, input.message), 1),
+        ahead: DISPATCH_DELIVERY_AHEAD_CURRENT_RUN,
+        note: DISPATCH_STEER_PENDING_NOTE,
+      },
     };
   }
 
@@ -247,10 +315,36 @@ export async function dispatchSetPermission(input: {
   return { session_id: updated.id, permission_mode: updated.permission_mode };
 }
 
+async function resolveConfiguredModel(modelId: string): Promise<{ endpoint: string; model: ModelInfo }> {
+  const settings = useSettingsStore.getState().settings;
+  if (!settings) {
+    throw new DispatchRequestError("invalid_request", "settings are not loaded");
+  }
+  const endpointNames = Object.keys(settings.endpoints ?? {});
+  const preferred = settings.default_endpoint?.trim();
+  const ordered = preferred
+    ? [preferred, ...endpointNames.filter((name) => name !== preferred)]
+    : endpointNames;
+  const unavailable: string[] = [];
+  for (const endpoint of ordered) {
+    try {
+      const models = await invoke<ModelInfo[]>("list_models", { endpointName: endpoint });
+      const model = Array.isArray(models) ? models.find((candidate) => candidate.id === modelId) : undefined;
+      if (model) return { endpoint, model };
+    } catch {
+      unavailable.push(endpoint);
+    }
+  }
+  const detail = unavailable.length > 0 ? `; unavailable endpoints: ${unavailable.join(", ")}` : "";
+  throw new DispatchRequestError(
+    "invalid_request",
+    `no configured endpoint serves ${modelId}${detail}; refusing to substitute another model`,
+  );
+}
+
 /**
- * CF-HDE-R10：带 session_id 时改那个会话的模型（端点保持该会话自己的）；
- * 省略时设置**新会话的默认模型**，并且端点与模型必须配套——验不过就 fail-closed，
- * 绝不写出"端点是 deepseek、默认模型是 gpt"这种错配。
+ * CF-MSP-R1/R2：模型 ID 先解析为唯一的已配置端点，再原子地写入配套配置。
+ * 带 session_id 时端点与模型一起更新；省略时端点 active_model、全局默认和草稿投影一致。
  */
 export async function dispatchSetModel(input: {
   sessionId?: string;
@@ -259,11 +353,15 @@ export async function dispatchSetModel(input: {
   | { scope: "session"; session_id: string; model: string; endpoint: string | null }
   | { scope: "default"; model: string; endpoint: string }
 > {
-  if (input.sessionId) {
-    const session = requireSession(input.sessionId);
+  const session = input.sessionId ? requireSession(input.sessionId) : null;
+  const resolved = await resolveConfiguredModel(input.model);
+  if (session) {
     if (session.kind === "anonymous" || session.kind === "quick") {
-      // 这些会话没有数据库行可写（匿名会话永不落库），只更新内存投影。
-      const updated: Session = { ...session, model_id: input.model };
+      const updated: Session = {
+        ...session,
+        endpoint_id: resolved.endpoint,
+        model_id: input.model,
+      };
       useChatStore.setState((state) => ({
         sessions: state.sessions.map((item) => (item.id === updated.id ? updated : item)),
         activeSession: state.activeSession?.id === updated.id ? updated : state.activeSession,
@@ -271,9 +369,11 @@ export async function dispatchSetModel(input: {
       }));
       return { scope: "session", session_id: updated.id, model: updated.model_id, endpoint: updated.endpoint_id ?? null };
     }
-    const updated = await invoke<Session>("update_session_model", {
+    const updated = await invoke<Session>("update_session_model_config", {
       sessionId: session.id,
+      endpointId: resolved.endpoint,
       modelId: input.model,
+      policy: session.model_policy ?? "prefer",
     });
     useChatStore.setState((state) => ({
       sessions: state.sessions.map((item) => (item.id === updated.id ? updated : item)),
@@ -288,39 +388,25 @@ export async function dispatchSetModel(input: {
     };
   }
 
-  // 默认模型：走界面选择器同一条路（端点自己的 active_model + 全局默认）。
-  const settings = useSettingsStore.getState().settings;
-  const endpoint = settings?.default_endpoint?.trim();
-  if (!settings || !endpoint) {
-    throw new DispatchRequestError(
-      "invalid_request",
-      "no endpoint is configured to set a default model on",
-    );
-  }
-  let models: ModelInfo[];
-  try {
-    models = await invoke<ModelInfo[]>("list_models", { endpointName: endpoint });
-  } catch (error) {
-    throw new DispatchRequestError(
-      "internal",
-      `could not verify that endpoint ${endpoint} serves ${input.model}: ${describeError(error)}`,
-    );
-  }
-  if (!Array.isArray(models) || !models.some((model) => model.id === input.model)) {
-    throw new DispatchRequestError(
-      "invalid_request",
-      `endpoint ${endpoint} does not serve ${input.model}; refusing to pair endpoint and default model silently`,
-    );
-  }
-  await invoke("set_endpoint_active_model", { endpointName: endpoint, modelId: input.model });
-  // 走界面模型选择器同一条保存路径（`useSettingsStore().save`）。
+  const settings = useSettingsStore.getState().settings!;
+  await invoke("set_endpoint_active_model", {
+    endpointName: resolved.endpoint,
+    modelId: input.model,
+  });
   await useSettingsStore.getState().save({
     ...settings,
-    default_endpoint: endpoint,
+    default_endpoint: resolved.endpoint,
     default_model: input.model,
+    endpoints: {
+      ...settings.endpoints,
+      [resolved.endpoint]: {
+        ...settings.endpoints[resolved.endpoint],
+        active_model: input.model,
+      },
+    },
   });
   useChatStore.getState().setModel(input.model);
-  return { scope: "default", model: input.model, endpoint };
+  return { scope: "default", model: input.model, endpoint: resolved.endpoint };
 }
 
 /**

@@ -28,37 +28,77 @@ pub struct Interjection {
     pub at: i64, // unix ms
 }
 
-/// session_id → queue of pending interjections. Drained by the scheduler.
-pub type InterjectionQueue = Arc<Mutex<HashMap<String, Vec<Interjection>>>>;
+/// One session's steering state.
+///
+/// `delivered_ids` is CF-STOP-R4 (M63) idempotency: a client message id that has
+/// already been handed to this session can never be handed over a second time.
+/// M63's shape was: the loop was parked inside a tool call, the steer sat
+/// unread, the user stopped the session, and the continuation re-sent the same
+/// message — the same line landed twice. Identity now travels with the message
+/// instead of being inferred from its text.
+#[derive(Debug, Default)]
+pub struct SessionInterjections {
+    pub pending: Vec<Interjection>,
+    pub delivered_ids: std::collections::HashSet<String>,
+}
 
+/// session_id → pending interjections + the ids already delivered.
+pub type InterjectionQueue = Arc<Mutex<HashMap<String, SessionInterjections>>>;
+
+/// `true` = queued, `false` = this exact client message was already delivered
+/// to this session (a duplicate must not be handed over twice).
 #[command]
 pub async fn queue_interjection(
     session_id: String,
     message: String,
+    client_message_id: Option<String>,
     state: State<'_, AppState>,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
+    enqueue_interjection(&state.interjections, &session_id, &message, client_message_id.as_deref()).await
+}
+
+/// The queueing rule itself, free of `AppState` so it stays directly testable.
+pub async fn enqueue_interjection(
+    queue: &InterjectionQueue,
+    session_id: &str,
+    message: &str,
+    client_message_id: Option<&str>,
+) -> Result<bool, AppError> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Err(AppError::Other("interjection cannot be empty".into()));
     }
     let entry = Interjection {
-        session_id: session_id.clone(),
+        session_id: session_id.to_string(),
         message: trimmed.into(),
         at: chrono::Utc::now().timestamp_millis(),
     };
-    let mut q = state.interjections.lock().await;
-    q.entry(session_id).or_default().push(entry);
-    Ok(())
+    let mut q = queue.lock().await;
+    let session = q.entry(session_id.to_string()).or_default();
+    if let Some(id) = client_message_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if !session.delivered_ids.insert(id.to_string()) {
+            return Ok(false);
+        }
+    }
+    session.pending.push(entry);
+    Ok(true)
 }
 
-/// Drain (return + clear) the queue for a session. Used by the scheduler
-/// at the start of each task dispatch.
+/// Drain (return + clear) the pending queue for a session. Used by the
+/// scheduler at the start of each task dispatch. The delivered-id set stays:
+/// draining means "the message was handed over", not "it may come again".
 pub async fn drain_for_session(
     queue: &InterjectionQueue,
     session_id: &str,
 ) -> Vec<Interjection> {
     let mut q = queue.lock().await;
-    q.remove(session_id).unwrap_or_default()
+    let Some(session) = q.get_mut(session_id) else {
+        return Vec::new();
+    };
+    std::mem::take(&mut session.pending)
 }
 
 /// The chat loop's view of the same queue. Both consumers drain at their own
@@ -104,7 +144,7 @@ mod tests {
         let q: InterjectionQueue = Arc::new(Mutex::new(HashMap::new()));
         {
             let mut g = q.lock().await;
-            g.entry("s1".into()).or_default().push(Interjection {
+            g.entry("s1".into()).or_default().pending.push(Interjection {
                 session_id: "s1".into(),
                 message: "hi".into(),
                 at: 0,
@@ -114,6 +154,46 @@ mod tests {
         assert_eq!(drained.len(), 1);
         let drained_again = drain_for_session(&q, "s1").await;
         assert!(drained_again.is_empty());
+    }
+
+    /// CF-STOP-R4 最低证据（幂等的一半）：同一条客户端消息 id 只会被交付一次——
+    /// 即使它在被读到之前又被送了一次，也只会落一条。
+    #[tokio::test]
+    async fn the_same_client_message_is_never_handed_over_twice() {
+        let q: InterjectionQueue = Arc::new(Mutex::new(HashMap::new()));
+        assert!(enqueue_interjection(&q, "s1", "改用 chrome channel", Some("m-1"))
+            .await
+            .unwrap());
+        assert!(
+            !enqueue_interjection(&q, "s1", "改用 chrome channel", Some("m-1"))
+                .await
+                .unwrap(),
+            "同一条消息第二次必须被拒绝"
+        );
+        // 换一条消息（新 id）当然可以进。
+        assert!(enqueue_interjection(&q, "s1", "然后跑测试", Some("m-2"))
+            .await
+            .unwrap());
+
+        let drained = drain_for_session(&q, "s1").await;
+        assert_eq!(
+            drained.iter().map(|i| i.message.as_str()).collect::<Vec<_>>(),
+            vec!["改用 chrome channel", "然后跑测试"],
+            "重复的一条只能落一次"
+        );
+
+        // 「读到之后又续跑」也不能把同一条再送一次：id 集合不随 drain 清空。
+        assert!(
+            !enqueue_interjection(&q, "s1", "改用 chrome channel", Some("m-1"))
+                .await
+                .unwrap(),
+            "已经交付过的消息在续跑时仍然必须被拒绝"
+        );
+        assert!(drain_for_session(&q, "s1").await.is_empty());
+        // 另一个会话不受影响：id 是会话内身份，不是全局身份。
+        assert!(enqueue_interjection(&q, "s2", "改用 chrome channel", Some("m-1"))
+            .await
+            .unwrap());
     }
 
     /// The inbox is where the 2026-09-08 regression actually bit: it asked
