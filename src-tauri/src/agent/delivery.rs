@@ -3265,6 +3265,115 @@ fn branch_is_ahead_of(root: &Path, remote: &str, base: &str, branch: &str) -> bo
     .unwrap_or(true) // if we can't tell (e.g. no origin/base yet), assume there is work
 }
 
+/// Machine-generated leftovers that must never become a commit subject or a PR
+/// title: the branch tail of an Objective workspace (`objective <hex>`) and bare
+/// identifiers. CF-TRUTH-R2.
+fn machine_generated_title_noise(token: &str) -> bool {
+    let token = token.trim();
+    if token.is_empty() {
+        return true;
+    }
+    if token.eq_ignore_ascii_case("objective") || token.eq_ignore_ascii_case("task") {
+        return true;
+    }
+    if token.len() < 12 {
+        return false;
+    }
+    token.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+/// The words a branch tail contributes to a human subject, with machine ids
+/// dropped (`objective-b8af1a61fd71788e579add0a1cd6fb3c` → empty).
+fn humanized_branch_subject(branch: &str) -> String {
+    let tail = branch.rsplit('/').next().unwrap_or(branch);
+    tail.split(['-', '_'])
+        .filter(|token| !machine_generated_title_noise(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+/// The conventional-commit prefix a staged change justifies, when nobody supplied
+/// a real title. `fix` is the conservative default for product code: this
+/// repository derives its release slot from the squash subject, and understating
+/// delays value while overstating fabricates a release nobody asked for.
+fn derived_title_prefix(staged_paths: &[String]) -> &'static str {
+    let relevant: Vec<&String> = staged_paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+    if relevant.is_empty() {
+        return "chore";
+    }
+    let all_under = |prefix: &str| relevant.iter().all(|path| path.starts_with(prefix));
+    if all_under("docs/") {
+        "docs"
+    } else if all_under(".github/") {
+        "ci"
+    } else if relevant
+        .iter()
+        .all(|path| path.contains("/tests/") || path.contains(".test.") || path.starts_with("tests/"))
+    {
+        "test"
+    } else {
+        "fix"
+    }
+}
+
+/// CF-TRUTH-R2 (2026-10-10): the subject a delivery writes must be the same
+/// conventional subject the pull request carries.
+///
+/// Squash-merge makes the PR title the subject on `main`, and the release plan
+/// reads that subject to decide the version slot. Delivery used to accept a
+/// machine placeholder (`objective <id>`) and the humanized branch tail, so a
+/// real fix reached `main` as `objective b8af1a61… (#605)`: the release plan saw
+/// no `feat`/`fix` and skipped the whole batch. A title that is already
+/// conventional is kept verbatim; otherwise the branch's own conventional
+/// commits decide, and only when nothing at all supplies a type does this derive
+/// the conservative one — never inventing a bigger release than the change
+/// justifies.
+fn canonical_delivery_title(
+    root: &Path,
+    branch: &str,
+    base: &str,
+    title: Option<&str>,
+    staged_paths: &[String],
+) -> String {
+    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+        if conventional_slot(title) > 0 {
+            return title.to_string();
+        }
+    }
+    // The branch's own commits are the strongest witness of intent that exists
+    // before the delivery commit is written.
+    if let Ok(log) = git(
+        root,
+        &["log", "--format=%s", &format!("{base}..{branch}")],
+    ) {
+        let mut best: Option<(u8, String)> = None;
+        for subject in log.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let slot = conventional_slot(subject);
+            if slot == 0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(best_slot, _)| slot > *best_slot) {
+                best = Some((slot, subject.to_string()));
+            }
+        }
+        if let Some((_, subject)) = best {
+            return subject;
+        }
+    }
+    let prefix = derived_title_prefix(staged_paths);
+    let subject = humanized_branch_subject(branch);
+    if subject.is_empty() {
+        format!("{prefix}: update {} file(s)", staged_paths.len().max(1))
+    } else {
+        format!("{prefix}: {subject}")
+    }
+}
+
 fn generate_commit_message(root: &Path, branch: &str, title: Option<&str>) -> String {
     if let Some(t) = title {
         if !t.trim().is_empty() {
@@ -3273,12 +3382,13 @@ fn generate_commit_message(root: &Path, branch: &str, title: Option<&str>) -> St
     }
     let files = git(root, &["diff", "--cached", "--name-only"]).unwrap_or_default();
     let count = files.lines().count();
-    let subject = branch
-        .rsplit('/')
-        .next()
-        .unwrap_or(branch)
-        .replace(['-', '_'], " ");
-    format!("{subject}\n\nDelivered by CodeFactory ({count} file(s) changed).")
+    let subject = humanized_branch_subject(branch);
+    let subject = if subject.is_empty() {
+        format!("update {count} file(s)")
+    } else {
+        subject
+    };
+    format!("chore: {subject}\n\nDelivered by CodeFactory ({count} file(s) changed).")
 }
 
 fn generate_commit_message_for_paths(
@@ -3291,13 +3401,15 @@ fn generate_commit_message_for_paths(
             return title.trim().to_string();
         }
     }
-    let subject = branch
-        .rsplit('/')
-        .next()
-        .unwrap_or(branch)
-        .replace(['-', '_'], " ");
+    let subject = humanized_branch_subject(branch);
+    let prefix = derived_title_prefix(staged_paths);
+    let subject = if subject.is_empty() {
+        format!("update {} file(s)", staged_paths.len())
+    } else {
+        subject
+    };
     format!(
-        "{subject}\n\nDelivered by CodeFactory ({} file(s) changed).",
+        "{prefix}: {subject}\n\nDelivered by CodeFactory ({} file(s) changed).",
         staged_paths.len()
     )
 }
@@ -3939,11 +4051,21 @@ pub async fn deliver<R: DeliveryRemote>(
         }
     };
     let head_tree = git(&repo.root, &["rev-parse", "HEAD^{tree}"]).unwrap_or_default();
+    // CF-TRUTH-R2: one canonical subject for the commit this delivery writes and
+    // the PR title it opens — computed before the commit exists, so a placeholder
+    // title cannot become the subject `main` ends up carrying after squash merge.
+    let delivery_subject = canonical_delivery_title(
+        &repo.root,
+        &repo.branch,
+        &repo.default_branch,
+        opts.title.as_deref(),
+        &commit_plan.staged_paths,
+    );
     if commit_plan.target_tree_sha != head_tree {
         let msg = append_release_urgency(
             generate_commit_message_for_paths(
                 &repo.branch,
-                opts.title.as_deref(),
+                Some(&delivery_subject),
                 &commit_plan.staged_paths,
             ),
             opts.release_urgency,
@@ -4452,14 +4574,7 @@ pub async fn deliver<R: DeliveryRemote>(
     let mut pr_title = prior_receipt
         .as_ref()
         .and_then(|receipt| receipt.pr_title.clone())
-        .or_else(|| opts.title.clone())
-        .unwrap_or_else(|| {
-            generate_commit_message(&repo.root, &repo.branch, None)
-                .lines()
-                .next()
-                .unwrap_or(&repo.branch)
-                .to_string()
-        });
+        .unwrap_or_else(|| delivery_subject.clone());
     // The title may have come from session context rather than from this
     // branch. Never let it claim a bigger release than the commits justify.
     let commit_slot = branch_commit_slot(&repo.root, &repo.default_branch, &repo.branch);
@@ -14530,5 +14645,166 @@ GITHUB.COM:
     user: BumStill
 ";
         assert!(gh_hosts_content_has_auth_for_host(content, "github.com"));
+    }
+
+    // ── CF-TRUTH-R2: the delivery subject must be a real conventional title ──
+
+    fn git_in(root: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git").no_window()
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "CodeFactory Test")
+            .env("GIT_AUTHOR_EMAIL", "noreply@codefactory.local")
+            .env("GIT_COMMITTER_NAME", "CodeFactory Test")
+            .env("GIT_COMMITTER_EMAIL", "noreply@codefactory.local")
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The placeholder a field session actually wrote: the Objective id became
+    /// the subject of `main` after squash merge (#605).
+    const FIELD_PLACEHOLDER_TITLE: &str = "objective b8af1a61fd71788e579add0a1cd6fb3c";
+
+    #[test]
+    fn a_placeholder_title_never_becomes_the_delivery_subject() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "baseline\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
+        git_in(
+            root,
+            &["checkout", "-q", "-b", "codefactory/objective-b8af1a61fd71788e579add0a1cd6fb3c"],
+        );
+
+        // The pre-fix behaviour is kept as an explicit negative control: this is
+        // exactly the subject that made `plan_release` skip the batch.
+        assert_eq!(
+            conventional_slot(FIELD_PLACEHOLDER_TITLE),
+            0,
+            "the field placeholder is not a conventional subject"
+        );
+
+        let staged = vec!["src-tauri/src/agent/objective.rs".to_string()];
+        let title = canonical_delivery_title(
+            root,
+            "codefactory/objective-b8af1a61fd71788e579add0a1cd6fb3c",
+            "main",
+            Some(FIELD_PLACEHOLDER_TITLE),
+            &staged,
+        );
+        assert!(
+            conventional_slot(&title) > 0,
+            "the delivery subject must be a conventional title, got {title:?}"
+        );
+        assert!(
+            !title.contains("b8af1a61fd71788e579add0a1cd6fb3c"),
+            "machine ids must not reach the subject: {title:?}"
+        );
+
+        // The commit this delivery writes carries that exact subject, and it is
+        // the same string the PR title uses.
+        let message =
+            generate_commit_message_for_paths("codefactory/objective-b8af1a61", Some(&title), &staged);
+        assert_eq!(message.lines().next(), Some(title.as_str()));
+        assert!(
+            conventional_slot(message.lines().next().unwrap()) > 0,
+            "the written commit subject must be conventional: {message:?}"
+        );
+    }
+
+    /// A supplied conventional title is never rewritten: the caller's judgement
+    /// wins, including a deliberate `feat`.
+    #[test]
+    fn an_explicit_conventional_title_is_kept_verbatim() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "baseline\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
+
+        let title = "feat(delivery): add the thing";
+        assert_eq!(
+            canonical_delivery_title(root, "work/branch", "main", Some(title), &[]),
+            title
+        );
+    }
+
+    /// CF-TRUTH-R2 acceptance: the real release plan, run over a synthetic
+    /// history whose only commit came from this delivery path, must recognise the
+    /// change. Before the fix the same history produced `slot=none` /
+    /// `skip_reason="no feat/fix since the last tag"` and the batch was skipped.
+    #[test]
+    fn plan_release_recognises_a_single_commit_delivery() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "baseline\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
+        let base = String::from_utf8(
+            std::process::Command::new("git").no_window()
+                .arg("-C")
+                .arg(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let staged = vec!["src-tauri/src/agent/objective.rs".to_string()];
+        let title = canonical_delivery_title(
+            root,
+            "codefactory/objective-b8af1a61fd71788e579add0a1cd6fb3c",
+            "main",
+            Some(FIELD_PLACEHOLDER_TITLE),
+            &staged,
+        );
+        std::fs::write(root.join("file.txt"), "delivered\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", &title]);
+        let head = "HEAD".to_string();
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repository root")
+            .to_path_buf();
+        let plan = |revision_range: &str| -> serde_json::Value {
+            let output = std::process::Command::new("python3").no_window()
+                .arg(repo_root.join("tools/release/plan_release.py"))
+                .arg("--repo")
+                .arg(root)
+                .arg("--range")
+                .arg(revision_range)
+                .output()
+                .expect("run plan_release.py");
+            assert!(
+                output.status.success(),
+                "plan_release failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).expect("plan_release JSON")
+        };
+
+        let delivered = plan(&format!("{base}..{head}"));
+        assert_eq!(
+            delivered["skip"], false,
+            "the delivery commit must be recognised by the release plan: {delivered}"
+        );
+        assert_eq!(delivered["slot"], "patch");
+
+        // Negative control: the placeholder subject from the field session is
+        // exactly what made this plan skip the whole batch.
+        git_in(root, &["commit", "-q", "--allow-empty", "-m", FIELD_PLACEHOLDER_TITLE]);
+        let placeholder = plan(&format!("{head}..HEAD"));
+        assert_eq!(placeholder["skip"], true);
+        assert_eq!(placeholder["slot"], "none");
     }
 }
