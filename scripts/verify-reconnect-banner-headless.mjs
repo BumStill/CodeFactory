@@ -9,11 +9,11 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { allocateLoopbackPort, waitForAcceptanceDocument, waitForStableAnimationFrames } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
-const port = Number(process.env.CODEFACTORY_RECONNECT_BANNER_PORT ?? 1446);
-const baseUrl = `http://127.0.0.1:${port}/reconnect-banner-acceptance.html`;
+const preferredPort = Number(process.env.CODEFACTORY_RECONNECT_BANNER_PORT ?? 1446);
 const artifactDir = process.env.CODEFACTORY_RECONNECT_BANNER_ARTIFACT_DIR
   ?? path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), "codefactory-reconnect-banner-headless");
 
@@ -71,6 +71,8 @@ async function stopServer(child) {
 async function main() {
   await rm(artifactDir, { recursive: true, force: true });
   await mkdir(artifactDir, { recursive: true });
+  const port = await allocateLoopbackPort(preferredPort);
+  const baseUrl = `http://127.0.0.1:${port}/reconnect-banner-acceptance.html`;
   const vite = spawn(process.execPath, [viteCli, "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     detached: process.platform !== "win32",
@@ -83,7 +85,7 @@ async function main() {
 
   let browser;
   try {
-    await waitForServer(vite);
+    await waitForAcceptanceDocument(vite, baseUrl, "reconnect-banner.tsx");
     const executablePath = await firstBrowser();
     browser = await chromium.launch({ executablePath, headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
@@ -94,6 +96,7 @@ async function main() {
     const modelPanel = page.locator("section", { hasText: "Actually waiting on model transport" });
     await toolPanel.waitFor();
     await modelPanel.waitFor();
+    await waitForStableAnimationFrames(page);
 
     assert(
       await toolPanel.getByText("模型连接曾短暂不稳定，已完成重连", { exact: true }).isVisible(),

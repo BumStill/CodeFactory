@@ -9,11 +9,11 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { allocateLoopbackPort, waitForAcceptanceDocument, waitForFocused } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
-const port = Number(process.env.CODEFACTORY_PERMISSION_MODE_PORT ?? 1449);
-const baseUrl = `http://127.0.0.1:${port}/permission-mode-acceptance.html`;
+const preferredPort = Number(process.env.CODEFACTORY_PERMISSION_MODE_PORT ?? 1449);
 const artifactDir = process.env.CODEFACTORY_PERMISSION_MODE_ARTIFACT_DIR
   ?? path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), "codefactory-permission-mode-headless");
 
@@ -62,6 +62,8 @@ async function stopServer(child) {
 async function main() {
   await rm(artifactDir, { recursive: true, force: true });
   await mkdir(artifactDir, { recursive: true });
+  const port = await allocateLoopbackPort(preferredPort);
+  const baseUrl = `http://127.0.0.1:${port}/permission-mode-acceptance.html`;
   const vite = spawn(process.execPath, [viteCli, "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     detached: process.platform !== "win32",
@@ -75,7 +77,7 @@ async function main() {
 
   let browser;
   try {
-    await waitForServer(vite);
+    await waitForAcceptanceDocument(vite, baseUrl, "permission-mode.tsx");
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
@@ -89,8 +91,15 @@ async function main() {
     const standardItem = page.getByRole("menuitemradio", { name: /标准/ });
     await standardItem.waitFor();
     assert(await standardItem.getAttribute("aria-checked") === "true", "default session mode should be standard");
+    // Roving focus must already own the menu before the arrow key is sent: the
+    // menu element can be in the DOM before React commits the focus move, and a
+    // keypress delivered inside that gap goes to the trigger instead, which
+    // leaves the next item unfocused. Wait for the real precondition rather than
+    // assuming the keypress arrives after the commit.
+    await waitForFocused(standardItem);
     await page.keyboard.press("ArrowDown");
     const trustedItem = page.getByRole("menuitemradio", { name: /信任/ });
+    await waitForFocused(trustedItem);
     assert(await trustedItem.evaluate((element) => element === document.activeElement), "ArrowDown should focus trusted mode");
     await page.keyboard.press("Enter");
     await page.getByTestId("current-permission-mode").waitFor({ state: "visible" });

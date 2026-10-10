@@ -282,7 +282,7 @@ async fn authorize_task_mutation_rung(
         return Ok(true);
     };
     let store = ObjectiveStore::new(pool.clone());
-    let renewed = store
+    let renewal = store
         .renew_claimed_remediation(
             &permit.objective_id,
             &permit.remediation_id,
@@ -292,7 +292,10 @@ async fn authorize_task_mutation_rung(
         )
         .await
         .map_err(|error| AppError::Other(format!("renew task mutation permit: {error:#}")))?;
-    if !renewed {
+    // Only a live renewal authorizes a mutation: a claim that the owner already
+    // closed (its own settlement) is just as unusable for a new mutation as one
+    // someone else now holds.
+    if !renewal.renewed() {
         return Ok(false);
     }
     store
