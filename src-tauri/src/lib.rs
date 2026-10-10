@@ -1430,15 +1430,16 @@ pub fn run_headless_smoke_cli() -> bool {
 }
 
 pub fn run() {
+    let context = tauri::generate_context!();
     // U34: the local-only dispatch client entry. `src-tauri/src/main.rs` is the
     // E2E-001 trust root and an ordinary PR must keep it byte-identical, so the
     // client is resolved here — the entry the frozen main falls through to —
-    // before any Tauri/GUI work starts. It never re-implements behaviour: the
+    // after the context is fixed (desktop isolation contract)
+    // and before any Tauri/GUI work starts. It never re-implements behaviour: the
     // request goes to the same code path the GUI uses (`src/lib/desktopDispatch.ts`).
     if run_headless_dispatch_cli() {
         return;
     }
-    let context = tauri::generate_context!();
     match desktop_context::initialize(&context) {
         Ok(desktop_context::DesktopContext::Normal) => {}
         Ok(desktop_context::DesktopContext::Synthetic(synthetic)) => {
