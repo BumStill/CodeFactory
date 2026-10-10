@@ -50,3 +50,48 @@ Spec Harness; Compatibility Harness (existing session/route records); Observatio
 - 不可用判定沿用 `classify_provider_failure` 的 `permits_endpoint_failover()`（连接失败/超时/5xx、模型不可用、401、429、配额用尽）；这些类别现在都会把端点写入冷却期（R3 的「配额重置前不要反复打首选端点」在单轮内由冷却期 + `failed_indices` 保证，跨轮由「新一轮先试首选、一次失败即冷却」保证，仍是 bounded）。
 - `fixed` 模式下 `settings_for_session_route` 会把端点收敛为唯一一个，计划里不存在回落候选，`has_available_fallback()` 恒为 false（R6）。
 - endpoint 冷却窗口沿用既有 `DEFAULT_ENDPOINT_COOLDOWN`（120s），不新增配置项、不改用户端点配置或凭据。
+
+## Fallback when a reply breaks off partway
+
+### Background and evidence（U33，2026-10-09 / 2026-10-10）
+- 2026-10-09，session ab2d7b0f（U32 任务，`prefer`，chatgpt/gpt-6-luna）：
+  - 20:50:36、20:50:54、21:32:13 连续三次 `TRANSPORT_UNREACHABLE`（`HTTP error: error decoding response body`），`model_route_attempts` 里**一次 deepseek/openrouter 尝试都没有**。
+  - objective 从 19:50 到 21:42 停在 `waiting_system / provider_transport_unreachable` 约 2 小时，重试间隔一度到 40 分钟，期间毫无进展；同时 chatgpt.com 与 api.deepseek.com 都是通的。
+- #586（U30）留下的已知缺口：「副作用未知时（`!replay_is_proven`）仍停在 objective 级等待，而不回落」。本案例正中该缺口：模型**自己的回复中途断掉**（外部什么都没碰过），却被当成「不能安全重放，等着」。
+- 补充证据（2026-10-10 10:20–10:24，M51 会话 4c1fdf4f）：首选 GPT-6.1-Sol（prefer）在一轮中途收到 429 `usage_limit_reached`（plus 套餐 300 分钟窗口，约 3.7 小时后重置）。`model_route_attempts` 三次失败均 `output_started=1`、`side_effect_started=1`，没有回落到 DeepSeek；objective 进入 `waiting_system / provider_overload_budget_exhausted` 原地等几个小时。
+- 「额度用完」与「瞬时过载」性质不同：前者重置时间明确且很长，原地等待只会烧掉恢复次数。期望：额度用完时后续请求直接走回落链，或至少明说「GPT 额度到 HH:MM 才恢复，已切到 DeepSeek / 需要你决定」。
+
+### Decision
+回复中途断掉、且外部什么都没碰过时，这只是一个「可以重发的模型请求」，按既有回落链换端点重发，不长时间干等；只有工具调用/外部副作用可能已经开始时，才回到「先核对」的谨慎路径。首选端点恢复后，新的一轮仍回到首选。
+
+### Requirements Traceability
+
+| Req ID | Requirement | Minimum evidence |
+| --- | --- | --- |
+| CF-PFB-R10 | 模型回复中途断掉（解码失败/流中断/连接重置）且**尚未开始任何工具调用或其他外部副作用**时，计为「可重发的模型请求」：prefer 模式下在有界时间内切到下一个可用端点重发同一请求，不长时间等待 | 集成测试：断流 / 解码失败 / 连接重置 → 下一次请求打到 deepseek，任务继续 |
+| CF-PFB-R11 | 只有工具调用/副作用可能已经开始时，才回到「先核对」的谨慎路径（维持现状，不得弱化） | 反例测试 |
+| CF-PFB-R12 | 所有端点都不可用时的等待时间有上界且可见：会话用平实的话说明下一次尝试会在什么时候发生；超过 N 分钟（取值见 Implementation Notes 并在 PR 说明）没有任何尝试即算缺陷 | 测试 + 平实措辞通过内部术语守卫 |
+| CF-PFB-R13 | 首选端点恢复后，新的一轮回到首选端点 | 测试 |
+
+### Applicable Harnesses
+Spec Harness；Compatibility Harness；Observation Harness（每一次尝试按端点可追溯）；AI Collaboration Harness。
+
+### Test matrix
+- 断流类型：纯文本流中断 / 解码失败（`error decoding response body`）/ 连接重置。
+- 已起副作用：流中断前已经吐出 `ToolCallStart` → 不换路（反例）。
+- 额度用完（429 `usage_limit_reached`）：有回落可用时不烧预算，直接换路。
+- 等待上界：所有端点不可用 → 下一次尝试时间 ≤ N 分钟且用平实语言说出来。
+- 回归：fixed 模式仍不换路；首选恢复后新一轮回到首选。
+
+### Constraints
+- 与 U25（#584 短暂断网等待）和 U30（#586 prefer 回落）保持一致；冲突时写 Spec Amendment。
+- 其余约束同工作流模板。
+
+### Implementation Notes
+（不改变任何 Requirement 或验收标准，只记录实现约束。）
+
+- 根因：`RoutedDesktopModelTransport::complete` 在 POST 之后的 `Retryable` 分支里用**本轮 `output_started`**（任何 SSE 事件，含纯文本 `TextDelta`）加上 turn 级 `turn_uncommitted_output` 判定「不可换路」；而 `TrackingEventSink` 同时把 `turn_uncommitted_output` 也置位。于是「模型已经开始说话但中途断掉」把换路彻底挡住，只能原路重试 —— 这就是 ab2d7b0f / M51 里 0 次 deepseek 尝试的机械原因。
+- 判定改为按**副作用**而非「任何输出」：新增本轮 `round_side_effect_started`（只在 `ToolCallStart` / `ToolResult` 置位），换路条件是「本轮没有工具调用」且「本轮开始前 turn 级副作用闩未置位」（R10）；任一为真则保持谨慎路径（R11）。
+- 对偶账本（`provider_route_attempts`）仍由 `record_failure` 的 `replay_is_proven = !attempt.side_effect_started && receipt 为空` 决定，纯文本中断因此以 `failed_replayable` 结案，端点进入既有 120s 冷却。
+- 429 `usage_limit_reached` 目前被 `is_provider_overloaded`（含 `"429"` 字面）归为 `provider_overload`，在无可用回落时才走严格三次预算并落 `provider_overload_budget_exhausted`；R10 让这类中途失败在 prefer 模式下重新被判定为可回落（有回落即 `RetryAfter`），不再烧预算干等。
+- R12 的上界取 **N = 5 分钟**（`MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS`），对 objective 级 `next_observation_at` 统一做上界钳制；用户可见文案由 `src/stores/chatEvents.ts` 的 `modelRouteExhaustedGuidance()` 生成，明说下一次尝试的本地时间（HH:MM），并沿用既有平实措辞守卫。
