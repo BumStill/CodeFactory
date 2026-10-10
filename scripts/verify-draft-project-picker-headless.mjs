@@ -55,7 +55,7 @@ async function main() {
   let browser;
   try {
     await waitForServer(vite);
-    browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox"] });
+    browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox", "--no-proxy-server"] });
     const page = await browser.newPage({ viewport: { width: 375, height: 812 } });
     await page.goto(baseUrl, { waitUntil: "networkidle" });
     await page.getByRole("main", { name: "Draft project picker acceptance" }).waitFor({ timeout: 10_000 });
@@ -119,6 +119,64 @@ async function main() {
     await page.screenshot({ path: path.join(artifactDir, "draft-model-picker-visible.png"), fullPage: true });
     await page.keyboard.press("Escape");
 
+    // CF-MSH-R2: a new draft shows — and admits — the current settings default,
+    // never the stale cached selection, and both move together when the default
+    // changes. The synthetic store starts with a deliberately different cached
+    // model, so a regression to the old behaviour fails here in a real browser.
+    const modelSelection = await page.evaluate(async () => {
+      const readSelection = () => {
+        const trigger = document.querySelector('[aria-label^="选择下一回合模型："]');
+        const probe = document.querySelector('[aria-label="Model selection probe"]');
+        return {
+          label: trigger?.getAttribute("aria-label") ?? null,
+          activeModel: probe?.getAttribute("data-active-model") ?? null,
+          draftModel: probe?.getAttribute("data-draft-model") ?? null,
+        };
+      };
+      const api = window.__modelSelectionAcceptance;
+      if (!api) throw new Error("model selection acceptance hooks missing");
+      const settle = () =>
+        new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const before = readSelection();
+      api.seedDefault("gpt-6.1-sol");
+      api.beginDraft();
+      await settle();
+      const seeded = readSelection();
+      api.seedDefault("gpt-6.1-flash");
+      api.beginDraft();
+      await settle();
+      const changed = readSelection();
+      return { before, seeded, changed };
+    });
+    assert(
+      modelSelection.before.activeModel === "gpt-6-luna",
+      `the stale cached selection was not seeded: ${JSON.stringify(modelSelection)}`,
+    );
+    assert(
+      modelSelection.seeded.activeModel === "gpt-6.1-sol" && modelSelection.seeded.draftModel === "gpt-6.1-sol",
+      `a new draft did not adopt the settings default: ${JSON.stringify(modelSelection)}`,
+    );
+    assert(
+      (modelSelection.seeded.label ?? "").includes("gpt-6.1-sol")
+        && !(modelSelection.seeded.label ?? "").includes("gpt-6-luna"),
+      `the model picker still shows a cached model instead of the default: ${JSON.stringify(modelSelection)}`,
+    );
+    assert(
+      modelSelection.changed.activeModel === "gpt-6.1-flash"
+        && modelSelection.changed.draftModel === "gpt-6.1-flash"
+        && (modelSelection.changed.label ?? "").includes("gpt-6.1-flash"),
+      `changing the settings default did not move the draft with it: ${JSON.stringify(modelSelection)}`,
+    );
+    await page.screenshot({ path: path.join(artifactDir, "model-picker-settings-default-dark.png"), fullPage: true });
+    await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
+    await page.waitForFunction(
+      () => getComputedStyle(document.querySelector("main")).backgroundColor !== "rgb(30, 30, 30)",
+      null,
+      { timeout: 5_000 },
+    ).catch(() => {});
+    await page.screenshot({ path: path.join(artifactDir, "model-picker-settings-default-light.png"), fullPage: true });
+    await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
+
     await page.getByRole("button", { name: "选择项目" }).click();
     const menu = page.getByRole("menu", { name: "项目选择" });
     await menu.waitFor({ timeout: 10_000 });
@@ -177,6 +235,7 @@ async function main() {
       checks: {
         compact375: compactGeometry,
         modelMenuAvoidsComposer: modelMenuGeometry,
+        modelPickerFollowsSettingsDefault: modelSelection,
         menuEscapesComposerClip: true,
         projectKeyboardSelectable: true,
         wideFocusedComposer: wideGeometry,
