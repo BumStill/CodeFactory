@@ -360,6 +360,11 @@ export function WorkspacePage({
       stopRun: async () => {
         if (await cancelStream(sessionId)) setDurableTurnActive(false);
       },
+      // CF-BLD-R4 的后台入口:菜单栏「清理编译缓存」走的就是面板按钮调用
+      // 的同一条命令,所以界面不可用时也能清理。
+      cleanBuildCache: async () => {
+        await invoke("build_cache_cleanup");
+      },
     },
   });
   // 本地非界面派单入口(U34)。和菜单栏是同一个模式:原生侧只发信封(传输、
@@ -407,6 +412,11 @@ export function WorkspacePage({
         const stopped = await store.cancelStream(target);
         if (stopped) setDurableTurnActive(false);
         return { stopped };
+      },
+      cleanBuildCache: async () => {
+        // CF-BLD-R4：和「资源中心」面板上的清理按钮调用同一个 Tauri 命令，
+        // 所以锁屏期间编排方也能回收构建缓存，而不是只能等有人点界面。
+        return invoke("build_cache_cleanup");
       },
       listApprovals: async () => {
         const store = useChatStore.getState();

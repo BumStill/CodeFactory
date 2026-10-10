@@ -983,6 +983,21 @@ pub fn reclaim_until(
     apply_plan(&plan, trigger, log)
 }
 
+/// CF-BLD-R6: environment for commands the shell tool is about to run.
+///
+/// A *one-shot full* build never reuses incremental data — cargo keys it by
+/// absolute path, so a full compile writes it and nothing reads it back. Those
+/// commands run with incremental off; an ordinary editing build (the human's or
+/// the agent's `cargo check` loop inside an existing target directory) keeps it,
+/// because there it is exactly what makes the loop fast.
+pub fn one_shot_build_env(command: &str) -> &'static [(&'static str, &'static str)] {
+    if HeavyBuildLimiter::is_heavy_build_command(command) {
+        &[("CARGO_INCREMENTAL", "0")]
+    } else {
+        &[]
+    }
+}
+
 /// Live occupancy for the panel and the background entry point (CF-BLD-R4).
 pub async fn current_report(container: &Path, limiter: &HeavyBuildLimiter) -> BuildCacheReport {
     let entries = scan_workspace_container(container);
@@ -1447,6 +1462,33 @@ mod tests {
         }
         if std::env::var("CODEFACTORY_MAX_HEAVY_BUILDS").is_err() {
             assert_eq!(configured_max_heavy_builds(), DEFAULT_MAX_HEAVY_BUILDS);
+        }
+    }
+
+    #[test]
+    fn r6_incremental_is_disabled_only_on_one_shot_full_builds() {
+        // One-shot full builds: the disk they write must be disk a rebuild reads.
+        for command in [
+            "cargo test --workspace",
+            "cargo build --release",
+            "cargo check",
+            "cargo clippy --all-targets",
+            "pnpm build",
+            "pnpm test",
+        ] {
+            assert_eq!(
+                one_shot_build_env(command),
+                &[("CARGO_INCREMENTAL", "0")],
+                "{command} is a one-shot full build"
+            );
+        }
+        // Everything else keeps the incremental data that makes the edit-build
+        // loop fast — the profile no longer disables it globally.
+        for command in ["cargo --version", "git status", "ls -la", "pnpm lint"] {
+            assert!(
+                one_shot_build_env(command).is_empty(),
+                "{command} is not a one-shot full build"
+            );
         }
     }
 

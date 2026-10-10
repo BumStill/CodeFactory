@@ -65,19 +65,32 @@ export function heavyBuildLine(report: BuildCacheReport): string | null {
   return null;
 }
 
-export default function BuildCachePanel() {
+/** Where the panel gets its numbers. Production passes nothing and the real
+ * Tauri commands are used; the real-browser acceptance entry injects a stub so
+ * the same component renders without a Tauri runtime. */
+export interface BuildCacheSource {
+  report: () => Promise<BuildCacheReport>;
+  cleanup: () => Promise<MaintenanceOutcome>;
+}
+
+const liveSource: BuildCacheSource = {
+  report: () => invoke<BuildCacheReport>("build_cache_report"),
+  cleanup: () => invoke<MaintenanceOutcome>("build_cache_cleanup"),
+};
+
+export default function BuildCachePanel({ source = liveSource }: { source?: BuildCacheSource }) {
   const [report, setReport] = useState<BuildCacheReport | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const next = await invoke<BuildCacheReport>("build_cache_report");
+      const next = await source.report();
       setReport(next);
     } catch (error) {
       setMessage(`读取编译缓存失败：${String(error)}`);
     }
-  }, []);
+  }, [source]);
 
   useEffect(() => {
     void refresh();
@@ -86,7 +99,7 @@ export default function BuildCachePanel() {
   const cleanup = useCallback(async () => {
     setBusy(true);
     try {
-      const outcome = await invoke<MaintenanceOutcome>("build_cache_cleanup");
+      const outcome = await source.cleanup();
       setMessage(cleanupSummary(outcome));
       await refresh();
     } catch (error) {
@@ -94,7 +107,7 @@ export default function BuildCachePanel() {
     } finally {
       setBusy(false);
     }
-  }, [refresh]);
+  }, [refresh, source]);
 
   const queue = report ? heavyBuildLine(report) : null;
 

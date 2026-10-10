@@ -90,18 +90,20 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 # split-debuginfo side files under `target/debug/deps`. Line tables keep
 # `file:line` in a failing test's output while dropping the rest of DWARF, and
 # `split-debuginfo = "off"` stops the extra .o/.dSYM copies on macOS.
-# `incremental = false` is the same decision the shared cache already made:
-# incremental data is keyed by absolute path, so it can never be reused across
-# workspaces and only ever rewrites bytes.
+#
+# `incremental` is deliberately NOT disabled here. Turning it off globally
+# would slow down the edit-build loop for a person and for an agent working
+# request by request. The incremental directory is only worthless in a
+# *one-shot full* build, so it is disabled exactly there instead: the shared
+# cache (`scripts/cargo-shared.mjs`) and heavy build commands the agent runs
+# through the shell tool (`tools/bash.rs`).
 [profile.dev]
 debug            = 1
 split-debuginfo  = "off"
-incremental      = false
 
 [profile.test]
 debug            = 1
 split-debuginfo  = "off"
-incremental      = false
 
 [profile.release]
 panic         = "abort"

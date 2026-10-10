@@ -27,6 +27,7 @@ const OPERATIONS = new Set([
   "list_approvals",
   "resolve_approval",
   "focus_main_display",
+  "clean_build_cache",
 ]);
 
 const PERMISSION_MODES = new Set(["safe", "standard", "trusted"]);

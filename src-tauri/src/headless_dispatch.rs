@@ -101,6 +101,13 @@ pub enum Request {
     ResolveApproval { approval_id: String, approve: bool },
     /// CF-HDE-R6 (M42): move the main window back to the main display.
     FocusMainDisplay {},
+    /// CF-BLD-R4: reclaim what is safe to reclaim from the build cache
+    /// (caches of tasks that already ended, then the long-orphaned
+    /// backlog, then the ceiling). It runs the exact command the
+    /// Resources panel's button runs, so an orchestrator can do it with
+    /// the screen locked. It takes no fields at all — nothing here can be
+    /// talked into deleting a cache by the wording of a message.
+    CleanBuildCache {},
 }
 
 /// A machine-readable failure. `code` is stable so a client can branch on it.
@@ -246,6 +253,7 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             require_non_empty("approval_id", approval_id)?
         }
         Request::FocusMainDisplay {} => {}
+        Request::CleanBuildCache {} => {}
     }
     Ok(())
 }
@@ -355,7 +363,7 @@ impl AuditEntry {
             Request::SetModel { session_id, .. } | Request::Stop { session_id } => {
                 entry.session_id = session_id.clone();
             }
-            Request::ListApprovals {} | Request::FocusMainDisplay {} => {}
+            Request::ListApprovals {} | Request::FocusMainDisplay {} | Request::CleanBuildCache {} => {}
             Request::ResolveApproval { approval_id, .. } => {
                 entry.message = Some(format!("approval_id={approval_id}"));
             }
@@ -377,6 +385,7 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::ListApprovals {} => "list_approvals",
         Request::ResolveApproval { .. } => "resolve_approval",
         Request::FocusMainDisplay {} => "focus_main_display",
+        Request::CleanBuildCache {} => "clean_build_cache",
     }
 }
 
@@ -1134,6 +1143,21 @@ mod tests {
             ))
             .is_ok());
         }
+    }
+
+    #[test]
+    fn build_cache_cleanup_is_reachable_from_the_background_entry() {
+        // CF-BLD-R4: reclaiming the build cache must not need the GUI (or an
+        // unlocked screen). It is an ordinary forwarded operation that takes no
+        // fields, so nothing about it can be argued into deleting anything.
+        let request = parse_request(r#"{"operation":"clean_build_cache"}"#)
+            .expect("a fieldless cleanup request parses");
+        assert!(matches!(request, Request::CleanBuildCache {}));
+        assert_eq!(operation_of(&request), "clean_build_cache");
+        let entry = AuditEntry::for_request(&request, chrono::Utc::now());
+        assert_eq!(entry.operation, "clean_build_cache");
+        assert!(entry.session_id.is_none());
+        assert!(entry.delivery_authorized.is_none());
     }
 
     #[test]

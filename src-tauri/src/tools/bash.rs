@@ -13,6 +13,12 @@ use crate::util::command_env;
 use crate::util::no_window::NoWindow;
 use crate::util::process_tree::{self, ProcessOutputError};
 
+// `emit`/`path` are trait methods: without these in scope the non-test build
+// fails with E0599 on every platform that compiles the branch below (the
+// Windows CI job caught what a `--tests`-only local run cannot see).
+#[cfg(not(test))]
+use tauri::{Emitter, Manager};
+
 use super::{shell_policy, ExecCtx, ToolOutput};
 use crate::errors::Result;
 use crate::openrouter::types::{FunctionDefinition, ToolDefinition};
@@ -39,6 +45,15 @@ fn command_failure_metadata(
         ),
         "effective_timeout_sec": timeout_secs,
     })
+}
+
+/// CF-BLD-R6: a one-shot full build run through the shell tool gets the same
+/// treatment as the shared cache — incremental off — so the disk it writes is
+/// the disk a rebuild actually reads. Interactive builds keep it.
+fn apply_one_shot_build_env(cmd: &mut Command, command: &str) {
+    for (key, value) in crate::build_cache::one_shot_build_env(command) {
+        cmd.env(key, value);
+    }
 }
 
 /// CF-BLD-R7/R3: the admissions a heavy build must pass before it starts.
@@ -380,6 +395,7 @@ async fn execute_inner(
                 .current_dir(&ctx.cwd)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            apply_one_shot_build_env(&mut cmd, &a.command);
             cmd
         }
         crate::config::settings::SandboxMode::Off => {
@@ -391,6 +407,7 @@ async fn execute_inner(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             command_env::apply_developer_path(&mut cmd);
+            apply_one_shot_build_env(&mut cmd, &a.command);
             cmd
         }
     };
