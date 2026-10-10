@@ -175,6 +175,12 @@ pub fn plain_failure_reason(failure_code: Option<&str>) -> String {
             "上一次模型回复中断时已经开始了一项改动，这项改动的结果一直没法确认，所以没有贸然重做"
         }
         "provider_rate_limited" => "模型服务持续拒绝请求",
+        // U33 / M51: a used-up subscription quota is not a momentary overload.
+        // Its reset window is long and stated by the service, so the honest
+        // sentence names what happened instead of implying a quick retry.
+        "provider_quota_exhausted" => {
+            "首选模型的额度已用完，短期内重试不会恢复；系统已改用可用的备用模型继续，恢复后会回到首选模型"
+        }
         "provider_auth_expired" => "模型服务的登录状态已失效",
         "completion_evidence_incomplete" => "给出的结论缺少可核对的依据",
         "external_state_uncertain" => "外部改动是否已经生效无法确认",
@@ -573,6 +579,18 @@ mod tests {
         let reason = plain_failure_reason(Some("weird_internal_code_7"));
         assert_eq!(reason, "遇到了一个没说明的技术问题");
         assert_no_internal_vocabulary(&reason).expect("reason must be user-safe");
+    }
+
+    /// U33 / M51: "the quota is used up until a known reset time" needs its own
+    /// plain-language sentence — not the transient-overload wording, and no raw
+    /// identifier.
+    #[test]
+    fn quota_exhaustion_has_its_own_plain_language_reason() {
+        let reason = plain_failure_reason(Some("provider_quota_exhausted"));
+        assert!(reason.contains("额度已用完"), "{reason}");
+        assert!(reason.contains("备用模型"), "{reason}");
+        assert!(!reason.contains("provider_"), "{reason}");
+        assert_no_internal_vocabulary(&reason).expect("quota reason must be user-safe");
     }
 
     #[test]
