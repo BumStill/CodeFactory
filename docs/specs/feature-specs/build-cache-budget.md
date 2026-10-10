@@ -106,3 +106,43 @@ CodeFactory 产生或管理的编译缓存（托管工作区里的，加上本�
 - R3/R7 的运行时准入：bash 工具的重型构建尚未在启动前取重型构建名额与磁盘守卫名额。
 - R4：占用展示与一键清理的界面面板与后台入口尚未提供（当前入口是 CLI：`pnpm build-cache`）。
 
+### 真机返修（2026-10-10，v1.85.0 发布后的真机行为修正）
+
+真机症状：`execution-workspaces/` 下 17 个任务私有编译缓存合计约 130 GB，超过 R1 的 60 GiB 一倍多；
+两个 `state=cleanup_pending`、`objective=cancelled` 的工作区（R2 明确应回收）15 分钟未回收；
+应用数据目录下也没有任何构建缓存审计记录（R10）。
+
+根因（先用失败测试复现：`build_cache::tests::scan_finds_the_cache_below_a_nested_repo_workspace`
+在修复前得到 `scanned=0`，`nested_ended_workspace_cache_is_reclaimed_and_audited` 得到 `scanned=0`）：
+
+- 托管工作区的真实布局是 `execution-workspaces/<repo-digest16>/<objective-digest24>/.codefactory-cache/cargo-target-*`
+  （由 `execution_workspace::allocate_new_locked` 的 `worktree_path` 拼接决定），比缓存巡检假设的
+  `execution-workspaces/<workspace>/.codefactory-cache` 多一层。`scan_workspace_container` 只看容器的直接子目录，
+  每个 repo 桶下都不存在 `.codefactory-cache`，扫描结果恒为 0 条目：既不回收（R2）、也不淘汰（R1）、
+  更不会写审计（R10）——三类症状是同一个根因。
+- `owner_from_workspace_path` 只取相对路径的第一个组件，会把同一 repo 桶下的所有工作区并成一个 owner。
+
+修复：
+
+- `build_cache::workspace_cache_roots` 在容器下同时识别「扁平（旧）」与「嵌套（现行）」两种布局的
+  `.codefactory-cache` 根，且只下探这两层，不会走进 checkout 的源码树；`scan_workspace_container` 与
+  `cache_ownership` 的 orphan 判定共用它。
+- owner id 改为工作区目录相对容器的完整相对路径（如 `94eef8f7b2987cbf/9836f5aa40c05ec34cd801fa`）；
+  `owner_from_workspace_path` 对 worktree 路径与缓存根都给出同一个 id。
+- R1 增加 owner 级保护：任务还能继续（`workspace_is_ended` 为假）的缓存与「正在构建」的缓存一样不参与淘汰；
+  `MaintenanceOutcome.protected_bytes` 如实统计这部分，`overflow_bytes` 如实上报无法回收的差额，
+  不再静默超限。
+- R2 的「任务结束」判定改为工作区状态与 objective 终态一起看：`closed` / `incident` / `cleanup_pending`
+  直接算结束；objective 已终态而工作区不是 `active` 的算泄漏分配；`active` + `failed`（真机上保留的 13 个）
+  视为可续做，受保护。
+- R10 审计文件位置（真机核对用）：`<app data>/execution-workspaces/build-cache-audit.jsonl`。
+
+Spec Amendment（待用户决定，未改需求）：现行 R1 的「所属任务还能继续的缓存一律不淘汰」在真机上的含义是
+13 个 `objective=failed`、`workspace=active` 的缓存永远不进入淘汰顺序，总上限因此可能长期被突破
+（本次修复后至少如实上报 `overflow_bytes`，而不是静默超限）。建议把这类「受保护但已闲置」的缓存排在淘汰顺序
+最后（先淘汰无主闲置，再淘汰受保护闲置），使 R1 的总上限重新成立。在用户决定前不实现，
+优先保证 cancelled / cleanup_pending 这类缓存一定能被回收。
+
+Implementation Notes 增补：R3 的 `guard_before_build` / `reclaim_until` 仍然不区分「任务是否还能继续」，
+磁盘低于低水位时会清任意闲置缓存（含可续做任务的）。本次返修未改动该路径，留作后续增量。
+
