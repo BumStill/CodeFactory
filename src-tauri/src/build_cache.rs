@@ -476,11 +476,13 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
 /// best-effort — an unmeasurable volume must not stop a build.
 #[cfg(not(unix))]
 pub fn free_bytes(path: &Path) -> Option<u64> {
+    use crate::util::no_window::NoWindow;
     let script = format!(
         "(Get-Item -LiteralPath '{}' -ErrorAction Stop).PSDrive.Free",
         path.display()
     );
     let output = std::process::Command::new("powershell")
+        .no_window()
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .ok()?;
