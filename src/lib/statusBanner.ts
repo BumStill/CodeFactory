@@ -41,6 +41,13 @@ export interface StatusBannerInput {
   activity?: StatusBannerActivity | null;
   startedAt: number;
   nowMs: number;
+  /**
+   * CF-HDE-R11（M53）：这个会话此刻是不是**真的**在执行，来自
+   * `lib/sessionTurnState.ts` 那一个真实来源。为 true 时，一条陈旧的活动投影
+   * （还写着"等待重试"、或者已经带 terminalReason）不能把横幅变成等待／消失——
+   * 真机上模型正在连续调用，顶部却一直显示"等待自动重试"。
+   */
+  systemRunning?: boolean;
 }
 
 /**
@@ -130,11 +137,12 @@ function plainOrNull(text: string | null | undefined): string | null {
  */
 export function statusBannerView(input: StatusBannerInput): StatusBannerView | null {
   const activity = input.activity ?? null;
+  const running = input.systemRunning === true;
 
   // Terminal: the system has stopped and nothing is still running.
-  if (activity?.terminalReason) return null;
+  if (activity?.terminalReason && !running) return null;
   const objectiveStatus = activity?.objectiveStatus ?? null;
-  if (objectiveStatus && !systemOwnsObjective(objectiveStatus)) return null;
+  if (objectiveStatus && !systemOwnsObjective(objectiveStatus) && !running) return null;
   const reason = activity?.waitingReason ?? null;
   // A user-action reason (authorization, a decision) must survive the terminal
   // check: those codes are internal-shaped, and a generic code-shaped guard
@@ -149,6 +157,7 @@ export function statusBannerView(input: StatusBannerInput): StatusBannerView | n
   const detailPlain = userAction ? null : plainOrNull(humanWaitingReason(reason));
 
   const waiting =
+    !running &&
     !userAction &&
     (objectiveStatus === "waiting_system" || (systemOwned && activity?.nextObservationAt != null));
 
@@ -165,7 +174,7 @@ export function statusBannerView(input: StatusBannerInput): StatusBannerView | n
         : null;
 
   const waitHint =
-    systemOwned && !userAction
+    systemOwned && !userAction && !running
       ? formatRetryHint(activity?.nextObservationAt, input.nowMs)
       : null;
 

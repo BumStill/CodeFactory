@@ -118,6 +118,19 @@ async function main() {
       "waiting fixture should show a truthful estimate",
     );
 
+    // CF-HDE-R11（M53）：这一轮真的在跑（实时流或服务器说在跑）时，一条陈旧的
+    // "等待重试"投影不许出现在顶部横幅里——真机上会话已在模型上连续调用。
+    for (const id of ["live-stream-stale-waiting", "server-running-stale-waiting"]) {
+      const text = await banner(id).innerText();
+      assert(
+        text.includes("正在调用模型"),
+        `fixture "${id}" should show the live work, got: ${text}`,
+      );
+      for (const forbidden of ["等待", "重试"]) {
+        assert(!text.includes(forbidden), `fixture "${id}" must not say "${forbidden}" (got: ${text})`);
+      }
+    }
+
     // CF-RSB-R1/R2: the evidence banner — no owner, no raw label, no 0ms.
     const overdueText = await banner("overdue").innerText();
     assert(overdueText.includes("马上重试"), "overdue fixture should say 马上重试");
@@ -144,7 +157,7 @@ async function main() {
     );
 
     // CF-RSB-R1: no fixture leaks internal vocabulary anywhere in its text.
-    for (const id of ["running", "waiting", "overdue", "unknown", "authorization", "completed"]) {
+    for (const id of ["running", "live-stream-stale-waiting", "server-running-stale-waiting", "waiting", "overdue", "unknown", "authorization", "completed"]) {
       const text = await fixture(id).innerText();
       assert(!INTERNAL_VOCABULARY.test(text), `fixture "${id}" leaks internal vocabulary: ${text}`);
     }
@@ -198,6 +211,8 @@ async function main() {
       url: pageUrl,
       checks: {
         runningShowsPlainText: true,
+        liveStreamNeverSaysWaiting: true,
+        serverRunningNeverSaysWaiting: true,
         waitingShowsTruthfulEstimate: true,
         overdueSaysImmediateNotZeroMs: true,
         unknownShowsNoTime: true,
