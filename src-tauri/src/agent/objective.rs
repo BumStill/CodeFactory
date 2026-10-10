@@ -688,6 +688,25 @@ string_enum!(EvidenceKind {
     LiveVerification => "live_verification",
 });
 
+/// Outcome of a lease heartbeat renewal.
+///
+/// `ClaimClosed` is the case that used to be indistinguishable from theft: the
+/// claim this owner was keeping alive is no longer live and no other owner holds
+/// it, which is exactly what an adapter's own settlement leaves behind. Only
+/// `OwnershipLost` may cancel a pending adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRenewal {
+    Renewed,
+    ClaimClosed,
+    OwnershipLost,
+}
+
+impl ClaimRenewal {
+    pub fn renewed(self) -> bool {
+        matches!(self, ClaimRenewal::Renewed)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectiveSnapshot {
     pub id: String,
@@ -3925,10 +3944,23 @@ impl ObjectiveStore {
         owner: &str,
         claim_epoch: i64,
         lease_ms: i64,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<ClaimRenewal> {
         let now = Utc::now().timestamp_millis();
         let lease_expires_at = now + lease_ms.max(1);
         let mut tx = self.pool.begin().await?;
+        // Read the claim's committed identity before touching it. When an update
+        // below cannot match, this is what says whether the claim was closed by
+        // its own owner (an adapter settling its own work, which leaves the row
+        // superseded and unowned) or taken over by someone else. Doing it inside
+        // this transaction keeps the answer on the connection we already hold.
+        let claim_state: Option<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT status, lease_owner, attempt_index FROM objective_remediations
+             WHERE id=? AND objective_id=?",
+        )
+        .bind(remediation_id)
+        .bind(objective_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let remediation = sqlx::query(
             "UPDATE objective_remediations
              SET lease_expires_at=?, updated_at=?
@@ -3946,7 +3978,11 @@ impl ObjectiveStore {
         .await?;
         if remediation.rows_affected() != 1 {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(Self::classify_claim_renewal_failure(
+                claim_state.as_ref(),
+                owner,
+                claim_epoch,
+            ));
         }
         let objective = sqlx::query(
             "UPDATE objectives
@@ -3964,10 +4000,45 @@ impl ObjectiveStore {
         .await?;
         if objective.rows_affected() != 1 {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(Self::classify_claim_renewal_failure(
+                claim_state.as_ref(),
+                owner,
+                claim_epoch,
+            ));
         }
         tx.commit().await?;
-        Ok(true)
+        Ok(ClaimRenewal::Renewed)
+    }
+
+    /// Explain a refused renewal from the claim's committed state. A row that is
+    /// still owned by this exact epoch but no longer renewable means the lease
+    /// itself expired; a row closed for this epoch with no foreign owner means
+    /// the adapter settled its own work and must be allowed to finish.
+    fn classify_claim_renewal_failure(
+        claim_state: Option<&(String, Option<String>, i64)>,
+        owner: &str,
+        claim_epoch: i64,
+    ) -> ClaimRenewal {
+        let Some((status, lease_owner, attempt_index)) = claim_state else {
+            return ClaimRenewal::OwnershipLost;
+        };
+        if lease_owner
+            .as_deref()
+            .is_some_and(|holder| holder != owner)
+        {
+            return ClaimRenewal::OwnershipLost;
+        }
+        if *attempt_index != claim_epoch {
+            // A newer attempt owns this row: the epoch this adapter holds is
+            // stale even when the owner string still matches.
+            return ClaimRenewal::OwnershipLost;
+        }
+        if status != "claimed" {
+            // This exact attempt is closed and nobody else took it over, which
+            // is what the adapter's own settlement leaves behind.
+            return ClaimRenewal::ClaimClosed;
+        }
+        ClaimRenewal::OwnershipLost
     }
 
     /// Observe whether an adapter still owns the exact durable claim it was
@@ -10895,7 +10966,8 @@ CREATE TABLE objectives (
                 30_000,
             )
             .await
-            .unwrap());
+            .unwrap()
+            .renewed());
     }
 
     #[tokio::test]
@@ -10958,7 +11030,8 @@ CREATE TABLE objectives (
                 60_000,
             )
             .await
-            .unwrap());
+            .unwrap()
+            .renewed());
         assert!(store
             .renew_claimed_remediation(
                 &claim.objective.id,
@@ -10968,7 +11041,8 @@ CREATE TABLE objectives (
                 60_000,
             )
             .await
-            .unwrap());
+            .unwrap()
+            .renewed());
 
         let (renewed_remediation_lease, renewed_objective_lease): (i64, i64) = sqlx::query_as(
             "SELECT remediation.lease_expires_at, objective.lease_expires_at
@@ -11019,7 +11093,8 @@ CREATE TABLE objectives (
                 60_000,
             )
             .await
-            .unwrap());
+            .unwrap()
+            .renewed());
 
         let (remediation_lease, objective_lease): (i64, i64) = sqlx::query_as(
             "SELECT remediation.lease_expires_at, objective.lease_expires_at

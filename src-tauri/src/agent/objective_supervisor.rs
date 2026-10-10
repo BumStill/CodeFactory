@@ -578,10 +578,17 @@ where
     // Consume the immediate first tick; the claim itself already owns a fresh
     // lease and the next renewal should happen after one heartbeat interval.
     heartbeat.tick().await;
+    // Set once the adapter has closed its own claim. A settled claim can never
+    // be renewed again, so the heartbeat stops trying and merely drains the
+    // adapter instead of cancelling the settlement it just performed.
+    let mut claim_closed_by_adapter = false;
     loop {
         tokio::select! {
             result = &mut adapter_future => return result,
             _ = heartbeat.tick() => {
+                if claim_closed_by_adapter {
+                    continue;
+                }
                 let renewal = store.renew_claimed_remediation(
                     &claim.objective.id,
                     &claim.remediation_id,
@@ -602,12 +609,25 @@ where
                     renewed = &mut renewal => renewed,
                 };
                 match renewed {
-                    Ok(true) => tracing::debug!(
+                    Ok(crate::agent::objective::ClaimRenewal::Renewed) => tracing::debug!(
                         objective_id = %claim.objective.id,
                         remediation_id = %claim.remediation_id,
                         "objective remediation lease renewed"
                     ),
-                    Ok(false) => {
+                    // The adapter settled its own claim before returning. That
+                    // is the work completing, not a takeover, and a settled
+                    // claim can never be renewed again: stop renewing and drain
+                    // the adapter instead of discarding its committed result.
+                    Ok(crate::agent::objective::ClaimRenewal::ClaimClosed) => {
+                        claim_closed_by_adapter = true;
+                        tracing::debug!(
+                            objective_id = %claim.objective.id,
+                            remediation_id = %claim.remediation_id,
+                            "adapter settled its own claim; lease owner stops renewing"
+                        );
+                        continue;
+                    }
+                    Ok(crate::agent::objective::ClaimRenewal::OwnershipLost) => {
                         return Err(crate::errors::AppError::Other(
                             "objective remediation ownership changed; adapter cancelled".into(),
                         ));
@@ -3264,7 +3284,7 @@ mod tests {
     /// #525 wired the stale-attempt sweep into `process_claim`, directly in
     /// front of executor dispatch. That is the lease-sensitive path: the
     /// sweep's multi-subquery SQL runs on the same pool the claim heartbeat
-    /// still needs, so on a slow runner the short lease exercised by
+    /// still needs, so on a slow runner the lease exercised by
     /// `short_claim_lease_stays_live_until_adapter_settlement` can expire
     /// before its next renewal (Windows CI: "objective remediation ownership
     /// changed; adapter cancelled"; macOS stayed green). The sweep belongs on
@@ -4047,7 +4067,7 @@ mod tests {
             .await
             .unwrap();
         crate::agent::objective::ensure_schema(&pool).await.unwrap();
-        let store = ObjectiveStore::new(pool);
+        let store = ObjectiveStore::new(pool.clone());
         let objective = store
             .create(CreateObjective {
                 id: "objective-short-heartbeat".into(),
@@ -4075,8 +4095,13 @@ mod tests {
             .apply_decision(objective.revision, waiting)
             .await
             .unwrap();
+        // 30s matches the lease budget the other claim/renewal tests use
+        // (`objective.rs`) and stays far above the runner's scheduling noise.
+        // The previous 2s lease turned "is the heartbeat scheduled within two
+        // seconds" into a wall-clock requirement the test could not enforce.
+        let lease_ms: i64 = 30_000;
         let claim = store
-            .claim_due_remediations("short-heartbeat-owner", 1, 2_000)
+            .claim_due_remediations("short-heartbeat-owner", 1, lease_ms)
             .await
             .unwrap()
             .pop()
@@ -4085,17 +4110,52 @@ mod tests {
         let adapter_store = store.clone();
         let adapter_objective = claim.objective.clone();
         let old_remediation_id = claim.remediation_id.clone();
+        let heartbeat_remediation_id = old_remediation_id.clone();
 
+        let initial_expires_at: i64 = sqlx::query_scalar(
+            "SELECT lease_expires_at FROM objective_remediations WHERE id=?",
+        )
+        .bind(&claim.remediation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // The adapter must stay pending across several heartbeats and the
+        // renewals have to be *observed*. The old body slept 4.5s of wall clock
+        // and trusted that the heartbeat task had been scheduled inside that
+        // window; on a saturated Windows runner it had not, the lease really
+        // expired, and the renewal was refused ("objective remediation
+        // ownership changed; adapter cancelled"). Waiting on the observed lease
+        // state removes that wall-clock assumption in both directions.
+        let required_renewals = 2;
         run_with_claim_lease_timing(
             &store,
             &claim,
             "short-heartbeat-owner",
-            2_000,
+            lease_ms,
             Duration::from_millis(100),
             async move {
-                // Cross more than two original TTLs. Without the adapter being
-                // awaited by the heartbeat owner, this claim is necessarily stale.
-                tokio::time::sleep(Duration::from_millis(4_500)).await;
+                let mut observed_expires_at = initial_expires_at;
+                let mut observed_renewals = 0;
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while observed_renewals < required_renewals {
+                        let renewed_expires_at: i64 = sqlx::query_scalar(
+                            "SELECT lease_expires_at FROM objective_remediations WHERE id=?",
+                        )
+                        .bind(&heartbeat_remediation_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        if renewed_expires_at > observed_expires_at {
+                            observed_expires_at = renewed_expires_at;
+                            observed_renewals += 1;
+                        }
+                        // Poll on a cadence so the heartbeat branch of the lease
+                        // owner takes its turn on the single pooled connection.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .expect("the lease owner must renew the claim while the adapter is pending");
                 assert!(adapter_store.claim_is_current(&permit).await.unwrap());
                 let retry = DecisionRouter::route(
                     &adapter_objective,
@@ -4126,6 +4186,167 @@ mod tests {
         assert_ne!(
             current.remediation_id.as_deref(),
             Some(old_remediation_id.as_str())
+        );
+    }
+
+    /// A settlement is an await point: the lease owner can tick between the
+    /// adapter committing its decision and the adapter returning. That renewal
+    /// can never succeed, and it must not cancel the settlement that just
+    /// committed (Windows CI: "objective remediation ownership changed;
+    /// adapter cancelled" while the settlement was already durable).
+    #[tokio::test]
+    async fn adapter_that_settles_its_own_claim_is_drained_not_cancelled() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-self-settled".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-self-settled".into()),
+                root_turn_id: Some("turn-self-settled".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "provider_timeout".into(),
+                failure_signature: "sha256:self-settled".into(),
+                next_observation_at: chrono::Utc::now().timestamp_millis() - 1,
+                resume_cursor: Some("turn-self-settled".into()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_due_remediations("self-settling-owner", 1, 60_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let permit = mutation_permit(&claim, "self-settling-owner");
+        let adapter_store = store.clone();
+        let adapter_objective = claim.objective.clone();
+
+        run_with_claim_lease_timing(
+            &store,
+            &claim,
+            "self-settling-owner",
+            60_000,
+            Duration::from_millis(1),
+            async move {
+                let retry = DecisionRouter::route(
+                    &adapter_objective,
+                    RouteSignal::TechnicalFailure {
+                        domain: RecoveryDomain::Chat,
+                        failure_code: "provider_still_unavailable".into(),
+                        failure_signature: "sha256:self-settled-retry".into(),
+                        next_observation_at: chrono::Utc::now().timestamp_millis() + 1_000,
+                        resume_cursor: Some("turn-self-settled".into()),
+                    },
+                )
+                .unwrap();
+                adapter_store
+                    .apply_claimed_decision(adapter_objective.revision, retry, &permit)
+                    .await
+                    .unwrap();
+                // The claim is settled from here on; stay pending across many
+                // heartbeats so the lease owner has to drain this future.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let current = store.get("objective-self-settled").await.unwrap().unwrap();
+        assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+        assert_ne!(
+            current.remediation_id.as_deref(),
+            Some(claim.remediation_id.as_str()),
+            "the settled decision must stand"
+        );
+    }
+
+    /// The drain above must not swallow real ownership loss: a claim whose epoch
+    /// was bumped by a reclaim still cancels the stale adapter.
+    #[tokio::test]
+    async fn a_reclaimed_claim_epoch_still_cancels_the_stale_adapter() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-reclaimed-epoch".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-reclaimed-epoch".into()),
+                root_turn_id: Some("turn-reclaimed-epoch".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "provider_timeout".into(),
+                failure_signature: "sha256:reclaimed-epoch".into(),
+                next_observation_at: chrono::Utc::now().timestamp_millis() - 1,
+                resume_cursor: Some("turn-reclaimed-epoch".into()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_due_remediations("stale-owner", 1, 60_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        // A reclaim mints a new attempt epoch while the old adapter is pending.
+        sqlx::query("UPDATE objective_remediations SET attempt_index=attempt_index+1 WHERE id=?")
+            .bind(&claim.remediation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = run_with_claim_lease_timing(
+            &store,
+            &claim,
+            "stale-owner",
+            60_000,
+            Duration::from_millis(1),
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error}").contains("ownership changed"),
+            "stale adapter must still be cancelled, got: {error}"
         );
     }
 }

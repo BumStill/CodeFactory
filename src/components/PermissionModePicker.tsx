@@ -45,6 +45,14 @@ export function PermissionModePicker({
   useLayoutEffect(() => {
     if (!open) return;
     updateMenuPosition();
+    // Focus the checked item in the commit phase. A requestAnimationFrame (or a
+    // passive effect) leaves a window where the menu is already visible but no
+    // item owns focus yet; a keypress that arrives inside that window found
+    // `document.activeElement` outside the item list, so roving focus fell back
+    // to the first item and ArrowDown landed on "标准" instead of "信任".
+    menuRef.current
+      ?.querySelector<HTMLElement>('[role="menuitemradio"][aria-checked="true"]')
+      ?.focus();
     window.addEventListener("resize", updateMenuPosition);
     window.addEventListener("scroll", updateMenuPosition, true);
     return () => {
@@ -138,7 +146,14 @@ export function PermissionModePicker({
               menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitemradio"]') ?? [],
             );
             if (items.length === 0) return;
-            const currentIndex = items.indexOf(document.activeElement as HTMLElement);
+            // A keypress can arrive before any item owns focus (the menu is
+            // committed and visible first). Treat "no item focused" as the
+            // checked item so ArrowDown still moves off the current mode
+            // instead of wrapping to the first item.
+            const focusedIndex = items.indexOf(document.activeElement as HTMLElement);
+            const currentIndex = focusedIndex >= 0
+              ? focusedIndex
+              : Math.max(0, items.findIndex((item) => item.getAttribute("aria-checked") === "true"));
             const nextIndex = event.key === "Home"
               ? 0
               : event.key === "End"

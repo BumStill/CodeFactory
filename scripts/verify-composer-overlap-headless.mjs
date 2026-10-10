@@ -16,11 +16,11 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { allocateLoopbackPort, waitForAcceptanceDocument, waitForStableAnimationFrames } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
-const port = Number(process.env.CODEFACTORY_COMPOSER_OVERLAP_PORT ?? 1456);
-const baseUrl = `http://127.0.0.1:${port}/composer-overlap-acceptance.html`;
+const preferredPort = Number(process.env.CODEFACTORY_COMPOSER_OVERLAP_PORT ?? 1456);
 const artifactDir = process.env.CODEFACTORY_COMPOSER_OVERLAP_ARTIFACT_DIR
   ?? path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), "codefactory-composer-overlap-headless");
 
@@ -104,6 +104,8 @@ function probeLayout() {
 async function main() {
   await rm(artifactDir, { recursive: true, force: true });
   await mkdir(artifactDir, { recursive: true });
+  const port = await allocateLoopbackPort(preferredPort);
+  const baseUrl = `http://127.0.0.1:${port}/composer-overlap-acceptance.html`;
   const vite = spawn(process.execPath, [viteCli, "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: root,
     detached: process.platform !== "win32",
@@ -116,7 +118,7 @@ async function main() {
   console.log(JSON.stringify({ service_pid: vite.pid, log: path.join(artifactDir, "vite.log"), url: baseUrl }));
   let browser;
   try {
-    await waitForServer(vite);
+    await waitForAcceptanceDocument(vite, baseUrl, "composer-overlap.tsx");
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox"] });
     const checks = {};
     // Both viewports are deliberately short: the welcome content must not fit,
@@ -129,6 +131,7 @@ async function main() {
       await page.goto(baseUrl, { waitUntil: "networkidle" });
       await page.getByRole("main", { name: "Composer overlap acceptance" }).waitFor({ timeout: 10_000 });
       await page.getByRole("textbox", { name: "消息输入" }).waitFor({ timeout: 10_000 });
+      await waitForStableAnimationFrames(page);
       const layout = await page.evaluate(probeLayout);
       const label = `${viewport.width}x${viewport.height}`;
       await page.screenshot({ path: path.join(artifactDir, `composer-${label}.png`), fullPage: false });
