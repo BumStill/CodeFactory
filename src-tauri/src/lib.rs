@@ -6,6 +6,7 @@ mod ai_text;
 mod benchmark;
 mod benchmark_consistency;
 mod browser;
+mod build_cache;
 mod codex_auth;
 mod commands;
 mod config;
