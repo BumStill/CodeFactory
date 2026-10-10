@@ -19,6 +19,18 @@ function baseRequest(overrides: Partial<PendingPermission>): PendingPermission {
 const noop = { onAllow: vi.fn(), onDeny: vi.fn(), onAllowFullAccess: vi.fn() };
 
 describe("PermissionDialog tool-args preview", () => {
+  it("CF-TPP-R3 hides redundant trust and explains the boundary", () => {
+    render(<PermissionDialog request={baseRequest({})} trusted={true} {...noop} />);
+    expect(screen.queryByRole("button", { name: "信任本会话并允许" })).not.toBeInTheDocument();
+    expect(screen.getByText(/无法确认.*工作区/)).toBeInTheDocument();
+  });
+
+  it("CF-TPP-R4 keeps late approval available without an expiry countdown", () => {
+    render(<PermissionDialog request={baseRequest({ expiresAt: Date.now() - 120_000 })} trusted={false} {...noop} />);
+    expect(screen.queryByText(/秒内处理/)).not.toBeInTheDocument();
+    expect(screen.getByText(/等待你的批准/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "仅允许一次" })).toBeEnabled();
+  });
   it("is an accessible modal and explains that expiry is not a user denial", () => {
     render(
       <PermissionDialog

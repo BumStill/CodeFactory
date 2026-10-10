@@ -92,6 +92,8 @@ export interface DispatchHandlers {
   stop: (input: { sessionId?: string }) => Promise<unknown>;
   listApprovals: () => Promise<DispatchApproval[]>;
   resolveApproval: (input: { approvalId: string; approve: boolean }) => Promise<unknown>;
+  /** CF-BLD-R4: the panel's one-click cleanup, reachable from the background. */
+  cleanBuildCache?: () => Promise<unknown>;
 }
 
 function invalid(message: string): DispatchOutcome {
@@ -209,6 +211,11 @@ export async function applyDispatchRequest(
         break;
       case "list_approvals":
         result = await handlers.listApprovals();
+        break;
+      case "clean_build_cache":
+        // 面板上的"一键清理"和这里必须是同一个命令；没接上就明说，不假装清过了。
+        if (!handlers.cleanBuildCache) return invalid("clean_build_cache is not available");
+        result = await handlers.cleanBuildCache();
         break;
       case "resolve_approval":
         result = await handlers.resolveApproval({

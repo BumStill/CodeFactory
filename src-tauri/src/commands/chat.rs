@@ -997,9 +997,10 @@ pub async fn is_chat_running(
          WHERE objective.session_id=? AND objective.root_turn_id IS NOT NULL
            AND objective.status IN ('active','waiting_system')
            AND NOT (objective.status='waiting_system'
-                    AND objective.failure_code='technical_recovery_exhausted')",
+                    AND objective.failure_code IN ('technical_recovery_exhausted', ?))",
     )
     .bind(session_id)
+    .bind(crate::agent::objective::DELIVERED_AWAITING_CI)
     .fetch_one(&pool)
     .await?;
     Ok(system_owned > 0)
@@ -1232,6 +1233,16 @@ fn chat_turn_projection(
             "objective_failed",
             "这件事没做成，已把试过的办法和保留下来的改动写给你",
         ),
+        ObjectiveStatus::WaitingSystem
+            if objective.failure_code.as_deref()
+                == Some(crate::agent::objective::DELIVERED_AWAITING_CI) =>
+        {
+            (
+                "finalizing",
+                "delivery_awaiting_ci",
+                "改动已交付，等待检查结果",
+            )
+        }
         ObjectiveStatus::WaitingSystem => ("recovering", "system_recovery", "系统正在恢复并续接"),
         ObjectiveStatus::WaitingCoreInput => ("waiting", "core_input_required", "需要补充核心输入"),
         ObjectiveStatus::WaitingAuthorization => {
@@ -1428,6 +1439,30 @@ async fn apply_chat_objective_outcome(
         terminal_reason.as_deref(),
     )
     .map_err(|error| AppError::Other(error.to_string()))?;
+    // CF-TRUTH-R3/R4: an ownership handoff (or any other internal interruption)
+    // must not be recorded as the user pressing stop. The run only counts as a
+    // user cancellation when a durable stop request exists for this session; with
+    // no such record the truthful decision is the recoverable system
+    // interruption, which the next owner continues and which says so in the
+    // conversation.
+    let decision = if decision.decision_type == crate::agent::objective::DecisionType::Cancelled {
+        let session_id = current.session_id.clone().unwrap_or_default();
+        let stop_requested = store
+            .has_durable_stop_request(&session_id, current.created_at)
+            .await;
+        if stop_requested {
+            decision
+        } else {
+            crate::agent::objective::decision_for_interrupted_run(
+                &current,
+                outcome,
+                terminal_reason.as_deref(),
+            )
+            .map_err(|error| AppError::Other(error.to_string()))?
+        }
+    } else {
+        decision
+    };
     match mutation_permit {
         Some(permit) => {
             store
@@ -5277,6 +5312,19 @@ mod tests {
         .bind(waiting.session_id.as_deref().unwrap())
         .bind(waiting.root_turn_id.as_deref().unwrap())
         .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The durable intent the stop click writes before the crash; CF-TRUTH-R3
+        // requires it before a crash-left control row counts as a user stop.
+        sqlx::query(
+            "INSERT INTO chat_session_cancel_intents
+             (session_id, status, requested_at, settled_at, updated_at)
+             VALUES (?, 'requested', ?, NULL, ?)",
+        )
+        .bind(waiting.session_id.as_deref().unwrap())
         .bind(now)
         .bind(now)
         .execute(&pool)
