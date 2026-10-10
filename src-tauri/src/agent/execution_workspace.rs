@@ -1311,6 +1311,99 @@ pub(crate) fn spawn_cleanup_supervisor(
     });
 }
 
+// ── CF-BLD-R2/R8: build-cache ownership and the reclamation supervisor ───────
+
+/// Workspace states whose task is over. Its build cache is dead weight the
+/// moment the task ends — that is exactly how 160 GB accumulated.
+const TERMINAL_WORKSPACE_STATES: &[&str] = &["closed", "incident", "cleanup_pending"];
+
+/// Which managed workspaces have ended, and which cache directories have no
+/// workspace row at all.
+///
+/// R2 reclaims a cache as soon as its task ends. "Ended" is read from the
+/// workspace row rather than guessed from the directory names, because a task
+/// that can still be resumed must keep its cache — that is the whole difference
+/// between bounding the caches and throwing away work someone still needs.
+pub async fn cache_ownership(
+    pool: &SqlitePool,
+    container: &Path,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let rows = sqlx::query("SELECT worktree_path, state FROM execution_workspaces")
+        .fetch_all(pool)
+        .await?;
+    let mut ended: Vec<String> = Vec::new();
+    let mut alive: Vec<String> = Vec::new();
+    for row in rows {
+        let worktree_path: String = row.get("worktree_path");
+        let state: String = row.get("state");
+        let Some(owner) =
+            crate::build_cache::owner_from_workspace_path(Path::new(&worktree_path), container)
+        else {
+            continue;
+        };
+        if TERMINAL_WORKSPACE_STATES.contains(&state.as_str()) {
+            ended.push(owner);
+        } else {
+            alive.push(owner);
+        }
+    }
+    // A directory with no row at all is a task that never finished writing its
+    // own record; it is reclaimed only once the long idle rule allows it.
+    let orphans = std::fs::read_dir(container)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| !alive.contains(name) && !ended.contains(name))
+        .collect();
+    Ok((ended, orphans))
+}
+
+/// CF-BLD-R2/R8: reclaim the build caches of finished tasks and the long-idle
+/// orphan backlog, then hold the total under the ceiling. Runs on the same
+/// cadence as workspace closeout, so "the task ended" and "its cache is gone"
+/// stay one decision instead of two hand-synchronised ones.
+pub(crate) fn spawn_build_cache_supervisor(pool: SqlitePool, container: PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        tracing::info!(
+            poll_ms = CLEANUP_POLL_INTERVAL.as_millis(),
+            "build cache supervisor started"
+        );
+        loop {
+            match cache_ownership(&pool, &container).await {
+                Ok((ended, orphans)) => {
+                    let working = container.clone();
+                    let sweep = tauri::async_runtime::spawn_blocking(move || {
+                        let log = crate::build_cache::AuditLog::new(
+                            crate::build_cache::audit_log_path(&working),
+                        );
+                        crate::build_cache::startup_sweep(&working, &ended, &orphans, Some(&log))
+                    })
+                    .await;
+                    match sweep {
+                        Ok(outcome) if !outcome.removed.is_empty() => tracing::info!(
+                            removed = outcome.removed.len(),
+                            reclaimed_bytes = outcome.reclaimed_bytes,
+                            "build cache reclaimed finished tasks"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "build cache sweep failed; retrying later"
+                        ),
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    "build cache ownership could not be read; retrying later"
+                ),
+            }
+            tokio::time::sleep(CLEANUP_POLL_INTERVAL).await;
+        }
+    });
+}
+
 #[cfg(not(test))]
 #[derive(Debug, Serialize)]
 pub(crate) struct CleanupSmokeReceipt {

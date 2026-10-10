@@ -85,6 +85,26 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
+# CF-BUILD (CF-BLD-R6): one full-workspace test build wrote 5.97 GB per task.
+# Almost all of it was full DWARF debug info plus the macOS `unpacked`
+# split-debuginfo side files under `target/debug/deps`. Line tables keep
+# `file:line` in a failing test's output while dropping the rest of DWARF, and
+# `split-debuginfo = "off"` stops the extra .o/.dSYM copies on macOS.
+#
+# `incremental` is deliberately NOT disabled here. Turning it off globally
+# would slow down the edit-build loop for a person and for an agent working
+# request by request. The incremental directory is only worthless in a
+# *one-shot full* build, so it is disabled exactly there instead: the shared
+# cache (`scripts/cargo-shared.mjs`) and heavy build commands the agent runs
+# through the shell tool (`tools/bash.rs`).
+[profile.dev]
+debug            = 1
+split-debuginfo  = "off"
+
+[profile.test]
+debug            = 1
+split-debuginfo  = "off"
+
 [profile.release]
 panic         = "abort"
 codegen-units = 1
