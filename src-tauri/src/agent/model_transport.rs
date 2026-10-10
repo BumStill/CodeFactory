@@ -2849,8 +2849,37 @@ mod tests {
             for (status, content_type, body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept fixture request");
                 fixture_hits.fetch_add(1, Ordering::SeqCst);
-                let mut request = [0_u8; 16 * 1024];
-                let _ = stream.read(&mut request);
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let mut expected_len = None;
+                loop {
+                    let read = stream.read(&mut chunk).expect("read fixture request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if expected_len.is_none() {
+                        if let Some(headers_end) = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..headers_end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            expected_len = Some(headers_end + 4 + content_length);
+                        }
+                    }
+                    if expected_len.is_some_and(|length| request.len() >= length) {
+                        break;
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
