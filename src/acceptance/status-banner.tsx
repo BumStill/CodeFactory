@@ -41,11 +41,42 @@ function turn(overrides: Partial<Activity>): UIMessage[] {
   ];
 }
 
-const fixtures: Array<{ id: string; title: string; messages: UIMessage[] }> = [
+const fixtures: Array<{
+  id: string;
+  title: string;
+  messages: UIMessage[];
+  /** CF-HDE-R11: a live frontend stream is attached to this session. */
+  streaming?: boolean;
+  /** CF-HDE-R11: the server says a run currently owns this session. */
+  sessionIsRunning?: boolean;
+}> = [
   {
     id: "running",
     title: "正在执行（正常）",
     messages: turn({ objectiveStatus: "active", label: "正在执行命令" }),
+  },
+  {
+    // CF-HDE-R11（M53）：真机证据——会话已经在模型上连续调用，活动投影却还停在
+    // "等待自动重试"。只要这一轮真的在跑（实时流或服务器说在跑），横幅就不许再
+    // 说"等待"。
+    id: "live-stream-stale-waiting",
+    title: "模型正在调用（陈旧的等待投影）",
+    messages: turn({
+      objectiveStatus: "waiting_system",
+      nextObservationAt: Date.now() + 30_000,
+      label: "正在调用模型",
+    }),
+    streaming: true,
+  },
+  {
+    id: "server-running-stale-waiting",
+    title: "服务器说会话在跑（陈旧的等待投影）",
+    messages: turn({
+      objectiveStatus: "waiting_system",
+      nextObservationAt: Date.now() + 30_000,
+      label: "正在调用模型",
+    }),
+    sessionIsRunning: true,
   },
   {
     id: "waiting",
@@ -130,7 +161,8 @@ function AcceptanceApp() {
             <div data-fixture={fixture.id} className="h-full">
               <MessageList
                 messages={fixture.messages}
-                streaming={fixture.id === "running"}
+                streaming={fixture.streaming ?? fixture.id === "running"}
+                sessionIsRunning={fixture.sessionIsRunning === true}
                 cwd={null}
                 conversationKey={`status-banner-${fixture.id}`}
               />
