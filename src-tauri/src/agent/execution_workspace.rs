@@ -140,6 +140,111 @@ enum CandidateDisposition {
     Incident(String),
 }
 
+/// What the canonical PR of a workspace actually means when no committed local
+/// `provider_pr_merge` receipt exists: the externally-merged case (a PR merged
+/// from the GitHub web UI) and the crash-lost-receipt case both land here.
+///
+/// CF-CLO-R1 / CF-CLO-R4: only a positive `Merged` answer authorises deletion;
+/// `ClosedUnmerged` keeps everything and reports it in plain language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CanonicalPrState {
+    Merged { merge_sha: String },
+    ClosedUnmerged,
+    Open,
+    /// The observer could not establish the truth (no remote, network, schema).
+    /// This is never a reason to delete or to claim the work is done.
+    Unknown(String),
+}
+
+/// Read-only authority for "was this session's PR merged?".
+///
+/// The cleanup pass itself has no network, so the background supervisor supplies
+/// a remote-backed implementation and the offline/smoke path supplies
+/// [`OfflineCanonicalPrObserver`]. Kept as a trait so the removal decision is
+/// testable without a live provider.
+#[async_trait::async_trait]
+pub(crate) trait CanonicalPrObserver: Send + Sync {
+    async fn observe(
+        &self,
+        repo_root: &Path,
+        pr_number: i64,
+        pr_url: &str,
+        expected_head_sha: &str,
+    ) -> Result<CanonicalPrState>;
+}
+
+/// No-network observer used by the deterministic offline pass and by tests: it
+/// can never claim the work is merged, so the previous "preserve and retry"
+/// behaviour is preserved exactly.
+pub(crate) struct OfflineCanonicalPrObserver;
+
+#[async_trait::async_trait]
+impl CanonicalPrObserver for OfflineCanonicalPrObserver {
+    async fn observe(
+        &self,
+        _repo_root: &Path,
+        _pr_number: i64,
+        _pr_url: &str,
+        _expected_head_sha: &str,
+    ) -> Result<CanonicalPrState> {
+        Ok(CanonicalPrState::Unknown(
+            "closeout pass runs without a remote observer".into(),
+        ))
+    }
+}
+
+/// Remote-backed observer: resolves the same delivery remote the delivery chain
+/// uses (logged-in `gh` CLI for GitHub) and asks it for the canonical PR's real
+/// state. Any failure is `Unknown`, never a deletion.
+pub(crate) struct RemoteCanonicalPrObserver;
+
+#[async_trait::async_trait]
+impl CanonicalPrObserver for RemoteCanonicalPrObserver {
+    async fn observe(
+        &self,
+        repo_root: &Path,
+        pr_number: i64,
+        _pr_url: &str,
+        expected_head_sha: &str,
+    ) -> Result<CanonicalPrState> {
+        use crate::agent::delivery::{gh_remote_for, DeliveryRemote, MergeObservation};
+        let Some(remote) = gh_remote_for(repo_root) else {
+            return Ok(CanonicalPrState::Unknown(
+                "no delivery remote is resolvable for this repository".into(),
+            ));
+        };
+        match remote.observe_merge(pr_number as u64, expected_head_sha).await {
+            Ok(MergeObservation::Merged { merge_sha }) => Ok(CanonicalPrState::Merged { merge_sha }),
+            Ok(MergeObservation::ClosedUnmerged) => Ok(CanonicalPrState::ClosedUnmerged),
+            Ok(MergeObservation::OpenSameHead { .. }) => Ok(CanonicalPrState::Open),
+            Ok(MergeObservation::HeadChanged { actual_head }) => Ok(CanonicalPrState::Unknown(
+                format!("PR head moved to {actual_head}"),
+            )),
+            Ok(MergeObservation::Unsupported) => Ok(CanonicalPrState::Unknown(
+                "provider cannot report merge state".into(),
+            )),
+            Err(error) => Err(anyhow!("observe canonical PR #{pr_number}: {error}")),
+        }
+    }
+}
+
+/// The canonical PR a `delivery_runs` row recorded for this workspace, with the
+/// exact identity fields that must agree with the workspace before cleanup may
+/// touch anything.
+#[derive(Debug, FromRow)]
+struct CanonicalPrReference {
+    run_id: String,
+    claim_epoch: i64,
+    workspace_path: String,
+    worktree_identity: String,
+    repo_identity: String,
+    head_branch: String,
+    expected_head_sha: String,
+    canonical_pr_number: i64,
+    canonical_pr_url: String,
+    canonical_head_sha: String,
+}
+
 impl WorkspaceRow {
     fn ready(self) -> Result<ExecutionWorkspace> {
         let worktree_identity = self
@@ -356,6 +461,19 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
+fn remote_branch_exists(root: &Path, remote: &str, branch: &str) -> Result<bool> {
+    let heads = git(
+        root,
+        &[
+            "ls-remote",
+            "--heads",
+            remote,
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    Ok(!heads.trim().is_empty())
+}
+
 fn canonicalize_allow_missing(path: &Path) -> Result<PathBuf> {
     if path.exists() {
         return path
@@ -505,6 +623,200 @@ async fn load_cleanup_authority(
         }
     }
     Ok(None)
+}
+
+/// The canonical PR recorded for this workspace, independent of whether a local
+/// merge receipt exists. This is what makes an *external* merge observable: the
+/// delivery record already knows the PR number/url/head, the merge receipt is
+/// just missing.
+async fn load_canonical_pr_reference(
+    pool: &SqlitePool,
+    candidate: &CleanupCandidate,
+) -> Result<Option<CanonicalPrReference>> {
+    let has_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_table == 0 {
+        return Ok(None);
+    }
+    let rows = sqlx::query_as::<_, CanonicalPrReference>(
+        "SELECT delivery_runs.id AS run_id,
+                delivery_runs.claim_epoch,
+                delivery_runs.workspace_path,
+                delivery_runs.worktree_identity,
+                delivery_runs.repo_identity,
+                delivery_runs.head_branch,
+                delivery_runs.expected_head_sha,
+                delivery_runs.canonical_pr_number,
+                delivery_runs.canonical_pr_url,
+                delivery_runs.canonical_head_sha
+         FROM delivery_runs
+         WHERE delivery_runs.objective_id=?
+           AND delivery_runs.canonical_pr_number IS NOT NULL
+           AND delivery_runs.canonical_pr_url IS NOT NULL
+           AND delivery_runs.canonical_head_sha IS NOT NULL
+         ORDER BY delivery_runs.updated_at DESC",
+    )
+    .bind(&candidate.objective_id)
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        if row.workspace_path != candidate.worktree_path
+            || row.worktree_identity != candidate.worktree_identity
+            || row.repo_identity != candidate.repo_identity
+            || row.head_branch != candidate.branch_name
+            || row.expected_head_sha != candidate.head_sha
+            || row.canonical_head_sha != candidate.head_sha
+            || row.canonical_pr_number <= 0
+            || row.canonical_pr_url.trim().is_empty()
+        {
+            continue;
+        }
+        return Ok(Some(row));
+    }
+    Ok(None)
+}
+
+/// Record a remote-observed merge as a `reconciled_committed` local receipt so
+/// the ordinary cleanup authority path resumes. Idempotent: a run that already
+/// carries a merge receipt is left untouched, so an interrupted closeout simply
+/// re-enters the same authority check.
+async fn record_reconciled_merge_receipt(
+    pool: &SqlitePool,
+    reference: &CanonicalPrReference,
+    merge_sha: &str,
+    owner: &str,
+) -> Result<()> {
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_mutation_intents
+         WHERE run_id=? AND rung='provider_pr_merge'
+           AND status IN ('committed', 'reconciled_committed')",
+    )
+    .bind(&reference.run_id)
+    .fetch_one(pool)
+    .await?;
+    if existing > 0 {
+        return Ok(());
+    }
+    let now = Utc::now().timestamp_millis();
+    let evidence = serde_json::json!({
+        "pr_number": reference.canonical_pr_number,
+        "merge_sha": merge_sha,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO delivery_mutation_intents
+         (intent_id, run_id, claim_epoch, rung, operation_key, status,
+          process_instance, evidence_json, started_at, updated_at)
+         VALUES (?, ?, ?, 'provider_pr_merge', ?, 'reconciled_committed',
+                 ?, ?, ?, ?)",
+    )
+    .bind(format!(
+        "closeout-reconcile-{}-{}",
+        reference.run_id, reference.canonical_pr_number
+    ))
+    .bind(&reference.run_id)
+    .bind(reference.claim_epoch)
+    .bind(format!(
+        "closeout-provider-pr-merge-{}-{merge_sha}",
+        reference.canonical_pr_number
+    ))
+    .bind(owner)
+    .bind(&evidence)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    // CF-CLO-R1: the delivery record must show "merged" (plus the merge commit
+    // in the receipt evidence) after a merge, whether CodeFactory or the user
+    // merged it. The merge SHA lives in `evidence_json` above.
+    sqlx::query("UPDATE delivery_runs SET reached_ceiling='merged', updated_at=? WHERE id=?")
+        .bind(now)
+        .bind(&reference.run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn plain_keep_message(pr_number: i64, worktree_path: &str, tail: &str) -> String {
+    format!("PR #{pr_number} {tail}，改动保留在 {worktree_path}")
+}
+
+/// Decide what a workspace whose local merge receipt is missing really is.
+///
+/// CF-CLO-R1 (external merge → same closeout), CF-CLO-R3 (nothing is deleted
+/// without proof, and what is kept is said in plain words), CF-CLO-R4 (closed
+/// without merge → keep everything and say so).
+async fn resolve_unrecorded_merge(
+    pool: &SqlitePool,
+    candidate: &CleanupCandidate,
+    observer: &dyn CanonicalPrObserver,
+    workspace_container: &Path,
+    owner: &str,
+) -> Result<CandidateDisposition> {
+    let Some(reference) = load_canonical_pr_reference(pool, candidate).await? else {
+        return Ok(CandidateDisposition::Preserved {
+            code: "workspace_cleanup_merge_unproven",
+            detail: format!(
+                "no canonical PR is recorded for this managed workspace; 改动保留在 {}",
+                candidate.worktree_path
+            ),
+        });
+    };
+    let pr_number = reference.canonical_pr_number;
+    match observer
+        .observe(
+            Path::new(&candidate.repo_root),
+            pr_number,
+            &reference.canonical_pr_url,
+            &candidate.head_sha,
+        )
+        .await
+    {
+        Ok(CanonicalPrState::Merged { merge_sha }) => {
+            record_reconciled_merge_receipt(pool, &reference, &merge_sha, owner).await?;
+            // The merge receipt now exists, so the exact same authority check
+            // that guards a locally-merged workspace guards this one too: the
+            // external merge is settled and cleaned in this very pass.
+            match load_cleanup_authority(pool, candidate).await? {
+                Some(authority) => {
+                    inspect_and_remove_candidate(candidate, workspace_container, authority)
+                }
+                None => Ok(CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_merge_unproven",
+                    detail: format!(
+                        "远端确认 PR #{pr_number} 已合并为 {merge_sha}，但本地授权尚未对齐；{}",
+                        plain_keep_message(pr_number, &candidate.worktree_path, "合并已确认")
+                    ),
+                }),
+            }
+        }
+        Ok(CanonicalPrState::ClosedUnmerged) => Ok(CandidateDisposition::Preserved {
+            code: "workspace_cleanup_pr_closed_unmerged",
+            detail: plain_keep_message(pr_number, &candidate.worktree_path, "已关闭但未合并"),
+        }),
+        Ok(CanonicalPrState::Open) => Ok(CandidateDisposition::Preserved {
+            code: "workspace_cleanup_merge_pending",
+            detail: plain_keep_message(pr_number, &candidate.worktree_path, "尚未合并"),
+        }),
+        Ok(CanonicalPrState::Unknown(reason)) => Ok(CandidateDisposition::Preserved {
+            code: "workspace_cleanup_merge_unproven",
+            detail: format!(
+                "暂时无法确认 PR #{pr_number} 的合并状态（{reason}）；{}",
+                plain_keep_message(pr_number, &candidate.worktree_path, "状态待确认")
+            ),
+        }),
+        Err(error) => Ok(CandidateDisposition::Preserved {
+            code: "workspace_cleanup_merge_unproven",
+            detail: format!(
+                "核对 PR #{pr_number} 的合并状态失败：{error}；{}",
+                plain_keep_message(pr_number, &candidate.worktree_path, "状态待确认")
+            ),
+        }),
+    }
 }
 
 async fn claim_cleanup_candidate(
@@ -791,6 +1103,45 @@ fn inspect_and_remove_candidate(
             detail: "managed workspace branch still exists after exact deletion".into(),
         });
     }
+    // CF-CLO-R2: the remote branch is deleted only after the exact local branch
+    // is gone, and only when the remote still publishes that exact name. A
+    // remote failure keeps the workspace row, so the next pass resumes here.
+    if let Some(remote) = choose_remote(&canonical_repo_root) {
+        match remote_branch_exists(&canonical_repo_root, &remote, &candidate.branch_name) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(error) = git(
+                    &canonical_repo_root,
+                    &["push", &remote, "--delete", &candidate.branch_name],
+                ) {
+                    return Ok(CandidateDisposition::Preserved {
+                        code: "workspace_cleanup_remote_branch_failed",
+                        detail: format!(
+                            "远端分支 {} 删除失败: {error}",
+                            candidate.branch_name
+                        ),
+                    });
+                }
+                if remote_branch_exists(&canonical_repo_root, &remote, &candidate.branch_name)
+                    .unwrap_or(true)
+                {
+                    return Ok(CandidateDisposition::Preserved {
+                        code: "workspace_cleanup_remote_branch_failed",
+                        detail: format!(
+                            "远端分支 {} 在删除后仍然存在",
+                            candidate.branch_name
+                        ),
+                    });
+                }
+            }
+            Err(error) => {
+                return Ok(CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_remote_branch_failed",
+                    detail: format!("无法确认远端分支状态: {error}"),
+                })
+            }
+        }
+    }
     Ok(CandidateDisposition::Closed {
         pr_number: authority.0,
         pr_url: authority.1,
@@ -801,6 +1152,25 @@ pub(crate) async fn run_cleanup_pass(
     pool: &SqlitePool,
     workspace_container: &Path,
     process_instance: &str,
+) -> Result<CleanupPassOutcome> {
+    run_cleanup_pass_with(
+        pool,
+        workspace_container,
+        process_instance,
+        &OfflineCanonicalPrObserver,
+    )
+    .await
+}
+
+/// Cleanup pass with an explicit canonical-PR observer. The offline entry point
+/// above passes [`OfflineCanonicalPrObserver`], so deterministic local callers
+/// keep the exact previous behaviour; the background supervisor injects the
+/// remote-backed observer so an externally-merged PR is settled too (CF-CLO-R1).
+pub(crate) async fn run_cleanup_pass_with(
+    pool: &SqlitePool,
+    workspace_container: &Path,
+    process_instance: &str,
+    observer: &dyn CanonicalPrObserver,
 ) -> Result<CleanupPassOutcome> {
     ensure_schema(pool).await?;
     let _guard = ALLOCATION_LOCK.lock().await;
@@ -864,11 +1234,19 @@ pub(crate) async fn run_cleanup_pass(
                 Ok(Some(authority)) => {
                     inspect_and_remove_candidate(&candidate, workspace_container, authority)?
                 }
-                Ok(None) => CandidateDisposition::Preserved {
-                    code: "workspace_cleanup_merge_unproven",
-                    detail: "no exact committed canonical PR merge receipt matches this workspace"
-                        .into(),
-                },
+                Ok(None) => {
+                    // CF-CLO-R1/R3/R4: no committed local receipt. Ask the
+                    // read-only observer whether the canonical PR was merged
+                    // externally; never delete on an unknown answer.
+                    resolve_unrecorded_merge(
+                        pool,
+                        &candidate,
+                        observer,
+                        workspace_container,
+                        &owner,
+                    )
+                    .await?
+                }
                 Err(error) => CandidateDisposition::Preserved {
                     code: "workspace_cleanup_inspection_failed",
                     detail: error.to_string(),
@@ -907,7 +1285,14 @@ pub(crate) fn spawn_cleanup_supervisor(
             "managed workspace cleanup supervisor started"
         );
         loop {
-            match run_cleanup_pass(&pool, &workspace_container, &process_instance).await {
+            match run_cleanup_pass_with(
+                &pool,
+                &workspace_container,
+                &process_instance,
+                &RemoteCanonicalPrObserver,
+            )
+            .await
+            {
                 Ok(outcome) if outcome.scanned > 0 => tracing::info!(
                     scanned = outcome.scanned,
                     closed = outcome.closed,
@@ -3250,5 +3635,346 @@ mod tests {
         assert!(!one_b.worktree_path.join("two.txt").exists());
         assert!(two_b.worktree_path.join("two.txt").is_file());
         assert!(!two_b.worktree_path.join("one.txt").exists());
+    }
+
+    /// A read-only observer answering a scripted sequence, so the closeout
+    /// decision is exercised without a live provider.
+    struct ScriptedPrObserver {
+        answers:
+            std::sync::Mutex<std::collections::VecDeque<anyhow::Result<super::CanonicalPrState>>>,
+    }
+
+    impl ScriptedPrObserver {
+        fn new(answers: Vec<anyhow::Result<super::CanonicalPrState>>) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::CanonicalPrObserver for ScriptedPrObserver {
+        async fn observe(
+            &self,
+            _repo_root: &Path,
+            _pr_number: i64,
+            _pr_url: &str,
+            _expected_head_sha: &str,
+        ) -> anyhow::Result<super::CanonicalPrState> {
+            self.answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(super::CanonicalPrState::Unknown(
+                    "scripted observer exhausted".into(),
+                )))
+        }
+    }
+
+    /// CF-CLO-R1 external path: the delivery record knows the canonical PR, but
+    /// there is no committed local merge receipt because the PR was merged in
+    /// the GitHub web UI.
+    async fn record_open_canonical_pr(
+        pool: &SqlitePool,
+        workspace: &super::ExecutionWorkspace,
+        pr_number: i64,
+    ) -> String {
+        crate::agent::delivery_run::ensure_schema(pool)
+            .await
+            .unwrap();
+        let head_sha = git(&workspace.worktree_path, &["rev-parse", "HEAD"]);
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
+            .bind(&workspace.objective_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET head_sha=?, state='cleanup_pending', lease_owner=NULL,
+                 lease_expires_at=NULL, updated_at=?
+             WHERE objective_id=?",
+        )
+        .bind(&head_sha)
+        .bind(now)
+        .bind(&workspace.objective_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let run_id = format!("delivery-{}", workspace.id);
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, objective_id, run_kind, workspace_path, worktree_identity,
+              repo_identity, head_branch, expected_head_sha, canonical_pr_number,
+              canonical_pr_url, canonical_head_sha, requested_ceiling,
+              reached_ceiling, stage, status, last_observed_at, last_progress_at,
+              app_version, app_build, process_instance, created_at, updated_at,
+              claim_epoch, reconciled_claim_epoch)
+             VALUES (?, ?, 'objective', ?, ?, ?, ?, ?, ?, ?, ?, 'through_merge',
+                     'pr_open', 'pr_open', 'running', ?, ?, 'test', 'test',
+                     'test-process', ?, ?, 1, 1)",
+        )
+        .bind(&run_id)
+        .bind(&workspace.objective_id)
+        .bind(workspace.worktree_path.to_string_lossy().into_owned())
+        .bind(&workspace.worktree_identity)
+        .bind(&workspace.repo_identity)
+        .bind(&workspace.branch_name)
+        .bind(&head_sha)
+        .bind(pr_number)
+        .bind(format!("https://example.invalid/pull/{pr_number}"))
+        .bind(&head_sha)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+        head_sha
+    }
+
+    async fn workspace_cleanup_cell(
+        pool: &SqlitePool,
+        objective_id: &str,
+    ) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as(
+            "SELECT state, failure_code, failure_detail
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind(objective_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Publish the workspace branch on the bare remote the same way a real
+    /// delivery does (`origin` receives the ref), so the remote-branch arm of
+    /// closeout has something to delete.
+    fn publish_workspace_branch(root: &Path, remote: &Path, branch: &str) {
+        git(
+            remote,
+            &[
+                "fetch",
+                root.to_str().unwrap(),
+                &format!("refs/heads/{branch}:refs/heads/{branch}"),
+            ],
+        );
+    }
+
+    /// CF-CLO-R1 (external merge) + CF-CLO-R2 (remove worktree, local branch,
+    /// and the remote branch once it is merged and contained).
+    #[tokio::test]
+    async fn externally_merged_pr_is_settled_and_cleaned_up() {
+        let (_temp, root, remote, container) = init_repo();
+        let pool = pool_with_objective("objective-external-merge").await;
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-external-merge", "process-a"),
+        )
+            .await
+            .unwrap();
+        std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
+        git(&workspace.worktree_path, &["add", "change.txt"]);
+        git(
+            &workspace.worktree_path,
+            &["commit", "-m", "delivered change"],
+        );
+        publish_workspace_branch(&root, &remote, &workspace.branch_name);
+        record_open_canonical_pr(&pool, &workspace, 77).await;
+
+        // Red before the fix: an externally merged PR has no local merge
+        // receipt, so the offline pass can only preserve it and the session
+        // stays "not done" (the reported U22 symptom).
+        let offline = super::run_cleanup_pass(&pool, &container, "cleanup-offline")
+            .await
+            .unwrap();
+        assert_eq!(offline.closed, 0);
+        assert_eq!(offline.preserved, 1);
+        assert!(workspace.worktree_path.is_dir());
+        let (state, code, _) = workspace_cleanup_cell(&pool, &workspace.objective_id).await;
+        assert_eq!(state, "cleanup_pending");
+        assert_eq!(code.as_deref(), Some("workspace_cleanup_merge_unproven"));
+        // Simulate the next scheduled poll after the retry backoff.
+        sqlx::query(
+            "UPDATE execution_workspaces SET failure_code=NULL, updated_at=?
+             WHERE objective_id=?",
+        )
+        .bind(chrono::Utc::now().timestamp_millis() - 600_000)
+        .bind(&workspace.objective_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+            merge_sha: "externally-merged-sha".into(),
+        })]);
+
+        let outcome = super::run_cleanup_pass_with(&pool, &container, "cleanup-a", &observer)
+            .await
+            .unwrap();
+        assert_eq!(outcome.closed, 1);
+        assert_eq!(outcome.preserved, 0);
+        assert!(!workspace.worktree_path.exists());
+        assert!(!super::branch_exists(&root, &workspace.branch_name));
+        assert!(!super::remote_branch_exists(&root, "origin", &workspace.branch_name).unwrap());
+        let (state, _, _) = workspace_cleanup_cell(&pool, &workspace.objective_id).await;
+        assert_eq!(state, "closed");
+        // CF-CLO-R1: the delivery record now shows merged, with the merge commit.
+        let (ceiling, evidence): (String, String) = sqlx::query_as(
+            "SELECT delivery_runs.reached_ceiling, delivery_mutation_intents.evidence_json
+             FROM delivery_runs
+             JOIN delivery_mutation_intents ON delivery_mutation_intents.run_id=delivery_runs.id
+             WHERE delivery_runs.objective_id=?
+               AND delivery_mutation_intents.rung='provider_pr_merge'",
+        )
+        .bind(&workspace.objective_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ceiling, "merged");
+        assert!(evidence.contains("externally-merged-sha"), "{evidence}");
+    }
+
+    /// CF-CLO-R4 + CF-CLO-R3: a PR closed without merging deletes nothing and
+    /// says in plain words where the work stays.
+    #[tokio::test]
+    async fn externally_closed_unmerged_pr_keeps_everything_and_says_where() {
+        let (_temp, root, remote, container) = init_repo();
+        let pool = pool_with_objective("objective-closed-pr").await;
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-closed-pr", "process-a"),
+        )
+            .await
+            .unwrap();
+        std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
+        git(&workspace.worktree_path, &["add", "change.txt"]);
+        git(
+            &workspace.worktree_path,
+            &["commit", "-m", "delivered change"],
+        );
+        publish_workspace_branch(&root, &remote, &workspace.branch_name);
+        record_open_canonical_pr(&pool, &workspace, 88).await;
+
+        let observer =
+            ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::ClosedUnmerged)]);
+        let outcome =
+            super::run_cleanup_pass_with(&pool, &container, "cleanup-a", &observer)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.closed, 0);
+        assert_eq!(outcome.preserved, 1);
+        assert!(workspace.worktree_path.is_dir());
+        assert!(workspace.worktree_path.join("change.txt").is_file());
+        assert!(super::branch_exists(&root, &workspace.branch_name));
+        let remote_heads = git(&root, &["ls-remote", "--heads", "origin"]);
+        assert!(
+            super::remote_branch_exists(&root, "origin", &workspace.branch_name).unwrap(),
+            "remote heads after push: {remote_heads:?}"
+        );
+        let (state, code, detail) = workspace_cleanup_cell(&pool, &workspace.objective_id).await;
+        assert_eq!(state, "cleanup_pending");
+        assert_eq!(code.as_deref(), Some("workspace_cleanup_pr_closed_unmerged"));
+        let detail = detail.unwrap();
+        assert!(detail.contains("PR #88 已关闭但未合并"), "{detail}");
+        assert!(
+            detail.contains(workspace.worktree_path.to_str().unwrap()),
+            "{detail}"
+        );
+    }
+
+    /// CF-CLO-R3: an unobservable merge state never deletes anything.
+    #[tokio::test]
+    async fn unproven_merge_state_is_never_deleted() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-unknown-pr").await;
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-unknown-pr", "process-a"),
+        )
+            .await
+            .unwrap();
+        record_open_canonical_pr(&pool, &workspace, 99).await;
+
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Unknown(
+            "network down".into(),
+        ))]);
+        let outcome =
+            super::run_cleanup_pass_with(&pool, &container, "cleanup-a", &observer)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.closed, 0);
+        assert_eq!(outcome.preserved, 1);
+        assert!(workspace.worktree_path.is_dir());
+        assert!(super::branch_exists(&root, &workspace.branch_name));
+        let (state, code, _) = workspace_cleanup_cell(&pool, &workspace.objective_id).await;
+        assert_eq!(state, "cleanup_pending");
+        assert_eq!(code.as_deref(), Some("workspace_cleanup_merge_unproven"));
+    }
+
+    /// CF-CLO-R7: an interrupted closeout (network failure during observation)
+    /// leaves no half-finished state and resumes at the next pass.
+    #[tokio::test]
+    async fn interrupted_closeout_resumes_and_completes_next_pass() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-interrupted").await;
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-interrupted", "process-a"),
+        )
+            .await
+            .unwrap();
+        std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
+        git(&workspace.worktree_path, &["add", "change.txt"]);
+        git(
+            &workspace.worktree_path,
+            &["commit", "-m", "delivered change"],
+        );
+        record_open_canonical_pr(&pool, &workspace, 55).await;
+
+        let observer = ScriptedPrObserver::new(vec![
+            Err(anyhow::anyhow!("network outage during observation")),
+            Ok(super::CanonicalPrState::Merged {
+                merge_sha: "merged-after-restart".into(),
+            }),
+        ]);
+
+        // First pass: observation fails. Nothing is deleted and no partial state
+        // is left behind.
+        let interrupted = super::run_cleanup_pass_with(&pool, &container, "cleanup-a", &observer)
+            .await
+            .unwrap();
+        assert_eq!(interrupted.closed, 0);
+        assert_eq!(interrupted.preserved, 1);
+        assert!(workspace.worktree_path.is_dir());
+        assert!(super::branch_exists(&root, &workspace.branch_name));
+        let (state, code, detail) =
+            workspace_cleanup_cell(&pool, &workspace.objective_id).await;
+        assert_eq!(state, "cleanup_pending");
+        assert_eq!(code.as_deref(), Some("workspace_cleanup_merge_unproven"));
+        assert!(detail.unwrap().contains("network outage during observation"));
+
+        // Simulate the next scheduled poll after the retry backoff: the same
+        // pass resumes and completes, with no manual repair.
+        sqlx::query(
+            "UPDATE execution_workspaces SET failure_code=NULL, updated_at=?
+             WHERE objective_id=?",
+        )
+        .bind(chrono::Utc::now().timestamp_millis() - 600_000)
+        .bind(&workspace.objective_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let finished = super::run_cleanup_pass_with(&pool, &container, "cleanup-b", &observer)
+            .await
+            .unwrap();
+        assert_eq!(finished.closed, 1);
+        assert!(!workspace.worktree_path.exists());
+        assert!(!super::branch_exists(&root, &workspace.branch_name));
+        let (state, _, _) = workspace_cleanup_cell(&pool, &workspace.objective_id).await;
+        assert_eq!(state, "closed");
     }
 }
