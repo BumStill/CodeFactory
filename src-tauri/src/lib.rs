@@ -1,6 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod unattended_smoke_cli;
 
+/// U34: the local-only headless dispatch entry (CF-HDE-*). Public so both the
+/// GUI process and the CLI client share exactly one implementation of the
+/// protocol and its security checks.
+pub mod headless_dispatch;
+
+/// Platform-neutral wrapper for the dispatch CLI client entry. On platforms
+/// without a private per-user socket implementation this is a no-op, so the GUI
+/// still starts normally.
+pub fn run_headless_dispatch_cli() -> bool {
+    #[cfg(unix)]
+    {
+        headless_dispatch::run_client_cli()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 mod agent;
 mod ai_text;
 mod benchmark;
@@ -1458,6 +1477,21 @@ pub fn run() {
                 tracing::warn!("session menu unavailable: {error}");
             }
 
+            // U34: the local-only headless task entry. The menu bar above is the
+            // reliable channel for an unlocked screen; this socket is the one that
+            // still works with the screen locked or the window on another display.
+            // It never re-implements behaviour: every request is forwarded to the
+            // same code path the GUI uses (`src/lib/desktopDispatch.ts`).
+            #[cfg(unix)]
+            match crate::headless_dispatch::bridge::start(app.handle()) {
+                Ok(bridge) => {
+                    app.manage(bridge);
+                }
+                Err(error) => {
+                    tracing::warn!("local task entry unavailable: {}", error.message);
+                }
+            }
+
             // Rolling daily DB backup — one snapshot per day, 7-day retention.
             // Best-effort: failures are logged and never block startup.
             let db_path = data_dir.join("codefactory.db");
@@ -1737,6 +1771,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             menu::sync_session_menu,
             menu::read_session_clipboard,
+            commands::dispatch::dispatch_reply,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::save_api_key,
