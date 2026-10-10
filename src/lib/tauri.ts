@@ -697,6 +697,30 @@ export interface Settings {
     alert_thresholds: number[];
     alerts_enabled: boolean;
   };
+  /** CF-QUOTA: per-endpoint share of each subscription metering window that
+   *  CodeFactory may consume before it hands the turn to the next endpoint.
+   *  Missing → 80% / 80%. Only consulted for subscription (ChatGPT) endpoints;
+   *  pay-per-token endpoints are never capped. */
+  subscription_quota_caps?: Record<
+    string,
+    { five_hour_percent: number; weekly_percent: number }
+  >;
+}
+
+/** CF-QUOTA: current subscription metering state for one endpoint. */
+export interface SubscriptionQuotaStatus {
+  endpoint: string;
+  label: string;
+  /** "服务端读数" | "本地估算" | "尚无用量记录" */
+  source: string;
+  five_hour_percent: number;
+  weekly_percent: number;
+  five_hour_cap_percent: number;
+  weekly_cap_percent: number;
+  five_hour_resets_at_ms?: number | null;
+  weekly_resets_at_ms?: number | null;
+  /** True while CodeFactory is handing this endpoint's turns to the next one. */
+  over_cap: boolean;
 }
 
 // ── Git ─────────────────────────────────────────────────────────────────────
