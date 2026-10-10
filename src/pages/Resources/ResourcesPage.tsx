@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { SkillsPanel } from "../Skills/SkillsPage";
+import BuildCachePanel from "../../components/BuildCachePanel";
 import { useKnowledgeStore } from "../../stores/knowledge";
 import type { KnowledgeLibrary } from "../../lib/tauri";
 
@@ -146,6 +147,7 @@ function KnowledgeLibrariesPanel() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-5xl space-y-5 px-6 py-6">
+        <BuildCachePanel />
         <section className="flex items-start justify-between gap-4">
           <div>
             <h2 className="flex items-center gap-2 text-body font-semibold text-gray-200">

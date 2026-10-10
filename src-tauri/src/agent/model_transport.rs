@@ -1098,6 +1098,21 @@ impl DesktopModelTransport {
             )));
         }
 
+        // CF-QUOTA-R1: the ChatGPT backend reports the current 5-hour and weekly
+        // window usage on the very response carrying the answer — the same
+        // numbers Codex CLI's `/status` shows. Record them under this route's
+        // base URL so route planning can stop before the window is spent. The
+        // headers are credential-free and only ever feed local routing.
+        if let Some(quota) = crate::agent::quota_cap::parse_codex_usage_headers(
+            response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+            chrono::Utc::now().timestamp_millis(),
+        ) {
+            crate::agent::quota_cap::shared_quota_ledger().record_server_usage(&self.base_url, quota);
+        }
+
         // ── Parse the Responses SSE stream ──
         let mut byte_stream = response.bytes_stream();
         let mut text_buf = String::new();
@@ -2006,6 +2021,27 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         attempt.commit_response(&response).await?;
                     }
                     self.route_state.mark_current_success();
+                    // CF-QUOTA-R1 (estimate path): charge this round's real
+                    // tokens to the subscription endpoint's local estimate, the
+                    // one used whenever the service gave us no usage reading.
+                    // Pay-per-token endpoints are never metered.
+                    if route.api_style == ApiStyle::Chatgpt {
+                        if let Some(usage) = response.usage.as_ref() {
+                            crate::agent::quota_cap::shared_quota_ledger().record_local_usage(
+                                &route.base_url,
+                                crate::agent::quota_cap::TokenUsage {
+                                    input_tokens: usage.prompt_tokens as u64,
+                                    cached_input_tokens: usage
+                                        .prompt_tokens_details
+                                        .as_ref()
+                                        .map(|details| details.cached_tokens as u64)
+                                        .unwrap_or(0),
+                                    output_tokens: usage.completion_tokens as u64,
+                                },
+                                chrono::Utc::now().timestamp_millis(),
+                            );
+                        }
+                    }
                     response.effective_route = Some(effective_route(&route));
                     if let Some(first) = transitions.first() {
                         let reason = transitions
@@ -2019,6 +2055,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                             to_endpoint: route.endpoint_name.clone(),
                             to_model: route.model_id.clone(),
                             reason,
+                            kind: first.kind,
                         };
                         response.route_change = Some(LoopRouteChange {
                             from_endpoint: combined.from_endpoint.clone(),

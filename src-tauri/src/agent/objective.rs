@@ -151,6 +151,25 @@ pub const MAX_SIGNATURE_RECOVERY_ATTEMPTS: i64 = 5;
 /// The verdict "you finished, but the evidence does not support it".
 pub const COMPLETION_EVIDENCE_INCOMPLETE: &str = "completion_evidence_incomplete";
 
+/// CF-TRUTH-R1 (2026-10-10): the completion gate kept refusing to confirm that
+/// the checks were rerun and passed *after* the change had already been
+/// delivered to a pull request. A delivered change is not a failed task, so the
+/// Objective parks in this system-owned but **non-failed** wait: it names what
+/// is still outstanding (a CI result nobody can hurry), schedules no retry and
+/// asks the user for nothing. The delivery record reports the outcome later.
+pub const DELIVERED_AWAITING_CI: &str = "delivered_awaiting_ci";
+
+/// CF-TRUTH-R4 (2026-10-10): the run was stopped by the system itself — the
+/// durable owner moved to another run — never by the user. The work is
+/// recoverable: the new owner carries it on from the same Objective.
+pub const INTERRUPTED_BY_SYSTEM: &str = "interrupted_by_system";
+
+/// CF-TRUTH-R4 (2026-10-10): typed reason for the model transport's ownership
+/// fence (`PROVIDER_OWNER_FENCED: durable owner changed before …`), so the
+/// retry, the recovery budget and the visible wording all name the real cause
+/// instead of reporting a user cancellation.
+pub const PROVIDER_OWNER_FENCED: &str = "provider_owner_fenced";
+
 /// A completion verdict that saw no new evidence cannot improve by being asked
 /// again: the model already answered, the arbiter already refused it, and
 /// nothing between two identical rounds changed. Every further round costs the
@@ -924,6 +943,21 @@ impl DecisionEnvelope {
             && !self.requires_user_action
     }
 
+    /// CF-TRUTH-R1: the *non-failed* parked wait for a change that is already
+    /// delivered. Deliberately separate from [`Self::is_parked_system_incident`]:
+    /// that predicate means "a real failure terminal" and is what makes the
+    /// system write a failure report, which a delivered change must never get.
+    /// This one only licenses "no retry, no owner, no user question" as a valid
+    /// system wait, because the outstanding thing is a result nobody can hurry.
+    fn is_parked_delivery_wait(&self) -> bool {
+        self.status == ObjectiveStatus::WaitingSystem
+            && self.decision_type == DecisionType::Waiting
+            && self.failure_code.as_deref() == Some(DELIVERED_AWAITING_CI)
+            && self.remediation_id.is_none()
+            && self.next_observation_at.is_none()
+            && !self.requires_user_action
+    }
+
     fn validate(&self, objective: &ObjectiveSnapshot) -> anyhow::Result<()> {
         if self.objective_id != objective.id || self.revision != objective.revision + 1 {
             bail!("objective decision revision/identity mismatch");
@@ -948,6 +982,7 @@ impl DecisionEnvelope {
         }
         if self.status == ObjectiveStatus::WaitingSystem
             && !self.is_parked_system_incident()
+            && !self.is_parked_delivery_wait()
             && (self
                 .recovery_owner
                 .as_deref()
@@ -1325,6 +1360,46 @@ pub fn decision_for_run_outcome(
     outcome: &codefactory_agent_loop::run::RunOutcome,
 ) -> anyhow::Result<DecisionEnvelope> {
     decision_for_run_outcome_with_reason(objective, outcome, None)
+}
+
+/// CF-TRUTH-R4 (2026-10-10): the outcome of a run the *system* stopped.
+///
+/// The caller has already established that no durable stop request exists (see
+/// [`ObjectiveStore::has_durable_stop_request`]). Two things must then be true,
+/// and both were false in the field: the record must name the real cause, and
+/// the task must stay recoverable. A `StopReason::Cancelled` from an ownership
+/// fence ("PROVIDER_OWNER_FENCED: durable owner changed before provider response
+/// commit") is not a user cancellation — it is exactly the case where another
+/// owner can carry the work on, so it routes to the recoverable system wait with
+/// the fence as its typed reason instead of a terminal state.
+pub fn decision_for_interrupted_run(
+    objective: &ObjectiveSnapshot,
+    outcome: &codefactory_agent_loop::run::RunOutcome,
+    terminal_reason: Option<&str>,
+) -> anyhow::Result<DecisionEnvelope> {
+    let reason = terminal_reason.unwrap_or("interrupted");
+    let failure_code = if reason.to_ascii_lowercase().contains("fence") {
+        PROVIDER_OWNER_FENCED
+    } else {
+        INTERRUPTED_BY_SYSTEM
+    };
+    let now = Utc::now().timestamp_millis();
+    DecisionRouter::route(
+        objective,
+        RouteSignal::TechnicalFailure {
+            domain: RecoveryDomain::Chat,
+            failure_code: failure_code.into(),
+            failure_signature: format!(
+                "{}:{:?}:{reason}:{failure_code}",
+                objective.id, outcome.stop_reason
+            ),
+            next_observation_at: now + RECOVERY_BACKOFF_BASE_MS,
+            resume_cursor: objective
+                .resume_cursor
+                .clone()
+                .or_else(|| objective.root_turn_id.clone()),
+        },
+    )
 }
 
 pub fn decision_for_run_outcome_with_reason(
@@ -2919,6 +2994,30 @@ impl ObjectiveStore {
         bail!("chat cancellation could not win a stable Objective revision")
     }
 
+    /// CF-TRUTH-R3 (2026-10-10): the only authority for saying "the user
+    /// stopped this" is a durable stop request. An internal failure used to end
+    /// up recorded as `cancellation_provenance=explicit_cancel` three seconds
+    /// later, with *no* intent row anywhere in
+    /// `chat_session_cancel_intents` — twice in one day, with nobody pressing
+    /// stop. This asks the durable store, and treats a schema too old to answer
+    /// as "cannot prove it was synthetic", so an unreadable table can never turn
+    /// a real user stop into a system interruption.
+    pub async fn has_durable_stop_request(&self, session_id: &str, since_ms: i64) -> bool {
+        let intents: Result<i64, _> = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_session_cancel_intents
+             WHERE session_id=?
+               AND (status='requested' OR COALESCE(settled_at, requested_at) >= ?)",
+        )
+        .bind(session_id)
+        .bind(since_ms)
+        .fetch_one(&self.pool)
+        .await;
+        match intents {
+            Ok(count) => count > 0,
+            Err(_) => true,
+        }
+    }
+
     /// Persist a session-wide stop fence before touching any individual
     /// Objective. Re-requesting a settled stop starts a new intent; no later
     /// chat admission may pass while this row remains `requested`.
@@ -3065,6 +3164,15 @@ impl ObjectiveStore {
                ON objective.id=COALESCE(control.objective_id, turn.objective_id)
              WHERE control.status='cancel_requested'
                AND control.root_turn_id IS NOT NULL
+               -- CF-TRUTH-R3: a run-level transport flag is not a user stop.
+               -- Only a durable session stop request may turn an Objective into
+               -- an `explicit_cancel`; a control row with no intent behind it is
+               -- left to stale-run reconciliation, which keeps the Objective
+               -- recoverable instead of inventing a cancellation.
+               AND EXISTS (
+                 SELECT 1 FROM chat_session_cancel_intents intent
+                 WHERE intent.session_id=control.session_id
+               )
              ORDER BY control.cancel_requested_at, control.run_instance_id",
         )
         .fetch_all(&self.pool)
@@ -4795,6 +4903,47 @@ impl ObjectiveStore {
             objective_attempts,
             "system recovery made no progress; parking a system-owned incident"
         );
+
+        // CF-TRUTH-R1: "no further recovery round can confirm the checks" is a
+        // true statement about the *evidence*, never about the *delivery*. When
+        // this exact Objective already has a canonical PR, the change has
+        // landed: calling it a failed task is a false statement to the user and
+        // a false record for the release path. Park the honest non-failed wait
+        // instead and let the delivery record report the CI outcome.
+        if decision.failure_code.as_deref() == Some(COMPLETION_EVIDENCE_INCOMPLETE) {
+            if let Some(reference) = self.delivered_pr_reference(&decision.objective_id).await {
+                let prompt = delivered_awaiting_ci_message(&reference);
+                tracing::info!(
+                    objective_id = %decision.objective_id,
+                    reference = %reference,
+                    "completion gate exhausted after delivery; parking a delivered wait, not a failure"
+                );
+                decision.decision_type = DecisionType::Waiting;
+                decision.status = ObjectiveStatus::WaitingSystem;
+                // The typed reason doubles as the record of *why* nothing is
+                // retried: the only outstanding item is a CI result.
+                decision.failure_code = Some(DELIVERED_AWAITING_CI.into());
+                decision.request_key = None;
+                decision.recovery_owner = None;
+                decision.remediation_id = None;
+                decision.next_observation_at = None;
+                decision.next_action_authorized = false;
+                decision.requires_user_action = false;
+                decision.attention_request = Some(UserAttentionRequest {
+                    kind: DELIVERED_AWAITING_CI.into(),
+                    prompt,
+                    missing_inputs: Vec::new(),
+                    attempted_routes: Vec::new(),
+                    decision_options: Vec::new(),
+                    recommended_option: None,
+                    irreversible: false,
+                    no_safe_default_reason: None,
+                    resume_cursor: decision.resume_cursor.clone(),
+                });
+                return Ok(decision);
+            }
+        }
+
         decision.decision_type = DecisionType::FailedInternal;
         decision.status = ObjectiveStatus::Failed;
         decision.request_key = None;
@@ -6385,6 +6534,7 @@ impl ObjectiveStore {
 
         if decision.status == ObjectiveStatus::WaitingSystem
             && !decision.is_parked_system_incident()
+            && !decision.is_parked_delivery_wait()
             && !decision.transport_probe_wait
         {
             let strategy = if decision.domain == RecoveryDomain::Update
@@ -6719,6 +6869,14 @@ impl ObjectiveStore {
         Some((verdict, checks))
     }
 
+    /// CF-TRUTH-R1: the canonical PR already recorded for this Objective, as the
+    /// `PR #N` reference the user reads. `None` means nothing has been delivered,
+    /// so the ordinary failure terminal is still the honest outcome.
+    async fn delivered_pr_reference(&self, objective_id: &str) -> Option<String> {
+        let (url, _status) = self.latest_delivery_pr(objective_id).await?;
+        Some(pull_request_reference(&url).unwrap_or_else(|| "已经开好的 PR".to_string()))
+    }
+
     /// The PR a previous delivery attempt already opened, when both the schema
     /// and the row carry it. Best-effort and schema-tolerant by design: an
     /// older database without the column must still produce a report.
@@ -6853,6 +7011,16 @@ fn workspace_commits_ahead(root: &std::path::Path, base_sha: &str) -> i64 {
             .unwrap_or(0),
         _ => 0,
     }
+}
+
+/// CF-TRUTH-R1: the sentence a delivered-but-unconfirmed change gets instead of
+/// a failure report. It states the delivery as the fact it is and names the one
+/// thing still outstanding, in the same vocabulary the delivery record uses.
+pub fn delivered_awaiting_ci_message(reference: &str) -> String {
+    format!(
+        "改动已交付到{reference}（PR 已开出），正在等这条 PR 的检查结果；\
+交付记录会在检查结束后更新结论，不需要再重跑一次一样的实现。"
+    )
 }
 
 /// `PR #572` for a GitHub pull-request URL, matching the wording the run's own
@@ -11431,6 +11599,33 @@ CREATE TABLE objectives (
         .execute(&pool)
         .await
         .unwrap();
+        // The stop path writes this durable intent *before* the run stops (the
+        // session-scoped fence in migration 0016), so a crash-left
+        // `cancel_requested` control always has it behind it. CF-TRUTH-R3 makes
+        // that record the authority for calling a stop a user cancellation.
+        sqlx::query("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, updated_at INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, updated_at) VALUES (?, ?)",
+        )
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_session_cancel_intents
+             (session_id, status, requested_at, settled_at, updated_at)
+             VALUES (?, 'requested', ?, NULL, ?)",
+        )
+        .bind(objective.session_id.as_deref().unwrap())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
         let late = RunOutcome {
             final_text: "late model answer".into(),
             final_message_id: Some("assistant-late-answer".into()),
@@ -12084,6 +12279,7 @@ CREATE TABLE objectives (
             .unwrap();
         if waiting.status == ObjectiveStatus::WaitingSystem
             && waiting.failure_code.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED)
+            && waiting.failure_code.as_deref() != Some(DELIVERED_AWAITING_CI)
         {
             // A repeating signature is now scheduled with a growing backoff, so
             // driving several rounds in a test has to stand in for the wait the
@@ -12944,8 +13140,12 @@ CREATE TABLE objectives (
             head_branch: "feature/recovery-ceiling".into(),
             change_set_digest: "sha256:recovery-ceiling".into(),
             expected_head_sha: "abc".into(),
-            canonical_pr_number: Some(411),
-            canonical_pr_url: Some("https://example.invalid/pull/411".into()),
+            // CF-TRUTH-R1: no canonical PR on this fixture. The recovery ceiling
+            // is only an honest failure while nothing was delivered; the
+            // *delivered* variant of the same ceiling is covered by
+            // `a_delivered_change_is_never_reported_as_a_failed_task`.
+            canonical_pr_number: None,
+            canonical_pr_url: None,
             canonical_head_sha: Some("abc".into()),
             requested_ceiling: "through_release".into(),
             reached_ceiling: "pr_open".into(),
@@ -13169,17 +13369,18 @@ CREATE TABLE objectives (
                 .await
                 .unwrap();
         assert_eq!(visible_final.0, "assistant");
-        // U1b: this Objective parked with a canonical PR already open, and the
-        // only unconfirmed thing is that the checks were rerun. The honest
-        // terminal states that fact — denying the work would be false.
+        // CF-TRUTH-R1: nothing is delivered on this fixture (no canonical PR), so
+        // the honest failure wording is the right one — and the *delivered*
+        // variant of the same ceiling is asserted the other way round by
+        // `a_delivered_change_with_unconfirmed_checks_is_reported_as_delivered`.
         assert!(
-            visible_final.1.contains("改动已交付到 PR #411"),
-            "{}",
+            visible_final.1.contains("这件事没做成"),
+            "an undelivered ceiling must still say the task did not work out: {}",
             visible_final.1
         );
         assert!(
-            !visible_final.1.contains("这件事没做成"),
-            "a delivered change must not be reported as not done: {}",
+            !visible_final.1.contains("改动已交付"),
+            "an undelivered change must not be reported as delivered: {}",
             visible_final.1
         );
         crate::agent::failure_summary::assert_no_internal_vocabulary(&visible_final.1).unwrap();
@@ -13576,7 +13777,14 @@ CREATE TABLE objectives (
         .unwrap();
 
         let signature = "sha256:u1b-delivered-checks";
-        while current.failure_code.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED) {
+        // CF-TRUTH-R1 supersedes U1b's failure terminal for exactly this shape.
+        // U1b wrote "delivered, but the checks could not be confirmed" *as a
+        // failure*; a delivered change is not a failed task, so the ladder now
+        // ends in the non-failed delivered wait that names the open PR. The
+        // honest-failure wording is still covered, word for word, by the
+        // undelivered negative control below.
+        let mut rounds = 0;
+        while current.failure_code.as_deref() != Some(DELIVERED_AWAITING_CI) && rounds < 8 {
             current = route_technical_failure(
                 &store,
                 &current,
@@ -13584,22 +13792,27 @@ CREATE TABLE objectives (
                 signature,
             )
             .await;
+            rounds += 1;
         }
-        assert_parked_system_incident(&current);
+        assert_eq!(
+            current.failure_code.as_deref(),
+            Some(DELIVERED_AWAITING_CI),
+            "a delivered change must end in the delivered wait, not a failure"
+        );
+        assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+        assert!(!current.status.is_terminal());
+        assert_eq!(claimable_remediations(&pool, &current.id).await, 0);
 
-        let content: String = sqlx::query_scalar(
-            "SELECT content FROM messages WHERE session_id=?
-             ORDER BY created_at DESC, rowid DESC LIMIT 1",
-        )
-        .bind(format!("session-{}", current.id))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(content.contains("PR #572"), "{content}");
-        assert!(content.contains("check X"), "{content}");
-        assert!(!content.contains("没做成"), "{content}");
-        assert!(!content.contains("目标没有达成"), "{content}");
-        crate::agent::failure_summary::assert_no_internal_vocabulary(&content).unwrap();
+        let prompt = current
+            .attention_request
+            .as_ref()
+            .expect("the user must be able to read the real state")
+            .prompt
+            .clone();
+        assert!(prompt.contains("PR #572"), "{prompt}");
+        assert!(!prompt.contains("没做成"), "{prompt}");
+        assert!(!prompt.contains("目标没有达成"), "{prompt}");
+        crate::agent::failure_summary::assert_no_internal_vocabulary(&prompt).unwrap();
     }
 
     /// U1b negative control: the same verification gap with nothing delivered
@@ -14620,5 +14833,433 @@ CREATE TABLE objectives (
             summary.contains("工作区"),
             "the reason must say where the user's work is: {summary}"
         );
+    }
+
+    // ── CF-TRUTH: the session state must be true after delivery ─────────────
+
+    /// Synthetic chat Objective on the completion-gate route, already parked in
+    /// a system wait with a burned signature budget.
+    async fn completion_gate_fixture(
+        pool: &SqlitePool,
+        objective_id: &str,
+        root_turn_id: &str,
+        signature: &str,
+    ) {
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objectives
+             (id, revision, kind, session_id, root_turn_id, status, decision_type,
+              domain, requested_acceptance, requires_user_action, recovery_owner,
+              created_surface, created_process_instance,
+              last_observed_process_instance, last_progress_at,
+              created_at, updated_at, failure_code, failure_signature)
+             VALUES (?, 1, 'local_mutation', 'session-truth', ?, 'waiting_system',
+                     'waiting', 'chat', 'synthetic acceptance', 0,
+                     'objective-supervisor:chat', 'chat', 'test-process',
+                     'test-process', ?, ?, ?, ?, ?)",
+        )
+        .bind(objective_id)
+        .bind(root_turn_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(COMPLETION_EVIDENCE_INCOMPLETE)
+        .bind(signature)
+        .execute(pool)
+        .await
+        .unwrap();
+        // Exactly the ceiling the ladder allows for this failure class, so the
+        // next observation is the one that used to write the failure terminal.
+        let attempts = max_signature_attempts_for(Some(COMPLETION_EVIDENCE_INCOMPLETE));
+        for index in 0..attempts {
+            sqlx::query(
+                "INSERT INTO objective_remediations
+                 (id, objective_id, domain, status, failure_code, failure_signature,
+                  strategy, approach_index, attempt_index, execution_attempt_index,
+                  recovery_generation, next_observation_at, created_at, updated_at)
+                 VALUES (?, ?, 'chat', 'completed', ?, ?, 'reconcile_then_resume', 0,
+                         1, 1, 0, ?, ?, ?)",
+            )
+            .bind(format!("remediation-truth-{index}"))
+            .bind(objective_id)
+            .bind(COMPLETION_EVIDENCE_INCOMPLETE)
+            .bind(signature)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn record_delivered_pr(pool: &SqlitePool, objective_id: &str, url: &str) {
+        delivery_runs_table(pool).await;
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, objective_id, run_kind, requested_ceiling, reached_ceiling, stage, status,
+              canonical_pr_number, canonical_pr_url, last_observed_at, last_progress_at,
+              app_version, app_build, process_instance, created_at, updated_at)
+             VALUES (?, ?, 'objective', 'pr_only', 'pr_only', 'pr_opened', 'pr_opened',
+                     605, ?, ?, ?, '1.83.2', 'test-build', 'test-process', ?, ?)",
+        )
+        .bind(format!("delivery-truth-{objective_id}"))
+        .bind(objective_id)
+        .bind(url)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The real table and its shipped extensions, not a hand-copied subset: the
+    /// settlement path writes most of these columns, and a fixture that drifts
+    /// silently turns a product behaviour into a confusing column error. With no
+    /// row inserted, nothing has been delivered.
+    async fn delivery_runs_table(pool: &SqlitePool) {
+        for migration in [
+            include_str!("../../migrations/0004_delivery_runs.sql"),
+            include_str!("../../migrations/0005_objective_recovery_control_plane.sql"),
+            include_str!("../../migrations/0008_delivery_identity_revisions.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(pool).await.unwrap();
+        }
+    }
+
+    /// The settlement path writes columns added by later migrations than the
+    /// fixture runs; add whatever is missing instead of guessing one at a time.
+    async fn ensure_chat_turn_state_columns(pool: &SqlitePool) {
+        for (name, kind) in [
+            ("next_action", "TEXT"),
+            ("terminal_reason", "TEXT"),
+            ("turn_settled_at", "INTEGER"),
+            ("stream_closed_at", "INTEGER"),
+            ("terminal_revision", "INTEGER"),
+            ("objective_revision", "INTEGER"),
+            ("visible_final_message_id", "TEXT"),
+            ("visible_final_kind", "TEXT"),
+            ("completed_at", "INTEGER"),
+            ("updated_at", "INTEGER"),
+            ("recent_activity_kind", "TEXT"),
+            ("recent_activity_label", "TEXT"),
+            ("waiting_reason", "TEXT"),
+        ] {
+            let present: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('chat_turn_state') WHERE name=?",
+            )
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if present == 0 {
+                sqlx::query(&format!(
+                    "ALTER TABLE chat_turn_state ADD COLUMN {name} {kind}"
+                ))
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    fn gate_exhaustion_decision(
+        objective: &ObjectiveSnapshot,
+        signature: &str,
+    ) -> DecisionEnvelope {
+        DecisionRouter::route(
+            objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: COMPLETION_EVIDENCE_INCOMPLETE.into(),
+                failure_signature: signature.into(),
+                next_observation_at: Utc::now().timestamp_millis(),
+                resume_cursor: objective.resume_cursor.clone(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// CF-TRUTH-R1 acceptance case 1 (M57, 2026-10-10): the PR is open and the
+    /// completion gate cannot confirm the checks. The session used to be reported
+    /// as **failed** (`technical_recovery_exhausted`) although the change had
+    /// landed. The truthful outcome is a non-failed wait that names the open PR.
+    #[tokio::test]
+    async fn a_delivered_change_is_never_reported_as_a_failed_task() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        ensure_chat_turn_state_columns(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let signature = format!("objective-delivered:Finished:{COMPLETION_EVIDENCE_INCOMPLETE}");
+        completion_gate_fixture(&pool, "objective-delivered", "turn-delivered", &signature).await;
+        record_delivered_pr(
+            &pool,
+            "objective-delivered",
+            "https://github.com/BumStill/CodeFactory/pull/605",
+        )
+        .await;
+
+        let current = store.get("objective-delivered").await.unwrap().unwrap();
+        let decision = gate_exhaustion_decision(&current, &signature);
+        let parked = store.bound_system_recovery(decision).await.unwrap();
+
+        assert!(
+            !parked.status.is_terminal(),
+            "a delivered change must not settle as a terminal failure: {:?}",
+            parked.status
+        );
+        assert_ne!(parked.status.as_str(), "failed");
+        assert_eq!(parked.status.as_str(), "waiting_system");
+        assert_eq!(parked.failure_code.as_deref(), Some(DELIVERED_AWAITING_CI));
+        assert_eq!(parked.decision_type.as_str(), "waiting");
+        assert!(parked.remediation_id.is_none());
+        assert!(parked.next_observation_at.is_none());
+        assert!(parked.recovery_owner.is_none());
+        assert!(!parked.requires_user_action);
+        let prompt = parked
+            .attention_request
+            .as_ref()
+            .expect("the user must be able to read the real state")
+            .prompt
+            .clone();
+        assert!(
+            prompt.contains("PR #605"),
+            "the visible sentence must name the open PR: {prompt}"
+        );
+        // The decision must be applicable: validate() is what apply_decision
+        // enforces, including the "no owner, no retry" delivery wait.
+        parked.clone().validate(&current).unwrap();
+        let applied = store
+            .apply_decision(current.revision, parked)
+            .await
+            .unwrap();
+        assert_ne!(applied.status.as_str(), "failed");
+        assert_eq!(applied.failure_code.as_deref(), Some(DELIVERED_AWAITING_CI));
+    }
+
+    /// CF-TRUTH-R1 acceptance case 2: nothing was delivered, so the same
+    /// exhausted gate is still an honest failure. The delivered wait must never
+    /// become a way to launder a genuinely unfinished task into "waiting".
+    #[tokio::test]
+    async fn an_undelivered_change_still_settles_as_a_failure() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let signature = format!("objective-undelivered:Finished:{COMPLETION_EVIDENCE_INCOMPLETE}");
+        completion_gate_fixture(&pool, "objective-undelivered", "turn-undelivered", &signature)
+            .await;
+
+        let current = store.get("objective-undelivered").await.unwrap().unwrap();
+        let decision = gate_exhaustion_decision(&current, &signature);
+        let parked = store.bound_system_recovery(decision).await.unwrap();
+
+        assert_eq!(parked.status.as_str(), "failed");
+        assert_eq!(parked.decision_type.as_str(), "failed_internal");
+        assert_eq!(
+            parked.failure_code.as_deref(),
+            Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        );
+    }
+
+    /// CF-TRUTH-R3 acceptance case 1 (M54, 2026-10-10): a run control left in
+    /// `cancel_requested` by the system itself — no session stop request behind
+    /// it — must not be recorded as the user cancelling. Two sessions that day
+    /// became `explicit_cancel` with no intent row anywhere.
+    #[tokio::test]
+    async fn a_run_control_without_a_stop_intent_never_becomes_a_user_cancel() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        delivery_runs_table(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objectives
+             (id, revision, kind, session_id, root_turn_id, status, decision_type,
+              domain, requested_acceptance, requires_user_action, recovery_owner,
+              created_surface, created_process_instance,
+              last_observed_process_instance, last_progress_at,
+              created_at, updated_at, failure_code, failure_signature)
+             VALUES ('objective-fenced', 1, 'local_mutation', 'session-fenced',
+                     'turn-fenced', 'waiting_system', 'waiting', 'chat',
+                     'synthetic acceptance', 0, 'objective-supervisor:chat',
+                     'chat', 'test-process', 'test-process', ?, ?, ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind("failed_internal")
+        .bind("objective-fenced:FailedInternal")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, next_action, objective_id)
+             VALUES ('turn-fenced', 'session-fenced', 'working', 'continue',
+                     'objective-fenced')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, status, created_process_instance,
+              cancel_requested_at, created_at, updated_at)
+             VALUES ('run-fenced', 'session-fenced', 'turn-fenced',
+                     'cancel_requested', 'test-process', ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let consumed = store.consume_pending_chat_cancellations().await.unwrap();
+        assert_eq!(
+            consumed, 0,
+            "a control row with no stop request behind it is not a cancellation"
+        );
+        let objective = store.get("objective-fenced").await.unwrap().unwrap();
+        assert_ne!(objective.status.as_str(), "cancelled");
+        assert_ne!(
+            objective.cancellation_provenance.as_deref(),
+            Some("explicit_cancel")
+        );
+    }
+
+    /// CF-TRUTH-R3 acceptance case 2 — the control group: a real stop request
+    /// (the durable intent the stop button writes) still cancels explicitly, so
+    /// the fix does not silence genuine user stops.
+    #[tokio::test]
+    async fn a_real_stop_request_still_cancels_explicitly() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        ensure_chat_turn_state_columns(&pool).await;
+        delivery_runs_table(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO objectives
+             (id, revision, kind, session_id, root_turn_id, status, decision_type,
+              domain, requested_acceptance, requires_user_action, recovery_owner,
+              created_surface, created_process_instance,
+              last_observed_process_instance, last_progress_at,
+              created_at, updated_at)
+             VALUES ('objective-stopped', 1, 'local_mutation', 'session-stopped',
+                     'turn-stopped', 'waiting_system', 'waiting', 'chat',
+                     'synthetic acceptance', 0, 'objective-supervisor:chat',
+                     'chat', 'test-process', 'test-process', ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, status, next_action, objective_id)
+             VALUES ('turn-stopped', 'session-stopped', 'working', 'continue',
+                     'objective-stopped')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, status, created_process_instance,
+              cancel_requested_at, created_at, updated_at)
+             VALUES ('run-stopped', 'session-stopped', 'turn-stopped',
+                     'cancel_requested', 'test-process', ?, ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('session-stopped', 'synthetic', '/tmp/synthetic', 'test-model', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_session_cancel_intents
+             (session_id, status, requested_at, settled_at, updated_at)
+             VALUES ('session-stopped', 'requested', ?, NULL, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let consumed = store.consume_pending_chat_cancellations().await.unwrap();
+        assert_eq!(consumed, 1, "the user's stop must still be consumed");
+        let objective = store.get("objective-stopped").await.unwrap().unwrap();
+        assert_eq!(objective.status.as_str(), "cancelled");
+        assert_eq!(
+            objective.cancellation_provenance.as_deref(),
+            Some("explicit_cancel")
+        );
+    }
+
+    /// CF-TRUTH-R3/R4 acceptance case 3 (2026-10-10, 14:38): the ownership fence
+    /// (`PROVIDER_OWNER_FENCED: durable owner changed before provider response
+    /// commit`) stopped a run, and three seconds later the Objective was recorded
+    /// as an explicit user cancel. An unrequested interruption must instead be
+    /// recoverable and must name the fence as its real cause.
+    #[tokio::test]
+    async fn an_unrequested_interruption_is_recoverable_and_names_its_cause() {
+        let objective = ObjectiveSnapshot::new(
+            "objective-fence-decision",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "synthetic acceptance",
+        );
+        let outcome = codefactory_agent_loop::run::RunOutcome {
+            final_text: String::new(),
+            final_message_id: None,
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: codefactory_agent_loop::run::StopReason::Cancelled,
+        };
+
+        // The mapping still says "user cancel" on its own — that is exactly why
+        // the production path asks the durable store before believing it.
+        let naive = decision_for_run_outcome_with_reason(
+            &objective,
+            &outcome,
+            Some("provider_owner_fenced"),
+        )
+        .unwrap();
+        assert_eq!(naive.decision_type.as_str(), "cancelled");
+        assert_eq!(naive.cancellation_provenance.as_deref(), Some("explicit_cancel"));
+
+        let truthful =
+            decision_for_interrupted_run(&objective, &outcome, Some("provider_owner_fenced"))
+                .unwrap();
+        assert_eq!(truthful.failure_code.as_deref(), Some(PROVIDER_OWNER_FENCED));
+        assert_eq!(truthful.status.as_str(), "waiting_system");
+        assert!(!truthful.status.is_terminal());
+        assert!(!truthful.requires_user_action);
+        assert!(
+            truthful.cancellation_provenance.is_none(),
+            "an internal interruption must not claim a user cancellation"
+        );
+
+        // A non-fence interruption is still recoverable, with its own honest code.
+        let generic = decision_for_interrupted_run(&objective, &outcome, Some("failed_internal"))
+            .unwrap();
+        assert_eq!(generic.failure_code.as_deref(), Some(INTERRUPTED_BY_SYSTEM));
+        assert!(!generic.status.is_terminal());
     }
 }

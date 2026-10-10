@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useLayoutEffect, useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Check, ShieldAlert, X, Unlock } from "lucide-react";
 import { createTwoFilesPatch } from "diff";
 import type { PendingPermission } from "../stores/chat";
@@ -93,22 +93,6 @@ export function PermissionDialog({
   const dialogRef = useRef<HTMLDivElement>(null);
   const denyButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
-  const [remainingSeconds, setRemainingSeconds] = useState<number | null>(() =>
-    request.expiresAt == null
-      ? null
-      : Math.max(0, Math.ceil((request.expiresAt - Date.now()) / 1000)),
-  );
-  useEffect(() => {
-    if (request.expiresAt == null) {
-      setRemainingSeconds(null);
-      return;
-    }
-    const update = () =>
-      setRemainingSeconds(Math.max(0, Math.ceil((request.expiresAt! - Date.now()) / 1000)));
-    update();
-    const timer = window.setInterval(update, 250);
-    return () => window.clearInterval(timer);
-  }, [request.expiresAt]);
 
   useLayoutEffect(() => {
     restoreFocusRef.current = document.activeElement instanceof HTMLElement
@@ -178,14 +162,12 @@ export function PermissionDialog({
         <div className="max-h-[45vh] overflow-auto px-4 py-3">
           <div className="mb-2 text-label text-gray-600">参数</div>
           <ToolArgsPreview request={request} />
-          {remainingSeconds != null && (
-            <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
-              请在 {remainingSeconds} 秒内处理；超时只会标记“授权已过期”，不会记成你拒绝。
-            </div>
-          )}
+          <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
+            等待你的批准；超时或无人应答不会记成你拒绝，请确认操作范围后再批准。
+          </div>
           {trusted && (
             <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
-              当前会话已处于信任模式，普通工具会减少确认；高风险命令仍会拦截。
+              当前会话已受信任，但无法确认此操作的影响仅限本会话工作区，因此仍需你确认。
             </div>
           )}
         </div>
@@ -206,13 +188,13 @@ export function PermissionDialog({
             <Check size={14} />
             仅允许一次
           </button>
-          <button
+          {!trusted && <button
             onClick={onAllowFullAccess}
             className="inline-flex min-h-11 items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 text-label text-amber-900 dark:text-amber-100 hover:bg-amber-500/20 lg:min-h-9"
           >
             <Unlock size={14} />
             信任本会话并允许
-          </button>
+          </button>}
         </div>
       </div>
     </div>
