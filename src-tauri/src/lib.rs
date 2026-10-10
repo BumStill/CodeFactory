@@ -1783,6 +1783,7 @@ pub fn run() {
             commands::dispatch::dispatch_reply,
             commands::settings::get_settings,
             commands::settings::save_settings,
+            commands::settings::subscription_quota_status,
             commands::settings::save_api_key,
             commands::settings::delete_api_key,
             commands::update_safety::reserve_update_install,
