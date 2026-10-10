@@ -4,6 +4,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  budgetBytesFromEnv,
+  clearInUse,
+  enforceBudget,
+  formatGiB,
+  markInUse,
+} from "./build-cache-budget.mjs";
+
 function git(args, cwd) {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
@@ -56,6 +64,31 @@ export function resolveCargoCwd({ cwd, args, worktreeRoot }) {
   return { cwd: workspaceDir, relocated: true };
 }
 
+// CF-BLD-R9: the shared cache is governed by the same ceiling as the caches the
+// runtime manages, and every build marks the directory it is using so an idle
+// sweep can never delete a cache out from under a running build.
+export function sharedBuildEnvironment({ targetDir, baseEnv = process.env }) {
+  return {
+    ...baseEnv,
+    CARGO_TARGET_DIR: targetDir,
+    // Incremental artifacts are keyed by the *worktree path*, so in a cache
+    // shared by many worktrees they are write-only ballast — 201 GB of the
+    // 410 GB that had to be deleted by hand. Sharing only pays off without them.
+    CARGO_INCREMENTAL: "0",
+  };
+}
+
+export function enforceSharedBudget({ repoRoot, targetDir, env = process.env, logFile }) {
+  const cacheRoot = path.join(repoRoot, ".codefactory-cache");
+  return enforceBudget({
+    roots: [cacheRoot],
+    limitBytes: budgetBytesFromEnv(env),
+    keep: [targetDir],
+    trigger: "cargo_shared",
+    logFile: logFile ?? path.join(cacheRoot, "build-cache-audit.jsonl"),
+  });
+}
+
 function main() {
   const targetDir = sharedTargetFor(process.cwd());
   const args = stripLeadingSeparator(process.argv.slice(2));
@@ -76,11 +109,32 @@ function main() {
     process.stderr.write(`cargo target: running in ${path.relative(worktreeRoot, resolved.cwd)} (workspace manifest)\n`);
   }
 
-  const result = spawnSync("cargo", args, {
-    cwd: resolved.cwd,
-    env: { ...process.env, CARGO_TARGET_DIR: targetDir },
-    stdio: "inherit",
-  });
+  // Mark before sweeping so this build's own directory can never be a
+  // candidate, then bring the shared cache back inside the ceiling.
+  markInUse(targetDir);
+  let budgetSummary = null;
+  try {
+    budgetSummary = enforceSharedBudget({ repoRoot: path.resolve(targetDir, "..", ".."), targetDir });
+  } catch (error) {
+    // A budget pass must never stop a build; the build is the user's work.
+    process.stderr.write(`cargo target: build-cache budget pass skipped: ${error?.message ?? error}\n`);
+  }
+  if (budgetSummary && budgetSummary.reclaimed_bytes + budgetSummary.evicted_bytes > 0) {
+    process.stderr.write(
+      `cargo target: reclaimed ${formatGiB(budgetSummary.reclaimed_bytes + budgetSummary.evicted_bytes)} of shared build cache\n`,
+    );
+  }
+
+  let result;
+  try {
+    result = spawnSync("cargo", args, {
+      cwd: resolved.cwd,
+      env: sharedBuildEnvironment({ targetDir }),
+      stdio: "inherit",
+    });
+  } finally {
+    clearInUse(targetDir);
+  }
 
   if (result.error) {
     throw result.error;

@@ -176,6 +176,12 @@ pub struct Settings {
     /// usage surfaces but never stops a task or silently switches models.
     #[serde(default)]
     pub usage_budget: UsageBudget,
+    /// CF-QUOTA: per-endpoint share of each subscription metering window that
+    /// CodeFactory may consume before it hands the turn to the next endpoint.
+    /// Keyed by endpoint name; a missing entry means the 80% / 80% default.
+    /// Only consulted for subscription (ChatGPT) endpoints.
+    #[serde(default)]
+    pub subscription_quota_caps: HashMap<String, QuotaCapConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -196,6 +202,55 @@ fn default_usage_alert_thresholds() -> Vec<f64> {
 
 fn default_true() -> bool {
     true
+}
+
+/// CF-QUOTA: the share of each subscription metering window CodeFactory may
+/// consume before handing the turn to the next endpoint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuotaCapConfig {
+    #[serde(default = "default_five_hour_cap_percent")]
+    pub five_hour_percent: u8,
+    #[serde(default = "default_weekly_cap_percent")]
+    pub weekly_percent: u8,
+}
+
+fn default_five_hour_cap_percent() -> u8 {
+    crate::agent::quota_cap::DEFAULT_FIVE_HOUR_CAP_PERCENT
+}
+
+fn default_weekly_cap_percent() -> u8 {
+    crate::agent::quota_cap::DEFAULT_WEEKLY_CAP_PERCENT
+}
+
+impl Default for QuotaCapConfig {
+    fn default() -> Self {
+        Self {
+            five_hour_percent: default_five_hour_cap_percent(),
+            weekly_percent: default_weekly_cap_percent(),
+        }
+    }
+}
+
+impl Settings {
+    /// CF-QUOTA: the subscription metering caps for `endpoint_name`, falling
+    /// back to the 80% / 80% default when the user has not customised them.
+    pub fn quota_cap_for(&self, endpoint_name: &str) -> crate::agent::quota_cap::QuotaCap {
+        match self.subscription_quota_caps.get(endpoint_name) {
+            Some(config) => {
+                crate::agent::quota_cap::QuotaCap::new(config.five_hour_percent, config.weekly_percent)
+            }
+            None => crate::agent::quota_cap::QuotaCap::default(),
+        }
+    }
+
+    /// CF-QUOTA: only subscription endpoints share a metered quota with the
+    /// user; pay-per-token endpoints are never capped.
+    pub fn endpoint_is_subscription(&self, endpoint_name: &str) -> bool {
+        self.endpoints
+            .get(endpoint_name)
+            .map(|endpoint| endpoint.api_style == ApiStyle::Chatgpt)
+            .unwrap_or(false)
+    }
 }
 
 impl Default for UsageBudget {
@@ -619,6 +674,7 @@ impl Default for Settings {
             delivery_exclude_globs: Vec::new(),
             delivery_ci_timeout_secs: default_delivery_ci_timeout_secs(),
             usage_budget: UsageBudget::default(),
+            subscription_quota_caps: HashMap::new(),
         }
     }
 }

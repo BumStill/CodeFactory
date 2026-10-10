@@ -286,6 +286,9 @@ fn remote_error_is_retryable(detail: &str) -> bool {
         "timed out",
         "timeout",
         "temporarily unavailable",
+        "ssl_error_syscall",
+        "http 500",
+        "ssl connection",
         "connection reset",
         "connection refused",
         "dns",
@@ -577,6 +580,43 @@ pub struct DeliverOpts {
     /// every local or external mutation rung. Non-durable/manual callers leave
     /// this unset and retain the legacy single-process behavior.
     pub mutation_permit: Option<DeliveryMutationPermit>,
+    /// U28 `CF-REL-R2`: explicit force for a release-only batch. Force alone is
+    /// only the caller's intent; `release_force_approved` records that the SAME
+    /// authorization explicitly approved releasing a batch with no `feat`/`fix`.
+    /// Both are required, and a `Release-Urgency: hold` trailer still wins
+    /// (`CF-REL-R5`).
+    pub release_force: bool,
+    pub release_force_approved: bool,
+    /// U28 `CF-REL-R1`: `ReleaseOnly` asks for a release of the already-merged
+    /// default branch from a session that has no changes of its own. It never
+    /// stages, commits, pushes, or opens a PR.
+    pub delivery_mode: DeliveryMode,
+    /// U28 `CF-REL-R3`/`CF-REL-R4`: how long the release-only path waits for the
+    /// dispatched run to appear and for the release to become published.
+    pub release_only_timing: ReleaseOnlyTiming,
+}
+
+/// U28: bounded observation windows for the release-only path. Defaults match
+/// the spec (a run must appear within 5 minutes; a release is given 30 minutes
+/// to publish). Tests shorten them so no test ever sleeps for minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseOnlyTiming {
+    /// `CF-REL-R4`: how long to wait for the dispatched run to appear.
+    pub run_appears_timeout_secs: u32,
+    /// Cadence between read-only observations.
+    pub poll_interval_secs: u32,
+    /// `CF-REL-R3`: how long to wait for the release to become published.
+    pub publish_timeout_secs: u32,
+}
+
+impl Default for ReleaseOnlyTiming {
+    fn default() -> Self {
+        Self {
+            run_appears_timeout_secs: 300,
+            poll_interval_secs: 5,
+            publish_timeout_secs: 1800,
+        }
+    }
 }
 
 async fn verify_mutation_permit(opts: &DeliverOpts, rung: &str) -> Result<(), StepResult> {
@@ -1006,6 +1046,15 @@ async fn materialize_local_commit_with_permit(
 pub enum ReleaseUrgency {
     Immediate,
     Hold,
+}
+
+/// A session may explicitly request a release of the already-merged default
+/// branch. This mode never stages, commits, pushes, or opens a PR.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeliveryMode {
+    #[default]
+    Changes,
+    ReleaseOnly,
 }
 
 impl ReleaseUrgency {
@@ -1474,6 +1523,18 @@ pub trait DeliveryRemote {
             "live verifier not configured".into(),
         )))
     }
+
+    /// U28 `CF-REL-R3`: the asset names of the newest published release, so the
+    /// release-only path can assert that Windows, macOS and updater artifacts
+    /// are really present. `Ok(None)` means the adapter cannot report assets;
+    /// the caller then reports publication without the cross-platform claim
+    /// instead of inventing one.
+    fn release_asset_names(
+        &self,
+        _sha: &str,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<String>>, String>> {
+        std::future::ready(Ok(None))
+    }
 }
 
 // ── Local git helper ────────────────────────────────────────────────────────
@@ -1493,18 +1554,50 @@ fn dev_command(program: &str) -> Command {
     command
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let out = dev_command("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to spawn git: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T, String>, mut sleep: impl FnMut(u64)) -> Result<T, String> {
+    for attempt in 1..=3 {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if remote_error_is_retryable(&error) && attempt < 3 => {
+                tracing::warn!(step, attempt, "delivery network retry scheduled");
+                sleep(1 << (attempt - 1));
+            }
+            Err(error) => return Err(format!("交付卡在 {step}：已尝试 {attempt}/3 次；等待网络恢复，由系统续接。已有提交、分支和 PR 未删除；远端结果须重新核对。原因：{error}")),
+        }
     }
+    unreachable!()
+}
+
+fn bounded_delivery_output(command: &mut Command) -> Result<String, String> {
+    use std::io::Read;
+    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|error| format!("failed to spawn delivery command: {error}"))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
+    let err = std::thread::spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? { break status; }
+        if started.elapsed() >= std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("timeout：交付子进程超过 30 秒；等待网络或代理恢复，由系统重试；远端结果未知".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    let stdout = out.join().map_err(|_| "delivery stdout reader failed")?.map_err(|e| e.to_string())?;
+    let stderr = err.join().map_err(|_| "delivery stderr reader failed")?.map_err(|e| e.to_string())?;
+    if status.success() { Ok(String::from_utf8_lossy(&stdout).trim().into()) }
+    else { Err(String::from_utf8_lossy(&stderr).trim().into()) }
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let network = matches!(args.first(), Some(&"fetch" | &"push" | &"ls-remote"));
+    let mut operation = || bounded_delivery_output(dev_command("git").arg("-C").arg(cwd).args(args));
+    if network {
+        retry_delivery_network(args[0], operation, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))
+    } else { operation() }
 }
 
 fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
@@ -3230,6 +3323,115 @@ fn branch_is_ahead_of(root: &Path, remote: &str, base: &str, branch: &str) -> bo
     .unwrap_or(true) // if we can't tell (e.g. no origin/base yet), assume there is work
 }
 
+/// Machine-generated leftovers that must never become a commit subject or a PR
+/// title: the branch tail of an Objective workspace (`objective <hex>`) and bare
+/// identifiers. CF-TRUTH-R2.
+fn machine_generated_title_noise(token: &str) -> bool {
+    let token = token.trim();
+    if token.is_empty() {
+        return true;
+    }
+    if token.eq_ignore_ascii_case("objective") || token.eq_ignore_ascii_case("task") {
+        return true;
+    }
+    if token.len() < 12 {
+        return false;
+    }
+    token.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+/// The words a branch tail contributes to a human subject, with machine ids
+/// dropped (`objective-b8af1a61fd71788e579add0a1cd6fb3c` → empty).
+fn humanized_branch_subject(branch: &str) -> String {
+    let tail = branch.rsplit('/').next().unwrap_or(branch);
+    tail.split(['-', '_'])
+        .filter(|token| !machine_generated_title_noise(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+/// The conventional-commit prefix a staged change justifies, when nobody supplied
+/// a real title. `fix` is the conservative default for product code: this
+/// repository derives its release slot from the squash subject, and understating
+/// delays value while overstating fabricates a release nobody asked for.
+fn derived_title_prefix(staged_paths: &[String]) -> &'static str {
+    let relevant: Vec<&String> = staged_paths
+        .iter()
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+    if relevant.is_empty() {
+        return "chore";
+    }
+    let all_under = |prefix: &str| relevant.iter().all(|path| path.starts_with(prefix));
+    if all_under("docs/") {
+        "docs"
+    } else if all_under(".github/") {
+        "ci"
+    } else if relevant
+        .iter()
+        .all(|path| path.contains("/tests/") || path.contains(".test.") || path.starts_with("tests/"))
+    {
+        "test"
+    } else {
+        "fix"
+    }
+}
+
+/// CF-TRUTH-R2 (2026-10-10): the subject a delivery writes must be the same
+/// conventional subject the pull request carries.
+///
+/// Squash-merge makes the PR title the subject on `main`, and the release plan
+/// reads that subject to decide the version slot. Delivery used to accept a
+/// machine placeholder (`objective <id>`) and the humanized branch tail, so a
+/// real fix reached `main` as `objective b8af1a61… (#605)`: the release plan saw
+/// no `feat`/`fix` and skipped the whole batch. A title that is already
+/// conventional is kept verbatim; otherwise the branch's own conventional
+/// commits decide, and only when nothing at all supplies a type does this derive
+/// the conservative one — never inventing a bigger release than the change
+/// justifies.
+fn canonical_delivery_title(
+    root: &Path,
+    branch: &str,
+    base: &str,
+    title: Option<&str>,
+    staged_paths: &[String],
+) -> String {
+    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+        if conventional_slot(title) > 0 {
+            return title.to_string();
+        }
+    }
+    // The branch's own commits are the strongest witness of intent that exists
+    // before the delivery commit is written.
+    if let Ok(log) = git(
+        root,
+        &["log", "--format=%s", &format!("{base}..{branch}")],
+    ) {
+        let mut best: Option<(u8, String)> = None;
+        for subject in log.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let slot = conventional_slot(subject);
+            if slot == 0 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(best_slot, _)| slot > *best_slot) {
+                best = Some((slot, subject.to_string()));
+            }
+        }
+        if let Some((_, subject)) = best {
+            return subject;
+        }
+    }
+    let prefix = derived_title_prefix(staged_paths);
+    let subject = humanized_branch_subject(branch);
+    if subject.is_empty() {
+        format!("{prefix}: update {} file(s)", staged_paths.len().max(1))
+    } else {
+        format!("{prefix}: {subject}")
+    }
+}
+
 fn generate_commit_message(root: &Path, branch: &str, title: Option<&str>) -> String {
     if let Some(t) = title {
         if !t.trim().is_empty() {
@@ -3238,12 +3440,13 @@ fn generate_commit_message(root: &Path, branch: &str, title: Option<&str>) -> St
     }
     let files = git(root, &["diff", "--cached", "--name-only"]).unwrap_or_default();
     let count = files.lines().count();
-    let subject = branch
-        .rsplit('/')
-        .next()
-        .unwrap_or(branch)
-        .replace(['-', '_'], " ");
-    format!("{subject}\n\nDelivered by CodeFactory ({count} file(s) changed).")
+    let subject = humanized_branch_subject(branch);
+    let subject = if subject.is_empty() {
+        format!("update {count} file(s)")
+    } else {
+        subject
+    };
+    format!("chore: {subject}\n\nDelivered by CodeFactory ({count} file(s) changed).")
 }
 
 fn generate_commit_message_for_paths(
@@ -3256,13 +3459,15 @@ fn generate_commit_message_for_paths(
             return title.trim().to_string();
         }
     }
-    let subject = branch
-        .rsplit('/')
-        .next()
-        .unwrap_or(branch)
-        .replace(['-', '_'], " ");
+    let subject = humanized_branch_subject(branch);
+    let prefix = derived_title_prefix(staged_paths);
+    let subject = if subject.is_empty() {
+        format!("update {} file(s)", staged_paths.len())
+    } else {
+        subject
+    };
     format!(
-        "{subject}\n\nDelivered by CodeFactory ({} file(s) changed).",
+        "{prefix}: {subject}\n\nDelivered by CodeFactory ({} file(s) changed).",
         staged_paths.len()
     )
 }
@@ -3382,6 +3587,138 @@ fn branch_release_metadata(
     metadata.breaking_changes.sort();
     metadata.breaking_changes.dedup();
     Ok(metadata)
+}
+
+fn release_only_batch_policy(
+    commit_messages: &[&str],
+    force: bool,
+    force_approved: bool,
+) -> Result<(), String> {
+    let mut has_release_change = false;
+    let mut hold = false;
+    let mut invalid = false;
+    for message in commit_messages {
+        let subject = message.lines().next().unwrap_or_default();
+        let prefix = subject.split_once(':').map(|(prefix, _)| prefix).unwrap_or("");
+        has_release_change |= prefix == "feat"
+            || prefix.starts_with("feat(")
+            || prefix == "fix"
+            || prefix.starts_with("fix(");
+        for urgency in release_urgency_trailers(message) {
+            hold |= urgency == "hold";
+            invalid |= !matches!(urgency.as_str(), "immediate" | "hold");
+        }
+    }
+    if hold {
+        return Err("发布批次包含 Release-Urgency: hold；普通 force 不能绕过".into());
+    }
+    if invalid {
+        return Err("发布批次包含非法 Release-Urgency；未触发发布".into());
+    }
+    if has_release_change || (force && force_approved) {
+        Ok(())
+    } else if force {
+        Err("强制发布没有同一授权中的明确批准；未触发发布".into())
+    } else {
+        Err("自上个 tag 起没有 feat/fix；未触发发布".into())
+    }
+}
+
+fn release_assets_complete(assets: &[&str]) -> bool {
+    let windows = assets.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.ends_with(".exe") || lower.ends_with(".msi")
+    });
+    let macos = assets.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.ends_with(".dmg") || lower.ends_with(".app.tar.gz")
+    });
+    let updater = assets
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("latest.json"));
+    windows && macos && updater
+}
+
+/// `CF-REL-R2`: the last tag reachable from the release head. `None` means the
+/// repository has no tags yet, in which case the batch is the reachable head
+/// history (bounded) rather than "everything since the beginning of time".
+fn release_batch_messages(root: &Path, remote: &str, base: &str) -> Result<Vec<String>, String> {
+    let head = format!("{remote}/{base}");
+    let last_tag = git(root, &["describe", "--tags", "--abbrev=0", &head])
+        .ok()
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty());
+    let range = match last_tag {
+        Some(tag) => format!("{tag}..{head}"),
+        None => head.clone(),
+    };
+    let mut args = vec!["log", "--format=%B%x1e"];
+    if !range.contains("..") {
+        args.extend(["-n", "100"]);
+    }
+    args.push(&range);
+    let bodies = git(root, &args)?;
+    Ok(bodies
+        .split('\x1e')
+        .map(|body| body.trim().to_string())
+        .filter(|body| !body.is_empty())
+        .collect())
+}
+
+/// `CF-REL-R2`: decide whether a release-only batch may be dispatched at all,
+/// and bind the dispatch to the exact default-branch head observed at decision
+/// time. A head that moves between the decision and the dispatch is a refusal,
+/// never a silent release of something the user did not approve.
+fn plan_release_only(
+    commit_messages: &[String],
+    decision_head_sha: &str,
+    current_head_sha: &str,
+    force: bool,
+    force_approved: bool,
+) -> Result<String, String> {
+    if decision_head_sha.trim().is_empty() {
+        return Err("无法解析默认分支的 exact head；未触发发布".into());
+    }
+    if decision_head_sha != current_head_sha {
+        return Err(format!(
+            "发布绑定的默认分支 head 在决策后移动了（{} → {}）；未触发发布",
+            sha_prefix(decision_head_sha),
+            sha_prefix(current_head_sha)
+        ));
+    }
+    let borrowed: Vec<&str> = commit_messages.iter().map(String::as_str).collect();
+    release_only_batch_policy(&borrowed, force, force_approved)?;
+    Ok(decision_head_sha.to_string())
+}
+
+fn sha_prefix(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// `CF-REL-R3`: a release is only "published" once it is no longer a draft and
+/// carries Windows, macOS and updater artifacts.
+fn release_publication_state(assets: Option<&[String]>) -> ReleasePublicationState {
+    match assets {
+        None => ReleasePublicationState::AssetsUnknown,
+        Some(assets) => {
+            let borrowed: Vec<&str> = assets.iter().map(String::as_str).collect();
+            if release_assets_complete(&borrowed) {
+                ReleasePublicationState::Complete
+            } else {
+                ReleasePublicationState::Pending(format!(
+                    "release 已发布但产物不完整: {:?}",
+                    assets
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReleasePublicationState {
+    Complete,
+    Pending(String),
+    AssetsUnknown,
 }
 
 fn guarded_release_reason(urgencies: &[String]) -> Option<String> {
@@ -3733,6 +4070,452 @@ fn delivery_preflight<R: DeliveryRemote>(
 
 // ── The state machine ───────────────────────────────────────────────────────
 
+/// U28 `CF-REL-R1`: cut a release of the already-merged default branch from a
+/// session that has no changes of its own.
+///
+/// By construction this path has no staging, no commit, no push and no PR: it
+/// only reads the checked-out repository for history/config, binds the release
+/// to the exact default-branch head, and calls the repository's EXISTING
+/// release entry point (`CF-REL-R5`: no tag rewrite, no release deletion, no
+/// workflow edit).
+pub async fn deliver_release_only<R: DeliveryRemote>(
+    cwd: &Path,
+    opts: &DeliverOpts,
+    remote: Option<&R>,
+    default_branch_hint: Option<&str>,
+) -> DeliveryOutcome {
+    let ceiling = DeliveryCeiling::ThroughRelease;
+    let mut outcome = DeliveryOutcome {
+        steps: Vec::new(),
+        branch: None,
+        commit_sha: None,
+        pr_url: None,
+        pr_number: None,
+        final_state: "delivered".into(),
+        stage: "release_binding".into(),
+        code: "release_only_ready".into(),
+        recoverable: false,
+        recovery_class: RecoveryClass::None,
+        retry_after_ms: None,
+        next_action: None,
+        reached_state: "release_binding".into(),
+        requested_ceiling: ceiling_label(ceiling).into(),
+        effective_ceiling: ceiling_label(ceiling).into(),
+        capability_gap: None,
+        lowered_from_configured: None,
+        release_receipt: None,
+        summary: String::new(),
+    };
+    let timing = opts.release_only_timing;
+
+    let repo = match resolve_repo(cwd, default_branch_hint) {
+        Ok(repo) => repo,
+        Err(error) => return outcome.blocked_at(StepResult::blocked("repo", error)),
+    };
+    // A release task legitimately runs from any checkout: it never mutates the
+    // working tree, and the release itself is bound to the REMOTE default
+    // branch. So this path deliberately does NOT use the worktree-discovery
+    // rules of the change-delivery ladder.
+    if let Some(expected) = opts.expect_branch.as_deref() {
+        if expected != repo.branch {
+            return outcome.blocked_at(StepResult::blocked(
+                "preflight",
+                format!(
+                    "调用方声明要交付分支 `{expected}`，但当前工作目录在 `{}` 上；release_only 只读取默认分支并发布，未触发发布。",
+                    repo.branch
+                ),
+            ));
+        }
+    }
+    outcome.branch = Some(repo.branch.clone());
+    outcome.steps.push(StepResult::ok(
+        "release_only",
+        "只发版模式：不 stage、不 commit、不 push、不开 PR",
+    ));
+
+    let Some(remote) = remote else {
+        return outcome.blocked_at(StepResult::blocked(
+            "release",
+            no_remote_channel_message(repo.remote_url.as_deref()),
+        ));
+    };
+    if !remote.capabilities().release {
+        return outcome.blocked_at(StepResult::blocked(
+            "release",
+            "release adapter 不可用；未触发发布".to_string(),
+        ));
+    }
+
+    // Read-only with respect to the remote, and required before any decision:
+    // the batch and the head must be read from the freshly fetched default
+    // branch, never from a stale local ref.
+    let fetch = |label: &str| {
+        git(
+            &repo.root,
+            &["fetch", "--prune", &repo.remote, &repo.default_branch],
+        )
+        .map_err(|error| format!("无法刷新 {}/{label}: {error}", repo.remote))
+    };
+    if let Err(error) = fetch(&repo.default_branch) {
+        return outcome.blocked_at(StepResult::blocked("base_sync", error));
+    }
+
+    let batch_messages = match release_batch_messages(
+        &repo.root,
+        &repo.remote,
+        &repo.default_branch,
+    ) {
+        Ok(messages) => messages,
+        Err(error) => {
+            return outcome.blocked_at(StepResult::blocked(
+                "release_batch",
+                format!("无法读取上个 tag 之后的提交批次: {error}"),
+            ))
+        }
+    };
+    let decision_head = match observe_remote_ref_head(&repo, &repo.default_branch) {
+        Ok(Some(head)) => head,
+        Ok(None) => {
+            return outcome.blocked_at(StepResult::blocked(
+                "release_binding",
+                format!(
+                    "无法建立 release dispatch 身份: 远端基线分支 {} 不存在；未触发发布",
+                    repo.default_branch
+                ),
+            ))
+        }
+        Err(error) => {
+            return outcome.remote_observation_failed(
+                "release_observation",
+                format!(
+                    "触发发布前无法只读解析 {} 的 exact head: {error}",
+                    repo.default_branch
+                ),
+            )
+        }
+    };
+
+    // `CF-REL-R2`: re-read the head immediately before dispatch. Anything the
+    // user approved was approved for THIS head; a concurrent merge must be a
+    // refusal, not a silent release of unreviewed commits.
+    if let Err(error) = fetch(&repo.default_branch) {
+        return outcome.blocked_at(StepResult::blocked("base_sync", error));
+    }
+    let current_head = match observe_remote_ref_head(&repo, &repo.default_branch) {
+        Ok(Some(head)) => head,
+        Ok(None) => decision_head.clone(),
+        Err(error) => {
+            return outcome.remote_observation_failed(
+                "release_observation",
+                format!("决策后无法只读复核默认分支 head: {error}"),
+            )
+        }
+    };
+
+    let release_head_sha = match plan_release_only(
+        &batch_messages,
+        &decision_head,
+        &current_head,
+        opts.release_force,
+        opts.release_force_approved,
+    ) {
+        Ok(head) => head,
+        Err(reason) => {
+            outcome.steps.push(StepResult::skipped("release", reason.clone()));
+            return outcome.blocked_at(StepResult::blocked(
+                "release",
+                format!("{reason}（批次 {} 个提交）", batch_messages.len()),
+            ));
+        }
+    };
+    outcome.commit_sha = Some(release_head_sha.clone());
+    outcome.steps.push(StepResult::ok(
+        "release_binding",
+        format!(
+            "发布绑定默认分支 {} 的 exact head {}",
+            repo.default_branch,
+            sha_prefix(&release_head_sha)
+        ),
+    ));
+
+    let Some(target) = remote.release_dispatch_target(&release_head_sha) else {
+        return outcome.blocked_at(StepResult::blocked(
+            "release",
+            "release adapter 未提供可持久化的 exact workflow/ref/head identity；未触发发布",
+        ));
+    };
+    let target_envelope = match encode_release_dispatch_target(&target) {
+        Ok(envelope) => envelope,
+        Err(error) => return outcome.blocked_at(StepResult::blocked("release", error)),
+    };
+
+    let base_receipt = |state: &str, detail: Option<String>| DeliveryReceipt {
+        version: 1,
+        state: state.to_string(),
+        remote: repo.remote.clone(),
+        remote_identity: receipt_remote_identity(&repo),
+        base_branch: repo.default_branch.clone(),
+        head_branch: repo.default_branch.clone(),
+        commit_sha: release_head_sha.clone(),
+        pr_number: 0,
+        pr_url: String::new(),
+        pr_title: None,
+        pr_body: None,
+        release_detail: detail,
+    };
+
+    if let Err(step) = verify_mutation_permit(opts, "receipt_intent_release").await {
+        return outcome.blocked_on_uncertain_side_effect(step);
+    }
+    if let Err(error) = write_delivery_receipt(
+        &repo,
+        &release_head_sha,
+        &base_receipt("intent_release", Some(target_envelope)),
+    ) {
+        return outcome.blocked_at(StepResult::blocked(
+            "receipt",
+            format!("发布前无法写入本地意图回执，未触发发布: {error}"),
+        ));
+    }
+
+    if let Err(step) = verify_mutation_permit(opts, "trigger_release").await {
+        return outcome.blocked_on_uncertain_side_effect(step);
+    }
+    let trigger_detail = match remote
+        .trigger_release(&release_head_sha, opts.mutation_permit.as_ref())
+        .await
+    {
+        Ok(detail) => detail,
+        Err(error) => {
+            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                "release",
+                format!(
+                    "发布触发请求返回失败: {error}(服务端可能已接收；已保留 intent_release 回执)。"
+                ),
+            ))
+        }
+    };
+    outcome
+        .steps
+        .push(StepResult::ok("release", trigger_detail.clone()));
+    match write_delivery_receipt(
+        &repo,
+        &release_head_sha,
+        &base_receipt("release_triggered", Some(trigger_detail)),
+    ) {
+        Ok(raw) => outcome.release_receipt = Some(raw),
+        Err(error) => {
+            return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                "receipt",
+                format!("发布请求已返回成功，但完成回执写入失败: {error}；intent_release 仍保留。"),
+            ))
+        }
+    }
+
+    // `CF-REL-R4`: within the bounded window the dispatched run must really
+    // appear on the provider. Only reads happen here — the release is never
+    // dispatched twice because the retry wraps observations, not the trigger.
+    let run_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(timing.run_appears_timeout_secs as u64);
+    let run_detail = loop {
+        let observation = match retry_release_network("release run observation", || {
+            remote.observe_release_dispatch(&target)
+        })
+        .await
+        {
+            Ok(observation) => observation,
+            Err(error) => return outcome.blocked_on_uncertain_side_effect(StepResult::blocked("release", error)),
+        };
+        match observation {
+            ReleaseDispatchObservation::Triggered {
+                run_id,
+                status,
+                head_sha,
+                detail,
+            } => {
+                if head_sha != release_head_sha {
+                    return outcome.blocked_at(StepResult::blocked(
+                        "release",
+                        format!(
+                            "release run 绑定在 {}，而本次批准的是 {}；未声明发布",
+                            sha_prefix(&head_sha),
+                            sha_prefix(&release_head_sha)
+                        ),
+                    ));
+                }
+                break format!("release run {run_id}（{status}）{detail}");
+            }
+            ReleaseDispatchObservation::HeadMismatch { observed_heads } => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "release",
+                    format!(
+                        "默认分支上出现了与本次批准 head {} 不同的 release dispatch: {:?}；未声明发布",
+                        sha_prefix(&release_head_sha),
+                        observed_heads
+                            .iter()
+                            .map(|head| sha_prefix(head))
+                            .collect::<Vec<_>>()
+                    ),
+                ));
+            }
+            ReleaseDispatchObservation::Unsupported(detail) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "release_observation",
+                    format!("无法只读观察 release run: {detail}"),
+                ));
+            }
+            ReleaseDispatchObservation::Absent => {
+                if std::time::Instant::now() >= run_deadline {
+                    // Plain language, no further waiting (`CF-REL-R4`).
+                    return outcome.blocked_at(StepResult::blocked(
+                        "release_observation",
+                        format!(
+                            "触发发布后 {} 秒内没有在 GitHub 上看到对应的 release run（head {}）；\
+疑似没有真正触发，未继续等待，也请勿重复触发。",
+                            timing.run_appears_timeout_secs,
+                            sha_prefix(&release_head_sha)
+                        ),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    timing.poll_interval_secs.max(1) as u64,
+                ))
+                .await;
+            }
+        }
+    };
+    outcome.steps.push(StepResult::ok("release_run", run_detail));
+
+    // `CF-REL-R3`: wait for the release to be genuinely published — not a draft,
+    // and carrying Windows, macOS and updater artifacts.
+    let publish_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(timing.publish_timeout_secs as u64);
+    loop {
+        let status = match retry_release_network("release publication observation", || {
+            remote.verify_live(&release_head_sha, None)
+        })
+        .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
+                    "release",
+                    error,
+                ))
+            }
+        };
+        match status {
+            ObservationStatus::Success(detail) => {
+                let assets = match remote.release_asset_names(&release_head_sha).await {
+                    Ok(assets) => assets,
+                    Err(error) => {
+                        outcome.steps.push(StepResult::blocked(
+                            "release_assets",
+                            format!("无法读取 release 产物清单: {error}"),
+                        ));
+                        None
+                    }
+                };
+                match release_publication_state(assets.as_deref()) {
+                    ReleasePublicationState::Complete => {
+                        let names = assets.unwrap_or_default();
+                        outcome.steps.push(StepResult::ok(
+                            "release_published",
+                            format!(
+                                "{detail}；已确认跨平台产物: {}",
+                                names.join(", ")
+                            ),
+                        ));
+                        outcome.summary = format!(
+                            "已发布 {} 的发布（head {}），包含 Windows/macOS/更新文件产物。",
+                            repo.default_branch,
+                            sha_prefix(&release_head_sha)
+                        );
+                        break;
+                    }
+                    ReleasePublicationState::Pending(reason) => {
+                        if std::time::Instant::now() >= publish_deadline {
+                            return outcome.blocked_at(StepResult::blocked(
+                                "release_assets",
+                                format!("发布在 {} 秒内产物仍不完整: {reason}", timing.publish_timeout_secs),
+                            ));
+                        }
+                    }
+                    ReleasePublicationState::AssetsUnknown => {
+                        outcome.steps.push(StepResult::ok(
+                            "release_published",
+                            format!("{detail}；该 provider 不报告产物清单，未声明跨平台产物"),
+                        ));
+                        outcome.summary =
+                            format!("已发布（head {}）。", sha_prefix(&release_head_sha));
+                        break;
+                    }
+                }
+            }
+            ObservationStatus::Failure(detail) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "release_published",
+                    format!("release 校验失败: {detail}"),
+                ))
+            }
+            ObservationStatus::Unsupported(detail) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "release_published",
+                    format!("release 已触发但无法确认它真的发布: {detail}；未声明已发布。"),
+                ))
+            }
+            ObservationStatus::Pending(detail) => {
+                if std::time::Instant::now() >= publish_deadline {
+                    return outcome.blocked_at(StepResult::blocked(
+                        "release_published",
+                        format!("发布在 {} 秒内仍未完成: {detail}", timing.publish_timeout_secs),
+                    ));
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(
+            timing.poll_interval_secs.max(1) as u64,
+        ))
+        .await;
+    }
+
+    // `CF-REL-R3`: the summary names the version/head and the run link the user
+    // asked for, and `finish` is deliberately NOT used here because it would
+    // replace this release-specific report with the change-delivery wording.
+    outcome.reached_state = "release_published".into();
+    outcome.stage = "release".into();
+    outcome.code = "release_only_published".into();
+    if outcome.summary.is_empty() {
+        outcome.summary = format!("已发布（head {}）。", sha_prefix(&release_head_sha));
+    }
+    outcome
+}
+
+/// Async twin of [`retry_delivery_network`] for the read-only observations the
+/// release-only path performs. Retrying observations (never the dispatch) is
+/// what makes `CF-REL-R3`'s "no second release" property hold.
+async fn retry_release_network<T, F, Fut>(step: &str, mut operation: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    for attempt in 1..=3 {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if remote_error_is_retryable(&error) && attempt < 3 => {
+                tracing::warn!(step, attempt, "release observation retry scheduled");
+                tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1))).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "交付卡在 {step}：已尝试 {attempt}/3 次；远端结果须重新核对。原因：{error}"
+                ))
+            }
+        }
+    }
+    unreachable!()
+}
+
 /// Run delivery up to the effective ceiling.
 ///
 /// The configured ceiling is first clamped by any per-call request, then by what
@@ -3751,6 +4534,14 @@ pub async fn deliver<R: DeliveryRemote>(
     remote: Option<&R>,
     default_branch_hint: Option<&str>,
 ) -> DeliveryOutcome {
+    // `CF-REL-R1`: a release task has no changes of its own. It must not be
+    // forced down the "deliver my own changes" ladder — that is exactly the
+    // 2026-10-09 failure where an empty branch identical to main was pushed and
+    // the session then stalled at "external state uncertain".
+    if opts.delivery_mode == DeliveryMode::ReleaseOnly {
+        return deliver_release_only(cwd, opts, remote, default_branch_hint).await;
+    }
+
     let requested_ceiling = match opts.requested_ceiling {
         Some(req) => configured_ceiling.clamp_request(req),
         None => configured_ceiling,
@@ -3904,11 +4695,21 @@ pub async fn deliver<R: DeliveryRemote>(
         }
     };
     let head_tree = git(&repo.root, &["rev-parse", "HEAD^{tree}"]).unwrap_or_default();
+    // CF-TRUTH-R2: one canonical subject for the commit this delivery writes and
+    // the PR title it opens — computed before the commit exists, so a placeholder
+    // title cannot become the subject `main` ends up carrying after squash merge.
+    let delivery_subject = canonical_delivery_title(
+        &repo.root,
+        &repo.branch,
+        &repo.default_branch,
+        opts.title.as_deref(),
+        &commit_plan.staged_paths,
+    );
     if commit_plan.target_tree_sha != head_tree {
         let msg = append_release_urgency(
             generate_commit_message_for_paths(
                 &repo.branch,
-                opts.title.as_deref(),
+                Some(&delivery_subject),
                 &commit_plan.staged_paths,
             ),
             opts.release_urgency,
@@ -4417,14 +5218,7 @@ pub async fn deliver<R: DeliveryRemote>(
     let mut pr_title = prior_receipt
         .as_ref()
         .and_then(|receipt| receipt.pr_title.clone())
-        .or_else(|| opts.title.clone())
-        .unwrap_or_else(|| {
-            generate_commit_message(&repo.root, &repo.branch, None)
-                .lines()
-                .next()
-                .unwrap_or(&repo.branch)
-                .to_string()
-        });
+        .unwrap_or_else(|| delivery_subject.clone());
     // The title may have come from session context rather than from this
     // branch. Never let it claim a bigger release than the commits justify.
     let commit_slot = branch_commit_slot(&repo.root, &repo.default_branch, &repo.branch);
@@ -6831,16 +7625,13 @@ pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
 
 impl GhCliRemote {
     fn gh(&self, args: &[String]) -> Result<String, String> {
-        let out = dev_command("gh")
-            .current_dir(&self.cwd)
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to spawn gh: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
+        let step = args.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
+        let operation = || bounded_delivery_output(dev_command("gh").current_dir(&self.cwd).args(args));
+        // Creation is reconciled by open_or_get_pr before redispatch. Never
+        // blindly replay an ambiguous external mutation here.
+        if args.get(1).is_some_and(|arg| matches!(arg.as_str(), "view" | "list" | "status")) || args.first().is_some_and(|arg| arg == "api") && !args.iter().any(|arg| arg == "--method" || arg == "-X" || arg == "-f" || arg == "-F") {
+            retry_delivery_network(&step, operation, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))
+        } else { operation() }
     }
 
     fn merge_observation(
@@ -7033,7 +7824,15 @@ impl DeliveryRemote for GhCliRemote {
             }
         };
         let result = (|| {
-            self.gh(&gh_pr_create_args(title, body, head, base))?;
+            retry_delivery_network("pr create", || {
+                // A failed create may already have committed remotely. Read
+                // the exact head/base projection before any retry.
+                let raw = self.gh(&["pr".into(), "list".into(), "--head".into(), head.into(), "--base".into(), base.into(), "--state".into(), "open".into(), "--json".into(), "number,url,title,body,headRefOid".into(), "--limit".into(), "1".into()])?;
+                if exact_open_pr_projection(parse_gh_open_pr_state(&raw, head, base)?, None, expected_head_sha)?.is_some() {
+                    return Ok(String::new());
+                }
+                self.gh(&gh_pr_create_args(title, body, head, base))
+            }, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))?;
             let created = self.gh(&[
                 "pr".into(),
                 "view".into(),
@@ -7678,6 +8477,44 @@ impl DeliveryRemote for GhCliRemote {
             Ok(matches!(status, "identical" | "ahead") && behind_by == 0)
         })
     }
+
+    /// U28 `CF-REL-R3`: the release-only path asserts the published release's
+    /// artifacts, so the Windows/macOS/updater claim is machine-checked rather
+    /// than inferred from "some assets exist".
+    async fn release_asset_names(&self, _sha: &str) -> Result<Option<Vec<String>>, String> {
+        let raw = self.gh(&[
+            "release".into(),
+            "view".into(),
+            "--json".into(),
+            "tagName,isDraft,isPrerelease,publishedAt,assets".into(),
+        ])?;
+        let release: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("gh release view returned non-JSON: {e}"))?;
+        let draft = release
+            .get("isDraft")
+            .or_else(|| release.get("draft"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if draft {
+            return Ok(None);
+        }
+        let names = release
+            .get("assets")
+            .and_then(serde_json::Value::as_array)
+            .map(|assets| {
+                assets
+                    .iter()
+                    .filter_map(|asset| {
+                        asset
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<String>>()
+            })
+            .ok_or_else(|| "gh release view returned no asset list".to_string())?;
+        Ok(Some(names))
+    }
 }
 
 /// Static-dispatch wrapper so `deliver` keeps its generic signature while the
@@ -7925,6 +8762,15 @@ impl DeliveryRemote for EitherRemote {
             EitherRemote::Gh(r) => r.verify_live(sha, url).await,
             EitherRemote::Github(r) => r.verify_live(sha, url).await,
             EitherRemote::Gitlab(r) => r.verify_live(sha, url).await,
+        }
+    }
+
+    async fn release_asset_names(&self, sha: &str) -> Result<Option<Vec<String>>, String> {
+        match self {
+            EitherRemote::Hook(r) => r.release_asset_names(sha).await,
+            EitherRemote::Gh(r) => r.release_asset_names(sha).await,
+            EitherRemote::Github(r) => r.release_asset_names(sha).await,
+            EitherRemote::Gitlab(r) => r.release_asset_names(sha).await,
         }
     }
 }
@@ -9300,6 +10146,371 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
+
+    #[test]
+    fn cf_lease_network_retry_budget_and_proxy_config() {
+        for step in ["fetch", "push", "pr view", "pr create"] {
+            let mut attempts = 0;
+            let mut delays = Vec::new();
+            let result = retry_delivery_network(step, || {
+                attempts += 1;
+                if attempts < 3 { Err("LibreSSL SSL_ERROR_SYSCALL".into()) } else { Ok("preserved".to_string()) }
+            }, |delay| delays.push(delay));
+            assert_eq!(result.unwrap(), "preserved");
+            assert_eq!(attempts, 3);
+            assert_eq!(delays, vec![1, 2]);
+            let error = retry_delivery_network(step, || Err::<String, _>("HTTP 503".into()), |_| {}).unwrap_err();
+            assert!(error.contains(step) && error.contains("3 次") && error.contains("未删除"));
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let config = fixture.path().join("gitconfig");
+        std::fs::write(&config, "[http]\n proxy = http://127.0.0.1:18080\n").unwrap();
+        let output = dev_command("git").env("GIT_CONFIG_GLOBAL", &config)
+            .env("HTTPS_PROXY", "http://127.0.0.1:18081")
+            .args(["config", "--global", "--get", "http.proxy"]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "http://127.0.0.1:18080");
+    }
+
+    #[test]
+    fn cf_lease_ssl_errors_are_transient() {
+        assert!(remote_error_is_retryable("LibreSSL SSL_ERROR_SYSCALL github.com:443"));
+        assert!(remote_error_is_retryable("HTTP 500 Internal Server Error"));
+
+    }
+
+    #[test]
+    fn u28_release_only_batch_policy_is_fail_closed() {
+        let cases = [
+            (vec!["fix: repair updater\n\nRelease-Urgency: immediate"], false, false, true),
+            (vec!["docs: clarify release"], false, false, false),
+            (vec!["fix: guarded\n\nRelease-Urgency: hold"], false, false, false),
+            (vec!["docs: forced"], true, true, true),
+            (vec!["docs: unapproved force"], true, false, false),
+            (vec!["fix: hold stays guarded\n\nRelease-Urgency: hold"], true, true, false),
+        ];
+        for (messages, force, approved, expected) in cases {
+            assert_eq!(
+                release_only_batch_policy(&messages, force, approved).is_ok(),
+                expected,
+                "messages={messages:?}, force={force}, approved={approved}"
+            );
+        }
+    }
+
+    #[test]
+    fn u28_published_release_requires_all_cross_platform_assets() {
+        let assets = [
+            "CodeFactory_1.2.3_x64-setup.exe",
+            "CodeFactory_1.2.3_x64.dmg",
+            "latest.json",
+        ];
+        assert!(release_assets_complete(&assets));
+        assert!(!release_assets_complete(&assets[..2]));
+        assert!(!release_assets_complete(&["latest.json", "CodeFactory.dmg"]));
+    }
+
+    #[test]
+    fn u28_release_only_source_has_no_destructive_release_operations() {
+        let production = include_str!("delivery.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in ["git tag -f", "git push --delete", "DELETE /repos/", "PATCH /repos/"] {
+            assert!(!production.contains(forbidden), "forbidden release operation: {forbidden}");
+        }
+    }
+
+    /// U28: a repository whose default branch already carries the merged,
+    /// releasable commit. The session itself has nothing to commit.
+    fn release_only_repo(tag: &str, subject: &str) -> PathBuf {
+        let root = make_repo(tag);
+        let origin = root.parent().unwrap().join("origin.git");
+        Command::new("git")
+            .no_window()
+            .args(["init", "--bare", "-q", origin.to_str().unwrap()])
+            .status()
+            .unwrap();
+        git(
+            &root,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .unwrap();
+        git(&root, &["push", "-q", "origin", "main"]).unwrap();
+        std::fs::write(root.join("merged.txt"), "merged change\n").unwrap();
+        git(&root, &["add", "merged.txt"]).unwrap();
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=CodeFactory Test",
+                "-c",
+                "user.email=test@codefactory.invalid",
+                "commit",
+                "-q",
+                "-m",
+                subject,
+            ],
+        )
+        .unwrap();
+        git(&root, &["push", "-q", "origin", "main"]).unwrap();
+        root
+    }
+
+    fn release_only_opts() -> DeliverOpts {
+        DeliverOpts {
+            delivery_mode: DeliveryMode::ReleaseOnly,
+            release_only_timing: ReleaseOnlyTiming {
+                run_appears_timeout_secs: 5,
+                poll_interval_secs: 1,
+                publish_timeout_secs: 5,
+            },
+            ..DeliverOpts::default()
+        }
+    }
+
+    #[test]
+    fn u28_plan_release_only_binds_the_exact_head_and_refuses_bad_batches() {
+        let normal = vec!["fix: repair the updater".to_string()];
+        assert_eq!(
+            plan_release_only(&normal, "aaaaaaa1", "aaaaaaa1", false, false).unwrap(),
+            "aaaaaaa1"
+        );
+
+        // CF-REL-R2: a head that moved after the decision is a refusal.
+        let moved = plan_release_only(&normal, "aaaaaaa1", "bbbbbbb2", false, false)
+            .expect_err("a moved default-branch head must refuse");
+        assert!(moved.contains("移动"), "{moved}");
+
+        // CF-REL-R5: `hold` still wins over an approved force.
+        let hold = vec!["fix: guarded\n\nRelease-Urgency: hold".to_string()];
+        assert!(plan_release_only(&hold, "a", "a", true, true).is_err());
+        assert!(plan_release_only(&hold, "a", "a", false, false).is_err());
+
+        // No feat/fix in the batch.
+        let docs = vec!["docs: clarify".to_string(), "chore: bump".to_string()];
+        let missing = plan_release_only(&docs, "a", "a", false, false)
+            .expect_err("a docs/chore-only batch must refuse");
+        assert!(missing.contains("feat/fix"), "{missing}");
+
+        // Force without the same authorization's approval is still a refusal.
+        let unapproved = plan_release_only(&docs, "a", "a", true, false)
+            .expect_err("an unapproved force must refuse");
+        assert!(unapproved.contains("批准"), "{unapproved}");
+        assert_eq!(plan_release_only(&docs, "a", "a", true, true).unwrap(), "a");
+
+        // An unresolvable head is a refusal, never a silent release.
+        assert!(plan_release_only(&normal, "", "", false, false).is_err());
+    }
+
+    #[test]
+    fn u28_release_only_reports_an_incomplete_asset_set_as_not_yet_published() {
+        let complete = vec![
+            "CodeFactory_1.84.1_x64-setup.exe".to_string(),
+            "CodeFactory_1.84.1_x64.dmg".to_string(),
+            "latest.json".to_string(),
+        ];
+        assert_eq!(
+            release_publication_state(Some(&complete)),
+            ReleasePublicationState::Complete
+        );
+        let partial = vec!["CodeFactory_1.84.1_x64.dmg".to_string()];
+        assert!(matches!(
+            release_publication_state(Some(&partial)),
+            ReleasePublicationState::Pending(_)
+        ));
+        // An adapter that cannot report assets must not be read as complete.
+        assert_eq!(
+            release_publication_state(None),
+            ReleasePublicationState::AssetsUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn u28_release_only_publishes_main_without_a_change_of_its_own() {
+        // CF-REL-R1: zero changes of our own, yet a release happens; no branch,
+        // no push, no PR. CF-REL-R3: it is only "published" once Windows, macOS
+        // and updater artifacts are all present.
+        let root = release_only_repo("u28-release-only-ok", "fix: repair the updater");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        *calls.live_status.lock().unwrap() = Some(ObservationStatus::Success(
+            "GitHub Release v1.84.1 is published".into(),
+        ));
+        *calls.release_assets.lock().unwrap() = Some(vec![
+            "CodeFactory_1.84.1_x64-setup.exe".into(),
+            "CodeFactory_1.84.1_x64.dmg".into(),
+            "latest.json".into(),
+        ]);
+
+        let head_before = git(&root, &["rev-parse", "HEAD"]).unwrap();
+        let status_before = git(
+            &root,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+        .unwrap();
+        let branches_before = git(
+            &root,
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        )
+        .unwrap();
+
+        let out = deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main"))
+            .await;
+
+        assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
+        assert_eq!(out.reached_state, "release_published", "{:?}", out.steps);
+        assert_eq!(out.code, "release_only_published");
+        assert_eq!(calls.release.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.update_pr_body.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
+        for step in ["commit", "push", "pr", "merge"] {
+            assert!(
+                !out.steps.iter().any(|s| s.step == step),
+                "release-only must not {step}: {:?}",
+                out.steps
+            );
+        }
+        assert!(
+            out.steps.iter().any(|s| {
+                s.step == "release_published"
+                    && s.detail.contains("latest.json")
+                    && s.detail.contains(".exe")
+            }),
+            "the published claim must name the real artifacts: {:?}",
+            out.steps
+        );
+        // HEAD, the worktree and the local branch set are untouched.
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), head_before);
+        assert_eq!(
+            git(
+                &root,
+                &["status", "--porcelain=v1", "--untracked-files=all"],
+            )
+            .unwrap(),
+            status_before
+        );
+        assert_eq!(
+            git(
+                &root,
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+            )
+            .unwrap(),
+            branches_before
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn u28_release_only_refuses_a_batch_with_no_feat_or_fix() {
+        // CF-REL-R2: chore/docs-only batch → tell the user why, release nothing.
+        let root = release_only_repo("u28-release-only-empty", "chore: tidy the repo");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let out = deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main"))
+            .await;
+
+        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert_eq!(calls.release.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        assert!(
+            out.summary.contains("feat/fix"),
+            "the refusal must be plain: {}",
+            out.summary
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn u28_release_only_retries_observation_without_releasing_twice() {
+        // CF-REL-R3: a transient network failure while watching retries the SAME
+        // step and must never dispatch a second release.
+        let root = release_only_repo("u28-release-only-retry", "fix: retry observation");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        calls
+            .release_observation_failures
+            .store(1, Ordering::SeqCst);
+        *calls.live_status.lock().unwrap() =
+            Some(ObservationStatus::Success("GitHub Release v1.84.2 is published".into()));
+        *calls.release_assets.lock().unwrap() = Some(vec![
+            "CodeFactory_1.84.2_x64-setup.exe".into(),
+            "CodeFactory_1.84.2_x64.dmg".into(),
+            "latest.json".into(),
+        ]);
+
+        let out = deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main"))
+            .await;
+
+        assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
+        assert_eq!(
+            calls.release.load(Ordering::SeqCst),
+            1,
+            "retrying an observation must never dispatch a second release"
+        );
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn u28_release_only_reports_plainly_when_the_run_never_appears() {
+        // CF-REL-R4: no run within the window → say so plainly and stop waiting.
+        let root = release_only_repo("u28-release-only-no-run", "fix: run never appears");
+        let calls = stub_calls();
+        // The stub's trigger claims a run, but the read-only observation stays
+        // absent — exactly the "GitHub saw no release at all" symptom.
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        *calls.release_observation.lock().unwrap() = Some(ReleaseDispatchObservation::Absent);
+        calls.release_run_never_appears.store(true, Ordering::SeqCst);
+
+        let mut opts = release_only_opts();
+        opts.release_only_timing.run_appears_timeout_secs = 1;
+        let out = deliver_release_only(&root, &opts, Some(&remote), Some("main")).await;
+
+        assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
+        assert_eq!(out.code, "delivery_release_observation_blocked");
+        assert!(
+            out.summary.contains("release run") && out.summary.contains("请勿重复触发"),
+            "the report must be plain and must not invite a duplicate trigger: {}",
+            out.summary
+        );
+        assert_eq!(
+            calls.release.load(Ordering::SeqCst),
+            1,
+            "a missing run is reported, not retried by releasing again"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
 
     #[test]
     fn production_gh_git_spawns_go_through_dev_command() {
@@ -10841,6 +12052,7 @@ else:
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                ..DeliverOpts::default()
             },
             Some(&remote),
             Some("main"),
@@ -11088,6 +12300,16 @@ else:
         release_observation: Mutex<Option<ReleaseDispatchObservation>>,
         created_pr: Mutex<Option<DeliveryPr>>,
         branch_update_repo: Mutex<Option<PathBuf>>,
+        /// U28: how many release-run observations fail with a retryable network
+        /// error before succeeding. Used to prove retries never re-dispatch.
+        release_observation_failures: AtomicUsize,
+        /// U28: the live/release publication verdict the stub reports.
+        live_status: Mutex<Option<ObservationStatus>>,
+        /// U28: the published release's asset names.
+        release_assets: Mutex<Option<Vec<String>>>,
+        /// U28: force the release-run observation to stay `Absent` even after the
+        /// stub's own trigger claims a run — the "GitHub saw nothing" symptom.
+        release_run_never_appears: AtomicBool,
     }
 
     fn stub_calls() -> Arc<StubCalls> {
@@ -11493,6 +12715,22 @@ else:
             &self,
             _target: &ReleaseDispatchTarget,
         ) -> Result<ReleaseDispatchObservation, String> {
+            // U28: a transient network failure must be retried, never treated as
+            // "the run is absent" and never as a reason to dispatch again.
+            if self
+                .calls
+                .release_observation_failures
+                .load(Ordering::SeqCst)
+                > 0
+            {
+                self.calls
+                    .release_observation_failures
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err("LibreSSL SSL_ERROR_SYSCALL while observing the release run".into());
+            }
+            if self.calls.release_run_never_appears.load(Ordering::SeqCst) {
+                return Ok(ReleaseDispatchObservation::Absent);
+            }
             Ok(self
                 .calls
                 .release_observation
@@ -11500,6 +12738,28 @@ else:
                 .unwrap()
                 .clone()
                 .unwrap_or(ReleaseDispatchObservation::Absent))
+        }
+
+        async fn verify_live(
+            &self,
+            _sha: &str,
+            _url: Option<&str>,
+        ) -> Result<ObservationStatus, String> {
+            // U28: default stays Unsupported so every pre-existing test keeps its
+            // old outcome; a release-only test opts in by setting a verdict.
+            Ok(self
+                .calls
+                .live_status
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(ObservationStatus::Unsupported(
+                    "stub live verifier not configured".into(),
+                )))
+        }
+
+        async fn release_asset_names(&self, _sha: &str) -> Result<Option<Vec<String>>, String> {
+            Ok(self.calls.release_assets.lock().unwrap().clone())
         }
 
         async fn trigger_release(
@@ -14259,6 +15519,7 @@ Release-Urgency: hold"
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                ..DeliverOpts::default()
             },
             Some(&remote),
             Some("main"),
@@ -14298,6 +15559,7 @@ Release-Urgency: hold"
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                ..DeliverOpts::default()
             },
             Some(&remote),
             Some("main"),
@@ -14361,6 +15623,7 @@ Release-Urgency: hold"
                 expect_branch: None,
                 expected_identity: None,
                 mutation_permit: None,
+                ..DeliverOpts::default()
             },
             Some(&remote),
             Some("main"),
@@ -14390,6 +15653,7 @@ Release-Urgency: hold"
                 expect_branch: Some("feat/wt".into()),
                 expected_identity: None,
                 mutation_permit: None,
+                ..DeliverOpts::default()
             },
             Some(&remote),
             Some("main"),
@@ -14459,5 +15723,166 @@ GITHUB.COM:
     user: BumStill
 ";
         assert!(gh_hosts_content_has_auth_for_host(content, "github.com"));
+    }
+
+    // ── CF-TRUTH-R2: the delivery subject must be a real conventional title ──
+
+    fn git_in(root: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git").no_window()
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "CodeFactory Test")
+            .env("GIT_AUTHOR_EMAIL", "noreply@codefactory.local")
+            .env("GIT_COMMITTER_NAME", "CodeFactory Test")
+            .env("GIT_COMMITTER_EMAIL", "noreply@codefactory.local")
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The placeholder a field session actually wrote: the Objective id became
+    /// the subject of `main` after squash merge (#605).
+    const FIELD_PLACEHOLDER_TITLE: &str = "objective b8af1a61fd71788e579add0a1cd6fb3c";
+
+    #[test]
+    fn a_placeholder_title_never_becomes_the_delivery_subject() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "baseline\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
+        git_in(
+            root,
+            &["checkout", "-q", "-b", "codefactory/objective-b8af1a61fd71788e579add0a1cd6fb3c"],
+        );
+
+        // The pre-fix behaviour is kept as an explicit negative control: this is
+        // exactly the subject that made `plan_release` skip the batch.
+        assert_eq!(
+            conventional_slot(FIELD_PLACEHOLDER_TITLE),
+            0,
+            "the field placeholder is not a conventional subject"
+        );
+
+        let staged = vec!["src-tauri/src/agent/objective.rs".to_string()];
+        let title = canonical_delivery_title(
+            root,
+            "codefactory/objective-b8af1a61fd71788e579add0a1cd6fb3c",
+            "main",
+            Some(FIELD_PLACEHOLDER_TITLE),
+            &staged,
+        );
+        assert!(
+            conventional_slot(&title) > 0,
+            "the delivery subject must be a conventional title, got {title:?}"
+        );
+        assert!(
+            !title.contains("b8af1a61fd71788e579add0a1cd6fb3c"),
+            "machine ids must not reach the subject: {title:?}"
+        );
+
+        // The commit this delivery writes carries that exact subject, and it is
+        // the same string the PR title uses.
+        let message =
+            generate_commit_message_for_paths("codefactory/objective-b8af1a61", Some(&title), &staged);
+        assert_eq!(message.lines().next(), Some(title.as_str()));
+        assert!(
+            conventional_slot(message.lines().next().unwrap()) > 0,
+            "the written commit subject must be conventional: {message:?}"
+        );
+    }
+
+    /// A supplied conventional title is never rewritten: the caller's judgement
+    /// wins, including a deliberate `feat`.
+    #[test]
+    fn an_explicit_conventional_title_is_kept_verbatim() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "baseline\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
+
+        let title = "feat(delivery): add the thing";
+        assert_eq!(
+            canonical_delivery_title(root, "work/branch", "main", Some(title), &[]),
+            title
+        );
+    }
+
+    /// CF-TRUTH-R2 acceptance: the real release plan, run over a synthetic
+    /// history whose only commit came from this delivery path, must recognise the
+    /// change. Before the fix the same history produced `slot=none` /
+    /// `skip_reason="no feat/fix since the last tag"` and the batch was skipped.
+    #[test]
+    fn plan_release_recognises_a_single_commit_delivery() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "baseline\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
+        let base = String::from_utf8(
+            std::process::Command::new("git").no_window()
+                .arg("-C")
+                .arg(root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let staged = vec!["src-tauri/src/agent/objective.rs".to_string()];
+        let title = canonical_delivery_title(
+            root,
+            "codefactory/objective-b8af1a61fd71788e579add0a1cd6fb3c",
+            "main",
+            Some(FIELD_PLACEHOLDER_TITLE),
+            &staged,
+        );
+        std::fs::write(root.join("file.txt"), "delivered\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", &title]);
+        let head = "HEAD".to_string();
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repository root")
+            .to_path_buf();
+        let plan = |revision_range: &str| -> serde_json::Value {
+            let output = std::process::Command::new("python3").no_window()
+                .arg(repo_root.join("tools/release/plan_release.py"))
+                .arg("--repo")
+                .arg(root)
+                .arg("--range")
+                .arg(revision_range)
+                .output()
+                .expect("run plan_release.py");
+            assert!(
+                output.status.success(),
+                "plan_release failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).expect("plan_release JSON")
+        };
+
+        let delivered = plan(&format!("{base}..{head}"));
+        assert_eq!(
+            delivered["skip"], false,
+            "the delivery commit must be recognised by the release plan: {delivered}"
+        );
+        assert_eq!(delivered["slot"], "patch");
+
+        // Negative control: the placeholder subject from the field session is
+        // exactly what made this plan skip the whole batch.
+        git_in(root, &["commit", "-q", "--allow-empty", "-m", FIELD_PLACEHOLDER_TITLE]);
+        let placeholder = plan(&format!("{head}..HEAD"));
+        assert_eq!(placeholder["skip"], true);
+        assert_eq!(placeholder["slot"], "none");
     }
 }
