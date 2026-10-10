@@ -1651,22 +1651,16 @@ fn workspace_has_commits_beyond_base(worktree_path: &Path, base_sha: &str) -> bo
         && git(worktree_path, &["rev-parse", "HEAD"]).is_ok_and(|head| head != base_sha)
 }
 
-/// Has this Objective's work already left the machine — merged, or captured by
-/// a canonical delivery PR? Then there is nothing left to carry forward.
-async fn objective_work_is_already_delivered(
-    pool: &SqlitePool,
-    objective_id: &str,
-) -> Result<bool> {
-    let recorded_pr: Option<Option<i64>> = sqlx::query_scalar(
-        "SELECT canonical_pr_number FROM execution_workspaces WHERE objective_id=?",
-    )
-    .bind(objective_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
-    if recorded_pr.flatten().is_some() {
-        return Ok(true);
-    }
+/// Has this Objective's work actually reached the merged result? Only then is
+/// there nothing left to carry forward.
+///
+/// U26 / CF-WSC-R1 + R5: U24 treated a *recorded* canonical PR number as
+/// delivered, so an open, unmerged PR made the next message in the session
+/// start a second checkout and open a duplicate PR. Unfinished work is
+/// uncommitted edits, commits that were never pushed, and a PR that is still
+/// open; only a merge (a proven merge receipt on the delivery record) means the
+/// work is finished and the next message may start from the latest main.
+async fn objective_work_is_merged(pool: &SqlitePool, objective_id: &str) -> Result<bool> {
     let has_table: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
     )
@@ -1678,7 +1672,8 @@ async fn objective_work_is_already_delivered(
     let merged: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM delivery_runs
          WHERE objective_id=? AND canonical_pr_number IS NOT NULL
-           AND (reached_ceiling='merged' OR status='merged')",
+           AND (reached_ceiling IN ('merged','release_triggered','deployment_succeeded','live_verified')
+                OR status='merged')",
     )
     .bind(objective_id)
     .fetch_one(pool)
@@ -1687,34 +1682,120 @@ async fn objective_work_is_already_delivered(
     Ok(merged > 0)
 }
 
-/// U24: a session whose previous Objective was **stopped** must continue in
-/// that Objective's workspace.
+/// CF-WSC-R4: the code the fresh workspace carries when the previous message's
+/// unfinished work could not be continued in place.
+pub(crate) const PREVIOUS_WORK_NOT_CARRIED_FORWARD: &str = "previous_work_not_carried_forward";
+
+/// What the continued Objective inherited from the session's previous
+/// Objective (CF-WSC-R1): either the workspace itself, or — when unfinished
+/// work existed but could not be carried — the plain-language notice the
+/// session must show instead of silently starting over (CF-WSC-R4).
+#[derive(Debug, Default)]
+struct PredecessorHandoff {
+    inherited: Option<ExecutionWorkspace>,
+    not_carried_forward: Option<ContinuationNotice>,
+}
+
+/// Unfinished work the continued Objective could not take over, kept as data so
+/// the wording stays in one place and cannot drift from the guard that keeps
+/// machine words out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContinuationNotice {
+    location: String,
+    reason: &'static str,
+}
+
+impl ContinuationNotice {
+    fn new(location: &str, reason: &'static str) -> Self {
+        Self {
+            location: location.to_string(),
+            reason,
+        }
+    }
+
+    /// Plain words naming where the previous changes are and what happens next.
+    /// A stored path that would itself trip the vocabulary guard is replaced
+    /// rather than shown, so this can never leak an internal word.
+    fn detail(&self) -> String {
+        let location = if crate::agent::failure_summary::assert_no_internal_vocabulary(
+            &self.location,
+        )
+        .is_ok()
+        {
+            self.location.clone()
+        } else {
+            "上一次任务留下的目录".to_string()
+        };
+        format!(
+            "上一条消息留下的改动还在 {location}，这一次没能接着用（{}）。现在用的是基于最新主线开出的新目录，那些改动没有被删除；想接着用它们，说一声就行。",
+            self.reason
+        )
+    }
+}
+
+/// CF-WSC-R4: record the notice on the workspace the session is about to use, so
+/// the user hears where their work is instead of silently starting from an
+/// empty checkout.
+async fn record_continuation_notice(
+    pool: &SqlitePool,
+    objective_id: &str,
+    notice: &ContinuationNotice,
+) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE execution_workspaces
+         SET failure_code=?, failure_detail=?, updated_at=?
+         WHERE objective_id=?",
+    )
+    .bind(PREVIOUS_WORK_NOT_CARRIED_FORWARD)
+    .bind(notice.detail().chars().take(1000).collect::<String>())
+    .bind(Utc::now().timestamp_millis())
+    .bind(objective_id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        bail!("managed workspace disappeared while recording the continuation notice");
+    }
+    Ok(())
+}
+
+/// U24 + U26 (CF-WSC-R1): a session whose previous Objective already ended must
+/// continue in that Objective's workspace for as long as the workspace still
+/// holds unfinished work.
 ///
-/// Stopping used to terminate the Objective and park its workspace for
-/// closeout, while the next message in the same session created a new
-/// Objective with a brand-new checkout — silently dropping every uncommitted
-/// change, even though the UI promised the opposite ("停止后续生成不会撤销已经完成的修改"
-/// and "直接回一句「继续」…就可以接着做"). The failure path already reactivates the
-/// same Objective, so only the stop path needed to carry the workspace over.
+/// Ending a task used to park its workspace for closeout while the next message
+/// in the same session created a new Objective with a brand-new checkout —
+/// silently dropping every uncommitted change, even though the UI promised the
+/// opposite ("停止后续生成不会撤销已经完成的修改" and "直接回一句「继续」…就可以接着做").
+/// U24 covered the stop path. U26 widens the same hand-off to *every* terminal
+/// state (`completed`, `cancelled`, `failed`), because the reported case is a
+/// task that finished its turn with work still staged and uncommitted, and
+/// decides "is there anything left to carry" on whether the work reached a
+/// *merge* rather than on whether some PR number is recorded: an open,
+/// unmerged PR is unfinished work (CF-WSC-R1), and only a merged result lets
+/// the next message start from the latest main (CF-WSC-R5).
 ///
 /// The hand-off re-keys the existing row to the new Objective instead of
-/// copying files: same worktree, same branch, same base — uncommitted edits,
-/// commits, and untracked files all survive with no merge step that could
-/// conflict or half-apply. Callers hold `ALLOCATION_LOCK` and the repository
-/// allocation lock, which is exactly the lock the cleanup pass takes, so either
-/// the cleanup sees a `cleanup_pending` row for the cancelled Objective or it
-/// sees an `active` row for the new one — never a workspace it may delete.
+/// copying files: same worktree, same branch, same base, same recorded
+/// canonical PR — uncommitted edits, commits, and untracked files all survive
+/// with no merge step that could conflict or half-apply, and delivery keeps
+/// working on the PR the session already has (CF-WSC-R3). Callers hold
+/// `ALLOCATION_LOCK` and the repository allocation lock, which is exactly the
+/// lock the cleanup pass takes, so either the cleanup sees a `cleanup_pending`
+/// row for the ended Objective or it sees an `active` row for the new one —
+/// never a workspace it may delete (CF-WSC-R2).
 ///
-/// A clean workspace, one whose only work is already delivered/merged, or one
-/// whose directory is gone
-/// yields `None`: the caller provisions a fresh checkout rather than
-/// pretending anything was carried over.
-async fn inherit_stopped_predecessor_locked(
+/// A clean workspace, one whose work already reached a merge, or an Objective
+/// that never owned a workspace yields no hand-off: the caller provisions a
+/// fresh checkout. When a workspace *does* hold unfinished work that can no
+/// longer be continued in place, the caller receives a plain-language notice
+/// instead of silently starting from an empty checkout (CF-WSC-R4).
+async fn inherit_predecessor_locked(
     pool: &SqlitePool,
     request: &ExecutionWorkspaceRequest,
-) -> Result<Option<ExecutionWorkspace>> {
+    repo_identity: &str,
+) -> Result<PredecessorHandoff> {
     let Some(session_id) = request.session_id.as_deref() else {
-        return Ok(None);
+        return Ok(PredecessorHandoff::default());
     };
     let candidates: Vec<WorkspaceRow> = sqlx::query_as::<_, WorkspaceRow>(
         "SELECT workspace.id, workspace.objective_id, workspace.session_id,
@@ -1726,28 +1807,47 @@ async fn inherit_stopped_predecessor_locked(
          JOIN objectives ON objectives.id=workspace.objective_id
          WHERE workspace.session_id=?
            AND workspace.objective_id<>?
+           AND workspace.repo_identity=?
            AND workspace.state IN ('allocating', 'active', 'delivering', 'cleanup_pending')
-           AND objectives.status='cancelled'
+           AND objectives.status IN ('completed', 'cancelled', 'failed')
          ORDER BY workspace.updated_at DESC
          LIMIT 5",
     )
     .bind(session_id)
     .bind(&request.objective_id)
+    .bind(repo_identity)
     .fetch_all(pool)
     .await?;
 
+    let mut not_carried_forward: Option<ContinuationNotice> = None;
     for row in candidates {
+        let worktree_path = Path::new(&row.worktree_path);
+        // CF-WSC-R4: the row says this Objective left work here, but the
+        // directory is gone, so nothing can be verified or carried. Never
+        // pretend it was empty and never start again without a word.
+        if !worktree_path.is_dir() {
+            not_carried_forward.get_or_insert_with(|| {
+                ContinuationNotice::new(
+                    &row.worktree_path,
+                    "那个目录已经不在磁盘上了",
+                )
+            });
+            continue;
+        }
         if row.worktree_identity.as_deref().is_none_or(str::is_empty)
             || row.head_sha.as_deref().is_none_or(str::is_empty)
         {
+            not_carried_forward.get_or_insert_with(|| {
+                ContinuationNotice::new(&row.worktree_path, "那个目录的记录不完整")
+            });
             continue;
         }
-        let worktree_path = Path::new(&row.worktree_path);
-        // Edits made after a PR was opened are on no PR yet: delivery only
-        // excuses committed work, never the uncommitted tail.
+        // Edits made after a PR was opened are on no PR yet, and a PR that is
+        // still open has not captured anything that survived on main: delivery
+        // only excuses committed work that actually merged, never the rest.
         let carries_work = workspace_has_uncommitted_changes(worktree_path)
             || (workspace_has_commits_beyond_base(worktree_path, &row.base_sha)
-                && !objective_work_is_already_delivered(pool, &row.objective_id).await?);
+                && !objective_work_is_merged(pool, &row.objective_id).await?);
         if !carries_work {
             continue;
         }
@@ -1769,7 +1869,14 @@ async fn inherit_stopped_predecessor_locked(
         .await?;
         if handed_over.rows_affected() != 1 {
             // Lost the race with a cleanup pass or another process: never
-            // attach to a workspace somebody else owns.
+            // attach to a workspace somebody else owns, but say so plainly
+            // instead of quietly starting over (CF-WSC-R4).
+            not_carried_forward.get_or_insert_with(|| {
+                ContinuationNotice::new(
+                    &row.worktree_path,
+                    "那个目录刚刚被别的步骤接管了",
+                )
+            });
             continue;
         }
         let inherited = load_workspace(pool, &request.objective_id)
@@ -1778,12 +1885,19 @@ async fn inherit_stopped_predecessor_locked(
         tracing::info!(
             objective_id = %request.objective_id,
             inherited_from = %row.objective_id,
+            inherited_state = %row.state,
             branch = %inherited.branch_name,
-            "continued Objective inherited the stopped Objective's managed workspace"
+            "continued Objective inherited the previous Objective's managed workspace"
         );
-        return Ok(Some(reattach_inner(pool, inherited, &request.process_instance).await?));
+        return Ok(PredecessorHandoff {
+            inherited: Some(reattach_inner(pool, inherited, &request.process_instance).await?),
+            not_carried_forward: None,
+        });
     }
-    Ok(None)
+    Ok(PredecessorHandoff {
+        inherited: None,
+        not_carried_forward,
+    })
 }
 
 async fn allocate_new_locked(
@@ -1931,12 +2045,18 @@ pub async fn allocate_or_attach(
             );
         }
         // Inheriting needs no fresh base, so a flaky `git fetch` must not stop
-        // a stopped task from continuing in its own workspace.
-        if let Some(inherited) = inherit_stopped_predecessor_locked(pool, &request).await? {
+        // a task that already ended from continuing in its own workspace.
+        let handoff = inherit_predecessor_locked(pool, &request, &repo_identity).await?;
+        if let Some(inherited) = handoff.inherited {
             return Ok(inherited);
         }
+        let objective_id = request.objective_id.clone();
         let observed = refresh_source_base(seed)?;
-        allocate_new_locked(pool, request, observed).await
+        let workspace = allocate_new_locked(pool, request, observed).await?;
+        if let Some(notice) = handoff.not_carried_forward {
+            record_continuation_notice(pool, &objective_id, &notice).await?;
+        }
+        Ok(workspace)
     }
     .await;
     release_repo_allocation_lock(pool, &repo_identity, &process_instance).await;
@@ -1998,6 +2118,7 @@ mod tests {
         acquire_repo_allocation_lock, allocate_or_attach, attach_existing, ensure_schema,
         latest_for_session, mark_objective_terminal_in_tx, release_repo_allocation_lock,
         run_cleanup_pass, verify_objective_workspace, ExecutionWorkspaceRequest,
+        PREVIOUS_WORK_NOT_CARRIED_FORWARD,
     };
     use crate::util::no_window::NoWindow;
     use sqlx::SqlitePool;
@@ -2924,6 +3045,79 @@ mod tests {
             .unwrap()
     }
 
+    /// Exactly what the completion path does: the Objective becomes `completed`
+    /// and its workspace is handed to the closeout lifecycle in the same
+    /// transaction.
+    async fn complete_objective(pool: &SqlitePool, objective_id: &str) {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
+            .bind(objective_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        mark_objective_terminal_in_tx(
+            &mut tx,
+            objective_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn fail_objective(pool: &SqlitePool, objective_id: &str) {
+        sqlx::query("UPDATE objectives SET status='failed' WHERE id=?")
+            .bind(objective_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    fn commit_file(worktree: &Path, name: &str, contents: &str) {
+        std::fs::write(worktree.join(name), contents).unwrap();
+        git(worktree, &["add", name]);
+        git(worktree, &["commit", "-m", name]);
+    }
+
+    /// The canonical PR a previous delivery opened: recorded on the workspace,
+    /// with no merge receipt on `delivery_runs`, i.e. still open.
+    async fn record_open_pr(pool: &SqlitePool, objective_id: &str, number: i64) {
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET canonical_pr_number=?, canonical_pr_url=?
+             WHERE objective_id=?",
+        )
+        .bind(number)
+        .bind(format!("https://example.invalid/pull/{number}"))
+        .bind(objective_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn workspace_pr_number(pool: &SqlitePool, objective_id: &str) -> Option<i64> {
+        let recorded: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(canonical_pr_number, 0) FROM execution_workspaces
+             WHERE objective_id=?",
+        )
+        .bind(objective_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (recorded > 0).then_some(recorded)
+    }
+
+    async fn workspace_failure(pool: &SqlitePool, objective_id: &str) -> (String, String) {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT COALESCE(failure_code, ''), COALESCE(failure_detail, '')
+             FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind(objective_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     /// U24 (a): the user stops a task that has uncommitted work, then sends
     /// another message in the same session. The next Objective must continue in
     /// the same worktree/branch instead of starting over in an empty checkout.
@@ -3000,13 +3194,19 @@ mod tests {
 
         let workspace_b = allocate_or_attach(
             &pool,
-            request_for(&root, &container, "objective-failed-b", "process-c"),
+            request_for_session(
+                &root,
+                &container,
+                "objective-failed-b",
+                "session-unrelated",
+                "process-c",
+            ),
         )
         .await
         .unwrap();
         assert_ne!(
             workspace_b.worktree_path, workspace_a.worktree_path,
-            "an unrelated Objective must not inherit a failed Objective's workspace"
+            "another session must not inherit a failed Objective's workspace"
         );
         assert_eq!(
             std::fs::read_to_string(workspace_a.worktree_path.join("draft.txt")).unwrap(),
@@ -3014,18 +3214,12 @@ mod tests {
         );
     }
 
-    /// U24 (c): the stopped Objective's work was already delivered, so there is
+    /// U24 (c): the ended Objective's work already reached a merge, so there is
     /// nothing to carry over — the next Objective gets a clean workspace.
     #[tokio::test]
     async fn continuing_after_a_delivered_stop_starts_fresh() {
         let (_temp, root, _remote, container) = init_repo();
-        let pool = pool_with_objectives(&[
-            "objective-delivered-a",
-            "objective-delivered-b",
-            "objective-pr-a",
-            "objective-pr-b",
-        ])
-        .await;
+        let pool = pool_with_objectives(&["objective-delivered-a", "objective-delivered-b"]).await;
 
         // (c1) merged: the closeout already proved the merge.
         let workspace_a = allocate_or_attach(
@@ -3047,35 +3241,46 @@ mod tests {
         .unwrap();
         assert_ne!(workspace_b.worktree_path, workspace_a.worktree_path);
 
-        // (c2) cancelled but its work already rides on a delivery PR.
-        let workspace_pr = allocate_or_attach(
-            &pool,
-            request_for(&root, &container, "objective-pr-a", "process-c"),
-        )
-        .await
-        .unwrap();
-        std::fs::write(workspace_pr.worktree_path.join("pr.txt"), "on a PR\n").unwrap();
-        git(&workspace_pr.worktree_path, &["add", "pr.txt"]);
-        git(&workspace_pr.worktree_path, &["commit", "-m", "on a PR"]);
-        sqlx::query(
-            "UPDATE execution_workspaces
-             SET canonical_pr_number=7, canonical_pr_url='https://example.invalid/pull/7'
-             WHERE objective_id='objective-pr-a'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        cancel_objective(&pool, "objective-pr-a").await;
+    }
 
-        let workspace_pr_b = allocate_or_attach(
+    /// U26 / CF-WSC-R1 + R3. This case deliberately replaces the U24 assertion
+    /// that a recorded PR number meant "already delivered": a PR that is open
+    /// and unmerged is unfinished work, so the next message in the session
+    /// continues in the same workspace, on the same branch, and keeps working
+    /// toward the same PR instead of opening a duplicate.
+    #[tokio::test]
+    async fn continuing_after_an_open_pr_keeps_the_same_workspace_and_pr() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-open-pr-a", "objective-open-pr-b"]).await;
+        let workspace_a = allocate_or_attach(
             &pool,
-            request_for(&root, &container, "objective-pr-b", "process-d"),
+            request_for(&root, &container, "objective-open-pr-a", "process-a"),
         )
         .await
         .unwrap();
-        assert_ne!(
-            workspace_pr_b.worktree_path, workspace_pr.worktree_path,
-            "a delivered change must not be carried forward"
+        commit_file(&workspace_a.worktree_path, "pr.txt", "on a PR\n");
+        record_open_pr(&pool, "objective-open-pr-a", 7).await;
+        cancel_objective(&pool, "objective-open-pr-a").await;
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-open-pr-b", "process-b"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workspace_b.worktree_path, workspace_a.worktree_path,
+            "an open, unmerged PR is unfinished work and must not be abandoned"
+        );
+        assert_eq!(
+            workspace_b.branch_name, workspace_a.branch_name,
+            "the same branch is what keeps delivery pointing at the same PR"
+        );
+        assert_eq!(
+            workspace_pr_number(&pool, "objective-open-pr-b").await,
+            Some(7),
+            "the PR the session already has must travel with the workspace"
         );
     }
 
@@ -3250,5 +3455,244 @@ mod tests {
         assert!(!one_b.worktree_path.join("two.txt").exists());
         assert!(two_b.worktree_path.join("two.txt").is_file());
         assert!(!two_b.worktree_path.join("one.txt").exists());
+    }
+
+    /// U26 / CF-WSC-R1: table-driven over every terminal state × every kind of
+    /// unfinished work. Ending the task in any of these states must not end the
+    /// job: the next message in the same session continues in that workspace.
+    #[tokio::test]
+    async fn a_continued_session_carries_unfinished_work_in_every_terminal_state() {
+        for ending in ["completed", "failed", "stopped"] {
+            for work in ["staged", "unpushed", "open_pr"] {
+                let (_temp, root, _remote, container) = init_repo();
+                let previous = format!("objective-{ending}-{work}-a");
+                let next = format!("objective-{ending}-{work}-b");
+                let pool = pool_with_objectives(&[previous.as_str(), next.as_str()]).await;
+                let workspace_a = allocate_or_attach(
+                    &pool,
+                    request_for(&root, &container, &previous, "process-a"),
+                )
+                .await
+                .unwrap();
+                match work {
+                    "staged" => {
+                        std::fs::write(
+                            workspace_a.worktree_path.join("staged.rs"),
+                            "// staged but not committed\n",
+                        )
+                        .unwrap();
+                        git(&workspace_a.worktree_path, &["add", "staged.rs"]);
+                    }
+                    "unpushed" => {
+                        commit_file(&workspace_a.worktree_path, "unpushed.rs", "// never pushed\n");
+                    }
+                    _ => {
+                        commit_file(&workspace_a.worktree_path, "on-pr.rs", "// on an open PR\n");
+                        record_open_pr(&pool, &previous, 11).await;
+                    }
+                }
+                match ending {
+                    "completed" => complete_objective(&pool, &previous).await,
+                    "failed" => fail_objective(&pool, &previous).await,
+                    _ => cancel_objective(&pool, &previous).await,
+                }
+
+                let workspace_b = allocate_or_attach(
+                    &pool,
+                    request_for(&root, &container, &next, "process-b"),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    workspace_b.worktree_path, workspace_a.worktree_path,
+                    "{ending} + {work}: the next message must continue in the same workspace"
+                );
+                assert_eq!(
+                    workspace_b.branch_name, workspace_a.branch_name,
+                    "{ending} + {work}: on the same branch"
+                );
+                assert_eq!(
+                    workspace_state_of(&pool, &previous).await,
+                    None,
+                    "{ending} + {work}: the workspace now belongs to the continued Objective"
+                );
+                match work {
+                    "staged" => {
+                        assert_eq!(
+                            std::fs::read_to_string(
+                                workspace_b.worktree_path.join("staged.rs")
+                            )
+                            .unwrap(),
+                            "// staged but not committed\n",
+                            "{ending}: the staged change is still inside the continued workspace"
+                        );
+                        assert!(
+                            git(&workspace_b.worktree_path, &["status", "--porcelain"])
+                                .contains("staged.rs"),
+                            "{ending}: the change is still staged, not committed"
+                        );
+                    }
+                    "unpushed" => {
+                        assert!(workspace_b.worktree_path.join("unpushed.rs").is_file());
+                        assert!(
+                            git(&workspace_b.worktree_path, &["log", "--oneline", "-1"])
+                                .contains("unpushed.rs"),
+                            "{ending}: the unpushed commit is still the workspace HEAD"
+                        );
+                    }
+                    _ => {}
+                }
+                assert_eq!(
+                    workspace_pr_number(&pool, &next).await,
+                    (work == "open_pr").then_some(11),
+                    "{ending} + {work}: the PR the session already has travels with it"
+                );
+            }
+        }
+    }
+
+    /// U26 / CF-WSC-R5: once the work reached a merge, the next message starts
+    /// from the latest main instead of dragging the merged branch along.
+    #[tokio::test]
+    async fn continuing_after_a_merge_starts_from_the_latest_main() {
+        let (temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-merged-a", "objective-merged-b"]).await;
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-merged-a", "process-a"),
+        )
+        .await
+        .unwrap();
+        commit_file(&workspace_a.worktree_path, "merged.rs", "// merged\n");
+        record_terminal_merge_receipt(&pool, &workspace_a).await;
+
+        // main moves on while the user is away
+        let seed = temp.path().join("seed");
+        commit_file(&seed, "after-merge.txt", "moved on\n");
+        git(&seed, &["push", "origin", "main"]);
+        let latest_main = git(&seed, &["rev-parse", "origin/main"]);
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-merged-b", "process-b"),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(workspace_b.worktree_path, workspace_a.worktree_path);
+        assert_eq!(
+            workspace_b.base_sha, latest_main,
+            "the fresh workspace must be based on the latest main"
+        );
+        assert!(
+            !workspace_b.worktree_path.join("merged.rs").exists(),
+            "the merged branch must not be dragged into the fresh workspace"
+        );
+        assert!(workspace_b.worktree_path.join("after-merge.txt").is_file());
+    }
+
+    /// U26 / CF-WSC-R4: when the previous workspace really is gone, the session
+    /// says in plain words where the changes are instead of silently starting
+    /// from an empty checkout.
+    #[tokio::test]
+    async fn unfinished_work_that_cannot_be_continued_says_where_it_is() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-gone-a", "objective-gone-b"]).await;
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-gone-a", "process-a"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace_a.worktree_path.join("staged.rs"), "// staged\n").unwrap();
+        git(&workspace_a.worktree_path, &["add", "staged.rs"]);
+        cancel_objective(&pool, "objective-gone-a").await;
+        let lost = workspace_a.worktree_path.to_string_lossy().into_owned();
+        std::fs::remove_dir_all(&workspace_a.worktree_path).unwrap();
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-gone-b", "process-b"),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            workspace_b.worktree_path, workspace_a.worktree_path,
+            "a workspace that is really gone cannot be continued in place"
+        );
+        let (code, detail) = workspace_failure(&pool, "objective-gone-b").await;
+        assert_eq!(code, PREVIOUS_WORK_NOT_CARRIED_FORWARD);
+        assert!(
+            detail.contains(&lost),
+            "the notice must name where the previous work is: {detail}"
+        );
+        assert!(
+            detail.contains("没有被删除"),
+            "the notice must say the changes were kept: {detail}"
+        );
+        crate::agent::failure_summary::assert_no_internal_vocabulary(&detail)
+            .expect("the notice is shown to the user and must be plain language");
+    }
+
+    /// U26 / CF-WSC-R2: a workspace whose PR is still open is unfinished, so the
+    /// cleanup pass preserves it — and the user can still continue in it.
+    #[tokio::test]
+    async fn cleanup_preserves_a_workspace_whose_pr_is_still_open() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-open-pr-cleanup"]).await;
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-open-pr-cleanup", "process-a"),
+        )
+        .await
+        .unwrap();
+        commit_file(&workspace.worktree_path, "on-pr.rs", "// on an open PR\n");
+        complete_objective(&pool, "objective-open-pr-cleanup").await;
+        record_open_pr(&pool, "objective-open-pr-cleanup", 23).await;
+
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 0, "an open PR is not a merged result");
+        assert_eq!(outcome.preserved, 1);
+        assert!(workspace.worktree_path.is_dir());
+        assert_eq!(
+            workspace_state_of(&pool, "objective-open-pr-cleanup")
+                .await
+                .as_deref(),
+            Some("cleanup_pending"),
+            "the workspace stays available for the continuing session"
+        );
+    }
+
+    /// U26 / CF-WSC-R2: uncommitted work is never cleaned up, even after the
+    /// closeout lifecycle has claimed the workspace.
+    #[tokio::test]
+    async fn cleanup_preserves_a_workspace_with_uncommitted_work() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["objective-dirty-cleanup"]).await;
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-dirty-cleanup", "process-a"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace.worktree_path.join("staged.rs"), "// staged\n").unwrap();
+        git(&workspace.worktree_path, &["add", "staged.rs"]);
+        complete_objective(&pool, "objective-dirty-cleanup").await;
+
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.closed, 0);
+        assert_eq!(outcome.preserved, 1);
+        assert_eq!(
+            std::fs::read_to_string(workspace.worktree_path.join("staged.rs")).unwrap(),
+            "// staged\n"
+        );
     }
 }
