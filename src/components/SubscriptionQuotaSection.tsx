@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useCallback, useEffect, useState } from "react";
 import { Gauge } from "lucide-react";
-import { invoke } from "../lib/tauri";
 import { useSettingsStore } from "../stores/settings";
 import type { SubscriptionQuotaStatus } from "../lib/tauri";
 
-/** The share of each window CodeFactory uses when the user has not chosen one. */
-export const DEFAULT_QUOTA_CAP_PERCENT = 80;
+import { getQuota, setQuotaCap, DEFAULT_QUOTA_CAP_PERCENT } from "../lib/subscriptionQuota";
+export { DEFAULT_QUOTA_CAP_PERCENT };
 
 type WindowKey = "five_hour_percent" | "weekly_percent";
 
@@ -38,7 +37,7 @@ export function SubscriptionQuotaSection() {
 
   const reload = useCallback(async () => {
     try {
-      const result = await invoke<SubscriptionQuotaStatus[]>("subscription_quota_status");
+      const result = await getQuota();
       // Any environment that does not answer with a list (an unmocked command in
       // a test, or a build where the command is absent) simply has nothing to
       // show — never crash the Settings page over it.
@@ -55,16 +54,10 @@ export function SubscriptionQuotaSection() {
   const setCap = async (endpoint: string, window: WindowKey, value: number) => {
     if (!settings || !Number.isFinite(value)) return;
     const clamped = Math.max(1, Math.min(100, Math.round(value)));
-    const caps = { ...(settings.subscription_quota_caps ?? {}) };
-    const current = caps[endpoint] ?? {
-      five_hour_percent: DEFAULT_QUOTA_CAP_PERCENT,
-      weekly_percent: DEFAULT_QUOTA_CAP_PERCENT,
-    };
-    caps[endpoint] = { ...current, [window]: clamped };
     setBusy(true);
     try {
-      await save({ ...settings, subscription_quota_caps: caps });
-      await reload();
+      const result = await setQuotaCap({ endpoint, [window]: clamped }, { settings, save });
+      setStatuses(Array.isArray(result) ? result : []);
     } finally {
       setBusy(false);
     }

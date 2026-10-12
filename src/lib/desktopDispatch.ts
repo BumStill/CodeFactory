@@ -20,6 +20,7 @@
 /** 事件名，必须与 `headless_dispatch.rs` 的 `DISPATCH_REQUEST_EVENT` 一致。 */
 export const DISPATCH_REQUEST_EVENT = "dispatch:request";
 
+import type { QuotaCapInput } from "./subscriptionQuota";
 import { isDispatchRequestError } from "./dispatchErrors";
 
 /** 权限模式，与 `headless_dispatch.rs` / `menu_spec.rs` 一致。 */
@@ -93,6 +94,9 @@ export interface DispatchHandlers {
   listApprovals: () => Promise<DispatchApproval[]>;
   resolveApproval: (input: { approvalId: string; approve: boolean }) => Promise<unknown>;
   /** CF-BLD-R4: the panel's one-click cleanup, reachable from the background. */
+  /** CF-QUOTA-R2: same reads and persistence as Settings. */
+  getQuota?: () => Promise<unknown>;
+  setQuotaCap?: (input: QuotaCapInput) => Promise<unknown>;
   cleanBuildCache?: () => Promise<unknown>;
 }
 
@@ -212,6 +216,27 @@ export async function applyDispatchRequest(
       case "list_approvals":
         result = await handlers.listApprovals();
         break;
+      case "get_quota":
+        if (!handlers.getQuota) return invalid("get_quota is not available");
+        result = await handlers.getQuota();
+        break;
+      case "set_quota_cap": {
+        if (!handlers.setQuotaCap) return invalid("set_quota_cap is not available");
+        const caps: QuotaCapInput = { endpoint: requiredString(body.endpoint, "endpoint") };
+        for (const key of ["five_hour_percent", "weekly_percent"] as const) {
+          if (!(key in body)) continue;
+          const value = body[key];
+          if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 100) {
+            return invalid(`${key} must be an integer from 1 to 100`);
+          }
+          caps[key] = value;
+        }
+        if (caps.five_hour_percent === undefined && caps.weekly_percent === undefined) {
+          return invalid("at least one quota cap must be supplied");
+        }
+        result = await handlers.setQuotaCap(caps);
+        break;
+      }
       case "clean_build_cache":
         // 面板上的"一键清理"和这里必须是同一个命令；没接上就明说，不假装清过了。
         if (!handlers.cleanBuildCache) return invalid("clean_build_cache is not available");

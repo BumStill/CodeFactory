@@ -122,6 +122,20 @@ pub enum Request {
     /// the screen locked. It takes no fields at all — nothing here can be
     /// talked into deleting a cache by the wording of a message.
     CleanBuildCache {},
+    /// CF-QUOTA-R2: read the same subscription status as Settings.
+    GetQuota {},
+    /// CF-QUOTA-R2: partial per-endpoint cap update; no paid endpoint changes.
+    SetQuotaCap {
+        endpoint: String,
+        #[serde(default, deserialize_with = "deserialize_quota_cap")]
+        five_hour_percent: Option<u8>,
+        #[serde(default, deserialize_with = "deserialize_quota_cap")]
+        weekly_percent: Option<u8>,
+    },
+}
+
+fn deserialize_quota_cap<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u8>, D::Error> {
+    u8::deserialize(deserializer).map(Some)
 }
 
 /// Failure codes the interface may hand back through `Response::error`
@@ -291,7 +305,18 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             require_non_empty("approval_id", approval_id)?
         }
         Request::FocusMainDisplay {} => {}
-        Request::CleanBuildCache {} => {}
+        Request::CleanBuildCache {} | Request::GetQuota {} => {}
+        Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
+            require_non_empty("endpoint", endpoint)?;
+            if five_hour_percent.is_none() && weekly_percent.is_none() {
+                return Err(ErrorBody::invalid("at least one quota cap must be supplied"));
+            }
+            for value in [five_hour_percent, weekly_percent].into_iter().flatten() {
+                if !(1..=100).contains(value) {
+                    return Err(ErrorBody::invalid("quota caps must be integers from 1 to 100"));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -402,6 +427,10 @@ impl AuditEntry {
             Request::SetModel { session_id, .. } | Request::Stop { session_id } => {
                 entry.session_id = session_id.clone();
             }
+            Request::GetQuota {} => {}
+            Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
+                entry.message = Some(format!("endpoint={endpoint}; five_hour_percent={five_hour_percent:?}; weekly_percent={weekly_percent:?}"));
+            }
             Request::ListApprovals {} | Request::FocusMainDisplay {} | Request::CleanBuildCache {} => {}
             Request::ResolveApproval { approval_id, .. } => {
                 entry.message = Some(format!("approval_id={approval_id}"));
@@ -425,6 +454,8 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::ResolveApproval { .. } => "resolve_approval",
         Request::FocusMainDisplay {} => "focus_main_display",
         Request::CleanBuildCache {} => "clean_build_cache",
+        Request::GetQuota {} => "get_quota",
+        Request::SetQuotaCap { .. } => "set_quota_cap",
     }
 }
 
