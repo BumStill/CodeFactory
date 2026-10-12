@@ -1139,7 +1139,8 @@ async fn reconcile_advanced_delivery_run_identity(
             && existing.try_get::<String, _>("repo_identity")? == run.repo_identity
             && existing.try_get::<String, _>("base_branch")? == run.base_branch
             && existing.try_get::<String, _>("head_branch")? == run.head_branch
-            && existing.try_get::<String, _>("requested_ceiling")? == run.requested_ceiling;
+            && delivery_run::delivery_ceiling_allows_resume(
+                &existing.try_get::<String, _>("requested_ceiling")?, &run.requested_ceiling);
     if !non_head_matches
         || !delivery_is_forward_advance(repo_root, &existing_head, &run.expected_head_sha)?
     {
@@ -1318,7 +1319,8 @@ fn build_delivery_identity_revision(
                 .into(),
         ));
     }
-    if observed_head_sha == durable.expected_head_sha {
+    if observed_head_sha == durable.expected_head_sha
+        && observed_change_set_digest == durable.change_set_digest {
         return Ok(None);
     }
     if observed_head_sha.is_empty() || observed_change_set_digest.is_empty() {
@@ -1953,7 +1955,8 @@ async fn reconcile_claimed_forward_advance_identity(
     }
     let observed =
         delivery::capture_delivery_identity(&repo).map_err(crate::errors::AppError::Other)?;
-    if observed.head_sha == claimed.expected_head_sha {
+    if observed.head_sha == claimed.expected_head_sha
+        && observed.change_set_digest == claimed.change_set_digest {
         return Ok(false);
     }
     // Same repo/worktree and a real descendant is required. Anything else (a
@@ -1961,7 +1964,8 @@ async fn reconcile_claimed_forward_advance_identity(
     // that must keep failing closed.
     if observed.repo_identity != claimed.repo_identity
         || observed.worktree_identity != claimed.worktree_identity
-        || !delivery_is_forward_advance(&cwd, &claimed.expected_head_sha, &observed.head_sha)?
+        || (observed.head_sha != claimed.expected_head_sha
+            && !delivery_is_forward_advance(&cwd, &claimed.expected_head_sha, &observed.head_sha)?)
     {
         return Ok(false);
     }
@@ -1970,14 +1974,14 @@ async fn reconcile_claimed_forward_advance_identity(
     // (the agent's concurrent redelivery concluded the same revision), or the
     // lease is no longer ours (a newer claim epoch owns the run), yield instead
     // of writing a second conclusion. Exactly one actor concludes.
-    let current_state: Option<(String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT expected_head_sha, lease_owner, claim_epoch FROM delivery_runs WHERE id=?",
+    let current_state: Option<(String, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT expected_head_sha, change_set_digest, lease_owner, claim_epoch FROM delivery_runs WHERE id=?",
     )
     .bind(&claimed.run_id)
     .fetch_optional(db)
     .await?;
-    if let Some((durable_head, lease_owner, claim_epoch)) = current_state {
-        if durable_head == observed.head_sha
+    if let Some((durable_head, durable_digest, lease_owner, claim_epoch)) = current_state {
+        if (durable_head == observed.head_sha && durable_digest == observed.change_set_digest)
             || lease_owner.as_deref() != Some(process.instance_id.as_str())
             || claim_epoch != claimed.claim_epoch
         {
@@ -5460,6 +5464,28 @@ mod tests {
     /// (a) A base branch that moves mid-delivery is merged into the same managed
     /// branch by the agent. Takeover must read that as an identity revision and
     /// continue the same delivery — never as `delivery_identity_conflict`.
+    #[tokio::test]
+    async fn cf_truth_r5_m37_restaged_checkout_recovers_the_same_run() {
+        let (root, worktree) = u22_base_advanced_repo();
+        let pool = u22_pool().await;
+        u22_seed_objective(&pool, "truth-restage", "objective-truth-restage").await;
+        let head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
+        u22_create_run(&pool, &worktree, "truth-restage", "objective-truth-restage", &head, None).await;
+        std::fs::write(worktree.join("work.txt"), "updated synthetic change\n").unwrap();
+        recovery_git(&worktree, &["add", "work.txt"]);
+        let owner = ProcessIdentity::new("truth-recovery", "test", "test");
+        let mut claimed = u22_expire_and_claim(&pool, "truth-restage", &owner).await;
+        let before_digest = claimed.change_set_digest.clone();
+        assert!(reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &owner).await.unwrap(),
+            "restaging after a failed plan must not strand recovery");
+        assert_eq!(claimed.expected_head_sha, head);
+        assert_ne!(claimed.change_set_digest, before_digest);
+        let revisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_identity_revisions WHERE run_id='truth-restage'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(revisions, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn base_advanced_mid_delivery_is_an_identity_revision_not_a_conflict() {
         let (fixture_root, worktree) = u22_base_advanced_repo();

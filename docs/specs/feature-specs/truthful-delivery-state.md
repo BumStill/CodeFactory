@@ -20,6 +20,19 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 - 单提交 PR 与多提交 PR 的提交标题。
 - failed_internal 后取消、owner fenced 后取消、用户真实停止（对照组）。
 
+## CF-TRUTH-R5 / R6：交付身份冲突
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| CF-TRUTH-R5 | 查清 identity collision 在这两次真实时序里是哪一项身份变了（objective、worktree 还是 change-set）、为什么会变（续跑、恢复、合并 main、重新暂存等），用合成数据复现 | 失败测试复现两条时序 |
+| CF-TRUTH-R6 | 合法的变化（同一任务在同一工作区里提交了新改动、合入了 main、或者恢复后接着跑）不算冲突，交付继续并接上同一次交付；只有真的换了任务或换了工作区才拒绝，并用大白话说明哪一项变了、怎么办 | 测试：合法变化继续交付；真冲突拒绝，并给出文案 |
+
+### Implementation Notes（R5/R6）
+- 生产只读证据：53686537 的记录已前进到提交并创建 PR；后续 `through_ci_green` 调用与持久化 `through_merge` 不同。它把等待检查的本次上限误作任务身份冲突，不是 objective/worktree 改变。
+- b1c47692 的记录停留在原 HEAD，隔离 index 规划检测到 index/checkout 变化；随后恢复把同 HEAD 的 change-set 变化判作 identity conflict。该场景必须用真实 Git 暂存状态与 SQLite 恢复复现，不能把摘要当作固定身份。
+- 安全边界仍保留 objective、repo、worktree、workspace、分支和任务来源；一次调用降低 ceiling 不改变既有授权上限、不升级权限。
+- M70 落点：`create_delivery_run` 在 `status='waiting'` 的停放记录上，若外部持有者的 lease 已过期，或该记录已有一个完整 lease 周期没有任何进展（`last_progress_at` 早于 `lease_ttl`），则视为**停滞的等待持有者**而非在飞调用：前台按 `stale_waiting_holder` 回收 claim（epoch 递增、写入 `lease_takeover` 事件、保留 canonical PR），并在有界时间内接管同一交付继续入队；真正在飞且持续进展的 mutation lease 仍按原规则 fail closed。
+
 ## Implementation Notes
 
 以下只记录实现选用的技术位点，不改变任何需求或验收标准。
