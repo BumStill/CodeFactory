@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   save: vi.fn(),
   settings: {
-    endpoints: { chatgpt: {} },
+    endpoints: { chatgpt: { api_style: "chatgpt" } },
     subscription_quota_caps: {},
   } as Record<string, unknown>,
 }));
@@ -38,7 +38,7 @@ describe("SubscriptionQuotaSection (CF-QUOTA-R4)", () => {
   beforeEach(() => {
     mocks.invoke.mockReset();
     mocks.save.mockReset();
-    mocks.settings = { endpoints: { chatgpt: {} }, subscription_quota_caps: {} };
+    mocks.settings = { endpoints: { chatgpt: { api_style: "chatgpt" } }, subscription_quota_caps: {} };
   });
 
   it("shows the used share, the cap, the source and the reset clock", async () => {

@@ -28,6 +28,8 @@ const OPERATIONS = new Set([
   "resolve_approval",
   "focus_main_display",
   "clean_build_cache",
+  "get_quota",
+  "set_quota_cap",
 ]);
 
 const PERMISSION_MODES = new Set(["safe", "standard", "trusted"]);
@@ -76,6 +78,24 @@ function validate(request) {
     if (typeof request.session_id === "string" && !request.session_id.trim()) {
       fail("invalid_request", "session_id must not be empty");
     }
+  }
+  if (operation === "set_quota_cap") {
+    if (typeof request.endpoint !== "string" || !request.endpoint.trim()) {
+      fail("invalid_request", "endpoint must be a non-empty string");
+    }
+    const keys = ["five_hour_percent", "weekly_percent"];
+    if (!keys.some((key) => key in request)) fail("invalid_request", "at least one quota cap must be supplied");
+    for (const key of keys) {
+      if (key in request && (!Number.isInteger(request[key]) || request[key] < 1 || request[key] > 100)) {
+        fail("invalid_request", `${key} must be an integer from 1 to 100`);
+      }
+    }
+    if (Object.keys(request).some((key) => !["operation", "endpoint", ...keys].includes(key))) {
+      fail("invalid_request", "unknown quota field");
+    }
+  }
+  if (operation === "get_quota" && Object.keys(request).some((key) => key !== "operation")) {
+    fail("invalid_request", "get_quota takes no fields");
   }
   return request;
 }
