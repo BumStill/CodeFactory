@@ -992,6 +992,30 @@ impl PermissionIntentStore {
             bail!("late permission response arrived after prompt expiry");
         }
         validate_scope(&mut tx, &intent.scope).await?;
+        // CF-TRUTH-R3/R4: a live same-process prompt retains its current runner.
+        // An entry response is not permission to hand off the Objective.
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM permission_intents i JOIN objectives o ON o.id=i.objective_id
+             WHERE i.intent_id=? AND i.created_process_instance=? AND o.status='active'
+               AND o.revision=i.objective_revision",
+        ).bind(intent_id).bind(super::objective::current_process_instance())
+            .fetch_one(&mut *tx).await?;
+        if live == 1 {
+            let (status, failure) = match response {
+                PermissionPromptResponse::Allow => (PermissionIntentStatus::Allowed, None),
+                PermissionPromptResponse::Deny => (PermissionIntentStatus::Denied, Some("permission_denied_by_user")),
+            };
+            if update_pending_intent_response(&mut tx, &intent, status, failure, now).await? != 1 {
+                bail!("permission response lost its prompt CAS");
+            }
+            tx.commit().await?;
+            return Ok(ProjectedPermissionSettlement {
+                objective_id: intent.scope.objective_id,
+                objective_revision: intent.scope.objective_revision,
+                recovery_scheduled: false,
+                remediation_id: None,
+            });
+        }
         let request_key = format!("permission:{intent_id}");
         let objective: Option<(String, Option<String>, i64, i64)> = sqlx::query_as(
             "SELECT status, resume_cursor, output_started, side_effect_started
@@ -3041,6 +3065,26 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn m72_entry_allow_keeps_the_current_owner_and_revision() {
+        let (pool, store, intent, objective) = pending_active_permission("m72-entry").await;
+        sqlx::query("UPDATE permission_intents SET created_process_instance=? WHERE intent_id=?")
+            .bind(super::super::objective::current_process_instance()).bind(&intent.intent_id)
+            .execute(&pool).await.unwrap();
+        let settlement = store.settle_projected_response(
+            &intent.intent_id, PermissionPromptResponse::Allow, 10_010,
+        ).await.unwrap();
+        assert!(!settlement.recovery_scheduled);
+        let after = ObjectiveStore::new(pool).get(&objective.id).await.unwrap().unwrap();
+        assert_eq!(after.revision, objective.revision);
+        assert_eq!(after.status, ObjectiveStatus::Active);
+        assert_eq!(after.remediation_id, objective.remediation_id);
+        assert_eq!(after.lease_owner, objective.lease_owner);
+        assert!(after.cancellation_provenance.is_none());
+        assert!(store.consume_exact_allow(&intent.prompt_key(), 10_011).await.unwrap());
+        assert!(!store.consume_exact_allow(&intent.prompt_key(), 10_012).await.unwrap());
     }
 
     #[tokio::test]

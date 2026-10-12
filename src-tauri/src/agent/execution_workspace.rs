@@ -1186,7 +1186,7 @@ async fn reconcile_parked_delivery_progress(
         "SELECT w.id, w.objective_id, w.repo_identity, w.repo_root, w.git_common_dir,
                 w.worktree_path, w.worktree_identity, w.branch_name, w.head_sha
          FROM execution_workspaces w JOIN objectives o ON o.id=w.objective_id
-         WHERE o.status='waiting_system' AND w.state IN ('active','delivering','cleanup_pending')
+         WHERE o.status IN ('waiting_system','cancelled') AND w.state IN ('active','delivering','cleanup_pending')
            AND w.head_sha IS NOT NULL AND w.worktree_identity IS NOT NULL
            AND EXISTS (SELECT 1 FROM delivery_runs r WHERE r.objective_id=o.id
                AND r.canonical_pr_number IS NOT NULL
@@ -1206,6 +1206,20 @@ async fn reconcile_parked_delivery_progress(
                 ("complete", "completed", "merged", true),
             _ => continue, // Unknown/closed/head drift never proves success or authorises deletion.
         };
+        let objective_status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+            .bind(&candidate.objective_id).fetch_one(pool).await?;
+        if objective_status == "cancelled" {
+            // Historical false cancellation is corrected only by positive merge
+            // evidence, never by an open/unknown PR or a real stop request.
+            if !merged { continue; }
+            if columns.iter().any(|c| c == "session_id") {
+                let stopped: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM objectives o JOIN chat_session_cancel_intents i ON i.session_id=o.session_id
+                     WHERE o.id=? AND (i.status='requested' OR COALESCE(i.settled_at,i.requested_at)>=o.created_at)",
+                ).bind(&candidate.objective_id).fetch_one(pool).await?;
+                if stopped > 0 { continue; }
+            }
+        }
         let run_columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('delivery_runs')")
             .fetch_all(pool).await?;
         let has = |column: &str| run_columns.iter().any(|name| name == column);
@@ -1274,6 +1288,7 @@ async fn reconcile_parked_delivery_progress(
             ("decision_type", format!("'{}'", if complete { "complete" } else { "waiting" })),
             ("reached_acceptance", format!("'{reached}'")),
             ("failure_code", if complete { "NULL".into() } else { "'delivered_awaiting_ci'".into() }),
+            ("cancellation_provenance", "NULL".into()),
             ("failure_signature", "NULL".into()), ("recovery_owner", "NULL".into()),
             ("remediation_id", "NULL".into()), ("lease_owner", "NULL".into()),
             ("lease_expires_at", "NULL".into()), ("next_observation_at", "NULL".into()),
@@ -1287,7 +1302,7 @@ async fn reconcile_parked_delivery_progress(
         let pointer = if columns.iter().any(|c| c == "delivery_run_id") {
             " AND delivery_run_id=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)"
         } else { "" };
-        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status='waiting_system'{pointer}", sets.join(","));
+        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ('waiting_system','cancelled'){pointer}", sets.join(","));
         let mut query = sqlx::query(&statement).bind(&candidate.objective_id);
         if !pointer.is_empty() { query = query.bind(&reference.run_id).bind(now); }
         if query.execute(&mut *tx).await?.rows_affected() != 1 { continue; }
@@ -4454,6 +4469,43 @@ mod tests {
         .unwrap();
         assert_eq!(ceiling, "merged");
         assert!(evidence.contains("externally-merged-sha"), "{evidence}");
+    }
+
+    #[tokio::test]
+    async fn m72_misclassified_cancel_with_merged_pr_is_completed() {
+        let (_temp, root, remote, container) = init_repo();
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
+            crate::agent::objective::CreateObjective {
+                id: "synthetic-m72-merged".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "delivery_receipt".into(), created_surface: "synthetic-test".into(),
+            },
+        ).await.unwrap();
+        let workspace = allocate_or_attach(&pool,
+            request_for(&root, &container, "synthetic-m72-merged", "process-a"),
+        ).await.unwrap();
+        std::fs::write(workspace.worktree_path.join("change.txt"), "synthetic delivery\n").unwrap();
+        git(&workspace.worktree_path, &["add", "change.txt"]);
+        git(&workspace.worktree_path, &["commit", "-m", "fix: synthetic M72"]);
+        publish_workspace_branch(&root, &remote, &workspace.branch_name);
+        record_open_canonical_pr(&pool, &workspace, 92, "through_merge").await;
+        sqlx::query("UPDATE objectives SET status='cancelled', decision_type='cancelled', completed_at=1, cancellation_provenance='explicit_cancel', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE execution_workspaces SET state='cleanup_pending', lease_owner=NULL, lease_expires_at=NULL")
+            .execute(&pool).await.unwrap();
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+            merge_sha: "synthetic-m72-merge".into(),
+        })]);
+        let outcome = super::run_cleanup_pass_with(&pool, &container, "m72-observer", &observer).await.unwrap();
+        let (status, provenance, acceptance): (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, cancellation_provenance, reached_acceptance FROM objectives",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "completed");
+        assert!(provenance.is_none());
+        assert_eq!(acceptance.as_deref(), Some("merged"));
+        assert_eq!(outcome.closed, 1);
+        assert!(!workspace.worktree_path.exists());
     }
 
     #[tokio::test]

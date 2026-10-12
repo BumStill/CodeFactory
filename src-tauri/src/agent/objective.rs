@@ -1448,6 +1448,11 @@ pub fn decision_for_run_outcome_with_reason(
 ) -> anyhow::Result<DecisionEnvelope> {
     use codefactory_agent_loop::run::StopReason;
 
+    // CF-TRUTH-R3/R4: an ownership fence is a system interruption, not stop intent.
+    if terminal_reason.is_some_and(|reason| reason.to_ascii_lowercase().contains("fence")) {
+        return decision_for_interrupted_run(objective, outcome, terminal_reason);
+    }
+
     if outcome.stop_reason == StopReason::Cancelled
         || (outcome.stop_reason == StopReason::Blocked
             && terminal_reason == Some("permission_denied_by_user"))
@@ -15577,8 +15582,9 @@ CREATE TABLE objectives (
             Some("provider_owner_fenced"),
         )
         .unwrap();
-        assert_eq!(naive.decision_type.as_str(), "cancelled");
-        assert_eq!(naive.cancellation_provenance.as_deref(), Some("explicit_cancel"));
+        assert_eq!(naive.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(naive.failure_code.as_deref(), Some(PROVIDER_OWNER_FENCED));
+        assert!(naive.cancellation_provenance.is_none());
 
         let truthful =
             decision_for_interrupted_run(&objective, &outcome, Some("provider_owner_fenced"))
