@@ -69,6 +69,8 @@ pub enum EvictionReason {
     OverBudget,
     /// The owning task finished, failed or was stopped (R2).
     TaskEnded,
+    /// Failed objective with no activity for the configured idle window (R2a).
+    FailedIdle24h,
     /// Free space dropped below the floor before a new build (R3).
     DiskPressure,
     /// Upgrade sweep over pre-existing caches (R8).
@@ -80,6 +82,7 @@ impl EvictionReason {
         match self {
             EvictionReason::OverBudget => "over_budget",
             EvictionReason::TaskEnded => "task_ended",
+            EvictionReason::FailedIdle24h => "failed_idle_24h",
             EvictionReason::DiskPressure => "disk_pressure",
             EvictionReason::Upgrade => "upgrade",
         }
@@ -931,6 +934,8 @@ pub struct MaintenanceRequest<'a> {
     pub container: &'a Path,
     /// Workspace ids whose task reached a terminal state (CF-BLD-R2).
     pub ended_owners: &'a [String],
+    /// Failed tasks past the activity idle deadline (CF-BLD-R2a).
+    pub failed_idle_owners: &'a [String],
     /// Workspace ids with no live row at all; dropped only once idle past
     /// `idle_before_unix` (CF-BLD-R8 backlog), never while they look resumable.
     pub orphan_owners: &'a [String],
@@ -962,6 +967,23 @@ pub fn workspace_is_ended(workspace_state: &str, objective_status: Option<&str>)
         (false, true) => workspace_state != "active",
         (false, false) => false,
     }
+}
+
+/// R2a uses persisted activity in milliseconds, never cache mtimes.
+pub fn failed_cache_is_idle(status: Option<&str>, last_activity_ms: i64, now_ms: i64, idle_ms: i64) -> bool {
+    status == Some("failed") && last_activity_ms > 0 && now_ms.saturating_sub(last_activity_ms) >= idle_ms
+}
+
+pub fn configured_failed_idle_ms() -> i64 {
+    std::env::var("CODEFACTORY_FAILED_CACHE_IDLE_HOURS")
+        .ok().and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|hours| hours.is_finite() && *hours > 0.0 && *hours <= i64::MAX as f64 / 3_600_000.0)
+        .map(|hours| (hours * 3_600_000.0).ceil() as i64)
+        .unwrap_or(24 * 3_600_000)
+}
+
+pub fn sweep_trigger(first_pass: bool) -> &'static str {
+    if first_pass { "startup" } else { "runtime_sweep" }
 }
 
 /// Run R2, then the R8 backlog rule, then R1 — in that order, so the ceiling
@@ -996,6 +1018,12 @@ pub fn maintain_entries(
     let mut removed: Vec<PathBuf> = Vec::new();
     let mut reclaimed_bytes = 0u64;
     let mut evicted_bytes = 0u64;
+
+    // R2a — failed tasks idle past the configured deadline have their own audit reason.
+    let mut failed = plan_task_reclaim(entries, request.failed_idle_owners);
+    failed.reason = EvictionReason::FailedIdle24h;
+    reclaimed_bytes = reclaimed_bytes.saturating_add(apply_plan(&failed, request.trigger, log));
+    removed.extend(failed.evict.iter().map(|entry| entry.path.clone()));
 
     // R2 — a finished task's cache is dead weight now, not a budget question.
     let ended = plan_task_reclaim(entries, request.ended_owners);
@@ -1083,6 +1111,7 @@ pub fn startup_sweep(
     let request = MaintenanceRequest {
         container,
         ended_owners,
+        failed_idle_owners: &[],
         orphan_owners,
         protected_owners,
         idle_before_unix: now_unix().saturating_sub(ORPHAN_IDLE_SECS),
@@ -1464,6 +1493,42 @@ mod tests {
 
     // ── CF-BLD-R2/R3/R8: the runtime maintenance pass ────────────────────────
 
+    #[test]
+    fn failed_idle_boundary_and_activity_reset() {
+        let now = 200_000_000i64;
+        let hour = 3_600_000;
+        assert!(!failed_cache_is_idle(Some("failed"), now - 23 * hour, now, 24 * hour));
+        assert!(failed_cache_is_idle(Some("failed"), now - 25 * hour, now, 24 * hour));
+        assert!(!failed_cache_is_idle(Some("failed"), now - hour, now, 24 * hour));
+        assert!(!failed_cache_is_idle(Some("active"), now - 25 * hour, now, 24 * hour));
+        assert!(!failed_cache_is_idle(Some("failed"), now + hour, now, 24 * hour));
+        assert!(failed_cache_is_idle(Some("failed"), now - 24 * hour, now, 24 * hour));
+        assert!(failed_cache_is_idle(Some("failed"), now - 2 * hour, now, hour));
+    }
+
+    #[test]
+    fn failed_reclaim_audits_reason_and_sweep_trigger_and_preserves_builder() {
+        for trigger in ["startup", "runtime_sweep"] {
+            let root = temp_dir(trigger);
+            let idle = owned(&root, "cargo-target-idle", 123, 1, false, "idle");
+            let busy = owned(&root, "cargo-target-busy", 321, 1, true, "idle");
+            let log = AuditLog::new(root.join("audit.jsonl"));
+            let mut req = request(&root, &[], &[], 0, u64::MAX);
+            let failed_owners = ["idle".to_owned()];
+            req.failed_idle_owners = &failed_owners;
+            req.trigger = trigger;
+            maintain_entries(&[idle.clone(), busy.clone()], &req, Some(&log));
+            assert!(!idle.path.exists());
+            assert!(busy.path.exists());
+            let records = log.read_all();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].reason.as_str(), "failed_idle_24h");
+            assert_eq!(records[0].trigger, trigger);
+        }
+        assert_eq!(sweep_trigger(true), "startup");
+        assert_eq!(sweep_trigger(false), "runtime_sweep");
+    }
+
     fn request<'a>(
         container: &'a Path,
         ended: &'a [String],
@@ -1474,6 +1539,7 @@ mod tests {
         MaintenanceRequest {
             container,
             ended_owners: ended,
+            failed_idle_owners: &[],
             orphan_owners: orphans,
             protected_owners: &[],
             idle_before_unix: idle_before,
@@ -1761,6 +1827,7 @@ mod tests {
             &MaintenanceRequest {
                 container: &container,
                 ended_owners: &ended,
+                failed_idle_owners: &[],
                 orphan_owners: &orphans,
                 protected_owners: &protected,
                 idle_before_unix: 0,

@@ -76,6 +76,23 @@ CodeFactory 产生或管理的编译缓存（托管工作区里的，加上本�
 - 托管工作区目录本身的删除归 CF-CLOSEOUT（合并后收尾），本任务只管编译缓存；两边重叠的「任务何时算结束」判定，与 CF-CLOSEOUT、U26 保持一致；碰到同一处逻辑时改动最小化，并在 PR 里写明重叠。
 - 其余约束同模板。
 
+## CF-BLD-R2a/R2b：失败任务闲置回收（2026-10-12）
+
+用户决定：「失败任务缓存 24 小时回收」。
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| CF-BLD-R2a | objective 为 failed、且该任务最近 24 小时内没有任何活动（无模型调用、无工具调用、无用户消息）时，它的私有编译缓存进入回收；之后再续做，就重新编译。期限可配置，默认 24 小时；cancelled / completed 的回收规则不变 | 测试：failed 23 小时不回收，25 小时回收；期间有活动就重新计时；回收写审计（reason 区分 failed_idle_24h 与 task_ended） |
+| CF-BLD-R2b | 审计记录里的 trigger 如实区分「启动时扫描」和「运行中巡检」（2026-10-11 真机看到的巡检回收被记成了 startup） | 测试 |
+
+运行中或在 24 小时内有活动的任务，缓存一律不动；其余约束同模板。
+
+### Implementation Notes（本次增量）
+
+- 环境变量 `CODEFACTORY_FAILED_CACHE_IDLE_HOURS` 配置期限，默认 24 小时；无效值回退默认。
+- 持久化活动时间使用毫秒；取 objective 更新时间、进度时间、session 消息、工具调用及模型请求的最新时间，保守保护同 session 的活动。
+- Applicable Harnesses：Spec、Compatibility、Observation、Payload、AI Collaboration；无 UI 修改，不启用 Viewport。用户要求单执行流，未启动 sub-agent。
+
 ## Implementation Notes
 
 （技术约束，不改变任何需求或验收标准；实现过程中补充。）
