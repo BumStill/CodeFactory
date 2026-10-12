@@ -42,6 +42,19 @@ ChatGPT Plus 订阅（Codex 通道）按「5 小时滚动窗口」加「每周�
 
 ## Implementation Notes
 
+### CF-QUOTA-R2 后台入口补齐
+
+- `get_quota` 返回与设置页相同的 `subscription_quota_status` 列表；不暴露凭据。
+- `set_quota_cap` 使用端点键和至少一个 `five_hour_percent` / `weekly_percent`，
+  取值为 1–100 整数；未提供的窗口保留原值，旧配置缺值默认 80%。
+- 设置页与后台入口共用 `src/lib/subscriptionQuota.ts`，经设置 store 的 `save_settings`
+  持久化后读取状态。只接受订阅端点；未知端点、非法参数和保存失败如实报错。
+- 原有 socket 当前用户鉴权、权限与审计边界不变；修改上限记录端点和窗口值。
+- R2 验收映射：`desktopDispatch.quota.test.ts` 覆盖后台→共享服务→真实设置 store；
+  `headless_dispatch_quota.rs` 覆盖 public API、真实 socket 往返、1–100 参数域与审计；
+  `SubscriptionQuotaSection.test.tsx` 保留设置保存断言；浏览器 light/dark 门禁验证设置回归。
+- 本次仅补齐 R2，不修改 R1/R3/R4/R5 的计量、路由或布局语义。
+
 - 计量窗口：Codex/ChatGPT 后端在响应头里给出 `x-codex-primary-*`（5 小时窗口）与
   `x-codex-secondary-*`（每周窗口）的已用百分比与重置倒计时；本实现按这两组头解析，
   并按 `window-minutes` 兜底映射（≤1440 分钟 → 5 小时窗口，否则每周）。

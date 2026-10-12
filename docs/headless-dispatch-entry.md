@@ -67,7 +67,29 @@ echo '{"operation":"stop"}' | CodeFactory --dispatch -
 | `stop` | 停止当前执行 | 可选 `session_id` |
 | `list_approvals` | 列出待审批请求 | — |
 | `resolve_approval` | 批准/拒绝一条待审批请求 | `approval_id`, `approve` |
+| `get_quota` | 查看所有订阅端点当前用量、上限、来源与重置时间 | — |
+| `set_quota_cap` | 修改一个订阅端点的用量上限，复用设置页保存路径 | `endpoint`；至少一个 `five_hour_percent` / `weekly_percent`（1–100 整数） |
 | `focus_main_display` | 把主窗口挪回主屏（M42） | — |
+
+## 后台订阅配额（CF-QUOTA-R2）
+
+```bash
+node scripts/dispatch-task.mjs '{"operation":"get_quota"}'
+node scripts/dispatch-task.mjs '{"operation":"set_quota_cap","endpoint":"chatgpt","five_hour_percent":70,"weekly_percent":75}'
+# 只改每周窗口，五小时窗口保持现值（旧配置缺值时默认 80%）
+node scripts/dispatch-task.mjs '{"operation":"set_quota_cap","endpoint":"chatgpt","weekly_percent":60}'
+```
+
+`endpoint` 是设置中的端点键，不是显示名称或模型 ID；只能修改订阅（`chatgpt`）
+端点。未找到端点返回 `not_found`；按量端点、空更新、非整数、null、越界或未知字段
+返回 `invalid_request`，不保存。两个操作都返回订阅状态列表：`endpoint`、`label`、
+`source`、`five_hour_percent` / `weekly_percent`（已用百分比）、
+`five_hour_cap_percent` / `weekly_cap_percent`（上限）、
+`five_hour_resets_at_ms` / `weekly_resets_at_ms`（epoch 毫秒或 null）、`over_cap`。
+没有订阅端点返回空列表；没有用量记录时保留原有“尚无用量记录”标记，不冒充服务端读数。
+不返回设置全文、凭据或原始服务端响应。修改复用设置页 `setQuotaCap → settings.save → save_settings`，
+保存成功后重新读取 `subscription_quota_status`；原生审计记录目标端点和修改值。
+应用必须运行，但无需前台或解锁；这些操作不启动任务，也不需要 `delivery_authorized`。
 
 ## 应答
 
