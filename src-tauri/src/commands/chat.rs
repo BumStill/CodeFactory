@@ -4110,9 +4110,39 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("chat.sqlite");
-        let pool = crate::storage::db::connect(db_path.to_str().unwrap())
+        let initialized = crate::storage::db::connect(db_path.to_str().unwrap())
             .await
             .unwrap();
+        initialized.close().await;
+        // Use a file-backed, two-connection pool: an independent writer must
+        // really contend, rather than accidentally sharing the admission connection.
+        let pool = SqlitePoolOptions::new()
+            .min_connections(2)
+            .max_connections(2)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+            )
+            .await
+            .unwrap();
+        // Complete both handshakes before disabling lock waits: applying
+        // connection pragmas can itself briefly need a SQLite lock.
+        let mut first = pool.acquire().await.unwrap();
+        let mut second = pool.acquire().await.unwrap();
+        for connection in [&mut first, &mut second] {
+            sqlx::query("PRAGMA busy_timeout=0")
+                .execute(&mut **connection)
+                .await
+                .unwrap();
+            let timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            assert_eq!(timeout, 0);
+        }
+        drop((first, second));
         sqlx::query(
             "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
              VALUES ('session-wording', 'title', '/tmp', 'model', 1, 1)",
@@ -4121,8 +4151,26 @@ mod tests {
         .await
         .unwrap();
 
+        // Establish the observable precondition: this transaction owns SQLite's
+        // write lock, and a second connection cannot write. Zero busy_timeout
+        // turns a cross-connection regression into SQLITE_BUSY, not a timing race.
+        let mut lock_owner = pool.begin().await.unwrap();
+        sqlx::query("UPDATE sessions SET updated_at=2 WHERE id='session-wording'")
+            .execute(&mut *lock_owner)
+            .await
+            .unwrap();
+        let blocked = sqlx::query("UPDATE sessions SET updated_at=3 WHERE id='session-wording'")
+            .execute(&pool)
+            .await
+            .expect_err("an independent writer must encounter the held SQLite write lock");
+        assert_eq!(
+            blocked.as_database_error().and_then(|error| error.code()).as_deref(),
+            Some("5"),
+            "the precondition must be SQLITE_BUSY, not an unrelated database error"
+        );
+        lock_owner.rollback().await.unwrap();
+
         let control = crate::ChatRunControl::pending();
-        let started = std::time::Instant::now();
         let receipt = admit_persisted_chat_turn(
             &pool,
             &control,
@@ -4132,7 +4180,6 @@ mod tests {
         )
         .await
         .unwrap();
-        let elapsed = started.elapsed();
 
         // 1) The audit event exists for the Objective admission itself created,
         //    and it says explicitly that the constraint had no capability effect.
@@ -4148,15 +4195,12 @@ mod tests {
         let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
         assert_eq!(detail["capability_effect"], "none");
 
-        // 2) Admission did not wait on the write lock. sqlx's default
-        //    `busy_timeout` is 5s, so a contended write shows up as a multi-second
-        //    admission; a write inside the admission transaction is immediate.
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "admission waited on the SQLite write lock: {elapsed:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
+        // With the verified zero-wait policy, an audit through another pool
+        // connection would fail with SQLITE_BUSY while admission owns the lock.
+        // Its best-effort error handling would then drop the event, so the durable
+        // assertions above reject that regression without measuring wall time.
+        pool.close().await;
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     async fn reprompt_test_pool() -> sqlx::SqlitePool {
