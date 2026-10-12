@@ -4516,11 +4516,76 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
         let base_url = format!("http://{}", listener.local_addr().expect("dead addr"));
         std::thread::spawn(move || {
             while let Ok((mut stream, _)) = listener.accept() {
+                // Consume the POST before replying. Closing with unread bytes
+                // can reset TCP, making this fixture a transport failure rather
+                // than the explicit 502 the routing tests require.
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let mut expected_len = None;
+                loop {
+                    let read = stream.read(&mut chunk).expect("read dead endpoint request");
+                    assert_ne!(read, 0, "request must be complete before the 502");
+                    request.extend_from_slice(&chunk[..read]);
+                    if expected_len.is_none() {
+                        if let Some(headers_end) = request
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..headers_end]);
+                            let content_length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            expected_len = Some(headers_end + 4 + content_length);
+                        }
+                    }
+                    if expected_len.is_some_and(|length| request.len() >= length) {
+                        break;
+                    }
+                }
                 let response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(response);
+                stream.write_all(response).expect("write dead endpoint 502");
             }
         });
         base_url
+    }
+
+    #[test]
+    fn unread_request_transport_errors_can_hit_overload_budget_via_url_ports() {
+        // Adjacent ephemeral ports can all contain the same overload token.
+        // This is why the fixture must deliver HTTP 502 instead of resetting
+        // the POST and letting its URL become part of the failure message.
+        for port in [54290, 54291, 54292] {
+            let reason = format!(
+                "HTTP error: error sending request for url (http://127.0.0.1:{port}/chat/completions)"
+            );
+            assert!(codefactory_agent_loop::context::is_provider_overloaded(&reason));
+        }
+        assert!(matches!(
+            super::super::provider_recovery::overload_budget_decision(3, 0),
+            OverloadBudgetDecision::DurableWaiting { .. }
+        ));
+        assert!(!codefactory_agent_loop::context::is_provider_overloaded(
+            "HTTP 502 Bad Gateway: "
+        ));
+    }
+
+    #[tokio::test]
+    async fn unavailable_fixture_returns_http_502_after_consuming_request() {
+        // A response is only explicit once the request has been consumed. Closing
+        // with unread POST bytes can reset TCP instead (especially on Windows).
+        let response = test_client()
+            .post(unreachable_base_url())
+            .body(vec![b'x'; 1024 * 1024])
+            .send()
+            .await
+            .expect("fixture must return an explicit HTTP response, not reset TCP");
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
     }
 
     /// A genuinely closed loopback port, kept separate for tests that need
@@ -4925,6 +4990,17 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                 .await
                 .unwrap();
         assert_eq!(tried, vec!["chatgpt", "deepseek", "openrouter"]);
+        let failures: Vec<(String, String)> = sqlx::query_as(
+            "SELECT status, failure_class FROM provider_route_attempts ORDER BY attempt_order",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            failures,
+            vec![("failed_replayable".into(), "provider_rejected".into()); 3],
+            "each fixture must deliver an explicit 502, not an incidental transport/overload error"
+        );
         for handoff in ["回复继续", "点击重试", "technical_recovery_exhausted"] {
             assert!(
                 !error.to_string().contains(handoff),
