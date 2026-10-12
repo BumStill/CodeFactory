@@ -40,17 +40,23 @@ pub async fn build_cache_cleanup(
 ) -> Result<MaintenanceOutcome, AppError> {
     let container = workspace_container(&app)?;
     let pool = state.db.read().await.clone();
-    let (ended_owners, orphan_owners, protected_owners) =
+    let (ended_owners, orphan_owners, protected_owners, failed_idle_owners) =
         crate::agent::execution_workspace::cache_ownership(&pool, &container)
             .await
             .map_err(|error| AppError::Other(error.to_string()))?;
     let report = tauri::async_runtime::spawn_blocking(move || {
         let log = build_cache::AuditLog::new(build_cache::audit_log_path(&container));
-        build_cache::startup_sweep(
-            &container,
-            &ended_owners,
-            &orphan_owners,
-            &protected_owners,
+        build_cache::maintain(
+            &build_cache::MaintenanceRequest {
+                container: &container,
+                ended_owners: &ended_owners,
+                failed_idle_owners: &failed_idle_owners,
+                orphan_owners: &orphan_owners,
+                protected_owners: &protected_owners,
+                idle_before_unix: build_cache::now_unix().saturating_sub(build_cache::ORPHAN_IDLE_SECS),
+                limit_bytes: build_cache::configured_budget_bytes(),
+                trigger: "manual_clean",
+            },
             Some(&log),
         )
     })
