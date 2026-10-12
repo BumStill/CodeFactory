@@ -3423,6 +3423,21 @@ fn derived_title_prefix(staged_paths: &[String]) -> &'static str {
     }
 }
 
+/// CF-TRUTH-R2 (M66, 2026-10-11): the base refs whose commits are *not* this
+/// delivery's work. `main..branch` alone is not that boundary: the managed
+/// branch is cut from `origin/main`, so a stale local `main` made the range
+/// include commits that already live on the base branch, and their subject
+/// became the delivery's title (#626 shipped the base commit's
+/// `feat(release): …` subject). Excluding every resolvable base ref leaves only
+/// the commits this delivery actually adds.
+fn base_exclusion_refs(root: &Path, base: &str) -> Vec<String> {
+    ["origin/", "upstream/"]
+        .iter()
+        .map(|prefix| format!("{prefix}{base}"))
+        .filter(|reference| git(root, &["rev-parse", "--verify", "--quiet", reference]).is_ok())
+        .collect()
+}
+
 /// CF-TRUTH-R2 (2026-10-10): the subject a delivery writes must be the same
 /// conventional subject the pull request carries.
 ///
@@ -3443,16 +3458,29 @@ fn canonical_delivery_title(
     staged_paths: &[String],
 ) -> String {
     if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
-        if conventional_slot(title) > 0 {
+        let nonrelease_conventional = title.split_once(':').is_some_and(|(kind, subject)| {
+            let kind = kind.trim().trim_end_matches('!');
+            let kind = kind.split_once('(').map_or(kind, |(base, _)| base);
+            matches!(kind, "docs" | "ci" | "test" | "chore" | "refactor" | "perf" | "build" | "style" | "revert") && !subject.trim().is_empty()
+        });
+        if conventional_slot(title) > 0 || nonrelease_conventional {
             return title.to_string();
         }
     }
     // The branch's own commits are the strongest witness of intent that exists
-    // before the delivery commit is written.
-    if let Ok(log) = git(
-        root,
-        &["log", "--format=%s", &format!("{base}..{branch}")],
-    ) {
+    // before the delivery commit is written. "Own" means unreachable from the
+    // base branch — every resolvable base ref is excluded, so the base branch's
+    // existing subjects can never become this delivery's title (M66).
+    let mut log_args: Vec<String> = vec![
+        "log".into(),
+        "--format=%s".into(),
+        branch.into(),
+        "--not".into(),
+        base.into(),
+    ];
+    log_args.extend(base_exclusion_refs(root, base));
+    let log_args: Vec<&str> = log_args.iter().map(String::as_str).collect();
+    if let Ok(log) = git(root, &log_args) {
         let mut best: Option<(u8, String)> = None;
         for subject in log.lines().map(str::trim).filter(|line| !line.is_empty()) {
             let slot = conventional_slot(subject);
@@ -3467,10 +3495,27 @@ fn canonical_delivery_title(
             return subject;
         }
     }
-    let prefix = derived_title_prefix(staged_paths);
+    // Nothing at all describes this change: no title from the agent, no commit
+    // of its own, no staged path. Fabricating a subject here is how a delivery
+    // ends up naming work it did not do, so the caller must refuse instead.
+    // Retries have no staged paths, but plain-subject commits still carry
+    // their own change evidence. Apply the identical base exclusions.
+    let mut path_args = vec!["log".to_string(), "--format=".into(),
+        "--name-only".into(), branch.into(), "--not".into(), base.into()];
+    path_args.extend(base_exclusion_refs(root, base));
+    let path_args: Vec<&str> = path_args.iter().map(String::as_str).collect();
+    let own_paths = git(root, &path_args).unwrap_or_default();
+    let mut paths = staged_paths.to_vec();
+    paths.extend(own_paths.lines().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string));
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        return String::new();
+    }
+    let prefix = derived_title_prefix(&paths);
     let subject = humanized_branch_subject(branch);
     if subject.is_empty() {
-        format!("{prefix}: update {} file(s)", staged_paths.len().max(1))
+        format!("{prefix}: update {} file(s)", paths.len())
     } else {
         format!("{prefix}: {subject}")
     }
@@ -4742,13 +4787,30 @@ pub async fn deliver<R: DeliveryRemote>(
     // CF-TRUTH-R2: one canonical subject for the commit this delivery writes and
     // the PR title it opens — computed before the commit exists, so a placeholder
     // title cannot become the subject `main` ends up carrying after squash merge.
+    let receipt_title = match read_delivery_receipt(
+        &repo, &git(&repo.root, &["rev-parse", "HEAD"]).unwrap_or_default(),
+    ) {
+        Ok(receipt) => receipt.and_then(|r| r.pr_title),
+        Err(error) => return outcome.blocked_at(StepResult::blocked("receipt", error)),
+    };
     let delivery_subject = canonical_delivery_title(
         &repo.root,
         &repo.branch,
         &repo.default_branch,
-        opts.title.as_deref(),
+        opts.title.as_deref().or(receipt_title.as_deref()),
         &commit_plan.staged_paths,
     );
+    // CF-TRUTH-R2 (M66): a delivery with nothing to name must refuse, not invent
+    // or inherit a subject. The commit message and the PR title are the same
+    // string, and `main` carries it after squash merge, so a fabricated title is
+    // a false record the release plan reads.
+    if delivery_subject.trim().is_empty() {
+        return outcome.blocked_at(StepResult::blocked(
+            "commit",
+            "本次交付没有可用标题，也没有可由本次改动推导的改动集：提交说明与 PR 标题只能来自 agent 提供的规范标题或本次改动自身，系统不会沿用基础分支已有提交的标题，也不会自行编造。未执行 stage、commit、push 或 PR 动作。"
+                .to_string(),
+        ));
+    }
     if commit_plan.target_tree_sha != head_tree {
         let msg = append_release_urgency(
             generate_commit_message_for_paths(
@@ -16330,6 +16392,43 @@ GITHUB.COM:
             conventional_slot(message.lines().next().unwrap()) > 0,
             "the written commit subject must be conventional: {message:?}"
         );
+    }
+
+    #[test]
+    fn m66_remote_baseline_subject_is_never_reused() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "baseline\n").unwrap();
+        git_in(root, &["add", "."]);
+        git_in(root, &["commit", "-q", "-m", "chore: old local baseline"]);
+        git_in(root, &["branch", "work/task"]);
+        std::fs::write(root.join("file.txt"), "unrelated upstream\n").unwrap();
+        git_in(root, &["commit", "-qam", "feat(release): unrelated main change"]);
+        git_in(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(root, &["checkout", "-q", "work/task"]);
+        git_in(root, &["reset", "--hard", "origin/main"]);
+        // Local main is stale, but the managed branch includes latest origin/main.
+        let title = canonical_delivery_title(root, "work/task", "main", None,
+            &["src-tauri/src/agent/objective.rs".into()]);
+        assert_ne!(title, "feat(release): unrelated main change");
+        assert!(title.starts_with("fix:"));
+    }
+
+    #[test]
+    fn m66_missing_change_and_title_fails_closed() {
+        let sandbox = tempfile::tempdir().unwrap();
+        assert!(canonical_delivery_title(sandbox.path(), "work/task", "main", None, &[]).is_empty(),
+            "no evidence for a title must not fabricate a deliverable subject");
+    }
+
+    #[test]
+    fn m66_own_plain_subject_still_has_change_evidence() {
+        let root = feature_branch_repo("m66-plain-own-subject");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
+        let title = canonical_delivery_title(&root, "feat/x", "main", None, &[]);
+        assert!(title.starts_with("fix:"), "own committed paths must derive a title: {title:?}");
     }
 
     /// A supplied conventional title is never rewritten: the caller's judgement

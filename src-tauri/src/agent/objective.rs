@@ -4972,12 +4972,17 @@ impl ObjectiveStore {
                  SELECT recovery_generation FROM objectives WHERE id=?
                )
                AND remediation.created_at>=?
+               AND remediation.created_at>=?
                AND COALESCE(decision.decision_type, 'waiting')<>'apply_recommended'",
         )
         .bind(&signature)
         .bind(&decision.objective_id)
         .bind(&decision.objective_id)
         .bind(Utc::now().timestamp_millis() - SIGNATURE_RECOVERY_WINDOW_MS)
+        // CF-MSP-R3 / M65: attempts recorded before the Objective's last durable
+        // progress do not count, so a session that keeps producing new work
+        // never spends its recovery budget on effort.
+        .bind(self.recovery_progress_watermark(&decision.objective_id).await.unwrap_or(0))
         .fetch_one(&self.pool)
         .await?;
         if signature_attempts < max_signature_attempts_for(decision.failure_code.as_deref())
@@ -5001,9 +5006,25 @@ impl ObjectiveStore {
         // landed: calling it a failed task is a false statement to the user and
         // a false record for the release path. Park the honest non-failed wait
         // instead and let the delivery record report the CI outcome.
-        if decision.failure_code.as_deref() == Some(COMPLETION_EVIDENCE_INCOMPLETE) {
-            if let Some(reference) = self.delivered_pr_reference(&decision.objective_id).await {
-                let prompt = delivered_awaiting_ci_message(&reference);
+        // CF-TRUTH-R1 (M67, 2026-10-11): the PR being open is what makes the
+        // change delivered — regardless of *which* closing step failed
+        // afterwards. The field session opened #627 and was then recorded as
+        // `takeover_reconciliation / failed` with `reached_ceiling=pr_open`, so
+        // the user read "系统未能确认…" as a failed task although the change had
+        // landed. Any system wait or internal failure that reaches this fork
+        // with a canonical PR parks in the same non-failed delivered wait and
+        // names the closing step that did not finish.
+        if let Some((reference, unfinished)) =
+            self.delivered_pr_closing_state(&decision.objective_id).await
+        {
+            {
+                let mut prompt = delivered_awaiting_ci_message(&reference);
+                if let Some(step) = unfinished {
+                    prompt.push_str(&format!(
+                        "收尾步骤（{step}）没有做完，系统不会再重复实现一次；\
+交付记录会在检查结束后更新结论。"
+                    ));
+                }
                 tracing::info!(
                     objective_id = %decision.objective_id,
                     reference = %reference,
@@ -6960,12 +6981,76 @@ impl ObjectiveStore {
         Some((verdict, checks))
     }
 
-    /// CF-TRUTH-R1: the canonical PR already recorded for this Objective, as the
-    /// `PR #N` reference the user reads. `None` means nothing has been delivered,
-    /// so the ordinary failure terminal is still the honest outcome.
-    async fn delivered_pr_reference(&self, objective_id: &str) -> Option<String> {
+    /// CF-TRUTH-R1 (M67): everything the delivered park needs — the open PR the
+    /// user reads, plus the closing step that did not finish, when the delivery
+    /// record names one. `None` means nothing was delivered, so the ordinary
+    /// failure terminal is still the honest outcome.
+    async fn delivered_pr_closing_state(&self, objective_id: &str) -> Option<(String, Option<String>)> {
         let (url, _status) = self.latest_delivery_pr(objective_id).await?;
-        Some(pull_request_reference(&url).unwrap_or_else(|| "已经开好的 PR".to_string()))
+        let reference = pull_request_reference(&url).unwrap_or_else(|| "已经开好的 PR".to_string());
+        let unfinished = self.unfinished_delivery_closing_step(objective_id).await;
+        Some((reference, unfinished))
+    }
+
+    /// CF-TRUTH-R1 (M67): the closing step a delivery run died on *after* its PR
+    /// was open — `takeover_reconciliation` in the field case. Reported in plain
+    /// words, with the internal stage kept in parentheses for forensics.
+    async fn unfinished_delivery_closing_step(&self, objective_id: &str) -> Option<String> {
+        let stage = sqlx::query_scalar::<_, String>(
+            "SELECT stage FROM delivery_runs
+             WHERE objective_id=? AND canonical_pr_url IS NOT NULL AND status='failed'
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(objective_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        stage.map(|stage| plain_closing_step(&stage))
+    }
+
+    /// How long ago the Objective last proved, durably, that it was making
+    /// progress: the newest completion-gate verdict whose unmet-check list is
+    /// strictly shorter than the verdict before it (CF-MSP-R3 / M65).
+    ///
+    /// The recovery caps must bound repetition, not effort. In the field the
+    /// workspace kept changing while the completion gate kept answering
+    /// `external_state_uncertain`, and the session burned its budget anyway.
+    /// Attempts recorded before the last real progress no longer count, so
+    /// progress restarts the budget while a loop that changes nothing still
+    /// spends it. An unreadable verdict never counts as progress: unknown must
+    /// not buy a fresh budget.
+    async fn recovery_progress_watermark(&self, objective_id: &str) -> Option<i64> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT created_at, detail_json FROM objective_events
+             WHERE objective_id=? AND event_type='completion_gate_verdict'
+             ORDER BY created_at ASC, rowid ASC",
+        )
+        .bind(objective_id)
+        .fetch_all(&self.pool)
+        .await
+        .ok()?;
+        let unmet_checks = |detail: &str| -> usize {
+            serde_json::from_str::<serde_json::Value>(detail)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("blockers")
+                        .and_then(|blockers| blockers.as_array())
+                        .map(Vec::len)
+                })
+                .unwrap_or(usize::MAX)
+        };
+        let mut watermark = None;
+        let mut previous = None;
+        for (created_at, detail) in rows {
+            let current = unmet_checks(&detail);
+            if previous.is_some_and(|previous| current < previous) {
+                watermark = Some(created_at);
+            }
+            previous = Some(current);
+        }
+        watermark
     }
 
     /// The PR a previous delivery attempt already opened, when both the schema
@@ -7101,6 +7186,21 @@ fn workspace_commits_ahead(root: &std::path::Path, base_sha: &str) -> i64 {
             .parse()
             .unwrap_or(0),
         _ => 0,
+    }
+}
+
+/// CF-TRUTH-R1 (M67): a delivery stage named for the user. The internal stage
+/// token is kept in parentheses because the point of the sentence is that the
+/// change *is* delivered and one closing step is not — not to hide which one.
+fn plain_closing_step(stage: &str) -> String {
+    match stage.trim() {
+        "takeover_reconciliation" => "接管对账".to_string(),
+        "merge" | "merge_wait" | "awaiting_merge" => "合并".to_string(),
+        "release" | "release_only" => "发版".to_string(),
+        "reconcile" | "reconciliation" => "对账".to_string(),
+        "ci" | "checks" => "检查结果".to_string(),
+        other if other.is_empty() => "自动收尾".to_string(),
+        other => format!("自动收尾（{other}）"),
     }
 }
 
@@ -15133,6 +15233,147 @@ CREATE TABLE objectives (
             .unwrap();
         assert_ne!(applied.status.as_str(), "failed");
         assert_eq!(applied.failure_code.as_deref(), Some(DELIVERED_AWAITING_CI));
+    }
+
+    /// CF-MSP-R3 / M65 acceptance: five `external_state_uncertain` rounds that
+    /// each produced new work must not exhaust the technical recovery budget,
+    /// while the identical sequence with no progress still parks.
+    #[tokio::test]
+    async fn progress_restarts_the_recovery_budget_but_stagnation_still_stops() {
+        for (objective_id, progresses) in [("m65-progress", true), ("m65-stagnant", false)] {
+            let pool = pool().await;
+            settlement_tables(&pool).await;
+            let store = ObjectiveStore::new(pool.clone());
+            let now = Utc::now().timestamp_millis();
+            let signature = format!("{objective_id}:PlatformIncident:external_state_uncertain");
+            completion_gate_fixture(&pool, objective_id, &format!("{objective_id}-turn"), &signature)
+                .await;
+            sqlx::query(
+                "UPDATE objectives SET failure_code='external_state_uncertain',
+                   failure_signature=? WHERE id=?",
+            )
+            .bind(&signature)
+            .bind(objective_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            for index in 0..5 {
+                let created_at = now - (5 - index) * 60_000;
+                sqlx::query(
+                    "INSERT INTO objective_remediations
+                     (id, objective_id, domain, status, failure_code, failure_signature,
+                      strategy, approach_index, attempt_index, execution_attempt_index,
+                      recovery_generation, next_observation_at, created_at, updated_at)
+                     VALUES (?, ?, 'chat', 'completed', 'external_state_uncertain', ?,
+                             'reconcile_then_resume', 0, 1, 1, 0, ?, ?, ?)",
+                )
+                .bind(format!("{objective_id}-remediation-{index}"))
+                .bind(objective_id)
+                .bind(&signature)
+                .bind(now)
+                .bind(created_at)
+                .bind(created_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+                // The durable record of what the gate saw: the unmet-check list
+                // shrinks only in the progressing session.
+                let blockers = if progresses && index >= 3 { 0 } else { 3 };
+                let detail = serde_json::json!({
+                    "verdict": "completion_evidence_incomplete",
+                    "blockers": (0..blockers)
+                        .map(|n| serde_json::json!({"message": format!("check {n}")}))
+                        .collect::<Vec<_>>(),
+                })
+                .to_string();
+                sqlx::query(
+                    "INSERT INTO objective_events
+                     (id, objective_id, revision, event_type, status, decision_type,
+                      domain, failure_code, detail_json, created_at)
+                     VALUES (?, ?, 1, 'completion_gate_verdict', 'waiting_system',
+                             'waiting', 'chat', 'external_state_uncertain', ?, ?)",
+                )
+                .bind(format!("{objective_id}-verdict-{index}"))
+                .bind(objective_id)
+                .bind(detail)
+                .bind(created_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+
+            let current = store.get(objective_id).await.unwrap().unwrap();
+            let mut decision = gate_exhaustion_decision(&current, &signature);
+            decision.failure_code = Some("external_state_uncertain".into());
+            decision.status = ObjectiveStatus::WaitingSystem;
+            decision.decision_type = DecisionType::Waiting;
+            let bounded = store.bound_system_recovery(decision).await.unwrap();
+            if progresses {
+                assert_ne!(
+                    bounded.failure_code.as_deref(),
+                    Some(TECHNICAL_RECOVERY_EXHAUSTED),
+                    "a session whose checked work kept advancing must not exhaust its budget"
+                );
+                assert_eq!(bounded.status, ObjectiveStatus::WaitingSystem);
+            } else {
+                assert_eq!(
+                    bounded.failure_code.as_deref(),
+                    Some(TECHNICAL_RECOVERY_EXHAUSTED),
+                    "repeating the same verdict with nothing new must still stop"
+                );
+                assert_eq!(bounded.status, ObjectiveStatus::Failed);
+            }
+        }
+    }
+
+    /// CF-TRUTH-R1 (M67) reproduction: the PR is open and a *closing* step
+    /// (`takeover_reconciliation`) then fails. The session used to be reported as
+    /// `failed / technical_recovery_exhausted` although the change had landed.
+    #[tokio::test]
+    async fn m67_takeover_failure_after_pr_open_is_not_failed() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        ensure_chat_turn_state_columns(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let signature = "synthetic-takeover-failure";
+        completion_gate_fixture(&pool, "m67-delivered", "m67-turn", signature).await;
+        record_delivered_pr(&pool, "m67-delivered", "https://github.com/example/project/pull/67").await;
+        sqlx::query("UPDATE delivery_runs SET stage='takeover_reconciliation', status='failed', reached_ceiling='pr_open' WHERE objective_id='m67-delivered'")
+            .execute(&pool).await.unwrap();
+        // Burn the signature budget of the *delivery* failure class, exactly as
+        // the field session did before the closing step died.
+        let now = Utc::now().timestamp_millis();
+        for index in 0..5 {
+            sqlx::query(
+                "INSERT INTO objective_remediations
+                 (id, objective_id, domain, status, failure_code, failure_signature,
+                  strategy, approach_index, attempt_index, execution_attempt_index,
+                  recovery_generation, next_observation_at, created_at, updated_at)
+                 VALUES (?, 'm67-delivered', 'delivery', 'completed',
+                         'delivery_identity_conflict', ?, 'reconcile_then_resume', 0, 1, 1, 0, ?, ?, ?)",
+            )
+            .bind(format!("m67-remediation-{index}"))
+            .bind(signature)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let current = store.get("m67-delivered").await.unwrap().unwrap();
+        let mut decision = gate_exhaustion_decision(&current, signature);
+        decision.failure_code = Some("delivery_identity_conflict".into());
+        decision.domain = RecoveryDomain::Delivery;
+        decision.status = ObjectiveStatus::WaitingSystem;
+        decision.decision_type = DecisionType::FailedInternal;
+        let parked = store.bound_system_recovery(decision).await.unwrap();
+        assert_eq!(parked.failure_code.as_deref(), Some(DELIVERED_AWAITING_CI));
+        assert_ne!(parked.status, ObjectiveStatus::Failed);
+        let prompt = &parked.attention_request.as_ref().unwrap().prompt;
+        assert!(prompt.contains("PR #67"));
+        assert!(prompt.contains("接管对账"));
+        parked.validate(&current).unwrap();
     }
 
     /// CF-TRUTH-R1 acceptance case 2: nothing was delivered, so the same
