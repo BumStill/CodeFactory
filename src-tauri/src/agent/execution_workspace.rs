@@ -1330,9 +1330,14 @@ pub(crate) fn spawn_cleanup_supervisor(
 pub async fn cache_ownership(
     pool: &SqlitePool,
     container: &Path,
-) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+) -> Result<(Vec<String>, Vec<String>, Vec<String>, Vec<String>)> {
     let rows = sqlx::query(
-        "SELECT w.worktree_path AS worktree_path, w.state AS state, o.status AS objective_status
+        "SELECT w.worktree_path AS worktree_path, w.state AS state, o.status AS objective_status,
+         MAX(COALESCE(o.updated_at, 0), COALESCE(o.last_progress_at, 0),
+             COALESCE((SELECT MAX(created_at) FROM messages WHERE session_id = o.session_id), 0),
+             COALESCE((SELECT MAX(t.created_at) FROM tool_calls t JOIN messages m ON m.id = t.message_id WHERE m.session_id = o.session_id), 0),
+             COALESCE((SELECT MAX(updated_at) FROM chat_turn_state WHERE session_id = o.session_id), 0),
+             COALESCE((SELECT MAX(CAST((julianday(created_at) - 2440587.5) * 86400000 AS INTEGER)) FROM model_usage_events WHERE session_id = o.session_id), 0)) AS last_activity_ms
          FROM execution_workspaces w
          LEFT JOIN objectives o ON o.id = w.objective_id",
     )
@@ -1340,6 +1345,9 @@ pub async fn cache_ownership(
     .await?;
     let mut ended: Vec<String> = Vec::new();
     let mut alive: Vec<String> = Vec::new();
+    let mut failed_idle: Vec<String> = Vec::new();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let idle_ms = crate::build_cache::configured_failed_idle_ms();
     for row in rows {
         let worktree_path: String = row.get("worktree_path");
         let state: String = row.get("state");
@@ -1349,7 +1357,15 @@ pub async fn cache_ownership(
         else {
             continue;
         };
-        if crate::build_cache::workspace_is_ended(&state, objective_status.as_deref()) {
+        if objective_status.as_deref() == Some("failed") {
+            if crate::build_cache::failed_cache_is_idle(
+                objective_status.as_deref(), row.get("last_activity_ms"), now_ms, idle_ms,
+            ) {
+                failed_idle.push(owner);
+            } else {
+                alive.push(owner);
+            }
+        } else if crate::build_cache::workspace_is_ended(&state, objective_status.as_deref()) {
             ended.push(owner);
         } else {
             alive.push(owner);
@@ -1361,9 +1377,9 @@ pub async fn cache_ownership(
     // ids line up on the nested layout too.
     let orphans = crate::build_cache::workspace_cache_owners(container)
         .into_iter()
-        .filter(|owner| !alive.contains(owner) && !ended.contains(owner))
+        .filter(|owner| !alive.contains(owner) && !ended.contains(owner) && !failed_idle.contains(owner))
         .collect();
-    Ok((ended, orphans, alive))
+    Ok((ended, orphans, alive, failed_idle))
 }
 
 /// CF-BLD-R2/R8: reclaim the build caches of finished tasks and the long-idle
@@ -1376,19 +1392,28 @@ pub(crate) fn spawn_build_cache_supervisor(pool: SqlitePool, container: PathBuf)
             poll_ms = CLEANUP_POLL_INTERVAL.as_millis(),
             "build cache supervisor started"
         );
+        let mut first_pass = true;
         loop {
+            let trigger = crate::build_cache::sweep_trigger(first_pass);
+            first_pass = false;
             match cache_ownership(&pool, &container).await {
-                Ok((ended, orphans, alive)) => {
+                Ok((ended, orphans, alive, failed_idle)) => {
                     let working = container.clone();
                     let sweep = tauri::async_runtime::spawn_blocking(move || {
                         let log = crate::build_cache::AuditLog::new(
                             crate::build_cache::audit_log_path(&working),
                         );
-                        crate::build_cache::startup_sweep(
-                            &working,
-                            &ended,
-                            &orphans,
-                            &alive,
+                        crate::build_cache::maintain(
+                            &crate::build_cache::MaintenanceRequest {
+                                container: &working,
+                                ended_owners: &ended,
+                                failed_idle_owners: &failed_idle,
+                                orphan_owners: &orphans,
+                                protected_owners: &alive,
+                                idle_before_unix: crate::build_cache::now_unix().saturating_sub(crate::build_cache::ORPHAN_IDLE_SECS),
+                                limit_bytes: crate::build_cache::configured_budget_bytes(),
+                                trigger,
+                            },
                             Some(&log),
                         )
                     })
@@ -2614,6 +2639,57 @@ mod tests {
     use sqlx::SqlitePool;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    #[tokio::test]
+    async fn failed_cache_ownership_resets_on_each_persisted_activity_source() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for sql in [
+            "CREATE TABLE execution_workspaces(worktree_path TEXT, state TEXT, objective_id TEXT)",
+            "CREATE TABLE objectives(id TEXT, session_id TEXT, status TEXT, updated_at INTEGER, last_progress_at INTEGER)",
+            "CREATE TABLE messages(id TEXT, session_id TEXT, created_at INTEGER)",
+            "CREATE TABLE tool_calls(message_id TEXT, created_at INTEGER)",
+            "CREATE TABLE chat_turn_state(session_id TEXT, updated_at INTEGER)",
+            "CREATE TABLE model_usage_events(session_id TEXT, created_at TEXT)",
+        ] { sqlx::query(sql).execute(&pool).await.unwrap(); }
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("repo/task");
+        std::fs::create_dir_all(workspace.join(".codefactory-cache/cargo-target-test")).unwrap();
+        sqlx::query("INSERT INTO execution_workspaces VALUES (?, 'active', 'obj')")
+            .bind(workspace.to_string_lossy().as_ref()).execute(&pool).await.unwrap();
+        let old = chrono::Utc::now().timestamp_millis() - 25 * 3_600_000;
+        sqlx::query("INSERT INTO objectives VALUES ('obj', 'session', 'failed', ?, NULL)")
+            .bind(old).execute(&pool).await.unwrap();
+        let ownership = super::cache_ownership(&pool, temp.path()).await.unwrap();
+        assert_eq!(ownership.3, vec!["repo/task"]);
+        assert!(ownership.1.is_empty());
+        sqlx::query("INSERT INTO messages VALUES ('message', 'session', ?)")
+            .bind(old).execute(&pool).await.unwrap();
+        for activity in [
+            "UPDATE messages SET created_at = ?",
+            "INSERT INTO tool_calls VALUES ('message', ?)",
+            "INSERT INTO chat_turn_state VALUES ('session', ?)",
+            "UPDATE objectives SET last_progress_at = ?",
+        ] {
+            sqlx::query(activity).bind(chrono::Utc::now().timestamp_millis()).execute(&pool).await.unwrap();
+            let ownership = super::cache_ownership(&pool, temp.path()).await.unwrap();
+            assert!(ownership.3.is_empty(), "{activity}");
+            assert_eq!(ownership.2, vec!["repo/task"]);
+            sqlx::query("UPDATE messages SET created_at = ?").bind(old).execute(&pool).await.unwrap();
+            sqlx::query("DELETE FROM tool_calls").execute(&pool).await.unwrap();
+            sqlx::query("DELETE FROM chat_turn_state").execute(&pool).await.unwrap();
+            sqlx::query("UPDATE objectives SET last_progress_at = NULL").execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO model_usage_events VALUES ('session', ?)")
+            .bind(chrono::Utc::now().to_rfc3339()).execute(&pool).await.unwrap();
+        assert!(super::cache_ownership(&pool, temp.path()).await.unwrap().3.is_empty());
+        sqlx::query("DELETE FROM model_usage_events").execute(&pool).await.unwrap();
+        for status in ["active", "completed", "cancelled"] {
+            sqlx::query("UPDATE objectives SET status = ?").bind(status).execute(&pool).await.unwrap();
+            let ownership = super::cache_ownership(&pool, temp.path()).await.unwrap();
+            assert!(ownership.3.is_empty());
+            if status == "active" { assert_eq!(ownership.2, vec!["repo/task"]); }
+        }
+    }
 
     fn git(cwd: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
