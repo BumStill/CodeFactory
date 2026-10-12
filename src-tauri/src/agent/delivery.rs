@@ -3458,7 +3458,12 @@ fn canonical_delivery_title(
     staged_paths: &[String],
 ) -> String {
     if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
-        if conventional_slot(title) > 0 {
+        let nonrelease_conventional = title.split_once(':').is_some_and(|(kind, subject)| {
+            let kind = kind.trim().trim_end_matches('!');
+            let kind = kind.split_once('(').map_or(kind, |(base, _)| base);
+            matches!(kind, "docs" | "ci" | "test" | "chore" | "refactor" | "perf" | "build" | "style" | "revert") && !subject.trim().is_empty()
+        });
+        if conventional_slot(title) > 0 || nonrelease_conventional {
             return title.to_string();
         }
     }
@@ -3493,13 +3498,24 @@ fn canonical_delivery_title(
     // Nothing at all describes this change: no title from the agent, no commit
     // of its own, no staged path. Fabricating a subject here is how a delivery
     // ends up naming work it did not do, so the caller must refuse instead.
-    if staged_paths.iter().all(|path| path.trim().is_empty()) {
+    // Retries have no staged paths, but plain-subject commits still carry
+    // their own change evidence. Apply the identical base exclusions.
+    let mut path_args = vec!["log".to_string(), "--format=".into(),
+        "--name-only".into(), branch.into(), "--not".into(), base.into()];
+    path_args.extend(base_exclusion_refs(root, base));
+    let path_args: Vec<&str> = path_args.iter().map(String::as_str).collect();
+    let own_paths = git(root, &path_args).unwrap_or_default();
+    let mut paths = staged_paths.to_vec();
+    paths.extend(own_paths.lines().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string));
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
         return String::new();
     }
-    let prefix = derived_title_prefix(staged_paths);
+    let prefix = derived_title_prefix(&paths);
     let subject = humanized_branch_subject(branch);
     if subject.is_empty() {
-        format!("{prefix}: update {} file(s)", staged_paths.len().max(1))
+        format!("{prefix}: update {} file(s)", paths.len())
     } else {
         format!("{prefix}: {subject}")
     }
@@ -4771,11 +4787,17 @@ pub async fn deliver<R: DeliveryRemote>(
     // CF-TRUTH-R2: one canonical subject for the commit this delivery writes and
     // the PR title it opens — computed before the commit exists, so a placeholder
     // title cannot become the subject `main` ends up carrying after squash merge.
+    let receipt_title = match read_delivery_receipt(
+        &repo, &git(&repo.root, &["rev-parse", "HEAD"]).unwrap_or_default(),
+    ) {
+        Ok(receipt) => receipt.and_then(|r| r.pr_title),
+        Err(error) => return outcome.blocked_at(StepResult::blocked("receipt", error)),
+    };
     let delivery_subject = canonical_delivery_title(
         &repo.root,
         &repo.branch,
         &repo.default_branch,
-        opts.title.as_deref(),
+        opts.title.as_deref().or(receipt_title.as_deref()),
         &commit_plan.staged_paths,
     );
     // CF-TRUTH-R2 (M66): a delivery with nothing to name must refuse, not invent
@@ -16398,6 +16420,15 @@ GITHUB.COM:
         let sandbox = tempfile::tempdir().unwrap();
         assert!(canonical_delivery_title(sandbox.path(), "work/task", "main", None, &[]).is_empty(),
             "no evidence for a title must not fabricate a deliverable subject");
+    }
+
+    #[test]
+    fn m66_own_plain_subject_still_has_change_evidence() {
+        let root = feature_branch_repo("m66-plain-own-subject");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
+        let title = canonical_delivery_title(&root, "feat/x", "main", None, &[]);
+        assert!(title.starts_with("fix:"), "own committed paths must derive a title: {title:?}");
     }
 
     /// A supplied conventional title is never rewritten: the caller's judgement
