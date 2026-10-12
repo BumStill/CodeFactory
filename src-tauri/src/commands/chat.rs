@@ -712,6 +712,11 @@ async fn request_chat_run_cancel(
     run_instance_id: &str,
     session_id: &str,
 ) -> Result<Option<ChatRunIdentity>, AppError> {
+    // This function is the explicit stop entry, not internal fencing. Persist
+    // its intent before the control row so setup/registration races retain it.
+    crate::agent::objective::ObjectiveStore::new(pool.clone())
+        .request_chat_session_cancel(session_id).await
+        .map_err(|error| AppError::Other(error.to_string()))?;
     let now = Utc::now().timestamp_millis();
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -901,7 +906,11 @@ async fn consume_requested_chat_cancel(
            ON objective.id=COALESCE(control.objective_id, turn.objective_id)
          WHERE control.run_instance_id=? AND control.status='cancel_requested'
            AND control.root_turn_id IS NOT NULL
-           AND COALESCE(control.objective_id, turn.objective_id) IS NOT NULL",
+           AND COALESCE(control.objective_id, turn.objective_id) IS NOT NULL
+           AND EXISTS (SELECT 1 FROM chat_session_cancel_intents intent
+               WHERE intent.session_id=control.session_id
+                 AND (intent.status='requested'
+                      OR COALESCE(intent.settled_at, intent.requested_at)>=objective.created_at))",
     )
     .bind(run_instance_id)
     .fetch_optional(pool)
@@ -4992,6 +5001,8 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions VALUES ('session-setup-cancel')").execute(&pool).await.unwrap();
         crate::agent::delivery_run::ensure_schema(&pool)
             .await
             .unwrap();
@@ -5297,6 +5308,23 @@ mod tests {
             ObjectiveStatus::Cancelled,
             "an Objective must remain stoppable before turn projection exists"
         );
+    }
+
+    #[tokio::test]
+    async fn m72_fenced_run_control_without_stop_intent_is_not_cancelled() {
+        let (pool, waiting) = durable_cancel_test_objective("m72-fenced").await;
+        let control = crate::ChatRunControl::pending();
+        let session = waiting.session_id.as_deref().unwrap();
+        let root = waiting.root_turn_id.as_deref().unwrap();
+        register_chat_run_control(&pool, &control, session).await.unwrap();
+        bind_chat_run_root(&pool, &control.run_instance_id, session, root).await.unwrap();
+        bind_chat_run_objective(&pool, &control.run_instance_id, session, root, &waiting.id, waiting.revision).await.unwrap();
+        sqlx::query("UPDATE chat_run_controls SET status='cancel_requested', cancel_requested_at=1 WHERE run_instance_id=?")
+            .bind(&control.run_instance_id).execute(&pool).await.unwrap();
+        assert!(consume_requested_chat_cancel(&pool, &control.run_instance_id).await.unwrap().is_none());
+        let after = crate::agent::objective::ObjectiveStore::new(pool).get(&waiting.id).await.unwrap().unwrap();
+        assert_eq!(after.status, crate::agent::objective::ObjectiveStatus::WaitingSystem);
+        assert!(after.cancellation_provenance.is_none());
     }
 
     #[tokio::test]

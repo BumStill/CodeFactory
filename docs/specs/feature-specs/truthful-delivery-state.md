@@ -64,6 +64,17 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
   CF-TRUTH-R1 判定该场景不应成为失败，故该终态在此路由下被停放态取代，失败报告渲染逻辑本身
   保留给其它失败路由。既有测试按新要求更新，未交付仍保留诚实失败文案作为对照。
 
+## M72 返修：后台审批保持归属，隔离不得伪装用户停止
+
+背景：本地入口批准一条 bash 审批后，provider 报 owner fenced，旧结算把无停止意图的会话记成 explicit_cancel；此前 PR 已合并。
+
+本次沿用 CF-TRUTH-R3/R4 与 CF-CLOSEOUT，不改变需求：
+- 当前进程活跃审批只持久化决定，不递增 objective revision、不创建 remediation、不切换 lease owner；真实 orphan/restart 仍走原恢复路径。
+- owner-fenced 在中央 outcome 路由优先映射可恢复系统中断；chat run control 的取消消费必须查到持久停止意图，真实停止入口先写意图再写 control。
+- 无真实停止意图的历史误取消仅在 canonical PR 正向合并证据下对账，delivery-only 按 merged 完成；live/release 仍不得伪造验收。清理沿用原安全 closeout。
+
+验收使用独立 SQLite 与临时 Git 仓库，全部合成数据。测试先失败后修复：`m72_entry_allow_keeps_the_current_owner_and_revision`、`m72_fenced_run_control_without_stop_intent_is_not_cancelled`、`m72_misclassified_cancel_with_merged_pr_is_completed`、`an_unrequested_interruption_is_recoverable_and_names_its_cause`。完整 Rust workspace、前端测试与构建均执行；不修改真实会话或生产数据库。
+
 ## M71 返修：接管对账失败后，交付记录与 objective 必须跟上真实进展
 
 背景（2026-10-12，会话 0a2cfd7a，v1.87.1）：接管对账因未决 mutation intent 失败后，记录被写成
