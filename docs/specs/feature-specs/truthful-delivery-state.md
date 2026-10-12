@@ -63,3 +63,28 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 - **与 U1b 的关系**：U1b 把「已交付但检查未确认」写成失败终态并渲染专门的失败报告；
   CF-TRUTH-R1 判定该场景不应成为失败，故该终态在此路由下被停放态取代，失败报告渲染逻辑本身
   保留给其它失败路由。既有测试按新要求更新，未交付仍保留诚实失败文案作为对照。
+
+## M71 返修：接管对账失败后，交付记录与 objective 必须跟上真实进展
+
+背景（2026-10-12，会话 0a2cfd7a，v1.87.1）：接管对账因未决 mutation intent 失败后，记录被写成
+`takeover_mutation_reconciliation|platform_incident|pr_open`，objective 停在
+`waiting_system + run_blocked`；随后同一会话通过其它步骤真的开出了 PR、打上 `merge-queue: armed`
+并被合并队列合并，但这两处状态从未更新，界面因此显示成失败的内部故障。
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| CF-TRUTH-R7 | 接管对账失败只表示「这一次无法用 replay 证明外部副作用」，不得写成 platform_incident；并且后台只读对账必须独立于 mutation 接管，按真实观察把交付记录推进到 `pr_open` / `merge_queued`（合并队列已 armed） | 合成时序测试：接管失败 → 观察到 PR 已开 → 已入队，断言记录 stage/status/reached_ceiling 与 objective 的 decision/failure_code 都如实 |
+| CF-TRUTH-R8 | PR 合并后按 CF-CLOSEOUT 结算：记录 `merged`、objective 按请求的验收口径结算（delivery-only 验收结算为完成；live/release 验收只是记录 merged，不得假装通过），并只在有正向合并证据时才清理工作区 | 合成时序测试：`pr_only` 请求合并后结算 + 工作区按既有安全 closeout 关闭；`through_release` 请求合并后仍等待真实 live 验收且不删除任何东西 |
+| CF-TRUTH-R9 | 观察不确定（离线、Unknown、head 漂移、已关闭未合并）不得制造故障、不得回退已确认的入队/合并状态 | 合成测试：同一观察重复不再推进 revision；Unknown/更早状态不改变已确认的 reached_ceiling |
+
+### Implementation Notes（R7–R9）
+- 只读对账落在 `agent::execution_workspace::reconcile_parked_delivery_progress`，由既有
+  closeout supervisor（`run_cleanup_pass_with` + `RemoteCanonicalPrObserver`）驱动，不经过
+  mutation 接管，也不需要任何写权限；对 lead 的 `delivery_runs` 以 fail-closed 谓词更新
+  （claim_epoch、expected/canonical head、PR number 必须一致，且无有效 lease）。
+- `CanonicalPrState` 增加 `Queued`：`merge-queue: armed` 标签 + 同一 head 才算入队，
+  由 `GhCliRemote::observed_queue_arm` 只读观察。
+- 历史/最小 schema 兼容：目标表列按 `pragma_table_info` 探测后再拼写 UPDATE，缺列即不写该列。
+- R8 的验收口径只认 `objectives.kind` 与 `delivery_runs.requested_ceiling`：`live` 或
+  `through_release` 等更高请求不会被 merge 观察直接判成完成。
+
