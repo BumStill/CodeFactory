@@ -58,7 +58,13 @@ your own API key, or sign in with ChatGPT for the Codex-backed provider.
 | 🌐 **On-demand browser** | Task-scoped managed browser sessions open an embedded pane only when needed; pause for login or approval, then recover the session without leaving an idle browser daemon behind. |
 | 📦 **Docker sandbox** | Optional `sandbox_mode: Docker` runs every shell/tool command in a disposable container instead of your host shell. |
 | 🔔 **IM notifications** | Optional WeCom / Feishu / generic-JSON webhook pings you when a task finishes, fails, or needs permission — fire-and-forget, no secrets in the payload. |
-| 🚚 **Controlled delivery** | Turn a completed task into an auditable PR → CI → merge → release flow. CI, metadata, branch, remote-observation, and restart failures remain system-owned recovery; only irreducible core input or a material business decision is handed back. |
+| 🚚 **Controlled delivery** | Turn a completed task into an auditable PR → CI → merge → release flow, bounded by the user's authorization. Show the actual stage — PR opened / waiting for CI / merged / released — rather than marking delivered work as failed or system interruptions as user cancellations. Recoverable CI, metadata, network, and restart failures remain system-owned recovery. |
+| 🖥 **Local dispatch** | Submit and control sessions without interacting with the GUI, even while the screen is locked: `CodeFactory --dispatch` (the `codefactory --dispatch` entry) or the repository's dispatch script. Target a session, choose models, steer or queue messages, query replies and PR state, stop, and handle individual approvals. The running app is required; this is not a standalone headless agent. Current transport is a private Unix domain socket for the current OS user, with no network listener; Windows named-pipe transport is not implemented. Explicit `delivery_authorized` is required, and the same permission, delivery, and completion gates apply — no blanket high-risk approval. [Usage and security boundary](docs/headless-dispatch-entry.md). |
+| 📊 **Subscription quota reserve** | ChatGPT subscription endpoints have configurable 5-hour and weekly usage caps, both defaulting to 80%. At the cap, routing uses the next available endpoint in preference order; after reset, new turns can return to the preferred subscription endpoint. Server usage is used when available; local fallback readings are marked Estimated. Caps govern CodeFactory requests, not your other clients, and do not apply to pay-as-you-go endpoints. [Scope and metering](docs/specs/feature-specs/subscription-quota-cap.md). |
+| 🧹 **Build-cache budget** | Managed Rust build caches share dependencies and a configurable total budget (default 60 GiB), reclaiming eligible least-recently-used caches and task-private artifacts after completion, failure, or stop. Active builds and resumable tasks are protected, so protected caches can prevent reaching the budget immediately. Disk-space checks, bounded heavy-build concurrency, usage inspection, and cleanup controls help avoid runaway disk use. [Limits and safeguards](docs/specs/feature-specs/build-cache-budget.md). |
+| ✅ **Automatic merge closeout** | After a session's PR is confirmed merged, including an external merge, settle the result and clean its managed workspace and exact branches only when all work is contained in the merge. Keep uncommitted, unpushed, or extra work and explain what remains; a PR closed without merging keeps its workspace. Interrupted cleanup can resume. [Closeout rules](docs/specs/feature-specs/delivery-closeout.md). |
+| 🏷 **Release from a session** | An explicitly authorized release-only task can publish the exact main head without changes of its own or a new PR. Merge is not release: the batch must satisfy release-cadence gates, including no hold and a feat/fix (a batch without one needs explicit force approval). Report publication only after the release and required artifacts are confirmed. [Release-only delivery](docs/specs/feature-specs/release-only-delivery.md). |
+| ⏹ **Stop means stop** | Stop fences the session's pending push, PR, merge, and release actions, including delivery waiting for CI; completed actions are not rolled back. Continuing delivery requires an explicit user or orchestrator request, not a background retry. Steering reports whether the message was actually read or is queued behind the current tool. [Stop boundaries](docs/specs/feature-specs/stop-means-stop.md). |
 | 🔁 **Auto-update** | Signed updates over GitHub Releases. One click queues the update, waits only for live local work to reach a safe point, then shows real download/install progress and relaunches without reopening completed tasks. |
 
 ## Install
@@ -212,14 +218,6 @@ what's planned next.
 
 ## Roadmap
 
-- [x] Per-endpoint active model
-- [x] Auto-update over GitHub Releases
-- [x] DeepSeek `reasoning_content` round-tripping
-- [x] Path-typo detection harness
-- [x] Export / import settings + DB
-- [x] Office document generation (PowerPoint / Word / Excel)
-- [x] Skill management from chat (create / edit / import / search)
-- [x] macOS (Apple Silicon) build
 - [ ] Welcome page with template projects
 - [ ] Linux build
 
