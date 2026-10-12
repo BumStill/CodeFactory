@@ -2727,7 +2727,7 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
             let failure = DeliveryObservation {
                 head_branch: claimed.head_branch.clone(),
                 stage: "takeover_mutation_reconciliation".into(),
-                status: "platform_incident".into(),
+                status: "waiting".into(),
                 wait_class: Some("external_state_uncertain".into()),
                 next_action: Some("observe_only_reconcile".into()),
                 reached_ceiling: claimed.reached_ceiling.clone(),

@@ -151,6 +151,7 @@ pub(crate) enum CanonicalPrState {
     Merged { merge_sha: String },
     ClosedUnmerged,
     Open,
+    Queued,
     /// The observer could not establish the truth (no remote, network, schema).
     /// This is never a reason to delete or to claim the work is done.
     Unknown(String),
@@ -216,7 +217,10 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         match remote.observe_merge(pr_number as u64, expected_head_sha).await {
             Ok(MergeObservation::Merged { merge_sha }) => Ok(CanonicalPrState::Merged { merge_sha }),
             Ok(MergeObservation::ClosedUnmerged) => Ok(CanonicalPrState::ClosedUnmerged),
-            Ok(MergeObservation::OpenSameHead { .. }) => Ok(CanonicalPrState::Open),
+            Ok(MergeObservation::OpenSameHead { .. }) => remote
+                .observed_queue_arm(pr_number as u64, expected_head_sha)
+                .map(|armed| if armed { CanonicalPrState::Queued } else { CanonicalPrState::Open })
+                .map_err(|error| anyhow!(error)),
             Ok(MergeObservation::HeadChanged { actual_head }) => Ok(CanonicalPrState::Unknown(
                 format!("PR head moved to {actual_head}"),
             )),
@@ -798,7 +802,7 @@ async fn resolve_unrecorded_merge(
             code: "workspace_cleanup_pr_closed_unmerged",
             detail: plain_keep_message(pr_number, &candidate.worktree_path, "已关闭但未合并"),
         }),
-        Ok(CanonicalPrState::Open) => Ok(CandidateDisposition::Preserved {
+        Ok(CanonicalPrState::Open | CanonicalPrState::Queued) => Ok(CandidateDisposition::Preserved {
             code: "workspace_cleanup_merge_pending",
             detail: plain_keep_message(pr_number, &candidate.worktree_path, "尚未合并"),
         }),
@@ -1166,6 +1170,136 @@ pub(crate) async fn run_cleanup_pass(
 /// above passes [`OfflineCanonicalPrObserver`], so deterministic local callers
 /// keep the exact previous behaviour; the background supervisor injects the
 /// remote-backed observer so an externally-merged PR is settled too (CF-CLO-R1).
+/// Read-only progress reconciliation is independent of mutation takeover. A
+/// failed intent check must not hide a PR opened/armed by later session steps.
+async fn reconcile_parked_delivery_progress(
+    pool: &SqlitePool,
+    observer: &dyn CanonicalPrObserver,
+    owner: &str,
+) -> Result<()> {
+    let has_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
+    ).fetch_one(pool).await?;
+    if has_runs == 0 { return Ok(()); }
+    let now = Utc::now().timestamp_millis();
+    let candidates = sqlx::query_as::<_, CleanupCandidate>(
+        "SELECT w.id, w.objective_id, w.repo_identity, w.repo_root, w.git_common_dir,
+                w.worktree_path, w.worktree_identity, w.branch_name, w.head_sha
+         FROM execution_workspaces w JOIN objectives o ON o.id=w.objective_id
+         WHERE o.status='waiting_system' AND w.state IN ('active','delivering','cleanup_pending')
+           AND w.head_sha IS NOT NULL AND w.worktree_identity IS NOT NULL
+           AND EXISTS (SELECT 1 FROM delivery_runs r WHERE r.objective_id=o.id
+               AND r.canonical_pr_number IS NOT NULL
+               AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?))
+         ORDER BY w.updated_at LIMIT 16",
+    ).bind(now).fetch_all(pool).await?;
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('objectives')")
+        .fetch_all(pool).await?;
+    for candidate in candidates {
+        let Some(reference) = load_canonical_pr_reference(pool, &candidate).await? else { continue; };
+        let state = observer.observe(Path::new(&candidate.repo_root), reference.canonical_pr_number,
+            &reference.canonical_pr_url, &reference.canonical_head_sha).await;
+        let (stage, status, reached, merged) = match &state {
+            Ok(CanonicalPrState::Open) => ("pr_open", "waiting", "pr_open", false),
+            Ok(CanonicalPrState::Queued) => ("merge_queued", "waiting", "merge_queued", false),
+            Ok(CanonicalPrState::Merged { merge_sha }) if !merge_sha.trim().is_empty() =>
+                ("complete", "completed", "merged", true),
+            _ => continue, // Unknown/closed/head drift never proves success or authorises deletion.
+        };
+        let run_columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('delivery_runs')")
+            .fetch_all(pool).await?;
+        let has = |column: &str| run_columns.iter().any(|name| name == column);
+        // A merge settles the *delivery*; it is only an acceptance for objectives
+        // whose request was itself delivery-only. Live/release objectives keep
+        // waiting for their real live verification.
+        let complete = merged && if columns.iter().any(|c| c == "kind") {
+            let kind: String = sqlx::query_scalar("SELECT kind FROM objectives WHERE id=?")
+                .bind(&candidate.objective_id).fetch_one(pool).await?;
+            let requested: String = sqlx::query_scalar(
+                "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
+            ).bind(&reference.run_id).fetch_one(pool).await?;
+            matches!(kind.as_str(), "delivery" | "local_mutation")
+                && matches!(requested.as_str(), "pr_only" | "through_ci_green" | "through_merge")
+        } else { true };
+        let run_statement = format!(
+            "UPDATE delivery_runs SET reached_ceiling=?{}{} WHERE id=? AND claim_epoch=? AND expected_head_sha=?
+               AND canonical_head_sha=? AND canonical_pr_number=?
+               AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+               AND NOT (status='waiting' AND stage=? AND reached_ceiling=?)
+               AND (reached_ceiling IN ('local','committed','pushed','pr_open')
+                    OR ? IN ('merge_queued','merged'))",
+            if has("stage") { ", stage=?" } else { "" },
+            if has("status") { ", status=?, wait_class=?, next_action=NULL, failure_signature=NULL" } else { "" },
+        );
+        let mut run_query = sqlx::query(&run_statement).bind(reached);
+        if has("stage") { run_query = run_query.bind(stage); }
+        if has("status") {
+            run_query = run_query
+                .bind(if complete { "completed" } else { "waiting" })
+                .bind(if complete { "none" } else { "external_wait" });
+        }
+        let mut tx = pool.begin().await?;
+        // Fence observations against a takeover that acquired a lease while we
+        // were reading the provider; this path never grants mutation authority.
+        let changed = run_query.bind(&reference.run_id).bind(reference.claim_epoch)
+            .bind(&reference.expected_head_sha).bind(&reference.canonical_head_sha)
+            .bind(reference.canonical_pr_number).bind(now).bind(stage).bind(reached).bind(reached)
+            .execute(&mut *tx).await?;
+        if changed.rows_affected() == 0 { continue; }
+        let evidence = serde_json::json!({"pr_number": reference.canonical_pr_number,
+            "pr_url": reference.canonical_pr_url, "head_sha": reference.canonical_head_sha,
+            "reached_ceiling": reached,
+            "merge_sha": match &state { Ok(CanonicalPrState::Merged { merge_sha }) => Some(merge_sha), _ => None },
+        }).to_string();
+        let event_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO delivery_run_events (id,run_id,event_kind,stage,status,detail_json,process_instance,created_at)
+            VALUES (?,?,'canonical_pr_progress',?,?,?,?,?)")
+            .bind(&event_id).bind(&reference.run_id).bind(stage).bind(status).bind(&evidence)
+            .bind(owner).bind(now).execute(&mut *tx).await?;
+        // Historical/minimal schemas are supported without inventing columns.
+        // Live/release objectives are not completed from merge evidence alone.
+        let complete = merged && if columns.iter().any(|c| c == "kind") {
+            let kind: String = sqlx::query_scalar(
+                "SELECT kind FROM objectives WHERE id=?",
+            ).bind(&candidate.objective_id).fetch_one(&mut *tx).await?;
+            let requested: String = sqlx::query_scalar(
+                "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
+            ).bind(&reference.run_id).fetch_one(&mut *tx).await?;
+            matches!(kind.as_str(), "delivery" | "local_mutation")
+                && matches!(requested.as_str(), "pr_only" | "through_ci_green" | "through_merge")
+        } else { true };
+        let mut sets = vec![format!("status='{}'", if complete { "completed" } else { "waiting_system" })];
+        for (column, expression) in [
+            ("revision", "revision+1".to_string()),
+            ("decision_type", format!("'{}'", if complete { "complete" } else { "waiting" })),
+            ("reached_acceptance", format!("'{reached}'")),
+            ("failure_code", if complete { "NULL".into() } else { "'delivered_awaiting_ci'".into() }),
+            ("failure_signature", "NULL".into()), ("recovery_owner", "NULL".into()),
+            ("remediation_id", "NULL".into()), ("lease_owner", "NULL".into()),
+            ("lease_expires_at", "NULL".into()), ("next_observation_at", "NULL".into()),
+            ("attention_request_json", "NULL".into()),
+            ("evidence_ref", format!("'delivery_run_events:{event_id}'")),
+            ("completed_at", if complete { now.to_string() } else { "NULL".into() }),
+            ("updated_at", now.to_string()), ("last_progress_at", now.to_string()),
+        ] {
+            if columns.iter().any(|c| c == column) { sets.push(format!("{column}={expression}")); }
+        }
+        let pointer = if columns.iter().any(|c| c == "delivery_run_id") {
+            " AND delivery_run_id=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)"
+        } else { "" };
+        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status='waiting_system'{pointer}", sets.join(","));
+        let mut query = sqlx::query(&statement).bind(&candidate.objective_id);
+        if !pointer.is_empty() { query = query.bind(&reference.run_id).bind(now); }
+        if query.execute(&mut *tx).await?.rows_affected() != 1 { continue; }
+        if complete { mark_objective_terminal_in_tx(&mut tx, &candidate.objective_id, now).await?; }
+        tx.commit().await?;
+        if let Ok(CanonicalPrState::Merged { merge_sha }) = &state {
+            record_reconciled_merge_receipt(pool, &reference, merge_sha, owner).await?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_cleanup_pass_with(
     pool: &SqlitePool,
     workspace_container: &Path,
@@ -1174,6 +1308,7 @@ pub(crate) async fn run_cleanup_pass_with(
 ) -> Result<CleanupPassOutcome> {
     ensure_schema(pool).await?;
     let _guard = ALLOCATION_LOCK.lock().await;
+    reconcile_parked_delivery_progress(pool, observer, process_instance).await?;
     let now = Utc::now().timestamp_millis();
     let candidates = sqlx::query_as::<_, CleanupCandidate>(
         "SELECT execution_workspaces.id, execution_workspaces.objective_id,
@@ -2790,11 +2925,12 @@ mod tests {
             .unwrap();
         let head_sha = git(&workspace.worktree_path, &["rev-parse", "HEAD"]);
         let now = chrono::Utc::now().timestamp_millis();
-        sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
-            .bind(&workspace.objective_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        let has_revision: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='revision'")
+            .fetch_one(pool).await.unwrap();
+        if has_revision == 0 {
+            sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
+                .bind(&workspace.objective_id).execute(pool).await.unwrap();
+        }
         sqlx::query(
             "UPDATE execution_workspaces
              SET head_sha=?, state='cleanup_pending', lease_owner=NULL,
@@ -4159,17 +4295,19 @@ mod tests {
         pool: &SqlitePool,
         workspace: &super::ExecutionWorkspace,
         pr_number: i64,
+        requested_ceiling: &str,
     ) -> String {
         crate::agent::delivery_run::ensure_schema(pool)
             .await
             .unwrap();
         let head_sha = git(&workspace.worktree_path, &["rev-parse", "HEAD"]);
         let now = chrono::Utc::now().timestamp_millis();
-        sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
-            .bind(&workspace.objective_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        let has_revision: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='revision'")
+            .fetch_one(pool).await.unwrap();
+        if has_revision == 0 {
+            sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
+                .bind(&workspace.objective_id).execute(pool).await.unwrap();
+        }
         sqlx::query(
             "UPDATE execution_workspaces
              SET head_sha=?, state='cleanup_pending', lease_owner=NULL,
@@ -4191,7 +4329,7 @@ mod tests {
               reached_ceiling, stage, status, last_observed_at, last_progress_at,
               app_version, app_build, process_instance, created_at, updated_at,
               claim_epoch, reconciled_claim_epoch)
-             VALUES (?, ?, 'objective', ?, ?, ?, ?, ?, ?, ?, ?, 'through_merge',
+             VALUES (?, ?, 'objective', ?, ?, ?, ?, ?, ?, ?, ?, ?,
                      'pr_open', 'pr_open', 'running', ?, ?, 'test', 'test',
                      'test-process', ?, ?, 1, 1)",
         )
@@ -4205,6 +4343,7 @@ mod tests {
         .bind(pr_number)
         .bind(format!("https://example.invalid/pull/{pr_number}"))
         .bind(&head_sha)
+        .bind(requested_ceiling)
         .bind(now)
         .bind(now)
         .bind(now)
@@ -4262,7 +4401,7 @@ mod tests {
             &["commit", "-m", "delivered change"],
         );
         publish_workspace_branch(&root, &remote, &workspace.branch_name);
-        record_open_canonical_pr(&pool, &workspace, 77).await;
+        record_open_canonical_pr(&pool, &workspace, 77, "through_merge").await;
 
         // Red before the fix: an externally merged PR has no local merge
         // receipt, so the offline pass can only preserve it and the session
@@ -4317,6 +4456,127 @@ mod tests {
         assert!(evidence.contains("externally-merged-sha"), "{evidence}");
     }
 
+    #[tokio::test]
+    async fn m71_failed_takeover_tracks_open_queued_and_external_merge() {
+        let (_temp, root, remote, container) = init_repo();
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
+            crate::agent::objective::CreateObjective {
+                id: "synthetic-m71".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "delivery_receipt".into(), created_surface: "synthetic-test".into(),
+            },
+        ).await.unwrap();
+        let workspace = allocate_or_attach(
+            &pool, request_for(&root, &container, "synthetic-m71", "process-a"),
+        ).await.unwrap();
+        std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
+        git(&workspace.worktree_path, &["add", "change.txt"]);
+        git(&workspace.worktree_path, &["commit", "-m", "fix: synthetic delivery"]);
+        publish_workspace_branch(&root, &remote, &workspace.branch_name);
+        record_open_canonical_pr(&pool, &workspace, 91, "pr_only").await;
+        // The old takeover failed before other session steps opened and armed the PR.
+        sqlx::query("UPDATE delivery_runs SET stage='takeover_mutation_reconciliation', status='platform_incident', wait_class='external_state_uncertain', failure_signature='synthetic unresolved intent', lease_owner=NULL, lease_expires_at=NULL")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', failure_code='run_blocked', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE execution_workspaces SET state='delivering', lease_owner=NULL, lease_expires_at=NULL")
+            .execute(&pool).await.unwrap();
+        for (observed, expected) in [
+            (super::CanonicalPrState::Open, "pr_open"),
+            (super::CanonicalPrState::Queued, "merge_queued"),
+        ] {
+            let observer = ScriptedPrObserver::new(vec![Ok(observed)]);
+            super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer).await.unwrap();
+            let (stage, status, reached): (String, String, String) = sqlx::query_as(
+                "SELECT stage, status, reached_ceiling FROM delivery_runs",
+            ).fetch_one(&pool).await.unwrap();
+            assert_eq!(stage, expected);
+            assert_eq!(status, "waiting");
+            assert_eq!(reached, expected);
+            let (decision, failure, acceptance): (String, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT decision_type, failure_code, reached_acceptance FROM objectives",
+            ).fetch_one(&pool).await.unwrap();
+            assert_eq!(decision, "waiting");
+            assert_eq!(failure.as_deref(), Some("delivered_awaiting_ci"));
+            assert_eq!(acceptance.as_deref(), Some(expected));
+            assert!(workspace.worktree_path.exists());
+        }
+        // An identical observation is not new progress; head drift / offline
+        // uncertainty cannot erase the queue handoff or manufacture incidents.
+        let revision: i64 = sqlx::query_scalar("SELECT progress_revision FROM delivery_runs").fetch_one(&pool).await.unwrap();
+        for state in [super::CanonicalPrState::Queued, super::CanonicalPrState::Open,
+            super::CanonicalPrState::Unknown("synthetic network outage".into())] {
+            super::run_cleanup_pass_with(&pool, &container, "m71-observer", &ScriptedPrObserver::new(vec![Ok(state)]))
+                .await.unwrap();
+            let actual: i64 = sqlx::query_scalar("SELECT progress_revision FROM delivery_runs").fetch_one(&pool).await.unwrap();
+            assert_eq!(actual, revision);
+        }
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+            merge_sha: "synthetic-m71-merge".into(),
+        })]);
+        let outcome = super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer).await.unwrap();
+        assert_eq!(outcome.closed, 1);
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives").fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "completed");
+        let (stage, status, reached): (String, String, String) = sqlx::query_as(
+            "SELECT stage, status, reached_ceiling FROM delivery_runs",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!((stage.as_str(), status.as_str(), reached.as_str()), ("complete", "completed", "merged"));
+        assert!(!workspace.worktree_path.exists());
+        assert!(!super::branch_exists(&root, &workspace.branch_name));
+        assert!(!super::remote_branch_exists(&root, "origin", &workspace.branch_name).unwrap());
+    }
+
+    /// A merge alone is not acceptance for a live/release objective: the record
+    /// advances to merged, but the objective is not completed and nothing on
+    /// disk is deleted until real live verification settles it.
+    #[tokio::test]
+    async fn m71_external_merge_never_fakes_live_acceptance() {
+        let (_temp, root, remote, container) = init_repo();
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
+            crate::agent::objective::CreateObjective {
+                id: "synthetic-m71-live".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "live_verified".into(), created_surface: "synthetic-test".into(),
+            },
+        ).await.unwrap();
+        let workspace = allocate_or_attach(
+            &pool, request_for(&root, &container, "synthetic-m71-live", "process-a"),
+        ).await.unwrap();
+        std::fs::write(workspace.worktree_path.join("live.txt"), "delivered\n").unwrap();
+        git(&workspace.worktree_path, &["add", "live.txt"]);
+        git(&workspace.worktree_path, &["commit", "-m", "fix: synthetic live delivery"]);
+        publish_workspace_branch(&root, &remote, &workspace.branch_name);
+        record_open_canonical_pr(&pool, &workspace, 92, "through_release").await;
+        sqlx::query("UPDATE delivery_runs SET status='platform_incident', stage='takeover_mutation_reconciliation', lease_owner=NULL, lease_expires_at=NULL")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE execution_workspaces SET state='delivering', lease_owner=NULL, lease_expires_at=NULL")
+            .execute(&pool).await.unwrap();
+
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+            merge_sha: "synthetic-m71-live-merge".into(),
+        })]);
+        let outcome = super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer)
+            .await.unwrap();
+        let probe: (String, String, String) = sqlx::query_as(
+            "SELECT objectives.status, delivery_runs.status, delivery_runs.requested_ceiling
+             FROM objectives JOIN delivery_runs ON delivery_runs.objective_id=objectives.id",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!((outcome.closed, probe.0.as_str(), probe.1.as_str(), probe.2.as_str()),
+            (0, "waiting_system", "waiting", "through_release"));
+        let (status, reached): (String, String) = sqlx::query_as(
+            "SELECT objectives.status, delivery_runs.reached_ceiling FROM objectives
+             JOIN delivery_runs ON delivery_runs.objective_id=objectives.id",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "waiting_system", "a merge is not live acceptance");
+        assert_eq!(reached, "merged");
+        assert!(workspace.worktree_path.exists(), "nothing is deleted without live acceptance");
+        assert!(super::branch_exists(&root, &workspace.branch_name));
+    }
+
     /// CF-CLO-R4 + CF-CLO-R3: a PR closed without merging deletes nothing and
     /// says in plain words where the work stays.
     #[tokio::test]
@@ -4336,7 +4596,7 @@ mod tests {
             &["commit", "-m", "delivered change"],
         );
         publish_workspace_branch(&root, &remote, &workspace.branch_name);
-        record_open_canonical_pr(&pool, &workspace, 88).await;
+        record_open_canonical_pr(&pool, &workspace, 88, "through_merge").await;
 
         let observer =
             ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::ClosedUnmerged)]);
@@ -4377,7 +4637,7 @@ mod tests {
         )
             .await
             .unwrap();
-        record_open_canonical_pr(&pool, &workspace, 99).await;
+        record_open_canonical_pr(&pool, &workspace, 99, "through_merge").await;
 
         let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Unknown(
             "network down".into(),
@@ -4414,7 +4674,7 @@ mod tests {
             &workspace.worktree_path,
             &["commit", "-m", "delivered change"],
         );
-        record_open_canonical_pr(&pool, &workspace, 55).await;
+        record_open_canonical_pr(&pool, &workspace, 55, "through_merge").await;
 
         let observer = ScriptedPrObserver::new(vec![
             Err(anyhow::anyhow!("network outage during observation")),

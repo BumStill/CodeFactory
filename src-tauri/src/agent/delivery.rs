@@ -7877,6 +7877,20 @@ impl GhCliRemote {
         } else { operation() }
     }
 
+    pub(crate) fn observed_queue_arm(&self, number: u64, expected_head: &str) -> Result<bool, String> {
+        let raw = self.gh(&[
+            "pr".into(), "view".into(), number.to_string(), "--json".into(),
+            "headRefOid,labels".into(),
+        ])?;
+        let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if value.get("headRefOid").and_then(|v| v.as_str()) != Some(expected_head) {
+            return Err("PR head changed while observing queue arm".into());
+        }
+        Ok(value.get("labels").and_then(|v| v.as_array()).is_some_and(|labels| {
+            labels.iter().any(|label| label.get("name").and_then(|v| v.as_str()) == Some(MERGE_QUEUE_ARM_LABEL))
+        }))
+    }
+
     fn merge_observation(
         &self,
         number: u64,
