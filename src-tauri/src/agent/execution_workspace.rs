@@ -637,6 +637,14 @@ async fn load_canonical_pr_reference(
     pool: &SqlitePool,
     candidate: &CleanupCandidate,
 ) -> Result<Option<CanonicalPrReference>> {
+    load_canonical_pr_reference_with_identity(pool, candidate, true).await
+}
+
+async fn load_canonical_pr_reference_with_identity(
+    pool: &SqlitePool,
+    candidate: &CleanupCandidate,
+    require_local_identity: bool,
+) -> Result<Option<CanonicalPrReference>> {
     let has_table: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
     )
@@ -668,12 +676,12 @@ async fn load_canonical_pr_reference(
     .await?;
 
     for row in rows {
-        if row.workspace_path != candidate.worktree_path
+        if (require_local_identity && (row.workspace_path != candidate.worktree_path
             || row.worktree_identity != candidate.worktree_identity
             || row.repo_identity != candidate.repo_identity
             || row.head_branch != candidate.branch_name
             || row.expected_head_sha != candidate.head_sha
-            || row.canonical_head_sha != candidate.head_sha
+            || row.canonical_head_sha != candidate.head_sha))
             || row.canonical_pr_number <= 0
             || row.canonical_pr_url.trim().is_empty()
         {
@@ -1186,7 +1194,11 @@ async fn reconcile_parked_delivery_progress(
         "SELECT w.id, w.objective_id, w.repo_identity, w.repo_root, w.git_common_dir,
                 w.worktree_path, w.worktree_identity, w.branch_name, w.head_sha
          FROM execution_workspaces w JOIN objectives o ON o.id=w.objective_id
-         WHERE o.status IN ('waiting_system','cancelled') AND w.state IN ('active','delivering','cleanup_pending')
+         WHERE (o.status IN ('waiting_system','cancelled','failed')
+                OR (o.status='completed' AND EXISTS (
+                    SELECT 1 FROM delivery_runs broken WHERE broken.objective_id=o.id
+                    AND broken.status IN ('failed','cancelled','platform_incident'))))
+           AND w.state IN ('active','delivering','cleanup_pending','closed','incident')
            AND w.head_sha IS NOT NULL AND w.worktree_identity IS NOT NULL
            AND EXISTS (SELECT 1 FROM delivery_runs r WHERE r.objective_id=o.id
                AND r.canonical_pr_number IS NOT NULL
@@ -1196,7 +1208,8 @@ async fn reconcile_parked_delivery_progress(
     let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('objectives')")
         .fetch_all(pool).await?;
     for candidate in candidates {
-        let Some(reference) = load_canonical_pr_reference(pool, &candidate).await? else { continue; };
+        // Read-only remote truth does not grant replay or cleanup authority.
+        let Some(reference) = load_canonical_pr_reference_with_identity(pool, &candidate, false).await? else { continue; };
         let state = observer.observe(Path::new(&candidate.repo_root), reference.canonical_pr_number,
             &reference.canonical_pr_url, &reference.canonical_head_sha).await;
         let (stage, status, reached, merged) = match &state {
@@ -1208,6 +1221,9 @@ async fn reconcile_parked_delivery_progress(
         };
         let objective_status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
             .bind(&candidate.objective_id).fetch_one(pool).await?;
+        if matches!(objective_status.as_str(), "failed" | "completed") && !merged {
+            continue; // Historical terminal settlements need positive merge evidence.
+        }
         if objective_status == "cancelled" {
             // Historical false cancellation is corrected only by positive merge
             // evidence, never by an open/unknown PR or a real stop request.
@@ -1239,9 +1255,10 @@ async fn reconcile_parked_delivery_progress(
             "UPDATE delivery_runs SET reached_ceiling=?{}{} WHERE id=? AND claim_epoch=? AND expected_head_sha=?
                AND canonical_head_sha=? AND canonical_pr_number=?
                AND (lease_expires_at IS NULL OR lease_expires_at<=?)
-               AND NOT (status='waiting' AND stage=? AND reached_ceiling=?)
+               AND NOT (stage=? AND reached_ceiling=? AND status IN ('waiting','completed'))
                AND (reached_ceiling IN ('local','committed','pushed','pr_open')
-                    OR ? IN ('merge_queued','merged'))",
+                    OR (?='merge_queued' AND reached_ceiling='merge_queued')
+                    OR (?='merged' AND reached_ceiling NOT IN ('release_triggered','deployment_succeeded','live_verified')))",
             if has("stage") { ", stage=?" } else { "" },
             if has("status") { ", status=?, wait_class=?, next_action=NULL, failure_signature=NULL" } else { "" },
         );
@@ -1257,7 +1274,7 @@ async fn reconcile_parked_delivery_progress(
         // were reading the provider; this path never grants mutation authority.
         let changed = run_query.bind(&reference.run_id).bind(reference.claim_epoch)
             .bind(&reference.expected_head_sha).bind(&reference.canonical_head_sha)
-            .bind(reference.canonical_pr_number).bind(now).bind(stage).bind(reached).bind(reached)
+            .bind(reference.canonical_pr_number).bind(now).bind(stage).bind(reached).bind(reached).bind(reached)
             .execute(&mut *tx).await?;
         if changed.rows_affected() == 0 { continue; }
         let evidence = serde_json::json!({"pr_number": reference.canonical_pr_number,
@@ -1302,7 +1319,7 @@ async fn reconcile_parked_delivery_progress(
         let pointer = if columns.iter().any(|c| c == "delivery_run_id") {
             " AND delivery_run_id=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)"
         } else { "" };
-        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ('waiting_system','cancelled'){pointer}", sets.join(","));
+        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ('waiting_system','cancelled','failed','completed'){pointer}", sets.join(","));
         let mut query = sqlx::query(&statement).bind(&candidate.objective_id);
         if !pointer.is_empty() { query = query.bind(&reference.run_id).bind(now); }
         if query.execute(&mut *tx).await?.rows_affected() != 1 { continue; }
@@ -4506,6 +4523,60 @@ mod tests {
         assert_eq!(acceptance.as_deref(), Some("merged"));
         assert_eq!(outcome.closed, 1);
         assert!(!workspace.worktree_path.exists());
+    }
+
+    #[tokio::test]
+    async fn m74_remote_merge_repairs_failed_cancelled_and_incident_with_stale_workspace() {
+        for (index, status) in ["failed", "cancelled", "platform_incident"].iter().enumerate() {
+            let (_temp, root, _remote, container) = init_repo();
+            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+            crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
+                crate::agent::objective::CreateObjective {
+                    id: "synthetic-m74".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
+                    session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
+                    requested_acceptance: "delivery_receipt".into(), created_surface: "synthetic-test".into(),
+                },
+            ).await.unwrap();
+            let workspace = allocate_or_attach(&pool,
+                request_for(&root, &container, "synthetic-m74", "process-a"),
+            ).await.unwrap();
+            record_open_canonical_pr(&pool, &workspace, 174 + index as i64, "through_merge").await;
+            sqlx::query("UPDATE delivery_runs SET status=?, stage='takeover_reconciliation', reached_ceiling='merged', failure_signature='takeover_reconciliation:delivery_identity_conflict', lease_owner=NULL, lease_expires_at=NULL")
+                .bind(status).execute(&pool).await.unwrap();
+            sqlx::query("UPDATE objectives SET status='failed', decision_type='failed_internal', failure_code='technical_recovery_exhausted', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
+                .execute(&pool).await.unwrap();
+            // Local identity is no longer suitable for mutation replay. In the
+            // last case closeout has already removed the worktree altogether.
+            sqlx::query("UPDATE execution_workspaces SET head_sha='stale-local-head', worktree_identity='stale-local-identity', state=?, lease_owner=NULL, lease_expires_at=NULL")
+                .bind(if index == 2 { "closed" } else { "delivering" }).execute(&pool).await.unwrap();
+            if index == 2 {
+                git(&root, &["worktree", "remove", workspace.worktree_path.to_str().unwrap()]);
+            }
+            let before: (String, String, i64) = sqlx::query_as(
+                "SELECT o.status,r.status,o.revision FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
+            ).fetch_one(&pool).await.unwrap();
+            super::reconcile_parked_delivery_progress(&pool,
+                &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Unknown("offline".into()))]), "m74-restart",
+            ).await.unwrap();
+            let unknown: (String, String, i64) = sqlx::query_as(
+                "SELECT o.status,r.status,o.revision FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
+            ).fetch_one(&pool).await.unwrap();
+            assert_eq!(unknown, before, "R9: uncertainty must leave history unchanged");
+            for _ in 0..2 {
+                super::reconcile_parked_delivery_progress(&pool,
+                    &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m74-merge".into() })]), "m74-restart",
+                ).await.unwrap();
+                let repaired: (String, Option<String>, String, String, Option<String>, i64) = sqlx::query_as(
+                    "SELECT o.status,o.failure_code,r.status,r.reached_ceiling,r.failure_signature,o.revision FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
+                ).fetch_one(&pool).await.unwrap();
+                assert_eq!(repaired.0, "completed", "R8: repair historical objective failure");
+                assert_eq!(repaired.1, None);
+                assert_eq!(repaired.2, "completed", "R7: local drift is not a platform incident");
+                assert_eq!(repaired.3, "merged");
+                assert_eq!(repaired.4, None);
+                assert_eq!(repaired.5, before.2 + 1, "R9: repeated merge observation is idempotent");
+            }
+        }
     }
 
     #[tokio::test]

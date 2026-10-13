@@ -99,3 +99,11 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 - R8 的验收口径只认 `objectives.kind` 与 `delivery_runs.requested_ceiling`：`live` 或
   `through_release` 等更高请求不会被 merge 观察直接判成完成。
 
+### M74 返修实施记录（CF-TRUTH-R7/R8/R9）
+- 合成 SQLite + 临时 Git 仓库复现历史 `failed` / `cancelled` / `platform_incident`，包含本地身份漂移与工作区已关闭/清理；先看到 `failed != completed` 断言失败。
+- 只读 canonical PR 查询不再以工作区当前 identity/head 作为观察前提；清理仍使用原严格身份校验，远端观察不会授予 mutation 权限。
+- 后台纳入历史失败、错误交付终态与 closed/incident 工作区。仅正向合并证据可纠正历史终态；离线、Unknown、关闭未合并与更早状态不回退，重复观察不递增 objective revision。
+- replay 身份冲突只有在已确认 merged（或更高交付里程碑）时保留只读等待；PR 编号本身不是合并证据，未确认合并的外来身份仍按原有界 fail-closed 门禁收敛到 failed。已有真实停止记录仍保留；live/release 请求仍须真实验收。
+- 测试：`m74_remote_merge_repairs_failed_cancelled_and_incident_with_stale_workspace`、`local_takeover_identity_conflict_has_a_stable_bounded_recovery_signature`；原 M71/M72 与严格清理回归保留。
+- 本任务不读写生产数据库，不改会话内容，不新增 schema、workflow 或场景注册表。新版真机核对 SQL 见 PR body；本次仅授权合并，不宣称已发布或真机验收通过。
+

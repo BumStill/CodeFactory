@@ -1239,10 +1239,12 @@ pub async fn reconcile_delivery_run_identity(
         // Already reconciled; idempotent no-op.
         return Ok(());
     }
-    if previous_head == run.expected_head_sha {
-        return Err(crate::errors::AppError::Other(
-            "delivery identity revision must move the expected head".into(),
-        ));
+    if previous_head == run.expected_head_sha
+        && previous_digest == run.change_set_digest
+    {
+        // Idempotent no-op handling is above; a digest-only advance below is
+        // still a legitimate same-worktree revision (CF-TRUTH-R6).
+        return Ok(());
     }
 
     if revision.receipt_id != delivery_identity_revision_receipt_id(&run.id, revision)
@@ -3936,8 +3938,14 @@ mod tests {
         assert_eq!(digest, "digest-a");
     }
 
+    /// CF-TRUTH-R6: continuing the same delivery in the same worktree with a new
+    /// change-set is a legitimate advance (the delivery tool has not committed
+    /// it yet), so its identity is reconciled by receipt instead of being
+    /// reported as a foreign identity. A genuinely foreign worktree still fails
+    /// closed. Before R6 this asserted that any digest-only advance was an
+    /// error, which is exactly the false "identity collision" R5/R6 removed.
     #[tokio::test]
-    async fn reconcile_requires_the_expected_head_to_actually_move() {
+    async fn reconcile_accepts_a_same_worktree_change_set_advance_and_refuses_a_foreign_worktree() {
         let pool = pool().await;
         let process = ProcessIdentity::new("process", "1.80.3", "18003");
         let original = NewDeliveryRun {
@@ -3984,10 +3992,39 @@ mod tests {
             next_change_set_digest: "digest-b".into(),
         };
         revision.receipt_id = delivery_identity_revision_receipt_id(&not_moved.id, &revision);
-        let error = reconcile_delivery_run_identity(&pool, &not_moved, &process, 200, &revision)
+        reconcile_delivery_run_identity(&pool, &not_moved, &process, 200, &revision)
             .await
-            .expect_err("an identity revision must move the expected head");
-        assert!(error.to_string().contains("must move the expected head"));
+            .expect("R6: a same-worktree change-set advance is a revision, not a conflict");
+        let (head, digest): (String, String) = sqlx::query_as(
+            "SELECT expected_head_sha, change_set_digest FROM delivery_runs WHERE id=?",
+        )
+        .bind(&not_moved.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(head, "aaa", "the same-worktree advance keeps the durable head");
+        assert_eq!(digest, "digest-b");
+
+        // The safety boundary is unchanged: a foreign worktree is still refused.
+        let mut foreign = original.clone();
+        foreign.change_set_digest = "digest-c".into();
+        foreign.worktree_identity = "worktree:someone-else".into();
+        let mut foreign_revision = DeliveryIdentityRevision {
+            receipt_id: String::new(),
+            objective_id: foreign.objective_id.clone(),
+            repo_identity: foreign.repo_identity.clone(),
+            worktree_identity: foreign.worktree_identity.clone(),
+            previous_expected_head_sha: "aaa".into(),
+            previous_change_set_digest: "digest-b".into(),
+            next_expected_head_sha: "aaa".into(),
+            next_change_set_digest: "digest-c".into(),
+        };
+        foreign_revision.receipt_id =
+            delivery_identity_revision_receipt_id(&foreign.id, &foreign_revision);
+        let error = reconcile_delivery_run_identity(&pool, &foreign, &process, 300, &foreign_revision)
+            .await
+            .expect_err("a foreign worktree must stay a collision");
+        assert!(error.to_string().contains("identity collision"), "{error}");
     }
 
     #[tokio::test]

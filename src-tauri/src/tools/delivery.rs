@@ -1141,9 +1141,13 @@ async fn reconcile_advanced_delivery_run_identity(
             && existing.try_get::<String, _>("head_branch")? == run.head_branch
             && delivery_run::delivery_ceiling_allows_resume(
                 &existing.try_get::<String, _>("requested_ceiling")?, &run.requested_ceiling);
-    if !non_head_matches
-        || !delivery_is_forward_advance(repo_root, &existing_head, &run.expected_head_sha)?
-    {
+    // CF-TRUTH-R6: continuing the same delivery in the same worktree with a new
+    // pending change-set is a legitimate advance, not a foreign identity. Only
+    // a rewritten head (or a different objective/worktree/repo/branch) stays a
+    // conflict and is left to `create_delivery_run`'s guard.
+    let head_advances = existing_head == run.expected_head_sha
+        || delivery_is_forward_advance(repo_root, &existing_head, &run.expected_head_sha)?;
+    if !non_head_matches || !head_advances {
         // Genuine conflict (or not a forward advance): let create_delivery_run
         // apply the existing identity-collision guard.
         return Ok(());
@@ -1907,7 +1911,7 @@ fn local_takeover_identity_conflict_observation(
     DeliveryObservation {
         head_branch: claimed.head_branch.clone(),
         stage: "takeover_reconciliation".into(),
-        status: "platform_incident".into(),
+        status: "waiting".into(),
         wait_class: Some("delivery_identity_conflict".into()),
         next_action: Some("await_system_capability_change".into()),
         reached_ceiling: claimed.reached_ceiling.clone(),
@@ -2942,48 +2946,40 @@ async fn record_or_park_local_takeover_identity_conflict(
     claimed: &delivery_run::ClaimedRecovery,
     process: &ProcessIdentity,
 ) -> Result<()> {
-    let failure = local_takeover_identity_conflict_observation(claimed);
-    let signature = failure.failure_signature.as_deref().ok_or_else(|| {
-        crate::errors::AppError::Other("delivery identity conflict has no signature".into())
-    })?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let attempt = delivery_run::next_delivery_failure_attempt(
+    let mut failure = local_takeover_identity_conflict_observation(claimed);
+    // A PR number alone is not merge evidence. Genuine foreign identities
+    // retain the original bounded fail-closed path until merge is confirmed.
+    if !matches!(claimed.reached_ceiling.as_str(),
+        "merged" | "release_triggered" | "deployment_succeeded" | "live_verified") {
+        failure.status = "platform_incident".into();
+        let signature = failure.failure_signature.as_deref().ok_or_else(|| {
+            crate::errors::AppError::Other("delivery identity conflict has no signature".into())
+        })?;
+        let attempt = delivery_run::next_delivery_failure_attempt(
+            db, &claimed.run_id, process, claimed.claim_epoch, signature,
+            chrono::Utc::now().timestamp_millis(),
+        ).await?;
+        if attempt >= delivery_run::MAX_IDENTICAL_TAKEOVER_FAILURES {
+            ObjectiveStore::new(db.clone())
+                .park_delivery_identity_incident_after_takeover(
+                    &claimed.objective_id, &claimed.run_id, process,
+                    claimed.claim_epoch, signature, attempt,
+                ).await.map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+            return Ok(());
+        }
+    }
+    // A replay failure cannot establish a platform failure for a canonical PR.
+    // Keep mutation fenced; the independent observer settles remote progress.
+    delivery_run::record_delivery_observation(
         db,
         &claimed.run_id,
         process,
         claimed.claim_epoch,
-        signature,
-        now,
+        &failure,
+        chrono::Utc::now().timestamp_millis(),
+        DELIVERY_LEASE_TTL_MS,
     )
     .await?;
-    if attempt >= delivery_run::MAX_IDENTICAL_TAKEOVER_FAILURES {
-        ObjectiveStore::new(db.clone())
-            .park_delivery_identity_incident_after_takeover(
-                &claimed.objective_id,
-                &claimed.run_id,
-                process,
-                claimed.claim_epoch,
-                signature,
-                attempt,
-            )
-            .await
-            .map_err(|error| {
-                crate::errors::AppError::Other(format!(
-                    "delivery identity conflict could not atomically park its objective: {error}"
-                ))
-            })?;
-    } else {
-        delivery_run::record_delivery_observation(
-            db,
-            &claimed.run_id,
-            process,
-            claimed.claim_epoch,
-            &failure,
-            now,
-            DELIVERY_LEASE_TTL_MS,
-        )
-        .await?;
-    }
     Ok(())
 }
 
@@ -5177,6 +5173,7 @@ mod tests {
         };
 
         let observation = local_takeover_identity_conflict_observation(&claimed);
+        assert_eq!(observation.status, "waiting", "R7: replay identity conflict is not a platform incident");
         assert_eq!(
             observation.wait_class.as_deref(),
             Some("delivery_identity_conflict")
