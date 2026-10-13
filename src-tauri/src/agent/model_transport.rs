@@ -457,6 +457,25 @@ impl RoutedDesktopModelTransport {
         if active_root.is_empty() {
             return Ok(false);
         }
+        // M79: ownership is durable before (and independently of) its UI
+        // projection. A restart or a newly admitted user root can leave that
+        // projection absent while the same objective already has a valid binding.
+        let bound: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_bindings b
+             JOIN objectives o ON o.id=b.objective_id
+             WHERE o.id=? AND o.session_id=?
+               AND b.resource_kind='chat_root_turn' AND b.resource_id=?
+               AND o.status NOT IN ('completed','cancelled','failed','legacy_orphan')",
+        )
+        .bind(objective_id)
+        .bind(self.session_id.as_str())
+        .bind(&active_root)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|error| provider_transport_error("reconcile durable remediation binding", error))?;
+        if bound > 0 {
+            return Ok(true);
+        }
         let has_turn_state: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master
              WHERE type='table' AND name='chat_turn_state'",
@@ -564,36 +583,9 @@ impl RoutedDesktopModelTransport {
                 // recovery budget on a deterministic error. Reconcile instead:
                 // ask the Objective which turn is live, and only an
                 // undecidable identity stops the run.
-                let active_root = objective_root.clone().unwrap_or_default();
-                let has_turn_state: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM sqlite_master
-                     WHERE type='table' AND name='chat_turn_state'",
-                )
-                .fetch_one(&self.db)
-                .await
-                .map_err(|error| provider_transport_error("reconcile remediation turn", error))?;
-                let superseded = if has_turn_state == 1 && !active_root.is_empty() {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM chat_turn_state turn
-                         JOIN objectives objective ON objective.id=turn.objective_id
-                         WHERE turn.objective_id=? AND turn.root_turn_id=?
-                           AND turn.session_id=?
-                           AND turn.status NOT IN ('completed','cancelled')
-                           AND objective.status NOT IN
-                               ('completed','cancelled','failed','legacy_orphan')",
-                    )
-                    .bind(&permit.objective_id)
-                    .bind(&active_root)
-                    .bind(self.session_id.as_str())
-                    .fetch_one(&self.db)
-                    .await
-                    .map_err(|error| {
-                        provider_transport_error("reconcile remediation turn", error)
-                    })?
-                        == 1
-                } else {
-                    false
-                };
+                let superseded = self
+                    .stale_remediation_is_superseded_by_live_turn(&permit.objective_id)
+                    .await?;
                 return Err(TransportError::Fatal(if superseded {
                     "PROVIDER_DURABLE_IDENTITY_SUPERSEDED: remediation superseded by the objective's current turn".into()
                 } else {
@@ -3500,6 +3492,40 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
         );
     }
 
+    #[tokio::test]
+    async fn m79_handoff_uses_durable_binding_before_projection_and_after_restart() {
+        for suffix in ["m79-new-user", "m79-restart"] {
+            let (pool, session_id, root) = durable_reprompt_fixture(suffix).await;
+            let transport = RoutedDesktopModelTransport {
+                http: test_client(),
+                events: Arc::new(super::super::events::CollectingEventSink::new()),
+                session_id,
+                route_state: ActiveRouteState::from_plan_with_health(
+                    super::super::failover::RouteCandidatePlan::new(openai_candidate(
+                        "synthetic-provider", "synthetic-model", "http://127.0.0.1:1".into(),
+                    )),
+                    super::super::failover::EndpointHealthRegistry::new(std::time::Duration::from_secs(120)),
+                ),
+                cancel: None,
+                turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
+                turn_uncommitted_side_effect: Arc::new(AtomicBool::new(false)),
+                db: pool.clone(),
+                root_turn_id: Some(root),
+                mutation_permit: None,
+                context_authorization: None,
+                anonymous: false,
+                durable_provider_required: true,
+            };
+            let objective_id = format!("reprompt-{suffix}-objective");
+            assert!(transport.stale_remediation_is_superseded_by_live_turn(&objective_id).await.unwrap(),
+                "a durable same-task binding must hand over without requiring the UI projection");
+            sqlx::query("UPDATE objectives SET session_id='different-synthetic-session' WHERE id=?")
+                .bind(&objective_id).execute(&pool).await.unwrap();
+            assert!(!transport.stale_remediation_is_superseded_by_live_turn(&objective_id).await.unwrap(),
+                "a different session must not inherit the remediation");
+        }
+    }
+
     async fn durable_context_transport_fixture() -> (
         SqlitePool,
         crate::agent::objective::ObjectiveSnapshot,
@@ -3800,6 +3826,10 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             .execute(&pool)
             .await
             .unwrap();
+        // M79: absence of the UI projection alone is recoverable. The negative
+        // control must also remove the durable same-task handoff binding.
+        sqlx::query("DELETE FROM objective_bindings WHERE id='reprompt-restart-continue-binding-new'")
+            .execute(&pool).await.unwrap();
         let unavailable = stale
             .resolve_provider_owner()
             .await
@@ -3818,7 +3848,23 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
         .execute(&pool)
         .await
         .unwrap();
-
+        // Restore the durable handoff the negative control removed; the
+        // continuation must resolve this binding, not the UI projection.
+        sqlx::query(
+            "INSERT OR REPLACE INTO objective_bindings
+             (id, objective_id, domain, resource_kind, resource_id,
+              resource_generation, identity_digest, resume_cursor, created_at, updated_at)
+             VALUES ('reprompt-restart-continue-binding-new',
+                     'reprompt-restart-continue-objective', 'chat', 'chat_root_turn', ?, 1,
+                     'sha256:restart-binding-new', ?, ?, ?)",
+        )
+        .bind(&live_turn)
+        .bind(&live_turn)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
         // The continuation itself must still run: resolve its own owner and
         // issue a real provider request.
         let (base_url, hits) = serve_responses(vec![(

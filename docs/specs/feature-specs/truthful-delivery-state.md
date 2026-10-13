@@ -124,6 +124,32 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 - 无 Spec Amendment；本轮仅合并交付，安装新版后的真机核对由独立发布任务完成。
 
 
+## M79 返修：补救回合遇到「会话 / 根回合已变」时不能把任务判死
+
+规格（来自任务说明，逐字记录）：
+
+背景与用户决策：补救回合进行中，同会话来了新的用户消息并开始了新的 root turn，或应用在补救进行中重启时，旧实现把 `PROVIDER_DURABLE_IDENTITY_MISMATCH: remediation session/root changed` 归为 `chat_identity_unreconcilable` 失败终态。真机证据（v1.87.5，会话 7d22dc5c，objective 4946d379）：工作区改动完好、续派后会话还能接着做，用户看到的却是「失败」。
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| M79-R1 | 用合成数据复现两种时序（补救进行中来了新用户消息并开新 root turn；补救进行中应用重启），断言 objective 不以 `chat_identity_unreconcilable` 结束为 failed | 先失败的回归测试 |
+| M79-R2 | 新的用户回合到来时旧补救回合让位：作废或合并进新回合，objective 归新回合继续，并如实记录「补救被新的用户指令取代」 | 合成 SQLite 断言 |
+| M79-R3 | 重启后由新进程接管：接着跑，或在真不可恢复时写明原因 | 合成回归：绑定仍在的续跑；绑定消失仍然 fail closed |
+| M79-R4 | 只有真的换了会话 / 任务时才可判不可恢复，并在会话里写明原因和成果所在位置 | 反例断言 |
+| M80-R1 | 排队的消息不能排在一个已经不会再推进的 current_run 后面；`current_run` 已停摆时队列消息直接开始执行 | 前端派单验收 + 后端运行权威断言 |
+
+### Implementation Notes（M79/M80）
+
+- 交接的第一判据从「界面/投影里有活跃回合」改为**持久绑定**：`stale_remediation_is_superseded_by_live_turn` 先按 `objective_bindings(resource_kind='chat_root_turn', resource_id=该 objective 的 live turn)` + 同一 session + objective 非终态判定。投影（`chat_turn_state`）只在没有持久绑定时才作为次判据，因此重启后尚未重建投影、或新用户回合刚刚接管的情形都能交接。
+- 反例保留：会话变了、objective 终态、或既无绑定又无活跃回合时，仍返回 fail-closed 的 `PROVIDER_DURABLE_IDENTITY_MISSING`。
+- 过期补救 runner 结算时不再 `UPDATE objective_remediations ... WHERE objective_id=?`（那会连带作废新回合的恢复记录），改为按 `id + objective_id + lease_owner + claim_epoch + status='claimed'` 比较并仅作废自己；并把投影根切到 `COALESCE(resume_cursor, root_turn_id)`。该分支同时放宽了「先比 revision」的顺序，使已被用户接管（revision 已前进）的 runner 报告交接而不是抛 stale revision。
+- `is_chat_running` 改为 `has_progressing_system_chat_run`：`waiting_system` 且 `next_observation_at` 已过期、也没有有效 claimed 租约时不再算「正在运行」，后台入口 `dispatchSend` 在投递前用该权威标志纠正本地 `streaming` 残留，于是过期排队消息直接开新回合，而不是排在一个不会再推进的 run 后面。
+- 未改变 `chat_identity_unreconcilable` 的语义：真的换会话/换任务时仍收敛到该终态并给出可读原因。
+
+- 合成回归（全部临时 SQLite，不触生产数据）：`agent::model_transport::tests::m79_handoff_uses_durable_binding_before_projection_and_after_restart`（先失败）、`commands::chat::tests::m80_expired_wait_does_not_block_but_future_retry_and_claim_do`、`src/lib/dispatchActions.test.ts` 的 M80 用例（先失败）；既有 `a_stale_remediation_after_restart_lets_the_continuation_run` 继续覆盖「绑定消失仍 fail closed + 接管方真的发出模型请求」。
+- 不读写生产数据库，不改 `.github/`、场景注册表与校验器。仅授权合并，不宣称已发布或真机验收通过。
+
+
 ## M74c 返修：已合并的交付在真机上仍无法结算（R7/R8/R9 第三轮）
 
 真机 v1.87.4 证据（2026-10-13 13:43:34 对账）：#573、#616、#635 仍写成

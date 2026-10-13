@@ -210,8 +210,29 @@ export async function dispatchSend(
   const timeoutMs = options.timeoutMs ?? DISPATCH_DELIVERY_TIMEOUT_MS;
   const steerAppliedTimeoutMs =
     options.steerAppliedTimeoutMs ?? DISPATCH_STEER_APPLIED_TIMEOUT_MS;
-  const before = runtimeOf(session.id);
-  const state = sessionTurnStateOf(session);
+  let before = runtimeOf(session.id);
+  let state = sessionTurnStateOf(session);
+  if (state.running) {
+    const backendRunning = await withDeadline(
+      invoke<boolean>("is_chat_running", { sessionId: session.id }),
+      timeoutMs,
+      `session ${session.id}'s run ownership could not be checked`,
+    );
+    if (backendRunning === false) {
+      // M80: do not queue behind a stopped provider or stale streaming bucket.
+      useChatStore.setState((store) => ({
+        runtime: {
+          ...store.runtime,
+          [session.id]: { ...store.runtime[session.id], streaming: false },
+        },
+        sessions: store.sessions.map((item) => item.id === session.id ? { ...item, is_running: false } : item),
+        activeSession: store.activeSession?.id === session.id
+          ? { ...store.activeSession, is_running: false } : store.activeSession,
+      }));
+      before = runtimeOf(session.id);
+      state = sessionTurnStateOf({ ...session, is_running: false });
+    }
+  }
 
   if (state.running) {
     if (input.mode === "queue") {
