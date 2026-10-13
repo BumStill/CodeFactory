@@ -1180,7 +1180,7 @@ pub(crate) async fn run_cleanup_pass(
 /// remote-backed observer so an externally-merged PR is settled too (CF-CLO-R1).
 /// Read-only progress reconciliation is independent of mutation takeover. A
 /// failed intent check must not hide a PR opened/armed by later session steps.
-async fn reconcile_parked_delivery_progress(
+pub(crate) async fn reconcile_parked_delivery_progress(
     pool: &SqlitePool,
     observer: &dyn CanonicalPrObserver,
     owner: &str,
@@ -1194,7 +1194,7 @@ async fn reconcile_parked_delivery_progress(
         "SELECT w.id, w.objective_id, w.repo_identity, w.repo_root, w.git_common_dir,
                 w.worktree_path, w.worktree_identity, w.branch_name, w.head_sha
          FROM execution_workspaces w JOIN objectives o ON o.id=w.objective_id
-         WHERE (o.status IN ('waiting_system','cancelled','failed')
+         WHERE (o.status IN ('running','waiting_system','cancelled','failed')
                 OR (o.status='completed' AND EXISTS (
                     SELECT 1 FROM delivery_runs broken WHERE broken.objective_id=o.id
                     AND broken.status IN ('failed','cancelled','platform_incident'))))
@@ -1224,18 +1224,12 @@ async fn reconcile_parked_delivery_progress(
         if matches!(objective_status.as_str(), "failed" | "completed") && !merged {
             continue; // Historical terminal settlements need positive merge evidence.
         }
-        if objective_status == "cancelled" {
-            // Historical false cancellation is corrected only by positive merge
-            // evidence, never by an open/unknown PR or a real stop request.
-            if !merged { continue; }
-            if columns.iter().any(|c| c == "session_id") {
-                let stopped: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM objectives o JOIN chat_session_cancel_intents i ON i.session_id=o.session_id
-                     WHERE o.id=? AND (i.status='requested' OR COALESCE(i.settled_at,i.requested_at)>=o.created_at)",
-                ).bind(&candidate.objective_id).fetch_one(pool).await?;
-                if stopped > 0 { continue; }
-            }
+        if objective_status == "cancelled" && !merged {
+            continue;
         }
+        // Positive merge evidence settles delivery-only acceptance even after
+        // a real stop. This read-only settlement never resumes stopped work or
+        // removes its durable stop fence.
         let run_columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('delivery_runs')")
             .fetch_all(pool).await?;
         let has = |column: &str| run_columns.iter().any(|name| name == column);
@@ -1260,7 +1254,7 @@ async fn reconcile_parked_delivery_progress(
                     OR (?='merge_queued' AND reached_ceiling='merge_queued')
                     OR (?='merged' AND reached_ceiling NOT IN ('release_triggered','deployment_succeeded','live_verified')))",
             if has("stage") { ", stage=?" } else { "" },
-            if has("status") { ", status=?, wait_class=?, next_action=NULL, failure_signature=NULL" } else { "" },
+            if has("status") { format!(", status=?, wait_class=?, next_action=NULL, failure_signature=NULL{}{}{}", if has("failure_code") { ", failure_code=NULL" } else { "" }, if has("failure_class") { ", failure_class=NULL" } else { "" }, if has("next_action_authorized") && merged { ", next_action_authorized=0" } else { "" }) } else { String::new() },
         );
         let mut run_query = sqlx::query(&run_statement).bind(reached);
         if has("stage") { run_query = run_query.bind(stage); }
@@ -1319,7 +1313,7 @@ async fn reconcile_parked_delivery_progress(
         let pointer = if columns.iter().any(|c| c == "delivery_run_id") {
             " AND delivery_run_id=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)"
         } else { "" };
-        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ('waiting_system','cancelled','failed','completed'){pointer}", sets.join(","));
+        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ('running','waiting_system','cancelled','failed','completed'){pointer}", sets.join(","));
         let mut query = sqlx::query(&statement).bind(&candidate.objective_id);
         if !pointer.is_empty() { query = query.bind(&reference.run_id).bind(now); }
         if query.execute(&mut *tx).await?.rows_affected() != 1 { continue; }
@@ -4527,7 +4521,7 @@ mod tests {
 
     #[tokio::test]
     async fn m74_remote_merge_repairs_failed_cancelled_and_incident_with_stale_workspace() {
-        for (index, status) in ["failed", "cancelled", "platform_incident"].iter().enumerate() {
+        for (index, (status, reached)) in [("failed", "pr_open"), ("cancelled", "ci_green"), ("platform_incident", "pr_open"), ("failed", "merged"), ("cancelled", "merged"), ("stopped", "pr_open")].iter().enumerate() {
             let (_temp, root, _remote, container) = init_repo();
             let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
             crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
@@ -4541,10 +4535,18 @@ mod tests {
                 request_for(&root, &container, "synthetic-m74", "process-a"),
             ).await.unwrap();
             record_open_canonical_pr(&pool, &workspace, 174 + index as i64, "through_merge").await;
-            sqlx::query("UPDATE delivery_runs SET status=?, stage='takeover_reconciliation', reached_ceiling='merged', failure_signature='takeover_reconciliation:delivery_identity_conflict', lease_owner=NULL, lease_expires_at=NULL")
-                .bind(status).execute(&pool).await.unwrap();
-            sqlx::query("UPDATE objectives SET status='failed', decision_type='failed_internal', failure_code='technical_recovery_exhausted', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
-                .execute(&pool).await.unwrap();
+            sqlx::query("UPDATE delivery_runs SET status=?, stage='takeover_reconciliation', reached_ceiling=?, failure_signature='takeover_reconciliation:delivery_identity_conflict', lease_owner=NULL, lease_expires_at=NULL")
+                .bind(status).bind(reached).execute(&pool).await.unwrap();
+            sqlx::query("UPDATE objectives SET status=?, decision_type=CASE WHEN ?='cancelled' THEN 'cancelled' ELSE 'failed_internal' END, cancellation_provenance=CASE WHEN ?='cancelled' THEN 'explicit_cancel' ELSE NULL END, completed_at=1, failure_code='technical_recovery_exhausted', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
+                .bind(if index == 5 { "cancelled" } else { "failed" })
+                .bind(if index == 5 { "cancelled" } else { "failed" })
+                .bind(if index == 5 { "cancelled" } else { "failed" }).execute(&pool).await.unwrap();
+            if index == 5 {
+                sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-stopped-session','synthetic','/tmp/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
+                sqlx::query("UPDATE objectives SET session_id='synthetic-stopped-session'").execute(&pool).await.unwrap();
+                sqlx::query("INSERT INTO chat_session_cancel_intents (session_id,status,requested_at,updated_at) VALUES ('synthetic-stopped-session','requested',1,1)").execute(&pool).await.unwrap();
+                crate::agent::stop_fence::record_stop(&pool, "synthetic-stopped-session", "orchestrator_stop", Some(179)).await.unwrap();
+            }
             // Local identity is no longer suitable for mutation replay. In the
             // last case closeout has already removed the worktree altogether.
             sqlx::query("UPDATE execution_workspaces SET head_sha='stale-local-head', worktree_identity='stale-local-identity', state=?, lease_owner=NULL, lease_expires_at=NULL")
@@ -4575,6 +4577,14 @@ mod tests {
                 assert_eq!(repaired.3, "merged");
                 assert_eq!(repaired.4, None);
                 assert_eq!(repaired.5, before.2 + 1, "R9: repeated merge observation is idempotent");
+                let plan = crate::agent::delivery_run::plan_startup_recovery(&pool,
+                    &crate::agent::delivery_run::ProcessIdentity::new("m74b-recovery", "test", "test"),
+                    chrono::Utc::now().timestamp_millis(), 60_000).await.unwrap();
+                assert!(plan.claimed.is_empty(), "R7: merged settlement must bypass mutation takeover");
+                if index == 5 {
+                    let fences: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_stop_fences WHERE session_id='synthetic-stopped-session'").fetch_one(&pool).await.unwrap();
+                    assert_eq!(fences, 1, "read-only settlement must preserve the stop fence");
+                }
             }
         }
     }

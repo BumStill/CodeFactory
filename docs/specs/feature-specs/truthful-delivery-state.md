@@ -107,3 +107,10 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 - 测试：`m74_remote_merge_repairs_failed_cancelled_and_incident_with_stale_workspace`、`local_takeover_identity_conflict_has_a_stable_bounded_recovery_signature`；原 M71/M72 与严格清理回归保留。
 - 本任务不读写生产数据库，不改会话内容，不新增 schema、workflow 或场景注册表。新版真机核对 SQL 见 PR body；本次仅授权合并，不宣称已发布或真机验收通过。
 
+### M74b 返修实施记录（CF-TRUTH-R7/R8/R9）
+- 恢复 supervisor 在规划 mutation 接管前执行只读 canonical PR 对账；已 claim 的恢复入口也先观察远端，已合并跳过所有本地 replay 身份校验，不确定则释放租约而不制造故障。
+- 合并观察纠正 `failed/pr_open`、`cancelled/ci_green`、`platform_incident/pr_open`、`failed/merged`、`cancelled/merged` 与停止后 `stopped/pr_open`，delivery-only 按 R8 完成；live/release 仍等待真实验收。
+- 真实停止围栏保持不变，正向合并后的只读结算不是恢复执行；取消意图不再阻止已交付事实的结算。清理继续走原严格身份与正向合并证据门禁。
+- 合成回归 `m74_remote_merge_repairs_failed_cancelled_and_incident_with_stale_workspace` 先看到 `cancelled != completed`，修复后断言六类记录完成、重复观察 revision 不变、恢复规划无接管、停止围栏保留。原 M71 不确定/回退与 live/release 回归保留。
+- 无 Spec Amendment；本轮仅合并交付，安装新版后的真机核对由独立发布任务完成。
+
