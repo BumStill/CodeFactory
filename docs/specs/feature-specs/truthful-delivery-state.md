@@ -183,3 +183,56 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 
 反复观察仍幂等：同一合并证据重复观察不再推进 revision；不确定（Unknown/更早状态/已关闭
 未合并）保持原状（R9）。
+
+## M76 / M77 / M81 返修：交付不再挂起无人推进
+
+背景与用户决策（真机证据，2026-10-13，v1.87.4 / v1.87.5）：
+
+- **M81**：两个会话都已在本地提交，调用 `deliver_changes` 后返回「DeliveryRun fencing permit was lost
+  before `git_stage` … epoch 42 … The stale owner issued no later mutation」，随后进入
+  `waiting / external_state_uncertain`「只读核对同一远端对象」。远端既没有分支也没有 PR，工具自己也说
+  「不曾发生写操作」，却挂了 20 分钟，没有任何人或流程推进。
+- **M77**：ceiling=merged 的交付 CI 已全绿，`delivery_runs` 停在
+  `complete | awaiting_completion_arbitration | ci_green`，`merge-queue: armed` 始终没打上，最后由编排方手动打标签。
+- **M76**：PR 正文被传成字面字符串 `$(cat .codefactory-cache/m74c-body.md)`，deliver_changes 既没有展开也没有拒绝；
+  正文文件里写的 `Scenario-Test: none` 也是模板明令禁止的写法。
+
+## Requirements Traceability
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| CF-TRUTH-R10 | 交付在某个 mutation rung 前丢失 permit、且能确认「旧持有者没有发出写操作」时，不得直接进入 `external_state_uncertain` 等待：必须在有界次数内重新取得授权，并从**同一个 rung** 续接同一次交付；只有有界次数用尽才如实报告失败 | 合成测试：permit 先失败后恢复的时序下，同一 rung 的交付继续（断言返回 Ok，且两次验证都发生在同一个 rung）；次数用尽时返回原有 fail-closed 文案 |
+| CF-TRUTH-R11 | `ceiling` 为 through_merge（merged）或更高时，CI 全绿后必须由交付流程自己为 PR 打上 `merge-queue: armed`，不能停在 completion arbitration 等别人来做；打标签失败时在有界次数内重试，并在重试耗尽后如实报告「尚未交给合并队列」 | 纯判定函数断言 + 有界重试驱动：前两次失败、第三次成功时返回第 3 次尝试；全部失败时报告文案含 PR 号、标签名与「尚未交给合并队列」，且调用次数等于预算 |
+| CF-TRUTH-R12 | `deliver_changes` 收到的 PR 正文里如果含未展开的 shell 片段（`$(`、反引号命令替换），或缺少模板 §5 必需字段（`Scenario-Test` 不能是 `none`/散文，`README-Update` 为 `required`/`reviewed` 且带非空 `README-Update-Reason`），直接拒绝并说明应该怎么写；不得用这种正文开 PR | 合成测试：M76 的真实正文先失败（断言返回 Err 且文案给出改法），逐条字段缺失与 shell 片段各一条断言；合规正文通过 |
+
+## Applicable Harnesses
+
+Spec Harness；Compatibility Harness（既有交付阶梯、durable 记录与 stop fence 语义不变）；
+Observation Harness（重试次数、打标签结果与失败原因都可追溯）；AI Collaboration Harness。
+
+## 测试矩阵
+
+- permit 丢失：第一次验证即失败后恢复（成功续接同一 rung）／连续失败到预算用尽（如实失败）。
+- 打标签：owed 与 not-owed 的 ceiling 组合（pr_only / through_ci_green 不 owe；through_merge 起 owe）；
+  重试在第 2、3 次成功；全部失败（文案 + 调用次数）。
+- 正文：未展开 `$(`、反引号、`Scenario-Test: none`、缺 `README-Update`、缺 `README-Update-Reason`、
+  合规正文（对照组）。
+
+## Implementation Notes
+
+以下只记录实现选用的技术位点，不改变任何需求或验收标准。
+
+- **R10 的落点**：`DeliveryMutationPermitVerifier::reacquire`（默认实现：在
+  `DELIVERY_PERMIT_REACQUIRE_ATTEMPTS` 内重新调用 `verify(rung)`，每次都是对 durable 存储的重新读取），
+  `DeliveryMutationPermit::reacquire` 转发，`verify_mutation_permit` 改用它。成功即从原 rung 继续；
+  成功路径不改变既有 verify 调用次数（仍然只验证一次），因此不改变既有 fail-closed 语义。
+- **R11 的落点**：`merge_queue_arm_is_owed`（`ceiling.rank() >= ThroughMerge.rank()`）、
+  `arm_merge_queue_with_bounded_retry`（通过小型 `MergeQueueArmer` 抽象驱动
+  `DeliveryRemote::arm_merge_queue`，便于合成测试），以及 `merge_queue_arm_failure_report`。
+  接线点在 CI 通过之后、merge 阶梯之前，使用的是 `outcome.requested_ceiling`（用户请求的上限），
+  因此即使 effective ceiling 因能力缺口被降级，已请求 merged 的交付仍会自己把绿 PR 交给队列。
+  `merge_pr` 内原有的 best-effort 打标签保留（幂等）。
+- **R12 的落点**：`validate_pr_body_intent`，接线点在 `requested_pr_body` 计算之后、任何远端 mutation 之前。
+  只校验调用方显式给出的正文；未提供正文（沿用自动生成文案）不受影响。工具不代替调用方计算
+  Scenario-Test ID（校验器仍在 `tools/governance/`，本次不修改它），而是在拒绝文案里给出该运行的命令。
+- 仅改后端与本规格；不改 `.github/` 工作流、场景注册表与校验器，不读写生产数据库。授权仅到合并。
