@@ -64,6 +64,15 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
   CF-TRUTH-R1 判定该场景不应成为失败，故该终态在此路由下被停放态取代，失败报告渲染逻辑本身
   保留给其它失败路由。既有测试按新要求更新，未交付仍保留诚实失败文案作为对照。
 
+## M67b 返修实施记录（CF-TRUTH-R1）
+
+- 复现路径：`decision_for_run_outcome(Finished)` 在空 `CompletionEvidence` 下由 objective 验收仲裁转入 `completion_evidence_incomplete`；旧 `bound_system_recovery` 先创建恢复尝试，直到耗尽后才检查 canonical PR。此前测试只覆盖耗尽后的停放，没有覆盖 merged ceiling 首次等待与反复评估。
+- 在预算计算前，按同一 objective 最新交付记录识别 `waiting` / `pr_opened` / `merge_queued` 且已达 `pr_open` / `pr_only` / `merge_queued` 的 canonical PR，立即进入无 owner、无 remediation、无重试的 `delivered_awaiting_ci`。不把已开 PR 当作 merged 或 live 验收。
+- 没有具体未满足检查的已交付时序也不消耗恢复预算；尚未交付的真实验收缺口仍保留原有有界恢复。最新记录为 CI `blocked` 时仍交还 agent 修复，不能用旧等待记录遮蔽红灯。
+- 超过既有 `SIGNATURE_RECOVERY_WINDOW_MS` 无交付进展时，可读文案明确 PR 编号及实际等待分钟数，不改成任务失败；后台 canonical PR 只读观察继续沿用既有对账路径。
+- 合成 SQLite 回归 `m67b_merged_ceiling_wait_never_spends_recovery_attempts`：首次等待先失败（`completion_evidence_incomplete != delivered_awaiting_ci`），修复后连续八次门禁评估、空证据 Finished 路由、外部不确定、交付身份恢复、等待超时、新 CI/队列进展、CI 红灯修复全部断言通过。
+- 仅改后端和本规格；不改 workflow、场景注册表或校验器，不读写生产数据库；授权仅到合并，真机安装验收仍由后续发版任务执行。
+
 ## M72 返修：后台审批保持归属，隔离不得伪装用户停止
 
 背景：本地入口批准一条 bash 审批后，provider 报 owner fenced，旧结算把无停止意图的会话记成 explicit_cancel；此前 PR 已合并。

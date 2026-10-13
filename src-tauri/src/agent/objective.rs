@@ -4961,6 +4961,52 @@ impl ObjectiveStore {
         {
             return Ok(decision);
         }
+        // CF-TRUTH-R1 / M67b: observing an already-open PR waiting on CI is
+        // not a technical recovery attempt. Park before consulting the budget.
+        // A concrete red CI result remains repairable and must not be parked.
+        let pending_pr: Option<(String, i64)> = sqlx::query_as(
+            "SELECT canonical_pr_url, last_progress_at FROM delivery_runs
+             WHERE id=(SELECT id FROM delivery_runs WHERE objective_id=?
+                       ORDER BY updated_at DESC LIMIT 1)
+               AND canonical_pr_url IS NOT NULL
+               AND status IN ('waiting', 'pr_opened', 'merge_queued')
+               AND reached_ceiling IN ('pr_open', 'pr_only', 'merge_queued')",
+        )
+        .bind(&decision.objective_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((url, last_progress_at)) = pending_pr {
+            let reference = pull_request_reference(&url).unwrap_or_else(|| "已经开好的 PR".into());
+            let elapsed = Utc::now().timestamp_millis().saturating_sub(last_progress_at);
+            let prompt = if elapsed >= SIGNATURE_RECOVERY_WINDOW_MS {
+                format!("{reference} 已开出，CI / 合并队列在 {} 分钟内仍未完成；系统已停止重复重试，交付记录会按实际结果更新。", elapsed / 60_000)
+            } else {
+                delivered_awaiting_ci_message(&reference)
+            };
+            decision.decision_type = DecisionType::Waiting;
+            decision.status = ObjectiveStatus::WaitingSystem;
+            decision.failure_code = Some(DELIVERED_AWAITING_CI.into());
+            decision.request_key = None;
+            decision.recovery_owner = None;
+            decision.remediation_id = None;
+            decision.next_observation_at = None;
+            decision.next_action_authorized = false;
+            decision.requires_user_action = false;
+            decision.attention_request = Some(UserAttentionRequest {
+                kind: DELIVERED_AWAITING_CI.into(),
+                prompt,
+                missing_inputs: Vec::new(),
+                attempted_routes: Vec::new(),
+                decision_options: Vec::new(),
+                recommended_option: None,
+                irreversible: false,
+                no_safe_default_reason: None,
+                resume_cursor: decision.resume_cursor.clone(),
+            });
+            return Ok(decision);
+        }
         let signature = decision.failure_signature.clone().unwrap_or_default();
         let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
             "SELECT
@@ -15181,6 +15227,61 @@ CREATE TABLE objectives (
             },
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn m67b_merged_ceiling_wait_never_spends_recovery_attempts() {
+        for code in [COMPLETION_EVIDENCE_INCOMPLETE, "external_state_uncertain", "delivery_identity_conflict"] {
+            let pool = pool().await;
+            settlement_tables(&pool).await;
+            ensure_chat_turn_state_columns(&pool).await;
+            let store = ObjectiveStore::new(pool.clone());
+            completion_gate_fixture(&pool, "m67b", "m67b-turn", code).await;
+            delivery_runs_table(&pool).await;
+            sqlx::query("INSERT INTO delivery_runs (id, objective_id, run_kind, requested_ceiling, reached_ceiling, stage, status, canonical_pr_number, canonical_pr_url, last_observed_at, last_progress_at, app_version, app_build, process_instance, created_at, updated_at) VALUES ('m67b-run', 'm67b', 'objective', 'through_merge', 'pr_open', 'wait_ci', 'waiting', 671, 'https://github.com/example/project/pull/671', 1, 1, 'test', 'test', 'test', 1, 1)").execute(&pool).await.unwrap();
+            sqlx::query("DELETE FROM objective_remediations WHERE objective_id='m67b'").execute(&pool).await.unwrap();
+            let mut current = store.get("m67b").await.unwrap().unwrap();
+            for _ in 0..8 {
+                let mut decision = if code == COMPLETION_EVIDENCE_INCOMPLETE {
+                    decision_for_run_outcome(&current, &RunOutcome {
+                        final_text: "PR #671 已开出，等待 CI".into(),
+                        final_message_id: None,
+                        completion_evidence: CompletionEvidence::default(),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        stop_reason: StopReason::Finished,
+                    }).unwrap()
+                } else {
+                    gate_exhaustion_decision(&current, code)
+                };
+                decision.failure_code = Some(code.into());
+                current = store.apply_decision(current.revision, decision).await.unwrap();
+                assert_eq!(current.failure_code.as_deref(), Some(DELIVERED_AWAITING_CI));
+                assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+                let prompt = &current.attention_request.as_ref().unwrap().prompt;
+                assert!(prompt.contains("PR #671"));
+                assert!(prompt.contains("分钟内仍未完成"));
+                assert!(current.remediation_id.is_none());
+                assert_eq!(total_remediations(&pool, "m67b").await, 0);
+            }
+            // Fresh CI and queue observations use the ordinary honest wait.
+            for stage in ["ci", "merge_queued"] {
+                sqlx::query("UPDATE delivery_runs SET stage=?, reached_ceiling=?, last_progress_at=? WHERE objective_id='m67b'")
+                    .bind(stage).bind(if stage == "ci" { "pr_open" } else { "merge_queued" })
+                    .bind(Utc::now().timestamp_millis()).execute(&pool).await.unwrap();
+                let decision = gate_exhaustion_decision(&current, code);
+                current = store.apply_decision(current.revision, decision).await.unwrap();
+                let prompt = &current.attention_request.as_ref().unwrap().prompt;
+                assert!(prompt.contains("PR #671"));
+                assert!(!prompt.contains("分钟内仍未完成"));
+                assert_eq!(total_remediations(&pool, "m67b").await, 0);
+            }
+            // A red check is actual repair work, not a CI wait.
+            sqlx::query("UPDATE delivery_runs SET stage='ci', status='blocked' WHERE objective_id='m67b'").execute(&pool).await.unwrap();
+            let decision = gate_exhaustion_decision(&current, code);
+            let bounded = store.bound_system_recovery(decision).await.unwrap();
+            assert!(bounded.remediation_id.is_some());
+        }
     }
 
     /// CF-TRUTH-R1 acceptance case 1 (M57, 2026-10-10): the PR is open and the
