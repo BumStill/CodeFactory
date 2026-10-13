@@ -7879,7 +7879,8 @@ impl GhCliRemote {
 
     pub(crate) fn observed_queue_arm(&self, number: u64, expected_head: &str) -> Result<bool, String> {
         let raw = self.gh(&[
-            "pr".into(), "view".into(), number.to_string(), "--json".into(),
+            "pr".into(), "view".into(), number.to_string(), "-R".into(), self.repo.clone(),
+            "--json".into(),
             "headRefOid,labels".into(),
         ])?;
         let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -7900,6 +7901,8 @@ impl GhCliRemote {
             "pr".into(),
             "view".into(),
             number.to_string(),
+            "-R".into(),
+            self.repo.clone(),
             "--json".into(),
             "state,headRefOid,mergeCommit,autoMergeRequest".into(),
         ])?;
@@ -7918,6 +7921,16 @@ fn parse_github_merge_observation(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
+    // Queue synchronization may advance the head before merging. Positive
+    // merge evidence is authoritative; open PRs still require the pinned head.
+    if value.get("state").and_then(serde_json::Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("MERGED")) {
+        let merge_sha = value.get("mergeCommit").and_then(|merge| merge.get("oid"))
+            .and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        return if merge_sha.trim().is_empty() {
+            Err("GitHub reports MERGED but returned no merge commit SHA".into())
+        } else { Ok(MergeObservation::Merged { merge_sha }) };
+    }
     if !actual_head.is_empty() && actual_head != expected_head {
         return Ok(MergeObservation::HeadChanged { actual_head });
     }
@@ -11325,6 +11338,16 @@ mod tests {
             assert!(observation.status.contains("actions/runs/7/job/8"));
             assert_eq!(ci_failure_is_retryable(&observation.status), retryable);
         }
+    }
+
+    #[test]
+    fn m74c_merged_queue_head_is_positive_evidence() {
+        let value = serde_json::json!({
+            "state": "MERGED", "headRefOid": "queue-advanced-head",
+            "mergeCommit": {"oid": "synthetic-merge"}
+        });
+        assert_eq!(parse_github_merge_observation(&value, "original-head").unwrap(),
+            MergeObservation::Merged { merge_sha: "synthetic-merge".into() });
     }
 
     #[test]
