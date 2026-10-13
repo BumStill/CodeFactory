@@ -387,6 +387,17 @@ describe("CF-HDE-R8 · 插话与排队可选", () => {
     ).toHaveLength(1);
   });
 
+  it("M80 过期系统等待且后端无运行时，queue 直接开始新回合", async () => {
+    seed({ a: runningA });
+    const original = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "is_chat_running" ? false : original(cmd, args));
+    const receipt = await dispatchSend({ sessionId: "A", message: "接着修复", mode: "queue" });
+    expect(receipt.delivery).toEqual({ status: "delivered", into: "new_turn" });
+    expect(useChatStore.getState().runtime.A.queue).toHaveLength(0);
+    expect(invokeMock).toHaveBeenCalledWith("send_message", expect.objectContaining({ sessionId: "A" }));
+  });
+
   it("运行中 + queue：本轮结束后再发", async () => {
     seed({ a: runningA });
     const receipt = await dispatchSend({ sessionId: "A", message: "等这轮", mode: "queue" });
