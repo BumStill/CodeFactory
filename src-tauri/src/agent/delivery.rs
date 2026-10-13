@@ -453,7 +453,37 @@ pub trait DeliveryMutationPermitVerifier: Send + Sync {
         self.verify("materialize_pr_branch_update").await?;
         materialize_fetched_branch_update(request)
     }
+
+    /// CF-TRUTH-R10 (M81): re-acquire authority for the SAME rung within a
+    /// bounded budget instead of parking the run in a wait nobody advances.
+    ///
+    /// The default re-runs the durable authority check, so every attempt is a
+    /// fresh read of the real owner/epoch state rather than a cached verdict. A
+    /// successful re-acquisition resumes the delivery at this rung; an
+    /// implementor that never re-authorizes keeps the previous fail-closed
+    /// behavior, and the success path still costs exactly one `verify` call.
+    async fn reacquire(&self, rung: &str) -> Result<(), String> {
+        let mut last_error = String::new();
+        for attempt in 1..=DELIVERY_PERMIT_REACQUIRE_ATTEMPTS {
+            match self.verify(rung).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = error,
+            }
+            if attempt < DELIVERY_PERMIT_REACQUIRE_ATTEMPTS {
+                tokio::time::sleep(DELIVERY_PERMIT_REACQUIRE_BACKOFF).await;
+            }
+        }
+        Err(last_error)
+    }
 }
+
+/// CF-TRUTH-R10 (M81): bounded re-acquisition budget for a permit lost before a
+/// named mutation rung, and the backoff between attempts. Small and bounded on
+/// purpose: the point is to let the same delivery continue from the same rung,
+/// not to spin on a fence that is genuinely held elsewhere.
+pub const DELIVERY_PERMIT_REACQUIRE_ATTEMPTS: u32 = 3;
+pub const DELIVERY_PERMIT_REACQUIRE_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryMutationIntentToken {
@@ -511,6 +541,11 @@ impl DeliveryMutationPermit {
 
     async fn verify(&self, rung: &str) -> Result<(), String> {
         self.verifier.verify(rung).await
+    }
+
+    /// CF-TRUTH-R10 (M81): see `DeliveryMutationPermitVerifier::reacquire`.
+    async fn reacquire(&self, rung: &str) -> Result<(), String> {
+        self.verifier.reacquire(rung).await
     }
 
     async fn begin_external_mutation(
@@ -663,7 +698,12 @@ async fn verify_mutation_permit(opts: &DeliverOpts, rung: &str) -> Result<(), St
     let Some(permit) = opts.mutation_permit.as_ref() else {
         return Ok(());
     };
-    permit.verify(rung).await.map_err(|error| {
+    // CF-TRUTH-R10 (M81): a permit lost while the stale owner provably issued no
+    // later mutation is re-acquired in place within a bounded budget, so this
+    // same rung resumes the same delivery instead of parking the run in an
+    // `external_state_uncertain` wait with no actor pushing it. Exhausting the
+    // budget still fails closed and names the rung.
+    permit.reacquire(rung).await.map_err(|error| {
         StepResult::blocked(
             "mutation_permit",
             format!(
@@ -671,6 +711,137 @@ async fn verify_mutation_permit(opts: &DeliverOpts, rung: &str) -> Result<(), St
             ),
         )
     })
+}
+
+/// CF-TRUTH-R12 (M76): the template §5 fields, and no unexpanded shell text.
+///
+/// `deliver_changes` is called by a model that sometimes quotes a command
+/// substitution instead of running it (`$(cat body.md)`), and sometimes ships a
+/// body that skips the governance declarations. Both used to reach
+/// `gh pr create`/`gh pr edit` unchanged, so the PR opened with a literal
+/// command line and no usable `Scenario-Test:` — which the repository
+/// validators reject only after the fact. Refuse the body here, before any
+/// remote mutation, and say exactly what to send instead.
+pub(crate) fn validate_pr_body_intent(body: &str) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+    if body.contains("$(") || body.contains('`') {
+        problems.push(
+            "正文里出现未展开的 shell 片段（`$(` 或反引号命令替换）：通常是把一条命令当成正文传了进来。\
+请先在本机把正文展开（例如运行 `cat <文件>` 并把输出读进来），再把展开后的正文内容本身作为 body 传入；\
+不要传 `$(...)`、`<(...)` 或反引号。"
+                .to_string(),
+        );
+    }
+    let scenario_line = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Scenario-Test:"))
+        .map(str::trim)
+        .unwrap_or("");
+    let scenario_ids: Vec<&str> = scenario_line
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|token| !token.is_empty())
+        .collect();
+    let scenario_ok = !scenario_ids.is_empty()
+        && scenario_ids.iter().all(|id| {
+            !matches!(
+                id.to_ascii_lowercase().as_str(),
+                "none" | "n/a" | "na" | "not-applicable" | "not_applicable" | "tbd"
+            )
+        });
+    if !scenario_ok {
+        problems.push(format!(
+            "`Scenario-Test:` 必须列出校验器给出的受影响场景 ID（逗号分隔），不能写 `none` / `not-applicable` / 散文，\
+也不要写复杂 E2E case ID。先运行 \
+`python3 tools/governance/validate_scenario_test_governance.py --ci --base-ref origin/main --title \"<标题>\" --body-file <正文文件>`，\
+把它打印出的 ID 原样填进这一行。当前读到：`{scenario_line}`"
+        ));
+    }
+    let readme_decision = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("README-Update:"))
+        .map(str::trim)
+        .unwrap_or("");
+    if !matches!(readme_decision, "required" | "reviewed") {
+        problems.push(format!(
+            "`README-Update:` 只能写 `required` 或 `reviewed`，不能写 `none` / `not-needed` / 散文。当前读到：`{readme_decision}`"
+        ));
+    }
+    let readme_reason = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("README-Update-Reason:"))
+        .map(str::trim)
+        .unwrap_or("");
+    if readme_reason.is_empty() {
+        problems.push(
+            "缺少非空的 `README-Update-Reason:` 行，用来说明 README 是否需要更新以及为什么。".to_string(),
+        );
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "deliver_changes 拒绝了这份 PR 正文，未创建也没有修改任何 PR：\n- {}",
+        problems.join("\n- ")
+    ))
+}
+
+/// CF-TRUTH-R11 (M77): a ceiling of `through_merge` or higher means a green PR
+/// must be handed to the repository merge queue, so the delivery flow owes the
+/// `merge-queue: armed` label itself instead of parking until someone else
+/// notices.
+pub(crate) fn merge_queue_arm_is_owed(ceiling: &DeliveryCeiling) -> bool {
+    ceiling.rank() >= DeliveryCeiling::ThroughMerge.rank()
+}
+
+/// CF-TRUTH-R11 (M77): bounded arming budget.
+pub(crate) const MERGE_QUEUE_ARM_ATTEMPTS: u32 = 3;
+
+/// CF-TRUTH-R11 (M77): the smallest seam the bounded arming retry needs, so the
+/// retry itself can be exercised with synthetic failures and no network.
+/// CF-TRUTH-R11 (M77): the next arming attempt, or `None` once the bounded
+/// budget is spent. The pinned budget and the loop decision live in one place,
+/// so "bounded retry" stays machine-checkable.
+pub(crate) fn next_merge_queue_arm_attempt(attempts_used: u32) -> Option<u32> {
+    if attempts_used >= MERGE_QUEUE_ARM_ATTEMPTS {
+        None
+    } else {
+        Some(attempts_used + 1)
+    }
+}
+
+/// CF-TRUTH-R11 (M77): arm within a bounded budget. `Ok(attempt)` names the
+/// attempt that succeeded so the observation can say how hard it tried;
+/// exhausting the budget returns a truthful report that the PR was NOT handed
+/// to the queue.
+pub(crate) async fn arm_merge_queue_with_bounded_retry<R: DeliveryRemote + ?Sized>(
+    remote: &R,
+    number: u64,
+    expected_head: &str,
+) -> Result<u32, String> {
+    let mut attempts_used = 0;
+    let mut last_error = String::new();
+    loop {
+        let Some(attempt) = next_merge_queue_arm_attempt(attempts_used) else {
+            return Err(merge_queue_arm_failure_report(
+                number,
+                attempts_used,
+                &last_error,
+            ));
+        };
+        attempts_used = attempt;
+        match remote.arm_merge_queue(number, expected_head).await {
+            Ok(()) => return Ok(attempt),
+            Err(error) => last_error = error,
+        }
+    }
+}
+
+/// CF-TRUTH-R11 (M77): the truthful report for an arming budget that ran out.
+pub(crate) fn merge_queue_arm_failure_report(number: u64, attempts: u32, error: &str) -> String {
+    format!(
+        "CI 已通过，但连续 {attempts} 次都没能为 PR/MR #{number} 打上 `{MERGE_QUEUE_ARM_LABEL}`：{error}。\
+该 PR 尚未交给合并队列，不会有别的流程替它打标签；恢复后重新调用 deliver_changes 或手动打标才能合并。"
+    )
 }
 
 pub(crate) fn external_operation_key(rung: &str, fields: &[&str]) -> String {
@@ -1539,11 +1710,13 @@ pub trait DeliveryRemote {
     /// U31: arm a PR for the repository merge queue so the queue — not the tool's
     /// own catch-up loop — performs the update-branch + re-verify + squash merge.
     /// Default is unsupported so existing adapters stay source-compatible.
+    /// CF-TRUTH-R11: `+ Send` matches every other rung on this trait, so a
+    /// delivery ladder awaited inside a spawned (Send) task can arm the queue.
     fn arm_merge_queue(
         &self,
         _number: u64,
         _expected_head: &str,
-    ) -> impl std::future::Future<Output = Result<(), String>> {
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         std::future::ready(Err("adapter cannot arm the merge queue".into()))
     }
 
@@ -5347,6 +5520,18 @@ pub async fn deliver<R: DeliveryRemote>(
         outcome.steps.push(StepResult::ok("pr_title", note));
         pr_title = corrected;
     }
+    // CF-TRUTH-R12 (M76): a body the caller never expanded (`$(cat body.md)`) or
+    // that lacks the template's required declarations is refused here, before
+    // any remote mutation, with the fix spelled out. Only an explicitly
+    // supplied body is validated; the generated fallback stays as it was.
+    // Only the body this call explicitly supplied is judged: a resume replays a
+    // receipt written by an older version, and refusing that would strand an
+    // already-open PR.
+    if let Some(body) = opts.body.as_deref() {
+        if let Err(problem) = validate_pr_body_intent(body) {
+            return outcome.blocked_at(StepResult::blocked("pr_body", problem));
+        }
+    }
     let requested_pr_body = intent_body.clone().unwrap_or_else(|| {
         "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".to_string()
     });
@@ -5654,6 +5839,24 @@ pub async fn deliver<R: DeliveryRemote>(
                     30_000,
                     "等待退避后重新调用 deliver_changes，从同一 PR 和 head 继续核对 CI。",
                 )
+            }
+        }
+
+        // CF-TRUTH-R11 (M77): a merged-or-higher *requested* ceiling means this
+        // green PR must go to the repository merge queue, and nothing else will
+        // ever arm it. Arm here, with a bounded retry, and if every attempt
+        // fails, say so truthfully instead of parking in a wait nobody pushes.
+        if merge_queue_arm_is_owed(&ceiling) || merge_queue_arm_is_owed(&requested_ceiling) {
+            match arm_merge_queue_with_bounded_retry(remote, pr_number, &sha).await {
+                Ok(attempt) => outcome.steps.push(StepResult::ok(
+                    "merge_queue_arm",
+                    format!(
+                        "已为 PR/MR #{pr_number} 打上 `{MERGE_QUEUE_ARM_LABEL}`（第 {attempt} 次尝试），交给合并队列处理合并。"
+                    ),
+                )),
+                Err(report) => outcome
+                    .steps
+                    .push(StepResult::blocked("merge_queue_arm", report)),
             }
         }
 
@@ -11246,6 +11449,131 @@ mod tests {
         );
     }
 
+    // ── CF-TRUTH-R10/R11/R12 (M81 / M77 / M76) ─────────────────────────────
+
+    /// CF-TRUTH-R12 (M76): the literal body that reached `gh pr edit`, plus the
+    /// template fields the CI validators require.
+    #[test]
+    fn m76_unexpanded_shell_bodies_and_missing_template_fields_are_refused() {
+        let literal = "$(cat .codefactory-cache/m74c-body.md)\n\nScenario-Test: none\nREADME-Update: reviewed";
+        let error = validate_pr_body_intent(literal).expect_err("an unexpanded body is refused");
+        assert!(error.contains("shell"), "{error}");
+        assert!(error.contains("Scenario-Test"), "{error}");
+        assert!(
+            error.contains("validate_scenario_test_governance.py"),
+            "{error}"
+        );
+
+        let backtick =
+            "Scenario-Test: CXD-002\nREADME-Update: reviewed\nREADME-Update-Reason: 草稿\n`gh pr list`";
+        let error = validate_pr_body_intent(backtick).expect_err("backticks are refused");
+        assert!(error.contains("shell"), "{error}");
+
+        let missing_readme = "Scenario-Test: CXD-002\nREADME-Update-Reason: 缺了 README-Update 行";
+        let error = validate_pr_body_intent(missing_readme).expect_err("README-Update is required");
+        assert!(error.contains("README-Update:"), "{error}");
+
+        let missing_reason = "Scenario-Test: CXD-002\nREADME-Update: reviewed";
+        let error =
+            validate_pr_body_intent(missing_reason).expect_err("README-Update-Reason is required");
+        assert!(error.contains("README-Update-Reason"), "{error}");
+
+        // Control group: the template-compliant body passes unchanged.
+        validate_pr_body_intent(
+            "Scenario-Test: CXD-002, HLT-001, HLT-002, HLT-005, RTE-004\n\
+README-Update: reviewed\nREADME-Update-Reason: 本轮不改变产品承诺与安装路径",
+        )
+        .expect("a compliant body passes");
+    }
+
+    /// CF-TRUTH-R11 (M77): who owes the queue arm.
+    #[test]
+    fn m77_the_merge_queue_arm_is_owed_from_through_merge_upwards() {
+        assert!(!merge_queue_arm_is_owed(&DeliveryCeiling::PrOnly));
+        assert!(!merge_queue_arm_is_owed(&DeliveryCeiling::ThroughCiGreen));
+        assert!(merge_queue_arm_is_owed(&DeliveryCeiling::ThroughMerge));
+    }
+
+    /// CF-TRUTH-R11 (M77): the bounded budget itself, and the truthful report
+    /// that says the PR was NOT handed to the merge queue.
+    #[test]
+    fn m77_arming_budget_is_bounded_and_reports_when_exhausted() {
+        assert_eq!(next_merge_queue_arm_attempt(0), Some(1));
+        assert_eq!(next_merge_queue_arm_attempt(1), Some(2));
+        assert_eq!(
+            next_merge_queue_arm_attempt(MERGE_QUEUE_ARM_ATTEMPTS - 1),
+            Some(MERGE_QUEUE_ARM_ATTEMPTS)
+        );
+        assert_eq!(next_merge_queue_arm_attempt(MERGE_QUEUE_ARM_ATTEMPTS), None);
+        assert_eq!(next_merge_queue_arm_attempt(u32::MAX), None);
+
+        let report = merge_queue_arm_failure_report(646, MERGE_QUEUE_ARM_ATTEMPTS, "HTTP 502");
+        assert!(report.contains("646"), "{report}");
+        assert!(report.contains(MERGE_QUEUE_ARM_LABEL), "{report}");
+        assert!(report.contains("尚未交给合并队列"), "{report}");
+        assert!(report.contains("HTTP 502"), "{report}");
+    }
+
+    struct FlakyPermit {
+        failures_left: std::sync::atomic::AtomicUsize,
+        rungs: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeliveryMutationPermitVerifier for FlakyPermit {
+        async fn verify(&self, rung: &str) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            self.rungs.lock().unwrap().push(rung.to_string());
+            let left = self.failures_left.load(Ordering::SeqCst);
+            if left > 0 {
+                self.failures_left.store(left - 1, Ordering::SeqCst);
+                return Err(format!(
+                    "run run-1 owner inst-1 epoch 42 is no longer authorized for {rung}"
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// CF-TRUTH-R10 (M81): the M81 timing — the permit is lost before
+    /// `git_stage`, the stale owner issued no mutation — must resume the SAME
+    /// rung of the SAME delivery instead of parking in an
+    /// `external_state_uncertain` wait with no actor.
+    #[tokio::test]
+    async fn m81_a_lost_permit_is_reacquired_on_the_same_rung() {
+        use std::sync::atomic::AtomicUsize;
+        let flaky = std::sync::Arc::new(FlakyPermit {
+            failures_left: AtomicUsize::new(1),
+            rungs: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut opts = DeliverOpts::default();
+        opts.mutation_permit = Some(DeliveryMutationPermit::new(flaky.clone()));
+        verify_mutation_permit(&opts, "git_stage")
+            .await
+            .expect("the same rung resumes the same delivery");
+        let rungs = flaky.rungs.lock().unwrap().clone();
+        assert_eq!(rungs, vec!["git_stage".to_string(), "git_stage".to_string()]);
+
+        // Anti-case: when re-acquisition is genuinely impossible the budget
+        // runs out and the failure still names the rung, fail-closed.
+        let stubborn = std::sync::Arc::new(FlakyPermit {
+            failures_left: AtomicUsize::new(99),
+            rungs: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut opts = DeliverOpts::default();
+        opts.mutation_permit = Some(DeliveryMutationPermit::new(stubborn.clone()));
+        let step = verify_mutation_permit(&opts, "git_stage")
+            .await
+            .expect_err("an exhausted re-acquisition still fails");
+        assert_eq!(step.status, "blocked");
+        assert!(step.detail.contains("git_stage"), "{}", step.detail);
+        assert!(step.detail.contains("no later mutation"), "{}", step.detail);
+        assert_eq!(
+            stubborn.rungs.lock().unwrap().len(),
+            DELIVERY_PERMIT_REACQUIRE_ATTEMPTS as usize
+        );
+    }
+
     #[test]
     fn github_ci_terminal_observation_must_be_stable_before_green() {
         let stability = CiObservationStability::default();
@@ -12397,7 +12725,11 @@ else:
             1,
             &DeliverOpts {
                 title: Some("hook delivery".into()),
-                body: Some("body".into()),
+                body: Some(
+                    "Scenario-Test: CXD-002\nREADME-Update: reviewed\n\
+README-Update-Reason: synthetic fixture\n\nbody"
+                        .into(),
+                ),
                 release_urgency: None,
                 requested_ceiling: None,
                 extra_excludes: vec![],
@@ -13909,7 +14241,9 @@ else:
             &DeliverOpts {
                 title: Some("fix: resume guarded metadata".into()),
                 body: Some(
-                    "Reviewed migration.\n\n\
+                    "Scenario-Test: CXD-002\nREADME-Update: reviewed\n\
+README-Update-Reason: synthetic fixture\n\n\
+Reviewed migration.\n\n\
 BREAKING CHANGE: old databases require migration\n\
 Release-Urgency: hold"
                         .into(),
@@ -13971,7 +14305,11 @@ Release-Urgency: hold"
             5,
             &DeliverOpts {
                 title: Some("fix: refresh remote policy".into()),
-                body: Some("Initial review notes.".into()),
+                body: Some(
+                    "Scenario-Test: CXD-002\nREADME-Update: reviewed\n\
+README-Update-Reason: synthetic fixture\n\nInitial review notes."
+                        .into(),
+                ),
                 ..DeliverOpts::default()
             },
             Some(&remote),
@@ -15277,7 +15615,11 @@ Release-Urgency: hold"
             5,
             &DeliverOpts {
                 title: Some("fix: guarded delivery".into()),
-                body: Some("Requires a companion change.".into()),
+                body: Some(
+                    "Scenario-Test: CXD-002\nREADME-Update: reviewed\n\
+README-Update-Reason: synthetic fixture\n\nRequires a companion change."
+                        .into(),
+                ),
                 release_urgency: Some(ReleaseUrgency::Hold),
                 ..DeliverOpts::default()
             },
