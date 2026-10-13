@@ -1788,6 +1788,7 @@ pub fn run() {
             menu::sync_session_menu,
             menu::read_session_clipboard,
             commands::dispatch::dispatch_reply,
+            agent::usage_windows::set_session_usage_window_override,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::subscription_quota_status,

@@ -28,6 +28,9 @@ const OPERATIONS = new Set([
   "resolve_approval",
   "focus_main_display",
   "clean_build_cache",
+  "get_usage_windows",
+  "set_usage_window",
+  "set_session_usage_window_override",
   "get_quota",
   "set_quota_cap",
 ]);

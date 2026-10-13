@@ -182,6 +182,9 @@ pub struct Settings {
     /// Only consulted for subscription (ChatGPT) endpoints.
     #[serde(default)]
     pub subscription_quota_caps: HashMap<String, QuotaCapConfig>,
+    /// CF-WINDOW-R1: JSON [endpoint, model] tuple keys, default unrestricted.
+    #[serde(default)]
+    pub model_usage_windows: HashMap<String, crate::agent::usage_windows::UsageWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -675,6 +678,7 @@ impl Default for Settings {
             delivery_ci_timeout_secs: default_delivery_ci_timeout_secs(),
             usage_budget: UsageBudget::default(),
             subscription_quota_caps: HashMap::new(),
+            model_usage_windows: HashMap::new(),
         }
     }
 }

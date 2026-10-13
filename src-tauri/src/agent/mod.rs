@@ -33,6 +33,7 @@ pub(crate) mod permission_intent;
 pub mod persistence;
 pub(crate) mod provider_recovery;
 pub mod quota_cap;
+pub mod usage_windows;
 pub mod scheduler;
 /// CF-STOP：停止栅栏（「停止」真的停下）与 PR 侧的如实收尾。
 pub mod stop_fence;
@@ -1568,6 +1569,7 @@ impl AgentLoop {
         root_turn_id: Option<String>,
         mutation_permit: Option<codefactory_agent_loop::tool::MutationPermit>,
     ) -> model_transport::RoutedDesktopModelTransport {
+        self.route_state.attach_usage_settings(self.settings.clone());
         model_transport::RoutedDesktopModelTransport {
             http: self.http.clone(),
             events: self.events.clone(),

@@ -5,6 +5,7 @@ import { ChevronDown, Sparkles } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
 import { refreshChatGptCatalogIfStale } from "../stores/chatgptCatalog";
+import { evaluateWindow, modelWindowKey } from "../lib/usageWindows";
 import { invoke } from "../lib/tauri";
 import { ReasoningEffortPicker } from "./ReasoningEffortPicker";
 
@@ -289,6 +290,12 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
                 m.id === activeModel ? "text-accent" : "text-gray-300"
               }`}
               onClick={async () => {
+                const rule = settings?.model_usage_windows?.[modelWindowKey(activeEndpoint, m.id)];
+                if (!evaluateWindow(rule, Date.now()).available) {
+                  if (!activeSession) { window.alert("当前模型不在允许使用时段，请在设置中修改时段或选择其它模型。"); return; }
+                  if (!window.confirm("当前模型不在允许使用时段。是否本会话忽略时段限制？")) return;
+                  await invoke("set_session_usage_window_override", { sessionId: activeSession.id, ignore: true });
+                }
                 if (activeSession) {
                   await updateActiveSessionModelConfig({
                     endpointId: activeEndpoint,

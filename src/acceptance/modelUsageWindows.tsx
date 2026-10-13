@@ -1,0 +1,13 @@
+import { createRoot } from "react-dom/client";
+import { mockIPC } from "@tauri-apps/api/mocks";
+import "../styles/globals.css";
+import { useSettingsStore } from "../stores/settings";
+import type { Settings } from "../lib/tauri";
+import { ModelUsageWindowsSection } from "../components/ModelUsageWindowsSection";
+import { applyPreset, modelWindowKey } from "../lib/usageWindows";
+const theme = new URLSearchParams(location.search).get("theme") === "light" ? "light" : "dark";
+document.documentElement.dataset.theme = theme;
+const settings = { theme, font_size:14, endpoints:{deepseek:{base_url:"https://synthetic.example",api_style:"openai",active_model:"pro",custom_models:[{id:"pro"},{id:"flash"}]}}, model_usage_windows:{[modelWindowKey("deepseek","pro")]:applyPreset("deepseek_off_peak")}, subscription_quota_caps:{} } as unknown as Settings;
+mockIPC((command, args) => command === "save_settings" ? (args as { newSettings: Settings }).newSettings : settings);
+useSettingsStore.setState({settings});
+createRoot(document.getElementById("root")!).render(<main className="min-h-screen bg-surface-0 p-4"><ModelUsageWindowsSection/></main>);
