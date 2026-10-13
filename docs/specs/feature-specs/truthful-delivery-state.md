@@ -123,3 +123,37 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 - 合成回归 `m74_remote_merge_repairs_failed_cancelled_and_incident_with_stale_workspace` 先看到 `cancelled != completed`，修复后断言六类记录完成、重复观察 revision 不变、恢复规划无接管、停止围栏保留。原 M71 不确定/回退与 live/release 回归保留。
 - 无 Spec Amendment；本轮仅合并交付，安装新版后的真机核对由独立发布任务完成。
 
+
+## M74c 返修：已合并的交付在真机上仍无法结算（R7/R8/R9 第三轮）
+
+真机 v1.87.4 证据（2026-10-13 13:43:34 对账）：#573、#616、#635 仍写成
+`takeover_reconciliation` / `platform_incident`；#637（failed/pr_open）、#638
+（cancelled/merged）、#639（failed/merged）、#641（cancelled/pr_open）未变化；#644 本身
+已合并却记为 failed/merge_queued。这些 PR 在 GitHub 上全部 MERGED。
+
+只读观察的三处根因与落点（不改变任何需求文本）：
+
+- **合并队列推进 head 后不再拒绝合并证据**：`parse_github_merge_observation` 原先先比
+  `headRefOid`，队列在合并前同步分支必然让它与记录的 expected head 不同，于是 MERGED 被
+  判成 `HeadChanged`。现在 `state=MERGED` 且带合并提交时直接给出合并证据，未合并的 PR
+  仍要求 head 与记录逐字一致（`HeadChanged`/`Queued` 语义不变）。
+- **只读观察不再依赖工作区存在**：`gh pr view` 增加 `-R owner/repo`，`RemoteCanonicalPrObserver`
+  在记录的仓库根不可解析时回退到进程目录，因此被 closeout 清掉工作区的记录也能被观察。
+- **终态记录重新进入观察范围**：`reconcile_parked_delivery_progress` 的候选查询不再要求
+  `worktree_identity`/`head_sha` 非空（改用 `COALESCE(...,'')` 并显式别名），并把单轮上限
+  从 16 提到 64，使历史终态（failed/cancelled/platform_incident 且工作区状态已结束）仍被
+  观察；结算仍要求正向合并证据与既有的 fail-closed 谓词（claim_epoch、canonical PR 号、
+  无有效 lease、objective/run 状态）。
+
+合成回归（临时 Git 仓库 + 合成观察，全部不触生产数据）：
+
+- `agent::delivery::tests::m74c_merged_queue_head_is_positive_evidence`：先失败（`HeadChanged`
+  而非 `Merged`），修复后通过。
+- `agent::execution_workspace::tests::m74c_settles_merged_pr_after_the_queue_moved_the_head_and_the_workspace_is_gone`：
+  head 被队列推进 + 工作区身份被清空 + 记录为 failed/merge_queued，观察 MERGED 后
+  objective 结算为 completed、记录为 completed/merged。
+- 既有 `m71_*`、`m72_*`、`m74_*`、`externally_closed_unmerged_pr_keeps_everything_and_says_where`
+  全部保持通过（工作区 42 项、交付 134 项）。
+
+反复观察仍幂等：同一合并证据重复观察不再推进 revision；不确定（Unknown/更早状态/已关闭
+未合并）保持原状（R9）。

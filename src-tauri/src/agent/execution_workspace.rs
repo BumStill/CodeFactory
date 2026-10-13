@@ -209,7 +209,12 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         expected_head_sha: &str,
     ) -> Result<CanonicalPrState> {
         use crate::agent::delivery::{gh_remote_for, DeliveryRemote, MergeObservation};
-        let Some(remote) = gh_remote_for(repo_root) else {
+        // A cleaned-up workspace must not make the read-only observation fail:
+        // resolve the delivery remote from the recorded repository, and fall
+        // back to the process directory, which is enough with `-R owner/repo`.
+        let remote = gh_remote_for(repo_root)
+            .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)));
+        let Some(remote) = remote else {
             return Ok(CanonicalPrState::Unknown(
                 "no delivery remote is resolvable for this repository".into(),
             ));
@@ -1192,18 +1197,19 @@ pub(crate) async fn reconcile_parked_delivery_progress(
     let now = Utc::now().timestamp_millis();
     let candidates = sqlx::query_as::<_, CleanupCandidate>(
         "SELECT w.id, w.objective_id, w.repo_identity, w.repo_root, w.git_common_dir,
-                w.worktree_path, w.worktree_identity, w.branch_name, w.head_sha
+                COALESCE(w.worktree_path,'') AS worktree_path,
+                COALESCE(w.worktree_identity,'') AS worktree_identity, w.branch_name,
+                COALESCE(w.head_sha,'') AS head_sha
          FROM execution_workspaces w JOIN objectives o ON o.id=w.objective_id
          WHERE (o.status IN ('running','waiting_system','cancelled','failed')
                 OR (o.status='completed' AND EXISTS (
                     SELECT 1 FROM delivery_runs broken WHERE broken.objective_id=o.id
                     AND broken.status IN ('failed','cancelled','platform_incident'))))
            AND w.state IN ('active','delivering','cleanup_pending','closed','incident')
-           AND w.head_sha IS NOT NULL AND w.worktree_identity IS NOT NULL
            AND EXISTS (SELECT 1 FROM delivery_runs r WHERE r.objective_id=o.id
                AND r.canonical_pr_number IS NOT NULL
                AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?))
-         ORDER BY w.updated_at LIMIT 16",
+         ORDER BY w.updated_at LIMIT 64",
     ).bind(now).fetch_all(pool).await?;
     let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('objectives')")
         .fetch_all(pool).await?;
@@ -4587,6 +4593,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn m74c_settles_merged_pr_after_the_queue_moved_the_head_and_the_workspace_is_gone() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
+            crate::agent::objective::CreateObjective {
+                id: "synthetic-m74c".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "delivery_receipt".into(), created_surface: "synthetic-test".into(),
+            },
+        ).await.unwrap();
+        let workspace = allocate_or_attach(&pool,
+            request_for(&root, &container, "synthetic-m74c", "process-a"),
+        ).await.unwrap();
+        record_open_canonical_pr(&pool, &workspace, 644, "through_merge").await;
+        // The merge queue synced the branch before merging and closeout already
+        // removed the worktree, so the local head is no longer the PR head.
+        sqlx::query("UPDATE delivery_runs SET stage='takeover_reconciliation', status='failed', reached_ceiling='merge_queued', expected_head_sha='pinned-before-queue', canonical_head_sha='pinned-before-queue', failure_signature='takeover_reconciliation:delivery_identity_conflict', lease_owner=NULL, lease_expires_at=NULL")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE execution_workspaces SET worktree_identity=NULL, head_sha=NULL, state='closed', lease_owner=NULL, lease_expires_at=NULL")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objectives SET status='failed', decision_type='failed_internal', completed_at=1, failure_code='technical_recovery_exhausted', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
+            .execute(&pool).await.unwrap();
+        // The remote is authoritative: GitHub already merged PR #644.
+        super::reconcile_parked_delivery_progress(&pool,
+            &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m74c-merge".into() })]), "m74c-restart",
+        ).await.unwrap();
+        let settled: (String, Option<String>, String, String) = sqlx::query_as(
+            "SELECT o.status,o.failure_code,r.status,r.reached_ceiling FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(settled.0, "completed", "a merged PR settles even after the queue moved the head");
+        assert_eq!(settled.1, None);
+        assert_eq!(settled.2, "completed");
+        assert_eq!(settled.3, "merged");
     }
 
     #[tokio::test]
