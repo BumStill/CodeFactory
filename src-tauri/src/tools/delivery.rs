@@ -1907,7 +1907,7 @@ fn local_takeover_identity_conflict_observation(
     DeliveryObservation {
         head_branch: claimed.head_branch.clone(),
         stage: "takeover_reconciliation".into(),
-        status: "platform_incident".into(),
+        status: "waiting".into(),
         wait_class: Some("delivery_identity_conflict".into()),
         next_action: Some("await_system_capability_change".into()),
         reached_ceiling: claimed.reached_ceiling.clone(),
@@ -2943,47 +2943,18 @@ async fn record_or_park_local_takeover_identity_conflict(
     process: &ProcessIdentity,
 ) -> Result<()> {
     let failure = local_takeover_identity_conflict_observation(claimed);
-    let signature = failure.failure_signature.as_deref().ok_or_else(|| {
-        crate::errors::AppError::Other("delivery identity conflict has no signature".into())
-    })?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let attempt = delivery_run::next_delivery_failure_attempt(
+    // A replay failure cannot establish a platform failure. Keep mutation
+    // fenced; the independent canonical-PR observer settles remote progress.
+    delivery_run::record_delivery_observation(
         db,
         &claimed.run_id,
         process,
         claimed.claim_epoch,
-        signature,
-        now,
+        &failure,
+        chrono::Utc::now().timestamp_millis(),
+        DELIVERY_LEASE_TTL_MS,
     )
     .await?;
-    if attempt >= delivery_run::MAX_IDENTICAL_TAKEOVER_FAILURES {
-        ObjectiveStore::new(db.clone())
-            .park_delivery_identity_incident_after_takeover(
-                &claimed.objective_id,
-                &claimed.run_id,
-                process,
-                claimed.claim_epoch,
-                signature,
-                attempt,
-            )
-            .await
-            .map_err(|error| {
-                crate::errors::AppError::Other(format!(
-                    "delivery identity conflict could not atomically park its objective: {error}"
-                ))
-            })?;
-    } else {
-        delivery_run::record_delivery_observation(
-            db,
-            &claimed.run_id,
-            process,
-            claimed.claim_epoch,
-            &failure,
-            now,
-            DELIVERY_LEASE_TTL_MS,
-        )
-        .await?;
-    }
     Ok(())
 }
 
@@ -5177,6 +5148,7 @@ mod tests {
         };
 
         let observation = local_takeover_identity_conflict_observation(&claimed);
+        assert_eq!(observation.status, "waiting", "R7: replay identity conflict is not a platform incident");
         assert_eq!(
             observation.wait_class.as_deref(),
             Some("delivery_identity_conflict")
