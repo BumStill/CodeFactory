@@ -2590,6 +2590,26 @@ pub(crate) async fn resume_claimed_delivery(
         .await
 }
 
+struct ObservedMergedPr {
+    number: i64,
+    url: String,
+    head: String,
+    merge_sha: String,
+}
+
+#[async_trait::async_trait]
+impl crate::agent::execution_workspace::CanonicalPrObserver for ObservedMergedPr {
+    async fn observe(&self, _repo: &std::path::Path, number: i64, url: &str, head: &str)
+        -> anyhow::Result<crate::agent::execution_workspace::CanonicalPrState> {
+        use crate::agent::execution_workspace::CanonicalPrState;
+        Ok(if number == self.number && url == self.url && head == self.head {
+            CanonicalPrState::Merged { merge_sha: self.merge_sha.clone() }
+        } else {
+            CanonicalPrState::Unknown("different canonical PR".into())
+        })
+    }
+}
+
 async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
     db: sqlx::SqlitePool,
     settings: crate::config::settings::Settings,
@@ -2601,6 +2621,32 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
 ) -> Result<()> {
     if !should_resume_claimed_delivery(&claimed) {
         return Ok(());
+    }
+    // CF-TRUTH-R7/R8/R9: remote truth precedes every local replay check.
+    // Observing a merge grants settlement authority, never mutation authority.
+    if let Some(number) = claimed.canonical_pr_number {
+        let observed = match (remote, claimed.canonical_head_sha.as_deref()) {
+            (Some(remote), Some(head)) => remote.observe_merge(number as u64, head).await,
+            _ => Ok(delivery::MergeObservation::Unsupported),
+        };
+        match observed {
+            Ok(delivery::MergeObservation::Merged { merge_sha }) if !merge_sha.trim().is_empty() => {
+                delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
+                    chrono::Utc::now().timestamp_millis(), "canonical_pr_observed_before_takeover").await?;
+                crate::agent::execution_workspace::reconcile_parked_delivery_progress(
+                    &db, &ObservedMergedPr { number, url: claimed.canonical_pr_url.clone().unwrap_or_default(), head: claimed.canonical_head_sha.clone().unwrap_or_default(), merge_sha }, &process.instance_id,
+                ).await.map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+                return Ok(());
+            }
+            Ok(delivery::MergeObservation::OpenSameHead { .. } | delivery::MergeObservation::ClosedUnmerged) => {}
+            _ => {
+                // No identity failure may be inferred from an offline/unknown
+                // provider. Release the claim without rewriting progress.
+                delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
+                    chrono::Utc::now().timestamp_millis(), "canonical_pr_observed_before_takeover").await?;
+                return Ok(());
+            }
+        }
     }
     let receipted_parent_head =
         match reconcile_receipted_local_commit_head(&db, &mut claimed, &process).await {
@@ -3002,6 +3048,15 @@ pub(crate) fn spawn_delivery_recovery_supervisor(
             "recovery supervisor: started"
         );
         loop {
+            // Observe and settle expired canonical PRs before claiming replay
+            // authority. Keep the cleanup supervisor independent as a fallback.
+            if let Err(error) = crate::agent::execution_workspace::reconcile_parked_delivery_progress(
+                &pool, &crate::agent::execution_workspace::RemoteCanonicalPrObserver, &process.instance_id,
+            ).await {
+                tracing::warn!(%error, "recovery supervisor: canonical PR observation failed; skipping takeover");
+                tokio::time::sleep(recovery_supervisor_poll_interval()).await;
+                continue;
+            }
             let now = chrono::Utc::now().timestamp_millis();
             match delivery_run::plan_startup_recovery(&pool, &process, now, 60_000).await {
                 Ok(plan) => {
