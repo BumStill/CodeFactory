@@ -6,6 +6,7 @@
 
 use crate::config::settings::ApiStyle;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -103,7 +104,7 @@ impl RouteCandidatePlan {
         if self
             .candidates
             .iter()
-            .all(|existing| existing.endpoint_name != candidate.endpoint_name)
+            .all(|existing| existing.endpoint_name != candidate.endpoint_name || existing.model_id != candidate.model_id)
         {
             self.candidates.push(candidate);
         }
@@ -388,6 +389,8 @@ struct ActiveRouteInner {
     failed_indices: HashSet<usize>,
     failures: Vec<(String, String, String)>,
     initial_route_change: Option<RouteChange>,
+    usage_skips: Vec<RouteAttemptSnapshot>,
+    usage_settings: Option<Arc<tokio::sync::RwLock<crate::config::settings::Settings>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -460,8 +463,109 @@ impl ActiveRouteState {
                 failed_indices: HashSet::new(),
                 failures: Vec::new(),
                 initial_route_change,
+                usage_skips: Vec::new(),
+                usage_settings: None,
             })),
             health,
+        }
+    }
+
+    pub fn attach_usage_settings(&self, settings: Arc<tokio::sync::RwLock<crate::config::settings::Settings>>) {
+        self.inner.lock().expect("active route mutex poisoned").usage_settings = Some(settings);
+    }
+
+    /// Called before every POST, including retries; waits are not failures.
+    pub async fn admit_usage_window(&self, cancel: Option<&AtomicBool>, ignore_windows: bool, events: Option<&dyn crate::agent::events::EventSink>) -> Result<Option<RouteChange>, String> {
+        let settings = self.inner.lock().expect("active route mutex poisoned").usage_settings.clone();
+        let Some(settings) = settings else { return Ok(None); };
+        let mut wait_notified = false;
+        loop {
+            if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) { return Err("cancelled".into()); }
+            let now = super::usage_windows::now_ms();
+            let config = settings.read().await;
+            if config.model_usage_windows.is_empty() { return Ok(None); }
+            let delay = {
+            let mut inner = self.inner.lock().expect("active route mutex poisoned");
+            let from = inner.candidates[inner.current_index].clone();
+            let mut next_available = None;
+            let mut skipped = Vec::new();
+            // CF-WINDOW-R4/R5：换模型和等待都要如实说出原因，所以分开记两类。
+            let mut window_blocked: Vec<String> = Vec::new();
+            let mut quota_blocked: Vec<String> = Vec::new();
+            let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
+                if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name) { return None; }
+                let key = super::usage_windows::model_key(&route.endpoint_name, &route.model_id);
+                if let Some(rule) = config.model_usage_windows.get(&key) {
+                    let status = rule.evaluate(now);
+                    if !status.available && !ignore_windows {
+                        skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(format!("outside_usage_window:{}", serde_json::json!({"rule":rule,"next_available_ms":status.next_transition_ms}))) });
+                        if let Some(next) = status.next_transition_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
+                        window_blocked.push(route.model_id.clone());
+                        return None;
+                    }
+                }
+                if config.endpoint_is_subscription(&route.endpoint_name) {
+                    let ledger = super::quota_cap::shared_quota_ledger();
+                    let cap = config.quota_cap_for(&route.endpoint_name);
+                    let budget = super::quota_cap::SubscriptionBudget::default();
+                    if let Some(breach) = ledger.evaluate(&route.endpoint_name, cap, budget, now).or_else(|| ledger.evaluate(&route.base_url, cap, budget, now)) {
+                        if let Some(next) = breach.resets_at_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
+                        quota_blocked.push(route.model_id.clone());
+                        return None;
+                    }
+                }
+                Some(index)
+            });
+            for skip in skipped {
+                if !inner.usage_skips.iter().any(|old| old == &skip) { inner.usage_skips.push(skip); }
+            }
+            let blocked_causes = |window_blocked: &[String], quota_blocked: &[String], next_available: Option<i64>| {
+                let resume = next_available
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(|at| at.with_timezone(&chrono_tz::Asia::Shanghai).format("%m-%d %H:%M").to_string());
+                let mut causes: Vec<String> = Vec::new();
+                if !window_blocked.is_empty() {
+                    causes.push(format!(
+                        "{} 不在允许使用时段{}",
+                        window_blocked.join("、"),
+                        resume.as_deref().map(|clock| format!("，{clock} 起可用")).unwrap_or_default()
+                    ));
+                }
+                if !quota_blocked.is_empty() {
+                    causes.push(format!("{} 已达订阅用量上限", quota_blocked.join("、")));
+                }
+                causes
+            };
+            if let Some(index) = selected {
+                inner.current_index = index;
+                let to = inner.candidates[index].clone();
+                return Ok((from.endpoint_name != to.endpoint_name || from.model_id != to.model_id).then(|| RouteChange {
+                    from_endpoint: from.endpoint_name.clone(), from_model: from.model_id,
+                    to_endpoint: to.endpoint_name.clone(), to_model: to.model_id.clone(),
+                    reason: format!(
+                        "已切到 {}{}",
+                        to.model_id,
+                        blocked_causes(&window_blocked, &quota_blocked, next_available)
+                            .first()
+                            .map(|cause| format!("：{cause}"))
+                            .unwrap_or_default()
+                    ),
+                    kind: RouteChangeKind::QuotaCap,
+                }));
+            }
+            if !wait_notified {
+                if let Some(events) = events {
+                    let mut origins: Vec<&str> = Vec::new();
+                    if !window_blocked.is_empty() { origins.push("outside_usage_window"); }
+                    if !quota_blocked.is_empty() { origins.push("subscription_quota_cap"); }
+                    events.emit(crate::openrouter::types::StreamEvent::TransportRetry { label: super::usage_windows::wait_notice(&endpoint_label(&from.endpoint_name), next_available), attempt: 0, max_attempts: 0, delay_ms: 1000, reason: format!("{}；等待不消耗技术恢复次数", origins.join(" + ")) });
+                }
+                wait_notified = true;
+            }
+            next_available.map(|next| (next - now).clamp(1, 1000) as u64).unwrap_or(1000)
+            };
+            drop(config);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
     }
 
@@ -581,6 +685,7 @@ impl ActiveRouteState {
                 failure_code: Some(failure_code(reason).into()),
             })
             .collect::<Vec<_>>();
+        attempts.extend(inner.usage_skips.clone());
         if succeeded {
             let current = &inner.candidates[inner.current_index];
             attempts.push(RouteAttemptSnapshot {
@@ -656,6 +761,159 @@ mod tests {
     use super::*;
     use crate::config::settings::ApiStyle;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn usage_windows_same_endpoint_models_route_independently_and_audit_skip() {
+        let mut plan = RouteCandidatePlan::new(route("synthetic", "pro"));
+        plan.push_fallback(route("synthetic", "flash"));
+        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut settings = crate::config::settings::Settings::default();
+        let blocked = super::super::usage_windows::UsageWindow {
+            mode: "custom".into(), timezone: Some("UTC".into()), weekdays: vec![], periods: vec![],
+            exclude_holidays: false, invert: false, calendar: Default::default(),
+        };
+        settings.model_usage_windows.insert(super::super::usage_windows::model_key("synthetic", "pro"), blocked);
+        let live = Arc::new(tokio::sync::RwLock::new(settings));
+        state.attach_usage_settings(live.clone());
+        let change = state.admit_usage_window(None, false, None).await.unwrap().unwrap();
+        assert_eq!(change.to_model, "flash");
+        assert_eq!(state.current().model_id, "flash");
+        assert!(state.attempt_snapshots(true).iter().any(|attempt| attempt.status == "skipped" && attempt.model == "pro" && attempt.failure_code.as_deref().unwrap().starts_with("outside_usage_window:")));
+        live.write().await.model_usage_windows.get_mut(&super::super::usage_windows::model_key("synthetic", "pro")).unwrap().mode = "anytime".into();
+        state.admit_usage_window(None, false, None).await.unwrap();
+        assert_eq!(state.current().model_id, "pro", "restored preference on next request");
+    }
+
+    #[tokio::test]
+    async fn usage_windows_wait_observes_live_config_without_health_failure() {
+        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route("synthetic", "pro")), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut settings = crate::config::settings::Settings::default();
+        let key = super::super::usage_windows::model_key("synthetic", "pro");
+        let mut blocked = super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap();
+        blocked.mode = "custom".into(); blocked.weekdays.clear(); blocked.invert = false;
+        settings.model_usage_windows.insert(key.clone(), blocked);
+        let live = Arc::new(tokio::sync::RwLock::new(settings));
+        state.attach_usage_settings(live.clone());
+        let cloned = state.clone();
+        let waiter = tokio::spawn(async move { cloned.admit_usage_window(None, false, None).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished(), "blocked request must wait");
+        live.write().await.model_usage_windows.get_mut(&key).unwrap().mode = "anytime".into();
+        assert!(tokio::time::timeout(Duration::from_secs(3), waiter).await.unwrap().unwrap().is_ok());
+        assert!(state.health.is_available("synthetic"));
+        assert!(state.inner.lock().unwrap().failed_indices.is_empty());
+    }
+
+    /// CF-WINDOW-R4：一轮进行中跨过时段边界。时钟注入到北京时间 08:59 的
+    /// 官方闲时，请求直接放行；把时钟推过 09:00 边界后，**下一次**请求才换
+    /// 模型（已发出的请求不中途掐断），会话与端点保持不变，换模型的原因写进
+    /// 记录。
+    #[tokio::test]
+    async fn a_request_that_crosses_the_off_peak_boundary_switches_model_and_audits_why() {
+        let _serial = crate::agent::usage_windows::clock_test_lock();
+        let clock = |at: &str| {
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{at}:00+08:00"))
+                .unwrap()
+                .timestamp_millis()
+        };
+        let mut plan = RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro"));
+        plan.push_fallback(route("deepseek", "deepseek-flash"));
+        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut settings = crate::config::settings::Settings::default();
+        let pro = crate::agent::usage_windows::model_key("deepseek", "deepseek-v4-pro");
+        settings.model_usage_windows.insert(pro.clone(), crate::agent::usage_windows::presets().remove("deepseek_off_peak").unwrap());
+        // 同一端点、同一供应商下的另一个模型任何时候都可用。
+        settings.model_usage_windows.insert(
+            crate::agent::usage_windows::model_key("deepseek", "deepseek-flash"),
+            crate::agent::usage_windows::UsageWindow { mode: "anytime".into(), timezone: None, weekdays: vec![], periods: vec![], exclude_holidays: false, invert: false, calendar: Default::default() },
+        );
+        let live = Arc::new(tokio::sync::RwLock::new(settings));
+        state.attach_usage_settings(live.clone());
+
+        crate::agent::usage_windows::set_clock_override_ms(Some(clock("08:59")));
+        assert!(state.admit_usage_window(None, false, None).await.unwrap().is_none(), "官方闲时不该换模型");
+        assert_eq!(state.current().model_id, "deepseek-v4-pro");
+
+        crate::agent::usage_windows::set_clock_override_ms(Some(clock("09:00")));
+        let change = state.admit_usage_window(None, false, None).await.unwrap().expect("跨过边界后必须换模型");
+        assert_eq!(change.from_model, "deepseek-v4-pro");
+        assert_eq!(change.to_model, "deepseek-flash");
+        assert_eq!(state.current().endpoint_name, "deepseek", "只换模型，不换会话/端点");
+        assert!(change.reason.contains("deepseek-v4-pro") && change.reason.contains("deepseek-flash"), "{}", change.reason);
+
+        let journal = state.attempt_snapshots(false);
+        let skip = journal
+            .iter()
+            .find(|attempt| attempt.model == "deepseek-v4-pro" && attempt.status == "skipped")
+            .expect("被时段挡下的模型必须有记录");
+        let code = skip.failure_code.clone().unwrap_or_default();
+        assert!(code.starts_with("outside_usage_window:"), "{code}");
+        assert!(code.contains("next_available_ms") && code.contains("\"mode\":\"official_off_peak\""), "记录要带上所用规则与下一个可用时间：{code}");
+        crate::agent::usage_windows::set_clock_override_ms(None);
+    }
+
+    /// CF-WINDOW-R5：所有候选模型都不在允许时段时进入等待，由注入时钟推进到
+    /// 边界后自动继续；等待既不消耗技术恢复次数，也不是"恢复耗尽"。
+    #[tokio::test]
+    async fn a_blocked_fleet_waits_for_the_boundary_and_resumes_without_burning_recovery() {
+        let _serial = crate::agent::usage_windows::clock_test_lock();
+        let clock = |at: &str| {
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{at}:00+08:00"))
+                .unwrap()
+                .timestamp_millis()
+        };
+        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro")), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut settings = crate::config::settings::Settings::default();
+        settings.model_usage_windows.insert(
+            crate::agent::usage_windows::model_key("deepseek", "deepseek-v4-pro"),
+            crate::agent::usage_windows::presets().remove("deepseek_off_peak").unwrap(),
+        );
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
+
+        crate::agent::usage_windows::set_clock_override_ms(Some(clock("17:59")));
+        let waiter = {
+            let cloned = state.clone();
+            tokio::spawn(async move { cloned.admit_usage_window(None, false, None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "高峰时段必须等待，而不是失败");
+
+        crate::agent::usage_windows::set_clock_override_ms(Some(clock("18:00")));
+        let resumed = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("到 18:00 必须自动继续")
+            .unwrap()
+            .expect("等待不是错误");
+        assert!(resumed.is_none(), "到点后同一个模型即可继续，不需要换模型");
+
+        // 等待不是技术失败：健康状态不变、失败索引为空、记录里没有 failed。
+        assert!(state.health.is_available("deepseek"));
+        assert!(state.inner.lock().unwrap().failed_indices.is_empty());
+        assert!(state.attempt_snapshots(false).iter().all(|attempt| attempt.status != "failed"), "等待不得写入技术失败");
+        assert_eq!(
+            crate::agent::usage_windows::wait_notice(&endpoint_label("deepseek"), Some(clock("18:00"))),
+            "等 DeepSeek 闲时（10-13 18:00 开始）后继续；可在设置里放开时段，或换一个模型"
+        );
+        crate::agent::usage_windows::set_clock_override_ms(None);
+    }
+
+    /// CF-WINDOW-R2 / Compatibility Harness：没有配置任何时段时，准入是一次
+    /// 纯直通——不看时钟、不换模型、不写记录。升级后未配置的用户行为与现在一致。
+    #[tokio::test]
+    async fn an_unconfigured_route_is_admitted_unchanged() {
+        let _serial = crate::agent::usage_windows::clock_test_lock();
+        // 把时钟顶到高峰时刻：如果未配置也会被拦，这条就会红。
+        crate::agent::usage_windows::set_clock_override_ms(Some(
+            chrono::DateTime::parse_from_rfc3339("2026-10-13T10:00:00+08:00").unwrap().timestamp_millis(),
+        ));
+        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro")), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(crate::config::settings::Settings::default())));
+        assert!(state.admit_usage_window(None, false, None).await.unwrap().is_none(), "未配置时段不得改变选路");
+        assert_eq!(state.current().model_id, "deepseek-v4-pro");
+        assert!(state.attempt_snapshots(false).is_empty(), "未配置时段不得写任何记录");
+        assert!(state.inner.lock().unwrap().failed_indices.is_empty());
+        crate::agent::usage_windows::set_clock_override_ms(None);
+    }
 
     fn route(name: &str, model: &str) -> RouteCandidate {
         RouteCandidate {

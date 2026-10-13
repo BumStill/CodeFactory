@@ -1929,6 +1929,9 @@ impl ModelTransport for RoutedDesktopModelTransport {
         let mut downgraded_options: Option<RoundOptions> = None;
         loop {
             let opts = downgraded_options.as_ref().unwrap_or(opts);
+            if let Some(change) = self.route_state.admit_usage_window(self.cancel.as_deref(), super::usage_windows::session_ignores_windows(&self.session_id), Some(self.events.as_ref())).await.map_err(classify_transport_error)? {
+                transitions.push(change);
+            }
             let route = self.route_state.current();
             let output_started = Arc::new(AtomicBool::new(false));
             // U33 / CF-PFB-R11. The side-effect state this round inherits from

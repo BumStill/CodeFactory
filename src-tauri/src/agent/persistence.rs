@@ -1304,6 +1304,53 @@ mod tests {
         assert_eq!(actual, ("deepseek".into(), "deepseek-v4-pro".into()));
     }
 
+    // CF-WINDOW-R8: a model skipped for being outside its usage window is
+    // recorded in model_route_attempts with the machine-readable reason and the
+    // rule that produced it, next to the route that actually served the turn.
+    #[tokio::test]
+    async fn route_attempt_journal_records_outside_usage_window_with_its_rule() {
+        let db = pool().await;
+        let attempts = vec![
+            super::super::failover::RouteAttemptSnapshot {
+                endpoint: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                status: "skipped".into(),
+                failure_code: Some(
+                    r#"outside_usage_window:{"rule":{"mode":"official_off_peak","timezone":"Asia/Shanghai"},"next_available_ms":1800000000000}"#
+                        .into(),
+                ),
+            },
+            super::super::failover::RouteAttemptSnapshot {
+                endpoint: "deepseek".into(),
+                model: "deepseek-flash".into(),
+                status: "succeeded".into(),
+                failure_code: None,
+            },
+        ];
+        persist_model_route_attempts(&db, "s1", "user-1", "prefer", &attempts, true, false)
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT endpoint, model, status, failure_code
+             FROM model_route_attempts ORDER BY rowid",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "deepseek-v4-pro");
+        assert_eq!(rows[0].2, "skipped");
+        let recorded = rows[0].3.as_deref().unwrap();
+        assert!(recorded.starts_with("outside_usage_window:"), "{recorded}");
+        // The rule that produced the skip and the next allowed instant both travel
+        // with the row, so the wait is explainable after the fact.
+        assert!(recorded.contains("official_off_peak"), "{recorded}");
+        assert!(recorded.contains("Asia/Shanghai"), "{recorded}");
+        assert!(recorded.contains("1800000000000"), "{recorded}");
+        assert_eq!(rows[1].2, "succeeded");
+    }
+
     #[tokio::test]
     async fn route_attempt_journal_contains_provenance_but_no_credentials() {
         let db = pool().await;

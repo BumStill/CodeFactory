@@ -448,6 +448,12 @@ pub async fn update_session_model_config(
             "Model '{model_id}' is not configured for endpoint '{endpoint_id}'"
         )));
     }
+    if !crate::agent::usage_windows::session_ignores_windows(&session_id) {
+        let key = crate::agent::usage_windows::model_key(&endpoint_id, &model_id);
+        if settings.model_usage_windows.get(&key).is_some_and(|rule| !rule.evaluate(crate::agent::usage_windows::now_ms()).available) {
+            return Err(AppError::Other("OUTSIDE_USAGE_WINDOW: 当前模型不在允许时段；可选择本会话忽略时段限制，或换模型".into()));
+        }
+    }
     drop(settings);
 
     let pool = state.db.read().await;

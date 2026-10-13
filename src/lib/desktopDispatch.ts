@@ -95,6 +95,10 @@ export interface DispatchHandlers {
   resolveApproval: (input: { approvalId: string; approve: boolean }) => Promise<unknown>;
   /** CF-BLD-R4: the panel's one-click cleanup, reachable from the background. */
   /** CF-QUOTA-R2: same reads and persistence as Settings. */
+  getUsageWindows?: () => Promise<unknown> | unknown;
+  setUsageWindow?: (input: { endpoint: string; model: string; rule: import("./usageWindows").UsageWindow }) => Promise<unknown>;
+  /** CF-WINDOW-R6/R7: the same one-shot per-session exemption the picker offers. */
+  setSessionUsageWindowOverride?: (input: { sessionId: string; ignore: boolean }) => Promise<unknown>;
   getQuota?: () => Promise<unknown>;
   setQuotaCap?: (input: QuotaCapInput) => Promise<unknown>;
   cleanBuildCache?: () => Promise<unknown>;
@@ -215,6 +219,20 @@ export async function applyDispatchRequest(
         break;
       case "list_approvals":
         result = await handlers.listApprovals();
+        break;
+      case "get_usage_windows":
+        if (!handlers.getUsageWindows) return invalid("get_usage_windows is not available");
+        result = await handlers.getUsageWindows();
+        break;
+      case "set_usage_window":
+        if (!handlers.setUsageWindow) return invalid("set_usage_window is not available");
+        if (!body.rule || typeof body.rule !== "object") return invalid("rule must be an object");
+        result = await handlers.setUsageWindow({ endpoint: requiredString(body.endpoint, "endpoint"), model: requiredString(body.model, "model"), rule: body.rule as import("./usageWindows").UsageWindow });
+        break;
+      case "set_session_usage_window_override":
+        if (!handlers.setSessionUsageWindowOverride) return invalid("set_session_usage_window_override is not available");
+        if (typeof body.ignore !== "boolean") return invalid("ignore must be a boolean");
+        result = await handlers.setSessionUsageWindowOverride({ sessionId: requiredString(body.session_id, "session_id"), ignore: body.ignore });
         break;
       case "get_quota":
         if (!handlers.getQuota) return invalid("get_quota is not available");

@@ -63,6 +63,7 @@ same-file = "1"
 uuid     = { version = "1", features = ["v4"] }
 url      = "2"
 chrono   = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 iana-time-zone = "0.1"
 base64   = "0.22"
 sha2     = "0.10"          # PKCE S256 challenge for Codex/ChatGPT OAuth

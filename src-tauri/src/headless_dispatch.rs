@@ -123,6 +123,9 @@ pub enum Request {
     /// talked into deleting a cache by the wording of a message.
     CleanBuildCache {},
     /// CF-QUOTA-R2: read the same subscription status as Settings.
+    SetSessionUsageWindowOverride { session_id: String, ignore: bool },
+    GetUsageWindows {},
+    SetUsageWindow { endpoint: String, model: String, rule: crate::agent::usage_windows::UsageWindow },
     GetQuota {},
     /// CF-QUOTA-R2: partial per-endpoint cap update; no paid endpoint changes.
     SetQuotaCap {
@@ -305,6 +308,13 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             require_non_empty("approval_id", approval_id)?
         }
         Request::FocusMainDisplay {} => {}
+        Request::SetSessionUsageWindowOverride { session_id, .. } => require_non_empty("session_id", session_id)?,
+        Request::GetUsageWindows {} => {}
+        Request::SetUsageWindow { endpoint, model, rule } => {
+            require_non_empty("endpoint", endpoint)?;
+            require_non_empty("model", model)?;
+            rule.validate().map_err(ErrorBody::invalid)?;
+        }
         Request::CleanBuildCache {} | Request::GetQuota {} => {}
         Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
             require_non_empty("endpoint", endpoint)?;
@@ -427,6 +437,14 @@ impl AuditEntry {
             Request::SetModel { session_id, .. } | Request::Stop { session_id } => {
                 entry.session_id = session_id.clone();
             }
+            Request::SetSessionUsageWindowOverride { session_id, ignore } => {
+                entry.session_id = Some(session_id.clone());
+                entry.message = Some(format!("ignore_usage_windows={ignore}"));
+            }
+            Request::GetUsageWindows {} => {}
+            Request::SetUsageWindow { endpoint, model, rule } => {
+                entry.message = Some(format!("endpoint={endpoint}; model={model}; rule={}", serde_json::to_string(rule).unwrap_or_default()));
+            }
             Request::GetQuota {} => {}
             Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
                 entry.message = Some(format!("endpoint={endpoint}; five_hour_percent={five_hour_percent:?}; weekly_percent={weekly_percent:?}"));
@@ -454,6 +472,9 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::ResolveApproval { .. } => "resolve_approval",
         Request::FocusMainDisplay {} => "focus_main_display",
         Request::CleanBuildCache {} => "clean_build_cache",
+        Request::SetSessionUsageWindowOverride { .. } => "set_session_usage_window_override",
+        Request::GetUsageWindows {} => "get_usage_windows",
+        Request::SetUsageWindow { .. } => "set_usage_window",
         Request::GetQuota {} => "get_quota",
         Request::SetQuotaCap { .. } => "set_quota_cap",
     }
@@ -749,7 +770,7 @@ mod server {
     ///
     /// The peer check happens **before** the body is read, so a foreign user
     /// gets a denial without the server doing any work on their behalf.
-    fn handle_connection(
+    pub(super) fn handle_connection(
         mut stream: UnixStream,
         host: &Arc<dyn DispatchHost>,
         audit: Option<&AuditLog>,
@@ -1394,6 +1415,68 @@ mod unix_tests {
         // This is the credential the server trusts.
         let (_client, server) = UnixStream::pair().unwrap();
         assert_eq!(socket::peer_uid_of(&server).unwrap(), socket::current_uid());
+    }
+
+    #[test]
+    fn usage_windows_real_socket_round_trip_is_model_scoped_and_audited() {
+        struct WindowHost(std::sync::Mutex<crate::config::settings::Settings>);
+        impl DispatchHost for WindowHost {
+            fn execute(&self, request: &Request) -> Result<serde_json::Value, ErrorBody> {
+                let mut settings = self.0.lock().unwrap();
+                match request {
+                    Request::SetUsageWindow { endpoint, model, rule } => {
+                        rule.validate().map_err(ErrorBody::invalid)?;
+                        settings.model_usage_windows.insert(crate::agent::usage_windows::model_key(endpoint, model), rule.clone());
+                        Ok(serde_json::json!({"endpoint":endpoint,"model":model,"rule":rule}))
+                    }
+                    Request::GetUsageWindows {} => Ok(serde_json::to_value(&settings.model_usage_windows).unwrap()),
+                    Request::SetSessionUsageWindowOverride { session_id, ignore } => {
+                        // 后台入口落到界面按钮用的同一个函数上，不另造一条路径。
+                        crate::agent::usage_windows::set_session_usage_window_override(session_id.clone(), *ignore)
+                            .map_err(ErrorBody::invalid)?;
+                        Ok(serde_json::json!({"session_id":session_id,"ignore":ignore}))
+                    }
+                    _ => Err(ErrorBody::invalid("unsupported test operation")),
+                }
+            }
+        }
+        let dir = private_dir();
+        let path = dir.path().join("window.sock");
+        let audit_path = dir.path().join("audit.jsonl");
+        let listener = socket::bind(&path).unwrap();
+        let host: std::sync::Arc<dyn DispatchHost> = std::sync::Arc::new(WindowHost(std::sync::Mutex::new(crate::config::settings::Settings::default())));
+        let audit = AuditLog::new(&audit_path);
+        let worker = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().unwrap();
+                server::handle_connection(stream, &host, Some(&audit), socket::current_uid());
+            }
+        });
+        for (model, mode) in [("pro","custom"),("flash","anytime")] {
+            let request = serde_json::json!({"operation":"set_usage_window","endpoint":"synthetic","model":model,"rule":{"mode":mode,"timezone":"UTC","weekdays":[1],"periods":[{"start":"09:00","end":"12:00"}]}});
+            let reply = client::request(&path, &request.to_string()).unwrap();
+            assert!(reply.ok);
+            assert_eq!(reply.result.unwrap()["model"], model);
+        }
+        let reply = client::request(&path, r#"{"operation":"get_usage_windows"}"#).unwrap();
+        assert!(reply.ok);
+        let config = reply.result.unwrap();
+        assert_eq!(config[crate::agent::usage_windows::model_key("synthetic","pro")]["mode"], "custom");
+        assert_eq!(config[crate::agent::usage_windows::model_key("synthetic","flash")]["mode"], "anytime");
+        // CF-WINDOW-R6/R7：「本会话忽略时段限制」也要能从后台入口下得去，
+        // 而且落到界面按钮用的同一份会话状态上。
+        let session = "dispatch-window-override-session";
+        assert!(!crate::agent::usage_windows::session_ignores_windows(session));
+        let reply = client::request(&path, &serde_json::json!({"operation":"set_session_usage_window_override","session_id":session,"ignore":true}).to_string()).unwrap();
+        assert!(reply.ok, "{:?}", reply.error);
+        assert_eq!(reply.result.unwrap()["ignore"], true);
+        assert!(crate::agent::usage_windows::session_ignores_windows(session), "后台入口必须落到界面用的同一份状态上");
+        crate::agent::usage_windows::set_session_usage_window_override(session.into(), false).unwrap();
+        assert!(!crate::agent::usage_windows::session_ignores_windows(session));
+        worker.join().unwrap();
+        let log = std::fs::read_to_string(audit_path).unwrap();
+        assert!(log.contains("set_usage_window") && log.contains("get_usage_windows") && log.contains("model=pro"));
+        assert!(log.contains("set_session_usage_window_override") && log.contains("ignore_usage_windows=true"), "豁免操作必须留审计：{log}");
     }
 
     #[test]

@@ -47,6 +47,7 @@ import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
 import { currentTurnOwnership } from "../../lib/turnOwnership";
 import { useDesktopMenuBridge } from "../../lib/useDesktopMenuBridge";
+import { getUsageWindows, setUsageWindow, setSessionUsageWindowOverride } from "../../lib/modelUsageWindows";
 import { getQuota, setQuotaCap } from "../../lib/subscriptionQuota";
 import { useDesktopDispatchBridge } from "../../lib/useDesktopDispatchBridge";
 import type { DispatchApproval } from "../../lib/desktopDispatch";
@@ -381,6 +382,9 @@ export function WorkspacePage({
   // 同一批动作。区别只有一点:派单请求需要应答,编排方要拿到会话状态这类结果。
   useDesktopDispatchBridge({
     handlers: {
+      getUsageWindows,
+      setUsageWindow,
+      setSessionUsageWindowOverride,
       getQuota,
       setQuotaCap,
       createAndSend: async ({ project, message, model, permissionMode }) => {
