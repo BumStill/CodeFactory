@@ -1035,16 +1035,31 @@ pub async fn is_chat_running(
         return Ok(true);
     }
     let pool = state.db.read().await.clone();
+    has_progressing_system_chat_run(&pool, &session_id).await
+}
+
+async fn has_progressing_system_chat_run(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> Result<bool, AppError> {
     let system_owned: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM objectives objective
          WHERE objective.session_id=? AND objective.root_turn_id IS NOT NULL
            AND objective.status IN ('active','waiting_system')
            AND NOT (objective.status='waiting_system'
-                    AND objective.failure_code IN ('technical_recovery_exhausted', ?))",
+                    AND objective.failure_code IN ('technical_recovery_exhausted', ?))
+           AND (objective.status='active'
+                OR objective.next_observation_at > ?
+                OR EXISTS (SELECT 1 FROM objective_remediations remediation
+                           WHERE remediation.objective_id=objective.id
+                             AND remediation.status='claimed'
+                             AND remediation.lease_expires_at > ?))",
     )
     .bind(session_id)
     .bind(crate::agent::objective::DELIVERED_AWAITING_CI)
-    .fetch_one(&pool)
+    .bind(Utc::now().timestamp_millis())
+    .bind(Utc::now().timestamp_millis())
+    .fetch_one(pool)
     .await?;
     Ok(system_owned > 0)
 }
@@ -1607,31 +1622,36 @@ async fn settle_chat_objective_from_error(
         project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
         return Ok(current);
     }
+    if error_text.contains("PROVIDER_DURABLE_IDENTITY_SUPERSEDED") {
+        // M79: settle only this obsolete claim, never the new turn's recovery.
+        if let Some(permit) = mutation_permit {
+            sqlx::query(
+                "UPDATE objective_remediations SET status='superseded',
+                   lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+                 WHERE id=? AND objective_id=? AND lease_owner=? AND claim_epoch=?
+                   AND status='claimed'",
+            )
+            .bind(Utc::now().timestamp_millis())
+            .bind(&permit.remediation_id)
+            .bind(objective_id)
+            .bind(&permit.owner)
+            .bind(permit.claim_epoch)
+            .execute(db)
+            .await?;
+        }
+        // Project the objective's current root, not the stale runner's root.
+        let live_root = current.resume_cursor.as_deref()
+            .filter(|root| !root.is_empty())
+            .or(current.root_turn_id.as_deref())
+            .unwrap_or(root_turn_id);
+        project_chat_objective(db, app, event_name, live_root, &current).await?;
+        return Ok(current);
+    }
     if current.revision != expected_revision {
         return Err(AppError::Other(format!(
             "stale chat runner revision: expected {expected_revision}, actual {}",
             current.revision
         )));
-    }
-    if error_text.contains("PROVIDER_DURABLE_IDENTITY_SUPERSEDED") {
-        // U18/R3: this remediation belongs to a turn the Objective already
-        // replaced (the user's message took over and moved the live turn).
-        // Superseding the queued remediation — instead of creating a fresh one
-        // for the same stale turn — is what stops the session from looping on
-        // PROVIDER_DURABLE_IDENTITY_MISMATCH until the budget is gone. The live
-        // turn is the user's and keeps running on its own.
-        sqlx::query(
-            "UPDATE objective_remediations SET status='superseded',
-               lease_owner=NULL, lease_expires_at=NULL, updated_at=?
-             WHERE objective_id=?
-               AND status NOT IN ('completed','cancelled','superseded')",
-        )
-        .bind(Utc::now().timestamp_millis())
-        .bind(objective_id)
-        .execute(db)
-        .await?;
-        project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
-        return Ok(current);
     }
     let signal = if auth_expired {
         RouteSignal::AuthorizationRequired {
@@ -5167,6 +5187,23 @@ mod tests {
             .await
             .unwrap();
         (pool, waiting)
+    }
+
+    #[tokio::test]
+    async fn m80_expired_wait_does_not_block_but_future_retry_and_claim_do() {
+        let (pool, objective) = durable_cancel_test_objective("m80-stalled").await;
+        let session_id = objective.session_id.as_deref().unwrap();
+        assert!(!has_progressing_system_chat_run(&pool, session_id).await.unwrap());
+        sqlx::query("UPDATE objectives SET next_observation_at=? WHERE id=?")
+            .bind(Utc::now().timestamp_millis() + 60_000).bind(&objective.id)
+            .execute(&pool).await.unwrap();
+        assert!(has_progressing_system_chat_run(&pool, session_id).await.unwrap());
+        sqlx::query("UPDATE objectives SET next_observation_at=0 WHERE id=?")
+            .bind(&objective.id).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objective_remediations SET status='claimed', lease_expires_at=? WHERE objective_id=?")
+            .bind(Utc::now().timestamp_millis() + 60_000).bind(&objective.id)
+            .execute(&pool).await.unwrap();
+        assert!(has_progressing_system_chat_run(&pool, session_id).await.unwrap());
     }
 
     /// S2: a failed Objective is terminal, so it is not live work the composer
