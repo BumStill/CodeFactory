@@ -15,11 +15,16 @@ import { useSettingsStore } from "./stores/settings";
 import { syncChatGptCatalog } from "./stores/chatgptCatalog";
 import { useChatStore, openSessionId } from "./stores/chat";
 import { useAppNavigationStore } from "./stores/appNavigation";
+import { useAppDispatchBridge } from "./lib/useAppDispatchBridge";
 
 export type AppView = "workspace" | "resources" | "settings" | "profile" | "control-plane" | "benchmarks" | "evolution";
 
 export default function App() {
   const [view, setView] = useState<AppView>("workspace");
+  useAppDispatchBridge(() => {
+    setWorkspaceTaskLogId(null);
+    setView("workspace");
+  });
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>();
   const [workspaceTaskLogId, setWorkspaceTaskLogId] = useState<string | null>(null);
   const [evolutionCwd, setEvolutionCwd] = useState<string | null>(null);

@@ -47,17 +47,6 @@ import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
 import { currentTurnOwnership } from "../../lib/turnOwnership";
 import { useDesktopMenuBridge } from "../../lib/useDesktopMenuBridge";
-import { getUsageWindows, setUsageWindow, setSessionUsageWindowOverride } from "../../lib/modelUsageWindows";
-import { getQuota, setQuotaCap } from "../../lib/subscriptionQuota";
-import { useDesktopDispatchBridge } from "../../lib/useDesktopDispatchBridge";
-import type { DispatchApproval } from "../../lib/desktopDispatch";
-import {
-  dispatchSend,
-  dispatchSetModel,
-  dispatchSetPermission,
-  dispatchStatus,
-  dispatchStop,
-} from "../../lib/dispatchActions";
 
 type WorkspaceBrowserSession = BrowserSession & {
   status?: string | null;
@@ -375,48 +364,6 @@ export function WorkspacePage({
       cleanBuildCache: async () => {
         await invoke("build_cache_cleanup");
       },
-    },
-  });
-  // 本地非界面派单入口(U34)。和菜单栏是同一个模式:原生侧只发信封(传输、
-  // 鉴权、审计、协议校验),业务语义落在这里、复用上面菜单和按钮已经在用的
-  // 同一批动作。区别只有一点:派单请求需要应答,编排方要拿到会话状态这类结果。
-  useDesktopDispatchBridge({
-    handlers: {
-      getUsageWindows,
-      setUsageWindow,
-      setSessionUsageWindowOverride,
-      getQuota,
-      setQuotaCap,
-      createAndSend: async ({ project, message, model, permissionMode }) => {
-        const selected = model ? await dispatchSetModel({ model }) : null;
-        const store = useChatStore.getState();
-        const session = await store.createSession(project, selected?.model ?? store.activeModel);
-        if (permissionMode) await store.updateActiveSessionPermissionMode(permissionMode);
-        await composerRef.current?.sendText(message);
-        return { session_id: session.id, model: session.model_id };
-      },
-      send: async ({ sessionId, message, mode }) => dispatchSend({ sessionId, message, mode }),
-      setPermission: async ({ sessionId, mode }) => dispatchSetPermission({ sessionId, mode }),
-      setModel: async ({ sessionId, model }) => dispatchSetModel({ sessionId, model }),
-      switchSession: async ({ sessionId }) => {
-        await onOpenSession(sessionId);
-        return { session_id: sessionId };
-      },
-      stop: async ({ sessionId }) => dispatchStop({ sessionId }),
-      cleanBuildCache: async () => {
-        // CF-BLD-R4：和「资源中心」面板上的清理按钮调用同一个 Tauri 命令，
-        // 所以锁屏期间编排方也能回收构建缓存，而不是只能等有人点界面。
-        return invoke("build_cache_cleanup");
-      },
-      listApprovals: async () => {
-        return invoke<DispatchApproval[]>("list_pending_approvals");
-      },
-      resolveApproval: async ({ approvalId, approve }) => {
-        // 一次只处理一条:高危操作仍然要编排方明确选"批"或"拒",没有批量放行。
-        await invoke("respond_to_permission", { intentId: approvalId, allow: approve });
-        return { approval_id: approvalId, approved: approve };
-      },
-      status: async ({ sessionId }) => dispatchStatus({ sessionId }),
     },
   });
   const draftProjects = useMemo(() => recentProjects(sessions ?? []), [sessions]);

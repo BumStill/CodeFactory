@@ -1005,13 +1005,25 @@ pub mod bridge {
         timeout: Duration,
     }
 
+    fn wait_for_interface(rx: Receiver<Response>, timeout: Duration) -> Result<serde_json::Value, ErrorBody> {
+        match rx.recv_timeout(timeout) {
+            Ok(response) if response.ok => Ok(response.result.unwrap_or(serde_json::Value::Null)),
+            Ok(response) => Err(response.error.unwrap_or_else(|| ErrorBody::internal("the request was refused"))),
+            Err(_) => Err(ErrorBody {
+                code: "frontend_timeout".to_string(),
+                message: format!("frontend did not respond within {timeout:?}; the operation may have started, check status before retrying"),
+            }),
+        }
+    }
+
     impl DispatchBridge {
         pub fn new(app: AppHandle<Wry>) -> Self {
             let timeout = std::env::var("CODEFACTORY_DISPATCH_TIMEOUT_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_millis)
-                .unwrap_or_else(|| Duration::from_secs(120));
+                .filter(|value| *value > 0)
+                .map(|value| Duration::from_millis(value.min(30_000)))
+                .unwrap_or_else(|| Duration::from_secs(30));
             Self {
                 app,
                 pending: Mutex::new(HashMap::new()),
@@ -1052,16 +1064,12 @@ pub mod bridge {
                     "could not reach the app interface: {error}"
                 )));
             }
-            match rx.recv_timeout(self.timeout) {
-                Ok(response) if response.ok => Ok(response.result.unwrap_or(serde_json::Value::Null)),
-                Ok(response) => Err(response
-                    .error
-                    .unwrap_or_else(|| ErrorBody::internal("the request was refused"))),
-                Err(_) => Err(ErrorBody::internal(format!(
-                    "the app interface did not answer within {:?}",
-                    self.timeout
-                ))),
+            let result = wait_for_interface(rx, self.timeout);
+            // Always release ownership, including timeout/disconnect. Late replies are rejected.
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&request_id);
             }
+            result
         }
     }
 
@@ -1073,6 +1081,32 @@ pub mod bridge {
                 Request::FocusMainDisplay {} => super::focus_main_display(&self.app),
                 _ => self.ask_interface(request),
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod timeout_tests {
+        use super::*;
+
+        #[test]
+        fn m83_silent_frontend_times_out_and_late_reply_is_disconnected() {
+            let (tx, rx) = channel();
+            let started = std::time::Instant::now();
+            let error = wait_for_interface(rx, Duration::from_millis(20)).unwrap_err();
+            assert_eq!(error.code, "frontend_timeout");
+            assert!(error.message.contains("frontend did not respond"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(tx.send(Response::ok(serde_json::json!({"late": true}))).is_err());
+        }
+
+        #[test]
+        fn m83_reply_preserves_success_and_failure() {
+            let (tx, rx) = channel();
+            tx.send(Response::ok(serde_json::json!({"synthetic": 42}))).unwrap();
+            assert_eq!(wait_for_interface(rx, Duration::from_millis(20)).unwrap()["synthetic"], 42);
+            let (tx, rx) = channel();
+            tx.send(Response::failed(ErrorBody::internal("synthetic failure"))).unwrap();
+            assert_eq!(wait_for_interface(rx, Duration::from_millis(20)).unwrap_err().message, "synthetic failure");
         }
     }
 

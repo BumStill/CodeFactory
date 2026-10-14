@@ -1,0 +1,84 @@
+{
+  "status": "pass",
+  "environment": "real Chromium + production App/stores/handlers; synthetic IPC, not installed desktop",
+  "results": [
+    {
+      "theme": "light",
+      "quota": {
+        "requestId": "quota",
+        "ok": true,
+        "result": [
+          {
+            "endpoint": "synthetic",
+            "label": "合成订阅",
+            "source": "本地估算",
+            "five_hour_percent": 12,
+            "weekly_percent": 9,
+            "five_hour_cap_percent": 80,
+            "weekly_cap_percent": 80,
+            "over_cap": false
+          }
+        ]
+      },
+      "reply": {
+        "requestId": "create",
+        "ok": true,
+        "result": {
+          "session_id": "synthetic-created-1",
+          "delivery": {
+            "status": "delivered",
+            "into": "new_turn"
+          },
+          "model": "synthetic-model"
+        }
+      },
+      "sends": [
+        {
+          "sessionId": "synthetic-created-1",
+          "content": "合成派单消息",
+          "rootTurnId": "048ae26a-9109-48b4-b800-c4d41281f7c2"
+        }
+      ],
+      "switch_session": "pass"
+    },
+    {
+      "theme": "dark",
+      "quota": {
+        "requestId": "quota",
+        "ok": true,
+        "result": [
+          {
+            "endpoint": "synthetic",
+            "label": "合成订阅",
+            "source": "本地估算",
+            "five_hour_percent": 12,
+            "weekly_percent": 9,
+            "five_hour_cap_percent": 80,
+            "weekly_cap_percent": 80,
+            "over_cap": false
+          }
+        ]
+      },
+      "reply": {
+        "requestId": "create",
+        "ok": true,
+        "result": {
+          "session_id": "synthetic-created-1",
+          "delivery": {
+            "status": "delivered",
+            "into": "new_turn"
+          },
+          "model": "synthetic-model"
+        }
+      },
+      "sends": [
+        {
+          "sessionId": "synthetic-created-1",
+          "content": "合成派单消息",
+          "rootTurnId": "b7b82c6a-0fc9-4d08-9240-925172a84fd7"
+        }
+      ],
+      "switch_session": "pass"
+    }
+  ]
+}
