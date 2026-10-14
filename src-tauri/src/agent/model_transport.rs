@@ -34,7 +34,7 @@ use codefactory_agent_loop::transport::{
 };
 
 use super::events::EventSink;
-use super::failover::{classify_provider_failure, ActiveRouteState, RouteCandidate};
+use super::failover::{classify_provider_failure, ActiveRouteState, ProviderFailureClass, RouteCandidate};
 use super::provider_recovery::{
     OverloadBudgetDecision, ProviderAttemptSpec, ProviderEpisodeSpec, ProviderMutation,
     ProviderOwnerPermit, ProviderRecoveryStore,
@@ -429,6 +429,19 @@ impl RoutedDesktopModelTransport {
     /// as a missing durable identity failed the continued session every few
     /// minutes without a single step of progress. Without a live turn the claim
     /// really is unidentifiable, and the caller keeps the fail-closed answer.
+    fn failure_with_chain(&self, error: TransportError) -> TransportError {
+        let Some(primary) = self.route_state.primary_failure_reason() else {
+            return error;
+        };
+        if matches!(classify_provider_failure(&primary), ProviderFailureClass::TransportUnreachable)
+            && self.route_state.attempt_snapshots(false).iter().filter(|attempt| attempt.status == "failed")
+                .map(|attempt| &attempt.endpoint).collect::<std::collections::HashSet<_>>().len() > 1 {
+            TransportError::Retryable(self.route_state.exhausted_error(error.message()))
+        } else {
+            error
+        }
+    }
+
     async fn stale_remediation_is_superseded_by_live_turn(
         &self,
         objective_id: &str,
@@ -1969,7 +1982,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         let _ = attempt.settle_failure(&error).await?;
                     }
                     self.route_state.record_current_failure(&reason);
-                    return Err(TransportError::Fatal(reason));
+                    return Err(self.failure_with_chain(TransportError::Fatal(reason)));
                 }
                 Err(TransportError::Retryable(reason)) => {
                     let action = match provider_attempt.as_ref() {
@@ -1984,9 +1997,14 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         None => ProviderFailureAction::RetrySafe,
                     };
                     if action == ProviderFailureAction::DurableWaiting {
-                        return Err(TransportError::Retryable(
+                        let error = TransportError::Retryable(
                             "PROVIDER_RECOVERY_WAITING: provider overloaded".into(),
-                        ));
+                        );
+                        if !self.turn_uncommitted_side_effect.load(Ordering::SeqCst) {
+                            self.route_state.record_current_failure(&reason);
+                            return Err(self.failure_with_chain(error));
+                        }
+                        return Err(error);
                     }
                     if self.turn_uncommitted_output.load(Ordering::SeqCst)
                         || self.turn_uncommitted_side_effect.load(Ordering::SeqCst)
@@ -2083,7 +2101,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         continue;
                     }
                     self.route_state.record_current_failure(&error.to_string());
-                    return Err(error);
+                    return Err(self.failure_with_chain(error));
                 }
                 Err(TransportError::Retryable(reason)) => {
                     let action = match provider_attempt.as_ref() {
@@ -2099,9 +2117,14 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         None => ProviderFailureAction::RetrySafe,
                     };
                     if action == ProviderFailureAction::DurableWaiting {
-                        return Err(TransportError::Retryable(
+                        let error = TransportError::Retryable(
                             "PROVIDER_RECOVERY_WAITING: provider overloaded".into(),
-                        ));
+                        );
+                        if !self.turn_uncommitted_side_effect.load(Ordering::SeqCst) {
+                            self.route_state.record_current_failure(&reason);
+                            return Err(self.failure_with_chain(error));
+                        }
+                        return Err(error);
                     }
                     if reason.contains(REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT)
                         && downgraded_options.is_none()
