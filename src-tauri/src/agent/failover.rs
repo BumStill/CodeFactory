@@ -155,6 +155,11 @@ impl ProviderFailureClass {
 /// Classify only failures that are safe to replay on a different endpoint
 /// before any streamed output/tool side effect exists.
 pub fn classify_provider_failure(message: &str) -> ProviderFailureClass {
+    if let Some(rest) = message.strip_prefix("首选端点失败：") {
+        if let Some((primary, _)) = rest.split_once('\n') {
+            return classify_provider_failure(primary);
+        }
+    }
     let lower = message.to_ascii_lowercase();
     if codefactory_agent_loop::context::is_context_overflow(message) {
         return ProviderFailureClass::ContextOverflow;
@@ -698,6 +703,11 @@ impl ActiveRouteState {
         attempts
     }
 
+    pub fn primary_failure_reason(&self) -> Option<String> {
+        self.inner.lock().expect("active route mutex poisoned")
+            .failures.first().map(|(_, _, reason)| reason.clone())
+    }
+
     pub fn exhausted_error(&self, final_reason: &str) -> String {
         let mut inner = self.inner.lock().expect("active route mutex poisoned");
         let current = inner.candidates[inner.current_index].clone();
@@ -712,21 +722,28 @@ impl ActiveRouteState {
                 final_reason.to_string(),
             ));
         }
-        let attempts = inner
-            .failures
-            .iter()
-            .map(|(endpoint, model, reason)| {
-                format!(
-                    "{} / {}（{}）",
-                    endpoint_label(endpoint),
-                    model,
-                    concise_reason(reason)
-                )
+        let primary = inner.failures.first().map(|(_, _, reason)| concise_reason(reason))
+            .unwrap_or_else(|| concise_reason(final_reason));
+        let attempts = inner.candidates.iter().filter_map(|candidate| {
+            let label = format!("{} / {}", endpoint_label(&candidate.endpoint_name), candidate.model_id);
+            if let Some((_, _, reason)) = inner.failures.iter().find(|(endpoint, model, _)|
+                endpoint == &candidate.endpoint_name && model == &candidate.model_id) {
+                return Some(format!("{label}（{}）", concise_reason(reason)));
+            }
+            inner.usage_skips.iter().find(|skip| skip.endpoint == candidate.endpoint_name
+                && skip.model == candidate.model_id).map(|skip| {
+                let next = skip.failure_code.as_deref()
+                    .and_then(|code| code.strip_prefix("outside_usage_window:"))
+                    .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                    .and_then(|data| data["next_available_ms"].as_i64())
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(|at| at.with_timezone(&chrono_tz::Asia::Shanghai).format("%m-%d %H:%M").to_string());
+                format!("{label}（不在允许使用时段，已跳过{}）",
+                    next.map(|clock| format!("，{clock} 起可用")).unwrap_or_default())
             })
-            .collect::<Vec<_>>()
-            .join("；");
+        }).collect::<Vec<_>>().join("；");
         format!(
-            "所有可用模型端点均不可用：{attempts}。目标与失败证据已保留；系统将按退避策略重新观测可用路由。"
+            "首选端点失败：{primary}\n所有可用模型端点均不可用：{attempts}。目标与失败证据已保留；系统将按退避策略重新观测可用路由。"
         )
     }
 }
@@ -1161,6 +1178,33 @@ mod tests {
                 "route exhaustion must not hand technical recovery to the user: {message}"
             );
         }
+    }
+
+    #[test]
+    fn mixed_exhaustion_keeps_primary_transport_cause_and_window_skip() {
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-synthetic"));
+        plan.push_fallback(route("deepseek", "deepseek-synthetic"));
+        plan.push_fallback(route("openrouter", "router-synthetic"));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan, EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        state.advance_after_failure("error sending request: connection refused");
+        {
+            let mut inner = state.inner.lock().unwrap();
+            inner.usage_skips.push(RouteAttemptSnapshot {
+                endpoint: "deepseek".into(), model: "deepseek-synthetic".into(),
+                status: "skipped".into(),
+                failure_code: Some("outside_usage_window:{\"next_available_ms\":1791950400000}".into()),
+            });
+            inner.current_index = 2;
+        }
+        let message = state.exhausted_error("AUTH_MISSING: openrouter 尚未配置凭据");
+        assert!(message.contains("DeepSeek"), "{message}");
+        assert!(message.contains("允许使用时段"), "{message}");
+        assert!(message.contains("可用"), "{message}");
+        assert!(message.find("ChatGPT").unwrap() < message.find("DeepSeek").unwrap());
+        assert!(message.find("DeepSeek").unwrap() < message.find("OpenRouter").unwrap());
+        assert_eq!(classify_provider_failure(&message), ProviderFailureClass::TransportUnreachable);
     }
 
     #[test]

@@ -154,7 +154,10 @@ impl DeliveryOutcome {
                 !self.recoverable
                     && self.recovery_class == RecoveryClass::None
                     && self.retry_after_ms.is_none()
-                    && self.next_action.is_none()
+                    && (self.next_action.is_none()
+                        || (self.code == "delivery_ceiling_lowered_by_request"
+                            && self.lowered_from_configured.is_some()
+                            && self.requested_ceiling == self.effective_ceiling))
             }
             "waiting" => {
                 self.recoverable
@@ -12105,6 +12108,8 @@ Release-Urgency: hold"
         );
         // It is not a failure: everything that was asked for was delivered.
         assert_eq!(outcome.final_state, "delivered");
+        // CF-M77B-R1: this valid lowered result must survive the tool contract.
+        assert!(outcome.validate_contract().is_ok());
     }
 
     /// A call that honours the configured ceiling must stay silent about it —
