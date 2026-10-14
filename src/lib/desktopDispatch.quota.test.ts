@@ -59,7 +59,7 @@ describe("CF-QUOTA-R2 background settings integration", () => {
   it("native protocol, CLI, and mounted dispatch bridge advertise both operations", () => {
     const rust = readFileSync("src-tauri/src/headless_dispatch.rs", "utf8");
     const cli = readFileSync("scripts/dispatch-task.mjs", "utf8");
-    const bridge = readFileSync("src/pages/Workspace/WorkspacePage.tsx", "utf8");
+    const bridge = readFileSync("src/lib/useAppDispatchBridge.ts", "utf8");
     for (const operation of ["get_quota", "set_quota_cap"]) {
       expect(rust).toContain(`"${operation}"`);
       expect(cli).toContain(`"${operation}",`);
