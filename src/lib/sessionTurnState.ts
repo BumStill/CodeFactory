@@ -107,7 +107,10 @@ export function sessionTurnState(input: SessionTurnStateInput): SessionTurnState
   const serverRunning = input.sessionIsRunning === true;
   // 只有在"这一轮还没被释放"时，本地 streaming 才说明它在跑；结算后的残留
   // 不算（M56）。服务器权威标志永远是证据。
-  const running = serverRunning || (input.streaming && !ownership.released);
+  const activity = [...ownership.messages].reverse().find((message) => message.turnActivity)?.turnActivity;
+  const parked = input.sessionIsRunning === false && frozen === "waiting_system"
+    && activity?.nextObservationAt == null;
+  const running = serverRunning || (input.streaming && !ownership.released && !parked);
   const waitingPermission = input.waitingPermission === true;
 
   let objectiveState: SessionObjectiveState;

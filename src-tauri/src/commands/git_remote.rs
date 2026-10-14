@@ -477,6 +477,25 @@ async fn find_workspace_pr(
     Ok(Some(parse_github_delivery_pr(&value)))
 }
 
+/// CF-TRUTH-M28-R1: the PR a session shows in the top bar is the newest
+/// *delivery run* for that session — the revisioned delivery record that the
+/// delivery loop keeps up to date. The older one-row `session_delivery_refs`
+/// link is written once at push time and keeps naming a PR that was later
+/// superseded or merged, which is why #555 stayed on "CI 失败" for days.
+async fn latest_delivery_pr_ref(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> Result<Option<(String, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, i64)>(
+        "SELECT head_branch, canonical_pr_number FROM delivery_runs
+         WHERE session_id=? AND canonical_pr_number IS NOT NULL
+         ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+}
+
 #[tauri::command]
 pub async fn workspace_delivery_status(
     cwd: String,
@@ -487,13 +506,9 @@ pub async fn workspace_delivery_status(
 ) -> Result<WorkspaceDeliverySnapshot, String> {
     let stored = if let Some(session_id) = session_id.as_deref() {
         let db = state.db.read().await.clone();
-        sqlx::query_as::<_, (String, i64)>(
-            "SELECT branch, pr_number FROM session_delivery_refs WHERE session_id = ?",
-        )
-        .bind(session_id)
-        .fetch_optional(&db)
-        .await
-        .map_err(|error| error.to_string())?
+        latest_delivery_pr_ref(&db, session_id)
+            .await
+            .map_err(|error| error.to_string())?
     } else {
         None
     };
@@ -595,6 +610,62 @@ mod workspace_delivery_tests {
         assert_eq!(snapshot.state, "merged");
         assert_eq!(snapshot.head_sha, "head123");
         assert_eq!(snapshot.merge_commit_sha.as_deref(), Some("merge456"));
+    }
+
+    // M28：会话顶栏的 PR 必须取 delivery_runs 里**最新**那条，而不是 push 时写死
+    // 一次的 session_delivery_refs。旧链接仍指向被取代的 PR，顶栏就永远停在旧的
+    // CI 结论上（#555 合并多日后仍显示「CI 失败」）。
+    #[tokio::test]
+    async fn m28_latest_delivery_run_supersedes_the_stale_session_pr_link() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO session_delivery_refs (session_id,branch,pr_number,pr_url,commit_sha,updated_at)
+             VALUES ('synthetic-m28','feat/stale',999,'https://example.invalid/pull/999','stale-sha','2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, branch, number, at) in [
+            ("synthetic-old", "feat/old", 111_i64, 100_i64),
+            ("synthetic-new", "feat/merged", 222, 200),
+        ] {
+            sqlx::query(
+                "INSERT INTO delivery_runs (id,run_kind,session_id,head_branch,canonical_pr_number,
+                 requested_ceiling,reached_ceiling,stage,status,last_observed_at,last_progress_at,
+                 app_version,app_build,process_instance,created_at,updated_at)
+                 VALUES (?,?,'synthetic-m28',?,?,'through_merge','merged','complete','completed',?,?,'1.88.2','synthetic','synthetic-process',?,?)",
+            )
+            .bind(id)
+            .bind("delivery")
+            .bind(branch)
+            .bind(number)
+            .bind(at)
+            .bind(at)
+            .bind(at)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            latest_delivery_pr_ref(&pool, "synthetic-m28").await.unwrap(),
+            Some(("feat/merged".to_string(), 222)),
+            "最新的 delivery run 必须压过旧的 session_delivery_refs 链接"
+        );
+        // 同一条 fixture 下，旧数据源给出的仍是 push 时那一个 PR —— 顶栏照它就
+        // 永远停在旧的 CI 结论上。
+        let stale: (String, i64) = sqlx::query_as(
+            "SELECT branch, pr_number FROM session_delivery_refs WHERE session_id=?",
+        )
+        .bind("synthetic-m28")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stale, ("feat/stale".to_string(), 999));
+        assert_eq!(
+            latest_delivery_pr_ref(&pool, "synthetic-m28-unrelated").await.unwrap(),
+            None
+        );
     }
 
     #[test]

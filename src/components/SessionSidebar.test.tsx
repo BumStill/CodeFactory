@@ -69,6 +69,23 @@ describe("SessionSidebar", () => {
     mocks.loadSessions.mockResolvedValue(undefined);
   });
 
+  it("shows parked waiting as static and offers explicit closeout", async () => {
+    const previousRuntime = fakeChatState.runtime;
+    fakeChatState.runtime = { q1: { streaming: true, messages: [
+      { id: "root", role: "user", content: "synthetic", createdAt: 1 },
+      { id: "a", role: "assistant", content: "", createdAt: 2,
+        turnActivity: { objectiveStatus: "waiting_system", nextObservationAt: null, label: "PR #184 已合并，等你确认验收" } },
+    ] } };
+    try {
+      render(<SessionSidebar currentSessionId="q1" onOpenSession={noop} onNewConversation={noop} />);
+      expect(screen.queryByLabelText("运行中")).not.toBeInTheDocument();
+      expect(screen.getByLabelText("等待确认验收")).toBeInTheDocument();
+      const row = screen.getByText("改图脚本").closest("li")!;
+      fireEvent.click(within(row).getByLabelText("更多操作"));
+      expect(within(row).getByRole("button", { name: "确认验收 / 结案" })).toBeInTheDocument();
+    } finally { fakeChatState.runtime = previousRuntime; }
+  });
+
   it("keeps one recency-ordered list with no imposed sections", () => {
     render(
       <SessionSidebar currentSessionId="p1a" onOpenSession={noop} onNewConversation={noop} />,
