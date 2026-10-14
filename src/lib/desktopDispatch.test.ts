@@ -34,6 +34,7 @@ function stubHandlers(): DispatchHandlers & { calls: string[] } {
     createAndSend: record("createAndSend") as DispatchHandlers["createAndSend"],
     send: record("send") as DispatchHandlers["send"],
     setPermission: record("setPermission") as DispatchHandlers["setPermission"],
+    closeObjective: record("closeObjective") as DispatchHandlers["closeObjective"],
     status: record("status") as DispatchHandlers["status"],
     setModel: record("setModel") as DispatchHandlers["setModel"],
     switchSession: record("switchSession") as DispatchHandlers["switchSession"],
@@ -56,12 +57,43 @@ describe("本地派单入口的前端路由", () => {
       [request("stop", {}), "stop"],
       [request("list_approvals"), "listApprovals"],
       [request("resolve_approval", { approval_id: "a-1", approve: true }), "resolveApproval"],
+      [request("close_objective", { session_id: "s-1", outcome: "accepted" }), "closeObjective"],
     ];
     for (const [event, expected] of cases) {
       const outcome = await applyDispatchRequest(event, handlers);
       expect(outcome.ok, `${event.operation} 应该成功`).toBe(true);
       expect(handlers.calls[handlers.calls.length - 1]).toBe(expected);
     }
+  });
+
+  // CF-CLOSEOUT / M84：结案是一条**显式**的验收决定。派单入口不能替用户猜，
+  // 除了 "accepted" 之外的 outcome 必须在到达处理器之前被拒绝。
+  it("结案只接受明确 accepted，其它 outcome 在前端就被拒绝", async () => {
+    const handlers = stubHandlers();
+    for (const outcome of ["failed", "cancelled", "accepted "]) {
+      const result = await applyDispatchRequest(
+        request("close_objective", { session_id: "s-1", outcome }),
+        handlers,
+      );
+      expect(result.ok, `outcome=${outcome} 必须被拒绝`).toBe(false);
+    }
+    expect(handlers.calls).not.toContain("closeObjective");
+    const accepted = await applyDispatchRequest(
+      request("close_objective", { session_id: "s-1", outcome: "accepted" }),
+      handlers,
+    );
+    expect(accepted.ok).toBe(true);
+    expect(handlers.calls[handlers.calls.length - 1]).toBe("closeObjective");
+  });
+
+  it("没有结案处理器的旧版接收端会明确报错，而不是静默成功", async () => {
+    const { closeObjective: _omitted, ...withoutClose } = stubHandlers();
+    const result = await applyDispatchRequest(
+      request("close_objective", { session_id: "s-1", outcome: "accepted" }),
+      withoutClose,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.message).toContain("close_objective");
   });
 
   it("创建并发送、发送、设置权限、查询状态都走各自的处理器", async () => {

@@ -37,6 +37,38 @@ describe("formatRetryHint (CF-RSB-R2)", () => {
   });
 });
 
+describe("M8 parked waiting (CF-TRUTH-M8-R1)", () => {
+  it("says what it is waiting for instead of promising an automatic retry", () => {
+    const view = statusBannerView({
+      activity: {
+        objectiveStatus: "waiting_system",
+        label: "PR #175 已合并，等你确认验收",
+        nextObservationAt: null,
+      },
+      startedAt: NOW - 5_000,
+      nowMs: NOW,
+      systemRunning: false,
+    });
+    expect(view?.text).toBe("PR #175 已合并，等你确认验收");
+    expect(view?.waitHint).toBeNull();
+    const shown = `${view?.text ?? ""} ${view?.detail ?? ""} ${view?.waitHint ?? ""}`;
+    expect(shown).not.toMatch(/ms/i);
+    expect(shown).not.toContain("下次观察");
+    expect(shown).not.toContain("系统正在等待自动重试");
+  });
+
+  it("still promises a retry when a retry is actually scheduled", () => {
+    const view = statusBannerView({
+      activity: { objectiveStatus: "waiting_system", nextObservationAt: NOW + 12_000 },
+      startedAt: NOW - 5_000,
+      nowMs: NOW,
+      systemRunning: false,
+    });
+    expect(view?.text).toBe("系统正在等待自动重试");
+    expect(view?.waitHint).toBe("约 12 秒后重试");
+  });
+});
+
 describe("containsInternalVocabulary (CF-RSB-R1)", () => {
   it.each([
     "objective-supervisor:chat",

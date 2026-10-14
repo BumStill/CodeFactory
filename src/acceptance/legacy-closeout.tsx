@@ -15,7 +15,12 @@ const pending = { intentId: "synthetic-approval", toolCallId: "synthetic-call", 
   if (cmd === "get_message_page") return { messages: [], has_more: false };
   return false;
 }};
-useChatStore.setState({ sessions, activeSession: sessions[0], runtime: { A: { ...freshRuntime(), pendingPermission: pending }, B: freshRuntime() }, loadSessions: async () => sessions });
+useChatStore.setState({ sessions, activeSession: sessions[0], runtime: { A: { ...freshRuntime(), pendingPermission: pending }, B: { ...freshRuntime(), streaming: true, messages: [
+  { id: "synthetic-root", role: "user", content: "授权交付 ceiling merged", createdAt: 1 },
+  { id: "synthetic-answer", role: "assistant", content: "", createdAt: 2, turnActivity: { rootTurnId: "synthetic-root", revision: 1, phase: "waiting", status: "waiting", kind: "delivery", label: "PR #175 已合并，等你确认验收", waitingReason: "delivered_awaiting_ci", updatedAt: 2, terminalReason: null, nextObservationAt: null, objectiveStatus: "waiting_system" } },
+] } }, loadSessions: async () => sessions, selectSession: async (id: string) => {
+  useChatStore.setState({ activeSession: sessions.find(session => session.id === id) ?? sessions[0] });
+} });
 function App() {
   const current = useChatStore(s => s.activeSession);
   const request = useChatStore(s => activeRuntime(s).pendingPermission);

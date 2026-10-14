@@ -1026,6 +1026,51 @@ async fn settle_finished_turn_provider_episodes(
     Ok(())
 }
 
+async fn close_objective_in_pool(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    outcome: &str,
+) -> anyhow::Result<crate::agent::objective::ObjectiveSnapshot> {
+    anyhow::ensure!(outcome == "accepted", "outcome must be accepted");
+    let mut tx = pool.begin().await?;
+    let id: String = sqlx::query_scalar("SELECT id FROM objectives WHERE session_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1")
+        .bind(session_id).fetch_one(&mut *tx).await?;
+    let (status, reached): (String, Option<String>) = sqlx::query_as("SELECT status,reached_acceptance FROM objectives WHERE id=?")
+        .bind(&id).fetch_one(&mut *tx).await?;
+    anyhow::ensure!(status == "completed" || (status == "waiting_system" && reached.as_deref() == Some("merged")),
+        "only a merged task awaiting acceptance can be closed");
+    if status != "completed" {
+        let now = Utc::now().timestamp_millis();
+        let event_id = uuid::Uuid::new_v4().to_string();
+        let changed = sqlx::query("UPDATE objectives SET status='completed',decision_type='complete',revision=revision+1,requires_user_action=0,failure_code=NULL,recovery_owner=NULL,remediation_id=NULL,next_observation_at=NULL,lease_owner=NULL,lease_expires_at=NULL,attention_request_json=NULL,evidence_ref=?,completed_at=?,updated_at=? WHERE id=? AND status='waiting_system' AND reached_acceptance='merged' AND (lease_expires_at IS NULL OR lease_expires_at<=?)")
+            .bind(format!("objective_events:{event_id}")).bind(now).bind(now).bind(&id).bind(now).execute(&mut *tx).await?;
+        anyhow::ensure!(changed.rows_affected() == 1, "task is currently owned by a running executor");
+        sqlx::query("INSERT INTO objective_events (id,objective_id,revision,event_type,status,decision_type,domain,detail_json,created_at) SELECT ?,id,revision,'acceptance_confirmed',status,decision_type,domain,?,? FROM objectives WHERE id=?")
+            .bind(&event_id).bind(serde_json::json!({"outcome":outcome,"source":"explicit_acceptance"}).to_string()).bind(now).bind(&id).execute(&mut *tx).await?;
+        crate::agent::execution_workspace::mark_objective_terminal_in_tx(&mut tx, &id, now).await?;
+    }
+    tx.commit().await?;
+    crate::agent::objective::ObjectiveStore::new(pool.clone()).get(&id).await?
+        .ok_or_else(|| anyhow::anyhow!("objective disappeared"))
+}
+
+#[tauri::command]
+pub async fn close_objective(
+    session_id: String,
+    outcome: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
+    if state.chat_cancels.lock().await.contains_key(&session_id) {
+        return Err(AppError::Other("task is currently running".into()));
+    }
+    let pool = state.db.read().await.clone();
+    let objective = close_objective_in_pool(&pool, &session_id, &outcome).await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    publish_committed_objective_transition(&app, &objective).await?;
+    Ok(objective)
+}
+
 #[tauri::command]
 pub async fn is_chat_running(
     session_id: String,
@@ -1229,6 +1274,19 @@ where
     }
 }
 
+pub(crate) fn explicitly_requests_live_acceptance(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    ["本任务要求真机验收", "本任务要求真机验证", "要求上线验证", "acceptance: live_verification", "ceiling: through_release", "ceiling: released"]
+        .iter().any(|cue| normalized.contains(cue))
+}
+
+fn chat_requested_acceptance(kind: crate::agent::objective::ObjectiveKind, content: &str) -> &'static str {
+    if kind == crate::agent::objective::ObjectiveKind::Delivery
+        && content.to_ascii_lowercase().contains("ceiling: merged") {
+        "merged"
+    } else { requested_acceptance(kind) }
+}
+
 fn chat_objective_kind(
     capability: crate::agent::TurnCapability,
     content: &str,
@@ -1238,10 +1296,8 @@ fn chat_objective_kind(
         crate::agent::TurnCapability::ReviewOnly => ObjectiveKind::Informational,
         crate::agent::TurnCapability::Implement => ObjectiveKind::LocalMutation,
         crate::agent::TurnCapability::Deliver => {
-            let normalized = content.to_ascii_lowercase();
-            if ["上线", "生产", "部署", "live", "production", "deploy"]
-                .iter()
-                .any(|cue| normalized.contains(cue))
+            let explicit_live = explicitly_requests_live_acceptance(content);
+            if explicit_live
             {
                 ObjectiveKind::Live
             } else {
@@ -2440,7 +2496,7 @@ async fn admit_persisted_chat_turn(
             &root_turn_id,
             setup.continuation_root_turn_id.as_deref(),
             objective_kind,
-            requested_acceptance(objective_kind),
+            chat_requested_acceptance(objective_kind, content),
         )
         .await
         .map_err(|error| AppError::Other(error.to_string()))?;
@@ -3906,6 +3962,42 @@ fn select_chat_mode(
 mod tests {
     use super::*;
     use crate::agent::failover::{ActiveRouteState, EndpointHealthRegistry};
+
+    #[tokio::test]
+    async fn m84_close_objective_is_guarded_audited_and_idempotent() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-close','synthetic','/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
+        let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+        store.create(crate::agent::objective::CreateObjective {
+            id: "synthetic-close-objective".into(), kind: crate::agent::objective::ObjectiveKind::Live,
+            session_id: Some("synthetic-close".into()), root_turn_id: Some("synthetic-root".into()),
+            domain: crate::agent::objective::RecoveryDomain::Delivery,
+            requested_acceptance: "live_verification".into(), created_surface: "synthetic-test".into(),
+        }).await.unwrap();
+        assert!(close_objective_in_pool(&pool, "synthetic-close", "accepted").await.is_err());
+        sqlx::query("UPDATE objectives SET status='waiting_system',decision_type='waiting',reached_acceptance='merged'").execute(&pool).await.unwrap();
+        let closed = close_objective_in_pool(&pool, "synthetic-close", "accepted").await.unwrap();
+        assert_eq!(closed.status, crate::agent::objective::ObjectiveStatus::Completed);
+        let repeated = close_objective_in_pool(&pool, "synthetic-close", "accepted").await.unwrap();
+        assert_eq!(repeated.revision, closed.revision);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objective_events WHERE event_type='acceptance_confirmed'").fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1);
+        assert!(close_objective_in_pool(&pool, "synthetic-close", "unknown").await.is_err());
+    }
+
+    #[test]
+    fn m84_merged_authorization_does_not_infer_live_from_delivery_or_template() {
+        use crate::agent::{TurnCapability, objective::ObjectiveKind};
+        for text in [
+            "授权交付（ceiling: merged）：按 truthful-delivery-state.md 修复。",
+            "授权交付（ceiling: merged）；模板说生产发版后由用户真机验证，不在本任务做。",
+            "授权交付（ceiling: merged）。fix live defect; delivery receipt",
+        ] {
+            assert_eq!(chat_objective_kind(TurnCapability::Deliver, text), ObjectiveKind::Delivery);
+        }
+        assert_eq!(chat_objective_kind(TurnCapability::Deliver,
+            "授权交付（ceiling: merged），本任务要求真机验收"), ObjectiveKind::Live);
+    }
 
     /// U21 (2026-10-07). The provider episode fence reaches the chat runner
     /// wrapped by the transport ("open provider episode: …"). It must be

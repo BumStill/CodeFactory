@@ -229,9 +229,7 @@ pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionList
              SELECT DISTINCT objective.session_id
              FROM objectives objective
              WHERE objective.root_turn_id IS NOT NULL
-               AND objective.status IN ('active','waiting_system')
-               AND NOT (objective.status='waiting_system'
-                        AND objective.failure_code='technical_recovery_exhausted')
+               AND objective.status='active'
          ) running ON running.session_id=session.id
          WHERE session.parent_session_id IS NULL
          ORDER BY session.updated_at DESC LIMIT 200",

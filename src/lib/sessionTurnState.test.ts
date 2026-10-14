@@ -50,6 +50,19 @@ function assistantMessage(
 }
 
 describe("sessionTurnState", () => {
+  it("M8: authoritative idle suppresses stale streaming for a parked objective", () => {
+    const state = sessionTurnState({
+      streaming: true,
+      sessionIsRunning: false,
+      messages: [userMessage("t1"), assistantMessage("a1", "PR 已合并，等待确认验收", {
+        objectiveStatus: "waiting_system",
+        waitingReason: "delivered_awaiting_ci",
+        nextObservationAt: null,
+      })],
+    });
+    expect(state.running).toBe(false);
+    expect(state.objectiveState).toBe("waiting_system");
+  });
   it("treats an idle session as not running and reports idle", () => {
     const state = sessionTurnState({
       streaming: false,

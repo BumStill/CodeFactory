@@ -87,6 +87,7 @@ export interface DispatchHandlers {
     deliveryAuthorized: boolean;
   }) => Promise<unknown>;
   setPermission: (input: { sessionId: string; mode: DispatchPermissionMode }) => Promise<unknown>;
+  closeObjective?: (input: { sessionId: string; outcome: "accepted" }) => Promise<unknown>;
   status: (input: { sessionId: string }) => Promise<unknown>;
   setModel: (input: { sessionId?: string; model: string }) => Promise<unknown>;
   switchSession: (input: { sessionId: string }) => Promise<unknown>;
@@ -195,6 +196,11 @@ export async function applyDispatchRequest(
           sessionId: requiredString(body.session_id, "session_id"),
           mode: requiredPermissionMode(body.permission_mode),
         });
+        break;
+      case "close_objective":
+        if (!handlers.closeObjective) return invalid("close_objective is not available");
+        if (body.outcome !== "accepted") return invalid("outcome must be accepted");
+        result = await handlers.closeObjective({ sessionId: requiredString(body.session_id, "session_id"), outcome: "accepted" });
         break;
       case "status":
         result = await handlers.status({

@@ -344,6 +344,10 @@ function SessionRow({
     sessionIsRunning: session.is_running === true,
     messages: runtime?.messages ?? [],
   }).running;
+  const waitingActivity = [...(runtime?.messages ?? [])].reverse().find((message) => message.turnActivity)?.turnActivity;
+  const parkedWaiting = !running && waitingActivity?.objectiveStatus === "waiting_system";
+  const waitingLabel = waitingActivity?.label || "等待系统处理";
+  const [closeError, setCloseError] = useState<string | null>(null);
   const waitingPermission = useChatStore(
     (s) => s.runtime?.[session.id]?.pendingPermission != null,
   );
@@ -383,6 +387,8 @@ function SessionRow({
       className="shrink-0 animate-spin text-status-progress motion-reduce:animate-none"
       aria-label="运行中"
     />
+  ) : parkedWaiting ? (
+    <ShieldQuestion size={14} className="shrink-0 text-status-warning" aria-label="等待确认验收" />
   ) : null;
   const metadata = (
     <div className="mt-0.5 flex min-w-0 items-center gap-1 pl-[18px] text-caption leading-4 text-gray-600">
@@ -393,6 +399,8 @@ function SessionRow({
         </>
       )}
       <span className="shrink-0">{formatRelativeTime(session.updated_at)}</span>
+      {parkedWaiting && <span className="truncate" title={waitingLabel}>{waitingLabel}</span>}
+      {closeError && <span role="alert" className="text-status-danger">{closeError}</span>}
     </div>
   );
 
@@ -483,6 +491,17 @@ function SessionRow({
                   <Pencil size={14} />
                   重命名
                 </button>
+                {parkedWaiting && <button type="button"
+                  className="flex min-h-8 w-full items-center px-2.5 py-1.5 text-note text-gray-300 hover:bg-surface-3"
+                  onClick={async () => {
+                    try {
+                      const { invoke: call } = await import("../lib/tauri");
+                      await call("close_objective", { sessionId: session.id, outcome: "accepted" });
+                      await useChatStore.getState().loadSessions();
+                      setCloseError(null);
+                      setMenuOpen(false);
+                    } catch (error) { setCloseError(String(error)); }
+                  }}>确认验收 / 结案</button>}
                 <button
                   type="button"
                   onClick={() => {

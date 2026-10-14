@@ -162,7 +162,9 @@ export function statusBannerView(input: StatusBannerInput): StatusBannerView | n
     (objectiveStatus === "waiting_system" || (systemOwned && activity?.nextObservationAt != null));
 
   // What the system is doing right now.
-  const text = userReason ?? (waiting ? "系统正在等待自动重试" : label ?? "正在执行");
+  const text = userReason ?? (waiting
+    ? activity?.nextObservationAt == null ? label ?? "等待外部处理" : "系统正在等待自动重试"
+    : label ?? "正在执行");
 
   // Extra plain context: the label while waiting, otherwise the human reason.
   const detail = userAction

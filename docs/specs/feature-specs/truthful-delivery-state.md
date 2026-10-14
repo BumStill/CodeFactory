@@ -184,6 +184,22 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 反复观察仍幂等：同一合并证据重复观察不再推进 revision；不确定（Unknown/更早状态/已关闭
 未合并）保持原状（R9）。
 
+## M8 / M28 / M84：验收口径与等待结案
+
+批准任务要求（来自 task-ui-truth-m8-m28.md）：
+
+1. requested_acceptance 必须与授权的交付上限一致。授权 ceiling=merged 时，验收口径就是 merged（delivery 回执），合并即完成；只有用户或编排方明确要求真机验收时，才是 live_verification。
+2. 修正推断后，对历史记录做一次幂等的重新结算：授权 ceiling=merged、只是被误推断为 live_verification 的任务，按 merged 完成。界面和本地派单入口新增「确认验收 / 结案」操作，按 CF-CLOSEOUT 结算并写审计。
+3. 只有确实在运行的任务才转圈。等人的任务用静态标识并写明等待内容。顶栏 PR 状态以 delivery_runs 最新记录为准并及时刷新；横幅不显示内部计时；没有运行的会话不显示停止按钮。
+4. 组件测试、headless 截图与结算集成测试使用合成数据；不改 workflow、场景注册表或校验器，不读写生产数据库，历史纠正由应用运行时结算。
+
+### Implementation Notes
+
+- 根因：正文 `contains("live")` 命中 `delivery` 路径。明确验收要求与 merged 授权分别决定 kind 与 requested_acceptance。
+- 历史纠正使用原始 root 请求、持久授权、canonical PR 正向合并观察；缺来源保留，claim/head/PR/lease 围栏不放宽。
+- close_objective 只接受明确 accepted，要求 merged 等待或幂等完成；同事务写审计与 evidence_ref，清理仍走 CF-CLOSEOUT 包含性门禁。
+- 证据与命令见 docs/testing/m8-m28-m84-acceptance.md。
+
 ## M76 / M77 / M81 返修：交付不再挂起无人推进
 
 背景与用户决策（真机证据，2026-10-13，v1.87.4 / v1.87.5）：

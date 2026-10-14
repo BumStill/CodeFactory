@@ -1239,16 +1239,29 @@ pub(crate) async fn reconcile_parked_delivery_progress(
         let run_columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('delivery_runs')")
             .fetch_all(pool).await?;
         let has = |column: &str| run_columns.iter().any(|name| name == column);
-        // A merge settles the *delivery*; it is only an acceptance for objectives
-        // whose request was itself delivery-only. Live/release objectives keep
-        // waiting for their real live verification.
+        // Historical live inference can be corrected only from the original
+        // authorized merged request, never from merge evidence alone.
+        let request = if merged {
+            sqlx::query_scalar::<_, String>(
+                "SELECT m.content FROM objectives o JOIN sessions s ON s.id=o.session_id
+                 JOIN messages m ON m.id=o.root_turn_id AND m.session_id=s.id
+                 JOIN delivery_runs r ON r.id=o.delivery_run_id AND r.objective_id=o.id
+                 WHERE o.id=? AND o.kind='live' AND o.requested_acceptance='live_verification'
+                   AND s.delivery_authorized=1 AND m.role='user'
+                   AND r.requested_ceiling='through_merge'",
+            ).bind(&candidate.objective_id).fetch_optional(pool).await?
+        } else { None };
+        let repair = request.as_deref().is_some_and(|content| {
+            content.to_ascii_lowercase().contains("ceiling: merged")
+                && !crate::commands::chat::explicitly_requests_live_acceptance(content)
+        });
         let complete = merged && if columns.iter().any(|c| c == "kind") {
             let kind: String = sqlx::query_scalar("SELECT kind FROM objectives WHERE id=?")
                 .bind(&candidate.objective_id).fetch_one(pool).await?;
             let requested: String = sqlx::query_scalar(
                 "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
             ).bind(&reference.run_id).fetch_one(pool).await?;
-            matches!(kind.as_str(), "delivery" | "local_mutation")
+            (repair || matches!(kind.as_str(), "delivery" | "local_mutation"))
                 && matches!(requested.as_str(), "pr_only" | "through_ci_green" | "through_merge")
         } else { true };
         let run_statement = format!(
@@ -1276,7 +1289,14 @@ pub(crate) async fn reconcile_parked_delivery_progress(
             .bind(&reference.expected_head_sha).bind(&reference.canonical_head_sha)
             .bind(reference.canonical_pr_number).bind(now).bind(stage).bind(reached).bind(reached).bind(reached)
             .execute(&mut *tx).await?;
-        if changed.rows_affected() == 0 { continue; }
+        if changed.rows_affected() == 0 {
+            if !repair { continue; }
+            let fenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_runs WHERE id=? AND claim_epoch=? AND expected_head_sha=? AND canonical_head_sha=? AND canonical_pr_number=? AND (lease_expires_at IS NULL OR lease_expires_at<=?) AND reached_ceiling='merged'")
+                .bind(&reference.run_id).bind(reference.claim_epoch).bind(&reference.expected_head_sha)
+                .bind(&reference.canonical_head_sha).bind(reference.canonical_pr_number).bind(now)
+                .fetch_one(&mut *tx).await?;
+            if fenced != 1 { continue; }
+        }
         let evidence = serde_json::json!({"pr_number": reference.canonical_pr_number,
             "pr_url": reference.canonical_pr_url, "head_sha": reference.canonical_head_sha,
             "reached_ceiling": reached,
@@ -1296,10 +1316,14 @@ pub(crate) async fn reconcile_parked_delivery_progress(
             let requested: String = sqlx::query_scalar(
                 "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
             ).bind(&reference.run_id).fetch_one(&mut *tx).await?;
-            matches!(kind.as_str(), "delivery" | "local_mutation")
+            (repair || matches!(kind.as_str(), "delivery" | "local_mutation"))
                 && matches!(requested.as_str(), "pr_only" | "through_ci_green" | "through_merge")
         } else { true };
         let mut sets = vec![format!("status='{}'", if complete { "completed" } else { "waiting_system" })];
+        if repair {
+            sets.push("kind='delivery'".into());
+            sets.push("requested_acceptance='merged'".into());
+        }
         for (column, expression) in [
             ("revision", "revision+1".to_string()),
             ("decision_type", format!("'{}'", if complete { "complete" } else { "waiting" })),
@@ -4486,6 +4510,37 @@ mod tests {
         .unwrap();
         assert_eq!(ceiling, "merged");
         assert!(evidence.contains("externally-merged-sha"), "{evidence}");
+    }
+
+    #[tokio::test]
+    async fn m84_historical_misclassified_live_settles_once_at_merged() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
+            crate::agent::objective::CreateObjective {
+                id: "synthetic-m84".into(), kind: crate::agent::objective::ObjectiveKind::Live,
+                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "live_verification".into(), created_surface: "synthetic-test".into(),
+            },
+        ).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_authorized) VALUES ('synthetic-m84-session','synthetic','/synthetic','synthetic',1,1,1)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO messages (id,session_id,role,content,created_at) VALUES ('synthetic-m84-root','synthetic-m84-session','user','授权交付（ceiling: merged）：按 truthful-delivery-state.md 修复',1)").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objectives SET session_id='synthetic-m84-session', root_turn_id='synthetic-m84-root' WHERE id='synthetic-m84'").execute(&pool).await.unwrap();
+        let workspace = allocate_or_attach(&pool, request_for(&root, &container, "synthetic-m84", "process-a")).await.unwrap();
+        record_open_canonical_pr(&pool, &workspace, 184, "through_merge").await;
+        sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE execution_workspaces SET lease_owner=NULL, lease_expires_at=NULL").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE delivery_runs SET stage='complete',reached_ceiling='merged',status='waiting' WHERE objective_id='synthetic-m84'").execute(&pool).await.unwrap();
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m84-merge".into() })]);
+        super::reconcile_parked_delivery_progress(&pool, &observer, "synthetic-observer").await.unwrap();
+        let settled: (String, String, String, i64) = sqlx::query_as("SELECT status,kind,requested_acceptance,revision FROM objectives").fetch_one(&pool).await.unwrap();
+        assert_eq!(settled.0, "completed");
+        assert_eq!(settled.1, "delivery");
+        assert_eq!(settled.2, "merged");
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m84-merge".into() })]);
+        super::reconcile_parked_delivery_progress(&pool, &observer, "synthetic-observer").await.unwrap();
+        let revision: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
+        assert_eq!(revision, settled.3);
     }
 
     #[tokio::test]

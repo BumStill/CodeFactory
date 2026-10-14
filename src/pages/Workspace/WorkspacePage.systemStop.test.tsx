@@ -162,6 +162,13 @@ function assistantMessage(objectiveStatus?: string): RuntimeMessage {
 }
 
 describe("system-owned turns stay stoppable", () => {
+  it("M8 hides Stop for a parked merged delivery", () => {
+    runtime.streaming = true;
+    runtime.messages = [{ ...assistantMessage("waiting_system"), turnActivity: { objectiveStatus: "waiting_system", terminalReason: "delivery_awaiting_acceptance" } }];
+    renderWorkspace();
+    expect(screen.getByTestId("composer-mode")).toHaveTextContent("发送");
+  });
+
   it("offers stop while recovery still owns the turn, even though streaming ended", () => {
     runtime.streaming = false;
     runtime.messages = [assistantMessage("waiting_system")];

@@ -1883,6 +1883,7 @@ pub fn run() {
             commands::chat::list_pending_approvals,
             commands::chat::respond_to_permission,
             commands::chat::cancel_chat,
+            commands::chat::close_objective,
             commands::chat::is_chat_running,
             commands::chat::delivery_channel_status,
             commands::chat::get_session_execution_workspace,

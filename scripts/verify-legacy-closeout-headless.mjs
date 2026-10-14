@@ -19,6 +19,8 @@ try {
     await page.getByRole('dialog').waitFor();
     assert.equal(await page.getByRole('button', { name: '信任本会话并允许' }).count(), 0);
     assert.equal(await page.getByLabel('等待批准').count(), 1);
+    assert.equal(await page.getByLabel('运行中', { exact: true }).count(), 0);
+    assert.equal(await page.getByLabel('等待确认验收', { exact: true }).count(), 1);
     await page.screenshot({ path: `${artifacts}/approval-${theme}.png` });
     await page.getByRole('button', { name: '切到 B', exact: true }).evaluate(b => b.click());
     await page.waitForFunction(() => document.querySelector('[data-testid="active-session"]').textContent === 'B');

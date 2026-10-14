@@ -34,6 +34,11 @@ export function useAppDispatchBridge(showWorkspace: () => void): void {
       await invoke("respond_to_permission", { intentId: approvalId, allow: approve });
       return { approval_id: approvalId, approved: approve };
     },
+    closeObjective: async ({ sessionId, outcome }) => {
+      const result = await invoke("close_objective", { sessionId, outcome });
+      await useChatStore.getState().loadSessions();
+      return result;
+    },
     status: dispatchStatus,
   } });
 }

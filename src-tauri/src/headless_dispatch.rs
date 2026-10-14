@@ -95,6 +95,8 @@ pub enum Request {
     },
     /// CF-HDE-R1: query objective state / latest reply summary / PR number.
     Status { session_id: String },
+    /// Explicit acceptance; does not authorize execution or remote mutations.
+    CloseObjective { session_id: String, outcome: String },
     /// CF-HDE-R6: pick or change the model (session-scoped, or the default).
     SetModel {
         #[serde(default)]
@@ -290,6 +292,10 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             require_non_empty("session_id", session_id)?;
             require_permission_mode(permission_mode)?;
         }
+        Request::CloseObjective { session_id, outcome } => {
+            require_non_empty("session_id", session_id)?;
+            if outcome != "accepted" { return Err(ErrorBody::invalid("outcome must be accepted")); }
+        }
         Request::Status { session_id } => require_non_empty("session_id", session_id)?,
         Request::SetModel { session_id, model } => {
             require_non_empty("model", model)?;
@@ -430,6 +436,7 @@ impl AuditEntry {
                 entry.delivery_authorized = Some(*delivery_authorized);
             }
             Request::SetPermission { session_id, .. }
+            | Request::CloseObjective { session_id, .. }
             | Request::Status { session_id }
             | Request::SwitchSession { session_id } => {
                 entry.session_id = Some(session_id.clone());
@@ -464,6 +471,7 @@ pub fn operation_of(request: &Request) -> &'static str {
         Request::CreateAndSend { .. } => "create_and_send",
         Request::Send { .. } => "send",
         Request::SetPermission { .. } => "set_permission",
+        Request::CloseObjective { .. } => "close_objective",
         Request::Status { .. } => "status",
         Request::SetModel { .. } => "set_model",
         Request::SwitchSession { .. } => "switch_session",
