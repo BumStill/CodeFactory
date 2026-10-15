@@ -28,6 +28,7 @@ pub mod model_transport;
 pub mod failure_summary;
 pub mod objective;
 pub mod objective_supervisor;
+mod power_assertion;
 pub(crate) mod permission_gateway;
 pub(crate) mod permission_intent;
 pub mod persistence;

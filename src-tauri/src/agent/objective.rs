@@ -3042,10 +3042,8 @@ impl ObjectiveStore {
     /// stopped this" is a durable stop request. An internal failure used to end
     /// up recorded as `cancellation_provenance=explicit_cancel` three seconds
     /// later, with *no* intent row anywhere in
-    /// `chat_session_cancel_intents` — twice in one day, with nobody pressing
-    /// stop. This asks the durable store, and treats a schema too old to answer
-    /// as "cannot prove it was synthetic", so an unreadable table can never turn
-    /// a real user stop into a system interruption.
+    /// `chat_session_cancel_intents`. An unreadable table is not positive
+    /// evidence of a stop request: preserve recoverable system attribution.
     pub async fn has_durable_stop_request(&self, session_id: &str, since_ms: i64) -> bool {
         let intents: Result<i64, _> = sqlx::query_scalar(
             "SELECT COUNT(*) FROM chat_session_cancel_intents
@@ -3058,7 +3056,7 @@ impl ObjectiveStore {
         .await;
         match intents {
             Ok(count) => count > 0,
-            Err(_) => true,
+            Err(_) => false,
         }
     }
 
@@ -3216,6 +3214,8 @@ impl ObjectiveStore {
                AND EXISTS (
                  SELECT 1 FROM chat_session_cancel_intents intent
                  WHERE intent.session_id=control.session_id
+                   AND (intent.status='requested'
+                        OR COALESCE(intent.settled_at, intent.requested_at)>=control.created_at)
                )
              ORDER BY control.cancel_requested_at, control.run_instance_id",
         )
@@ -3951,6 +3951,13 @@ impl ObjectiveStore {
         lease_ms: i64,
     ) -> anyhow::Result<ClaimRenewal> {
         let now = Utc::now().timestamp_millis();
+        self.renew_claimed_remediation_at(objective_id, remediation_id, owner, claim_epoch, lease_ms, now).await
+    }
+
+    async fn renew_claimed_remediation_at(
+        &self, objective_id: &str, remediation_id: &str, owner: &str,
+        claim_epoch: i64, lease_ms: i64, now: i64,
+    ) -> anyhow::Result<ClaimRenewal> {
         let lease_expires_at = now + lease_ms.max(1);
         let mut tx = self.pool.begin().await?;
         // Read the claim's committed identity before touching it. When an update
@@ -3970,7 +3977,7 @@ impl ObjectiveStore {
             "UPDATE objective_remediations
              SET lease_expires_at=?, updated_at=?
              WHERE id=? AND objective_id=? AND status='claimed' AND lease_owner=?
-               AND attempt_index=? AND lease_expires_at>?",
+               AND attempt_index=?",
         )
         .bind(lease_expires_at)
         .bind(now)
@@ -3978,7 +3985,6 @@ impl ObjectiveStore {
         .bind(objective_id)
         .bind(owner)
         .bind(claim_epoch)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
         if remediation.rows_affected() != 1 {
@@ -3992,15 +3998,13 @@ impl ObjectiveStore {
         let objective = sqlx::query(
             "UPDATE objectives
              SET lease_expires_at=?, updated_at=?
-             WHERE id=? AND status='waiting_system' AND remediation_id=? AND lease_owner=?
-               AND lease_expires_at>?",
+             WHERE id=? AND status='waiting_system' AND remediation_id=? AND lease_owner=?",
         )
         .bind(lease_expires_at)
         .bind(now)
         .bind(objective_id)
         .bind(remediation_id)
         .bind(owner)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
         if objective.rows_affected() != 1 {
@@ -4834,6 +4838,121 @@ impl ObjectiveStore {
                 Ok(decision)
             }
         }
+    }
+
+    /// M88: look again at transport waits whose observation is due.
+    ///
+    /// [`Self::bound_transport_outage`] keeps a still-down path waiting without
+    /// inserting a remediation row (no charged attempt, no model turn aimed at a
+    /// dead route). The claim loop only claims real rows, so without this sweep
+    /// nothing ever looked at such an objective again: on 2026-10-15 a
+    /// one-minute network blip left sessions in `waiting_system` for hours.
+    ///
+    /// For each due wait the same probe and window policy decide:
+    /// - still down inside the window: schedule the next look, nothing charged;
+    /// - path answers, or the window is over: materialise the minted
+    ///   remediation as a queued resume so the ordinary claim path takes it
+    ///   (a resume that fails again past the window settles honestly there).
+    pub async fn reobserve_transport_probe_waits(&self, now: i64) -> anyhow::Result<usize> {
+        let due: Vec<(String, String)> = sqlx::query_as(
+            "SELECT objective.id, objective.remediation_id
+             FROM objectives objective
+             WHERE objective.status='waiting_system'
+               AND objective.failure_code=?
+               AND objective.remediation_id IS NOT NULL
+               AND objective.next_observation_at IS NOT NULL
+               AND objective.next_observation_at<=?
+               AND (objective.lease_expires_at IS NULL OR objective.lease_expires_at<=?)
+               AND NOT EXISTS (
+                 SELECT 1 FROM objective_remediations remediation
+                 WHERE remediation.id=objective.remediation_id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM chat_session_cancel_intents stop
+                 WHERE stop.session_id=objective.session_id AND stop.status='requested'
+               )
+             ORDER BY objective.next_observation_at, objective.id
+             LIMIT 16",
+        )
+        .bind(PROVIDER_TRANSPORT_UNREACHABLE)
+        .bind(now)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut observed = 0;
+        for (objective_id, remediation_id) in due {
+            let (first_unreachable_at, attempts, error_text) = self
+                .transport_outage_series(&objective_id, PROVIDER_TRANSPORT_UNREACHABLE)
+                .await?;
+            let probe_reachable = match error_text
+                .as_deref()
+                .and_then(probe_target_from_error_text)
+            {
+                Some((host, port)) => probe_transport_reachability(&host, port).await,
+                None => true,
+            };
+            let action = transport_outage_action(
+                now,
+                first_unreachable_at.unwrap_or(now),
+                attempts,
+                probe_reachable,
+            );
+            let changed = match action {
+                TransportOutageAction::Wait { delay_ms } => sqlx::query(
+                    "UPDATE objectives SET next_observation_at=?, updated_at=?
+                     WHERE id=? AND remediation_id=? AND status='waiting_system'
+                       AND failure_code=?",
+                )
+                .bind(bounded_next_observation_at(now, now + delay_ms))
+                .bind(now)
+                .bind(&objective_id)
+                .bind(&remediation_id)
+                .bind(PROVIDER_TRANSPORT_UNREACHABLE)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+                TransportOutageAction::Retry | TransportOutageAction::GiveUp { .. } => {
+                    sqlx::query(
+                        "INSERT INTO objective_remediations
+                         (id, objective_id, binding_id, domain, status, failure_code,
+                          failure_signature, strategy, approach_index, attempt_index,
+                          recovery_generation, resume_cursor, next_observation_at,
+                          created_at, updated_at)
+                         SELECT objective.remediation_id, objective.id,
+                                (SELECT binding.id FROM objective_bindings binding
+                                 WHERE binding.objective_id=objective.id
+                                 ORDER BY binding.updated_at DESC,
+                                          binding.resource_generation DESC
+                                 LIMIT 1),
+                                objective.domain, 'queued', objective.failure_code,
+                                objective.failure_signature, 'reconcile_then_resume',
+                                0, 0, objective.recovery_generation,
+                                objective.resume_cursor, ?, ?, ?
+                         FROM objectives objective
+                         WHERE objective.id=? AND objective.remediation_id=?
+                           AND objective.status='waiting_system'
+                           AND objective.failure_code=?
+                           AND NOT EXISTS (
+                             SELECT 1 FROM objective_remediations remediation
+                             WHERE remediation.id=objective.remediation_id
+                           )",
+                    )
+                    .bind(now)
+                    .bind(now)
+                    .bind(now)
+                    .bind(&objective_id)
+                    .bind(&remediation_id)
+                    .bind(PROVIDER_TRANSPORT_UNREACHABLE)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected()
+                }
+            };
+            if changed == 1 {
+                observed += 1;
+            }
+        }
+        Ok(observed)
     }
 
     /// The one durable series a transport outage forms: (first seen, attempts,
@@ -6745,7 +6864,7 @@ impl ObjectiveStore {
                     ),
                 )
             } else {
-                requested_observation
+                bounded_next_observation_at(now, requested_observation)
             };
             sqlx::query(
                 "INSERT INTO objective_remediations
@@ -11122,6 +11241,52 @@ CREATE TABLE objectives (
     }
 
     #[tokio::test]
+    async fn m88_first_wait_is_observed_within_five_minutes() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store.create(CreateObjective {
+            id: "synthetic-first-wait".into(), kind: ObjectiveKind::LocalMutation,
+            session_id: Some("synthetic-session".into()), root_turn_id: Some("synthetic-turn".into()),
+            domain: RecoveryDomain::Chat, requested_acceptance: "synthetic".into(), created_surface: "test".into(),
+        }).await.unwrap();
+        let now = Utc::now().timestamp_millis();
+        let waiting = DecisionRouter::route(&objective, RouteSignal::TechnicalFailure {
+            domain: RecoveryDomain::Chat, failure_code: "provider_timeout".into(),
+            failure_signature: "synthetic-first-wait".into(), next_observation_at: now + 13_000_000,
+            resume_cursor: Some("synthetic-turn".into()),
+        }).unwrap();
+        store.apply_decision(objective.revision, waiting).await.unwrap();
+        let (scheduled, created): (i64, i64) = sqlx::query_as(
+            "SELECT next_observation_at, created_at FROM objective_remediations WHERE objective_id='synthetic-first-wait'"
+        ).fetch_one(&pool).await.unwrap();
+        assert!(scheduled <= created + MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS,
+            "the first wait must be bounded too: {scheduled} > {created} + five minutes");
+    }
+
+    #[tokio::test]
+    async fn m89_same_owner_renews_after_fifteen_minute_clock_jump() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store.create(CreateObjective {
+            id: "synthetic-wake".into(), kind: ObjectiveKind::LocalMutation,
+            session_id: Some("synthetic-session".into()), root_turn_id: Some("synthetic-turn".into()),
+            domain: RecoveryDomain::Chat, requested_acceptance: "synthetic".into(), created_surface: "test".into(),
+        }).await.unwrap();
+        let now = Utc::now().timestamp_millis();
+        let waiting = DecisionRouter::route(&objective, RouteSignal::TechnicalFailure {
+            domain: RecoveryDomain::Chat, failure_code: "provider_timeout".into(),
+            failure_signature: "synthetic-wake".into(), next_observation_at: now - 1,
+            resume_cursor: Some("synthetic-turn".into()),
+        }).unwrap();
+        store.apply_decision(objective.revision, waiting).await.unwrap();
+        let claim = store.claim_due_remediations("synthetic-process-owner", 1, 60_000).await.unwrap().pop().unwrap();
+        assert!(store.renew_claimed_remediation_at(&claim.objective.id, &claim.remediation_id,
+            "synthetic-process-owner", claim.claim_epoch, 60_000, now + 900_000).await.unwrap().renewed());
+        assert!(!store.renew_claimed_remediation_at(&claim.objective.id, &claim.remediation_id,
+            "synthetic-process-owner", claim.claim_epoch - 1, 60_000, now + 900_001).await.unwrap().renewed());
+    }
+
+    #[tokio::test]
     async fn claimed_remediation_lease_is_renewed_only_by_its_current_owner() {
         let pool = pool().await;
         let store = ObjectiveStore::new(pool.clone());
@@ -11235,7 +11400,8 @@ CREATE TABLE objectives (
             .execute(&pool)
             .await
             .unwrap();
-        assert!(!store
+        // M89: expiration without an owner/epoch change is not a takeover.
+        assert!(store
             .renew_claimed_remediation(
                 &claim.objective.id,
                 &claim.remediation_id,
@@ -11257,7 +11423,7 @@ CREATE TABLE objectives (
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(remediation_lease, expired);
+        assert!(remediation_lease > expired);
         assert_eq!(remediation_lease, objective_lease);
     }
 
@@ -12897,6 +13063,83 @@ CREATE TABLE objectives (
         assert!(
             next_observation > Utc::now().timestamp_millis(),
             "the objective must come back to look again"
+        );
+    }
+
+    /// M88 (2026-10-15 real machine, session 7460b39a): a transport wait mints a
+    /// remediation id but deliberately inserts no row, so the claim loop — which
+    /// only claims real rows — never looks at it again. The network came back
+    /// within a minute and the objective sat in `waiting_system` for hours. Once
+    /// its observation is due and the path answers, the wait must turn into a
+    /// claimable resume.
+    #[tokio::test]
+    async fn m88_due_transport_wait_resumes_once_the_path_answers() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-m88-transport").await;
+        let down = unreachable_local_route();
+        let now = Utc::now().timestamp_millis();
+        seed_transport_failure(&pool, &current.id, &down, now - 30_000).await;
+        let waiting = route_transport_failure(&store, &current).await;
+        assert_eq!(waiting.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(queued_remediations(&pool, &waiting.id).await, 0);
+
+        // The network is back: the very route that failed answers again.
+        let (host, port) = probe_target_from_error_text(&format!(
+            "error sending request for url ({down})"
+        ))
+        .unwrap();
+        let listener = std::net::TcpListener::bind((host.as_str(), port)).unwrap();
+        // Its observation is due (the probe interval has passed).
+        sqlx::query("UPDATE objectives SET next_observation_at=? WHERE id=?")
+            .bind(Utc::now().timestamp_millis() - 1)
+            .bind(&waiting.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let due = Utc::now().timestamp_millis();
+        assert_eq!(store.reobserve_transport_probe_waits(due).await.unwrap(), 1);
+        drop(listener);
+
+        assert_eq!(
+            queued_remediations(&pool, &waiting.id).await,
+            1,
+            "a due transport wait whose path answers must become a claimable resume"
+        );
+        let claims = store
+            .claim_due_remediations("synthetic-owner", 1, 60_000)
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1, "the claim loop must now see the waiting objective");
+        assert_eq!(claims[0].objective.id, waiting.id);
+    }
+
+    /// M88: a path that is still down keeps waiting — no charged attempt — but
+    /// the objective is looked at again later instead of never.
+    #[tokio::test]
+    async fn m88_due_transport_wait_still_down_is_rescheduled_not_dropped() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-m88-still-down").await;
+        let down = unreachable_local_route();
+        let now = Utc::now().timestamp_millis();
+        seed_transport_failure(&pool, &current.id, &down, now - 30_000).await;
+        let waiting = route_transport_failure(&store, &current).await;
+        let due = waiting.next_observation_at.unwrap() + 1;
+
+        assert_eq!(store.reobserve_transport_probe_waits(due).await.unwrap(), 1);
+
+        assert_eq!(queued_remediations(&pool, &waiting.id).await, 0);
+        let after = store.get(&waiting.id).await.unwrap().unwrap();
+        assert_eq!(after.status, ObjectiveStatus::WaitingSystem);
+        assert!(
+            after.next_observation_at.unwrap() > due,
+            "the next look must be scheduled in the future, not lost"
+        );
+        assert_eq!(
+            store.reobserve_transport_probe_waits(due).await.unwrap(),
+            0,
+            "a rescheduled wait is not due again immediately"
         );
     }
 
@@ -15505,6 +15748,15 @@ CREATE TABLE objectives (
         );
     }
 
+    #[tokio::test]
+    async fn m87_missing_stop_authority_is_not_user_cancel() {
+        let pool = pool().await;
+        sqlx::query("DROP TABLE chat_session_cancel_intents").execute(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool);
+        assert!(!store.has_durable_stop_request("synthetic-m87", 0).await,
+            "missing or unreadable intent evidence must not invent user intent");
+    }
+
     /// CF-TRUTH-R3 acceptance case 1 (M54, 2026-10-10): a run control left in
     /// `cancel_requested` by the system itself — no session stop request behind
     /// it — must not be recorded as the user cancelling. Two sessions that day
@@ -15564,6 +15816,14 @@ CREATE TABLE objectives (
             consumed, 0,
             "a control row with no stop request behind it is not a cancellation"
         );
+        // M87: a stop from an earlier turn is not intent to cancel this run.
+        sqlx::query("INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at) VALUES ('session-fenced', 'synthetic', '/tmp/synthetic', 'test-model', ?, ?)")
+            .bind(now).bind(now).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chat_session_cancel_intents (session_id, status, requested_at, settled_at, updated_at) VALUES ('session-fenced', 'settled', ?, ?, ?)")
+            .bind(now - 900_000).bind(now - 900_000).bind(now - 900_000)
+            .execute(&pool).await.unwrap();
+        assert_eq!(store.consume_pending_chat_cancellations().await.unwrap(), 0,
+            "a historical settled stop must not cancel a later system interruption");
         let objective = store.get("objective-fenced").await.unwrap().unwrap();
         assert_ne!(objective.status.as_str(), "cancelled");
         assert_ne!(

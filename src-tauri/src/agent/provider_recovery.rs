@@ -518,6 +518,26 @@ impl ProviderRecoveryStore {
         }
         ensure_episode_current(&mut tx, permit, &spec.episode_id).await?;
 
+        // M88: a current durable permit proves that an older owner/epoch is
+        // fenced, even when takeover did not advance the objective revision.
+        // Only effect-free requests are replayable; uncertain receipts remain
+        // observation-only, and a request of this exact owner is never reaped.
+        sqlx::query(
+            "UPDATE provider_route_attempts
+             SET status='failed_replayable', failure_class='process_restart',
+                 failure_code='provider_owner_changed_no_side_effect',
+                 observed_at=?, completed_at=?
+             WHERE episode_id=? AND status IN ('in_flight','streaming','unknown')
+               AND (owner_kind<>? OR owner_id<>? OR owner_epoch<>?)
+               AND side_effect_started=0 AND side_effect_receipt_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM side_effect_receipts receipt
+                   WHERE receipt.objective_id=provider_route_attempts.objective_id
+                     AND receipt.status IN ('started','unknown'))",
+        )
+        .bind(now).bind(now).bind(&spec.episode_id)
+        .bind(&permit.owner_kind).bind(&permit.owner_id).bind(permit.owner_epoch)
+        .execute(&mut *tx).await?;
+
         if let Some(existing) = load_attempt(&mut tx, &spec.id).await? {
             ensure_existing_attempt_matches(&existing, permit, spec)?;
             if !attempt_owner_is_current(&existing, permit) {
