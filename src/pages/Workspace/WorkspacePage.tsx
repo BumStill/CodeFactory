@@ -46,6 +46,7 @@ import type { BrowserSession, TaskRun, VerificationResult } from "../../lib/taur
 import type { ExternalJobState, TurnTimingProfile } from "../../lib/chatPlan";
 import { parseVerification, verificationSummary } from "../../lib/verification";
 import { currentTurnOwnership } from "../../lib/turnOwnership";
+import { dispatchSend } from "../../lib/dispatchActions";
 import { useDesktopMenuBridge } from "../../lib/useDesktopMenuBridge";
 
 type WorkspaceBrowserSession = BrowserSession & {
@@ -137,7 +138,7 @@ export function WorkspacePage({
 }: WorkspacePageProps) {
   const {
     activeSession, draftSession, sessions,
-    sendOrQueue, steerRun, cancelStream, removeFromQueue, setDraftProject, setDraftAnonymous,
+    sendOrQueue, cancelStream, removeFromQueue, setDraftProject, setDraftAnonymous,
     setDraftPermissionMode, updateActiveSessionPermissionMode,
     respondPermission, exitAnonymous, renameSession, loadOlderMessages,
   } = useChatStore();
@@ -271,10 +272,17 @@ export function WorkspacePage({
   const turnExecutionActive = activeDraft
     ? false
     : !currentTurnWasReleased && (streaming || durableTurnActive);
+  // M2-R3/R5：Enter 的去向由"此刻真的有活跃执行"决定，不由"这一轮还没被释放"决定。
+  // 回合已停摆（无活跃 run、旧的 streaming 残留）时，Enter 直接开新一轮；此时提示
+  // 与回执都不能再说"引导当前执行"。
+  const liveSteerPending = messages.some((message) => message.steerPending);
+  const guidanceActive = activeDraft
+    ? false
+    : steerActive || liveSteerPending || durableTurnActive || persistedRunActive || systemHoldsTurn;
   const guideNextStep = async (message: string) => {
     const trimmed = message.trim();
-    if (!trimmed || activeDraft) return;
-    await steerRun(trimmed);
+    if (!trimmed || activeDraft || !activeSession) return;
+    return dispatchSend({ sessionId: activeSession.id, message: trimmed, mode: "steer" });
   };
   // Double-click the session title (here or in the sidebar) to rename it inline.
   const [titleEditing, setTitleEditing] = useState(false);
@@ -980,7 +988,11 @@ export function WorkspacePage({
                 ref={composerRef}
                 key={activeSession?.id ?? activeDraft?.id ?? sessionId}
                 initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
-                onSend={(t) => void sendOrQueue(t)}
+                onSend={(text) => {
+                  if (activeDraft || !activeSession) void sendOrQueue(text);
+                  else void dispatchSend({ sessionId: activeSession.id, message: text, mode: "queue" })
+                    .catch((error) => console.error("message delivery failed", error));
+                }}
                 onGuide={guideNextStep}
                 onCancel={async () => {
                   if (await cancelStream(sessionId)) {
@@ -988,7 +1000,9 @@ export function WorkspacePage({
                   }
                 }}
                 streaming={turnInFlight}
-                guidanceActive={steerActive}
+                guidanceActive={guidanceActive}
+                steeringActive={steerActive}
+                hasPendingSteer={liveSteerPending}
                 disabled={!activeSession && !activeDraft}
                 pendingInsert={pendingInsert}
                 onInsertConsumed={() => setPendingInsert(undefined)}

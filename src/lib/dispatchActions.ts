@@ -44,7 +44,7 @@ export const DISPATCH_DELIVERY_AHEAD_CURRENT_RUN = "current_run";
 export const DISPATCH_STEER_APPLIED_TIMEOUT_MS = 4_000;
 
 /** 插话已交出、但这一轮还没读到时的如实说明。 */
-export const DISPATCH_STEER_PENDING_NOTE = "当前工具调用返回后读取";
+export const DISPATCH_STEER_PENDING_NOTE = "当前步骤结束后读取";
 
 export interface DispatchDeliveryReceipt {
   status: "delivered" | "queued";
@@ -212,7 +212,7 @@ export async function dispatchSend(
     options.steerAppliedTimeoutMs ?? DISPATCH_STEER_APPLIED_TIMEOUT_MS;
   let before = runtimeOf(session.id);
   let state = sessionTurnStateOf(session);
-  if (state.running) {
+  if (state.running || before?.streaming) {
     const backendRunning = await withDeadline(
       invoke<boolean>("is_chat_running", { sessionId: session.id }),
       timeoutMs,
@@ -268,7 +268,8 @@ export async function dispatchSend(
     }
     // `steerRun` 成功只说明消息进了这个会话的插话队列。送达的证据是这一轮把它
     // 读走（`steer_applied`）；拿不到就如实说"排在当前这一轮、当前工具返回后读取"。
-    const applied = await waitForSteerApplied(
+    const hasConfirmationChannel = runtimeOf(session.id)?.streaming === true;
+    const applied = hasConfirmationChannel && await waitForSteerApplied(
       session.id,
       input.message,
       steerAppliedTimeoutMs,
