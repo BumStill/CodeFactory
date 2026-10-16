@@ -8,6 +8,7 @@ import { refreshChatGptCatalogIfStale } from "../stores/chatgptCatalog";
 import { evaluateWindow, modelWindowKey } from "../lib/usageWindows";
 import { invoke } from "../lib/tauri";
 import { ReasoningEffortPicker } from "./ReasoningEffortPicker";
+import { UsageWindowDialog } from "./UsageWindowDialog";
 
 interface ModelPickerProps {
   /** Render the menu in document.body so a draft composer cannot clip it. */
@@ -30,6 +31,11 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [loadingEndpoint, setLoadingEndpoint] = useState<string | null>(null);
+  // CF-WINDOW-R6（M86 返修）：不在时段内的模型不再用 window.alert/confirm 提示，
+  // 而是走应用内对话框（原生弹窗在 Tauri WebView 里不保证弹得出来）。
+  const [windowPrompt, setWindowPrompt] = useState<{ endpoint: string; model: string; nextTransitionMs: number | null } | null>(null);
+  // 本会话已持久化的时段豁免（重启后仍在），用来提供撤销入口。
+  const [sessionOverrides, setSessionOverrides] = useState<string[]>([]);
   const ref = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -279,6 +285,21 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
           placeholder="搜索模型…"
           className="min-h-[44px] w-full rounded border border-control-border bg-surface-3 px-2 py-1 text-label text-gray-200 placeholder-gray-600 outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-50 lg:min-h-[36px]"
         />
+        {activeSession && sessionOverrides.includes(activeSession.id) && (
+          <button
+            type="button"
+            className="mt-2 min-h-[44px] w-full rounded border border-accent/30 bg-accent/5 px-2 py-1 text-left text-label text-gray-300 transition-colors hover:bg-accent/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent lg:min-h-[36px]"
+            onClick={async () => {
+              await invoke("set_session_usage_window_override", {
+                sessionId: activeSession.id,
+                ignore: false,
+              });
+              setSessionOverrides((previous) => previous.filter((id) => id !== activeSession.id));
+            }}
+          >
+            本会话已忽略时段限制 · 恢复本会话的时段限制
+          </button>
+        )}
       </div>
       <ul className="max-h-64 overflow-y-auto py-1">
         {modelListLoading ? (
@@ -289,31 +310,20 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
               className={`flex min-h-[44px] w-full items-center gap-1.5 px-3 py-1.5 text-left text-label transition-colors hover:bg-surface-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent lg:min-h-[36px] ${
                 m.id === activeModel ? "text-accent" : "text-gray-300"
               }`}
-              onClick={async () => {
+              onClick={() => {
                 const rule = settings?.model_usage_windows?.[modelWindowKey(activeEndpoint, m.id)];
-                if (!evaluateWindow(rule, Date.now()).available) {
-                  if (!activeSession) { window.alert("当前模型不在允许使用时段，请在设置中修改时段或选择其它模型。"); return; }
-                  if (!window.confirm("当前模型不在允许使用时段。是否本会话忽略时段限制？")) return;
-                  await invoke("set_session_usage_window_override", { sessionId: activeSession.id, ignore: true });
-                }
-                if (activeSession) {
-                  await updateActiveSessionModelConfig({
-                    endpointId: activeEndpoint,
-                    modelId: m.id,
-                    policy: activePolicy,
+                const status = evaluateWindow(rule, Date.now());
+                if (!status.available) {
+                  // CF-WINDOW-R6：不静默改用别的模型，也不静默违反配置。说明
+                  // 原因，并把一次性豁免交给应用内对话框决定。
+                  setWindowPrompt({
+                    endpoint: activeEndpoint,
+                    model: m.id,
+                    nextTransitionMs: status.next_transition_ms,
                   });
-                } else {
-                  // Outside an existing session this remains the
-                  // new-session default for the endpoint.
-                  await invoke("set_endpoint_active_model", {
-                    endpointName: activeEndpoint,
-                    modelId: m.id,
-                  }).catch(() => { /* best-effort */ });
-                  await updateActiveSessionModel(m.id);
-                  await reloadSettings();
+                  return;
                 }
-                setOpen(false);
-                triggerRef.current?.focus();
+                void selectModel(m.id);
               }}
               title={m.id}
             >
@@ -328,6 +338,40 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
       </ul>
     </div>
   );
+
+  // CF-WINDOW-R6：把"选中模型"抽出来，让对话框确认后能继续同一条路径。
+  const selectModel = useCallback(async (modelId: string) => {
+    if (activeSession) {
+      await updateActiveSessionModelConfig({
+        endpointId: activeEndpoint,
+        modelId,
+        policy: activePolicy,
+      });
+    } else {
+      // Outside an existing session this remains the
+      // new-session default for the endpoint.
+      await invoke("set_endpoint_active_model", {
+        endpointName: activeEndpoint,
+        modelId,
+      }).catch(() => { /* best-effort */ });
+      await updateActiveSessionModel(modelId);
+      await reloadSettings();
+    }
+    setOpen(false);
+    triggerRef.current?.focus();
+  }, [activeEndpoint, activePolicy, activeSession, reloadSettings, updateActiveSessionModel, updateActiveSessionModelConfig]);
+
+  // 打开面板时读一次已持久化的会话豁免，这样重启后仍然能显示并提供撤销入口。
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    invoke<string[]>("get_session_usage_window_overrides")
+      .then((overrides) => {
+        if (!cancelled) setSessionOverrides(Array.isArray(overrides) ? overrides : []);
+      })
+      .catch(() => { /* the menu still works without the override list */ });
+    return () => { cancelled = true; };
+  }, [open]);
 
   const menuContent = portal && typeof document !== "undefined" ? (
     createPortal(
@@ -368,6 +412,27 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
       </button>
 
       {open && menuContent}
+
+      {windowPrompt && (
+        <UsageWindowDialog
+          endpoint={windowPrompt.endpoint}
+          model={windowPrompt.model}
+          nextTransitionMs={windowPrompt.nextTransitionMs}
+          onIgnoreForSession={activeSession ? async () => {
+            const target = windowPrompt.model;
+            await invoke("set_session_usage_window_override", {
+              sessionId: activeSession.id,
+              ignore: true,
+            });
+            setSessionOverrides((previous) =>
+              previous.includes(activeSession.id) ? previous : [...previous, activeSession.id],
+            );
+            setWindowPrompt(null);
+            await selectModel(target);
+          } : null}
+          onCancel={() => setWindowPrompt(null)}
+        />
+      )}
     </div>
   );
 }

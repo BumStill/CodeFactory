@@ -1513,6 +1513,8 @@ pub fn run() {
 
             let db_url = format!("sqlite:{}", db_path.display());
             let settings = config::settings::load();
+            // CF-WINDOW-R6：把持久化的会话豁免读回内存，重启后依然有效。
+            agent::usage_windows::hydrate_session_overrides();
 
             let pool = tauri::async_runtime::block_on(storage::db::connect(&db_url))?;
 
@@ -1790,6 +1792,7 @@ pub fn run() {
             menu::read_session_clipboard,
             commands::dispatch::dispatch_reply,
             agent::usage_windows::set_session_usage_window_override,
+            agent::usage_windows::get_session_usage_window_overrides,
             commands::settings::get_settings,
             commands::settings::save_settings,
             commands::settings::subscription_quota_status,
