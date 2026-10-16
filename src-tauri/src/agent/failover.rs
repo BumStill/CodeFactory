@@ -26,6 +26,20 @@ pub struct RouteCandidate {
     pub api_style: ApiStyle,
 }
 
+impl RouteCandidate {
+    /// M86 预过滤：这个候选现在就有可用凭据吗？
+    ///
+    /// ChatGPT 走订阅登录，不需要 API key；其余端点必须有非空的 inline key
+    /// 或 credential ref。过去没有凭据的端点会被"选中"，然后在传输层变成
+    /// `AUTH_MISSING`——于是失败说明只写得出真正尝试过的环节，被门禁预先
+    /// 过滤掉的端点反而看不见。现在它是一步**记录在案**的预过滤。
+    pub fn has_usable_credential(&self) -> bool {
+        matches!(self.api_style, ApiStyle::Chatgpt)
+            || self.legacy_inline_api_key.as_ref().is_some_and(|key| !key.trim().is_empty())
+            || self.credential_ref.as_deref().is_some_and(|reference| !reference.trim().is_empty())
+    }
+}
+
 impl std::fmt::Debug for RouteCandidate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RouteCandidate")
@@ -497,7 +511,10 @@ impl ActiveRouteState {
             // CF-WINDOW-R4/R5：换模型和等待都要如实说出原因，所以分开记两类。
             let mut window_blocked: Vec<String> = Vec::new();
             let mut quota_blocked: Vec<String> = Vec::new();
+            // M86：等待说明要列出**全部**原因（时段、额度、缺凭据）与最早可用时间。
+            let mut causes: Vec<super::usage_windows::WaitCause> = Vec::new();
             let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
+                let label = endpoint_label(&route.endpoint_name);
                 if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name) { return None; }
                 let key = super::usage_windows::model_key(&route.endpoint_name, &route.model_id);
                 if let Some(rule) = config.model_usage_windows.get(&key) {
@@ -505,6 +522,7 @@ impl ActiveRouteState {
                     if !status.available && !ignore_windows {
                         skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(format!("outside_usage_window:{}", serde_json::json!({"rule":rule,"next_available_ms":status.next_transition_ms}))) });
                         if let Some(next) = status.next_transition_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
+                        causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::UsageWindow, status.next_transition_ms));
                         window_blocked.push(route.model_id.clone());
                         return None;
                     }
@@ -514,10 +532,20 @@ impl ActiveRouteState {
                     let cap = config.quota_cap_for(&route.endpoint_name);
                     let budget = super::quota_cap::SubscriptionBudget::default();
                     if let Some(breach) = ledger.evaluate(&route.endpoint_name, cap, budget, now).or_else(|| ledger.evaluate(&route.base_url, cap, budget, now)) {
+                        // M86：额度门禁的预过滤同样是一步要写进路由记录的动作。
+                        skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":breach.resets_at_ms}))) });
                         if let Some(next) = breach.resets_at_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
+                        causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::QuotaCap, breach.resets_at_ms));
                         quota_blocked.push(route.model_id.clone());
                         return None;
                     }
+                }
+                // M86：没有凭据的端点在这里就被挡下，并且留下记录——而不是
+                // 被"选中"后在传输层变成 AUTH_MISSING，让失败说明只剩它一条。
+                if !route.has_usable_credential() && !ignore_windows {
+                    skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some("route_prefilter:missing_credential".into()) });
+                    causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
+                    return None;
                 }
                 Some(index)
             });
@@ -558,16 +586,28 @@ impl ActiveRouteState {
                     kind: RouteChangeKind::QuotaCap,
                 }));
             }
+            // CF-WINDOW-R5 / M86：判定"该等"还是"该报错"。时间会让时段到点、
+            // 让额度重置；缺凭据不会自己好，所以它只作为原因出现，不构成等待。
+            let decision = super::usage_windows::availability_decision(causes);
+            if !decision.causes.is_empty() && decision.causes.iter().all(|cause| cause.kind == super::usage_windows::WaitCauseKind::MissingCredential) {
+                // 例如全部候选都没配凭据：等也不会变好，交给原有的传输层错误
+                // 与失败说明，不在这里空转。
+                return Ok(None);
+            }
             if !wait_notified {
                 if let Some(events) = events {
                     let mut origins: Vec<&str> = Vec::new();
                     if !window_blocked.is_empty() { origins.push("outside_usage_window"); }
                     if !quota_blocked.is_empty() { origins.push("subscription_quota_cap"); }
-                    events.emit(crate::openrouter::types::StreamEvent::TransportRetry { label: super::usage_windows::wait_notice(&endpoint_label(&from.endpoint_name), next_available), attempt: 0, max_attempts: 0, delay_ms: 1000, reason: format!("{}；等待不消耗技术恢复次数", origins.join(" + ")) });
+                    if decision.causes.iter().any(|cause| cause.kind == super::usage_windows::WaitCauseKind::MissingCredential) { origins.push("missing_credential"); }
+                    // 会话里显示的就是 reason：全部原因 + 最早可用时间 + 这不
+                    // 是技术失败。label 是短标签，界面用 reason 那一行。
+                    let _ = &from;
+                    events.emit(crate::openrouter::types::StreamEvent::TransportRetry { label: "模型使用时段等待".into(), attempt: 0, max_attempts: 0, delay_ms: 1000, reason: format!("{}（来源：{}）", decision.notice, origins.join(" + ")) });
                 }
                 wait_notified = true;
             }
-            next_available.map(|next| (next - now).clamp(1, 1000) as u64).unwrap_or(1000)
+            decision.earliest_ms.map(|next| (next - now).clamp(1, 1000) as u64).unwrap_or(1000)
             };
             drop(config);
             tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -930,6 +970,128 @@ mod tests {
         assert!(state.attempt_snapshots(false).is_empty(), "未配置时段不得写任何记录");
         assert!(state.inner.lock().unwrap().failed_indices.is_empty());
         crate::agent::usage_windows::set_clock_override_ms(None);
+    }
+
+    /// M86（真实场景 2026-10-14 11:08–11:17）：额度上限预过滤 + 时段跳过 +
+    /// 无凭据三者同时发生。按 CF-WINDOW-R5 / CF-QUOTA 这必须是"可理解的等待"，
+    /// 不是 failed / technical_recovery_exhausted；说明里要列出**全部**原因和
+    /// 最早可用时间。
+    #[test]
+    fn quota_cap_plus_peak_plus_missing_credential_is_a_wait_not_a_failure() {
+        let at = |stamp: &str| chrono::DateTime::parse_from_rfc3339(stamp).unwrap().timestamp_millis();
+        let reset = at("2026-10-14T14:05:00+08:00");
+        let resume = at("2026-10-14T12:00:00+08:00");
+        let decision = crate::agent::usage_windows::availability_decision(vec![
+            crate::agent::usage_windows::WaitCause::new("ChatGPT", crate::agent::usage_windows::WaitCauseKind::QuotaCap, Some(reset)),
+            crate::agent::usage_windows::WaitCause::new("DeepSeek", crate::agent::usage_windows::WaitCauseKind::UsageWindow, Some(resume)),
+            crate::agent::usage_windows::WaitCause::new("OpenRouter", crate::agent::usage_windows::WaitCauseKind::MissingCredential, None),
+        ]);
+        assert!(decision.waitable, "时间会让额度重置、让时段到点，所以这是等待而不是失败");
+        assert_eq!(decision.earliest_ms, Some(resume), "最早可用时间取两个恢复时间里较早的那个");
+        assert_eq!(decision.causes.len(), 3, "三条原因都要在案");
+        for expected in [
+            "ChatGPT", "已达订阅用量上限", "14:05",
+            "DeepSeek", "高峰时段", "12:00",
+            "OpenRouter", "尚未配置凭据",
+            "不计入技术恢复次数",
+        ] {
+            assert!(decision.notice.contains(expected), "等待说明缺少「{expected}」：{}", decision.notice);
+        }
+    }
+
+    /// M86：被预过滤掉的候选（额度超额、时段高峰、无凭据）过去不进任何记录，
+    /// 失败说明于是只剩链上真正尝试过的那一条。现在预过滤本身就是记录在案的
+    /// 一步，并且三者都不可用时是等待。
+    #[tokio::test]
+    async fn a_fleet_blocked_by_window_and_a_credential_less_endpoint_waits_and_records_every_prefilter_step() {
+        let _serial = crate::agent::usage_windows::clock_test_lock();
+        let clock = |at: &str| {
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{at}:00+08:00"))
+                .unwrap()
+                .timestamp_millis()
+        };
+        let mut plan = RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro"));
+        plan.push_fallback(RouteCandidate {
+            endpoint_name: "openrouter".into(),
+            model_id: "synthetic-model".into(),
+            base_url: "https://openrouter.example".into(),
+            credential_ref: None,
+            legacy_inline_api_key: None,
+            supports_vision: true,
+            api_style: ApiStyle::Openai,
+        });
+        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut settings = crate::config::settings::Settings::default();
+        settings.model_usage_windows.insert(
+            crate::agent::usage_windows::model_key("deepseek", "deepseek-v4-pro"),
+            crate::agent::usage_windows::presets().remove("deepseek_off_peak").unwrap(),
+        );
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
+
+        crate::agent::usage_windows::set_clock_override_ms(Some(clock("10:00")));
+        let waiter = {
+            let cloned = state.clone();
+            tokio::spawn(async move { cloned.admit_usage_window(None, false, None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "时段高峰 + 无凭据同时存在时，任务必须等待而不是失败");
+
+        crate::agent::usage_windows::set_clock_override_ms(Some(clock("12:00")));
+        let resumed = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("到 12:00 必须自动继续")
+            .unwrap()
+            .expect("等待不是错误");
+        assert!(resumed.is_none(), "同一个模型到点即可继续");
+
+        // 等待不是技术失败：健康不变、没有失败索引、记录里没有 failed。
+        assert!(state.health.is_available("deepseek"));
+        assert!(state.inner.lock().unwrap().failed_indices.is_empty(), "等待不得消耗技术恢复次数");
+        let journal = state.attempt_snapshots(false);
+        assert!(journal.iter().all(|attempt| attempt.status != "failed"), "等待不得写入技术失败");
+        // M86：两步预过滤都要写进路由记录。
+        assert!(
+            journal.iter().any(|attempt| attempt.model == "deepseek-v4-pro" && attempt.failure_code.as_deref().unwrap_or_default().starts_with("outside_usage_window:")),
+            "时段跳过必须有记录：{journal:?}"
+        );
+        assert!(
+            journal.iter().any(|attempt| attempt.model == "synthetic-model" && attempt.failure_code.as_deref() == Some("route_prefilter:missing_credential")),
+            "无凭据的候选作为预过滤的一步必须有记录：{journal:?}"
+        );
+        crate::agent::usage_windows::set_clock_override_ms(None);
+    }
+
+    /// M86 的反面：如果所有候选都只是"没配凭据"，等多久都不会变好——这时
+    /// 不该空转等待，而是照原来的路径报出可执行的错误。
+    #[tokio::test]
+    async fn a_fleet_with_no_credential_at_all_is_not_waited_on() {
+        let mut plan = RouteCandidatePlan::new(RouteCandidate {
+            endpoint_name: "openrouter".into(),
+            model_id: "synthetic-model".into(),
+            base_url: "https://openrouter.example".into(),
+            credential_ref: None,
+            legacy_inline_api_key: None,
+            supports_vision: true,
+            api_style: ApiStyle::Openai,
+        });
+        let mut unconfigured = route("deepseek", "deepseek-v4-pro");
+        unconfigured.credential_ref = None;
+        unconfigured.legacy_inline_api_key = None;
+        plan.push_fallback(unconfigured);
+        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut settings = crate::config::settings::Settings::default();
+        // 让准入循环真的跑起来（配了时段就不再是纯直通），但这条时段不属于任何候选。
+        settings.model_usage_windows.insert(
+            crate::agent::usage_windows::model_key("elsewhere", "other-model"),
+            crate::agent::usage_windows::presets().remove("deepseek_off_peak").unwrap(),
+        );
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
+        let admitted = tokio::time::timeout(Duration::from_millis(500), state.admit_usage_window(None, false, None))
+            .await
+            .expect("没有可等待的原因时不得空转")
+            .unwrap();
+        assert!(admitted.is_none(), "缺凭据需要用户动作，不能靠等");
+        assert!(state.inner.lock().unwrap().failed_indices.is_empty(), "预过滤不是技术失败");
     }
 
     fn route(name: &str, model: &str) -> RouteCandidate {
