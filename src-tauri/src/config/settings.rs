@@ -185,6 +185,11 @@ pub struct Settings {
     /// CF-WINDOW-R1: JSON [endpoint, model] tuple keys, default unrestricted.
     #[serde(default)]
     pub model_usage_windows: HashMap<String, crate::agent::usage_windows::UsageWindow>,
+    /// CF-WINDOW-R6（M86 返修）: session ids whose owner chose "本会话忽略时段
+    /// 限制". Persisted so the exemption survives an app restart; still scoped
+    /// to those sessions only, and revocable from the model menu.
+    #[serde(default)]
+    pub session_usage_window_overrides: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -679,6 +684,7 @@ impl Default for Settings {
             usage_budget: UsageBudget::default(),
             subscription_quota_caps: HashMap::new(),
             model_usage_windows: HashMap::new(),
+            session_usage_window_overrides: Vec::new(),
         }
     }
 }

@@ -45,6 +45,7 @@ import type { UIMessage } from "../stores/chat";
 import {
   isModelRouteExhaustedError,
   MODEL_ROUTE_EXHAUSTED_GUIDANCE,
+  USAGE_WINDOW_WAIT_LABEL,
   type TurnSegment,
 } from "../stores/chatEvents";
 
@@ -1289,19 +1290,39 @@ const MessageRow = memo(function MessageRow({
         </>
       )}
       {msg.transportRetries && msg.transportRetries.length > 0 && (() => {
+        // CF-WINDOW-R5（M86 返修）："所有候选都不可用，等到 X 点自动继续"是任务
+        // 状态，不是连接故障。它必须直接显示在会话里——不折叠、不被写成"连接
+        // 不稳定"——用户才知道为什么没动静、什么时候会继续、要做什么。
+        const waitNotices = msg.transportRetries.filter((entry) => entry.label === USAGE_WINDOW_WAIT_LABEL);
+        const connectionRetries = msg.transportRetries.filter((entry) => entry.label !== USAGE_WINDOW_WAIT_LABEL);
         return (
-          <details className="w-fit max-w-full text-note leading-5 text-gray-500">
-            <summary className="cursor-pointer select-none hover:text-gray-400">
-              {isWaitingOnModelTransport ? "模型连接不稳定，正在重新连接…" : "模型连接曾短暂不稳定，已完成重连"}
-            </summary>
-            <div className="ml-4 mt-1 space-y-0.5 text-note leading-5 text-gray-600">
-              {msg.transportRetries.map((retry, index) => (
-                <div key={`${retry.attempt}-${index}`} className="break-words">
-                  第 {retry.attempt} 次 · {retry.reason}
+          <>
+            {waitNotices.map((entry, index) => (
+              <div
+                key={`usage-window-wait-${index}`}
+                data-testid="usage-window-wait-notice"
+                role="status"
+                aria-live="polite"
+                className="w-fit max-w-full rounded border border-status-info/30 bg-status-info-soft/55 px-2 py-1 text-caption leading-snug text-status-info break-words"
+              >
+                {entry.reason}
+              </div>
+            ))}
+            {connectionRetries.length > 0 && (
+              <details className="w-fit max-w-full text-note leading-5 text-gray-500">
+                <summary className="cursor-pointer select-none hover:text-gray-400">
+                  {isWaitingOnModelTransport ? "模型连接不稳定，正在重新连接…" : "模型连接曾短暂不稳定，已完成重连"}
+                </summary>
+                <div className="ml-4 mt-1 space-y-0.5 text-note leading-5 text-gray-600">
+                  {connectionRetries.map((entry, index) => (
+                    <div key={`${entry.attempt}-${index}`} className="break-words">
+                      第 {entry.attempt} 次 · {entry.reason}
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          </details>
+              </details>
+            )}
+          </>
         );
       })()}
       {msg.gateActions

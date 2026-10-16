@@ -3,15 +3,71 @@
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use std::sync::{Mutex, OnceLock};
 static SESSION_OVERRIDES: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-pub fn session_ignores_windows(session: &str) -> bool {
-    SESSION_OVERRIDES.get_or_init(Default::default).lock().expect("usage override lock").contains(session)
+fn overrides() -> &'static Mutex<std::collections::HashSet<String>> {
+    SESSION_OVERRIDES.get_or_init(Default::default)
 }
+pub fn session_ignores_windows(session: &str) -> bool {
+    overrides().lock().expect("usage override lock").contains(session)
+}
+
+/// CF-WINDOW-R6（M86 返修）：豁免不再只活在内存里。用户按下「本会话忽略时段
+/// 限制」后写进 Settings，随应用重启一起回来——「一重启豁免就没了、会话被
+/// 悄悄拦下」正是这条要修的问题。返回是否真的改了配置。
+pub fn persist_session_override(
+    settings: &mut crate::config::settings::Settings,
+    session: &str,
+    ignore: bool,
+) -> bool {
+    if ignore {
+        if settings.session_usage_window_overrides.iter().any(|existing| existing == session) {
+            return false;
+        }
+        settings.session_usage_window_overrides.push(session.to_string());
+        true
+    } else {
+        let before = settings.session_usage_window_overrides.len();
+        settings.session_usage_window_overrides.retain(|existing| existing != session);
+        settings.session_usage_window_overrides.len() != before
+    }
+}
+
+/// 进程启动时把持久化的会话豁免读回内存缓存——这就是"重启后仍然有效"的
+/// 那一步。
+pub fn apply_persisted_overrides(sessions: &[String]) {
+    let mut cache = overrides().lock().expect("usage override lock");
+    for session in sessions {
+        cache.insert(session.clone());
+    }
+}
+
+/// 启动路径调用：从磁盘上的设置读回豁免。
+pub fn hydrate_session_overrides() {
+    apply_persisted_overrides(&crate::config::settings::load().session_usage_window_overrides);
+}
+
+#[doc(hidden)]
+pub fn clear_session_overrides_for_test() {
+    overrides().lock().expect("usage override lock").clear();
+}
+
 #[tauri::command]
 pub fn set_session_usage_window_override(session_id: String, ignore: bool) -> Result<(), String> {
     if session_id.trim().is_empty() { return Err("session_id must be nonempty".into()); }
-    let mut overrides = SESSION_OVERRIDES.get_or_init(Default::default).lock().map_err(|e| e.to_string())?;
-    if ignore { overrides.insert(session_id); } else { overrides.remove(&session_id); }
+    let mut settings = crate::config::settings::load();
+    if persist_session_override(&mut settings, &session_id, ignore) {
+        crate::config::settings::save(&settings).map_err(|error| error.to_string())?;
+    }
+    let mut cache = overrides().lock().map_err(|e| e.to_string())?;
+    if ignore { cache.insert(session_id); } else { cache.remove(&session_id); }
     Ok(())
+}
+
+/// CF-WINDOW-R6：让界面能显示"本会话已忽略时段限制"，并提供撤销入口。
+#[tauri::command]
+pub fn get_session_usage_window_overrides() -> Vec<String> {
+    let mut sessions = overrides().lock().expect("usage override lock").iter().cloned().collect::<Vec<_>>();
+    sessions.sort();
+    sessions
 }
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +131,76 @@ pub fn wait_notice(label: &str, next_available_ms: Option<i64>) -> String {
         .map(|at| at.with_timezone(&chrono_tz::Asia::Shanghai).format("%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "允许时段恢复".into());
     format!("等 {label} 闲时（{clock} 开始）后继续；可在设置里放开时段，或换一个模型")
+}
+
+/// CF-WINDOW-R5 + CF-QUOTA + M86：一个候选为什么不可用。
+///
+/// 等待只有在"时间会让它变好"时才成立——时段会到点、额度会重置；缺凭据不会
+/// 自己好，它需要用户动作，所以它是一条**原因**，不是一条等待理由。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitCauseKind { UsageWindow, QuotaCap, MissingCredential }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitCause {
+    pub label: String,
+    pub kind: WaitCauseKind,
+    pub until_ms: Option<i64>,
+}
+
+impl WaitCause {
+    pub fn new(label: impl Into<String>, kind: WaitCauseKind, until_ms: Option<i64>) -> Self {
+        Self { label: label.into(), kind, until_ms }
+    }
+    fn clock(&self) -> Option<String> {
+        self.until_ms
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|at| at.with_timezone(&chrono_tz::Asia::Shanghai).format("%m-%d %H:%M").to_string())
+    }
+    /// 一句话，写明原因和（若有）恢复时间。
+    pub fn sentence(&self) -> String {
+        match (self.kind, self.clock()) {
+            (WaitCauseKind::UsageWindow, Some(clock)) => format!("{} 高峰时段，{clock} 可用", self.label),
+            (WaitCauseKind::UsageWindow, None) => format!("{} 不在允许使用时段", self.label),
+            (WaitCauseKind::QuotaCap, Some(clock)) => format!("{} 已达订阅用量上限，{clock} 重置", self.label),
+            (WaitCauseKind::QuotaCap, None) => format!("{} 已达订阅用量上限", self.label),
+            (WaitCauseKind::MissingCredential, _) => format!("{} 尚未配置凭据", self.label),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailabilityDecision {
+    /// 有没有"等一等就会好"的原因（时段到点 / 额度重置）。
+    pub waitable: bool,
+    /// 最早可以再试的时间（时段边界或额度重置里较早的那个）。
+    pub earliest_ms: Option<i64>,
+    pub causes: Vec<WaitCause>,
+    /// 会话里如实显示的那句话：列出全部原因与最早可用时间。
+    pub notice: String,
+}
+
+/// CF-WINDOW-R5 / M86：所有候选都不可用时，判定该等还是该报错。
+///
+/// M86 的真实场景：GPT 已达订阅上限（14:05 重置）、DeepSeek 处于高峰
+/// （12:00 可用）、OpenRouter 未配置凭据。三者都不可用，但**时间会让前两个
+/// 变好**，所以任务是"可理解的等待"，不是失败。只有"等也不会变好"的原因
+/// （例如全部候选都没凭据）才交给原来的错误路径，不在这里空转。
+pub fn availability_decision(causes: Vec<WaitCause>) -> AvailabilityDecision {
+    let earliest_ms = causes.iter().filter_map(|cause| cause.until_ms).min();
+    let notice = wait_notice_causes(&causes, earliest_ms);
+    AvailabilityDecision { waitable: earliest_ms.is_some(), earliest_ms, causes, notice }
+}
+
+/// 等待说明：全部原因 + 最早可用时间 + 用户能做什么，并明确它不是技术失败。
+pub fn wait_notice_causes(causes: &[WaitCause], earliest_ms: Option<i64>) -> String {
+    let clock = earliest_ms
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|at| at.with_timezone(&chrono_tz::Asia::Shanghai).format("%m-%d %H:%M").to_string());
+    let reasons = causes.iter().map(WaitCause::sentence).collect::<Vec<_>>().join("；");
+    match clock {
+        Some(clock) => format!("等待模型可用：{reasons}；最早 {clock} 自动继续。等待不计入技术恢复次数；可在设置里放开时段，或换一个模型"),
+        None => format!("{reasons}；等待不计入技术恢复次数；可在设置里放开时段、换一个模型，或先配好凭据"),
+    }
 }
 pub fn presets() -> std::collections::HashMap<String, UsageWindow> {
     serde_json::from_str(include_str!("../../../src/lib/usageWindowPresets.json")).expect("validated preset data")
@@ -154,5 +280,35 @@ mod tests {
             let now = chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{clock}:00+08:00")).unwrap().timestamp_millis();
             assert_eq!(rule.evaluate(now).available, expected, "{clock}");
         }
+    }
+
+    /// CF-WINDOW-R6（M86 返修）：豁免写进设置，所以**重启之后仍然有效**；
+    /// 用户撤销之后，重启也不会把它带回来。这里用一个真实的 Settings JSON
+    /// 往返来代表"重启"：内存缓存清空 → 从设置读回。
+    #[test]
+    fn a_session_override_survives_a_restart_and_can_be_revoked() {
+        let _serial = clock_test_lock();
+        clear_session_overrides_for_test();
+        let mut settings = crate::config::settings::Settings::default();
+        assert!(persist_session_override(&mut settings, "session-synthetic-a", true), "第一次授予应当改动配置");
+        assert!(!persist_session_override(&mut settings, "session-synthetic-a", true), "重复授予不必再写一次");
+
+        // 重启：新的 Settings 实例来自磁盘上的 JSON，进程内缓存是空的。
+        let persisted = serde_json::to_string(&settings).expect("settings serialize");
+        let mut restarted: crate::config::settings::Settings = serde_json::from_str(&persisted).expect("settings deserialize");
+        clear_session_overrides_for_test();
+        assert!(!session_ignores_windows("session-synthetic-a"), "重启瞬间缓存是空的");
+        apply_persisted_overrides(&restarted.session_usage_window_overrides);
+        assert!(session_ignores_windows("session-synthetic-a"), "重启后豁免必须还在");
+        assert!(!session_ignores_windows("session-synthetic-b"), "豁免仍然只属于那一个会话");
+
+        // 撤销：同样要挺过一次重启。
+        assert!(persist_session_override(&mut restarted, "session-synthetic-a", false));
+        let revoked = serde_json::to_string(&restarted).expect("settings serialize");
+        let after_revoke: crate::config::settings::Settings = serde_json::from_str(&revoked).expect("settings deserialize");
+        clear_session_overrides_for_test();
+        apply_persisted_overrides(&after_revoke.session_usage_window_overrides);
+        assert!(!session_ignores_windows("session-synthetic-a"), "撤销之后不得复活");
+        clear_session_overrides_for_test();
     }
 }

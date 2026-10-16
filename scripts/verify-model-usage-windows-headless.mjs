@@ -45,6 +45,19 @@ try {
     await page.getByLabel("flash 时区").waitFor();
     assert(await page.getByLabel("deepseek pro 使用时段").inputValue() === "official_off_peak","editing flash changed pro");
     assert(await page.getByLabel("deepseek flash 使用时段").inputValue() === "custom","custom did not persist");
+    // CF-WINDOW-R5（M86 返修）：等待说明必须出现在**会话界面**上，不是只进日志。
+    const waitNotice = page.getByTestId("usage-window-wait-notice");
+    assert(await waitNotice.isVisible(),`${theme}: the usage-window wait notice is not visible in the session`);
+    const waitText = await waitNotice.innerText();
+    for (const expected of ["已达订阅用量上限","高峰时段","尚未配置凭据","最早","自动继续","不计入技术恢复次数"]) {
+      assert(waitText.includes(expected),`${theme}: wait notice is missing 「${expected}」: ${waitText}`);
+    }
+    assert(await page.getByText(/模型连接不稳定/).count() === 0,`${theme}: a usage-window wait must not be described as an unstable connection`);
+    // CF-WINDOW-R6（M86 返修）：提示是应用内对话框（含一次性会话豁免），不是原生弹窗。
+    const windowDialog = page.getByTestId("usage-window-dialog");
+    assert(await windowDialog.isVisible(),`${theme}: the in-app usage-window dialog is not visible`);
+    assert(await page.getByRole("button",{name:/本会话忽略时段限制/}).isVisible(),`${theme}: the one-time per-session override option is missing`);
+    await page.screenshot({path:path.join(artifacts,`wait-and-dialog-${theme}.png`),fullPage:true});
     for (const width of [1366,375]) {
       await page.setViewportSize({width,height:768});
       assert(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1),`${theme}/${width} horizontal overflow`);
