@@ -24,6 +24,10 @@ pub trait EventSink: Send + Sync {
     /// the loop calls this instead of touching a raw `AppHandle`.
     fn usage_recorded(&self, _session_id: &str) {}
 
+    /// Bind desktop stream payloads to their durable root before any output.
+    /// Headless sinks already have run-scoped output channels.
+    fn bind_root_turn(&self, _root_turn_id: Option<&str>) {}
+
     /// One model round finished (after its tool batch, if any). Defaulted
     /// no-op; the eval sidecar overrides it to satisfy its bridge invariant —
     /// EVERY model round must emit at least one line carrying usage, either a

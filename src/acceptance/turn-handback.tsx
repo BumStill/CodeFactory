@@ -188,6 +188,18 @@ function turnInFlight(messages: UIMessage[], streaming: boolean): boolean {
 }
 
 const incidentInFlight = turnInFlight(incident.messages, incident.streaming);
+// M30: inject synthetic output delivered 30 seconds after the terminal receipt.
+const terminalSnapshot = JSON.stringify(incident.messages);
+for (const event of [
+  { type: "tool_result" as const, tool_call_id: "audit-tool-after-steer", content: "M30_LATE_RESULT", is_error: false, status: "done" as const },
+  { type: "text_delta" as const, content: "M30_LATE_TEXT" },
+]) {
+  const after = reduceChatStreamEvent(incident, event, "assistant-after-steer");
+  if (JSON.stringify(after.messages) !== terminalSnapshot) throw new Error("M30 late output changed the transcript");
+}
+const nextTurn = reduceChatStreamEvent({ ...incident, streaming: true, messages: [...incident.messages,
+  { id: "m30-next", rootTurnId: "m30-next-root", role: "assistant", content: "", createdAt: Date.now() },
+] }, { type: "text_delta", content: "M30 新回合正常输出", source_root_turn_id: "m30-next-root" }, "m30-next");
 const runningInFlight = turnInFlight(running, false);
 
 createRoot(document.getElementById("root")!).render(
@@ -202,6 +214,9 @@ createRoot(document.getElementById("root")!).render(
           cwd={null}
         />
         <Composer streaming={incidentInFlight} />
+      </Panel>
+      <Panel title="M30 next turn">
+        <MessageList messages={nextTurn.messages} streaming={false} cwd={null} />
       </Panel>
       <Panel title="Still running">
         <MessageList
