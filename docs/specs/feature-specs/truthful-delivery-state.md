@@ -124,6 +124,33 @@ Spec Harness；Compatibility Harness（已有的 objective 和交付记录）；
 - 无 Spec Amendment；本轮仅合并交付，安装新版后的真机核对由独立发布任务完成。
 
 
+## M92 返修：交付提交的标题又变成「update N file(s)」（CF-TRUTH-R2 回归）
+
+真机证据（v1.88.4，2026-10-16 21:5x–22:0x）：会话 22a5d188（M90）的分支
+`codefactory/objective-d4e455bca04f84213edbe8f8c08ea0ef` 上，提交 36502bd4 的标题是
+`fix: update 8 file(s)`；会话 c94e3cfb（M91）的分支
+`codefactory/objective-b643646ecabbaef221c5b2393a4c4684` 上，提交 aa3cf5f1 的标题是
+`fix: update 3 file(s)`。两个任务的规格里都写明了规范标题（`fix(chat): …`、`fix(delivery): …`），
+deliver_changes 却没有用上。合并队列 squash 时取提交标题，这类空泛标题就会原样进入 main。
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| CF-TRUTH-R2（M92-a） | `deliver_changes` 带 title、或任务规格 / PR 意图里有标题时，生成的提交标题必须等于这个规范标题；只有完全拿不到标题时才可回退，回退必须明确报错或要求 agent 提供标题，绝不生成「update N file(s)」 | 失败测试：无标题 + 有改动集时 `canonical_delivery_title` 不得编造文件数标题；修复后返回空并由交付在写提交前 fail closed |
+| CF-TRUTH-R2（M92-b） | 交付修订提交（同一工作区追加的改动）使用同一规范标题或带上下文的标题，不能退化成空泛描述 | 失败测试：分支上已有规范标题提交、随后追加「feat: update 3 file(s)」提交，交付仍选中规范标题，且写入的提交说明首行等于该标题 |
+
+根因有两条，都在 `agent::delivery::canonical_delivery_title` 的兜底路径上：
+
+- 兜底会用「分支名人性化 + 暂存文件数」拼出 `fix: update N file(s)`；
+- 显式标题的接受条件只看 `conventional_slot` / 非发版前缀，`fix: update 8 file(s)` 本身
+  就是合规结构，于是历史提交里的空泛标题会被当成「分支自己的意图」继承到修订提交。
+
+### Implementation Notes（M92）
+
+- 新增 `is_canonical_delivery_title`：要求类型在 `fix`/`feat`/`docs`/`ci`/`test`/`chore`/`refactor`/`perf`/`build`/`style`/`revert` 之中、主题非空、单行，且**不是** `update N file(s)` 占位。显式标题、分支自身提交、回执标题都改用这一判据。
+- `canonical_delivery_title` 与 `generate_commit_message_for_paths` 不再编造标题：无可用标题时返回空串，交留在写提交之前的既有 fail-closed 分支（返回「本次交付没有可用标题…」且不执行 stage/commit/push/PR）。`generate_commit_message`、`humanized_branch_subject`、`derived_title_prefix`、`machine_generated_title_noise` 随之删除。
+- PR 标题路径未改：它仍优先使用 agent 的意图标题并在 `reconcile_pr_title` 下不夸大 release slot。
+- 仅改后端与本规格；不改 `.github/` 工作流、场景注册表与校验器，不读写生产数据库。授权仅到合并，真机安装验收由编排方发版后完成。
+
 ## M79 返修：补救回合遇到「会话 / 根回合已变」时不能把任务判死
 
 规格（来自任务说明，逐字记录）：

@@ -3543,39 +3543,14 @@ fn branch_is_ahead_of(root: &Path, remote: &str, base: &str, branch: &str) -> bo
     .unwrap_or(true) // if we can't tell (e.g. no origin/base yet), assume there is work
 }
 
-/// Machine-generated leftovers that must never become a commit subject or a PR
-/// title: the branch tail of an Objective workspace (`objective <hex>`) and bare
-/// identifiers. CF-TRUTH-R2.
-fn machine_generated_title_noise(token: &str) -> bool {
-    let token = token.trim();
-    if token.is_empty() {
-        return true;
-    }
-    if token.eq_ignore_ascii_case("objective") || token.eq_ignore_ascii_case("task") {
-        return true;
-    }
-    if token.len() < 12 {
-        return false;
-    }
-    token.chars().all(|character| character.is_ascii_hexdigit())
-}
-
-/// The words a branch tail contributes to a human subject, with machine ids
-/// dropped (`objective-b8af1a61fd71788e579add0a1cd6fb3c` → empty).
-fn humanized_branch_subject(branch: &str) -> String {
-    let tail = branch.rsplit('/').next().unwrap_or(branch);
-    tail.split(['-', '_'])
-        .filter(|token| !machine_generated_title_noise(token))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string()
-}
-
-/// The conventional-commit prefix a staged change justifies, when nobody supplied
-/// a real title. `fix` is the conservative default for product code: this
-/// repository derives its release slot from the squash subject, and understating
-/// delays value while overstating fabricates a release nobody asked for.
+/// CF-TRUTH-R2 (M92, 2026-10-16): the file-count placeholder is gone, and what
+/// replaces it must still name the change. The branch tail of an Objective
+/// workspace (`objective <hex>`) and the staged-path prefix are no longer used to
+/// invent a delivery subject; field sessions showed that fallback reaching `main`
+/// as `fix: update 8 file(s)`, which names nothing about the change. A fallback
+/// now derives its subject from the changed paths themselves — the file it
+/// touches, or the deepest directory several of them share — and refuses when
+/// there is no change evidence at all.
 fn derived_title_prefix(staged_paths: &[String]) -> &'static str {
     let relevant: Vec<&String> = staged_paths
         .iter()
@@ -3596,6 +3571,72 @@ fn derived_title_prefix(staged_paths: &[String]) -> &'static str {
         "test"
     } else {
         "fix"
+    }
+}
+
+/// The deepest directory the changed paths share, as a bare label (`agent` for
+/// `src-tauri/src/agent/a.rs` + `src-tauri/src/agent/b.rs`).
+fn common_directory_label(paths: &[String]) -> String {
+    let mut dirs: Vec<Vec<String>> = Vec::new();
+    for path in paths {
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let components = std::path::Path::new(path)
+            .parent()
+            .map(|parent| {
+                parent
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        dirs.push(components);
+    }
+    let Some(first) = dirs.first().cloned() else { return String::new(); };
+    let mut common = first;
+    for dir in &dirs[1..] {
+        let shared = common
+            .iter()
+            .zip(dir.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        common.truncate(shared);
+    }
+    common.last().cloned().unwrap_or_default()
+}
+
+/// A subject for a delivery nobody named: the single changed file's stem, or the
+/// directory several of them share. Never a file count — that is what made the
+/// squash subject on `main` unreadable to `plan_release`.
+fn contextual_subject_from_paths(paths: &[String]) -> String {
+    let mut stems: Vec<String> = Vec::new();
+    for path in paths {
+        let path = path.trim().trim_end_matches('/');
+        if path.is_empty() {
+            continue;
+        }
+        let Some(stem) = std::path::Path::new(path).file_stem().and_then(|stem| stem.to_str())
+        else {
+            continue;
+        };
+        let stem = stem.trim();
+        if !stem.is_empty() && !stems.iter().any(|known| known == stem) {
+            stems.push(stem.to_string());
+        }
+    }
+    if stems.len() == 1 {
+        return stems[0].clone();
+    }
+    if stems.is_empty() {
+        return String::new();
+    }
+    let label = common_directory_label(paths);
+    if label.is_empty() {
+        stems.into_iter().next().unwrap_or_default()
+    } else {
+        label
     }
 }
 
@@ -3626,6 +3667,22 @@ fn base_exclusion_refs(root: &Path, base: &str) -> Vec<String> {
 /// commits decide, and only when nothing at all supplies a type does this derive
 /// the conservative one — never inventing a bigger release than the change
 /// justifies.
+fn is_canonical_delivery_title(title: &str) -> bool {
+    let title = title.trim();
+    if title.contains(['\n', '\r']) {
+        return false;
+    }
+    let Some((kind, subject)) = title.split_once(':') else { return false; };
+    let kind = kind.trim().trim_end_matches('!');
+    let kind = kind.split_once('(').map_or(kind, |(base, _)| base);
+    let subject = subject.trim();
+    let placeholder = subject.strip_prefix("update ")
+        .and_then(|s| s.strip_suffix(" file(s)"))
+        .is_some_and(|count| count.parse::<usize>().is_ok());
+    matches!(kind, "fix" | "feat" | "docs" | "ci" | "test" | "chore" | "refactor" | "perf" | "build" | "style" | "revert")
+        && !subject.is_empty() && !placeholder
+}
+
 fn canonical_delivery_title(
     root: &Path,
     branch: &str,
@@ -3633,15 +3690,8 @@ fn canonical_delivery_title(
     title: Option<&str>,
     staged_paths: &[String],
 ) -> String {
-    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
-        let nonrelease_conventional = title.split_once(':').is_some_and(|(kind, subject)| {
-            let kind = kind.trim().trim_end_matches('!');
-            let kind = kind.split_once('(').map_or(kind, |(base, _)| base);
-            matches!(kind, "docs" | "ci" | "test" | "chore" | "refactor" | "perf" | "build" | "style" | "revert") && !subject.trim().is_empty()
-        });
-        if conventional_slot(title) > 0 || nonrelease_conventional {
-            return title.to_string();
-        }
+    if let Some(title) = title.map(str::trim).filter(|title| is_canonical_delivery_title(title)) {
+        return title.to_string();
     }
     // The branch's own commits are the strongest witness of intent that exists
     // before the delivery commit is written. "Own" means unreachable from the
@@ -3660,7 +3710,7 @@ fn canonical_delivery_title(
         let mut best: Option<(u8, String)> = None;
         for subject in log.lines().map(str::trim).filter(|line| !line.is_empty()) {
             let slot = conventional_slot(subject);
-            if slot == 0 {
+            if !is_canonical_delivery_title(subject) {
                 continue;
             }
             if best.as_ref().is_none_or(|(best_slot, _)| slot > *best_slot) {
@@ -3685,56 +3735,23 @@ fn canonical_delivery_title(
     paths.extend(own_paths.lines().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string));
     paths.sort();
     paths.dedup();
-    if paths.is_empty() {
+    // CF-TRUTH-R2 (M92): the subject comes from the changed paths, never from a
+    // file count. `fix: update 8 file(s)` reached `main` through this branch of
+    // the fallback and told the release plan nothing about the change.
+    let subject = contextual_subject_from_paths(&paths);
+    if subject.is_empty() {
         return String::new();
     }
-    let prefix = derived_title_prefix(&paths);
-    let subject = humanized_branch_subject(branch);
-    if subject.is_empty() {
-        format!("{prefix}: update {} file(s)", paths.len())
-    } else {
-        format!("{prefix}: {subject}")
-    }
-}
-
-fn generate_commit_message(root: &Path, branch: &str, title: Option<&str>) -> String {
-    if let Some(t) = title {
-        if !t.trim().is_empty() {
-            return t.trim().to_string();
-        }
-    }
-    let files = git(root, &["diff", "--cached", "--name-only"]).unwrap_or_default();
-    let count = files.lines().count();
-    let subject = humanized_branch_subject(branch);
-    let subject = if subject.is_empty() {
-        format!("update {count} file(s)")
-    } else {
-        subject
-    };
-    format!("chore: {subject}\n\nDelivered by CodeFactory ({count} file(s) changed).")
+    format!("{}: {subject}", derived_title_prefix(&paths))
 }
 
 fn generate_commit_message_for_paths(
-    branch: &str,
+    _branch: &str,
     title: Option<&str>,
-    staged_paths: &[String],
+    _staged_paths: &[String],
 ) -> String {
-    if let Some(title) = title {
-        if !title.trim().is_empty() {
-            return title.trim().to_string();
-        }
-    }
-    let subject = humanized_branch_subject(branch);
-    let prefix = derived_title_prefix(staged_paths);
-    let subject = if subject.is_empty() {
-        format!("update {} file(s)", staged_paths.len())
-    } else {
-        subject
-    };
-    format!(
-        "{prefix}: {subject}\n\nDelivered by CodeFactory ({} file(s) changed).",
-        staged_paths.len()
-    )
+    title.map(str::trim).filter(|title| is_canonical_delivery_title(title))
+        .unwrap_or_default().to_string()
 }
 
 fn release_urgency_trailers(message: &str) -> Vec<String> {
@@ -16817,6 +16834,39 @@ GITHUB.COM:
 
     /// A supplied conventional title is never rewritten: the caller's judgement
     /// wins, including a deliberate `feat`.
+    #[test]
+    fn m92_missing_title_never_fabricates_file_count_subject() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let paths = vec![
+            "src-tauri/src/agent/delivery.rs".to_string(),
+            "src-tauri/src/agent/objective.rs".to_string(),
+        ];
+        let derived = canonical_delivery_title(sandbox.path(),
+            "codefactory/objective-synthetic", "main", None, &paths);
+        assert!(!derived.is_empty(), "change evidence must still name the change");
+        assert!(!derived.contains("file(s)") && !derived.contains("update "),
+            "a file count is not a title: {derived:?}");
+        assert_eq!(derived, "fix: agent");
+    }
+
+    #[test]
+    fn m92_followup_ignores_generic_commits_and_keeps_canonical_intent() {
+        let root = feature_branch_repo("m92-title");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        let title = "fix(delivery): preserve canonical task title";
+        git(&root, &["commit", "-q", "-m", title]).unwrap();
+        std::fs::write(root.join("feature.rs"), "followup").unwrap();
+        git(&root, &["commit", "-qam", "feat: update 3 file(s)"]).unwrap();
+        let selected = canonical_delivery_title(&root, "feat/x", "main", None,
+            &["feature.rs".into()]);
+        assert_eq!(selected, title);
+        let message = generate_commit_message_for_paths("feat/x", Some(&selected), &[]);
+        assert_eq!(message.lines().next(), Some(title));
+        assert_eq!(canonical_delivery_title(&root, "feat/x", "main",
+            Some("fix: update 8 file(s)"), &[]), title);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     #[test]
     fn an_explicit_conventional_title_is_kept_verbatim() {
         let sandbox = tempfile::tempdir().unwrap();
