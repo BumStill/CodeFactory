@@ -4324,7 +4324,10 @@ mod tests {
         // Its best-effort error handling would then drop the event, so the durable
         // assertions above reject that regression without measuring wall time.
         pool.close().await;
-        std::fs::remove_dir_all(&dir).unwrap();
+        // M93: on Windows the closed pool's WAL/SHM handles can outlive close()
+        // for a moment (os error 32). Cleanup of a temp dir is not what this test
+        // asserts, so it must never be the thing that fails it.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn reprompt_test_pool() -> sqlx::SqlitePool {
