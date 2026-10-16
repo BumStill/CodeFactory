@@ -22,6 +22,6 @@ AI Collaboration record：context scope 为共享 agent-loop、SqlitePersistence
 
 Spec Amendment：无待审批的需求变更。实施说明补充在规格中。
 
-Scenario-Test: SC-001
+Scenario-Test: HLT-001
 README-Update: reviewed
 README-Update-Reason: 仅修复已有活动计时，不改变 README 的公开功能、安装或隐私承诺。
