@@ -878,7 +878,8 @@ pub async fn create_delivery_run(
                     workspace_path, worktree_identity, repo_identity, base_branch, head_branch,
                     change_set_digest, expected_head_sha, requested_ceiling,
                     lease_owner, lease_expires_at, claim_epoch, reconciled_claim_epoch,
-                    progress_revision, stage, status, wait_class, last_progress_at
+                    progress_revision, stage, status, wait_class, last_progress_at,
+                    canonical_pr_number, canonical_pr_url
              FROM delivery_runs WHERE id=?",
         )
         .bind(&run.id)
@@ -931,7 +932,10 @@ pub async fn create_delivery_run(
         // `waiting` is a stale holder, not a live invocation: the foreground
         // reclaims the claim within a bounded window and resumes the same PR
         // (canonical identity is preserved) instead of attaching forever.
-        let stale_waiting_holder = existing_owner.is_some()
+        // M91: the validated identity may reclaim a run explicitly parked for
+        // agent repair. Advancing the epoch fences the previous invocation.
+        let agent_action_handoff = existing.try_get::<String, _>("status")? == "agent_action_required";
+        let stale_waiting_holder = agent_action_handoff || existing_owner.is_some()
             && existing_owner.as_deref() != Some(process.instance_id.as_str())
             && existing.try_get::<String, _>("status")? == "waiting"
             && (existing_lease_expires_at.is_some_and(|expires_at| expires_at <= now)
@@ -953,6 +957,11 @@ pub async fn create_delivery_run(
                 reconciled_claim_epoch: existing_reconciled_claim_epoch,
                 progress_revision: existing.try_get::<i64, _>("progress_revision")?,
                 lease_expires_at: existing_lease_expires_at,
+                stage: existing.try_get("stage")?,
+                status: existing.try_get("status")?,
+                canonical_pr_number: existing.try_get("canonical_pr_number")?,
+                canonical_pr_url: existing.try_get("canonical_pr_url")?,
+                wait_class: existing.try_get("wait_class")?,
             };
             return Err(crate::errors::AppError::Other(format!(
                 "delivery run already has an active invocation; attach to the existing objective instead of starting a concurrent worktree mutation {}",
@@ -2243,6 +2252,11 @@ pub struct ActiveDeliveryLease {
     pub reconciled_claim_epoch: i64,
     pub progress_revision: i64,
     pub lease_expires_at: Option<i64>,
+    pub stage: Option<String>,
+    pub status: Option<String>,
+    pub canonical_pr_number: Option<i64>,
+    pub canonical_pr_url: Option<String>,
+    pub wait_class: Option<String>,
 }
 
 impl ActiveDeliveryLease {
@@ -2260,6 +2274,11 @@ impl ActiveDeliveryLease {
                 "reconciled_claim_epoch": self.reconciled_claim_epoch,
                 "progress_revision": self.progress_revision,
                 "lease_expires_at": self.lease_expires_at,
+                "stage": self.stage,
+                "status": self.status,
+                "canonical_pr_number": self.canonical_pr_number,
+                "canonical_pr_url": self.canonical_pr_url,
+                "wait_class": self.wait_class,
             })
         )
     }
@@ -2280,6 +2299,11 @@ impl ActiveDeliveryLease {
                 .get("progress_revision")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0),
+            stage: value.get("stage").and_then(|v| v.as_str()).map(String::from),
+            status: value.get("status").and_then(|v| v.as_str()).map(String::from),
+            canonical_pr_number: value.get("canonical_pr_number").and_then(|v| v.as_i64()),
+            canonical_pr_url: value.get("canonical_pr_url").and_then(|v| v.as_str()).map(String::from),
+            wait_class: value.get("wait_class").and_then(|v| v.as_str()).map(String::from),
             lease_expires_at: value
                 .get("lease_expires_at")
                 .and_then(serde_json::Value::as_i64),
@@ -6147,6 +6171,24 @@ mod tests {
     /// refused with `delivery_operation_already_running` on every attempt and
     /// burned the objective recovery budget to `technical_recovery_exhausted`
     /// while the observer waited for the agent its own lock had shut out.
+    #[tokio::test]
+    async fn m91_agent_action_reentry_fences_previous_holder() {
+        let pool = pool().await;
+        let run = foreground_admission_fixture("m91-reentry");
+        let old = ProcessIdentity::new("synthetic-old", "test", "test");
+        let epoch = create_delivery_run(&pool, &run, &old, 100, 90_000).await.unwrap();
+        sqlx::query("UPDATE delivery_runs SET status='agent_action_required', stage='pr_body', reconciled_claim_epoch=claim_epoch WHERE id=?")
+            .bind(&run.id).execute(&pool).await.unwrap();
+        let mut foreign = run.clone();
+        foreign.objective_id = "synthetic-foreign".into();
+        let next = ProcessIdentity::new("synthetic-next", "test", "test");
+        assert!(create_delivery_run(&pool, &foreign, &next, 110, 90_000).await.is_err());
+        let claimed = create_delivery_run(&pool, &run, &next, 110, 90_000).await
+            .expect("M91: agent must resume its own action-required delivery");
+        assert_eq!(claimed, epoch + 1);
+        assert!(!verify_delivery_mutation_permit(&pool, &run.id, &old, epoch, 111).await.unwrap());
+    }
+
     #[tokio::test]
     async fn cf_truth_m70_stalled_ci_wait_is_fenced_and_reclaimed() {
         let pool = pool().await;

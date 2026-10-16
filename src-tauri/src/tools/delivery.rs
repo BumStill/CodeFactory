@@ -418,6 +418,27 @@ fn active_delivery_lease_output(
         }));
     };
 
+    // A known PR parked on remote checks is an observation attachment, not
+    // evidence that the mutation holder is stalled. Never steal its lease.
+    if holder.canonical_pr_number.is_some()
+        && matches!(holder.status.as_deref(), Some("waiting" | "running"))
+        && matches!(holder.stage.as_deref(), Some("ci" | "ci_observation" | "merge" | "merge_queue"))
+    {
+        return ToolOutput::waiting(format!(
+            "已附着当前交付 PR #{}；阶段 {}，状态 {}。系统继续观察，无需编排方解锁。",
+            holder.canonical_pr_number.unwrap(), holder.stage.as_deref().unwrap_or("ci"),
+            holder.wait_class.as_deref().unwrap_or("waiting"),
+        )).with_metadata(json!({
+            "status": "recovering", "delivery_state": "waiting", "recoverable": true,
+            "recovery_class": "wait_retryable", "decision_type": "system_owned",
+            "requires_user_continue": false, "stage": holder.stage,
+            "pr_number": holder.canonical_pr_number, "pr_url": holder.canonical_pr_url,
+            "ci_status": holder.wait_class, "requested_ceiling": ceiling,
+            "reached_state": "pr_open", "retry_after_ms": 30000,
+            "next_action": if matches!(holder.stage.as_deref(), Some("merge" | "merge_queue")) { "observe_merge_queue" } else { "observe_ci" },
+            "lease_run_id": holder.run_id,
+        }));
+    }
     let attachments = observe_lease_attachment(&holder);
     let remaining_ms = holder
         .lease_expires_at
@@ -4542,9 +4563,38 @@ mod tests {
                 },
                 progress_revision,
                 lease_expires_at: Some(lease_expires_at),
+                stage: None, status: None, canonical_pr_number: None,
+                canonical_pr_url: None, wait_class: None,
             }
             .encode()
         )
+    }
+
+    #[test]
+    fn m91_ci_attachment_reports_pr_without_stalling() {
+        let message = format!("[delivery-lease-holder] {}", json!({
+            "run_id": "synthetic-ci", "lease_owner": "synthetic-observer",
+            "lease_mode": "mutation", "claim_epoch": 3, "reconciled_claim_epoch": 3,
+            "progress_revision": 1, "lease_expires_at": 90000,
+            "stage": "ci", "status": "waiting", "canonical_pr_number": 42,
+            "canonical_pr_url": "https://example.invalid/pr/42", "wait_class": "ci_pending"
+        }));
+        for stage in ["ci", "merge", "merge_queue"] {
+        for status in ["waiting", "running"] {
+        let mut payload: Value = serde_json::from_str(message.split_once("] ").unwrap().1).unwrap();
+        payload["stage"] = json!(stage);
+        payload["status"] = json!(status);
+        let message = format!("[delivery-lease-holder] {}", payload);
+        for _ in 0..5 {
+            let output = active_delivery_lease_output(&message, DeliveryCeiling::ThroughMerge, None, 1000);
+            assert!(!output.is_error);
+            let metadata = output.metadata.unwrap();
+            assert_eq!(metadata["pr_number"], 42);
+            assert_eq!(metadata["stage"], stage);
+            assert_eq!(metadata["next_action"], if stage == "ci" { "observe_ci" } else { "observe_merge_queue" });
+        }
+        }
+        }
     }
 
     #[test]
