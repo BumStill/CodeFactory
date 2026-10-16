@@ -1293,11 +1293,11 @@ const MessageRow = memo(function MessageRow({
         // CF-WINDOW-R5（M86 返修）："所有候选都不可用，等到 X 点自动继续"是任务
         // 状态，不是连接故障。它必须直接显示在会话里——不折叠、不被写成"连接
         // 不稳定"——用户才知道为什么没动静、什么时候会继续、要做什么。
-        const waitNotices = msg.transportRetries.filter((retry) => retry.label === USAGE_WINDOW_WAIT_LABEL);
-        const connectionRetries = msg.transportRetries.filter((retry) => retry.label !== USAGE_WINDOW_WAIT_LABEL);
+        const waitNotices = msg.transportRetries.filter((entry) => entry.label === USAGE_WINDOW_WAIT_LABEL);
+        const connectionRetries = msg.transportRetries.filter((entry) => entry.label !== USAGE_WINDOW_WAIT_LABEL);
         return (
           <>
-            {waitNotices.map((retry, index) => (
+            {waitNotices.map((entry, index) => (
               <div
                 key={`usage-window-wait-${index}`}
                 data-testid="usage-window-wait-notice"
@@ -1305,7 +1305,7 @@ const MessageRow = memo(function MessageRow({
                 aria-live="polite"
                 className="w-fit max-w-full rounded border border-status-info/30 bg-status-info-soft/55 px-2 py-1 text-caption leading-snug text-status-info break-words"
               >
-                {retry.reason}
+                {entry.reason}
               </div>
             ))}
             {connectionRetries.length > 0 && (
@@ -1314,9 +1314,9 @@ const MessageRow = memo(function MessageRow({
                   {isWaitingOnModelTransport ? "模型连接不稳定，正在重新连接…" : "模型连接曾短暂不稳定，已完成重连"}
                 </summary>
                 <div className="ml-4 mt-1 space-y-0.5 text-note leading-5 text-gray-600">
-                  {connectionRetries.map((retry, index) => (
-                    <div key={`${retry.attempt}-${index}`} className="break-words">
-                      第 {retry.attempt} 次 · {retry.reason}
+                  {connectionRetries.map((entry, index) => (
+                    <div key={`${entry.attempt}-${index}`} className="break-words">
+                      第 {entry.attempt} 次 · {entry.reason}
                     </div>
                   ))}
                 </div>
