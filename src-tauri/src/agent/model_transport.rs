@@ -895,6 +895,7 @@ impl DesktopModelTransport {
                 .await
                 .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
         }
+        tracing::debug!(stage = "provider_post_admitted", "first request preparation");
         Ok(())
     }
 

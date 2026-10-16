@@ -1087,6 +1087,7 @@ impl AgentLoop {
         &mut self,
         history: Vec<Message>,
     ) -> Result<codefactory_agent_loop::run::RunOutcome> {
+        let context_started = std::time::Instant::now();
         let root_turn_id = history
             .iter()
             .rev()
@@ -1156,6 +1157,7 @@ impl AgentLoop {
             blocks,
             SYSTEM_PROMPT_BUDGET,
         );
+        tracing::debug!(stage = "context_assembly", elapsed_ms = context_started.elapsed().as_millis() as u64, "first request preparation");
         if supports_plan {
             system_prompt.push_str(STRUCTURED_EXECUTION_ROUTE_PROMPT);
         }

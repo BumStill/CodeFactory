@@ -60,13 +60,23 @@ static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub async fn refresh_if_needed(settings: &crate::config::settings::Settings, force: bool) -> Option<&'static str> {
     use crate::config::settings::ApiStyle;
     if !settings.endpoints.values().any(|e| e.api_style == ApiStyle::Chatgpt) { return None; }
+    // A fresh reading is already sufficient for the route gate (including
+    // above-cap readings). Do not queue it behind unrelated background I/O.
+    // Recheck after acquiring the lock: another refresher may have populated
+    // the ledger while this caller was waiting.
+    let fresh = || {
+        let now = chrono::Utc::now().timestamp_millis();
+        let ledger = super::quota_cap::shared_quota_ledger();
+        settings.endpoints.iter().filter(|(_, e)| e.api_style == ApiStyle::Chatgpt).all(|(name, _)| {
+            ledger.snapshot(name, super::quota_cap::SubscriptionBudget::default(), now)
+                .map(|q| q.source == UsageSource::LiveQuery && now - q.observed_at_ms < 120_000 && !q.five_hour.has_reset(now) && !q.weekly.has_reset(now)).unwrap_or(false)
+        })
+    };
+    if !force && fresh() { return None; }
+    let wait_started = std::time::Instant::now();
     let _guard = REFRESH_LOCK.lock().await;
-    let now = chrono::Utc::now().timestamp_millis();
-    let ledger = super::quota_cap::shared_quota_ledger();
-    if !force && settings.endpoints.iter().filter(|(_, e)| e.api_style == ApiStyle::Chatgpt).all(|(name, _)| {
-        ledger.snapshot(name, super::quota_cap::SubscriptionBudget::default(), now)
-            .map(|q| q.source == UsageSource::LiveQuery && now - q.observed_at_ms < 120_000 && !q.five_hour.has_reset(now) && !q.weekly.has_reset(now)).unwrap_or(false)
-    }) { return None; }
+    tracing::debug!(stage = "quota_refresh_lock", elapsed_ms = wait_started.elapsed().as_millis() as u64, "first request preparation");
+    if !force && fresh() { return None; }
     let (token, account) = match crate::codex_auth::valid_access_token().await {
         Ok(auth) => auth, Err(_) => return Some("未登录或登录已过期"),
     };
@@ -117,6 +127,64 @@ pub fn spawn_refresh(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn fresh_quota_does_not_wait_for_background_refresh_lock() {
+        use crate::config::settings::{ApiStyle, Endpoint, Settings};
+        let mut settings = Settings::default();
+        settings.endpoints.clear();
+        let name = "synthetic-m4-fresh";
+        settings.endpoints.insert(name.into(), Endpoint {
+            base_url: "https://synthetic.invalid/m4".into(),
+            key_ref: None, api_style: ApiStyle::Chatgpt,
+            custom_models: vec![], active_model: Some("synthetic-model".into()),
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        super::super::quota_cap::shared_quota_ledger().record_server_usage(name, EndpointQuota {
+            source: UsageSource::LiveQuery,
+            five_hour: WindowUsage { used_ratio: 0.9, resets_at_ms: Some(now + 300_000) },
+            weekly: WindowUsage { used_ratio: 0.9, resets_at_ms: Some(now + 600_000) },
+            observed_at_ms: now,
+        });
+        let _background_refresh = REFRESH_LOCK.lock().await;
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100),
+            refresh_if_needed(&settings, false)).await;
+        eprintln!("M4 fresh-cache route gate elapsed_ms={}", started.elapsed().as_millis());
+        assert!(result.is_ok(), "fresh quota must not wait behind background network I/O");
+        assert_eq!(result.unwrap(), None);
+        assert!(super::super::quota_cap::shared_quota_ledger().evaluate(name,
+            Default::default(), Default::default(), now).is_some(),
+            "fast path must preserve the above-cap reading");
+    }
+
+    #[tokio::test]
+    async fn stale_reset_missing_and_forced_quota_still_wait_for_refresh() {
+        use crate::config::settings::{ApiStyle, Endpoint, Settings};
+        let _background_refresh = REFRESH_LOCK.lock().await;
+        for case in ["stale", "reset", "missing", "forced"] {
+            let name = format!("synthetic-m4-{case}");
+            let mut settings = Settings::default();
+            settings.endpoints.clear();
+            settings.endpoints.insert(name.clone(), Endpoint {
+                base_url: format!("https://synthetic.invalid/{case}"),
+                key_ref: None, api_style: ApiStyle::Chatgpt,
+                custom_models: vec![], active_model: Some("synthetic-model".into()),
+            });
+            let now = chrono::Utc::now().timestamp_millis();
+            if case != "missing" {
+                super::super::quota_cap::shared_quota_ledger().record_server_usage(&name, EndpointQuota {
+                    source: UsageSource::LiveQuery,
+                    five_hour: WindowUsage { used_ratio: 0.2, resets_at_ms: Some(if case == "reset" { now - 1 } else { now + 300_000 }) },
+                    weekly: WindowUsage { used_ratio: 0.2, resets_at_ms: Some(now + 600_000) },
+                    observed_at_ms: if case == "stale" { now - 120_001 } else { now },
+                });
+            }
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(20),
+                refresh_if_needed(&settings, case == "forced")).await.is_err(),
+                "{case} must not bypass required refresh");
+        }
+    }
+
     #[test]
     fn credits_are_optional_typed_and_never_replace_window_caps() {
         let credits = parse_credits(&serde_json::json!({"credits": {
