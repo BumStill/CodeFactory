@@ -31,6 +31,7 @@
     "test:attachments:asset-scope": "node scripts/verify-attachment-asset-scope.mjs",
     "test:reconnect-banner:headless": "node scripts/verify-reconnect-banner-headless.mjs",
     "test:turn-handback:headless": "node scripts/verify-turn-handback-headless.mjs",
+    "test:enter-steer:headless": "node scripts/verify-enter-steer-headless.mjs",
     "test:turn-result-card:headless": "node scripts/verify-turn-result-card-headless.mjs",
     "test:turn-progress:headless": "node scripts/verify-turn-progress-headless.mjs",
     "test:streaming-markdown:headless": "node scripts/verify-streaming-markdown-headless.mjs",

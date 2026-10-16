@@ -5,6 +5,9 @@ target/
 # offers it to `git add -A`. Match it as a plain path too.
 src-tauri/target
 .codefactory-cache/
+# Local acceptance evidence (screenshots, PR body drafts): attached to the PR
+# as paths, never committed — same rule as the other task-owned working dirs.
+.codefactory-evidence/
 **/*.rs.bk
 
 # Node / pnpm
