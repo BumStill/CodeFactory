@@ -55,12 +55,17 @@ function attachmentImageMarkdown(name: string, path: string): string {
 interface Props {
   onSend: (text: string) => void;
   /** Route the primary input as an autonomous-run interjection instead of a chat turn. */
-  onGuide?: (text: string) => Promise<void>;
+  onGuide?: (text: string) => Promise<void | { delivery: { status: "delivered" | "queued"; into?: "new_turn" | "current_run" } }>;
   onCommand?: (command: ParsedSlashCommand) => void | Promise<void>;
   onCancel: () => void;
   streaming: boolean;
   /** True while an autonomous task run is active; Enter submits guidance for the next task. */
   guidanceActive?: boolean;
+  /** M2-R5：本轮此刻是否真的能被引导（有活跃执行）。为 false 而 guidanceActive 为 true
+   *  时说明回合已停摆，Enter 会直接开新一轮，提示与按钮不得再说"引导当前执行"。 */
+  steeringActive?: boolean;
+  /** M2-R5：已经有一条插话在等当前步骤结束——再按 Enter 只会继续等待，提示要说明。 */
+  hasPendingSteer?: boolean;
   disabled: boolean;
   /** When set, this text will be appended to the current input value. */
   pendingInsert?: string;
@@ -112,7 +117,7 @@ export function readComposerText(
   return stateValue.trim();
 }
 
-export const MessageInput = forwardRef<MessageInputHandle, Props>(function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory, toolbar }: Props, handleRef) {
+export const MessageInput = forwardRef<MessageInputHandle, Props>(function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, steeringActive = guidanceActive, hasPendingSteer = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory, toolbar }: Props, handleRef) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
@@ -120,7 +125,7 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   const [dragOver, setDragOver] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [guidanceState, setGuidanceState] = useState<
-    { kind: "idle" } | { kind: "pending" } | { kind: "success" } | { kind: "error"; message: string }
+    { kind: "idle" } | { kind: "pending" } | { kind: "success"; message: string } | { kind: "error"; message: string }
   >({ kind: "idle" });
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Shell-style input history: sent messages this session + where we are in it.
@@ -260,12 +265,14 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
     if (guidanceActive && !forceQueue && text && onGuide) {
       setGuidanceState({ kind: "pending" });
       try {
-        await onGuide(text);
+        const receipt = await onGuide(text);
         setValue("");
         setAttachments([]);
         setAttachError(null);
         if (ref.current) ref.current.style.height = "auto";
-        setGuidanceState({ kind: "success" });
+        setGuidanceState({ kind: "success", message: receipt?.delivery.status === "delivered"
+          ? receipt.delivery.into === "current_run" ? "已插入当前执行" : "已开始新一轮"
+          : "当前步骤结束后读取" });
       } catch (error) {
         setGuidanceState({ kind: "error", message: String(error) });
       }
@@ -550,8 +557,10 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
           placeholder={
             dragOver
               ? "松开以附加文件"
-              : guidanceActive
+              : guidanceActive && steeringActive
               ? "引导当前执行…"
+              : guidanceActive
+              ? "当前步骤结束后读取…"
               : disabled
               ? "选择项目，或输入 /cwd <path>"
               : "描述任务或继续对话…"
@@ -577,7 +586,7 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
           type="button"
           onClick={streaming ? onCancel : () => void submit()}
           disabled={!streaming && !submitReady}
-          aria-label={streaming ? "停止后续生成" : guidanceActive ? "引导当前执行" : "发送"}
+          aria-label={streaming ? "停止后续生成" : guidanceActive && steeringActive ? "引导当前执行" : guidanceActive ? "当前步骤结束后读取" : "发送"}
           className={`flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-30 lg:h-[36px] lg:w-[36px] ${
             streaming
               ? "bg-status-danger-soft text-status-danger hover:brightness-95"
@@ -597,8 +606,12 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
         </button>
         </div>
         <ComposerControlBar
-          shortcutHint={guidanceActive
+          shortcutHint={guidanceActive && steeringActive && hasPendingSteer
+            ? "Enter 继续引导当前执行 · 上一条等当前步骤结束后读取 · Shift+Enter 换行"
+            : guidanceActive && steeringActive
             ? "Enter 引导当前执行 · ⌘Enter 等这轮结束再发 · Shift+Enter 换行"
+            : guidanceActive
+            ? "Enter 当前步骤结束后读取 · Shift+Enter 换行"
             : "Enter 发送 · Shift+Enter 换行"}
         >
           {toolbar}
@@ -611,7 +624,7 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
         )}
         {guidanceState.kind === "success" && (
           <span aria-live="polite" className="flex items-center gap-1 text-status-success">
-            <Check size={14} /> 已送出
+            <Check size={14} /> {guidanceState.message}
           </span>
         )}
         {guidanceState.kind === "error" && (
