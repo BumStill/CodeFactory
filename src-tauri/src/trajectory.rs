@@ -311,7 +311,11 @@ pub(crate) async fn record_tool_call_metadata(
         Value::Object(compact).to_string()
     };
     let mut transaction = pool.begin().await?;
-    let updated = sqlx::query("UPDATE tool_calls SET metadata = ? WHERE id = ?")
+    let updated = sqlx::query("UPDATE tool_calls SET metadata = CASE \
+        WHEN json_extract(metadata, '$.execution_started_at_ms') IS NOT NULL \
+        THEN json_set(?, '$.execution_started_at_ms', json_extract(metadata, '$.execution_started_at_ms')) \
+        ELSE ? END WHERE id = ?")
+        .bind(&metadata)
         .bind(&metadata)
         .bind(&id)
         .execute(&mut *transaction)

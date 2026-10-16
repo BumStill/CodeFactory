@@ -2219,6 +2219,10 @@ pub async fn run_agent_loop(
                 };
 
                 let tool_start = std::time::Instant::now();
+                let execution_started_at_ms = persistence
+                    .tool_execution_started_at_ms(tc, crate::command_activity::now_ms())
+                    .await?;
+                let activity_timer = crate::command_activity::CommandActivityTimer::new(execution_started_at_ms);
                 let mut execution = Box::pin(tool_backend.execute(tc, &args, &tool_ctx));
                 let mut heartbeat_emitted = false;
                 let exec_result = if let Some(interval) =
@@ -2246,10 +2250,12 @@ pub async fn run_agent_loop(
                                     ));
                                 }
                                 heartbeat_emitted = true;
-                                let elapsed = tool_start.elapsed();
+                                let now_ms = crate::command_activity::now_ms();
+                                let elapsed = activity_timer.elapsed(now_ms);
                                 let elapsed_label = approximate_wait_label(elapsed);
-                                let heartbeat_label =
-                                    format!("{activity_subject}仍在运行（约 {elapsed_label}）");
+                                let heartbeat_label = activity_timer.label(
+                                    now_ms, activity_subject, bash_cmd.as_deref(),
+                                );
                                 let waiting_reason =
                                     (elapsed >= long_tool_wait_threshold).then(|| {
                                         format!("{activity_subject}已连续运行约 {elapsed_label}")

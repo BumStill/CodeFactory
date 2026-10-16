@@ -570,6 +570,24 @@ impl Persistence for SqlitePersistence {
         .map_err(perr)
     }
 
+    async fn tool_execution_started_at_ms(&self, tool_call: &ToolCall, now_ms: u64) -> PersistResult<u64> {
+        if self.anonymous {
+            return Ok(now_ms);
+        }
+        let id = crate::trajectory::trace_record_id(&self.session_id, &tool_call.id);
+        let started: i64 = sqlx::query_scalar(
+            "UPDATE tool_calls SET metadata = json_set(COALESCE(metadata, '{}'), \
+             '$.execution_started_at_ms', COALESCE(json_extract(metadata, '$.execution_started_at_ms'), ?)) \
+             WHERE id = ? RETURNING json_extract(metadata, '$.execution_started_at_ms')",
+        )
+        .bind(now_ms.min(i64::MAX as u64) as i64)
+        .bind(id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(perr)?;
+        Ok(started.max(0) as u64)
+    }
+
     async fn record_tool_call_outcome(
         &self,
         tool_call: &ToolCall,
@@ -658,6 +676,24 @@ mod tests {
     //! delegators depend on: a written gate row, and the anonymous no-op path.
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn m90_execution_origin_survives_persistence_recreation() {
+        let db = pool().await;
+        let tool: ToolCall = serde_json::from_value(serde_json::json!({
+            "id": "synthetic-m90", "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"cargo test\"}"}
+        })).unwrap();
+        let p = SqlitePersistence { db: db.clone(), session_id: "synthetic".into(), anonymous: false };
+        p.record_tool_call_started("synthetic-message", &tool).await.unwrap();
+        assert_eq!(p.tool_execution_started_at_ms(&tool, 1000).await.unwrap(), 1000);
+        drop(p);
+        let restored = SqlitePersistence { db, session_id: "synthetic".into(), anonymous: false };
+        assert_eq!(restored.tool_execution_started_at_ms(&tool, 1_561_000).await.unwrap(), 1000);
+        let timer = codefactory_agent_loop::command_activity::CommandActivityTimer::new(
+            restored.tool_execution_started_at_ms(&tool, 1_561_000).await.unwrap());
+        assert_eq!(timer.label(1_561_000, "命令", Some("cargo test")), "cargo test 已运行约 26 分钟");
+    }
 
     async fn pool() -> SqlitePool {
         let db = SqlitePoolOptions::new()
