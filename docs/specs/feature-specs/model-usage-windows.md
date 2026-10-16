@@ -31,3 +31,31 @@ Spec Harness；Compatibility Harness（未配置时行为与现在完全一致�
 - 配置键是 `[endpoint, model]` 的 JSON 元组，避免拼接分隔符造成的键碰撞。
 - 请求前判定挂在统一的传输入口（每轮 POST 之前，含自动恢复时的再次请求），因此会话默认模型、回落、自动恢复后的再次请求与派单入口新建会话共用同一条门禁。
 - 「本会话忽略时段限制」是一次性的会话内豁免，内存态，不写入配置、不影响其它会话或后续新会话。
+
+## M86 返修（2026-10-15，真机返修）
+
+观测记录 `ux-observations.md` M86 的两处返修，以及 R5 的"做得到但看不到"。
+
+### 问题
+
+1. **R6 的提示用了 `window.alert` / `window.confirm`**（`src/components/ModelPicker.tsx`）。Tauri 的 WebView 里浏览器原生弹窗不保证弹得出来，弹不出时用户点了模型却毫无反应；风格也与应用其它地方的确认交互不一致。
+2. **「本会话忽略时段限制」只活在进程内存里**（`usage_windows.rs` 的 `SESSION_OVERRIDES`）。应用一升级、一重启豁免就没了，会话会被悄悄拦下。
+3. **R5 的等待说明写进了事件与日志，但没有确认它真的出现在会话界面上。**
+4. **M86 的真实场景**：GPT 5 小时用量已达上限（14:05 重置）+ DeepSeek 处于高峰（12:00 可用）+ OpenRouter 未配置凭据。路由记录里**没有任何 chatgpt 尝试**——额度门禁把它预先过滤掉了，且这一步没有记录；结果任务被判 `failed / technical_recovery_exhausted`，失败说明只剩链上真正尝试过的那一条（"OpenRouter 未配置"）。这违反 CF-WINDOW-R5 与 CF-QUOTA。
+
+### 本次要求（不改变 R1–R8 的含义）
+
+- **CF-WINDOW-R6（提示可见）**：R6 的提示改成应用内对话框，复用仓库既有的对话框约定（`role="dialog"` + `aria-modal` + Esc 关闭 + 焦点归还），保留一次性「本会话忽略时段限制」选项；不静默改用别的模型，也不静默违反配置。
+- **CF-WINDOW-R6（豁免持久化）**：会话级豁免持久化到设置，重启后仍然有效；用户在同一个模型菜单里可以撤销。
+- **CF-WINDOW-R5（等待可见）**：等待说明如实出现在**会话界面**上：写明每一类原因（时段 / 额度上限 / 缺凭据）、最早可用时间和用户能做什么，并说明等待不计入技术恢复次数；不得被折叠或写成"模型连接不稳定"。
+- **CF-WINDOW-R5 / CF-QUOTA（M86 复现）**：全部候选不可用时，若是"时间会让它变好"的原因（时段到点、额度重置），进入可理解的等待而不是失败；额度门禁、时段门禁与缺凭据这些**预过滤**步骤都要写进路由记录，失败说明与等待说明要能列出全部原因与最早可用时间。只有"等也不会变好"的原因（例如全部候选都没凭据）才走原来的错误路径。
+
+### Implementation Notes（本次）
+
+- 新增 `WaitCause` / `WaitCauseKind` / `availability_decision`：`waitable` 只由"是否存在恢复时间"决定，缺凭据只作为原因出现，不构成等待。
+- 等待事件沿用 `StreamEvent::TransportRetry`，label 固定为 `模型使用时段等待`（`src/stores/chatEvents.ts` 的 `USAGE_WINDOW_WAIT_LABEL`），前端据此把它与真正的连接重试分开渲染；两侧字符串由 `src/stores/usageWindowWaitContract.test.ts` 契约测试盯住。
+- 会话豁免写入 `Settings.session_usage_window_overrides`（`Vec<session_id>`），启动时 `hydrate_session_overrides()` 读回内存缓存；新增入口 `get_session_usage_window_overrides` 供界面显示与撤销。
+
+### Spec Amendment（需要你确认）
+
+- 原文的 Implementation Notes 写「本会话忽略时段限制」是**内存态、不写入配置**。本次返修要求它**扛得住重启**，因此改成持久化到设置（仍是会话级、仍可撤销、不影响其它会话或后续新会话）。R6 的语义没有变化，只是把"一次性"从"进程生命周期"更正为"会话生命周期"——原表述会让用户在重启后被静默拦下，与 R6"不静默违反配置"的意图冲突。请确认按此理解。

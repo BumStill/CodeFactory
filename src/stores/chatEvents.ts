@@ -117,6 +117,12 @@ export interface TransportRetryState {
 
 const MODEL_ROUTE_EXHAUSTED_PREFIX = "所有可用模型端点均不可用：";
 
+/** CF-WINDOW-R5（M86 返修）：后端用这个 label 把"所有候选都在时段外／超额度，
+ *  正在等待"作为 StreamEvent::TransportRetry 发出。前端靠它把等待说明和真正的
+ *  连接重试区分开——等待要直接显示在会话里，不能被折叠成"连接不稳定"的日志。
+ *  两侧必须是同一个字符串（契约测试盯着 `src-tauri/src/agent/failover.rs`）。 */
+export const USAGE_WINDOW_WAIT_LABEL = "模型使用时段等待";
+
 /** U33 / CF-PFB-R12. The upper bound the backend clamps every wait to, in
  *  minutes. Kept in one place so the user-visible promise and the scheduler
  *  bound cannot drift apart. */
