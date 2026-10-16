@@ -298,6 +298,25 @@ export function reduceChatStreamEvent(
   event: StreamEvent,
   msgId: string,
 ): ChatEventState {
+  // A durable settlement is a root-turn watermark, not merely a streaming
+  // flag (waiting_system legitimately closes a transport without settling).
+  const controlEvent = event.type === "turn_settled" || event.type === "turn_activity_updated";
+  if (!controlEvent) {
+    let target: UIMessage | undefined;
+    for (let index = state.messages.length - 1; index >= 0; index -= 1) {
+      if (state.messages[index].id === msgId) { target = state.messages[index]; break; }
+    }
+    const targetRoot = target ? messageRootTurnId(target) : null;
+    const sourceRoot = event.source_root_turn_id ?? targetRoot;
+    const closed = state.messages.some((message) =>
+      message.turnSettledAt != null &&
+      (sourceRoot ? messageRootTurnId(message) === sourceRoot : message.id === msgId),
+    );
+    if (closed || (event.source_root_turn_id && targetRoot && sourceRoot !== targetRoot)) {
+      console.debug("Ignored stream output after turn settlement or from another root", event.type);
+      return state;
+    }
+  }
   switch (event.type) {
     case "plan_updated":
       return {
@@ -352,7 +371,9 @@ export function reduceChatStreamEvent(
             lastProgressAt: event.last_progress_at ?? null,
           },
         };
-        return transportSettled ? terminalizeTransientTools(projected) : projected;
+        return transportSettled
+          ? terminalizeTransientTools({ ...projected, turnSettledAt: message.turnSettledAt ?? event.updated_at })
+          : projected;
       };
       return {
         ...state,
