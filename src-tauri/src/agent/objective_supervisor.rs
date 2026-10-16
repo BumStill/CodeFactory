@@ -1061,6 +1061,15 @@ where
     Schedule: FnMut(ClaimedRemediation),
     Publish: FnMut(ObjectiveSnapshot),
 {
+    // M88: transport waits carry no remediation row; turn due ones into a
+    // claimable resume (or reschedule them) before claiming, so a network blip
+    // can never leave an objective unobserved.
+    if let Err(error) = store
+        .reobserve_transport_probe_waits(chrono::Utc::now().timestamp_millis())
+        .await
+    {
+        tracing::warn!(%error, "transport wait re-observation failed; claim loop continues");
+    }
     let batch = store
         .claim_due_remediation_batch(owner, limit, lease_ms)
         .await?;
@@ -1270,6 +1279,7 @@ async fn apply_decision_with_contention_retry(
 }
 
 pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
+    super::power_assertion::spawn(pool.clone());
     let owner = format!(
         "objective-supervisor:{}:{}",
         std::process::id(),

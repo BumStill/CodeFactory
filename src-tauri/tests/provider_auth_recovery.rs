@@ -187,6 +187,28 @@ fn attempt(id: &str, episode_id: &str, endpoint: &str) -> ProviderAttemptSpec {
 }
 
 #[tokio::test]
+async fn m88_same_revision_takeover_reconciles_old_in_flight() {
+    let pool = pool().await;
+    let old = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&old, &episode(), NOW).await.unwrap();
+    store.begin_attempt(&old, &attempt("old-flight", "episode-1", "chatgpt"), NOW + 1).await.unwrap();
+    store.mark_in_flight(&old, "old-flight", NOW + 2).await.unwrap();
+    sqlx::query("UPDATE objectives SET lease_owner='new-owner', lease_expires_at=?")
+        .bind(NOW + 960_000).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE objective_remediations SET lease_owner='new-owner', attempt_index=8, lease_expires_at=?")
+        .bind(NOW + 960_000).execute(&pool).await.unwrap();
+    let new = ProviderOwnerPermit::remediation("objective-opaque", 4, "binding-1", 3,
+        "remediation-1", "new-owner", 8);
+    assert!(matches!(store.open_episode(&new, &episode(), NOW + 900_000).await.unwrap(), ProviderMutation::Applied(_)));
+    assert!(matches!(store.begin_attempt(&new, &attempt("new-flight", "episode-1", "deepseek"), NOW + 900_001).await.unwrap(), ProviderMutation::Applied(_)));
+    let status: String = sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='old-flight'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "failed_replayable");
+    assert!(matches!(store.mark_in_flight(&old, "old-flight", NOW + 900_002).await.unwrap(), ProviderMutation::Fenced));
+}
+
+#[tokio::test]
 async fn attempt_is_write_ahead_and_bound_to_opaque_objective_revision() {
     let pool = pool().await;
     let permit = insert_claimed_provider_objective(&pool).await;
