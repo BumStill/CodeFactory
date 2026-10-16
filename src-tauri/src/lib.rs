@@ -1721,6 +1721,7 @@ pub fn run() {
                 objective_pool.clone(),
                 data_dir.join("execution-workspaces"),
             );
+            agent::quota_live::spawn_refresh(app.handle().clone());
             app.manage(commands::terminal::TerminalState::new());
 
             let browser_reclaim_pool = objective_pool.clone();

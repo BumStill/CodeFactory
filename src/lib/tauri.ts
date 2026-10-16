@@ -714,6 +714,8 @@ export interface SubscriptionQuotaStatus {
   label: string;
   /** "服务端读数" | "本地估算" | "尚无用量记录" */
   source: string;
+  observed_at_ms?: number | null;
+  refresh_error?: string | null;
   five_hour_percent: number;
   weekly_percent: number;
   five_hour_cap_percent: number;

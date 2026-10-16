@@ -35,6 +35,12 @@ function status(overrides: Partial<SubscriptionQuotaStatus> = {}): SubscriptionQ
 }
 
 describe("SubscriptionQuotaSection (CF-QUOTA-R4)", () => {
+  it("shows live observation time and a sanitized refresh failure", async () => {
+    mocks.invoke.mockResolvedValue([status({ source: "回复头读数", observed_at_ms: 1760000000000, refresh_error: "网络连接失败" } as Partial<SubscriptionQuotaStatus>)]);
+    render(<SubscriptionQuotaSection />);
+    expect(await screen.findByText(/网络连接失败/)).toBeInTheDocument();
+    expect(screen.getByText(/读取时间/)).toBeInTheDocument();
+  });
   beforeEach(() => {
     mocks.invoke.mockReset();
     mocks.save.mockReset();
