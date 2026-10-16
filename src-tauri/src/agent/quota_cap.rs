@@ -66,6 +66,7 @@ impl QuotaWindowKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UsageSource {
     /// Read from the service's own usage headers.
+    LiveQuery,
     ServerReported,
     /// Locally derived from token counts and the official rate card.
     Estimated,
@@ -79,7 +80,8 @@ impl UsageSource {
     /// Marker the UI appends so an estimate is never mistaken for a reading.
     pub fn label(self) -> &'static str {
         match self {
-            Self::ServerReported => "服务端读数",
+            Self::LiveQuery => "实时查询",
+            Self::ServerReported => "回复头读数",
             Self::Estimated => "本地估算",
         }
     }
@@ -130,6 +132,16 @@ pub struct EndpointQuota {
 }
 
 impl EndpointQuota {
+    pub fn source_label(&self, now_ms: i64) -> &'static str {
+        if self.source != UsageSource::Estimated
+            && (self.five_hour.has_reset(now_ms) || self.weekly.has_reset(now_ms))
+        {
+            "推算（已过重置点，待刷新）"
+        } else {
+            self.source.label()
+        }
+    }
+
     pub fn window(&self, kind: QuotaWindowKind) -> WindowUsage {
         match kind {
             QuotaWindowKind::FiveHour => self.five_hour,
@@ -251,7 +263,10 @@ pub fn evaluate_cap(quota: &EndpointQuota, cap: QuotaCap, now_ms: i64) -> Option
         .filter_map(|kind| {
             let window = quota.window(kind);
             let cap_percent = cap.for_window(kind);
-            let used_percent = window.used_percent(now_ms);
+            let used_percent = if window.has_reset(now_ms) && quota.source != UsageSource::Estimated {
+                // A reset timestamp is not evidence of available subscription quota.
+                100
+            } else { window.used_percent(now_ms) };
             if used_percent >= cap_percent {
                 Some(CapBreach {
                     window: kind,
@@ -529,9 +544,10 @@ impl QuotaLedger {
                         .resets_at_ms
                         .map(|reset| reset > now_ms)
                         .unwrap_or(false);
-                if still_valid {
-                    return Some(server);
-                }
+                // Keep stale server evidence for conservative routing; display labels
+                // distinguish expired windows until a successful refresh arrives.
+                let _ = still_valid;
+                return Some(server);
             }
             // No reading and no locally-observed usage: we know nothing, which
             // is not the same as "zero used". Saying so lets the caller try its
@@ -678,14 +694,17 @@ mod tests {
         assert_eq!(breach.used_percent, 85);
     }
 
-    // CF-QUOTA-R3: after the window resets, usage is zero and the endpoint is
-    // eligible again.
+    // CF-QUOTA-R3 live repair: reset time alone cannot authorize requests.
     #[test]
-    fn a_reset_window_reports_zero_usage_and_clears_the_breach() {
+    fn a_reset_window_requires_a_fresh_reading_before_clearing_the_breach() {
         let mut quota = server_quota(1.0, 0.5);
         quota.five_hour.resets_at_ms = Some(NOW - 1);
-        assert!(evaluate_cap(&quota, QuotaCap::default(), NOW).is_none());
-        assert_eq!(quota.five_hour.used_percent(NOW), 0);
+        let breach = evaluate_cap(&quota, QuotaCap::default(), NOW)
+            .expect("expired reading must not silently authorize subscription use");
+        assert_eq!(breach.window, QuotaWindowKind::FiveHour);
+        let mut refreshed = server_quota(0.05, 0.5);
+        refreshed.source = UsageSource::LiveQuery;
+        assert!(evaluate_cap(&refreshed, QuotaCap::default(), NOW).is_none());
     }
 
     // CF-QUOTA-R2: caps are configurable and clamped.
@@ -775,10 +794,9 @@ mod tests {
         assert!((quota.five_hour.used_ratio - 0.85).abs() < 1e-9);
     }
 
-    // CF-QUOTA-R1: once the server snapshot's windows have both reset, the
-    // ledger stops presenting the stale reading as current.
+    // CF-QUOTA-R9: retain expired evidence and block until refreshed.
     #[test]
-    fn a_fully_reset_server_snapshot_falls_back_to_the_estimate() {
+    fn a_fully_reset_server_snapshot_remains_blocked_until_refreshed() {
         let ledger = QuotaLedger::new();
         let mut stale = server_quota(0.9, 0.9);
         stale.five_hour.resets_at_ms = Some(NOW - 10);
@@ -787,8 +805,12 @@ mod tests {
         let quota = ledger
             .snapshot("chatgpt", SubscriptionBudget::default(), NOW)
             .unwrap();
-        assert_eq!(quota.source, UsageSource::Estimated);
-        assert!(evaluate_cap(&quota, QuotaCap::default(), NOW).is_none());
+        assert_eq!(quota.source, UsageSource::ServerReported);
+        assert!(evaluate_cap(&quota, QuotaCap::default(), NOW).is_some());
+        let mut fresh = server_quota(0.12, 0.24);
+        fresh.source = UsageSource::LiveQuery;
+        ledger.record_server_usage("chatgpt", fresh);
+        assert!(ledger.evaluate("chatgpt", QuotaCap::default(), SubscriptionBudget::default(), NOW).is_none());
     }
 
     // CF-QUOTA-R5: only the subscription endpoint carries quota; a pay-per-token
