@@ -20,6 +20,7 @@
 //! unconsumed: they lock the seam shapes and prove object-safety before the
 //! desktop impls (4.3-4.6) and the sidecar (4.8) wire in.
 
+pub mod command_activity;
 pub mod context;
 pub mod events;
 pub mod journal;

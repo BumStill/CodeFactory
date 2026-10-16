@@ -154,6 +154,12 @@ pub trait Persistence: Send + Sync {
         tool_call: &ToolCall,
     ) -> PersistResult<()>;
 
+    /// Save the actual execution origin once per tool identity, after approvals.
+    /// Implementations restore this value when the same in-flight call is resumed.
+    async fn tool_execution_started_at_ms(&self, _tool_call: &ToolCall, now_ms: u64) -> PersistResult<u64> {
+        Ok(now_ms)
+    }
+
     /// Record one terminal tool outcome into the trajectory.
     async fn record_tool_call_outcome(
         &self,
