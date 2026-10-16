@@ -17,6 +17,7 @@ use crate::openrouter::types::StreamEvent;
 pub struct TauriEventSink {
     app: tauri::AppHandle,
     event_name: String,
+    root_turn_id: std::sync::RwLock<Option<String>>,
 }
 
 impl TauriEventSink {
@@ -24,7 +25,33 @@ impl TauriEventSink {
         Self {
             app,
             event_name: format!("stream:{session_id}"),
+            root_turn_id: std::sync::RwLock::new(None),
         }
+    }
+}
+
+fn scoped_payload(event: &StreamEvent, root_turn_id: Option<&str>) -> serde_json::Value {
+    let mut payload = serde_json::to_value(event).expect("stream event serialization");
+    if let Some(root) = root_turn_id {
+        payload["source_root_turn_id"] = serde_json::Value::String(root.to_owned());
+    }
+    payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_payload_retains_root_and_original_event_fields() {
+        for root in ["old-root", "next-root"] {
+            let payload = scoped_payload(&StreamEvent::TextDelta { content: "synthetic".into() }, Some(root));
+            assert_eq!(payload["type"], "text_delta");
+            assert_eq!(payload["content"], "synthetic");
+            assert_eq!(payload["source_root_turn_id"], root);
+        }
+        let legacy = scoped_payload(&StreamEvent::TextDelta { content: "legacy".into() }, None);
+        assert!(legacy.get("source_root_turn_id").is_none());
     }
 }
 
@@ -32,7 +59,13 @@ impl TauriEventSink {
 impl EventSink for TauriEventSink {
     fn emit(&self, event: StreamEvent) {
         use tauri::Emitter;
-        self.app.emit(&self.event_name, event).ok();
+        let root = self.root_turn_id.read().expect("stream root lock");
+        let payload = scoped_payload(&event, root.as_deref());
+        self.app.emit(&self.event_name, payload).ok();
+    }
+
+    fn bind_root_turn(&self, root_turn_id: Option<&str>) {
+        *self.root_turn_id.write().expect("stream root lock") = root_turn_id.map(str::to_owned);
     }
 
     fn usage_recorded(&self, session_id: &str) {

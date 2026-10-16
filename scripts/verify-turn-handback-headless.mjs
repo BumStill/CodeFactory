@@ -187,6 +187,15 @@ async function main() {
       "the compact running receipt must remain visible in a narrow viewport",
     );
     await page.screenshot({ path: path.join(artifactDir, "turn-handback-narrow.png"), fullPage: true });
+    for (const theme of ["dark", "light"]) {
+      await page.evaluate((value) => document.documentElement.dataset.theme = value, theme);
+      assert(!(await page.locator("main").textContent()).includes("M30_LATE_"), "M30 late output must never reach the transcript");
+      assert((await page.getByRole("region", { name: "M30 next turn" }).textContent()).includes("M30 新回合正常输出"), "M30 next turn must display normal output");
+      await page.screenshot({ path: path.join(artifactDir, `m30-${theme}-narrow.png`), fullPage: true });
+      await page.setViewportSize({ width: 1366, height: 768 });
+      await page.screenshot({ path: path.join(artifactDir, `m30-${theme}-wide.png`), fullPage: true });
+      await page.setViewportSize({ width: 430, height: 780 });
+    }
     console.log(JSON.stringify({
       status: "pass",
       artifactDir,

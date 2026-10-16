@@ -89,7 +89,7 @@ export function onChromiumProgress(
 
 // ── Types mirroring Rust StreamEvent ────────────────────────────────────────
 
-export type StreamEvent =
+export type StreamEvent = { source_root_turn_id?: string | null } & (
   | { type: "text_delta"; content: string }
   | {
       type: "plan_updated";
@@ -182,7 +182,7 @@ export type StreamEvent =
       endpoint_id?: string | null;
       recoverable: boolean;
     }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string });
 
 export interface Session {
   id: string;

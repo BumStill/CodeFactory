@@ -1092,6 +1092,7 @@ impl AgentLoop {
             .rev()
             .find(|message| message.role == "user" && message.completion_state.is_none())
             .map(|message| message.id.clone());
+        self.events.bind_root_turn(root_turn_id.as_deref());
         let mut tool_defs = tools::all_definitions();
         // Append MCP tools as additional tool definitions
         let mcp_tools = self.mcp_manager.list_all_tools().await;
