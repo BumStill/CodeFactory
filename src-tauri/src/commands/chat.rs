@@ -2825,6 +2825,7 @@ pub async fn send_message(
     state: State<'_, AppState>,
     mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
+    let preparation_started = std::time::Instant::now();
     // Register cancellation before any database, model, or credential work so
     // a stop click cannot race the command's setup phase.
     let run_control = Arc::new(crate::ChatRunControl::pending());
@@ -2851,6 +2852,8 @@ pub async fn send_message(
         &content,
     )
     .await?;
+    tracing::debug!(stage = "admission", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "first request preparation");
+    let setup_started = std::time::Instant::now();
     let root_turn_id = admission.root_turn_id;
     let objective = admission.objective;
     let contract = admission.contract;
@@ -3014,6 +3017,8 @@ pub async fn send_message(
         }
     }
 
+    tracing::debug!(stage = "workspace_checkpoint", elapsed_ms = setup_started.elapsed().as_millis() as u64, "first request preparation");
+    let route_started = std::time::Instant::now();
     // Freeze all locally usable routes for this turn. This is a runtime
     // availability plan only: it never overwrites the user's preferred
     // endpoint/model in Settings.
@@ -3041,6 +3046,7 @@ pub async fn send_message(
         )
         .await
     );
+    tracing::debug!(stage = "route_quota", elapsed_ms = route_started.elapsed().as_millis() as u64, "first request preparation");
     let primary_route = route_plan
         .candidates()
         .first()
