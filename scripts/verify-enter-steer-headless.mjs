@@ -83,6 +83,8 @@ async function buildSite() {
       "--loader:.css=empty",
       `--outfile=${path.join(bundleDir, "app.js")}`,
       "--log-level=warning",
+      `--alias:@tauri-apps/api/core=${path.join(root, "src/acceptance/enter-steer-ipc.ts")}`,
+      `--alias:@tauri-apps/api/event=${path.join(root, "src/acceptance/enter-steer-ipc.ts")}`,
     ],
     "esbuild bundle",
   );

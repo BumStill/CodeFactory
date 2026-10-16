@@ -13,7 +13,26 @@ import { MessageInput } from "../components/MessageInput";
 import { MessageList } from "../components/MessageList";
 import type { UIMessage } from "../stores/chatEvents";
 
-type Receipt = { delivery: { status: "delivered" | "queued"; into?: "new_turn" | "current_run" } };
+import { useChatStore, freshRuntime } from "../stores/chat";
+import { dispatchSend } from "../lib/dispatchActions";
+import { listen } from "./enter-steer-ipc";
+import { reduceChatStreamEvent } from "../stores/chatEvents";
+import type { Session, StreamEvent } from "../lib/tauri";
+
+for (const id of ["live", "blocked", "stalled"]) {
+  const session: Session = { id, title: id, cwd: "/proj", model_id: "synthetic", created_at: 0, updated_at: 0, total_input_tokens: 0, total_output_tokens: 0 };
+  useChatStore.setState((state) => ({ sessions: [...state.sessions, session], runtime: {
+    ...state.runtime, [id]: { ...freshRuntime(), streaming: true },
+  } }));
+  void listen(`stream:${id}`, ({ payload }) => {
+    useChatStore.setState((state) => ({ runtime: { ...state.runtime,
+      [id]: { ...state.runtime[id], ...reduceChatStreamEvent(state.runtime[id], payload as StreamEvent, "assistant-live") },
+    } }));
+  });
+}
+function guide(id: string, message: string) {
+  return dispatchSend({ sessionId: id, message, mode: "steer" }, { steerAppliedTimeoutMs: 100 });
+}
 
 const conversation: UIMessage[] = [
   {
@@ -72,10 +91,7 @@ function App() {
         <Panel name="Live run" hint="一轮正在流式输出：Enter 引导当前执行">
           <MessageInput
             onSend={() => {}}
-            onGuide={async (): Promise<Receipt> => {
-              await new Promise((resolve) => setTimeout(resolve, 20));
-              return { delivery: { status: "delivered", into: "current_run" } };
-            }}
+            onGuide={(text) => guide("live", text)}
             onCancel={() => {}}
             streaming={true}
             guidanceActive={true}
@@ -88,10 +104,7 @@ function App() {
         <Panel name="Tool blocked" hint="卡在不可中断的工具里：只能等当前步骤结束">
           <MessageInput
             onSend={() => {}}
-            onGuide={async (): Promise<Receipt> => {
-              await new Promise((resolve) => setTimeout(resolve, 20));
-              return { delivery: { status: "queued" } };
-            }}
+            onGuide={(text) => guide("blocked", text)}
             onCancel={() => {}}
             streaming={true}
             guidanceActive={true}
@@ -105,7 +118,7 @@ function App() {
         <Panel name="Stalled run" hint="回合已停摆：Enter 直接开新一轮">
           <MessageInput
             onSend={() => {}}
-            onGuide={async (): Promise<Receipt> => ({ delivery: { status: "delivered", into: "new_turn" } })}
+            onGuide={(text) => guide("stalled", text)}
             onCancel={() => {}}
             streaming={false}
             guidanceActive={true}

@@ -988,7 +988,11 @@ export function WorkspacePage({
                 ref={composerRef}
                 key={activeSession?.id ?? activeDraft?.id ?? sessionId}
                 initialHistory={messages.filter((m) => m.role === "user").map((m) => m.content)}
-                onSend={(t) => void sendOrQueue(t)}
+                onSend={(text) => {
+                  if (activeDraft || !activeSession) void sendOrQueue(text);
+                  else void dispatchSend({ sessionId: activeSession.id, message: text, mode: "queue" })
+                    .catch((error) => console.error("message delivery failed", error));
+                }}
                 onGuide={guideNextStep}
                 onCancel={async () => {
                   if (await cancelStream(sessionId)) {
