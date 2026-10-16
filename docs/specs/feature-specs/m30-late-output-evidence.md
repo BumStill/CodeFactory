@@ -18,6 +18,6 @@ Context scope：chat reducer、desktop sink、既有 SQLite hydration；assumpti
 
 真机验收由编排方发版后完成：完成/失败/取消回合后核对无迟到文本/工具；开启下一轮核对正常输出；重开会话核对终态保留。当前 not live，本任务不发版。无新 GUI/dispatch 操作入口需求。
 
-Scenario-Test: SC-001
+Scenario-Test: HLT-001, HLT-005, SKL-002, SKL-003
 README-Update: reviewed
 README-Update-Reason: 内部事件终态隔离修复，不改变公开能力、安装和隐私承诺。
