@@ -735,30 +735,8 @@ pub(crate) fn validate_pr_body_intent(body: &str) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let scenario_line = body
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Scenario-Test:"))
-        .map(str::trim)
-        .unwrap_or("");
-    let scenario_ids: Vec<&str> = scenario_line
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|token| !token.is_empty())
-        .collect();
-    let scenario_ok = !scenario_ids.is_empty()
-        && scenario_ids.iter().all(|id| {
-            !matches!(
-                id.to_ascii_lowercase().as_str(),
-                "none" | "n/a" | "na" | "not-applicable" | "not_applicable" | "tbd"
-            )
-        });
-    if !scenario_ok {
-        problems.push(format!(
-            "`Scenario-Test:` 必须列出校验器给出的受影响场景 ID（逗号分隔），不能写 `none` / `not-applicable` / 散文，\
-也不要写复杂 E2E case ID。先运行 \
-`python3 tools/governance/validate_scenario_test_governance.py --ci --base-ref origin/main --title \"<标题>\" --body-file <正文文件>`，\
-把它打印出的 ID 原样填进这一行。当前读到：`{scenario_line}`"
-        ));
-    }
+    // M95: Scenario-Test is derived by the repository validator, not trusted
+    // from caller prose. README intent and shell expansion remain mandatory.
     let readme_decision = body
         .lines()
         .find_map(|line| line.trim().strip_prefix("README-Update:"))
@@ -4116,6 +4094,46 @@ fn readme_contract_lines(body: &str) -> (Vec<String>, Vec<String>) {
     (decisions, reasons)
 }
 
+#[derive(Deserialize)]
+struct ScenarioBodyReconciliation {
+    body: String,
+    changed: bool,
+    detail: String,
+}
+
+fn reconcile_scenario_contract_body(
+    root: &Path,
+    remote: &str,
+    base: &str,
+    body: &str,
+    steps: &mut Vec<StepResult>,
+) -> Result<String, String> {
+    let validator = root.join("tools/governance/validate_scenario_test_governance.py");
+    // Other repositories do not opt into CodeFactory's scenario contract.
+    if !root.join("docs/testing/scenario-registry.json").exists() && !validator.exists() {
+        return Ok(body.to_string());
+    }
+    use std::io::Write;
+    let mut input = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    input.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    let output = bounded_delivery_output(
+        dev_command("python3")
+            .arg("-c")
+            .arg(include_str!("../../../scripts/delivery-scenario-body.py"))
+            .arg(&validator)
+            .arg(root)
+            .arg(format!("{remote}/{base}"))
+            .arg("--validate-registry")
+            .stdin(std::process::Stdio::from(input.reopen().map_err(|e| e.to_string())?)),
+    )?;
+    let result: ScenarioBodyReconciliation = serde_json::from_str(&output)
+        .map_err(|e| format!("scenario validator returned invalid output: {e}"))?;
+    if result.changed {
+        steps.push(StepResult::ok("scenario_test", result.detail));
+    }
+    Ok(result.body)
+}
+
 fn reconcile_readme_contract_body(
     root: &Path,
     remote: &str,
@@ -5555,6 +5573,12 @@ pub async fn deliver<R: DeliveryRemote>(
     let requested_pr_body = intent_body.clone().unwrap_or_else(|| {
         "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".to_string()
     });
+    let requested_pr_body = match reconcile_scenario_contract_body(
+        &repo.root, &repo.remote, &repo.default_branch, &requested_pr_body, &mut outcome.steps,
+    ) {
+        Ok(body) => body,
+        Err(error) => return outcome.blocked_at(StepResult::blocked("scenario_test", error)),
+    };
     let mut pr_body = match reconcile_readme_contract_body(
         &repo.root,
         &repo.remote,
@@ -5709,6 +5733,12 @@ pub async fn deliver<R: DeliveryRemote>(
             requested_pr_body.clone()
         } else {
             remote_pr.body.clone()
+        };
+        let desired_body_source = match reconcile_scenario_contract_body(
+            &repo.root, &repo.remote, &repo.default_branch, &desired_body_source, &mut outcome.steps,
+        ) {
+            Ok(body) => body,
+            Err(error) => return outcome.blocked_at(StepResult::blocked("scenario_test", error)),
         };
         let reconciled_body = match reconcile_readme_contract_body(
             &repo.root,
@@ -5922,11 +5952,17 @@ pub async fn deliver<R: DeliveryRemote>(
             }
         };
         pr_title = refreshed_pr.title;
+        let scenario_body = match reconcile_scenario_contract_body(
+            &repo.root, &repo.remote, &repo.default_branch, &refreshed_pr.body, &mut outcome.steps,
+        ) {
+            Ok(body) => body,
+            Err(error) => return outcome.blocked_at(StepResult::blocked("scenario_test", error)),
+        };
         let reconciled_body = match reconcile_readme_contract_body(
             &repo.root,
             &repo.remote,
             &repo.default_branch,
-            &refreshed_pr.body,
+            &scenario_body,
         ) {
             Ok(reconciled) => reconciled,
             Err(error) => {
@@ -5936,7 +5972,7 @@ pub async fn deliver<R: DeliveryRemote>(
                 ))
             }
         };
-        if reconciled_body.changed {
+        if reconciled_body.body != refreshed_pr.body {
             if let Err(step) = verify_mutation_permit(opts, "update_pr_body_before_merge").await {
                 return outcome.blocked_on_uncertain_side_effect(step);
             }
@@ -11478,11 +11514,9 @@ mod tests {
         let literal = "$(cat .codefactory-cache/m74c-body.md)\n\nScenario-Test: none\nREADME-Update: reviewed";
         let error = validate_pr_body_intent(literal).expect_err("an unexpanded body is refused");
         assert!(error.contains("shell"), "{error}");
-        assert!(error.contains("Scenario-Test"), "{error}");
-        assert!(
-            error.contains("validate_scenario_test_governance.py"),
-            "{error}"
-        );
+        // M95 supersedes the old hand-written scenario requirement; the
+        // literal shell body is still rejected, independently of scenario IDs.
+        assert!(error.contains("README-Update-Reason"), "{error}");
 
         let backtick =
             "Scenario-Test: CXD-002\nREADME-Update: reviewed\nREADME-Update-Reason: 草稿\n`gh pr list`";
@@ -11498,6 +11532,10 @@ mod tests {
             validate_pr_body_intent(missing_reason).expect_err("README-Update-Reason is required");
         assert!(error.contains("README-Update-Reason"), "{error}");
 
+        for declaration in ["", "Scenario-Test: none\n", "Scenario-Test: SC-001\n", "Scenario-Test: SYN-101\nScenario-Test: SYN-202\n"] {
+            validate_pr_body_intent(&format!("{declaration}README-Update: reviewed\nREADME-Update-Reason: synthetic"))
+                .expect("M95 derives scenario IDs after intent validation");
+        }
         // Control group: the template-compliant body passes unchanged.
         validate_pr_body_intent(
             "Scenario-Test: CXD-002, HLT-001, HLT-002, HLT-005, RTE-004\n\
