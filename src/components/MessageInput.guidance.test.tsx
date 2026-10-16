@@ -29,6 +29,82 @@ function setup(onGuide = vi.fn()) {
 }
 
 describe("MessageInput guidance mode", () => {
+  it("M2-R1 reports waiting rather than delivery before a safe point", async () => {
+    setup();
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "先读这条修正" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(screen.getByText("当前步骤结束后读取")).toBeInTheDocument());
+    expect(screen.queryByText("已送出")).not.toBeInTheDocument();
+  });
+
+  it("M2-R5 says waiting instead of steering when the run is stalled", () => {
+    const onSend = vi.fn();
+    const onGuide = vi.fn();
+    render(
+      <MessageInput
+        onSend={onSend}
+        onGuide={onGuide}
+        onCancel={() => {}}
+        streaming={false}
+        guidanceActive={true}
+        steeringActive={false}
+        disabled={false}
+        cwd="/proj"
+      />,
+    );
+
+    expect(screen.getByTestId("composer-shortcut-hint")).toHaveTextContent(
+      "Enter 当前步骤结束后读取 · Shift+Enter 换行",
+    );
+    expect(screen.getByRole("button", { name: "当前步骤结束后读取" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "引导当前执行" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveAttribute("placeholder", "当前步骤结束后读取…");
+  });
+
+  it("M2-R5 tells the user a second steer also waits when one is already pending", () => {
+    const onSend = vi.fn();
+    const onGuide = vi.fn();
+    render(
+      <MessageInput
+        onSend={onSend}
+        onGuide={onGuide}
+        onCancel={() => {}}
+        streaming={true}
+        guidanceActive={true}
+        steeringActive={true}
+        hasPendingSteer={true}
+        disabled={false}
+        cwd="/proj"
+      />,
+    );
+
+    expect(screen.getByTestId("composer-shortcut-hint")).toHaveTextContent(
+      "Enter 继续引导当前执行 · 上一条等当前步骤结束后读取 · Shift+Enter 换行",
+    );
+  });
+
+  it("M2-R1 reports the receipt it actually got instead of 'sent'", async () => {
+    const onGuide = vi.fn(async () => ({ delivery: { status: "delivered" as const, into: "current_run" as const } }));
+    const user = userEvent.setup();
+    render(
+      <MessageInput
+        onSend={vi.fn()}
+        onGuide={onGuide}
+        onCancel={() => {}}
+        streaming={false}
+        guidanceActive={true}
+        disabled={false}
+        cwd="/proj"
+      />,
+    );
+
+    await user.type(screen.getByRole("textbox"), "改用 chrome channel{Enter}");
+
+    await waitFor(() => expect(screen.getByText("已插入当前执行")).toBeInTheDocument());
+    expect(screen.queryByText("已送出")).not.toBeInTheDocument();
+  });
+
   it("shows shortcut help only for a focused desktop composer and keeps controls 44/36px", () => {
     const { onSend } = setup();
     const shortcut = screen.getByTestId("composer-shortcut-hint");
@@ -131,7 +207,7 @@ describe("MessageInput guidance mode", () => {
     expect(textarea).toHaveValue("先修失败测试");
 
     resolveGuide?.();
-    await waitFor(() => expect(screen.getByText("已送出")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("当前步骤结束后读取")).toBeInTheDocument());
     expect(textarea).toHaveValue("");
   });
 

@@ -398,6 +398,32 @@ describe("CF-HDE-R8 · 插话与排队可选", () => {
     expect(invokeMock).toHaveBeenCalledWith("send_message", expect.objectContaining({ sessionId: "A" }));
   });
 
+  it("M2-R2 scheduler without a chat confirmation never claims delivered", async () => {
+    seed({ sessions: [{ ...sessionA, is_running: true }, sessionB] });
+    const receipt = await dispatchSend(
+      { sessionId: "A", message: "工具结束后调整", mode: "steer" },
+      { steerAppliedTimeoutMs: 30 },
+    );
+    expect(receipt.delivery).toMatchObject({ status: "queued", note: "当前步骤结束后读取" });
+    expect(invokeMock).toHaveBeenCalledWith("queue_interjection", expect.objectContaining({ sessionId: "A" }));
+    expect(useChatStore.getState().runtime.B.messages).toEqual([]);
+  });
+
+  it("M2-R3 parked stale stream starts a new turn after authoritative no-run", async () => {
+    seed({ a: { ...runningA, messages: [userMessage("root-stale", "旧任务"),
+      assistantMessage("reply-stale", "root-stale", "等待", {
+        turnActivity: { objectiveStatus: "waiting_system", nextObservationAt: null, rootTurnId: "root-stale" } as never,
+      })] } });
+    const original = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) =>
+      cmd === "is_chat_running" ? false : original(cmd, args));
+    const receipt = await dispatchSend({ sessionId: "A", message: "恢复停摆任务", mode: "queue" });
+    expect(receipt.delivery).toEqual({ status: "delivered", into: "new_turn" });
+    expect(invokeMock).toHaveBeenCalledWith("is_chat_running", { sessionId: "A" });
+    expect(invokeMock).toHaveBeenCalledWith("send_message", expect.objectContaining({ content: "恢复停摆任务" }));
+    expect(useChatStore.getState().runtime.A.queue).toEqual([]);
+  });
+
   it("运行中 + queue：本轮结束后再发", async () => {
     seed({ a: runningA });
     const receipt = await dispatchSend({ sessionId: "A", message: "等这轮", mode: "queue" });
