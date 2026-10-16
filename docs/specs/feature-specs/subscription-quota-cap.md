@@ -42,6 +42,40 @@ ChatGPT Plus 订阅（Codex 通道）按「5 小时滚动窗口」加「每周�
 
 ## Implementation Notes
 
+## CF-QUOTA 真机返修（2026-10-14）：实时查询订阅剩余额度
+
+### 背景与用户决策
+
+用户要求（2026-10-14）：「要实时获取它的剩余额度，而不是 CodeFactory 自己的」。
+
+真机证据（v1.88.2，2026-10-14 23:3x）：`get_quota` 返回 `five_hour_percent=0`、`source=服务端读数`，
+但 `five_hour_resets_at` 仍是 14:05。该读数来自回复头 `x-codex-*-used-percent`，只在请求经过时更新；
+过了重置时间后 `effective_ratio` 直接返回 0，于是 0% 只是推算值，界面却标成「服务端读数」，
+误导用户，也让额度门禁在读数过期时按 0% 放行。
+
+### Requirements Traceability
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| CF-QUOTA-R6 | **实时查询**：用应用已有的 ChatGPT 登录凭据主动查询 Codex 用量接口（先 `GET https://chatgpt.com/backend-api/wham/usage`，失败再试 `https://chatgpt.com/backend-api/codex/usage`），解析 5 小时与周两个窗口的 used_percent、reset，未知字段容错；只允许请求这两个地址，不跟随重定向 | 合成响应解析测试 + 只允许两个地址的常量断言 |
+| CF-QUOTA-R7 | **何时查询**：`get_quota` 调用时、路由决策前（读数超过 2 分钟或已过重置点）、后台每 5 分钟刷新 | 代码接线 + 聚焦测试 |
+| CF-QUOTA-R8 | **来源如实标注**：区分「实时查询」「回复头读数」「推算（已过重置点，待刷新）」；推算值不得标成服务端读数；实时查询失败时说明原因并退回回复头读数 | 组件测试（来源 + 读取时间 + 失败原因） |
+| CF-QUOTA-R9 | **门禁以最新读数为准**：查不到实时读数时不得把「已过重置点」当成 0% 放行，应先尝试刷新 | 测试：过期读数仍判为越限；取得实时低用量后解除 |
+| CF-QUOTA-R10 | **不泄漏凭据**：不得把令牌写进日志或审计；错误信息不含原始响应体 | 代码审查 + 错误为固定中文文案 |
+
+### Implementation Notes
+
+- 实时读数通过既有的 `codex_auth::valid_access_token()` 取得令牌，仅用于请求上述两个地址；
+  错误映射为固定文案（「未登录或登录已过期」「网络连接失败」「用量接口不可用」「用量接口已变更」），
+  不记录原始响应体，避免任何凭据或隐私内容进入日志与审计。
+- 实时读数写入既有 `QuotaLedger`（同时按端点名与路由 base_url 记录），来源标记为 `LiveQuery`。
+- 过期保护：`evaluate_cap` 中，非估算来源的窗口一旦 `resets_at <= now`，按 100% 处理（阻断），
+  直到刷新到新的读数为止——这是本次返修对 CF-QUOTA-R3「重置后自动切回」的收窄：
+  切回必须由实时读数确认，不能仅凭重置时间推断。
+- 前端在 `SubscriptionQuotaSection` 展示来源、读取时间与实时查询失败原因。
+
+本次仅修复实时额度读取与来源标注，不改变 R2 上限配置语义。
+
 ### CF-QUOTA-R2 后台入口补齐
 
 - `get_quota` 返回与设置页相同的 `subscription_quota_status` 列表；不暴露凭据。

@@ -237,6 +237,9 @@ pub(crate) async fn resolve_route_plan(
     policy: &str,
     requires_vision: bool,
 ) -> Result<(RouteCandidatePlan, Vec<String>), AppError> {
+    // Refresh subscription readings before quota-sensitive route selection.
+    #[cfg(not(test))]
+    crate::agent::quota_live::refresh_if_needed(settings, false).await;
     // Planning is deliberately credential-blind. Touching every configured
     // Keychain item here caused unrelated DeepSeek authorization prompts even
     // when a ChatGPT route was selected. The transport resolves only the route

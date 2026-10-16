@@ -97,6 +97,8 @@ export function SubscriptionQuotaSection() {
                 className="space-y-2 rounded-lg border border-border/70 bg-surface-2 p-2.5"
               >
                 <div className="flex flex-wrap items-center gap-2">
+                  {status.observed_at_ms && <span className="text-caption text-gray-500">读取时间：{new Date(status.observed_at_ms).toLocaleString("zh-CN")}</span>}
+                  {status.refresh_error && <span className="text-caption text-gray-500">实时查询失败：{status.refresh_error}</span>}
                   <span className="text-body text-gray-200">{status.label}</span>
                   <span className="rounded-full border border-border px-1.5 py-0.5 text-caption text-gray-500">
                     {status.source}

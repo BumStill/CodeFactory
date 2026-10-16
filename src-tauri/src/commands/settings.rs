@@ -13,6 +13,10 @@ pub struct SubscriptionQuotaStatus {
     pub endpoint: String,
     pub label: String,
     /// "服务端读数" / "本地估算" / "尚无用量记录".
+    pub observed_at_ms: Option<i64>,
+    pub refresh_error: Option<&'static str>,
+    /// Optional purchased credits; never used to override subscription caps.
+    pub credits: Option<crate::agent::quota_live::Credits>,
     pub source: &'static str,
     pub five_hour_percent: u8,
     pub weekly_percent: u8,
@@ -32,6 +36,7 @@ pub async fn subscription_quota_status(
     state: State<'_, AppState>,
 ) -> Result<Vec<SubscriptionQuotaStatus>, AppError> {
     let settings = state.settings.read().await.clone();
+    let refresh_error = crate::agent::quota_live::refresh(&settings).await;
     let ledger = crate::agent::quota_cap::shared_quota_ledger();
     let now_ms = chrono::Utc::now().timestamp_millis();
     let budget = crate::agent::quota_cap::SubscriptionBudget::default();
@@ -53,8 +58,11 @@ pub async fn subscription_quota_status(
         statuses.push(SubscriptionQuotaStatus {
             endpoint: name.clone(),
             label: crate::agent::failover::endpoint_label(name),
+            observed_at_ms: snapshot.map(|quota| quota.observed_at_ms),
+            refresh_error,
+            credits: crate::agent::quota_live::credits_snapshot(),
             source: snapshot
-                .map(|quota| quota.source.label())
+                .map(|quota| quota.source_label(now_ms))
                 .unwrap_or("尚无用量记录"),
             five_hour_percent: snapshot
                 .map(|quota| quota.five_hour.used_percent(now_ms))
