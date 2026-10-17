@@ -76,6 +76,17 @@
 - review point: QA 复核 M0/M1 contract；桌面技术评审决定 feasibility probe；治理评审划分普通 PR 与 external bootstrap，并审计 target implementation digest。
 - validation result: M0/M1a/M1b 已合并，旧最小路由 bootstrap 已通过 111 个 target canary。Bootstrap-1a 的入口、配置、类型、隐私、重复结果和版本漂移问题均已补失败优先测试，#508 已进入默认分支 judge，原始保护恢复。新基线非空 canary 已由 #512 以 113/113 及独立复算验收，完整 case 状态和 L3/L4 缺口保持不变。
 
+## CodeFactory 接手 E2E-004 L2（2026-10-17）
+
+- 规格：`docs/specs/feature-specs/e2e004-fake-forge.md`，原始 R1–R7 保持原意。
+- 已完成切片：复用 `delivery_scenario_tests.rs` 的生产 `deliver`、隔离 worker、真实 Git 和 SQLite FakeForge。新增 `e2e004_ci_failure_recovers_same_pr_and_artifact`：第一次 CI 失败，第二个进程切换成功，同分支/提交/PR identity；第三次重放无重复 PR/merge/release，预存 dirty file 和 root index 不变。产物从实际 Git 对象提取，匿名三字段 receipt 绑定 merge SHA 与字节摘要，并回读核验。
+- 失败优先：相同目标先以 worker 不支持恢复阶段失败（exit 101），修复后通过；全组反例发现旧 tag 提前读取不存在文件的问题，修复 fixture 提取路径后 10 passed、2 supervisor-only workers ignored。worker 由 supervisor 实际启动，并非跳过被测路径。
+- 本地复跑：`CARGO_TARGET_DIR="$PWD/.codefactory-cache/cargo-target-e2e004" CARGO_INCREMENTAL=0 cargo test --manifest-path src-tauri/Cargo.toml --lib agent::delivery::scenario_tests -- --nocapture`。现有 nightly 的全 workspace 测试自然包含此非 ignored target；未修改 workflow、validator 或 registry。
+- **未完成且不计为完整 E2E-004**：同会话运行时 steer/queue、provider 重连、测试失败自动诊断修复、durable objective/delivery run/change set 和 CI 等待 owner 释放尚未组合验证；缺证据任一项不得 completed 的整矩阵尚未覆盖。当前只是 PR/CI/merge/artifact 的 L2 前置切片，不将 10 项测试等同完整 case。
+- Spec Amendment 待编排方决定：R6 要求修改 registry，但任务模板 §6 禁止修改信任根。建议由编排方通过受控规则集流程更新 `automated_by` 与精确 remaining gaps，状态最多 `partially_implemented`；不得改为 `implemented`。本 PR 保持 registry 不变。
+- L3/L4、manual_canary 均保留。真机验收由编排方发版后完成：同一任务追加约束和纠正可见顺序、重连恢复、CI 等待释放 owner、重启续接原 run、实际交付回执及无重复副作用。
+- AI Collaboration：context scope 为任务文件、registry 和既有 FakeForge；assumption 为合成 fixture 不等于生产验收；review point 为本组反例与身份/字节断言；validation result 以 PR 中最终命令和 CI 为准。按任务模板禁止 `delegate_tasks`，本轮单执行流，不伪称独立 QA 已执行。
+
 ## Stop Boundary
 
 - 不在文档完成、本地绿色、PR 通过、merge、公开资产或安装成功任一单点停止。

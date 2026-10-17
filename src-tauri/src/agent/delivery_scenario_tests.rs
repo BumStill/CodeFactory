@@ -358,6 +358,14 @@ impl DeliveryRemote for FakeForge {
             sha.into()
         };
         git(&self.origin(), &["tag", "synthetic-v1", &artifact_head])?;
+        // Synthetic bytes come from the actual merged Git object, not the
+        // requested head. A mismatched tag therefore cannot validate them.
+        let content = git(&self.origin(), &["show", &format!("{artifact_head}:app.rs")])?;
+        let digest = format!("{:x}", sha2::Sha256::digest(content.as_bytes()));
+        std::fs::write(self.world.join("synthetic-artifact.txt"), content).unwrap();
+        std::fs::write(self.world.join("artifact-receipt.json"),
+            serde_json::to_vec(&json!({"synthetic": true, "merge_sha": artifact_head,
+                "artifact_sha256": digest})).unwrap()).unwrap();
         self.record(&target.operation_key(), &json!({"kind": "release", "target": target,
             "run_id": "synthetic-run-1", "status": "completed", "head_sha": sha,
             "release": {"tagName": "synthetic-v1", "isDraft": false, "isPrerelease": false,
@@ -644,6 +652,9 @@ fn delivery_fake_forge_worker() {
             };
             std::fs::write(world.join("ci-state"), state).unwrap();
         }
+        if phase == "ci-resume" {
+            std::fs::write(world.join("ci-state"), "success").unwrap();
+        }
         if phase == "wrong-tag" {
             std::fs::write(world.join("wrong-tag"), "synthetic").unwrap();
         }
@@ -652,7 +663,7 @@ fn delivery_fake_forge_worker() {
             assert_eq!(forge.counts().await, (1, 1, 1));
         }
         let outcome = run_delivery(&world, &forge).await;
-        if phase.starts_with("ci-") {
+        if phase == "ci-failure" || phase == "ci-pending" {
             assert_blocked(&outcome);
             assert_eq!(forge.counts().await, (1, 0, 0));
             assert!(!outcome
@@ -1015,6 +1026,37 @@ fn ci_not_green_never_merges_or_releases() {
         assert_eq!(result(world.path(), phase)["outcome"]["pr_number"], 1);
         close_world(world);
     }
+}
+
+#[test]
+fn e2e004_ci_failure_recovers_same_pr_and_artifact() {
+    let world = supervised_world();
+    Worker::spawn(world.path(), "ci-failure").wait();
+    let failed = result(world.path(), "ci-failure");
+    Worker::spawn(world.path(), "ci-resume").wait();
+    let resumed = result(world.path(), "ci-resume");
+    assert_ne!(failed["pid"], resumed["pid"]);
+    for field in ["branch", "commit_sha", "pr_number", "pr_url"] {
+        assert_eq!(failed["outcome"][field], resumed["outcome"][field]);
+        assert!(!resumed["outcome"][field].is_null());
+    }
+    let artifact: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(world.path().join("artifact-receipt.json")).unwrap(),
+    ).unwrap();
+    assert_eq!(artifact["merge_sha"], resumed["outcome"]["commit_sha"]);
+    let content = std::fs::read(world.path().join("synthetic-artifact.txt")).unwrap();
+    assert_eq!(artifact["artifact_sha256"], format!("{:x}", sha2::Sha256::digest(&content)));
+    assert_eq!(String::from_utf8(content).unwrap(), git(
+        &world.path().join("origin.git"),
+        &["show", &format!("{}:app.rs", artifact["merge_sha"].as_str().unwrap())],
+    ).unwrap());
+    assert_eq!(artifact["synthetic"], true);
+    assert_eq!(artifact.as_object().unwrap().len(), 3);
+    Worker::spawn(world.path(), "retry").wait();
+    assert_eq!(artifact, serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(world.path().join("artifact-receipt.json")).unwrap(),
+    ).unwrap());
+    close_world(world);
 }
 
 #[test]
