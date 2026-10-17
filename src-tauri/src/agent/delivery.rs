@@ -3044,6 +3044,29 @@ pub async fn observe_delivery_takeover<R: DeliveryRemote>(
 /// revised the durable head. The canonical branch/PR may legitimately remain
 /// at that receipt's exact parent until the replacement owner receives a new
 /// mutation permit and pushes the child. No other remote head is accepted.
+/// M98-R3: true when the remote head is this workspace's own past — equal to
+/// the local head or a real ancestor of it. A foreign commit is neither.
+fn remote_head_is_explained_by_local(repo_root: &Path, remote_head: &str, local_head: &str) -> bool {
+    if remote_head.is_empty() || local_head.is_empty() {
+        return false;
+    }
+    if remote_head == local_head {
+        return true;
+    }
+    let Ok(repository) = git2::Repository::open(repo_root) else {
+        return false;
+    };
+    let (Ok(remote_oid), Ok(local_oid)) = (
+        git2::Oid::from_str(remote_head),
+        git2::Oid::from_str(local_head),
+    ) else {
+        return false;
+    };
+    repository
+        .graph_descendant_of(local_oid, remote_oid)
+        .unwrap_or(false)
+}
+
 pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryRemote>(
     cwd: &Path,
     default_branch_hint: Option<&str>,
@@ -3082,11 +3105,25 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
     }
 
     let remote_head = observe_remote_branch_head(&repo)?;
-    if remote_head.as_deref().is_some_and(|head| {
-        head != persisted_identity.head_sha
-            && Some(head) != receipted_parent_head
-            && !remote_head_is_own_pushed_commit(&repo, &persisted_identity.head_sha, head)
-    }) {
+    // M98-R3 + M99-R3: the same objective on the same branch is one identity as
+    // long as the remote head is explained — equal to the persisted head, the
+    // receipted parent, a commit this delivery itself pushed, or an ancestor of
+    // the local head (the push simply had not run yet). A foreign head still
+    // fails closed, so an external write can never be adopted here.
+    let remote_explainable = match remote_head.as_deref() {
+        None => true,
+        Some(head) => {
+            head == persisted_identity.head_sha
+                || Some(head) == receipted_parent_head
+                || remote_head_is_own_pushed_commit(&repo, &persisted_identity.head_sha, head)
+                || remote_head_is_explained_by_local(
+                    cwd,
+                    head,
+                    &persisted_identity.head_sha,
+                )
+        }
+    };
+    if !remote_explainable {
         return Err(format!(
             "remote branch {} moved to an unrecognized head {}; expected persisted {}{}",
             repo.branch,
