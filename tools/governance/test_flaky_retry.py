@@ -92,6 +92,25 @@ class FlakyRetryTest(unittest.TestCase):
         self.assertIn("retried", summary)
         self.assertIn(TEST_NAME.lower(), summary)
 
+    def test_non_ascii_and_undecodable_output_does_not_crash_on_cp1252(self):
+        # Windows CI (#680 first run): output with byte 0x8f crashed the wrapper
+        # with UnicodeDecodeError under the runner's cp1252 default.
+        self.write_quarantine([])
+        env = dict(os.environ, PYTHONIOENCODING="cp1252", PYTHONUTF8="0")
+        command = (
+            "import sys\n"
+            "sys.stdout.buffer.write(b'\\x8f \\xe4\\xb8\\xad\\xe6\\x96\\x87 selectSession: gone\\n')\n"
+            "sys.stdout.buffer.flush()\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--quarantine", str(self.quarantine),
+             "--job", "check-frontend", "--summary-file", str(self.summary),
+             "--", sys.executable, "-c", command],
+            capture_output=True, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(b"UnicodeDecodeError", result.stdout + result.stderr)
+
     # -- Req E3 ----------------------------------------------------------
     def test_off_list_failure_fails(self):
         self.write_quarantine([])

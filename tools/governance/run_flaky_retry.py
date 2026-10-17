@@ -87,6 +87,10 @@ def run_streaming(command: list[str], label: str) -> tuple[int, str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        # Windows runners default to cp1252: test output (Chinese text, raw
+        # bytes) must never crash the wrapper itself.
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     chunks: list[str] = []
@@ -116,6 +120,9 @@ def split_command(raw: list[str]) -> tuple[list[str], list[str]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     raw = list(sys.argv[1:] if argv is None else argv)
     options, command = split_command(raw)
 
