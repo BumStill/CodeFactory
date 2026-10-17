@@ -208,6 +208,187 @@ async fn m88_same_revision_takeover_reconciles_old_in_flight() {
     assert!(matches!(store.mark_in_flight(&old, "old-flight", NOW + 900_002).await.unwrap(), ProviderMutation::Fenced));
 }
 
+/// M98-R2/R4. An upgrade restart replaces the owner after the provider round
+/// already committed its response (text persisted, no side effect, no receipt).
+/// The new owner must reconcile that completed step and open the next attempt —
+/// never fail the objective with `response_committed cannot continue`.
+#[tokio::test]
+async fn m98_restart_reconciles_committed_response_before_next_attempt() {
+    let pool = pool().await;
+    let old = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&old, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(&old, &attempt("old-committed", "episode-1", "deepseek"), NOW + 1)
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&old, "old-committed", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .commit_response(
+            &old,
+            "old-committed",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "已落库的最终回复",
+            false,
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+
+    // The updater replaces the process: a new owner and a new remediation epoch
+    // resume the same objective revision and episode.
+    sqlx::query("UPDATE objectives SET lease_owner='new-owner', lease_expires_at=?")
+        .bind(NOW + 960_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE objective_remediations SET lease_owner='new-owner', attempt_index=8, lease_expires_at=?")
+        .bind(NOW + 960_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let new = ProviderOwnerPermit::remediation(
+        "objective-opaque",
+        4,
+        "binding-1",
+        3,
+        "remediation-1",
+        "new-owner",
+        8,
+    );
+
+    let begun = store
+        .begin_attempt(
+            &new,
+            &attempt("new-next", "episode-1", "deepseek"),
+            NOW + 900_000,
+        )
+        .await
+        .expect("a committed effect-free response must be reconciled, not fenced");
+    assert!(matches!(begun, ProviderMutation::Applied(_)));
+
+    let (status, failure_code): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, failure_code FROM provider_route_attempts WHERE id='old-committed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "failed_replayable");
+    assert_eq!(
+        failure_code.as_deref(),
+        Some("provider_response_checkpoint_reconciled"),
+        "the reconciliation must be auditable and distinct from a real failure"
+    );
+
+    // Reconciliation never publishes a technical failure, so nothing is left
+    // in an observe-only state and no recovery budget is consumed. The newly
+    // prepared next attempt is exactly what the resume path accepts.
+    let disposition = store.observe("objective-opaque").await.unwrap();
+    assert!(
+        matches!(
+            disposition,
+            ProviderRecoveryDisposition::RetrySafe { .. }
+                | ProviderRecoveryDisposition::ReadyToAttempt { .. }
+                | ProviderRecoveryDisposition::ObserveOnlyPrepared { .. }
+        ),
+        "the settled checkpoint must not remain observe-only: {disposition:?}"
+    );
+    // No recovery work is produced for a settled checkpoint, so the supervisor
+    // never routes a technical failure (and never spends the recovery budget).
+    let candidates = store.startup_recovery_candidates(NOW + 900_002).await.unwrap();
+    assert!(
+        candidates.iter().all(|candidate| candidate.objective_id != "objective-opaque"),
+        "a reconciled committed response must not be a recovery candidate"
+    );
+    let technical_failures: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objective_events WHERE event_type='technical_failure_detail'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(technical_failures, 0);
+}
+
+/// M98-R2 security boundary. A committed response may only be reconciled when
+/// no side effect was started and no receipt is unresolved.
+#[tokio::test]
+async fn m98_reconciliation_never_adopts_an_unsettled_side_effect() {
+    let pool = pool().await;
+    let old = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&old, &episode(), NOW).await.unwrap();
+    store
+        .begin_attempt(&old, &attempt("old-side-effect", "episode-1", "deepseek"), NOW + 1)
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&old, "old-side-effect", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .begin_side_effect(
+            &old,
+            "old-side-effect",
+            "tool:write_file",
+            "old-side-effect:tool-1",
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    store
+        .commit_response(
+            &old,
+            "old-side-effect",
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "带副作用的回复",
+            true,
+            NOW + 4,
+        )
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE objectives SET lease_owner='new-owner', lease_expires_at=?")
+        .bind(NOW + 960_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE objective_remediations SET lease_owner='new-owner', attempt_index=8, lease_expires_at=?")
+        .bind(NOW + 960_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let new = ProviderOwnerPermit::remediation(
+        "objective-opaque",
+        4,
+        "binding-1",
+        3,
+        "remediation-1",
+        "new-owner",
+        8,
+    );
+
+    assert!(
+        store
+            .begin_attempt(
+                &new,
+                &attempt("new-next", "episode-1", "deepseek"),
+                NOW + 900_000,
+            )
+            .await
+            .is_err(),
+        "an unresolved side effect must remain observe-only"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='old-side-effect'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "response_committed");
+}
+
 #[tokio::test]
 async fn attempt_is_write_ahead_and_bound_to_opaque_objective_revision() {
     let pool = pool().await;
