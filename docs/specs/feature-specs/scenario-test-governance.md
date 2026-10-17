@@ -97,7 +97,7 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 <!-- scenario-registry-summary:start -->
 - 逻辑 Scenario：`28`（P0 `14`，P1 `14`，P2 `0`）
 - Complex E2E：`11`（implemented `0`，partially_implemented `10`，designed `1`）
-- 剩余自动化缺口：`26`
+- 剩余自动化缺口：`25`
 - PR slice：implemented `10`，partially_implemented `0`，missing `1`
 <!-- scenario-registry-summary:end -->
 
@@ -158,7 +158,7 @@ Scenario-Test: HLT-003, HLT-004
 | E2E-005 | 浏览器逻辑失败后回收并可继续任务 | P0 | `partially_implemented` | 1 | `implemented` | 0 |
 | E2E-006 | 历史卡住任务存在时仍可完成应用更新 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
 | E2E-007 | 计划拒绝与只读误判后恢复耗尽一致收敛 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
-| E2E-008 | 浏览器扩展空闲、瞬断与多连接交错后同一会话自动续接 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
+| E2E-008 | 浏览器扩展空闲、瞬断与多连接交错后同一会话自动续接 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
 | E2E-009 | dirty 旧分支根目录上的新代码任务全程隔离并安全交付 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-010 | 同机 Skill 命令失败后自主诊断、修正并完成 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-011 | DeliveryRun 本地提交掉线续接与外来身份有界停泊 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
