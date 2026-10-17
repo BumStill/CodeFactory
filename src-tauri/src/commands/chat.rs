@@ -787,6 +787,39 @@ async fn request_chat_run_cancel(
     }
 }
 
+/// M99 / R2: persist an *internal* stop of one run.
+///
+/// Only the run-control row changes. `chat_session_cancel_intents` is the sole
+/// durable statement that the user stopped a session (`has_durable_stop_request`
+/// and startup recovery both treat it that way), so an internal actor writes
+/// only `cancel_requested_at` here and keeps the Objective's attribution system
+/// -owned.
+async fn persist_internal_chat_run_stop(
+    pool: &sqlx::SqlitePool,
+    run_instance_id: &str,
+    session_id: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now().timestamp_millis();
+    sqlx::query(
+        "UPDATE chat_run_controls
+         SET status=CASE
+               WHEN status='cancel_requested' THEN 'active'
+               ELSE status
+             END,
+             cancel_requested_at=COALESCE(cancel_requested_at, ?),
+             updated_at=?
+         WHERE run_instance_id=? AND session_id=?
+           AND status IN ('active','cancel_requested')",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(run_instance_id)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn register_chat_run_control(
     pool: &sqlx::SqlitePool,
     control: &crate::ChatRunControl,
@@ -1977,9 +2010,19 @@ async fn converge_aborted_chat_setup(
     use crate::agent::objective::{DecisionRouter, ObjectiveStatus, RecoveryDomain, RouteSignal};
 
     if control.cancel.load(Ordering::SeqCst) {
-        // The process-local flag is fast, but only this exact durable intent
-        // can fence startup recovery after a crash.
-        request_chat_run_cancel(pool, &control.run_instance_id, session_id).await?;
+        if crate::chat_run_stop_is_internal(&control.run_instance_id) {
+            // M99 / R2: an internal settlement (incident controller,
+            // convergence, delivery supervisor) raised this flag to stop late
+            // output. That is a run-control fact, not the user's statement:
+            // persisting a session cancel intent here made every internal stop
+            // read back as `explicit_cancel`, so the Objective was cancelled
+            // under user attribution with no stop request from any entry point.
+            persist_internal_chat_run_stop(pool, &control.run_instance_id, session_id).await?;
+        } else {
+            // The process-local flag is fast, but only this exact durable
+            // intent can fence startup recovery after a crash.
+            request_chat_run_cancel(pool, &control.run_instance_id, session_id).await?;
+        }
     }
     if let Some(cancelled) = consume_requested_chat_cancel(pool, &control.run_instance_id).await? {
         let root_turn_id = sqlx::query_scalar::<_, Option<String>>(
@@ -5383,6 +5426,123 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(control_status, "completed");
+    }
+
+    /// M99 / R2: an internal settlement (incident controller, convergence,
+    /// delivery supervisor) stops a live run through the *internal* signal.
+    /// That must never be recorded as a durable user stop: no
+    /// `chat_session_cancel_intents` row, no `explicit_cancel` provenance, and
+    /// the Objective keeps its system attribution.
+    #[tokio::test]
+    async fn internal_settlement_stop_does_not_become_a_user_cancel() {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sessions VALUES ('session-internal-stop')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-internal-stop".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-internal-stop".into()),
+                root_turn_id: Some("turn-internal-stop".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-internal-stop', 'session-internal-stop', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let control = crate::ChatRunControl::pending();
+        register_chat_run_control(&pool, &control, "session-internal-stop")
+            .await
+            .unwrap();
+        bind_chat_run_root(
+            &pool,
+            &control.run_instance_id,
+            "session-internal-stop",
+            "turn-internal-stop",
+        )
+        .await
+        .unwrap();
+        bind_chat_run_objective(
+            &pool,
+            &control.run_instance_id,
+            "session-internal-stop",
+            "turn-internal-stop",
+            &objective.id,
+            objective.revision,
+        )
+        .await
+        .unwrap();
+
+        // Exactly what a background settlement does: raise the run's stop flag
+        // from an actor that is not the user.
+        assert!(crate::request_chat_run_stop_internal(&control.run_instance_id));
+
+        let _ = converge_aborted_chat_setup(&pool, &control, "session-internal-stop", None)
+            .await
+            .unwrap();
+
+        let intents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_session_cancel_intents WHERE session_id=?",
+        )
+        .bind("session-internal-stop")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            intents, 0,
+            "internal settlement must not persist a user stop intent"
+        );
+        assert!(
+            !store.has_durable_stop_request("session-internal-stop", 0).await,
+            "internal settlement must not be observable as a durable user stop"
+        );
+        let settled = store.get(&objective.id).await.unwrap().unwrap();
+        assert_ne!(
+            settled.status,
+            ObjectiveStatus::Cancelled,
+            "internal settlement must not cancel the Objective under user attribution"
+        );
+        assert_ne!(
+            settled.cancellation_provenance.as_deref(),
+            Some("explicit_cancel")
+        );
     }
 
     #[tokio::test]

@@ -2952,6 +2952,46 @@ fn observe_remote_branch_head(repo: &RepoContext) -> Result<Option<String>, Stri
     observe_remote_ref_head(repo, &repo.branch)
 }
 
+/// M99 / R3: a head this checkout pushed itself is not a foreign move.
+///
+/// A delivery run pushes its own child commit and only later persists the new
+/// head. When reconciliation runs in between, `ls-remote` legitimately shows a
+/// head that is neither the persisted head nor its receipted parent, and the
+/// takeover fence used to call that "unrecognized" — aborting a run on its own
+/// successful push (2026-10-17, session a1ce7c0b).
+///
+/// The proof stays narrow: the observed commit must be the branch's own
+/// remote-tracking head (this clone pushed exactly it), descend from the exact
+/// persisted head, and exist in the local object store. A local commit that was
+/// never pushed, an unknown rewrite, or a foreign head is still refused.
+fn remote_head_is_own_pushed_commit(
+    repo: &RepoContext,
+    persisted_head: &str,
+    observed: &str,
+) -> bool {
+    if observed == persisted_head {
+        return true;
+    }
+    let tracking_ref = format!("refs/remotes/{}/{}", repo.remote, repo.branch);
+    match git(&repo.root, &["rev-parse", "--verify", &tracking_ref]) {
+        Ok(head) if head.trim() == observed => {}
+        _ => return false,
+    }
+    if git(
+        &repo.root,
+        &["cat-file", "-e", &format!("{observed}^{{commit}}")],
+    )
+    .is_err()
+    {
+        return false;
+    }
+    git(
+        &repo.root,
+        &["merge-base", "--is-ancestor", persisted_head, observed],
+    )
+    .is_ok()
+}
+
 fn observe_remote_ref_head(repo: &RepoContext, branch: &str) -> Result<Option<String>, String> {
     let reference = format!("refs/heads/{branch}");
     let observed = git(
@@ -3016,7 +3056,25 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
 ) -> Result<DeliveryTakeoverObservation, String> {
     let (repo, _) = resolve_delivery_repo(cwd, default_branch_hint, Some(expected_branch))?;
     let identity = capture_delivery_identity(&repo)?;
-    if &identity != persisted_identity {
+    // M99 / R3: the run's own child commit may already exist locally (and on the
+    // remote) while the durable identity still names its parent. That is a
+    // receipted-parent-equivalent state, not unreceipted drift.
+    let own_pushed_local_head = identity.head_sha != persisted_identity.head_sha
+        && remote_head_is_own_pushed_commit(
+            &repo,
+            &persisted_identity.head_sha,
+            &identity.head_sha,
+        );
+    // Only the head may differ, and only for a proven own push: the worktree
+    // must be clean, so no unreceipted edit rides along with the new head.
+    let worktree_clean = git(
+        &repo.root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?
+    .is_empty();
+    let own_push_identity_matches = own_pushed_local_head && worktree_clean;
+    let identity_matches = &identity == persisted_identity || own_push_identity_matches;
+    if !identity_matches {
         return Err(
             "observe-only takeover found repo/worktree/head/change-set state that was not durably receipted; mutation remains fenced"
                 .to_string(),
@@ -3025,7 +3083,9 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
 
     let remote_head = observe_remote_branch_head(&repo)?;
     if remote_head.as_deref().is_some_and(|head| {
-        head != persisted_identity.head_sha && Some(head) != receipted_parent_head
+        head != persisted_identity.head_sha
+            && Some(head) != receipted_parent_head
+            && !remote_head_is_own_pushed_commit(&repo, &persisted_identity.head_sha, head)
     }) {
         return Err(format!(
             "remote branch {} moved to an unrecognized head {}; expected persisted {}{}",
@@ -14909,6 +14969,73 @@ Release-Urgency: hold"
         assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
         assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before_head);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// M99 / R3: a delivery run's own successful push must not surface as
+    /// "remote branch moved to an unrecognized head" when reconciliation runs
+    /// before the new head is persisted.
+    #[tokio::test]
+    async fn own_pushed_head_is_not_an_unrecognized_remote_head() {
+        let root = feature_branch_repo("takeover-own-pushed-head");
+        git(&root, &["add", "feature.rs"]).unwrap();
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=CodeFactory",
+                "-c",
+                "user.email=noreply@codefactory.local",
+                "commit",
+                "--no-verify",
+                "-m",
+                "fix: delivery parent",
+            ],
+        )
+        .unwrap();
+        git(&root, &["push", "-q", "-u", "origin", "feat/x"]).unwrap();
+        let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+        let parent = capture_delivery_identity(&repo).unwrap();
+
+        std::fs::write(root.join("followup.rs"), "pub fn followup() {}\n").unwrap();
+        git(&root, &["add", "followup.rs"]).unwrap();
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=CodeFactory",
+                "-c",
+                "user.email=noreply@codefactory.local",
+                "commit",
+                "--no-verify",
+                "-m",
+                "fix: delivery child",
+            ],
+        )
+        .unwrap();
+        git(&root, &["push", "-q", "origin", "feat/x"]).unwrap();
+
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        observe_delivery_takeover_with_receipted_parent(
+            &root,
+            Some("main"),
+            "feat/x",
+            &parent,
+            None,
+            None,
+            None,
+            Some(&remote),
+        )
+        .await
+        .expect("a run's own pushed child must not be refused as a foreign head");
     }
 
     #[tokio::test]
