@@ -538,6 +538,27 @@ impl ProviderRecoveryStore {
         .bind(&permit.owner_kind).bind(&permit.owner_id).bind(permit.owner_epoch)
         .execute(&mut *tx).await?;
 
+        // M98: the provider round before an upgrade restart already committed
+        // its response and persisted the text, but the old owner never settled
+        // it. That is a *completed* step, not a failure: settle it in the same
+        // write transaction under the new owner and let the turn continue.
+        // An unresolved side effect keeps the attempt fenced below.
+        sqlx::query(
+            "UPDATE provider_route_attempts
+             SET status='failed_replayable', failure_class='process_restart',
+                 failure_code='provider_response_checkpoint_reconciled',
+                 observed_at=?, completed_at=?
+             WHERE episode_id=? AND status='response_committed'
+               AND output_started<>0 AND side_effect_started=0
+               AND (owner_kind<>? OR owner_id<>? OR owner_epoch<>?)
+               AND NOT EXISTS (SELECT 1 FROM side_effect_receipts receipt
+                   WHERE receipt.objective_id=provider_route_attempts.objective_id
+                     AND receipt.status IN ('started','unknown'))",
+        )
+        .bind(now).bind(now).bind(&spec.episode_id)
+        .bind(&permit.owner_kind).bind(&permit.owner_id).bind(permit.owner_epoch)
+        .execute(&mut *tx).await?;
+
         if let Some(existing) = load_attempt(&mut tx, &spec.id).await? {
             ensure_existing_attempt_matches(&existing, permit, spec)?;
             if !attempt_owner_is_current(&existing, permit) {
@@ -1381,7 +1402,8 @@ impl ProviderRecoveryStore {
         .await?;
         // Keep the episode live after a committed provider response. The same
         // fenced owner may issue the next model round after tool results; a
-        // restart/takeover sees ResponseCheckpoint and cannot replay it.
+        // restart/takeover settles this completed step (M98) instead of
+        // treating the committed checkpoint as an unrecoverable failure.
         sqlx::query(
             "UPDATE provider_route_episodes SET status=?, output_started=1,
                side_effect_started=?, updated_at=?, completed_at=NULL WHERE id=?",
@@ -1546,9 +1568,12 @@ impl ProviderRecoveryStore {
                 episode_id,
                 attempt_id,
             }),
-            "response_committed" => Ok(ProviderRecoveryDisposition::ResponseCheckpoint {
+            // M98: a committed response with no side effect is already a
+            // completed step. Its text stays durable in the checkpoint; the
+            // turn may continue with the next attempt instead of waiting for a
+            // recovery the old owner can never make.
+            "response_committed" => Ok(ProviderRecoveryDisposition::RetrySafe {
                 episode_id,
-                checkpoint_content: load_checkpoint_content(&self.pool, &attempt_id).await?,
                 attempt_id,
             }),
             "failed_fatal" | "cancelled" => Ok(ProviderRecoveryDisposition::ObserveOnlyUnknown {
@@ -1601,6 +1626,12 @@ impl ProviderRecoveryStore {
                  WHERE c.objective_id=o.id AND c.objective_revision=o.revision
                    AND c.status IN ('active', 'cancel_requested')
                )
+               -- M98: a committed effect-free response is settled by the
+               -- resuming owner (or by the startup reconciliation above).
+               -- Routing it as a technical failure is what burned the
+               -- recovery budget after an upgrade restart.
+               AND NOT (a.status='response_committed' AND a.side_effect_started=0)
+               AND COALESCE(a.failure_code, '') <> 'provider_response_checkpoint_reconciled'
              ORDER BY o.updated_at, o.id",
         )
         .fetch_all(&self.pool)
@@ -1685,6 +1716,8 @@ impl ProviderRecoveryStore {
                  failure_class=CASE WHEN status='unknown'
                      THEN 'provider_transport' ELSE 'process_restart' END,
                  failure_code=CASE
+                     WHEN status='response_committed'
+                         THEN 'provider_response_checkpoint_reconciled'
                      WHEN output_started<>0
                          THEN 'provider_stream_interrupted_no_side_effect'
                      WHEN status='unknown'
@@ -1699,7 +1732,7 @@ impl ProviderRecoveryStore {
                  JOIN objective_bindings binding
                    ON binding.id=attempt.binding_id
                   AND binding.objective_id=attempt.objective_id
-                 WHERE attempt.status IN ('in_flight', 'streaming', 'unknown')
+                 WHERE attempt.status IN ('in_flight', 'streaming', 'unknown', 'response_committed')
                    AND attempt.side_effect_started=0
                    AND attempt.side_effect_receipt_id IS NULL
                    AND objective.status IN ('active', 'waiting_system')
