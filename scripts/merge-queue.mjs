@@ -175,6 +175,9 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
 
     const eligible = [];
     for (const pr of prs) {
+      if (seen.has(pr.number)) continue;
+      try {
+      if (pr.error) throw new Error(pr.error);
       const verdict = evaluateEligibility(pr);
       if (verdict.eligible) {
         eligible.push(pr);
@@ -190,6 +193,10 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
           outcomes.push({ number: pr.number, status: 'not-eligible', reason: verdict.reason });
         }
       }
+      } catch (error) {
+        seen.add(pr.number);
+        outcomes.push({ number: pr.number, status: 'error', reason: String(error.message ?? error) });
+      }
     }
 
     const ordered = orderQueue(eligible);
@@ -197,6 +204,7 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
     const head = ordered[0];
 
     let target = head;
+    try {
     if (head.mergeStateStatus === 'BEHIND') {
       // The catch-up nobody should do by hand: bring the branch onto latest
       // main, then require the checks to go green on the *combined* head.
@@ -223,7 +231,11 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
     }
     // Not merged right now (e.g. checks still running): wait, do not spin.
     outcomes.push({ number: target.number, status: 'waiting', reason: result.reason });
-    break;
+    seen.add(target.number);
+    } catch (error) {
+      seen.add(head.number);
+      outcomes.push({ number: head.number, status: 'error', reason: String(error.message ?? error) });
+    }
   }
   return outcomes;
 }
@@ -277,8 +289,12 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       const list = JSON.parse(raw);
       const out = [];
       for (const pr of list) {
-        const checks = await headChecks(pr.headRefOid);
-        out.push(mapPr(pr, checks));
+        try {
+          const checks = await headChecks(pr.headRefOid);
+          out.push(mapPr(pr, checks));
+        } catch (error) {
+          out.push({ ...mapPr(pr, []), error: String(error.message ?? error) });
+        }
       }
       return out;
     },
@@ -293,9 +309,25 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       ]);
     },
     async merge(number, { expectedHead } = {}) {
+      const commits = JSON.parse(run([
+        'gh', 'api', `repos/${repo}/pulls/${number}/commits`, '--paginate', '--slurp',
+      ])).flat();
+      // Pin metadata to the same head GitHub is asked to merge. Never execute it.
+      const metadata = JSON.parse(run([
+        'gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'title',
+      ]));
+      const messages = commits.map((commit) => commit.commit.message);
+      const trailers = [...new Set(messages.flatMap((message) => message.split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => /^(Release-Urgency|Co-Authored-By):\s*\S/i.test(line))))];
+      const prose = messages.map((message) => message.split(/\r?\n/)
+        .filter((line) => !/^(Release-Urgency|Co-Authored-By):/i.test(line.trim())).join('\n').trim())
+        .filter(Boolean).join('\n\n');
+      const body = [prose, trailers.join('\n')].filter(Boolean).join('\n\n');
       run([
         'gh', 'pr', 'merge', String(number), '--repo', repo, '--squash',
         '--match-head-commit', expectedHead,
+        '--subject', metadata.title ?? 'fix: synthetic change', '--body', body,
       ]);
       const after = JSON.parse(
         run(['gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'state,mergeCommit']),
@@ -306,8 +338,11 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       return { merged: false, reason: `PR #${number} is still ${after.state}` };
     },
     async markBlocked(number, reason) {
+      // --force is idempotent when the fixed label already exists.
+      run(['gh', 'label', 'create', BLOCKED_LABEL_PREFIX, '--repo', repo,
+        '--description', 'Blocked by merge queue; see PR comment for details', '--force']);
       run(['gh', 'pr', 'edit', String(number), '--repo', repo, '--add-label',
-        `${BLOCKED_LABEL_PREFIX}: ${reason}`.slice(0, 50)]);
+        BLOCKED_LABEL_PREFIX]);
       run(['gh', 'pr', 'comment', String(number), '--repo', repo, '--body',
         `Merge queue dropped this PR: ${reason}`]);
     },
