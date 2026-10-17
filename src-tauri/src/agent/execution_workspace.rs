@@ -1270,9 +1270,16 @@ pub(crate) async fn reconcile_parked_delivery_progress(
             let requested: String = sqlx::query_scalar(
                 "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
             ).bind(&reference.run_id).fetch_one(pool).await?;
+            let merged_target: bool = if columns.iter().any(|c| c == "requested_acceptance") {
+                let target: String = sqlx::query_scalar("SELECT requested_acceptance FROM objectives WHERE id=?")
+                    .bind(&candidate.objective_id).fetch_one(pool).await?;
+                target == "merged"
+            } else { false };
             (repair || matches!(kind.as_str(), "delivery" | "local_mutation"))
-                && matches!(requested.as_str(), "pr_only" | "through_ci_green" | "through_merge")
+                && (merged_target || matches!(requested.as_str(), "pr_only" | "through_ci_green" | "through_merge"))
         } else { true };
+        if matches!(objective_status.as_str(), "failed" | "cancelled") && !complete { continue; }
+        let settle_merged = i32::from(complete);
         let run_statement = format!(
             "UPDATE delivery_runs SET reached_ceiling=?{}{} WHERE id=? AND claim_epoch=? AND expected_head_sha=?
                AND canonical_head_sha=? AND canonical_pr_number=?
@@ -1280,7 +1287,7 @@ pub(crate) async fn reconcile_parked_delivery_progress(
                AND NOT (stage=? AND reached_ceiling=? AND status IN ('waiting','completed'))
                AND (reached_ceiling IN ('local','committed','pushed','pr_open')
                     OR (?='merge_queued' AND reached_ceiling='merge_queued')
-                    OR (?='merged' AND reached_ceiling NOT IN ('release_triggered','deployment_succeeded','live_verified')))",
+                    OR (?='merged' AND (reached_ceiling NOT IN ('release_triggered','deployment_succeeded','live_verified') OR {settle_merged})))",
             if has("stage") { ", stage=?" } else { "" },
             if has("status") { format!(", status=?, wait_class=?, next_action=NULL, failure_signature=NULL{}{}{}", if has("failure_code") { ", failure_code=NULL" } else { "" }, if has("failure_class") { ", failure_class=NULL" } else { "" }, if has("next_action_authorized") && merged { ", next_action_authorized=0" } else { "" }) } else { String::new() },
         );
@@ -1318,16 +1325,8 @@ pub(crate) async fn reconcile_parked_delivery_progress(
             .bind(owner).bind(now).execute(&mut *tx).await?;
         // Historical/minimal schemas are supported without inventing columns.
         // Live/release objectives are not completed from merge evidence alone.
-        let complete = merged && if columns.iter().any(|c| c == "kind") {
-            let kind: String = sqlx::query_scalar(
-                "SELECT kind FROM objectives WHERE id=?",
-            ).bind(&candidate.objective_id).fetch_one(&mut *tx).await?;
-            let requested: String = sqlx::query_scalar(
-                "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
-            ).bind(&reference.run_id).fetch_one(&mut *tx).await?;
-            (repair || matches!(kind.as_str(), "delivery" | "local_mutation"))
-                && matches!(requested.as_str(), "pr_only" | "through_ci_green" | "through_merge")
-        } else { true };
+        // Delivery tool ceilings are not objective acceptance requirements.
+        // Reuse the fenced observation's decision rather than classifying twice.
         let mut sets = vec![format!("status='{}'", if complete { "completed" } else { "waiting_system" })];
         if repair {
             sets.push("kind='delivery'".into());
@@ -1355,7 +1354,16 @@ pub(crate) async fn reconcile_parked_delivery_progress(
             sets.push("delivery_run_id=?".into());
             " AND ?=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id AND canonical_pr_number IS NOT NULL AND canonical_pr_url IS NOT NULL AND canonical_head_sha IS NOT NULL ORDER BY updated_at DESC, rowid DESC LIMIT 1) AND (lease_expires_at IS NULL OR lease_expires_at<=?) AND NOT COALESCE((delivery_run_id=? AND status=? AND reached_acceptance=? AND failure_code IS NULL),0)"
         } else { "" };
-        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ('running','waiting_system','cancelled','failed','completed'){pointer}", sets.join(","));
+        if objective_status == "completed" {
+            tx.commit().await?;
+            continue; // Acceptance is immutable; only delivery evidence may advance.
+        }
+        let eligible_statuses = if complete {
+            "'running','active','waiting_system','cancelled','failed'"
+        } else {
+            "'running','active','waiting_system'"
+        };
+        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ({eligible_statuses}){pointer}", sets.join(","));
         let mut query = sqlx::query(&statement);
         if !pointer.is_empty() { query = query.bind(&reference.run_id); }
         query = query.bind(&candidate.objective_id);
@@ -1365,6 +1373,14 @@ pub(crate) async fn reconcile_parked_delivery_progress(
         }
         if query.execute(&mut *tx).await?.rows_affected() != 1 { continue; }
         if complete { mark_objective_terminal_in_tx(&mut tx, &candidate.objective_id, now).await?; }
+        let has_objective_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objective_events'")
+            .fetch_one(&mut *tx).await?;
+        if has_objective_events != 0 {
+            sqlx::query("INSERT INTO objective_events (id,objective_id,revision,event_type,status,decision_type,domain,failure_code,detail_json,created_at)
+                SELECT ?,id,revision,'canonical_pr_progress',status,decision_type,domain,failure_code,?,? FROM objectives WHERE id=?")
+                .bind(uuid::Uuid::new_v4().to_string()).bind(&evidence).bind(now)
+                .bind(&candidate.objective_id).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         if let Ok(CanonicalPrState::Merged { merge_sha }) = &state {
             record_reconciled_merge_receipt(pool, &reference, merge_sha, owner).await?;
@@ -4533,6 +4549,43 @@ mod tests {
         .unwrap();
         assert_eq!(ceiling, "merged");
         assert!(evidence.contains("externally-merged-sha"), "{evidence}");
+    }
+
+    #[tokio::test]
+    async fn m102_reconcile_never_reopens_terminal() {
+        for initial in ["completed", "failed", "cancelled", "waiting_system"] {
+            for merged in [false, true] {
+                for reached in ["pr_open", "release_triggered"] {
+                    let (_temp, root, _remote, container) = init_repo();
+                    let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+                    crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
+                        crate::agent::objective::CreateObjective {
+                            id: "synthetic-m102".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
+                            session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
+                            requested_acceptance: "merged".into(), created_surface: "synthetic-test".into(),
+                        },
+                    ).await.unwrap();
+                    let workspace = allocate_or_attach(&pool, request_for(&root, &container, "synthetic-m102", "process-a")).await.unwrap();
+                    record_open_canonical_pr(&pool, &workspace, 102, "through_release").await;
+                    sqlx::query("UPDATE objectives SET recovery_owner=NULL, remediation_id=NULL, lease_owner=NULL, lease_expires_at=NULL, status=?, decision_type=?, completed_at=1, evidence_ref='synthetic-acceptance', reached_acceptance='merged', cancellation_provenance=?, delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
+                        .bind(initial).bind(match initial { "completed" => "complete", "cancelled" => "cancelled", "failed" => "failed_internal", _ => "waiting" })
+                        .bind(if initial == "cancelled" { Some("explicit_cancel") } else { None }).execute(&pool).await.unwrap();
+                    sqlx::query("UPDATE delivery_runs SET reached_ceiling=?, stage='live', status='failed', lease_owner=NULL, lease_expires_at=NULL").bind(reached).execute(&pool).await.unwrap();
+                    let before: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
+                    for _ in 0..2 {
+                        let state = if merged { super::CanonicalPrState::Merged { merge_sha: "synthetic-m102-merge".into() } } else { super::CanonicalPrState::Open };
+                        super::reconcile_parked_delivery_progress(&pool, &ScriptedPrObserver::new(vec![Ok(state)]), "m102").await.unwrap();
+                        let (status, revision): (String, i64) = sqlx::query_as("SELECT status,revision FROM objectives").fetch_one(&pool).await.unwrap();
+                        let advances = (merged && initial != "completed")
+                            || (!merged && initial == "waiting_system" && reached == "pr_open");
+                        assert_eq!(status, if merged { "completed" } else { initial }, "initial={initial} merged={merged} reached={reached}");
+                        assert_eq!(revision, before + i64::from(advances));
+                        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objective_events WHERE event_type='canonical_pr_progress'").fetch_one(&pool).await.unwrap();
+                        assert_eq!(events, i64::from(advances), "every state transition needs exactly one event");
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
