@@ -989,11 +989,24 @@ impl DecisionEnvelope {
     /// This one only licenses "no retry, no owner, no user question" as a valid
     /// system wait, because the outstanding thing is a result nobody can hurry.
     fn is_parked_delivery_wait(&self) -> bool {
+        // M104: a delivered wait is never a technical recovery attempt, so it
+        // queues no remediation and asks the user for nothing. It may — and now
+        // must — carry a bounded `next_observation_at`, because that scheduled
+        // re-read is what turns a finished CI run into a wake.
         self.status == ObjectiveStatus::WaitingSystem
             && self.decision_type == DecisionType::Waiting
-            && self.failure_code.as_deref() == Some(DELIVERED_AWAITING_CI)
+            && matches!(
+                self.failure_code.as_deref(),
+                Some(
+                    DELIVERED_AWAITING_CI
+                        | DELIVERED_CI_STILL_RUNNING
+                        | DELIVERED_CI_STALLED
+                        | DELIVERED_CI_GREEN
+                        | DELIVERED_CI_TRUST_ROOT_ONLY
+                        | DELIVERED_CI_FAILED
+                )
+            )
             && self.remediation_id.is_none()
-            && self.next_observation_at.is_none()
             && !self.requires_user_action
     }
 
@@ -5104,27 +5117,15 @@ impl ObjectiveStore {
             } else {
                 delivered_awaiting_ci_message(&reference)
             };
-            decision.decision_type = DecisionType::Waiting;
-            decision.status = ObjectiveStatus::WaitingSystem;
-            decision.failure_code = Some(DELIVERED_AWAITING_CI.into());
-            decision.request_key = None;
-            decision.recovery_owner = None;
-            decision.remediation_id = None;
-            decision.next_observation_at = None;
-            decision.next_action_authorized = false;
-            decision.requires_user_action = false;
-            decision.attention_request = Some(UserAttentionRequest {
-                kind: DELIVERED_AWAITING_CI.into(),
+            // M104: this wait must schedule its own re-observation. Parking it
+            // with `next_observation_at = None` is what let a finished CI run
+            // (including a red one) never wake the session.
+            return Ok(park_delivered_ci_wait(
+                decision,
                 prompt,
-                missing_inputs: Vec::new(),
-                attempted_routes: Vec::new(),
-                decision_options: Vec::new(),
-                recommended_option: None,
-                irreversible: false,
-                no_safe_default_reason: None,
-                resume_cursor: decision.resume_cursor.clone(),
-            });
-            return Ok(decision);
+                DELIVERED_AWAITING_CI,
+                Utc::now().timestamp_millis(),
+            ));
         }
         let signature = decision.failure_signature.clone().unwrap_or_default();
         let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
@@ -5200,29 +5201,16 @@ impl ObjectiveStore {
                     reference = %reference,
                     "completion gate exhausted after delivery; parking a delivered wait, not a failure"
                 );
-                decision.decision_type = DecisionType::Waiting;
-                decision.status = ObjectiveStatus::WaitingSystem;
                 // The typed reason doubles as the record of *why* nothing is
-                // retried: the only outstanding item is a CI result.
-                decision.failure_code = Some(DELIVERED_AWAITING_CI.into());
-                decision.request_key = None;
-                decision.recovery_owner = None;
-                decision.remediation_id = None;
-                decision.next_observation_at = None;
-                decision.next_action_authorized = false;
-                decision.requires_user_action = false;
-                decision.attention_request = Some(UserAttentionRequest {
-                    kind: DELIVERED_AWAITING_CI.into(),
+                // retried: the only outstanding item is a CI result. M104: the
+                // park keeps a scheduled re-observation so that result wakes
+                // this session instead of waiting for a human to relay it.
+                return Ok(park_delivered_ci_wait(
+                    decision,
                     prompt,
-                    missing_inputs: Vec::new(),
-                    attempted_routes: Vec::new(),
-                    decision_options: Vec::new(),
-                    recommended_option: None,
-                    irreversible: false,
-                    no_safe_default_reason: None,
-                    resume_cursor: decision.resume_cursor.clone(),
-                });
-                return Ok(decision);
+                    DELIVERED_AWAITING_CI,
+                    Utc::now().timestamp_millis(),
+                ));
             }
         }
 
@@ -7440,6 +7428,237 @@ pub fn delivered_awaiting_ci_message(reference: &str) -> String {
         "改动已交付到{reference}（PR 已开出），正在等这条 PR 的检查结果；\
 交付记录会在检查结束后更新结论，不需要再重跑一次一样的实现。"
     )
+}
+
+// ── M104: a CI result must wake the session that is waiting for it ────────────
+//
+// Field session 59147b73 parked in `waiting_system / delivered_awaiting_ci`
+// with `next_observation_at = None`. Its PR head had already finished CI (one
+// red job plus the expected trust-root refusal) and nothing was scheduled to
+// read that result back, so the session sat still until a human transcribed the
+// failure by hand. The park is therefore only correct while a re-observation is
+// scheduled, and the re-observation has to end in one of the outcomes below.
+
+/// M104: how often a delivered-but-unconfirmed session re-reads the checks.
+/// Bounded by [`MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS`], so a wait never silently
+/// walks away from the user.
+pub const DELIVERED_CI_REOBSERVE_MS: i64 = 60_000;
+
+/// M104/R4: after this long with checks still unconcluded, the wait is reported
+/// as stalled with a stated status instead of a silent "still running".
+pub const DELIVERED_CI_STALLED_AFTER_MS: i64 = 60 * 60 * 1_000;
+
+/// M104/R3: the typed outcome of one CI observation on a delivered PR.
+pub const DELIVERED_CI_STILL_RUNNING: &str = "delivered_ci_still_running";
+pub const DELIVERED_CI_STALLED: &str = "delivered_ci_stalled";
+pub const DELIVERED_CI_GREEN: &str = "delivered_ci_green";
+pub const DELIVERED_CI_TRUST_ROOT_ONLY: &str = "delivered_ci_trust_root_only";
+pub const DELIVERED_CI_FAILED: &str = "delivered_ci_failed";
+
+/// The marker the trust-root validator prints when a PR modifies the validator,
+/// the registry or the workflows it is checked against. Only the orchestrator
+/// can release that PR, so this failure is not the session's to repair.
+pub const TRUST_ROOT_SELF_MODIFY_MARKER: &str = "cannot self-modify";
+
+/// M104: one check run observed on a PR head. `detail` carries the first error
+/// excerpt (or the failing test line) when the forge exposes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiCheckState {
+    pub job: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl CiCheckState {
+    fn concluded(&self) -> bool {
+        self.conclusion.is_some() || self.status.eq_ignore_ascii_case("completed")
+    }
+
+    fn passed(&self) -> bool {
+        matches!(
+            self.conclusion.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("success" | "neutral" | "skipped")
+        )
+    }
+
+    fn is_trust_root_refusal(&self) -> bool {
+        self.detail
+            .as_deref()
+            .map(|detail| detail.contains(TRUST_ROOT_SELF_MODIFY_MARKER))
+            .unwrap_or(false)
+    }
+}
+
+/// M104/R3: what the session waiting on a delivered PR should be told. These
+/// are the three outcomes R2 requires plus the two "nothing has concluded yet"
+/// states, so a caller can never describe an unfinished run as a verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiOutcome {
+    StillRunning,
+    /// R4: still unconcluded past the stall bound — say so explicitly.
+    Stalled { minutes: i64 },
+    AllGreen,
+    /// R2: every failure is the trust-root refusal; wait for the orchestrator,
+    /// do not treat it as a task failure and do not spend recovery budget.
+    TrustRootOnly(Vec<CiCheckState>),
+    Failed(Vec<CiCheckState>),
+}
+
+impl CiOutcome {
+    pub fn failure_code(&self) -> &'static str {
+        match self {
+            CiOutcome::StillRunning => DELIVERED_CI_STILL_RUNNING,
+            CiOutcome::Stalled { .. } => DELIVERED_CI_STALLED,
+            CiOutcome::AllGreen => DELIVERED_CI_GREEN,
+            CiOutcome::TrustRootOnly(_) => DELIVERED_CI_TRUST_ROOT_ONLY,
+            CiOutcome::Failed(_) => DELIVERED_CI_FAILED,
+        }
+    }
+
+    /// R2: only a real failure is the session's to repair, so only a real
+    /// failure may consume the repairable path.
+    pub fn is_session_repairable(&self) -> bool {
+        matches!(self, CiOutcome::Failed(_))
+    }
+}
+
+/// M104/R3: classify one observation of a PR head's checks.
+pub fn classify_ci_checks(checks: &[CiCheckState], elapsed_ms: i64) -> CiOutcome {
+    let mut failures = Vec::new();
+    let mut pending = false;
+    for check in checks {
+        if !check.concluded() {
+            pending = true;
+            continue;
+        }
+        if check.passed() {
+            continue;
+        }
+        failures.push(check.clone());
+    }
+    if pending {
+        return if elapsed_ms >= DELIVERED_CI_STALLED_AFTER_MS {
+            CiOutcome::Stalled {
+                minutes: elapsed_ms / 60_000,
+            }
+        } else {
+            CiOutcome::StillRunning
+        };
+    }
+    if failures.is_empty() {
+        return CiOutcome::AllGreen;
+    }
+    if failures.iter().all(CiCheckState::is_trust_root_refusal) {
+        return CiOutcome::TrustRootOnly(failures);
+    }
+    CiOutcome::Failed(failures)
+}
+
+/// M104/R2: the failing test name from a check's error excerpt, when the
+/// excerpt names one. Rust's harness prints `test <name> ... FAILED`.
+pub fn failing_test_name(detail: &str) -> Option<String> {
+    for line in detail.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("test ") {
+            if let Some(name) = rest.strip_suffix(" ... FAILED") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn ci_failure_line(check: &CiCheckState) -> String {
+    let test = check.detail.as_deref().and_then(failing_test_name);
+    let detail = check
+        .detail
+        .as_deref()
+        .map(|detail| detail.lines().map(str::trim).find(|line| !line.is_empty()))
+        .flatten()
+        .unwrap_or("");
+    match (test, detail.is_empty()) {
+        (Some(test), false) => format!("{}：测试 {test} 失败（{detail}）", check.job),
+        (Some(test), true) => format!("{}：测试 {test} 失败", check.job),
+        (None, false) => format!("{}：{detail}", check.job),
+        (None, true) => format!("{}：检查失败", check.job),
+    }
+}
+
+/// M104/R2+R3: the wake input for one CI outcome. Every arm is a decision the
+/// session can act on; none of them is "assume it is still running".
+pub fn ci_outcome_wake_prompt(reference: &str, outcome: &CiOutcome) -> String {
+    match outcome {
+        CiOutcome::StillRunning => format!(
+            "{reference} 的检查还没全部结束。不要现在把阻断归因定论，也别重跑一遍实现；\
+等结果出来再按结论处理。"
+        ),
+        CiOutcome::Stalled { minutes } => format!(
+            "{reference} 的检查已经 {minutes} 分钟没有任何结论。重新观察一次这条 PR 的实际状态，\
+并向用户明确说明它仍然没有结果；不要把它说成失败，也不要重跑一遍实现。"
+        ),
+        CiOutcome::AllGreen => format!(
+            "{reference} 的检查全部通过。按当前 ceiling 收尾：需要打 `merge-queue: armed` 就打，\
+然后交给合并队列。"
+        ),
+        CiOutcome::TrustRootOnly(failures) => format!(
+            "{reference} 只有信任根自修改检查没有通过（{}）。这是预期结果，不是任务失败：\
+不要重试实现，也不要消耗恢复预算，明确告诉用户「等编排方放行」。",
+            failures
+                .iter()
+                .map(|check| check.job.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        ),
+        CiOutcome::Failed(failures) => format!(
+            "{reference} 的检查失败：{}。按这些失败修复后重新推送同一条分支，不要重新实现一遍。",
+            failures
+                .iter()
+                .map(ci_failure_line)
+                .collect::<Vec<_>>()
+                .join("；")
+        ),
+    }
+}
+
+/// M104/R2+R4: park a delivered change in the non-failed "awaiting CI" wait
+/// **with a scheduled re-observation**. The previous park cleared
+/// `next_observation_at`, which is exactly why a finished CI run could never
+/// wake the session.
+pub(crate) fn park_delivered_ci_wait(
+    mut decision: DecisionEnvelope,
+    prompt: String,
+    failure_code: &str,
+    now: i64,
+) -> DecisionEnvelope {
+    let resume_cursor = decision.resume_cursor.clone();
+    decision.decision_type = DecisionType::Waiting;
+    decision.status = ObjectiveStatus::WaitingSystem;
+    decision.failure_code = Some(failure_code.to_string());
+    decision.request_key = None;
+    decision.recovery_owner = None;
+    decision.remediation_id = None;
+    decision.next_observation_at = Some(bounded_next_observation_at(
+        now,
+        now.saturating_add(DELIVERED_CI_REOBSERVE_MS),
+    ));
+    decision.next_action_authorized = false;
+    decision.requires_user_action = false;
+    decision.attention_request = Some(UserAttentionRequest {
+        kind: failure_code.to_string(),
+        prompt,
+        missing_inputs: Vec::new(),
+        attempted_routes: Vec::new(),
+        decision_options: Vec::new(),
+        recommended_option: None,
+        irreversible: false,
+        no_safe_default_reason: None,
+        resume_cursor,
+    });
+    decision
 }
 
 /// `PR #572` for a GitHub pull-request URL, matching the wording the run's own
@@ -15632,7 +15851,19 @@ CREATE TABLE objectives (
         assert_eq!(parked.failure_code.as_deref(), Some(DELIVERED_AWAITING_CI));
         assert_eq!(parked.decision_type.as_str(), "waiting");
         assert!(parked.remediation_id.is_none());
-        assert!(parked.next_observation_at.is_none());
+        // M104 (supersedes the M57 "no retry at all" reading of this wait): a
+        // delivered wait still queues no remediation and asks the user for
+        // nothing, but it MUST carry a bounded re-observation. Clearing
+        // `next_observation_at` here is exactly why a finished CI run — failure
+        // included — never woke session 59147b73.
+        let next = parked
+            .next_observation_at
+            .expect("the delivered wait must schedule its own CI re-observation");
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            next > now && next <= now + super::MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS,
+            "the re-observation must stay inside the bounded wait: {next} vs {now}"
+        );
         assert!(parked.recovery_owner.is_none());
         assert!(!parked.requires_user_action);
         let prompt = parked
@@ -16106,5 +16337,165 @@ mod msp_continuation_prompt_tests {
                 "the injected prompt must stay plain instruction, found {jargon}"
             );
         }
+    }
+}
+
+/// M104/R5: synthetic forge state for the three CI outcomes a delivered PR can
+/// produce. Every case asserts the decision the waiting session is handed, and
+/// the ordinary failure also asserts the wake itself is scheduled and carries
+/// the failing test name into the next turn's input.
+#[cfg(test)]
+mod m104_ci_wake_tests {
+    use super::*;
+
+    fn check(
+        job: &str,
+        status: &str,
+        conclusion: Option<&str>,
+        detail: Option<&str>,
+    ) -> CiCheckState {
+        CiCheckState {
+            job: job.to_string(),
+            status: status.to_string(),
+            conclusion: conclusion.map(str::to_string),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    fn sample_decision() -> DecisionEnvelope {
+        DecisionEnvelope {
+            objective_id: "objective-m104".into(),
+            revision: 2,
+            domain: RecoveryDomain::Delivery,
+            decision_type: DecisionType::Waiting,
+            status: ObjectiveStatus::WaitingSystem,
+            failure_code: Some(DELIVERED_AWAITING_CI.into()),
+            failure_signature: None,
+            recovery_owner: None,
+            remediation_id: None,
+            next_observation_at: None,
+            next_action_authorized: false,
+            requires_user_action: false,
+            request_key: None,
+            decision_key: None,
+            action_signature: None,
+            output_started: false,
+            side_effect_started: false,
+            resume_cursor: Some("cursor".into()),
+            reached_acceptance: Some("pr_open".into()),
+            evidence: None,
+            visible_final_message_id: None,
+            cancellation_provenance: None,
+            attention_request: None,
+            settlement_origin: SettlementOrigin::Live,
+            transport_probe_wait: false,
+        }
+    }
+
+    #[test]
+    fn all_green_checks_wake_the_session_to_the_merge_path() {
+        let checks = vec![
+            check("check-rust", "completed", Some("success"), None),
+            check("scenario-gate-pr", "completed", Some("success"), None),
+        ];
+        let outcome = classify_ci_checks(&checks, 0);
+        assert_eq!(outcome, CiOutcome::AllGreen);
+        assert_eq!(outcome.failure_code(), DELIVERED_CI_GREEN);
+        let prompt = ci_outcome_wake_prompt("PR #704", &outcome);
+        assert!(prompt.contains("全部通过"), "{prompt}");
+        assert!(prompt.contains("merge-queue: armed"), "{prompt}");
+        assert!(!outcome.is_session_repairable());
+    }
+
+    #[test]
+    fn trust_root_only_failure_waits_for_the_orchestrator_without_failing_the_task() {
+        let checks = vec![
+            check("check-rust", "completed", Some("success"), None),
+            check(
+                "scenario-gate-pr",
+                "completed",
+                Some("failure"),
+                Some("scenario-gate-pr: trust roots cannot self-modify"),
+            ),
+        ];
+        let outcome = classify_ci_checks(&checks, 0);
+        assert!(matches!(outcome, CiOutcome::TrustRootOnly(_)));
+        assert!(!outcome.is_session_repairable());
+        let prompt = ci_outcome_wake_prompt("PR #704", &outcome);
+        assert!(prompt.contains("等编排方放行"), "{prompt}");
+        assert!(prompt.contains("不是任务失败"), "{prompt}");
+
+        let parked = park_delivered_ci_wait(
+            sample_decision(),
+            prompt,
+            outcome.failure_code(),
+            1_000_000,
+        );
+        assert!(!parked.requires_user_action);
+        assert!(parked.remediation_id.is_none());
+        assert!(
+            parked.is_parked_delivery_wait(),
+            "a trust-root refusal must not spend the technical recovery budget"
+        );
+    }
+
+    #[test]
+    fn ordinary_failure_wakes_the_session_with_the_failing_job_and_test_name() {
+        let detail = "test windows_target_falls_back_to_shared_cache ... FAILED\n\
+---- windows_target_falls_back_to_shared_cache stdout ----";
+        let checks = vec![
+            check("check-rust", "completed", Some("failure"), Some(detail)),
+            check("scenario-gate-pr", "completed", Some("success"), None),
+        ];
+        let outcome = classify_ci_checks(&checks, 5 * 60_000);
+        assert!(outcome.is_session_repairable());
+        assert_eq!(outcome.failure_code(), DELIVERED_CI_FAILED);
+        let prompt = ci_outcome_wake_prompt("PR #704", &outcome);
+        assert!(prompt.contains("check-rust"), "{prompt}");
+        assert!(
+            prompt.contains("windows_target_falls_back_to_shared_cache"),
+            "the failing test name must reach the next turn: {prompt}"
+        );
+
+        let parked = park_delivered_ci_wait(
+            sample_decision(),
+            prompt.clone(),
+            outcome.failure_code(),
+            1_000_000,
+        );
+        assert_eq!(parked.status, ObjectiveStatus::WaitingSystem);
+        assert_eq!(parked.failure_code.as_deref(), Some(DELIVERED_CI_FAILED));
+        assert_eq!(
+            parked.next_observation_at,
+            Some(1_000_000 + DELIVERED_CI_REOBSERVE_MS),
+            "the CI result must wake the session instead of parking it forever"
+        );
+        assert!(!parked.next_action_authorized);
+        assert_eq!(
+            parked.attention_request.as_ref().map(|a| a.prompt.as_str()),
+            Some(prompt.as_str())
+        );
+        assert!(
+            parked.is_parked_delivery_wait(),
+            "a delivered CI wait queues no second remediation"
+        );
+    }
+
+    #[test]
+    fn a_pending_check_past_the_bound_is_reported_as_stalled_not_as_a_verdict() {
+        let checks = vec![check("check-rust", "in_progress", None, None)];
+        assert_eq!(
+            classify_ci_checks(&checks, 60_000),
+            CiOutcome::StillRunning
+        );
+        assert_eq!(
+            classify_ci_checks(&checks, DELIVERED_CI_STALLED_AFTER_MS),
+            CiOutcome::Stalled { minutes: 60 }
+        );
+        let stalled = classify_ci_checks(&checks, DELIVERED_CI_STALLED_AFTER_MS + 60_000);
+        assert_eq!(stalled, CiOutcome::Stalled { minutes: 61 });
+        let prompt = ci_outcome_wake_prompt("PR #704", &stalled);
+        assert!(prompt.contains("61 分钟"), "{prompt}");
+        assert!(!stalled.is_session_repairable());
     }
 }

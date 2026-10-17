@@ -5957,6 +5957,21 @@ pub async fn deliver<R: DeliveryRemote>(
             CiStatus::Success | CiStatus::None => {
                 outcome.steps.push(StepResult::ok("ci", "CI 通过"))
             }
+            CiStatus::Failure(d)
+                if d.contains(crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER) =>
+            {
+                // M104/R2: the scenario gate refused a trust-root
+                // self-modification. Only the orchestrator can release that PR,
+                // so this is a stated wait — not a red test and not work the
+                // session may repeat.
+                return outcome.blocked_at(StepResult::blocked(
+                    "trust_root_gate",
+                    format!(
+                        "CI 里只有信任根自修改检查未通过（{d}）。这是预期结果，不是任务失败：\
+不要重试实现，也不要改动门禁；向用户明确说明「等编排方放行」，然后结束这一轮。"
+                    ),
+                ));
+            }
             CiStatus::Failure(d) => {
                 return outcome.blocked_at(StepResult::blocked(
                     "ci",
