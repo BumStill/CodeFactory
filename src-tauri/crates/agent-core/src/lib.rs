@@ -676,6 +676,66 @@ pub fn effective_command_timeout_sec(command: &str, requested: u64, maximum: u64
     }
 }
 
+/// Verbs whose exit status answers "what is in the workspace" rather than
+/// "did the work pass". `diff`/`cmp`/`test`/`[` are deliberately absent: their
+/// exit status IS a verdict, so a command using them is not a pure probe.
+const READ_ONLY_PROBE_VERBS: &[&str] = &[
+    "awk", "basename", "cat", "cd", "cut", "df", "dirname", "du", "echo", "file", "find",
+    "grep", "head", "jq", "ls", "printf", "pwd", "readlink", "realpath", "rg", "sed", "sort",
+    "stat", "tail", "tr", "tree", "type", "uniq", "wc", "which",
+];
+
+/// M52-R1/R2: is this command a pure read-only probe?
+///
+/// The rule is structural, not a keyword scan of the raw string: split the
+/// command into statements and pipeline segments, take what each segment
+/// actually executes, and require EVERY segment to be a query verb without an
+/// exit-status assertion flag. That is why a probe whose *arguments* merely
+/// name a runner (`ls vitest.config*`) stays a probe, while
+/// `ls x && pnpm test` is not one — one acceptance segment is enough to make
+/// the whole command's exit status a verdict.
+pub fn command_is_read_only_probe(command: &str) -> bool {
+    let control = shell_control_text(command);
+    let segments = shell_verification_segments(&control)
+        .iter()
+        .flat_map(|statement| shell_pipeline_segments(statement))
+        .map(|segment| execution_payload(segment.as_str()).to_ascii_lowercase())
+        .filter(|segment| !segment.trim().is_empty())
+        .collect::<Vec<_>>();
+    !segments.is_empty() && segments.iter().all(|segment| probe_segment(segment))
+}
+
+fn probe_segment(segment: &str) -> bool {
+    let words = segment.split_whitespace().collect::<Vec<_>>();
+    let Some(verb) = words.first().copied() else {
+        return false;
+    };
+    if !READ_ONLY_PROBE_VERBS.contains(&verb) {
+        return false;
+    }
+    let short_flag_contains = |flag: char| {
+        words
+            .iter()
+            .skip(1)
+            .any(|word| word.starts_with('-') && !word.starts_with("--") && word.contains(flag))
+    };
+    // `grep -q` / `jq -e` ask a yes/no question with the exit status: that is
+    // an assertion, so it must keep blocking when it fails.
+    match verb {
+        "grep" | "rg" => {
+            !(short_flag_contains('q')
+                || words
+                    .iter()
+                    .any(|word| matches!(*word, "--quiet" | "--silent")))
+        }
+        "jq" => {
+            !(short_flag_contains('e')
+                || words.iter().any(|word| *word == "--exit-status"))
+        }
+        _ => true,
+    }
+}
+
 pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     let shell_command = shell_control_text(command);
     let lower = shell_command.to_ascii_lowercase();
@@ -702,6 +762,13 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
         || has_inline_interpreter_workspace_mutation(&lower)
     {
         return ToolKind::Mutation;
+    }
+    // M52-R1: a command made only of workspace queries is a probe. Its exit
+    // status answers "what is there", so it must be settled before any
+    // runner-shaped word in an argument can promote it to a check. A mixed
+    // command (`ls x && pnpm test`) is not a probe and keeps its verdict.
+    if command_is_read_only_probe(command) {
+        return ToolKind::ReadOnly;
     }
     if is_delivery_verification(&lower) {
         return ToolKind::Verification;
@@ -3431,6 +3498,9 @@ impl CompletionGate {
             }
         } else if verification_like
             && !outcome.succeeded()
+            // M52-R1: even when a caller labelled this verification, a command
+            // that only queries the workspace never opens a must-pass check.
+            && !command_is_read_only_probe(&outcome.command)
             && verification_reached_test_scope(outcome)
             && !is_inconclusive_remote_observation(outcome)
         {
@@ -5652,6 +5722,97 @@ mod tests {
         let version_kind = classify_command("python3 --version", 30_000);
         assert_eq!(version_kind, ToolKind::ReadOnly);
         gate.record(&outcome(3, version_kind, 0));
+        assert!(!gate.evidence().completed);
+    }
+
+    fn command_outcome(
+        sequence: u64,
+        kind: ToolKind,
+        return_code: i32,
+        command: &str,
+    ) -> ToolOutcome {
+        let mut outcome = outcome(sequence, kind, return_code);
+        outcome.command = command.to_owned();
+        outcome
+    }
+
+    /// M52-R1 / M52-R3: the live symptom was a probe command — `cat` plus `ls`
+    /// of config globs that do not exist plus a `grep` — being turned into a
+    /// check that had to be rerun and pass. Its exit status answers "what is in
+    /// the workspace", not "did the work pass".
+    #[test]
+    fn a_read_only_probe_that_mentions_a_runner_stays_a_probe() {
+        let probe =
+            "cat package.json && ls vitest.config* vite.config* && grep -rn lightModeAudit src";
+        assert_eq!(
+            classify_command(probe, 300_000),
+            ToolKind::ReadOnly,
+            "naming vitest.config in an argument must not turn a probe into a test run"
+        );
+        assert!(command_is_read_only_probe(probe));
+    }
+
+    #[test]
+    fn a_failed_read_only_probe_never_opens_a_must_pass_check() {
+        let probe =
+            "cat package.json && ls vitest.config* vite.config* && grep -rn lightModeAudit src";
+        let mut gate = CompletionGate::new(true);
+        gate.record(&command_outcome(1, ToolKind::Mutation, 0, "edit_file"));
+        gate.record(&command_outcome(
+            2,
+            classify_command(probe, 300_000),
+            2,
+            probe,
+        ));
+
+        let blocked = gate.evidence();
+        assert!(
+            !blocked
+                .blockers_structured
+                .iter()
+                .any(|blocker| blocker.kind == "failed_verification"),
+            "a probe failure must not open a check ticket: {:?}",
+            blocked.blockers
+        );
+
+        gate.record(&command_outcome(3, ToolKind::Verification, 0, "pnpm test"));
+        let evidence = gate.evidence();
+        assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
+    #[test]
+    fn a_failed_acceptance_check_still_blocks_until_it_passes() {
+        let mut gate = CompletionGate::new(true);
+        gate.record(&command_outcome(1, ToolKind::Mutation, 0, "edit_file"));
+        gate.record(&command_outcome(2, ToolKind::Verification, 1, "pnpm test"));
+
+        let blocked = gate.evidence();
+        assert!(!blocked.completed);
+        assert!(
+            blocked
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("没有通过")),
+            "a real failing check must still ask for a rerun: {:?}",
+            blocked.blockers
+        );
+
+        gate.record(&command_outcome(3, ToolKind::Verification, 0, "pnpm test"));
+        assert!(gate.evidence().completed);
+    }
+
+    /// M52-R2 / M52-R3: one acceptance segment makes the whole command an
+    /// acceptance check, so a missing listing inside it does not get to excuse
+    /// the failure.
+    #[test]
+    fn a_mixed_probe_and_check_command_is_an_acceptance_check() {
+        let mixed = "ls vitest.config* && pnpm test";
+        assert_eq!(classify_command(mixed, 300_000), ToolKind::Verification);
+        assert!(!command_is_read_only_probe(mixed));
+
+        let mut gate = CompletionGate::new(true);
+        gate.record(&command_outcome(1, ToolKind::Mutation, 0, "edit_file"));
+        gate.record(&command_outcome(2, ToolKind::Verification, 2, mixed));
         assert!(!gate.evidence().completed);
     }
 
