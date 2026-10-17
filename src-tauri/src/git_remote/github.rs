@@ -474,11 +474,32 @@ pub(crate) fn classify_ci_observation(
             other => {
                 let name = str_val(run, "name");
                 let url = str_val(run, "details_url");
-                let detail = if url.is_empty() {
+                let mut detail = if url.is_empty() {
                     format!("failure:{name}:{other}")
                 } else {
                     format!("failure:{name}:{other} [{url}]")
                 };
+                // M104/R2: carry the trust-root refusal verbatim, so every reader
+                // of this observation (the delivery outcome, the parked
+                // Objective, the session's wake prompt) can tell "only the
+                // scenario gate refused a self-modification" apart from a red
+                // test. Without this marker the failure is indistinguishable and
+                // the session is told to repair code it must not touch.
+                let output = run.get("output");
+                let refused_trust_root = ["title", "summary", "text"].iter().any(|key| {
+                    output
+                        .and_then(|output| output.get(*key))
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| {
+                            text.contains(crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER)
+                        })
+                });
+                if refused_trust_root {
+                    detail.push_str(&format!(
+                        " ({})",
+                        crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER
+                    ));
+                }
                 return CiObservation {
                     status: detail,
                     fingerprint,
