@@ -37,6 +37,41 @@ export const ARM_LABEL = 'merge-queue: armed';
 export const HOLD_LABEL = 'merge-queue: hold';
 export const BLOCKED_LABEL_PREFIX = 'merge-queue: blocked';
 
+// M101 — which head the queue blocked, so a later push is re-evaluated instead
+// of being refused forever (2026-10-17: #693 stayed blocked after a green fix).
+// The record lives in a hidden marker inside the blocking PR comment: a label
+// description is repository-global and cannot hold a per-PR SHA, and the queue
+// is stateless between runs, so a local state file would not survive.
+const BLOCKED_MARKER_RE =
+  /<!--\s*merge-queue:blocked\s+head=([0-9a-f]{7,40})\s+at=([^\s]+)\s*-->/i;
+
+/** Render the machine-readable marker written at the top of a blocking comment. */
+export function blockedMarker(headSha, date = new Date()) {
+  return `<!-- merge-queue:blocked head=${headSha} at=${date.toISOString()} -->`;
+}
+
+/** Parse the marker back out of a PR comment body; null when absent. */
+export function parseBlockedMarker(body) {
+  if (typeof body !== 'string') return null;
+  const match = BLOCKED_MARKER_RE.exec(body);
+  if (!match) return null;
+  const at = Date.parse(match[2]);
+  return { headSha: match[1].toLowerCase(), at: Number.isNaN(at) ? null : at };
+}
+
+function shortSha(sha) {
+  return typeof sha === 'string' && sha.length > 8 ? sha.slice(0, 8) : String(sha ?? '');
+}
+
+function toMillis(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
 /** Highest-order readiness key: when the PR became green+armed. */
 function readyAtOf(pr) {
   const value = pr.readyAt;
@@ -72,8 +107,47 @@ export function evaluateEligibility(pr, { requiredChecks = REQUIRED_CHECKS } = {
   if (labels.includes(HOLD_LABEL)) {
     return { eligible: false, reason: 'on hold (`merge-queue: hold`)', terminal: false };
   }
-  if (labels.some((label) => label.startsWith(BLOCKED_LABEL_PREFIX))) {
-    return { eligible: false, reason: 'already blocked by the queue', terminal: false };
+  const blockedLabel = labels.find((label) => label.startsWith(BLOCKED_LABEL_PREFIX));
+  if (blockedLabel) {
+    // M101-R1/R2: the queue records the head it blocked. A different head is a
+    // different subject — clear the block and evaluate normally. The same head
+    // stays blocked, so a failed head is never retried in a loop.
+    const record = pr.blocked && typeof pr.blocked === 'object' ? pr.blocked : null;
+    const recordedHead = typeof record?.headSha === 'string' && record.headSha ? record.headSha : null;
+    if (recordedHead) {
+      if (recordedHead !== pr.headSha) {
+        return {
+          eligible: true,
+          clearedBlock: true,
+          reason: `blocked head ${shortSha(recordedHead)} was superseded by ${shortSha(pr.headSha)}; re-evaluating`,
+          terminal: false,
+        };
+      }
+      return {
+        eligible: false,
+        reason: `already blocked by the queue on this head (${shortSha(recordedHead)})`,
+        terminal: false,
+      };
+    }
+
+    // M101-R3: legacy label with no record. Conservative: unblock only when the
+    // head's latest commit is strictly newer than the label; if we cannot prove
+    // it, keep the block rather than retrying an unknown failed head.
+    const labelAt = toMillis(pr.blockedLabelAt) ?? toMillis(record?.at);
+    const headAt = toMillis(pr.headCommittedAt);
+    if (labelAt !== null && headAt !== null && headAt > labelAt) {
+      return {
+        eligible: true,
+        clearedBlock: true,
+        reason: 'the blocked label predates the current head; re-evaluating',
+        terminal: false,
+      };
+    }
+    return {
+      eligible: false,
+      reason: 'already blocked by the queue (no recorded head; keeping the block)',
+      terminal: false,
+    };
   }
 
   // Every required check must be a completed success bound to THIS head.
@@ -180,6 +254,12 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
       if (pr.error) throw new Error(pr.error);
       const verdict = evaluateEligibility(pr);
       if (verdict.eligible) {
+        // M101-R2: a block recorded for a head that no longer exists is stale.
+        // Remove the label before merging so the next run sees a clean PR.
+        if (verdict.clearedBlock) {
+          await adapter.unmarkBlocked(pr.number);
+          outcomes.push({ number: pr.number, status: 'unblocked', reason: verdict.reason });
+        }
         eligible.push(pr);
       } else if (!seen.has(pr.number)) {
         seen.add(pr.number);
@@ -187,7 +267,7 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
           // A definite failure (hard conflict, or a check failed on this exact
           // head) leaves the queue with a plain-language reason (R4) and the PRs
           // behind it keep going.
-          await adapter.markBlocked(pr.number, verdict.reason);
+          await adapter.markBlocked(pr.number, verdict.reason, { headSha: pr.headSha });
           outcomes.push({ number: pr.number, status: 'dropped', reason: verdict.reason });
         } else {
           outcomes.push({ number: pr.number, status: 'not-eligible', reason: verdict.reason });
@@ -213,7 +293,7 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
       const verdict = evaluateEligibility(target);
       if (!verdict.eligible) {
         const reason = `combined-state verification failed: ${verdict.reason}`;
-        await adapter.markBlocked(target.number, reason);
+        await adapter.markBlocked(target.number, reason, { headSha: target.headSha });
         outcomes.push({ number: target.number, status: 'dropped', reason: verdict.reason });
         seen.add(target.number);
         continue;
@@ -252,7 +332,7 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
     ]);
     const pr = JSON.parse(raw);
     const checks = await headChecks(pr.headRefOid);
-    return mapPr(pr, checks);
+    return mapPr(pr, checks, await blockedFields(pr));
   }
 
   async function headChecks(headSha) {
@@ -266,7 +346,51 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
     }));
   }
 
-  function mapPr(pr, checks) {
+  // M101: read the blocked-head record lazily — only for PRs that carry the
+  // blocked label, so an ordinary queue pass makes no extra API calls.
+  async function blockedFields(pr) {
+    const names = (pr.labels ?? []).map((label) => label.name);
+    if (!names.some((name) => typeof name === 'string' && name.startsWith(BLOCKED_LABEL_PREFIX))) {
+      return { blocked: null, blockedLabelAt: null, headCommittedAt: null };
+    }
+    const comments = JSON.parse(
+      run(['gh', 'api', `repos/${repo}/issues/${pr.number}/comments`, '--paginate']),
+    );
+    const record = [...(comments ?? [])]
+      .reverse()
+      .map((comment) => parseBlockedMarker(comment.body))
+      .find(Boolean) ?? null;
+    if (record) return { blocked: record, blockedLabelAt: null, headCommittedAt: null };
+
+    // Legacy label with no marker (M101-R3): compare the label's added time with
+    // the head commit time. Missing evidence keeps the block (conservative).
+    let blockedLabelAt = null;
+    let headCommittedAt = null;
+    try {
+      const events = JSON.parse(
+        run(['gh', 'api', `repos/${repo}/issues/${pr.number}/events`, '--paginate']),
+      );
+      const times = (events ?? [])
+        .filter((event) => event.event === 'labeled'
+          && typeof event.label?.name === 'string'
+          && event.label.name.startsWith(BLOCKED_LABEL_PREFIX))
+        .map((event) => Date.parse(event.created_at))
+        .filter((at) => !Number.isNaN(at));
+      blockedLabelAt = times.length ? Math.max(...times) : null;
+    } catch {
+      blockedLabelAt = null;
+    }
+    try {
+      const commit = JSON.parse(run(['gh', 'api', `repos/${repo}/commits/${pr.headRefOid}`]));
+      const at = Date.parse(commit?.commit?.committer?.date ?? commit?.commit?.author?.date ?? '');
+      headCommittedAt = Number.isNaN(at) ? null : at;
+    } catch {
+      headCommittedAt = null;
+    }
+    return { blocked: null, blockedLabelAt, headCommittedAt };
+  }
+
+  function mapPr(pr, checks, blocked = {}) {
     return {
       number: pr.number,
       title: pr.title,
@@ -277,6 +401,9 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       checks,
       mergeStateStatus: pr.mergeStateStatus,
       readyAt: pr.number,
+      blocked: blocked.blocked ?? null,
+      blockedLabelAt: blocked.blockedLabelAt ?? null,
+      headCommittedAt: blocked.headCommittedAt ?? null,
     };
   }
 
@@ -291,7 +418,7 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       for (const pr of list) {
         try {
           const checks = await headChecks(pr.headRefOid);
-          out.push(mapPr(pr, checks));
+          out.push(mapPr(pr, checks, await blockedFields(pr)));
         } catch (error) {
           out.push({ ...mapPr(pr, []), error: String(error.message ?? error) });
         }
@@ -337,14 +464,33 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       }
       return { merged: false, reason: `PR #${number} is still ${after.state}` };
     },
-    async markBlocked(number, reason) {
+    async markBlocked(number, reason, { headSha } = {}) {
       // --force is idempotent when the fixed label already exists.
       run(['gh', 'label', 'create', BLOCKED_LABEL_PREFIX, '--repo', repo,
         '--description', 'Blocked by merge queue; see PR comment for details', '--force']);
       run(['gh', 'pr', 'edit', String(number), '--repo', repo, '--add-label',
         BLOCKED_LABEL_PREFIX]);
+      // M101-R1: record WHICH head was blocked so a later push is re-evaluated
+      // instead of being refused forever. The marker is hidden when rendered.
+      const marker = headSha ? `${blockedMarker(headSha)}\n` : '';
       run(['gh', 'pr', 'comment', String(number), '--repo', repo, '--body',
-        `Merge queue dropped this PR: ${reason}`]);
+        `${marker}Merge queue dropped this PR: ${reason}`]);
+    },
+    async unmarkBlocked(number) {
+      // M101-R2: the recorded head no longer exists; lift the block and let the
+      // normal eligibility path decide again. If the removal fails, only treat
+      // it as an error when the label is still there — a concurrent removal is
+      // the outcome we wanted anyway.
+      try {
+        run(['gh', 'pr', 'edit', String(number), '--repo', repo, '--remove-label',
+          BLOCKED_LABEL_PREFIX]);
+      } catch (error) {
+        const raw = run(['gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'labels']);
+        const labels = (JSON.parse(raw).labels ?? []).map((label) => label.name);
+        if (labels.some((name) => typeof name === 'string' && name.startsWith(BLOCKED_LABEL_PREFIX))) {
+          throw error;
+        }
+      }
     },
     async rulesetGuard() {
       const summaries = JSON.parse(run(['gh', 'api', `repos/${repo}/rulesets`]));

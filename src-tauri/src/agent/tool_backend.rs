@@ -688,6 +688,13 @@ fn bash_segment_is_read_only(segment: &str) -> bool {
         return false;
     }
     let lower = segment.trim().to_ascii_lowercase();
+    // M52b-R1: forge/git queries (`gh run view`, `gh pr checks`, `git log`,
+    // `git fetch`) are probes by structure. The completion classifier and this
+    // admission check share one predicate, so a probe can never be classified
+    // as read-only and then fenced behind a receipt bash cannot satisfy.
+    if codefactory_agent_core::is_forge_query_segment(&lower) {
+        return true;
+    }
     READ_ONLY_BASH_VERBS.iter().any(|verb| {
         (lower == *verb
             || lower
@@ -3780,6 +3787,46 @@ mod tests {
             assert!(
                 !bash_is_explicit_read_only(command),
                 "{command} edits in place and must stay fenced"
+            );
+        }
+    }
+
+    /// M52b-R1: the completion classifier now calls a forge query a probe. A
+    /// probe whose command the admission layer cannot prove read-only would be
+    /// fenced behind a receipt bash can never satisfy — the 2026-09-08
+    /// "系统未执行" failure. Both layers must read the same structure.
+    #[test]
+    fn forge_read_only_queries_do_not_demand_a_mutation_receipt() {
+        for command in [
+            "cd \"/tmp/ws\" && gh run view --job 117365381431 --log-failed",
+            "gh run view 39018633201 --log-failed",
+            "gh pr checks 64",
+            "gh api repos/BumStill/CodeFactory/pulls/64",
+            "git log --oneline -5",
+            "git fetch --prune origin main",
+        ] {
+            assert!(
+                bash_is_explicit_read_only(command),
+                "{command} only reads and must not be fenced behind a receipt"
+            );
+            let args = serde_json::json!({ "command": command });
+            assert!(
+                !native_requires_mutation_receipt("bash", &args, &ToolKind::ReadOnly),
+                "{command} must dispatch as a probe"
+            );
+        }
+    }
+
+    #[test]
+    fn forge_write_commands_stay_mutations() {
+        for command in [
+            "gh pr merge 64 --squash --delete-branch",
+            "gh api -X POST repos/BumStill/CodeFactory/merges",
+            "gh workflow run release.yml",
+        ] {
+            assert!(
+                !bash_is_explicit_read_only(command),
+                "{command} writes and must stay fenced"
             );
         }
     }
