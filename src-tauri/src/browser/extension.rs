@@ -27,6 +27,8 @@
 //! folder — so an extension paired once stays paired, and reconnects on its own
 //! even when the port does change.
 
+pub mod lifecycle_smoke;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

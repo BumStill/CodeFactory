@@ -44,6 +44,9 @@ pub mod unattended_smoke_cli {
 // The legacy symbol lets the pre-fix main compile, so the regression fails on
 // the observed dispatch order rather than a missing fixture symbol.
 pub fn run_unattended_long_task_smoke_cli() -> bool { unattended_smoke_cli::run() }
+pub fn run_browser_extension_lifecycle_smoke_cli() -> bool {
+    std::env::args().nth(1).as_deref() == Some("--browser-extension-lifecycle-smoke")
+}
 pub fn run_history_session_smoke_cli() -> bool { dispatch("history", "--history-session-smoke") }
 pub fn run_delivery_recovery_smoke_cli() -> bool { dispatch("delivery", "--delivery-recovery-smoke") }
 pub fn run_managed_workspace_cleanup_smoke_cli() -> bool { dispatch("cleanup", "--managed-workspace-cleanup-smoke") }
