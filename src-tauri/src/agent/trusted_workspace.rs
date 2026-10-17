@@ -28,6 +28,13 @@ const NEVER_LOCAL: &[&str] = &[".git", ".env", ".ssh", ".aws", ".gnupg", ".netrc
 
 /// Deleting only what is inside the workspace (`false` = ask as usual).
 pub(super) fn local_delete(root: &Path, command: &str) -> bool {
+    // M105: the closeout spellings that really happened on real machines
+    // (`rm -rf "$PWD/.codefactory-cache/<task>"`) are handled by the dedicated
+    // closeout proof first; it accepts only `.codefactory-cache` operands and
+    // nothing else, so the general `rm -rf` rule below is not widened.
+    if super::closeout::bash_cache_delete(root, command) {
+        return true;
+    }
     let Some(argv) = tokenize(command) else {
         return false;
     };
@@ -320,6 +327,33 @@ mod tests {
             assert!(
                 !local_write(&fixture.root, "escape/seed.txt"),
                 "symlink escape write must ask"
+            );
+        }
+    }
+
+    /// M105: the real closeout spelling from the incident must not prompt,
+    /// while every other destructive spelling keeps asking.
+    #[test]
+    fn m105_closeout_cache_spelling_is_allowed() {
+        let fixture = Fixture::new("m105");
+        std::fs::create_dir_all(fixture.root.join(".codefactory-cache/cargo-target-m103")).unwrap();
+        assert!(local_delete(
+            &fixture.root,
+            "rm -rf \"$PWD/.codefactory-cache/cargo-target-m103\""
+        ));
+        assert!(local_delete(
+            &fixture.root,
+            "rm -rf .codefactory-cache/cargo-target-m103"
+        ));
+        for command in [
+            "rm -rf ../checkout",
+            "rm -rf /etc/hosts",
+            "rm -rf \"$PWD/notes.txt\"",
+            "rm -rf \"$PWD/.codefactory-cache/cargo-target-m103\" && gh api -X DELETE /x",
+        ] {
+            assert!(
+                !local_delete(&fixture.root, command),
+                "must still ask: {command}"
             );
         }
     }

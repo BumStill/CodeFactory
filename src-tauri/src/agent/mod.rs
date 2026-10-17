@@ -5,6 +5,7 @@ pub mod attachments;
 pub(crate) mod auth_recovery;
 pub(crate) mod browser_recovery;
 pub mod checkpoint;
+pub(crate) mod closeout;
 pub mod context;
 pub mod context_budget;
 mod context_policy;
