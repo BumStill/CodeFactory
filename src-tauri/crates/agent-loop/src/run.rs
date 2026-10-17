@@ -2991,52 +2991,6 @@ pub async fn run_agent_loop(
                     name: None,
                     reasoning_content: None,
                 });
-            // `required_tool_response` is this round's own tool_choice: when it
-            // is set, the batch we just finished IS the forced recovery. Making
-            // that batch re-arm the flag would lock the turn into back-to-back
-            // `required` rounds — the model could never speak again until the
-            // evidence ledger closed. One forced tool, then a normal `auto`
-            // round, whether the recovery tool succeeded, failed, or was denied.
-            } else if !matches!(turn_capability, TurnCapability::ReviewOnly)
-                && !evidence.completed
-                && !required_tool_response
-            {
-                require_tool_next = true;
-                messages.push(crate::types::ChatMessage {
-                    role: "user".into(),
-                    content: crate::types::MessageContent::Text(
-                        codefactory_agent_core::build_completion_recovery_prompt(&evidence),
-                    ),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                    reasoning_content: None,
-                });
-                let blockers_json =
-                    codefactory_agent_core::completion_gate_blockers_json(&evidence);
-                persistence
-                    .record_completion_gate_verdict(
-                        root_turn_id.as_deref(),
-                        "completion_evidence_incomplete",
-                        &blockers_json,
-                    )
-                    .await?;
-                events.emit(crate::types::StreamEvent::CompletionGateAction {
-                    kind: "evidence_needed".into(),
-                    detail: evidence.blockers.join("; "),
-                });
-                publish_turn_activity(
-                    persistence.as_ref(),
-                    events.as_ref(),
-                    root_turn_id.as_deref(),
-                    "recovering",
-                    "active",
-                    "verification",
-                    COMPLETION_CHECKPOINT_ACTIVITY_LABEL,
-                    COMPLETION_CHECKPOINT_ACTIVITY_WAITING_REASON,
-                    None,
-                )
-                .await?;
             } else if wall_budget {
                 let remaining = max_iterations.saturating_sub(segment_iteration + 1);
                 if codefactory_agent_core::should_prompt_budget_convergence(remaining as u32) {
@@ -6341,6 +6295,29 @@ mod tests {
             ],
             "a failed check must execute again",
         );
+    }
+
+    #[tokio::test]
+    async fn m107_tool_steps_do_not_request_completion_recovery() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response("", vec![call("edit", "write_file", serde_json::json!({"path":"src/lib.rs", "content":"one"}))], 0),
+            response("", vec![call("probe", "bash", serde_json::json!({"command":"gh run view --job 42 --log-failed && git show HEAD && git fetch --prune origin main"}))], 1),
+            response("", vec![call("verify", "bash", serde_json::json!({"command":"cargo test -p codefactory-agent-loop"}))], 2),
+            response("修复完成，测试通过。", vec![], 3),
+        ]));
+        let mut cfg = config();
+        cfg.finalization = FinalizationPolicy::BlockOnIncomplete;
+        cfg.max_iterations = 8;
+        let persistence = Arc::new(RecordingPersistence::default());
+        let events = Arc::new(CollectingEventSink::new());
+        let mut svc = services(transport.clone(), persistence.clone(), events.clone());
+        svc.tools = Arc::new(CountingTools::default());
+        let outcome = run_agent_loop(inputs(), cfg, svc).await.unwrap();
+        assert!(outcome.completion_evidence.completed);
+        assert!(transport.require_tool_flags().iter().all(|required| !required),
+            "ordinary tool steps must not arm forced completion recovery");
+        assert!(!persistence.notices.lock().unwrap().iter().any(|(_, text)|
+            text.contains("completion gate rejected") || text.contains("completion_evidence_incomplete")));
     }
 
     #[tokio::test]
