@@ -110,7 +110,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: affected-scenario-runner-windows
+          name: affected-scenario-runner-windows-attempt-${{ github.run_attempt }}
           path: runner-receipt.json
           if-no-files-found: error
 
@@ -163,7 +163,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: affected-scenario-runner-macos
+          name: affected-scenario-runner-macos-attempt-${{ github.run_attempt }}
           path: runner-receipt.json
           if-no-files-found: error
 
@@ -195,6 +195,6 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: affected-scenario-receipt-${{ github.event.pull_request.head.sha }}
+          name: affected-scenario-receipt-${{ github.event.pull_request.head.sha }}-attempt-${{ github.run_attempt }}
           path: scenario-execution-receipt.json
           if-no-files-found: error
