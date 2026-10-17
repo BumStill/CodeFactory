@@ -15,8 +15,10 @@ import {
   REQUIRED_CHECKS,
   ARM_LABEL,
   HOLD_LABEL,
+  BLOCKED_LABEL_PREFIX,
   evaluateEligibility,
   orderQueue,
+  parseBlockedMarker,
   runQueue,
   versionBumpHandoff,
   verifyRequiredChecks,
@@ -62,13 +64,18 @@ function pr(overrides = {}) {
 // combined state (the R2 counter-example).
 function fakeAdapter(prs, opts = {}) {
   const state = new Map(prs.map((p) => [p.number, structuredClone(p)]));
-  const calls = { merge: [], update: [], blocked: [] };
+  const calls = { merge: [], update: [], blocked: [], unblocked: [] };
   const behind = new Set(opts.behind ?? []);
   const combinedFailures = opts.combinedFailures ?? {};
 
   return {
     calls,
     _state: state,
+    async unmarkBlocked(number) {
+      calls.unblocked.push(number);
+      const p = state.get(number);
+      if (p) p.labels = p.labels.filter((label) => label !== BLOCKED_LABEL_PREFIX);
+    },
     async listOpenPrs() {
       return [...state.values()].map((p) => structuredClone(p));
     },
@@ -312,12 +319,25 @@ test('R6: a stop request halts the queue before the next merge', async () => {
 // ---------------------------------------------------------------------------
 // M94 / M78 / squash trailer regressions (synthetic GitHub client only).
 // ---------------------------------------------------------------------------
-function ghFixture({ failure, messages = ['fix: synthetic change'] } = {}) {
+function ghFixture({
+  failure,
+  messages = ['fix: synthetic change'],
+  blockedNumbers = [],
+  commentsFor = () => [],
+  eventsFor = () => [],
+  headOverrides = {},
+  headCommittedAt = '2026-10-17T00:00:00Z',
+} = {}) {
   const calls = [];
+  const postedComments = [];
   const open = new Map([1, 2].map((number) => [number, {
     number, title: 'fix: synthetic change', headRefName: `synthetic-${number}`,
-    headRefOid: String(number).repeat(40), isDraft: false,
-    labels: [{ name: ARM_LABEL }], mergeStateStatus: 'CLEAN',
+    headRefOid: headOverrides[number] ?? String(number).repeat(40), isDraft: false,
+    labels: [
+      { name: ARM_LABEL },
+      ...(blockedNumbers.includes(number) ? [{ name: BLOCKED_LABEL_PREFIX }] : []),
+    ],
+    mergeStateStatus: 'CLEAN',
   }]));
   const run = (args) => {
     calls.push(args);
@@ -331,11 +351,28 @@ function ghFixture({ failure, messages = ['fix: synthetic change'] } = {}) {
         ...c, head_sha: sha, conclusion: failure === 'label' && sha === '1'.repeat(40) ? 'failure' : 'success',
       })) });
     }
+    if (args[1] === 'api' && args[2].endsWith('/comments')) {
+      return JSON.stringify(commentsFor(Number(args[2].split('/')[4])).map((body, i) => ({
+        body, created_at: `2026-10-17T00:0${i}:00Z`,
+      })));
+    }
+    if (args[1] === 'api' && args[2].endsWith('/events')) {
+      const n = Number(args[2].split('/')[4]);
+      return JSON.stringify(eventsFor(n).map((at, i) => ({
+        event: 'labeled', label: { name: BLOCKED_LABEL_PREFIX }, created_at: at, id: i,
+      })));
+    }
+    if (args[1] === 'api' && /\/commits\/[0-9a-f]{40}$/.test(args[2])) {
+      return JSON.stringify({ commit: { committer: { date: headCommittedAt } } });
+    }
     if (args[1] === 'api' && args[2].includes('/commits')) {
       return JSON.stringify(messages.map((message) => ({ commit: { message } })));
     }
     if (args[2] === 'edit' && number === 1 && failure === 'label') throw Error('synthetic label error');
-    if (args[2] === 'edit' || args[2] === 'comment') return '';
+    if (args[2] === 'edit' || args[2] === 'comment') {
+      if (args[2] === 'comment') postedComments.push(args.at(-1));
+      return '';
+    }
     if (args[2] === 'merge') {
       if (number === 1 && failure === 'merge') throw Error('synthetic merge error');
       open.delete(number);
@@ -347,7 +384,7 @@ function ghFixture({ failure, messages = ['fix: synthetic change'] } = {}) {
     if (args[2] === 'view') return JSON.stringify({ state: 'MERGED', mergeCommit: { oid: SHA_C } });
     throw Error(`Unexpected synthetic gh call: ${args.join(' ')}`);
   };
-  return { calls, adapter: createGhAdapter({ repo: 'synthetic/queue', run }) };
+  return { calls, postedComments, adapter: createGhAdapter({ repo: 'synthetic/queue', run }) };
 }
 
 for (const failure of ['label', 'merge', 'checks']) {
@@ -424,4 +461,133 @@ test('Observation: the run emits one traceable outcome per PR touched', async ()
   const outcomes = await runQueue(adapter, {});
   assert.equal(outcomes.filter((o) => o.number === 81)[0].status, 'merged');
   assert.equal(outcomes.filter((o) => o.number === 82)[0].status, 'dropped');
+});
+
+// ---------------------------------------------------------------------------
+// M101 — a blocked PR is re-evaluated once its head moves (2026-10-17: #693
+// stayed `not-eligible: already blocked` for 20 minutes after the conflict fix
+// pushed a new, fully green head).
+// ---------------------------------------------------------------------------
+
+const BLOCKED = BLOCKED_LABEL_PREFIX;
+
+test('M101-R2: a new head clears the queue block and the PR is evaluated again', async () => {
+  const blocked = pr({
+    number: 101,
+    headSha: SHA_B,
+    labels: [ARM_LABEL, BLOCKED],
+    blocked: { headSha: SHA_A, at: 1000 },
+  });
+  const verdict = evaluateEligibility(blocked);
+  assert.equal(verdict.eligible, true);
+  assert.equal(verdict.clearedBlock, true);
+  assert.match(verdict.reason, /SHA_A|aaaaaaaa|superseded|re-evaluat/i);
+
+  const adapter = fakeAdapter([blocked]);
+  const outcomes = await runQueue(adapter, {});
+  assert.deepEqual(adapter.calls.unblocked, [101], 'the stale block must be removed exactly once');
+  assert.ok(outcomes.some((o) => o.number === 101 && o.status === 'unblocked'));
+  assert.deepEqual(
+    outcomes.filter((o) => o.status === 'merged').map((o) => o.number),
+    [101],
+  );
+});
+
+test('M101-R2: the same blocked head stays blocked and is never retried', async () => {
+  const blocked = pr({
+    number: 102,
+    headSha: SHA_A,
+    labels: [ARM_LABEL, BLOCKED],
+    blocked: { headSha: SHA_A, at: 1000 },
+  });
+  const verdict = evaluateEligibility(blocked);
+  assert.equal(verdict.eligible, false);
+  assert.equal(verdict.clearedBlock ?? false, false);
+  assert.match(verdict.reason, /already blocked/i);
+
+  const adapter = fakeAdapter([blocked]);
+  const outcomes = await runQueue(adapter, {});
+  assert.deepEqual(adapter.calls.merge, [], 'the same failed head must not be retried');
+  assert.deepEqual(adapter.calls.blocked, [], 'the queue must not block the same head twice');
+  assert.deepEqual(adapter.calls.unblocked, []);
+  assert.equal(outcomes.find((o) => o.number === 102).status, 'not-eligible');
+});
+
+test('M101-R3: a legacy blocked label without a record is cleared only when the head is newer than the label', () => {
+  const legacy = (extra) => pr({
+    number: 103,
+    headSha: SHA_B,
+    labels: [ARM_LABEL, BLOCKED],
+    blocked: null,
+    ...extra,
+  });
+
+  const newer = evaluateEligibility(legacy({ blockedLabelAt: 1000, headCommittedAt: 2000 }));
+  assert.equal(newer.eligible, true);
+  assert.equal(newer.clearedBlock, true);
+
+  const older = evaluateEligibility(legacy({ blockedLabelAt: 2000, headCommittedAt: 1000 }));
+  assert.equal(older.eligible, false);
+  assert.match(older.reason, /already blocked/i);
+
+  const unknown = evaluateEligibility(legacy({ blockedLabelAt: null, headCommittedAt: null }));
+  assert.equal(unknown.eligible, false, 'no timestamps must stay blocked (conservative)');
+});
+
+test('M101-R1: blocking a PR records the exact blocked head in a machine-readable marker', async () => {
+  const { adapter, postedComments } = ghFixture();
+  await adapter.markBlocked(1, 'conflicts with main', { headSha: SHA_A });
+  const body = postedComments.at(-1);
+  assert.match(body, /conflicts with main/, 'the human-readable reason is preserved');
+  const record = parseBlockedMarker(body);
+  assert.ok(record, 'the comment must carry a parseable marker');
+  assert.equal(record.headSha, SHA_A);
+  assert.equal(typeof record.at, 'number');
+});
+
+test('M101-R2: the adapter reads the recorded head back and unblocks a PR whose head moved', async () => {
+  const recorded = '1'.repeat(40);
+  const current = '2'.repeat(40);
+  const { adapter, calls } = ghFixture({
+    blockedNumbers: [1],
+    headOverrides: { 1: current },
+    commentsFor: (n) => (n === 1
+      ? [`<!-- merge-queue:blocked head=${recorded} at=2026-10-17T00:00:00Z -->\nMerge queue dropped this PR: conflicts with main`]
+      : []),
+    eventsFor: () => [],
+  });
+
+  const outcomes = await runQueue(adapter, { maxIterations: 4 });
+  assert.ok(outcomes.some((o) => o.number === 1 && o.status === 'unblocked'));
+  assert.ok(outcomes.some((o) => o.number === 1 && o.status === 'merged'));
+  const unblock = calls.find((a) => a[2] === 'edit' && a.includes('--remove-label'));
+  assert.ok(unblock, 'the blocked label must be removed');
+  assert.equal(unblock.at(-1), BLOCKED);
+});
+
+test('M101-R3: a legacy blocked label is unblocked when the head commit is newer than the label event', async () => {
+  const { adapter, calls } = ghFixture({
+    blockedNumbers: [1],
+    commentsFor: () => [],
+    eventsFor: () => ['2026-10-16T00:00:00Z'],
+    headCommittedAt: '2026-10-17T00:00:00Z',
+  });
+
+  const outcomes = await runQueue(adapter, { maxIterations: 4 });
+  assert.ok(outcomes.some((o) => o.number === 1 && o.status === 'unblocked'));
+  assert.ok(calls.some((a) => a[2] === 'edit' && a.includes('--remove-label')));
+});
+
+test('M101-R3: a legacy blocked label stays blocked when the head is not newer than the label', async () => {
+  const { adapter, calls } = ghFixture({
+    blockedNumbers: [1],
+    commentsFor: () => [],
+    eventsFor: () => ['2026-10-18T00:00:00Z'],
+    headCommittedAt: '2026-10-17T00:00:00Z',
+  });
+
+  const outcomes = await runQueue(adapter, { maxIterations: 4 });
+  assert.equal(outcomes.find((o) => o.number === 1).status, 'not-eligible');
+  assert.ok(!calls.some((a) => a[2] === 'edit' && a.includes('--remove-label')));
+  assert.ok(!calls.some((a) => a[2] === 'merge' && a[3] === '1'));
 });
