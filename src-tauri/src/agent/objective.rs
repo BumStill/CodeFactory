@@ -159,6 +159,17 @@ pub const COMPLETION_EVIDENCE_INCOMPLETE: &str = "completion_evidence_incomplete
 /// asks the user for nothing. The delivery record reports the outcome later.
 pub const DELIVERED_AWAITING_CI: &str = "delivered_awaiting_ci";
 
+/// M109 (2026-10-18): the delivery this Objective is waiting on still has work
+/// that never left the machine — an uncommitted edit, or a commit the branch has
+/// not received. Field sessions cd8d910e (#713) and 59147b73 (#704) were parked
+/// in [`DELIVERED_AWAITING_CI`] in the same second a `deliver_changes` call
+/// failed, while the actual fix was still an uncommitted file: a PR existed on
+/// the remote, so the completion gate called the change delivered and the
+/// session sat waiting for a CI run over a head that would never change.
+/// This wait says the delivery is unfinished instead, and authorizes the next
+/// action to continue it.
+pub const DELIVERY_LOCAL_WORK_UNPUSHED: &str = "delivery_local_work_unpushed";
+
 /// CF-TRUTH-R4 (2026-10-10): the run was stopped by the system itself — the
 /// durable owner moved to another run — never by the user. The work is
 /// recoverable: the new owner carries it on from the same Objective.
@@ -5110,6 +5121,22 @@ impl ObjectiveStore {
         .ok()
         .flatten();
         if let Some((url, last_progress_at)) = pending_pr {
+            // M109/R2+R4: "a PR exists" is not "this change was delivered". If
+            // the delivery's own workspace still holds an uncommitted edit or an
+            // unpushed commit, the honest state is "delivery unfinished" —
+            // parking on CI would wait for a head that never moves.
+            if let Some(reason) = self.pending_local_delivery_work(&decision.objective_id).await {
+                tracing::warn!(
+                    objective_id = %decision.objective_id,
+                    reason = %reason,
+                    "delivery wait still has local work; continuing instead of claiming delivered"
+                );
+                return Ok(delivery_local_work_wait(
+                    decision,
+                    &reason,
+                    Utc::now().timestamp_millis(),
+                ));
+            }
             let reference = pull_request_reference(&url).unwrap_or_else(|| "已经开好的 PR".into());
             let elapsed = Utc::now().timestamp_millis().saturating_sub(last_progress_at);
             let prompt = if elapsed >= SIGNATURE_RECOVERY_WINDOW_MS {
@@ -5188,6 +5215,21 @@ impl ObjectiveStore {
         if let Some((reference, unfinished)) =
             self.delivered_pr_closing_state(&decision.objective_id).await
         {
+            // M109/R2+R4: the same rule for the path that trusts *any* historical
+            // canonical PR. A closing step that failed while local work is still
+            // unpushed is an unfinished delivery, not a delivered CI wait.
+            if let Some(reason) = self.pending_local_delivery_work(&decision.objective_id).await {
+                tracing::warn!(
+                    objective_id = %decision.objective_id,
+                    reason = %reason,
+                    "canonical PR exists but the delivery still has local work; continuing"
+                );
+                return Ok(delivery_local_work_wait(
+                    decision,
+                    &reason,
+                    Utc::now().timestamp_millis(),
+                ));
+            }
             {
                 let mut prompt = delivered_awaiting_ci_message(&reference);
                 if let Some(step) = unfinished {
@@ -7153,6 +7195,28 @@ impl ObjectiveStore {
         Some((verdict, checks))
     }
 
+    /// M109/R2+R4: is this Objective waiting on a PR while its own delivery
+    /// still has work that never left the machine? The pre-M109 park only asked
+    /// "does a PR exist", which is why a tool error plus an uncommitted fix was
+    /// reported as `delivered_awaiting_ci`.
+    async fn pending_local_delivery_work(&self, objective_id: &str) -> Option<String> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT workspace_path, expected_head_sha FROM delivery_runs
+             WHERE objective_id=? ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(objective_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let (workspace, expected_head) = row?;
+        let workspace = workspace.filter(|path| !path.trim().is_empty())?;
+        pending_delivery_local_work(
+            std::path::Path::new(&workspace),
+            expected_head.as_deref(),
+        )
+    }
+
     /// CF-TRUTH-R1 (M67): everything the delivered park needs — the open PR the
     /// user reads, plus the closing step that did not finish, when the delivery
     /// record names one. `None` means nothing was delivered, so the ordinary
@@ -7661,6 +7725,94 @@ pub(crate) fn park_delivered_ci_wait(
     decision
 }
 
+/// M109/R4: what this Objective's delivery still owes the remote — an
+/// uncommitted edit, a commit the branch never received, or a HEAD that moved
+/// past the delivery record. Purely local probes: nothing here fetches, so a
+/// network outage can never make this check hang.
+///
+/// `None` means "nothing outstanding, or nothing we can observe": a legacy run
+/// row without a workspace is not evidence of unfinished work, so it keeps the
+/// pre-M109 behaviour.
+pub(crate) fn pending_delivery_local_work(
+    worktree: &std::path::Path,
+    expected_head_sha: Option<&str>,
+) -> Option<String> {
+    use crate::util::no_window::NoWindow;
+    let git = |args: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .no_window()
+            .current_dir(worktree)
+            .args(args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    if !worktree.is_dir() {
+        return Some("交付记录里的工作区已经不可读".into());
+    }
+    let status = match git(&["status", "--porcelain"]) {
+        Some(status) => status,
+        // Not a git worktree we can read: say so rather than claim delivery.
+        None => return Some("无法确认本地工作区状态".into()),
+    };
+    if !status.is_empty() {
+        return Some("工作区有未提交的改动".into());
+    }
+    let head = git(&["rev-parse", "HEAD"])?;
+    if let Some(expected) = expected_head_sha.filter(|value| !value.is_empty()) {
+        if head != expected {
+            return Some("本地 HEAD 已经不是交付记录里的那一版提交".into());
+        }
+    }
+    let unpushed = git(&["rev-list", "--count", "HEAD", "--not", "--remotes"])?;
+    if unpushed.parse::<u64>().unwrap_or(0) > 0 {
+        return Some("本地有未推送的提交".into());
+    }
+    None
+}
+
+/// M109/R2+R4: the wait an unfinished delivery gets. It is still a system-owned
+/// wait (the user owes nothing), but it must never be mistaken for "delivered,
+/// waiting for CI", and it authorizes the next action so the session continues
+/// the delivery instead of parking on a head nobody will push.
+pub(crate) fn delivery_local_work_wait(
+    mut decision: DecisionEnvelope,
+    reason: &str,
+    now: i64,
+) -> DecisionEnvelope {
+    let resume_cursor = decision.resume_cursor.clone();
+    decision.decision_type = DecisionType::Waiting;
+    decision.status = ObjectiveStatus::WaitingSystem;
+    decision.failure_code = Some(DELIVERY_LOCAL_WORK_UNPUSHED.to_string());
+    decision.request_key = None;
+    decision.recovery_owner = None;
+    decision.remediation_id = None;
+    decision.next_observation_at = Some(bounded_next_observation_at(
+        now,
+        now.saturating_add(DELIVERED_CI_REOBSERVE_MS),
+    ));
+    decision.next_action_authorized = true;
+    decision.requires_user_action = false;
+    decision.attention_request = Some(UserAttentionRequest {
+        kind: DELIVERY_LOCAL_WORK_UNPUSHED.to_string(),
+        prompt: format!(
+            "交付还没有完成：{reason}，这部分改动还没有进入 PR，所以现在不是等 CI 的状态。\
+继续交付：提交并推送这些改动，再观察新的 head 的检查结果。"
+        ),
+        missing_inputs: Vec::new(),
+        attempted_routes: Vec::new(),
+        decision_options: Vec::new(),
+        recommended_option: None,
+        irreversible: false,
+        no_safe_default_reason: None,
+        resume_cursor,
+    });
+    decision
+}
+
 /// `PR #572` for a GitHub pull-request URL, matching the wording the run's own
 /// delivery reference uses (U1b). `None` for anything that is not one.
 fn pull_request_reference(text: &str) -> Option<String> {
@@ -8104,7 +8256,7 @@ mod tests {
     use codefactory_agent_loop::run::{RunOutcome, StopReason};
     use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn pool() -> SqlitePool {
+    pub(crate) async fn pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -8118,7 +8270,7 @@ mod tests {
     /// the Objective control plane only; sessions, messages and chat_turn_state
     /// come from the storage migrations, so tests that exercise settlement build
     /// exactly the columns those paths read and write.
-    async fn settlement_tables(pool: &SqlitePool) {
+    pub(crate) async fn settlement_tables(pool: &SqlitePool) {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS sessions (
                id TEXT PRIMARY KEY, title TEXT NOT NULL, cwd TEXT NOT NULL,
@@ -15619,7 +15771,7 @@ CREATE TABLE objectives (
 
     /// Synthetic chat Objective on the completion-gate route, already parked in
     /// a system wait with a burned signature budget.
-    async fn completion_gate_fixture(
+    pub(crate) async fn completion_gate_fixture(
         pool: &SqlitePool,
         objective_id: &str,
         root_turn_id: &str,
@@ -15700,7 +15852,7 @@ CREATE TABLE objectives (
     /// settlement path writes most of these columns, and a fixture that drifts
     /// silently turns a product behaviour into a confusing column error. With no
     /// row inserted, nothing has been delivered.
-    async fn delivery_runs_table(pool: &SqlitePool) {
+    pub(crate) async fn delivery_runs_table(pool: &SqlitePool) {
         for migration in [
             include_str!("../../migrations/0004_delivery_runs.sql"),
             include_str!("../../migrations/0005_objective_recovery_control_plane.sql"),
@@ -15712,7 +15864,7 @@ CREATE TABLE objectives (
 
     /// The settlement path writes columns added by later migrations than the
     /// fixture runs; add whatever is missing instead of guessing one at a time.
-    async fn ensure_chat_turn_state_columns(pool: &SqlitePool) {
+    pub(crate) async fn ensure_chat_turn_state_columns(pool: &SqlitePool) {
         for (name, kind) in [
             ("next_action", "TEXT"),
             ("terminal_reason", "TEXT"),
@@ -15746,7 +15898,7 @@ CREATE TABLE objectives (
         }
     }
 
-    fn gate_exhaustion_decision(
+    pub(crate) fn gate_exhaustion_decision(
         objective: &ObjectiveSnapshot,
         signature: &str,
     ) -> DecisionEnvelope {
@@ -16347,6 +16499,12 @@ mod msp_continuation_prompt_tests {
 #[cfg(test)]
 mod m104_ci_wake_tests {
     use super::*;
+    // M109 fixtures: the ObjectiveStore decision path is exercised with the same
+    // settlement tables the completion-gate tests build.
+    use super::tests::{
+        completion_gate_fixture, delivery_runs_table, ensure_chat_turn_state_columns,
+        gate_exhaustion_decision, pool, settlement_tables,
+    };
 
     fn check(
         job: &str,
@@ -16497,5 +16655,203 @@ mod m104_ci_wake_tests {
         let prompt = ci_outcome_wake_prompt("PR #704", &stalled);
         assert!(prompt.contains("61 分钟"), "{prompt}");
         assert!(!stalled.is_session_repairable());
+    }
+
+    // ── M109: a delivered wait requires that no local work is left behind ────
+    //
+    // Field sessions cd8d910e (#713) and 59147b73 (#704) parked in
+    // `delivered_awaiting_ci` immediately after a `deliver_changes` tool error
+    // while the actual fix was still an uncommitted file in the workspace. The
+    // park only looked at "a PR exists on the remote", never at "this delivery's
+    // work reached it".
+
+    fn m109_git(cwd: &std::path::Path, args: &[&str]) -> String {
+        use crate::util::no_window::NoWindow;
+        let output = std::process::Command::new("git")
+            .no_window()
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A fixture workspace whose base commit is pushed to a bare origin.
+    /// Returns `(root, worktree, pushed_head)`.
+    fn m109_repo() -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "codefactory-m109-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let origin = root.join("origin.git");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&origin).unwrap();
+        m109_git(&origin, &["init", "--bare", "-q"]);
+        std::fs::create_dir_all(&worktree).unwrap();
+        m109_git(&worktree, &["init", "-q"]);
+        m109_git(&worktree, &["config", "user.name", "Fixture"]);
+        m109_git(&worktree, &["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(worktree.join("README.md"), "# fixture\n").unwrap();
+        m109_git(&worktree, &["add", "README.md"]);
+        m109_git(&worktree, &["commit", "-q", "-m", "chore: base"]);
+        m109_git(&worktree, &["branch", "-M", "main"]);
+        m109_git(
+            &worktree,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        m109_git(&worktree, &["push", "-q", "-u", "origin", "main"]);
+        let head = m109_git(&worktree, &["rev-parse", "HEAD"]);
+        (root, worktree, head)
+    }
+
+    #[test]
+    fn m109_pending_local_work_detects_uncommitted_and_unpushed_changes() {
+        let (root, worktree, pushed_head) = m109_repo();
+
+        // Clean and pushed: nothing is outstanding.
+        assert_eq!(
+            pending_delivery_local_work(&worktree, Some(&pushed_head)),
+            None
+        );
+
+        // An uncommitted edit is exactly what field session cd8d910e had while
+        // the Objective claimed the change was delivered.
+        std::fs::write(worktree.join("fix.txt"), "local fix\n").unwrap();
+        let dirty = pending_delivery_local_work(&worktree, Some(&pushed_head))
+            .expect("an uncommitted edit must be observed");
+        assert!(dirty.contains("未提交"), "{dirty}");
+
+        // Committed but never pushed: this is the M109 "head never moved" case.
+        m109_git(&worktree, &["add", "fix.txt"]);
+        m109_git(&worktree, &["commit", "-q", "-m", "fix: local"]);
+        let unpushed = pending_delivery_local_work(&worktree, Some(&pushed_head))
+            .expect("an unpushed commit must be observed");
+        assert!(
+            unpushed.contains("未推送") || unpushed.contains("HEAD"),
+            "{unpushed}"
+        );
+
+        // Pushed again: the wait is honest.
+        m109_git(&worktree, &["push", "-q", "origin", "main"]);
+        let head = m109_git(&worktree, &["rev-parse", "HEAD"]);
+        assert_eq!(pending_delivery_local_work(&worktree, Some(&head)), None);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn m109_local_work_wait_never_claims_delivered_awaiting_ci() {
+        let wait = delivery_local_work_wait(
+            sample_decision(),
+            "工作区有未提交的改动",
+            Utc::now().timestamp_millis(),
+        );
+
+        assert_ne!(
+            wait.failure_code.as_deref(),
+            Some(DELIVERED_AWAITING_CI),
+            "an unpushed change must never be reported as delivered"
+        );
+        assert_eq!(
+            wait.failure_code.as_deref(),
+            Some(DELIVERY_LOCAL_WORK_UNPUSHED)
+        );
+        assert_eq!(wait.status, ObjectiveStatus::WaitingSystem);
+        let prompt = &wait.attention_request.as_ref().unwrap().prompt;
+        assert!(prompt.contains("未提交"), "{prompt}");
+        assert!(
+            wait.next_action_authorized,
+            "the next action must continue the delivery instead of parking"
+        );
+        assert!(!wait.requires_user_action);
+    }
+
+    /// M109-R2/R4 end to end on the decision path: a tool error leaves local
+    /// work unpushed, the remote PR is open, and `bound_system_recovery` sees
+    /// the open PR. It must not park the Objective as delivered.
+    #[tokio::test]
+    async fn m109_unpushed_local_work_is_not_parked_as_delivered() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        ensure_chat_turn_state_columns(&pool).await;
+        delivery_runs_table(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let signature = format!("objective-m109:Finished:{COMPLETION_EVIDENCE_INCOMPLETE}");
+        completion_gate_fixture(&pool, "m109", "turn-m109", &signature).await;
+
+        let (root, worktree, pushed_head) = m109_repo();
+        std::fs::write(worktree.join("fix.txt"), "unpushed fix\n").unwrap();
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, objective_id, run_kind, requested_ceiling, reached_ceiling, stage, status,
+              workspace_path, base_branch, head_branch, expected_head_sha,
+              canonical_pr_number, canonical_pr_url, last_observed_at, last_progress_at,
+              app_version, app_build, process_instance, created_at, updated_at)
+             VALUES ('m109-run', 'm109', 'objective', 'through_merge', 'pr_open',
+                     'wait_ci', 'waiting', ?, 'main', 'main', ?, 913,
+                     'https://github.com/example/project/pull/913', ?, ?,
+                     'test', 'test', 'test', ?, ?)",
+        )
+        .bind(worktree.to_string_lossy().into_owned())
+        .bind(&pushed_head)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM objective_remediations WHERE objective_id='m109'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let current = store.get("m109").await.unwrap().unwrap();
+        let parked = store
+            .bound_system_recovery(gate_exhaustion_decision(&current, &signature))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            parked.failure_code.as_deref(),
+            Some(DELIVERED_AWAITING_CI),
+            "an unpushed local fix must not be reported as a delivered CI wait"
+        );
+        assert_eq!(
+            parked.failure_code.as_deref(),
+            Some(DELIVERY_LOCAL_WORK_UNPUSHED)
+        );
+        let prompt = &parked.attention_request.as_ref().unwrap().prompt;
+        assert!(prompt.contains("未提交"), "{prompt}");
+
+        // Once the work is committed and pushed, the same observation is an
+        // honest delivered wait again — the guard must not over-block.
+        m109_git(&worktree, &["add", "fix.txt"]);
+        m109_git(&worktree, &["commit", "-q", "-m", "fix: m109"]);
+        m109_git(&worktree, &["push", "-q", "origin", "main"]);
+        let head = m109_git(&worktree, &["rev-parse", "HEAD"]);
+        sqlx::query("UPDATE delivery_runs SET expected_head_sha=? WHERE id='m109-run'")
+            .bind(&head)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let settled = store
+            .bound_system_recovery(gate_exhaustion_decision(&current, &signature))
+            .await
+            .unwrap();
+        assert_eq!(
+            settled.failure_code.as_deref(),
+            Some(DELIVERED_AWAITING_CI),
+            "a genuinely pushed change may still wait for CI"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
