@@ -5325,7 +5325,10 @@ impl ObjectiveStore {
         // note nobody is reading.
         let mut told_to_stop = false;
         for run_instance_id in &run_instance_ids {
-            if crate::request_chat_run_stop(run_instance_id) {
+            // M99 / R2: settlement is not the user. The flag must go up so the
+            // loop stops writing, but the provenance makes sure convergence
+            // never records this as a durable user stop intent.
+            if crate::request_chat_run_stop_internal(run_instance_id) {
                 told_to_stop = true;
             }
         }
