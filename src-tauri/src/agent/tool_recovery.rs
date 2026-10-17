@@ -207,12 +207,18 @@ impl ToolRecoveryStore {
             JOIN tool_recovery_contracts contract ON contract.receipt_id=receipt.id
             JOIN objectives objective ON objective.id=receipt.objective_id
             WHERE receipt.objective_id=? AND receipt.binding_id=?
-            AND contract.resource_generation=? AND contract.resource_kind='workspace_git'
+            AND contract.resource_generation=? AND contract.resource_kind IN ('workspace_git','workspace_file')
             AND receipt.status IN ('started','unknown')")
             .bind(objective_id).bind(binding_id).bind(generation).fetch_all(&self.pool).await?;
         for row in rows {
             let receipt: String = row.get("id");
-            if self.local_receipt_is_bounded(&receipt).await? {
+            let finished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tool_recovery_call_links link
+                JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?
+                AND tool.status IN ('done','error') AND tool.result IS NOT NULL)")
+                .bind(&receipt).fetch_one(&self.pool).await?;
+            let file: bool = sqlx::query_scalar("SELECT resource_kind='workspace_file' FROM tool_recovery_contracts WHERE receipt_id=?")
+                .bind(&receipt).fetch_one(&self.pool).await?;
+            if finished || file || self.local_receipt_is_bounded(&receipt).await? {
                 let session: String = row.get("session_id");
                 let cwd: String = sqlx::query_scalar("SELECT cwd FROM sessions WHERE id=?")
                     .bind(session).fetch_one(&self.pool).await?;
@@ -256,6 +262,12 @@ impl ToolRecoveryStore {
         let pre: String = row.try_get("precondition_digest")?;
         let current = snapshot_digest(&self.pool, cwd, &kind, &locator).await?;
         let local = kind == "workspace_file" || (kind == "workspace_git" && self.local_receipt_is_bounded(receipt_id).await?);
+        // A returned foreground error is known, even for an opaque local
+        // program. It is not permission to replay an external write.
+        let finished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tool_recovery_call_links link
+            JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?
+            AND tool.status IN ('done','error') AND tool.result IS NOT NULL)")
+            .bind(receipt_id).fetch_one(&self.pool).await?;
         let now = chrono::Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
         if succeeded {
@@ -326,7 +338,7 @@ impl ToolRecoveryStore {
             // workspace changed; unchanged means the agent must retry/replan.
             let receipt_status = if local && observed == Some(pre.as_str()) {
                 "cancelled"
-            } else if local && observed.is_some() {
+            } else if (local && observed.is_some()) || finished {
                 "reconciled"
             } else {
                 "unknown"
@@ -1583,20 +1595,41 @@ mod tests {
 
     #[tokio::test]
     async fn m106_failed_local_tool_observation_does_not_remain_unknown() {
+        replay_local_receipt(None).await;
+    }
+
+    #[tokio::test]
+    async fn m107_replay_finished_regression_error_continues() {
+        replay_local_receipt(Some(2)).await;
+    }
+
+    #[tokio::test]
+    async fn m107_replay_finished_python_get_error_continues() {
+        replay_local_receipt(Some(0)).await;
+    }
+
+    #[tokio::test]
+    async fn m107_replay_waiting_local_edit_continues() {
+        replay_local_receipt(Some(1)).await;
+    }
+
+    async fn replay_local_receipt(selected: Option<usize>) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
             .connect("sqlite::memory:").await.unwrap();
         sqlx::query("PRAGMA foreign_keys=OFF").execute(&pool).await.unwrap();
         sqlx::raw_sql(include_str!("../../migrations/0007_unified_objective_control_plane.sql"))
             .execute(&pool).await.unwrap();
         ToolRecoveryStore::ensure_schema(&pool).await.unwrap();
-        sqlx::query("CREATE TABLE tool_calls (id TEXT PRIMARY KEY, tool_name TEXT, arguments TEXT)")
+        sqlx::query("CREATE TABLE tool_calls (id TEXT PRIMARY KEY, tool_name TEXT, arguments TEXT, status TEXT, result TEXT)")
             .execute(&pool).await.unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let store = ToolRecoveryStore::new(pool.clone());
         for (index, command) in [
             "python3 - <<'PY'\nimport subprocess\nprint(subprocess.check_output(['gh','api','repos/example/project/pulls/7']))\nPY",
             "cd src && python3 - <<'PY'\nfrom pathlib import Path\np = Path('repair.rs')\np.write_text(p.read_text().replace('old', 'new'))\nPY",
+            "rustc --test regression.rs -o /tmp/synthetic-regression && /tmp/synthetic-regression > /tmp/synthetic-result.log",
         ].iter().enumerate() {
+            if selected.is_some_and(|selected| selected != index) { continue; }
             let plan = store.prepare("bash", &serde_json::json!({"command":command}), cwd.path(), None, None)
                 .await.unwrap().expect("local snapshot observer");
             let receipt = format!("receipt-{index}");
@@ -1607,8 +1640,10 @@ mod tests {
                 &format!("sha256:{}", "a".repeat(64)), &format!("tool-{index}"), plan, None, 0, 1)
                 .await.unwrap();
             tx.commit().await.unwrap();
-            sqlx::query("INSERT INTO tool_calls (id,tool_name,arguments) VALUES (?, 'bash', ?)")
+            sqlx::query("INSERT INTO tool_calls (id,tool_name,arguments,status,result) VALUES (?, 'bash', ?, ?, ?)")
                 .bind(format!("tool-{index}")).bind(serde_json::json!({"command":command}).to_string())
+                .bind(if index == 1 { "waiting" } else { "error" })
+                .bind(if index == 1 { None } else { Some("synthetic known failure") })
                 .execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO tool_recovery_call_links (receipt_id,tool_call_id,created_at) VALUES (?, ?, 1)")
                 .bind(&receipt).bind(format!("tool-{index}")).execute(&pool).await.unwrap();

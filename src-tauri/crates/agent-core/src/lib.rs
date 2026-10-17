@@ -6015,6 +6015,7 @@ mod tests {
             "git status --short",
             "git diff origin/main...HEAD",
             "git fetch --prune origin main",
+            "gh run view --job 42 --log-failed && git show HEAD && git fetch --prune origin main",
         ];
         for command in commands {
             assert_eq!(

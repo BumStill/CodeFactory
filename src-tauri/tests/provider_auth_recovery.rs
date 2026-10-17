@@ -139,6 +139,25 @@ fn episode() -> ProviderEpisodeSpec {
 }
 
 #[tokio::test]
+async fn m107_normal_committed_steps_are_not_recovery_failures() {
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    for index in 0..12 {
+        let id = format!("round-{index}");
+        store.begin_attempt(&permit, &attempt(&id, "episode-1", "a"), NOW + 1).await.unwrap();
+        store.mark_in_flight(&permit, &id, NOW + 2).await.unwrap();
+        store.commit_response(&permit, &id, &format!("sha256:{}", "a".repeat(64)), "tool step", false, NOW + 3).await.unwrap();
+        assert_eq!(store.reconcile_finished_request(&permit, NOW + 4).await.unwrap(), ProviderMutation::Applied(0), "normal committed step is not a recovery");
+        let status: String = sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id=?").bind(&id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "response_committed");
+    }
+    let budget: i64 = sqlx::query_scalar("SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'").fetch_one(&pool).await.unwrap();
+    assert_eq!(budget, 7);
+}
+
+#[tokio::test]
 async fn m103_current_owner_reconciles_effect_free_request_at_serial_boundary() {
     for output in [false, true] {
         let pool = pool().await;
