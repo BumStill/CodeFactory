@@ -214,7 +214,8 @@ impl ToolRecoveryStore {
             let receipt: String = row.get("id");
             let finished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tool_recovery_call_links link
                 JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?
-                AND tool.status IN ('done','error') AND tool.result IS NOT NULL)")
+                AND tool.status IN ('done','error')
+                AND (tool.result IS NOT NULL OR tool.error IS NOT NULL))")
                 .bind(&receipt).fetch_one(&self.pool).await?;
             let file: bool = sqlx::query_scalar("SELECT resource_kind='workspace_file' FROM tool_recovery_contracts WHERE receipt_id=?")
                 .bind(&receipt).fetch_one(&self.pool).await?;
@@ -266,7 +267,8 @@ impl ToolRecoveryStore {
         // program. It is not permission to replay an external write.
         let finished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tool_recovery_call_links link
             JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?
-            AND tool.status IN ('done','error') AND tool.result IS NOT NULL)")
+            AND tool.status IN ('done','error')
+                AND (tool.result IS NOT NULL OR tool.error IS NOT NULL))")
             .bind(receipt_id).fetch_one(&self.pool).await?;
         let now = chrono::Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
@@ -1620,7 +1622,7 @@ mod tests {
         sqlx::raw_sql(include_str!("../../migrations/0007_unified_objective_control_plane.sql"))
             .execute(&pool).await.unwrap();
         ToolRecoveryStore::ensure_schema(&pool).await.unwrap();
-        sqlx::query("CREATE TABLE tool_calls (id TEXT PRIMARY KEY, tool_name TEXT, arguments TEXT, status TEXT, result TEXT)")
+        sqlx::query("CREATE TABLE tool_calls (id TEXT PRIMARY KEY, tool_name TEXT, arguments TEXT, status TEXT, result TEXT, error TEXT)")
             .execute(&pool).await.unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let store = ToolRecoveryStore::new(pool.clone());
@@ -1640,7 +1642,11 @@ mod tests {
                 &format!("sha256:{}", "a".repeat(64)), &format!("tool-{index}"), plan, None, 0, 1)
                 .await.unwrap();
             tx.commit().await.unwrap();
-            sqlx::query("INSERT INTO tool_calls (id,tool_name,arguments,status,result) VALUES (?, 'bash', ?, ?, ?)")
+            // M110: production stores a failed call's text in `error` and leaves
+            // `result` NULL (all 222 error rows on the reporting machine). The
+            // M107 replay put the failure in `result`, so it passed while every
+            // real failed command still left its receipt `unknown`.
+            sqlx::query("INSERT INTO tool_calls (id,tool_name,arguments,status,result,error) VALUES (?, 'bash', ?, ?, NULL, ?)")
                 .bind(format!("tool-{index}")).bind(serde_json::json!({"command":command}).to_string())
                 .bind(if index == 1 { "waiting" } else { "error" })
                 .bind(if index == 1 { None } else { Some("synthetic known failure") })
