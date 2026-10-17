@@ -30,6 +30,8 @@ def _git(repo: Path, *args: str, stdin: str | None = None) -> str:
         check=True,
         input=stdin,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
     )
     return result.stdout

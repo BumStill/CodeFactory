@@ -382,6 +382,8 @@ def _git(*args: str, repo_root: Path) -> str | None:
             cwd=repo_root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         )
     except (OSError, subprocess.CalledProcessError):

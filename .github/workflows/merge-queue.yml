@@ -19,6 +19,10 @@ name: merge-queue
 # The file is read from the DEFAULT BRANCH (workflow_run/schedule semantics), so
 # a candidate PR cannot rewrite the queue to certify itself.
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 on:
   pull_request_target:
     types: [labeled]

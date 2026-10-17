@@ -71,7 +71,7 @@ def blocker(msg: str) -> dict:
 def git(*args: str) -> str:
     try:
         return subprocess.run(
-            ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+            ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True
         ).stdout.strip()
     except Exception:
         return ""

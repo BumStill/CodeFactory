@@ -45,6 +45,8 @@ def changed_files(repo_root: Path, base_sha: str) -> tuple[list[str], str | None
         ["git", "-C", str(repo_root), "diff", "--name-only", f"{base_sha}...HEAD"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         return [], f"cannot diff against '{base_sha}': {result.stderr.strip()}"

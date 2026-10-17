@@ -300,6 +300,8 @@ class BenchmarkWatchdog:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
                 check=False,
             )
@@ -333,6 +335,8 @@ class BenchmarkWatchdog:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
                 check=False,
             )
@@ -348,6 +352,8 @@ class BenchmarkWatchdog:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
                 check=False,
             )
@@ -365,6 +371,8 @@ class BenchmarkWatchdog:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=30,
                     check=False,
                 )
@@ -637,6 +645,8 @@ def run_capture(command: list[str], timeout: int) -> CapturedCommand:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         return CapturedCommand(completed.returncode, completed.stdout)
@@ -909,6 +919,8 @@ def run_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     output: list[str] = []

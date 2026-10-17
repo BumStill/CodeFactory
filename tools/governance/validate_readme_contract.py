@@ -51,6 +51,8 @@ def _git(repo_root: Path, *args: str) -> tuple[bool, str, str]:
         ["git", "-C", str(repo_root), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
 
@@ -281,7 +283,28 @@ def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _force_utf8_stdio() -> None:
+    """Keep diagnostics readable under a non-UTF-8 locale (M49).
+
+    Windows runners default to ``cp1252``. A governance script that prints a
+    non-ASCII diagnostic there dies with ``UnicodeEncodeError`` and hides the
+    real contract failure (2026-10-10, #593). Reconfiguring the streams keeps
+    the message intact even when ``PYTHONIOENCODING``/``PYTHONUTF8`` are
+    hostile, so the validator reports the problem instead of crashing on it.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def main() -> int:
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ci", action="store_true", help="read the GitHub event payload")
     parser.add_argument("--body-file", help="validate a PR body from a local file")

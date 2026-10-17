@@ -259,6 +259,8 @@ def _git_changed_files(repo: Path, base_sha: str, head_sha: str) -> list[str]:
         ["git", "-C", str(repo), "diff", "--name-only", f"{base_sha}...{head_sha}"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "git diff failed")
@@ -290,6 +292,8 @@ def _run_command(
             env=merged_env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=45 * 60,
         )
     except OSError as error:

@@ -227,6 +227,8 @@ def validate_release_tree_provenance(repo_root: Path, policy_root: Path) -> list
         ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", candidate, trusted],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode == 0:
         return []
@@ -243,7 +245,7 @@ def validate_release_tree_provenance(repo_root: Path, policy_root: Path) -> list
 
 def _git_output(root: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, text=True
+        ["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -253,6 +255,8 @@ def _resolve_local_base(repo_root: Path) -> str:
         ["git", "-C", str(repo_root), "rev-parse", "origin/main"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
