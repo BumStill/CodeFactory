@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "codefactory"
-version = "1.88.9"
+version = "1.88.10"
 dependencies = [
  "anyhow",
  "async-trait",
