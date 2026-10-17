@@ -4088,22 +4088,38 @@ pub(crate) async fn recover_delivery_recovery_smoke(
         autonomous_completion: true,
     };
     delivery_run::create_delivery_run(&pool, &foreign_run, &foreign_owner, now + 1, 90_000).await?;
-    std::fs::write(worktree.join("foreign.txt"), "unreceipted foreign edit\n")?;
-    delivery_recovery_smoke_git(&worktree, &["add", "foreign.txt"])?;
-    delivery_recovery_smoke_git(
-        &worktree,
+    // M98-R3: a remote head this workspace can explain (equal to the persisted
+    // head, the receipted parent, or an ancestor of it) is now correctly the
+    // same identity, so the foreign fixture must be a commit the local
+    // worktree has never seen. Build it in the remote from the remote's own
+    // tree and move the managed ref there. The worktree therefore stays at the
+    // head its local receipt proves, while the canonical branch points at a
+    // truly foreign write.
+    let remote_tree = delivery_recovery_smoke_git(
+        &origin,
+        &["rev-parse", "refs/heads/fix/delivery-recovery-smoke^{tree}"],
+    )?;
+    let foreign_head = delivery_recovery_smoke_git(
+        &origin,
         &[
             "-c",
             "user.name=Foreign Fixture",
             "-c",
             "user.email=foreign@example.invalid",
-            "commit",
-            "-q",
+            "commit-tree",
+            &remote_tree,
             "-m",
             "chore: unreceipted foreign commit",
         ],
     )?;
-    let foreign_head = delivery_recovery_smoke_git(&worktree, &["rev-parse", "HEAD"])?;
+    delivery_recovery_smoke_git(
+        &origin,
+        &[
+            "update-ref",
+            "refs/heads/fix/delivery-recovery-smoke",
+            &foreign_head,
+        ],
+    )?;
     let remote_head_before = delivery_recovery_smoke_git(
         &origin,
         &["rev-parse", "refs/heads/fix/delivery-recovery-smoke"],
@@ -4225,8 +4241,8 @@ pub(crate) async fn recover_delivery_recovery_smoke(
         && claim_epoch == last_epoch
         && claim_epoch_after_third == claim_epoch;
     let remote_unchanged = remote_head_before == remote_head_after
-        && remote_head_after == reconciled_head
-        && foreign_head != remote_head_after;
+        && remote_head_after == foreign_head
+        && foreign_head != reconciled_head;
     if !foreign_identity_failed_closed
         || !claim_epoch_plateau
         || !remote_unchanged
@@ -5833,6 +5849,101 @@ mod tests {
         assert!(
             observation.is_err(),
             "a canonical PR that moved to a foreign head must fail closed: {observation:?}"
+        );
+        std::fs::remove_dir_all(fixture_root).ok();
+    }
+
+    /// M98-R3. After an upgrade restart the managed branch may be ahead of its
+    /// remote because the push never ran. A remote head that is an ancestor of
+    /// the local head is explainable by this workspace and must continue the
+    /// same delivery instead of parking as `delivery_identity_conflict`.
+    #[tokio::test]
+    async fn m98_remote_ancestor_head_continues_the_same_identity() {
+        let (fixture_root, worktree) = u22_base_advanced_repo();
+        let pool = u22_pool().await;
+        let run_id = "m98-ancestor-run";
+        let objective_id = "objective-m98-ancestor";
+        u22_seed_objective(&pool, run_id, objective_id).await;
+        let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
+        u22_create_run(&pool, &worktree, run_id, objective_id, &pre_merge_head, None).await;
+        recovery_git(
+            &worktree,
+            &["push", "-q", "origin", "fix/u22-base-advanced"],
+        );
+        let merged_head = u22_advance_base_and_merge(&worktree);
+        let remote_feature_head = recovery_git(
+            &worktree,
+            &["rev-parse", "refs/remotes/origin/fix/u22-base-advanced"],
+        );
+        assert_eq!(remote_feature_head, pre_merge_head);
+        assert_ne!(merged_head, remote_feature_head);
+
+        let takeover = ProcessIdentity::new("m98-ancestor-takeover", "test", "test");
+        let mut claimed = u22_expire_and_claim(&pool, run_id, &takeover).await;
+        assert!(
+            reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
+                .await
+                .unwrap()
+        );
+        assert_eq!(claimed.expected_head_sha, merged_head);
+
+        let observation = delivery::observe_delivery_takeover_with_receipted_parent(
+            &worktree,
+            Some("main"),
+            "fix/u22-base-advanced",
+            &u22_snapshot(&claimed),
+            None,
+            None,
+            None,
+            Option::<&ForeignPrHeadRemote>::None,
+        )
+        .await;
+        assert!(
+            observation.is_ok(),
+            "a remote ancestor head is the same identity: {observation:?}"
+        );
+        std::fs::remove_dir_all(fixture_root).ok();
+    }
+
+    /// M98-R3/R5 security boundary. A remote head this workspace cannot explain
+    /// (not equal, not the receipted parent, not an ancestor) still blocks.
+    #[tokio::test]
+    async fn m98_foreign_remote_head_still_blocks_takeover() {
+        let (fixture_root, worktree) = u22_base_advanced_repo();
+        let pool = u22_pool().await;
+        let run_id = "m98-foreign-branch-run";
+        let objective_id = "objective-m98-foreign-branch";
+        u22_seed_objective(&pool, run_id, objective_id).await;
+        let head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
+        u22_create_run(&pool, &worktree, run_id, objective_id, &head, None).await;
+
+        // A commit this workspace never produced, on the managed branch's ref.
+        let main_tree = recovery_git(&worktree, &["rev-parse", "origin/main^{tree}"]);
+        let foreign = recovery_git(
+            &worktree,
+            &["commit-tree", &main_tree, "-m", "chore: foreign write"],
+        );
+        let refspec = format!("+{foreign}:refs/heads/fix/u22-base-advanced");
+        recovery_git(&worktree, &["push", "-q", "origin", &refspec]);
+        recovery_git(&worktree, &["fetch", "-q", "origin"]);
+
+        let takeover = ProcessIdentity::new("m98-foreign-takeover", "test", "test");
+        let mut claimed = u22_expire_and_claim(&pool, run_id, &takeover).await;
+        assert_eq!(claimed.expected_head_sha, head);
+        let observation = delivery::observe_delivery_takeover_with_receipted_parent(
+            &worktree,
+            Some("main"),
+            "fix/u22-base-advanced",
+            &u22_snapshot(&claimed),
+            None,
+            None,
+            None,
+            Option::<&ForeignPrHeadRemote>::None,
+        )
+        .await;
+        assert!(
+            observation.is_err(),
+            "a foreign remote head must still fail closed: {observation:?}"
         );
         std::fs::remove_dir_all(fixture_root).ok();
     }
