@@ -30,16 +30,24 @@ impl ToolBackend for RepairTools {
             }
             "read_file" => (codefactory_agent_core::ToolKind::ReadOnly, 0, std::fs::read_to_string(source).unwrap(), String::new(), "read_file app.rs".into()),
             "bash" => {
-                assert_eq!(args["command"], "cargo test");
-                let name = if cfg!(windows) { "synthetic-check.exe" } else { "synthetic-check" };
-                let compile = Command::new(std::env::var_os("CF_FIXTURE_RUSTC").unwrap()).no_window()
-                    .args(["--test", "app.rs", "-o", name]).current_dir(&self.checkout).output().unwrap();
-                assert!(compile.status.success(), "{}", String::from_utf8_lossy(&compile.stderr));
-                let output = Command::new(self.checkout.join(name)).no_window().current_dir(&self.checkout).output().unwrap();
-                std::fs::remove_file(self.checkout.join(name)).unwrap();
+                assert_eq!(args["command"], "check-acceptance");
+                // The worker runs with a deliberately cleared environment, so a
+                // fresh `rustc` invocation cannot resolve the MSVC linker on
+                // Windows and falls back to whatever `link.exe` PATH offers
+                // (Git's `usr/bin/link.exe` then fails with "extra operand").
+                // The acceptance command therefore runs the already-built test
+                // executable as a real subprocess: real exit codes, real
+                // assertion output, and no linker or interpreter to discover.
+                let output = Command::new(std::env::current_exe().unwrap()).no_window()
+                    .args(["--ignored", ACCEPTANCE_PROBE])
+                    .env("CF_REPAIR_FIXTURE_EXPRESSION", self.checkout.join("app.rs"))
+                    .current_dir(&self.checkout).output().unwrap();
                 let code = output.status.code().unwrap();
+                let stdout = String::from_utf8(output.stdout).unwrap();
                 self.exits.lock().unwrap().push(code);
-                (codefactory_agent_core::ToolKind::Verification, code, String::from_utf8(output.stdout).unwrap(), String::from_utf8(output.stderr).unwrap(), "cargo test".into())
+                let reran = if code == 0 { stdout.contains("1 passed") } else { stdout.contains("FAILED") };
+                assert!(reran, "acceptance probe did not run: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+                (codefactory_agent_core::ToolKind::Verification, code, stdout, String::from_utf8(output.stderr).unwrap(), "check-acceptance".into())
             }
             other => panic!("unexpected synthetic tool {other}"),
         };
@@ -59,7 +67,35 @@ fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
     ToolCall { id: id.into(), r#type: "function".into(), function: FunctionCall { name: name.into(), arguments: args.to_string() } }
 }
 
-const BROKEN: &str = "pub fn double(value: i32) -> i32 { value + 2 }\n#[test] fn acceptance() { for value in [-3, 0, 2, 7, 19] { assert_eq!(double(value), value * 2); } }\n";
+const ACCEPTANCE_PROBE: &str = "synthetic_acceptance_probe";
+const BROKEN: &str = "value + 2\n";
+
+fn evaluate(expression: &str, value: i32) -> i32 {
+    let expression = expression.trim();
+    let (index, op) = expression
+        .char_indices()
+        .find(|(_, c)| matches!(c, '+' | '-' | '*'))
+        .expect("synthetic expression must contain one operator");
+    assert_eq!(expression[..index].trim(), "value", "synthetic expression must start with `value`");
+    let operand: i32 = expression[index + 1..].trim().parse().expect("synthetic expression needs an integer operand");
+    match op {
+        '+' => value + operand,
+        '-' => value - operand,
+        '*' => value * operand,
+        other => panic!("unsupported synthetic operator {other}"),
+    }
+}
+
+#[test]
+#[ignore = "acceptance probe executed as the fixture's verification subprocess"]
+fn synthetic_acceptance_probe() {
+    let source = std::env::var_os("CF_REPAIR_FIXTURE_EXPRESSION").expect("fixture probe only");
+    let expression = std::fs::read_to_string(source).unwrap();
+    for value in [-3, 0, 2, 7, 19] {
+        let actual = evaluate(&expression, value);
+        assert_eq!(actual, value * 2, "double({value}) from {:?}", expression.trim());
+    }
+}
 
 #[async_trait::async_trait]
 impl ModelTransport for RepairProvider {
@@ -79,7 +115,7 @@ impl ModelTransport for RepairProvider {
                 let accept = raw.find("accept: double(7) = 14").unwrap();
                 let correction = raw.find("correct: multiply, do not add").unwrap();
                 assert!(accept < correction);
-                ("Verify the mutation against the new acceptance", vec![call("verify-failure", "bash", json!({"command":"cargo test"}))])
+                ("Verify the mutation against the new acceptance", vec![call("verify-failure", "bash", json!({"command":"check-acceptance"}))])
             }
             2 => {
                 assert_eq!(*self.tools.exits.lock().unwrap(), vec![101]);
@@ -92,7 +128,7 @@ impl ModelTransport for RepairProvider {
                 assert!(raw.contains("value + 2"));
                 ("Addition violates the correction; change only the expression", vec![call("repair", "write_file", json!({"content": self.corrected}))])
             }
-            4 => ("Re-run the identical acceptance command", vec![call("verify-success", "bash", json!({"command":"cargo test"}))]),
+            4 => ("Re-run the identical acceptance command", vec![call("verify-success", "bash", json!({"command":"check-acceptance"}))]),
             5 => {
                 assert_eq!(*self.tools.exits.lock().unwrap(), vec![101, 0]);
                 ("Implemented double using multiplication. All five acceptance inputs pass.", vec![])

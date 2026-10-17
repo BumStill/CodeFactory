@@ -99,6 +99,15 @@
 - 真机验收由编排方发版后完成：安装 exact release，核对同 session 两条 steer 顺序、重连后原 objective/run、测试修复、CI 等待 owner 释放、恢复与单次 artifact 身份。当前无 UI 改动，不声称 L3/L4。
 - AI Collaboration：context scope 为任务/模板、FakeForge、queue、HTTP retry、delivery_run 与 registry；assumptions 为合成切片不等于完整 agent-loop；review point 为身份与副作用断言；validation result 为上述 Rust 全量和 registry 结果。模板禁止 delegate_tasks，故单执行流，无独立 QA 声明。
 
+## E2E-004 第二段 Windows 修复（2026-10-18）
+
+- 现象：`check-rust`（windows-latest）上 `e2e004_steer_reconnect_repair_resumes_same_durable_run` 失败，worker panic 在 `delivery_scenario_repair.rs` 的编译断言处；`gh run view --log-failed` 的完整日志是 `link.exe` 报 `link: extra operand '...rcgu.o' ... Try 'link --help'`。
+- 根因：那句 `link --help` 是 Git for Windows 自带的 coreutils `link.exe` 的输出，不是 MSVC 链接器。夹具原本在隔离 worker 内用 `rustc --test` 现场链接一个验收二进制，而 worker 为隔离 git/凭证会 `env_clear()`；Windows 上 rustc 因此无法从 MSVC 工具链环境解析链接器，回退到 PATH 中排在更前面的 Git `usr/bin/link.exe`。macOS/Linux 没有同名冲突，所以只在 Windows 红。
+- 修复（不放宽断言、不跳过或忽略被测路径）：验收命令改为在子进程运行**同一个已构建测试二进制**里的 `synthetic_acceptance_probe`（`--ignored` + 名称过滤），保持真实退出码 101→0 与真实的 ``assertion `left == right` failed`` 输出，五组输入 [-3,0,2,7,19] 不变；既不依赖原生链接器，也不引入 node/python 等额外解释器。工具命令名由 `cargo test` 改为 `check-acceptance`，并新增“探针确实执行”的断言（成功须含 `1 passed`、失败须含 `FAILED`），避免过滤路径写错时静默通过。
+- 同时删除 worker 对 `rustup which rustc` 的依赖，worker 不再需要现场编译任何东西。
+- 本地复跑：`CARGO_TARGET_DIR="$PWD/.codefactory-cache/cargo-target-e2e004s2" CARGO_INCREMENTAL=0 cargo test --manifest-path src-tauri/Cargo.toml --lib agent::delivery::scenario_tests:: -- --nocapture` → 11 passed、3 ignored（两个 supervisor-only worker 与验收探针本身，均由 supervisor 或夹具以子进程实际执行）。
+- 证据边界不变：仍是合成 fixture 的 L2 切片，诊断/修复由 fixture 驱动，L3/L4 与 manual_canary 保持 remaining gap。
+
 ## Stop Boundary
 
 - 不在文档完成、本地绿色、PR 通过、merge、公开资产或安装成功任一单点停止。

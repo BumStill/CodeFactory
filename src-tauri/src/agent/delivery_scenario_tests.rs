@@ -862,12 +862,8 @@ impl Worker {
         let log = world.join(format!("{phase}.log"));
         let output = std::fs::File::create(&log).unwrap();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
-        let rustc = Command::new("rustup").no_window().args(["which", "rustc"]).output().unwrap();
-        assert!(rustc.status.success(), "cannot resolve fixture compiler");
-        let rustc = String::from_utf8(rustc.stdout).unwrap();
         cmd.args(["--exact", WORKER, "--ignored", "--nocapture"])
             .env_clear()
-            .env("CF_FIXTURE_RUSTC", rustc.trim())
             .current_dir(world)
             .env("CF_DELIVERY_FIXTURE_WORLD", world)
             .env(
