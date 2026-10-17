@@ -359,29 +359,27 @@ pub(crate) fn parse_required_status_checks(value: &Value) -> Vec<RequiredStatusC
         .collect()
 }
 
-pub(crate) fn classify_ci_observation(
+fn run_identity(run: &Value) -> (String, Option<u64>) {
+    (
+        str_val(run, "name"),
+        run.get("app")
+            .and_then(|app| app.get("id"))
+            .and_then(Value::as_u64),
+    )
+}
+
+/// M108: keep only the newest check-run per (context, GitHub App) and drop runs
+/// that are not a required context. Shared by the one-line CI status and the
+/// per-check decision so both read exactly the same snapshot.
+fn latest_relevant_runs(
     value: &Value,
     required_checks: &[RequiredStatusCheck],
-) -> CiObservation {
+) -> (Vec<Value>, Vec<String>) {
     let raw_runs = value
         .get("check_runs")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let run_identity = |run: &Value| {
-        (
-            str_val(run, "name"),
-            run.get("app")
-                .and_then(|app| app.get("id"))
-                .and_then(Value::as_u64),
-        )
-    };
-
-    // A PR-body edit or workflow rerun creates another check-run with the same
-    // required context on the same commit. Judging every historical run makes
-    // the old red result win forever. Keep only the newest run per
-    // (context, GitHub App) identity; the monotonically increasing check-run id
-    // is also part of the fingerprint so recovery waits for fresh evidence.
     let mut latest_runs: Vec<Value> = Vec::new();
     for run in raw_runs {
         let identity = run_identity(&run);
@@ -429,7 +427,103 @@ pub(crate) fn classify_ci_observation(
                         .map_or(true, |expected| integration_id == Some(expected))
             })
         })
-        .map(|required| format!("{}:absent", required.context))
+        .map(|required| required.context.clone())
+        .collect::<Vec<_>>();
+    (runs, missing_required)
+}
+
+fn is_passing_conclusion(conclusion: &str) -> bool {
+    matches!(conclusion, "success" | "neutral" | "skipped")
+}
+
+/// M108/R2: one failed check as the decision model sees it — the job name, the
+/// trust-root marker when the gate refused a self-modification, and the failing
+/// test name when the log named one.
+fn failed_check_detail(run: &Value, name: &str, conclusion: &str) -> String {
+    let url = str_val(run, "details_url");
+    let mut detail = if url.is_empty() {
+        format!("failure:{name}:{conclusion}")
+    } else {
+        format!("failure:{name}:{conclusion} [{url}]")
+    };
+    let output = run.get("output");
+    let output_text = |key: &str| {
+        output
+            .and_then(|output| output.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    };
+    if ["title", "summary", "text"]
+        .iter()
+        .any(|key| output_text(key).contains(crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER))
+    {
+        detail.push_str(&format!(
+            " ({})",
+            crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER
+        ));
+    }
+    if let Some(test) = ["text", "summary", "title"]
+        .iter()
+        .find_map(|key| crate::agent::objective::failing_test_name(output_text(key)))
+    {
+        detail.push_str(&format!(" — test {test} ... FAILED"));
+    }
+    detail
+}
+
+/// M108: the full per-check snapshot of one PR head. The delivery outcome is
+/// decided from this list, so a trust-root refusal on one required check can
+/// never erase a red test running beside it.
+pub(crate) fn ci_check_states(
+    value: &Value,
+    required_checks: &[RequiredStatusCheck],
+) -> Vec<crate::agent::objective::CiCheckState> {
+    let (runs, missing_required) = latest_relevant_runs(value, required_checks);
+    let mut states = runs
+        .iter()
+        .map(|run| {
+            let job = str_val(run, "name");
+            let status = str_val(run, "status");
+            let conclusion = run
+                .get("conclusion")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let detail = match conclusion.as_deref() {
+                Some(passing) if is_passing_conclusion(passing) => None,
+                Some(failed) if status == "completed" => {
+                    Some(failed_check_detail(run, &job, failed))
+                }
+                _ => None,
+            };
+            crate::agent::objective::CiCheckState {
+                job,
+                status,
+                conclusion,
+                detail,
+            }
+        })
+        .collect::<Vec<_>>();
+    for context in missing_required {
+        states.push(crate::agent::objective::CiCheckState {
+            job: context,
+            status: "queued".into(),
+            conclusion: None,
+            detail: None,
+        });
+    }
+    states.sort_by(|left, right| left.job.cmp(&right.job));
+    states
+}
+
+pub(crate) fn classify_ci_observation(
+    value: &Value,
+    required_checks: &[RequiredStatusCheck],
+) -> CiObservation {
+    let (runs, missing_required) = latest_relevant_runs(value, required_checks);
+    let missing_required = missing_required
+        .into_iter()
+        .map(|context| format!("{context}:absent"))
         .collect::<Vec<_>>();
     let fingerprint = if runs.is_empty() && missing_required.is_empty() {
         "none".to_string()
@@ -463,49 +557,28 @@ pub(crate) fn classify_ci_observation(
         };
     }
     let mut any_pending = false;
+    // M108/R2: report *every* failed check on this head. Returning the first one
+    // let a trust-root refusal on one required check hide a red test running
+    // beside it (#713: `check-rust` panicked while `scenario-gate-pr` refused a
+    // registry edit), so the whole run was read as "wait for the orchestrator".
+    let mut failures = Vec::new();
     for run in &runs {
         let status = str_val(run, "status");
         if status != "completed" {
             any_pending = true;
             continue;
         }
-        match str_val(run, "conclusion").as_str() {
-            "success" | "neutral" | "skipped" => {}
-            other => {
-                let name = str_val(run, "name");
-                let url = str_val(run, "details_url");
-                let mut detail = if url.is_empty() {
-                    format!("failure:{name}:{other}")
-                } else {
-                    format!("failure:{name}:{other} [{url}]")
-                };
-                // M104/R2: carry the trust-root refusal verbatim, so every reader
-                // of this observation (the delivery outcome, the parked
-                // Objective, the session's wake prompt) can tell "only the
-                // scenario gate refused a self-modification" apart from a red
-                // test. Without this marker the failure is indistinguishable and
-                // the session is told to repair code it must not touch.
-                let output = run.get("output");
-                let refused_trust_root = ["title", "summary", "text"].iter().any(|key| {
-                    output
-                        .and_then(|output| output.get(*key))
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| {
-                            text.contains(crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER)
-                        })
-                });
-                if refused_trust_root {
-                    detail.push_str(&format!(
-                        " ({})",
-                        crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER
-                    ));
-                }
-                return CiObservation {
-                    status: detail,
-                    fingerprint,
-                };
-            }
+        let conclusion = str_val(run, "conclusion");
+        if is_passing_conclusion(&conclusion) {
+            continue;
         }
+        failures.push(failed_check_detail(run, &str_val(run, "name"), &conclusion));
+    }
+    if !failures.is_empty() {
+        return CiObservation {
+            status: failures.join("；"),
+            fingerprint,
+        };
     }
     CiObservation {
         status: if any_pending { "pending" } else { "success" }.into(),
@@ -552,4 +625,144 @@ pub async fn list_repos(client: &RemoteGitClient) -> Result<Vec<RemoteRepo>, Str
             stars: u64_val(r, "stargazers_count"),
         })
         .collect())
+}
+
+/// M108: the shape of a real PR head, taken from objective #713 (session
+/// cd8d910e). Both required checks concluded red at the same moment: an
+/// ordinary Windows test panic in `check-rust`, and the expected trust-root
+/// refusal in `scenario-gate-pr`. Reporting only one of them loses the fact
+/// that the session still has work to do, so this fixture is the regression
+/// shape for the decision the waiting session receives.
+#[cfg(test)]
+mod m108_ci_shape_tests {
+    use super::*;
+    use crate::agent::objective::{classify_ci_checks, ci_outcome_wake_prompt, CiOutcome};
+
+    fn required() -> Vec<RequiredStatusCheck> {
+        vec![
+            RequiredStatusCheck {
+                context: "check-rust".into(),
+                integration_id: None,
+            },
+            RequiredStatusCheck {
+                context: "scenario-gate-pr".into(),
+                integration_id: None,
+            },
+        ]
+    }
+
+    fn pr_713_head() -> Value {
+        json!({
+            "check_runs": [
+                {
+                    "id": 9001,
+                    "name": "check-rust",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "details_url": "https://github.com/BumStill/CodeFactory/runs/9001",
+                    "output": {
+                        "title": "lifecycle_smoke panicked at lifecycle_smoke.rs:141:46",
+                        "summary": "test windows_worktree_target_is_shared ... FAILED",
+                        "text": "test windows_worktree_target_is_shared ... FAILED\n\n---- windows_worktree_target_is_shared stdout ----\nthread 'windows_worktree_target_is_shared' panicked at lifecycle_smoke.rs:141:46"
+                    }
+                },
+                {
+                    "id": 9002,
+                    "name": "scenario-gate-pr",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "details_url": "https://github.com/BumStill/CodeFactory/runs/9002",
+                    "output": {
+                        "title": "trust roots cannot self-modify",
+                        "summary": "cannot self-modify: docs/testing/scenario-registry.json",
+                        "text": ""
+                    }
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn a_trust_root_refusal_must_not_hide_the_red_check_beside_it() {
+        let value = pr_713_head();
+        let observation = classify_ci_observation(&value, &required());
+        assert!(
+            observation.status.contains("check-rust"),
+            "the ordinary failure must survive the report: {}",
+            observation.status
+        );
+        assert!(
+            observation.status.contains("scenario-gate-pr"),
+            "the trust-root refusal must be reported too: {}",
+            observation.status
+        );
+        assert!(
+            observation.status.contains("windows_worktree_target_is_shared"),
+            "the failing test name must reach the session: {}",
+            observation.status
+        );
+
+        let outcome = classify_ci_checks(&ci_check_states(&value, &required()), 0);
+        match &outcome {
+            CiOutcome::Failed(failures) => assert_eq!(
+                failures.iter().map(|check| check.job.as_str()).collect::<Vec<_>>(),
+                vec!["check-rust", "scenario-gate-pr"],
+                "both red checks belong to the failure evidence"
+            ),
+            other => panic!("mixed failures must stay repairable, got {other:?}"),
+        }
+        assert!(outcome.is_session_repairable());
+        let prompt = ci_outcome_wake_prompt("PR #713", &outcome);
+        assert!(prompt.contains("check-rust"), "{prompt}");
+        assert!(
+            prompt.contains("windows_worktree_target_is_shared"),
+            "the failing test name must be in the wake input: {prompt}"
+        );
+        assert!(
+            !prompt.contains("等编排方放行"),
+            "an ordinary failure is not the orchestrator's to release: {prompt}"
+        );
+    }
+
+    #[test]
+    fn a_trust_root_refusal_alone_still_waits_for_the_orchestrator() {
+        let value = json!({
+            "check_runs": [
+                {"id": 9101, "name": "check-rust", "status": "completed", "conclusion": "success"},
+                {
+                    "id": 9102,
+                    "name": "scenario-gate-pr",
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "output": {"title": "trust roots cannot self-modify"}
+                }
+            ]
+        });
+        let observation = classify_ci_observation(&value, &required());
+        assert!(observation.status.contains("cannot self-modify"), "{}", observation.status);
+        let outcome = classify_ci_checks(&ci_check_states(&value, &required()), 0);
+        assert!(matches!(outcome, CiOutcome::TrustRootOnly(_)), "{outcome:?}");
+        assert!(!outcome.is_session_repairable());
+        let prompt = ci_outcome_wake_prompt("PR #713", &outcome);
+        assert!(prompt.contains("等编排方放行"), "{prompt}");
+    }
+
+    #[test]
+    fn a_green_head_wakes_the_session_to_the_arm_step() {
+        let value = json!({
+            "check_runs": [
+                {"id": 9201, "name": "check-rust", "status": "completed", "conclusion": "success"},
+                {"id": 9202, "name": "scenario-gate-pr", "status": "completed", "conclusion": "success"}
+            ]
+        });
+        assert_eq!(
+            classify_ci_observation(&value, &required()).status,
+            "success",
+            "green stays green"
+        );
+        let outcome = classify_ci_checks(&ci_check_states(&value, &required()), 0);
+        assert_eq!(outcome, CiOutcome::AllGreen);
+        let prompt = ci_outcome_wake_prompt("PR #713", &outcome);
+        assert!(prompt.contains("merge-queue: armed"), "{prompt}");
+    }
 }

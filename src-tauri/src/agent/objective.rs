@@ -7569,7 +7569,43 @@ pub fn failing_test_name(detail: &str) -> Option<String> {
             }
         }
     }
-    None
+    // M108: the aggregated CI status line keeps a single line per failed check,
+    // so the harness line can sit after the job prefix instead of at line start.
+    let start = detail.find("test ")?;
+    let rest = &detail[start + "test ".len()..];
+    let end = rest.find(" ... FAILED")?;
+    let name = rest[..end].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// M108/R2: rebuild the per-check evidence from one CI status line. The parked
+/// delivery observer only gets the status string, so the trust-root refusal has
+/// to be excluded per check — collapsing the string to "contains the marker"
+/// would turn a red test running beside the refusal into a wait for the
+/// orchestrator.
+pub fn ci_checks_from_status(status: &str) -> Vec<CiCheckState> {
+    status
+        .split('；')
+        .filter_map(|segment| {
+            let segment = segment.trim();
+            // `GhCliRemote::ci_status` strips the leading `failure:` when it
+            // builds `CiStatus::Failure`, so the first segment can arrive
+            // without it while later ones keep it. A segment without a
+            // `job:conclusion` shape (e.g. `pending`) is not a failure at all.
+            let rest = segment.strip_prefix("failure:").unwrap_or(segment);
+            let (job, _) = rest.split_once(':')?;
+            let job = job.trim();
+            if job.is_empty() {
+                return None;
+            }
+            Some(CiCheckState {
+                job: job.to_string(),
+                status: "completed".into(),
+                conclusion: Some("failure".into()),
+                detail: Some(rest.to_string()),
+            })
+        })
+        .collect()
 }
 
 fn ci_failure_line(check: &CiCheckState) -> String {
@@ -16497,5 +16533,61 @@ mod m104_ci_wake_tests {
         let prompt = ci_outcome_wake_prompt("PR #704", &stalled);
         assert!(prompt.contains("61 分钟"), "{prompt}");
         assert!(!stalled.is_session_repairable());
+    }
+}
+
+/// M108/R2+R3: the parked-delivery observer hands the decision one CI status
+/// line, not the raw check-run payload. This rebuilds the per-check evidence so
+/// the trust-root refusal can be excluded *per check* instead of collapsing the
+/// whole run into "wait for the orchestrator".
+#[cfg(test)]
+mod m108_reconcile_decision_tests {
+    use super::*;
+
+    #[test]
+    fn a_red_head_with_a_trust_root_refusal_still_reports_the_ordinary_failure() {
+        let status = "failure:check-rust:failure [https://github.com/runs/9001] — test windows_worktree_target_is_shared ... FAILED\
+；failure:scenario-gate-pr:failure [https://github.com/runs/9002] (cannot self-modify)";
+        let checks = ci_checks_from_status(status);
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        let outcome = classify_ci_checks(&checks, 0);
+        match &outcome {
+            CiOutcome::Failed(failures) => assert_eq!(failures.len(), 2, "{failures:?}"),
+            other => panic!("a red test beside a trust-root refusal is repairable: {other:?}"),
+        }
+        let prompt = ci_outcome_wake_prompt("PR #713", &outcome);
+        assert!(prompt.contains("check-rust"), "{prompt}");
+        assert!(
+            prompt.contains("windows_worktree_target_is_shared"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("等编排方放行"), "{prompt}");
+    }
+
+    #[test]
+    fn a_status_line_with_only_the_trust_root_refusal_is_not_a_task_failure() {
+        let checks = ci_checks_from_status(
+            "failure:scenario-gate-pr:failure [https://github.com/runs/9002] (cannot self-modify)",
+        );
+        assert_eq!(checks.len(), 1);
+        let outcome = classify_ci_checks(&checks, 0);
+        assert!(matches!(outcome, CiOutcome::TrustRootOnly(_)), "{outcome:?}");
+        assert!(!outcome.is_session_repairable());
+        let prompt = ci_outcome_wake_prompt("PR #713", &outcome);
+        assert!(prompt.contains("等编排方放行"), "{prompt}");
+        assert!(prompt.contains("不是任务失败"), "{prompt}");
+    }
+
+    #[test]
+    fn an_unfinished_head_never_becomes_a_verdict() {
+        assert!(ci_checks_from_status("pending").is_empty());
+        assert!(ci_checks_from_status("success").is_empty());
+        let running = vec![CiCheckState {
+            job: "check-rust".into(),
+            status: "in_progress".into(),
+            conclusion: None,
+            detail: None,
+        }];
+        assert_eq!(classify_ci_checks(&running, 0), CiOutcome::StillRunning);
     }
 }

@@ -5957,29 +5957,38 @@ pub async fn deliver<R: DeliveryRemote>(
             CiStatus::Success | CiStatus::None => {
                 outcome.steps.push(StepResult::ok("ci", "CI 通过"))
             }
-            CiStatus::Failure(d)
-                if d.contains(crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER) =>
-            {
-                // M104/R2: the scenario gate refused a trust-root
-                // self-modification. Only the orchestrator can release that PR,
-                // so this is a stated wait — not a red test and not work the
-                // session may repeat.
-                return outcome.blocked_at(StepResult::blocked(
-                    "trust_root_gate",
-                    format!(
-                        "CI 里只有信任根自修改检查未通过（{d}）。这是预期结果，不是任务失败：\
-不要重试实现，也不要改动门禁；向用户明确说明「等编排方放行」，然后结束这一轮。"
-                    ),
-                ));
-            }
             CiStatus::Failure(d) => {
+                // M108/R2: decide from every failed check, not from the first
+                // one. A trust-root refusal only means "wait for the
+                // orchestrator" when it is the *only* failure; a red test on the
+                // same head still belongs to the session (#713).
+                let ci_outcome = crate::agent::objective::classify_ci_checks(
+                    &crate::agent::objective::ci_checks_from_status(&d),
+                    0,
+                );
+                if matches!(
+                    ci_outcome,
+                    crate::agent::objective::CiOutcome::TrustRootOnly(_)
+                ) {
+                    // M104/R2: the scenario gate refused a trust-root
+                    // self-modification. Only the orchestrator can release that
+                    // PR, so this is a stated wait — not a red test and not work
+                    // the session may repeat.
+                    return outcome.blocked_at(StepResult::blocked(
+                        "trust_root_gate",
+                        format!(
+                            "CI 里只有信任根自修改检查未通过（{d}）。这是预期结果，不是任务失败：\
+不要重试实现，也不要改动门禁；向用户明确说明「等编排方放行」，然后结束这一轮。"
+                        ),
+                    ));
+                }
                 return outcome.blocked_at(StepResult::blocked(
                     "ci",
                     format!(
                         "CI 未通过: {d}。读取该 check 的失败日志，修复对应代码、测试或配置，\
 提交并 push 新 head 后重新调用 deliver_changes 续接；不要重复运行未修改的同一失败。"
                     ),
-                ))
+                ));
             }
             CiStatus::Unavailable(detail) => {
                 return outcome.remote_observation_failed(
@@ -8227,6 +8236,27 @@ pub struct GhCliRemote {
     default_branch: String,
     release_workflow: String,
     ci_stability: CiObservationStability,
+}
+
+impl GhCliRemote {
+    /// M108/R2+R4: the per-check snapshot of one head, for the parked-delivery
+    /// decision. Read-only: it never reruns, arms or merges anything.
+    pub(crate) async fn observed_ci_checks(
+        &self,
+        sha: &str,
+    ) -> Result<Vec<crate::agent::objective::CiCheckState>, String> {
+        let raw = self.gh(&[
+            "api".into(),
+            format!("repos/{}/commits/{}/check-runs", self.repo, sha),
+        ])?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("check-runs non-JSON: {e}"))?;
+        let required = github_required_status_checks(self.gh(&[
+            "api".into(),
+            format!("repos/{}/rules/branches/{}", self.repo, self.default_branch),
+        ]))?;
+        Ok(crate::git_remote::github::ci_check_states(&value, &required))
+    }
 }
 
 /// Build a [`GhCliRemote`] for `cwd` when it is a GitHub checkout. Does not
