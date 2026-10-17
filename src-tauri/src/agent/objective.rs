@@ -16767,7 +16767,7 @@ mod m104_ci_wake_tests {
         assert!(prompt.contains("未提交"), "{prompt}");
         assert!(
             wait.next_action_authorized,
-            "the next action must continue the delivery instead of parking"
+            "the wait authorizes the next delivery action so the work resumes by itself"
         );
         assert!(!wait.requires_user_action);
     }
