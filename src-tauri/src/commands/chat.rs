@@ -1734,6 +1734,8 @@ fn chat_failure_code_for_error(error_text: &str) -> &'static str {
         // and must converge to the same honest terminal instead of consuming
         // the system recovery budget repeatedly.
         crate::agent::objective::CHAT_IDENTITY_UNRECONCILABLE
+    } else if error_text.contains("PROVIDER_RECONCILIATION_UNSAFE") {
+        "provider_reconciliation_unsafe"
     } else if error_text.contains(crate::agent::provider_recovery::PROVIDER_EPISODE_FENCE_MARKER) {
         // U21: the prior model request started a side effect that is still
         // unresolved. It keeps the ordinary bounded ladder — the tool side may

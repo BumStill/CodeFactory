@@ -227,6 +227,9 @@ pub fn plain_failure_reason(failure_code: Option<&str>) -> String {
         "provider_transport_unreachable" => "网络或模型服务连不上，一直没能连上",
         "chat_identity_unreconcilable" => "任务恢复时找不到原有会话记录；工作区里的改动仍保留，请从该会话继续处理",
         "provider_route_unavailable" => "没有可用的模型线路",
+        "provider_reconciliation_unsafe" => {
+            "无法确认上一步外部操作是否完成，已停止以避免重复执行；已有输出保留在当前会话，文件改动保留在项目工作目录，请查看工具记录与交付回执".into()
+        }
         "provider_episode_unreconciled" => {
             "上一次模型回复中断时已经开始了一项改动，这项改动的结果一直没法确认，所以没有贸然重做"
         }
