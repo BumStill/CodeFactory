@@ -172,6 +172,18 @@ pub(crate) trait CanonicalPrObserver: Send + Sync {
         pr_url: &str,
         expected_head_sha: &str,
     ) -> Result<CanonicalPrState>;
+
+    /// M108/R4: the CI conclusion of the observed head, when the observer can
+    /// read it. `None` keeps the old "still awaiting CI" park; `Some` lets the
+    /// reconcile pass hand the waiting session a decision instead of clearing
+    /// its wake schedule.
+    async fn observe_ci_checks(
+        &self,
+        _repo_root: &Path,
+        _expected_head_sha: &str,
+    ) -> Option<Vec<crate::agent::objective::CiCheckState>> {
+        None
+    }
 }
 
 /// No-network observer used by the deterministic offline pass and by tests: it
@@ -234,6 +246,17 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
             )),
             Err(error) => Err(anyhow!("observe canonical PR #{pr_number}: {error}")),
         }
+    }
+
+    async fn observe_ci_checks(
+        &self,
+        repo_root: &Path,
+        expected_head_sha: &str,
+    ) -> Option<Vec<crate::agent::objective::CiCheckState>> {
+        use crate::agent::delivery::gh_remote_for;
+        let remote = gh_remote_for(repo_root)
+            .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)))?;
+        remote.observed_ci_checks(expected_head_sha).await.ok()
     }
 }
 
@@ -1242,6 +1265,60 @@ pub(crate) async fn reconcile_parked_delivery_progress(
         if objective_status == "cancelled" && !merged {
             continue;
         }
+        // M108/R4: an open PR whose checks already concluded must hand the
+        // waiting session a decision. The previous pass re-wrote
+        // `delivered_awaiting_ci`, cleared `next_observation_at` and dropped the
+        // attention prompt, so a finished red CI (#713: check-rust panic beside
+        // the expected trust-root refusal) sat unread until a human transcribed
+        // it. `classify_ci_checks` excludes the trust-root refusal per check, so
+        // any ordinary failure still wakes the session.
+        let ci_decision = if matches!(&state, Ok(CanonicalPrState::Open)) {
+            let reference_label = format!("PR #{}", reference.canonical_pr_number);
+            match observer
+                .observe_ci_checks(
+                    Path::new(&candidate.repo_root),
+                    &reference.canonical_head_sha,
+                )
+                .await
+            {
+                Some(checks) => {
+                    let outcome = crate::agent::objective::classify_ci_checks(&checks, 0);
+                    Some((
+                        outcome.failure_code().to_string(),
+                        crate::agent::objective::ci_outcome_wake_prompt(&reference_label, &outcome),
+                    ))
+                }
+                None => Some((
+                    crate::agent::objective::DELIVERED_AWAITING_CI.to_string(),
+                    crate::agent::objective::delivered_awaiting_ci_message(&reference_label),
+                )),
+            }
+        } else {
+            None
+        };
+        let sql_text = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let wait_failure_code = ci_decision
+            .as_ref()
+            .map(|(code, _)| code.as_str())
+            .unwrap_or(crate::agent::objective::DELIVERED_AWAITING_CI);
+        let wait_attention = ci_decision.as_ref().map(|(code, prompt)| {
+            serde_json::json!({
+                "kind": code,
+                "prompt": prompt,
+                "missing_inputs": [],
+                "attempted_routes": [],
+                "decision_options": [],
+                "recommended_option": null,
+                "irreversible": false,
+                "no_safe_default_reason": null,
+                "resume_cursor": null,
+            })
+            .to_string()
+        });
+        let wait_next_observation_at = crate::agent::objective::bounded_next_observation_at(
+            now,
+            now.saturating_add(crate::agent::objective::DELIVERED_CI_REOBSERVE_MS),
+        );
         // Positive merge evidence settles delivery-only acceptance even after
         // a real stop. This read-only settlement never resumes stopped work or
         // removes its durable stop fence.
@@ -1336,12 +1413,13 @@ pub(crate) async fn reconcile_parked_delivery_progress(
             ("revision", "revision+1".to_string()),
             ("decision_type", format!("'{}'", if complete { "complete" } else { "waiting" })),
             ("reached_acceptance", format!("'{reached}'")),
-            ("failure_code", if complete { "NULL".into() } else { "'delivered_awaiting_ci'".into() }),
+            ("failure_code", if complete { "NULL".into() } else { sql_text(wait_failure_code) }),
             ("cancellation_provenance", "NULL".into()),
             ("failure_signature", "NULL".into()), ("recovery_owner", "NULL".into()),
             ("remediation_id", "NULL".into()), ("lease_owner", "NULL".into()),
-            ("lease_expires_at", "NULL".into()), ("next_observation_at", "NULL".into()),
-            ("attention_request_json", "NULL".into()),
+            ("lease_expires_at", "NULL".into()),
+            ("next_observation_at", if complete { "NULL".into() } else { wait_next_observation_at.to_string() }),
+            ("attention_request_json", if complete { "NULL".into() } else { wait_attention.as_deref().map(sql_text).unwrap_or_else(|| "NULL".into()) }),
             ("evidence_ref", format!("'delivery_run_events:{event_id}'")),
             ("completed_at", if complete { now.to_string() } else { "NULL".into() }),
             ("updated_at", now.to_string()), ("last_progress_at", now.to_string()),
@@ -4760,6 +4838,152 @@ mod tests {
         assert_eq!(settled.1, None);
         assert_eq!(settled.2, "completed");
         assert_eq!(settled.3, "merged");
+    }
+
+    /// M108/R4: an open PR whose checks already concluded. The observer reports
+    /// the real check list so the reconcile pass makes the same decision the
+    /// delivery tool makes, instead of re-parking the objective silently.
+    struct SyntheticCiObserver {
+        checks: Vec<crate::agent::objective::CiCheckState>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::CanonicalPrObserver for SyntheticCiObserver {
+        async fn observe(
+            &self,
+            _repo_root: &Path,
+            _pr_number: i64,
+            _pr_url: &str,
+            _expected_head_sha: &str,
+        ) -> anyhow::Result<super::CanonicalPrState> {
+            Ok(super::CanonicalPrState::Open)
+        }
+
+        async fn observe_ci_checks(
+            &self,
+            _repo_root: &Path,
+            _head_sha: &str,
+        ) -> Option<Vec<crate::agent::objective::CiCheckState>> {
+            Some(self.checks.clone())
+        }
+    }
+
+    fn ci_state(
+        job: &str,
+        conclusion: &str,
+        detail: Option<&str>,
+    ) -> crate::agent::objective::CiCheckState {
+        crate::agent::objective::CiCheckState {
+            job: job.into(),
+            status: "completed".into(),
+            conclusion: Some(conclusion.into()),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn m108_a_finished_ci_decision_wakes_the_parked_delivery() {
+        use crate::agent::objective::{
+            CiCheckState, DELIVERED_CI_FAILED, DELIVERED_CI_GREEN, DELIVERED_CI_TRUST_ROOT_ONLY,
+        };
+        let cases: Vec<(Vec<CiCheckState>, &str, &str)> = vec![
+            (
+                vec![
+                    ci_state(
+                        "check-rust",
+                        "failure",
+                        Some("test windows_worktree_target_is_shared ... FAILED"),
+                    ),
+                    ci_state(
+                        "scenario-gate-pr",
+                        "failure",
+                        Some("trust roots cannot self-modify"),
+                    ),
+                ],
+                DELIVERED_CI_FAILED,
+                "check-rust",
+            ),
+            (
+                vec![
+                    ci_state("check-rust", "success", None),
+                    ci_state(
+                        "scenario-gate-pr",
+                        "failure",
+                        Some("trust roots cannot self-modify"),
+                    ),
+                ],
+                DELIVERED_CI_TRUST_ROOT_ONLY,
+                "等编排方放行",
+            ),
+            (
+                vec![
+                    ci_state("check-rust", "success", None),
+                    ci_state("scenario-gate-pr", "success", None),
+                ],
+                DELIVERED_CI_GREEN,
+                "merge-queue: armed",
+            ),
+        ];
+        for (checks, expected_code, expected_prompt) in cases {
+            let (_temp, root, _remote, container) = init_repo();
+            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+            crate::agent::objective::ObjectiveStore::new(pool.clone())
+                .create(crate::agent::objective::CreateObjective {
+                    id: "synthetic-m108".into(),
+                    kind: crate::agent::objective::ObjectiveKind::Delivery,
+                    session_id: None,
+                    root_turn_id: None,
+                    domain: crate::agent::objective::RecoveryDomain::Delivery,
+                    requested_acceptance: "merged".into(),
+                    created_surface: "synthetic-test".into(),
+                })
+                .await
+                .unwrap();
+            let workspace = allocate_or_attach(
+                &pool,
+                request_for(&root, &container, "synthetic-m108", "process-a"),
+            )
+            .await
+            .unwrap();
+            record_open_canonical_pr(&pool, &workspace, 713, "through_merge").await;
+            // The session is parked exactly as the field incident left it.
+            sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', failure_code='delivered_awaiting_ci', next_observation_at=NULL, attention_request_json=NULL")
+                .execute(&pool).await.unwrap();
+            super::reconcile_parked_delivery_progress(
+                &pool,
+                &SyntheticCiObserver { checks },
+                "m108-observer",
+            )
+            .await
+            .unwrap();
+            let (code, next, attention): (Option<String>, Option<i64>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT failure_code,next_observation_at,attention_request_json FROM objectives WHERE id='synthetic-m108'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                code.as_deref(),
+                Some(expected_code),
+                "the parked delivery must take the CI decision, not stay delivered_awaiting_ci"
+            );
+            assert!(
+                next.is_some_and(|at| at > 0),
+                "a concluded CI must schedule the wake instead of clearing next_observation_at"
+            );
+            let prompt = attention.unwrap_or_default();
+            assert!(
+                prompt.contains(expected_prompt),
+                "{expected_code}: the wake input must carry `{expected_prompt}`: {prompt}"
+            );
+            if expected_code == DELIVERED_CI_FAILED {
+                assert!(
+                    prompt.contains("windows_worktree_target_is_shared"),
+                    "the failing test name must reach the next turn: {prompt}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
