@@ -227,6 +227,20 @@ deliver_changes 却没有用上。合并队列 squash 时取提交标题，这�
 - close_objective 只接受明确 accepted，要求 merged 等待或幂等完成；同事务写审计与 evidence_ref，清理仍走 CF-CLOSEOUT 包含性门禁。
 - 证据与命令见 docs/testing/m8-m28-m84-acceptance.md。
 
+## 历史交付多记录滞后结算（#555，CF-TRUTH-R8 / CF-CLOSEOUT）
+
+批准任务要求（逐字记录）：
+
+1. 用合成数据复现这类形态（多条 delivery_runs、最新一行停在 pr_open / ci_green、PR 实际已合并），断言：后台对账能按远端真实状态把它推进到 merged 并结算；或者 close_objective 能基于远端已合并这一事实接受关闭。不能为了关掉它而放宽「必须已合并」的要求。
+2. 先写失败测试，再修。本任务不读写生产数据库；修好的新版装上后，由编排方在真机上核对这条记录能否关闭。
+
+### Implementation Notes
+
+- 沿用 CF-TRUTH-R8、CF-CLOSEOUT 与现有 Harness，不改变 close_objective 的合并要求。最新 canonical run 已观察合并时，事务内重新确认它仍是同一 objective 的最新 canonical run，并将滞后的 delivery_run_id 接上；现有 claim_epoch/head/PR/lease 围栏保持。
+- merged 行无新增进展时仍允许补结算 objective；同一指针、状态与验收已一致时不重复写事件或 revision。相同 updated_at 用 rowid 决定顺序，查询和事务围栏一致。
+- 合成回归 `lagged_latest_delivery_run_settles_remote_merge` 覆盖多行、旧指针、最新 pr_open/ci_green/merged、Unknown/关闭未合并反例与重复观察幂等；修复前断言 waiting_system != completed，修复后通过。原 live/release 与严格清理回归保持。
+- 真机验收由编排方发版安装后完成：等待后台观察 #555 已合并，核对 cd76d8d2 对应 objective/delivery run 的 merged 与结算审计；从本地入口调用 close_objective(outcome=accepted)，确认幂等成功。不得在本任务操作生产数据库。
+
 ## M76 / M77 / M81 返修：交付不再挂起无人推进
 
 背景与用户决策（真机证据，2026-10-13，v1.87.4 / v1.87.5）：

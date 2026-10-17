@@ -674,7 +674,7 @@ async fn load_canonical_pr_reference_with_identity(
            AND delivery_runs.canonical_pr_number IS NOT NULL
            AND delivery_runs.canonical_pr_url IS NOT NULL
            AND delivery_runs.canonical_head_sha IS NOT NULL
-         ORDER BY delivery_runs.updated_at DESC",
+         ORDER BY delivery_runs.updated_at DESC, delivery_runs.rowid DESC",
     )
     .bind(&candidate.objective_id)
     .fetch_all(pool)
@@ -1290,7 +1290,7 @@ pub(crate) async fn reconcile_parked_delivery_progress(
             .bind(reference.canonical_pr_number).bind(now).bind(stage).bind(reached).bind(reached).bind(reached)
             .execute(&mut *tx).await?;
         if changed.rows_affected() == 0 {
-            if !repair { continue; }
+            if !repair && !merged { continue; }
             let fenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_runs WHERE id=? AND claim_epoch=? AND expected_head_sha=? AND canonical_head_sha=? AND canonical_pr_number=? AND (lease_expires_at IS NULL OR lease_expires_at<=?) AND reached_ceiling='merged'")
                 .bind(&reference.run_id).bind(reference.claim_epoch).bind(&reference.expected_head_sha)
                 .bind(&reference.canonical_head_sha).bind(reference.canonical_pr_number).bind(now)
@@ -1341,11 +1341,19 @@ pub(crate) async fn reconcile_parked_delivery_progress(
             if columns.iter().any(|c| c == column) { sets.push(format!("{column}={expression}")); }
         }
         let pointer = if columns.iter().any(|c| c == "delivery_run_id") {
-            " AND delivery_run_id=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)"
+            // Adopt only the still-latest canonical run for this objective.
+            // A concurrent delivery or active executor must fence settlement.
+            sets.push("delivery_run_id=?".into());
+            " AND ?=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id AND canonical_pr_number IS NOT NULL AND canonical_pr_url IS NOT NULL AND canonical_head_sha IS NOT NULL ORDER BY updated_at DESC, rowid DESC LIMIT 1) AND (lease_expires_at IS NULL OR lease_expires_at<=?) AND NOT COALESCE((delivery_run_id=? AND status=? AND reached_acceptance=? AND failure_code IS NULL),0)"
         } else { "" };
         let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ('running','waiting_system','cancelled','failed','completed'){pointer}", sets.join(","));
-        let mut query = sqlx::query(&statement).bind(&candidate.objective_id);
-        if !pointer.is_empty() { query = query.bind(&reference.run_id).bind(now); }
+        let mut query = sqlx::query(&statement);
+        if !pointer.is_empty() { query = query.bind(&reference.run_id); }
+        query = query.bind(&candidate.objective_id);
+        if !pointer.is_empty() {
+            query = query.bind(&reference.run_id).bind(now).bind(&reference.run_id)
+                .bind(if complete { "completed" } else { "waiting_system" }).bind(reached);
+        }
         if query.execute(&mut *tx).await?.rows_affected() != 1 { continue; }
         if complete { mark_objective_terminal_in_tx(&mut tx, &candidate.objective_id, now).await?; }
         tx.commit().await?;
@@ -4684,6 +4692,44 @@ mod tests {
         assert_eq!(settled.1, None);
         assert_eq!(settled.2, "completed");
         assert_eq!(settled.3, "merged");
+    }
+
+    #[tokio::test]
+    async fn lagged_latest_delivery_run_settles_remote_merge() {
+        for reached in ["pr_open", "ci_green", "merged"] {
+            let (_temp, root, _remote, container) = init_repo();
+            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+            crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
+                crate::agent::objective::CreateObjective {
+                    id: "synthetic-lagged".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
+                    session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
+                    requested_acceptance: "merged".into(), created_surface: "synthetic-test".into(),
+                },
+            ).await.unwrap();
+            let workspace = allocate_or_attach(&pool,
+                request_for(&root, &container, "synthetic-lagged", "process-a"),
+            ).await.unwrap();
+            record_open_canonical_pr(&pool, &workspace, 755, "through_merge").await;
+            sqlx::query("UPDATE delivery_runs SET id='older-run', status='completed', updated_at=1")
+                .execute(&pool).await.unwrap();
+            sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', failure_code='delivered_awaiting_ci', delivery_run_id='older-run'")
+                .execute(&pool).await.unwrap();
+            record_open_canonical_pr(&pool, &workspace, 755, "through_merge").await;
+            sqlx::query("UPDATE delivery_runs SET reached_ceiling=?, stage=CASE WHEN ?='merged' THEN 'complete' ELSE 'pr_open' END, status=CASE WHEN ?='merged' THEN 'completed' ELSE 'waiting' END WHERE id<>'older-run'")
+                .bind(reached).bind(reached).bind(reached).execute(&pool).await.unwrap();
+            for state in [super::CanonicalPrState::Unknown("offline".into()), super::CanonicalPrState::ClosedUnmerged] {
+                super::reconcile_parked_delivery_progress(&pool, &ScriptedPrObserver::new(vec![Ok(state)]), "lagged-test").await.unwrap();
+                let status: String = sqlx::query_scalar("SELECT status FROM objectives").fetch_one(&pool).await.unwrap();
+                assert_eq!(status, "waiting_system", "only positive merge evidence settles");
+            }
+            let before: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
+            for _ in 0..2 {
+                super::reconcile_parked_delivery_progress(&pool, &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-merge".into() })]), "lagged-test").await.unwrap();
+                let actual: (String, String, String, i64) = sqlx::query_as("SELECT o.status,o.reached_acceptance,r.reached_ceiling,o.revision FROM objectives o JOIN delivery_runs r ON r.id=o.delivery_run_id")
+                    .fetch_one(&pool).await.unwrap();
+                assert_eq!(actual, ("completed".into(), "merged".into(), "merged".into(), before + 1), "latest {reached} run must settle once despite a stale objective pointer");
+            }
+        }
     }
 
     #[tokio::test]
