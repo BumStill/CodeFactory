@@ -1452,6 +1452,68 @@ fn core_input_request_for_outcome(outcome: &delivery::DeliveryOutcome) -> Option
     })
 }
 
+/// M109/R3: reconcile one unresolved `provider_pr_body_update` against what the
+/// forge actually holds.
+///
+/// A PR body is display content: the delivery tool itself rewrites it (README
+/// decision block, `Scenario-Test` lines), an orchestrator may `gh pr edit` it,
+/// and the forge may normalise whitespace. Byte inequality therefore does *not*
+/// mean "an external side effect of unknown outcome" — it means the body moved
+/// on, and the right response is to adopt the observed text as the new baseline
+/// and keep delivering. Only a different pull request is still a hard identity
+/// conflict, because then we cannot say whose body we are looking at.
+fn pr_body_update_confirmation(
+    observed_pr_number: u64,
+    observed_body: &str,
+    canonical_pr_number: Option<i64>,
+    intent_operation_key: &str,
+    head_branch: &str,
+    base_branch: &str,
+    expected_head_sha: &str,
+) -> Result<serde_json::Value> {
+    if let Some(canonical) = canonical_pr_number {
+        if canonical != observed_pr_number as i64 {
+            return Err(crate::errors::AppError::Other(
+                "observed PR body belongs to a different pull request than the durable canonical PR"
+                    .into(),
+            ));
+        }
+    }
+    let number_text = observed_pr_number.to_string();
+    let observed_key = delivery::external_operation_key(
+        "provider_pr_body_update",
+        &[
+            &number_text,
+            observed_body,
+            head_branch,
+            base_branch,
+            expected_head_sha,
+        ],
+    );
+    let body_digest = delivery::external_operation_key("body", &[observed_body]);
+    if observed_key == intent_operation_key {
+        return Ok(json!({
+            "confirmation": "pr_body_matches",
+            "pr_number": observed_pr_number,
+            "body_digest": body_digest,
+        }));
+    }
+    tracing::warn!(
+        pr_number = observed_pr_number,
+        intent_operation_key = %intent_operation_key,
+        observed_operation_key = %observed_key,
+        "PR body diverged from the unresolved update; adopting the observed body instead of blocking delivery"
+    );
+    Ok(json!({
+        "confirmation": "pr_body_adopted_observed_body",
+        "pr_number": observed_pr_number,
+        "body_digest": body_digest,
+        "intent_operation_key": intent_operation_key,
+        "observed_operation_key": observed_key,
+        "adopted": true,
+    }))
+}
+
 async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
     db: &sqlx::SqlitePool,
     claimed: &delivery_run::ClaimedRecovery,
@@ -1652,35 +1714,29 @@ async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
                         ))
                     }
                 };
-                let number_text = state.pr.number.to_string();
                 if state.head_sha.as_deref() != Some(claimed.expected_head_sha.as_str()) {
                     return Err(crate::errors::AppError::Other(
                         "observed PR body is attached to a foreign head; no update was replayed"
                             .into(),
                     ));
                 }
-                let expected_key = delivery::external_operation_key(
-                    "provider_pr_body_update",
-                    &[
-                        &number_text,
-                        &state.pr.body,
-                        &claimed.head_branch,
-                        &claimed.base_branch,
-                        &claimed.expected_head_sha,
-                    ],
-                );
-                if expected_key != intent.operation_key
-                    || claimed.canonical_pr_number != Some(state.pr.number as i64)
+                if claimed.canonical_pr_number.is_some()
+                    && claimed.canonical_pr_number != Some(state.pr.number as i64)
                 {
                     return Err(crate::errors::AppError::Other(
-                        "observed PR body does not match the unresolved update".into(),
+                        "observed PR body belongs to a different pull request than the durable canonical PR"
+                            .into(),
                     ));
                 }
-                json!({
-                    "confirmation": "pr_body_matches",
-                    "pr_number": state.pr.number,
-                    "body_digest": delivery::external_operation_key("body", &[&state.pr.body]),
-                })
+                pr_body_update_confirmation(
+                    state.pr.number,
+                    &state.pr.body,
+                    claimed.canonical_pr_number,
+                    &intent.operation_key,
+                    &claimed.head_branch,
+                    &claimed.base_branch,
+                    &claimed.expected_head_sha,
+                )?
             }
             "provider_ci_rerun" => {
                 if intent.status != "committed" {
@@ -7378,5 +7434,87 @@ mod tests {
 
         let identity = durable_objective_identity(&pool, &ctx).await.unwrap();
         assert_eq!(identity, ("task-objective-opaque-uuid".into(), None));
+    }
+
+    // ── M109/R3: a rewritten PR body is display content, not a lost side effect
+
+    #[test]
+    fn m109_pr_body_divergence_adopts_the_observed_body() {
+        let intent_key = delivery::external_operation_key(
+            "provider_pr_body_update",
+            &["913", "old body", "fix/branch", "main", "abc123"],
+        );
+        let confirmation = pr_body_update_confirmation(
+            913,
+            "new body written by the orchestrator",
+            Some(913),
+            &intent_key,
+            "fix/branch",
+            "main",
+            "abc123",
+        )
+        .expect("a rewritten body must not block the delivery");
+
+        assert_eq!(
+            confirmation.get("confirmation").and_then(Value::as_str),
+            Some("pr_body_adopted_observed_body")
+        );
+        assert_eq!(confirmation.get("adopted").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            confirmation.get("intent_operation_key").and_then(Value::as_str),
+            Some(intent_key.as_str())
+        );
+        assert_eq!(
+            confirmation.get("body_digest").and_then(Value::as_str),
+            Some(
+                delivery::external_operation_key("body", &["new body written by the orchestrator"])
+                    .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn m109_pr_body_matching_still_reports_matches() {
+        let intent_key = delivery::external_operation_key(
+            "provider_pr_body_update",
+            &["913", "same body", "fix/branch", "main", "abc123"],
+        );
+        let confirmation = pr_body_update_confirmation(
+            913,
+            "same body",
+            Some(913),
+            &intent_key,
+            "fix/branch",
+            "main",
+            "abc123",
+        )
+        .expect("an unchanged body reconciles");
+        assert_eq!(
+            confirmation.get("confirmation").and_then(Value::as_str),
+            Some("pr_body_matches")
+        );
+        assert_eq!(confirmation.get("adopted").and_then(Value::as_bool), None);
+    }
+
+    #[test]
+    fn m109_pr_body_from_a_foreign_pull_request_still_fails_closed() {
+        let intent_key = delivery::external_operation_key(
+            "provider_pr_body_update",
+            &["913", "body", "fix/branch", "main", "abc123"],
+        );
+        let error = pr_body_update_confirmation(
+            704,
+            "body",
+            Some(913),
+            &intent_key,
+            "fix/branch",
+            "main",
+            "abc123",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("different pull request"),
+            "{error}"
+        );
     }
 }
