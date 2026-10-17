@@ -2530,39 +2530,46 @@ async fn admit_persisted_chat_turn(
     // inserted mid-run — can turn such a turn writable.
     let structured_read_only =
         crate::storage::tasks::sub_session_read_only(&mut *tx, session_id).await?;
-    let mut contract = crate::agent::decide_chat_contract_with_intent(
-        previous_assistant.as_deref(),
-        content,
-        crate::agent::TurnIntent {
-            structured_read_only,
-        },
-    );
     let wording_constraint = crate::agent::constraint_audit_payload(content);
     let delivery_authorized: i64 =
         sqlx::query_scalar("SELECT delivery_authorized FROM sessions WHERE id=?")
             .bind(session_id)
             .fetch_one(&mut *tx)
             .await?;
-    if crate::agent::is_delivery_revocation(content) {
-        sqlx::query("UPDATE sessions SET delivery_authorized=0 WHERE id=?")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?;
-    } else if contract.capability == crate::agent::TurnCapability::Deliver {
-        // M47 R4: only fresh explicit authorization may lift a delivery stop.
-        // An existing root replay or a concurrent stop must never unfence it.
-        if fresh_user_message && !cancelled {
-            sqlx::query("DELETE FROM delivery_stop_fences WHERE session_id=?")
+    // M48: one shared decision, so the GUI path cannot drift from the background
+    // entry. An explicit authorization sentence outranks question/hesitation
+    // cues in the same message; only a revocation or an explicit read-only
+    // directive lowers it.
+    let (mut contract, delivery_update) = crate::agent::resolve_turn_delivery_authorization(
+        previous_assistant.as_deref(),
+        content,
+        crate::agent::TurnIntent {
+            structured_read_only,
+        },
+        delivery_authorized != 0,
+    );
+    match delivery_update {
+        crate::agent::DeliveryAuthorizationUpdate::Revoked => {
+            sqlx::query("UPDATE sessions SET delivery_authorized=0 WHERE id=?")
                 .bind(session_id)
                 .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id=?")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?;
-    } else if delivery_authorized != 0 {
-        contract = crate::agent::with_persisted_delivery_authorization(contract, true);
+        crate::agent::DeliveryAuthorizationUpdate::Granted => {
+            // M47 R4: only fresh explicit authorization may lift a delivery stop.
+            // An existing root replay or a concurrent stop must never unfence it.
+            if fresh_user_message && !cancelled {
+                sqlx::query("DELETE FROM delivery_stop_fences WHERE session_id=?")
+                    .bind(session_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id=?")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        crate::agent::DeliveryAuthorizationUpdate::Unchanged => {}
     }
 
     let objective_kind = chat_objective_kind(contract.capability, content);
@@ -3903,21 +3910,22 @@ pub async fn send_message_anonymous(
                     || crate::agent::proposal_capability(&turn.content).is_some())
         })
         .map(|turn| turn.content.as_str());
-    let mut contract = crate::agent::decide_chat_contract(prev_assistant, &content);
-    // Session-persisted delivery authorization (DB-backed, same semantics as
-    // send_message): once this session asked to deliver, later non-planning
-    // turns inherit Deliver capability; explicit delivery re-grants,
-    // revocation clears.
-    {
-        let db = state.db.read().await.clone();
-        let authorized = crate::agent::fetch_session_delivery_authorized(&db, &session_id).await;
-        if crate::agent::is_delivery_revocation(&content) {
+    let db = state.db.read().await.clone();
+    let authorized = crate::agent::fetch_session_delivery_authorized(&db, &session_id).await;
+    let (mut contract, delivery_update) = crate::agent::resolve_turn_delivery_authorization(
+        prev_assistant,
+        &content,
+        crate::agent::TurnIntent::default(),
+        authorized,
+    );
+    match delivery_update {
+        crate::agent::DeliveryAuthorizationUpdate::Revoked => {
             crate::agent::set_session_delivery_authorized(&db, &session_id, false).await;
-        } else if contract.capability == crate::agent::TurnCapability::Deliver {
-            crate::agent::set_session_delivery_authorized(&db, &session_id, true).await;
-        } else if authorized {
-            contract = crate::agent::with_persisted_delivery_authorization(contract, true);
         }
+        crate::agent::DeliveryAuthorizationUpdate::Granted => {
+            crate::agent::set_session_delivery_authorized(&db, &session_id, true).await;
+        }
+        crate::agent::DeliveryAuthorizationUpdate::Unchanged => {}
     }
 
     // Build in-memory history: prior turns from the frontend + this new message.

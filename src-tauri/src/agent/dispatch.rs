@@ -370,6 +370,139 @@ const DELIVERY_EN_PHRASES: &[&str] = &[
     "pull request",
 ];
 
+/// Explicit delivery-authorization declarations (M48 R1).
+///
+/// These are *permission* statements, not posture hints: "授权交付" tells the
+/// agent it may commit, push, open a PR and merge. Wording around them — a
+/// question, a hesitation, "先核实…能否…" — must never downgrade them, because
+/// only posture may be guessed from phrasing; permission may not.
+const DELIVERY_AUTHORIZATION_CJK: &[&str] = &[
+    "授权交付",
+    "授权发布",
+    "授权合并",
+    "授权提交",
+    "授权上线",
+    "交付授权",
+    "允许交付",
+    "允许发布",
+    "批准交付",
+    "准许交付",
+];
+const DELIVERY_AUTHORIZATION_EN_PHRASES: &[&str] = &[
+    "delivery authorized",
+    "delivery is authorized",
+    "delivery authorization",
+    "authorized to deliver",
+    "authorize delivery",
+    "authorized to ship",
+    "authorized to publish",
+    "authorized to merge",
+    "authorized to release",
+];
+
+/// A `ceiling:` declaration is itself a delivery instruction — the user is
+/// telling the agent how far it may carry the work, not asking whether it may.
+const DELIVERY_CEILINGS: &[&str] = &[
+    "pr_only",
+    "through_ci_green",
+    "through_merge",
+    "through_release",
+    "merged",
+];
+
+/// An explicit read-only directive is a *permission* constraint, so it still
+/// vetoes an authorization sentence in the same message. Anything in
+/// [`PLAN_ONLY_CJK`] that is merely a posture cue ("给个方案 / 分析一下") is
+/// deliberately absent: it changes how the turn talks, not what it may write.
+const HARD_READ_ONLY_CJK: &[&str] = &[
+    "只分析",
+    "只评估",
+    "只审视",
+    "只读",
+    "不要改",
+    "别改",
+    "不要修改",
+    "别修改",
+    "先别修改",
+    "不要执行",
+    "别执行",
+    "不要实现",
+    "别实现",
+    "不要动代码",
+    "别动代码",
+];
+const HARD_READ_ONLY_EN_PHRASES: &[&str] = &[
+    "only analyze",
+    "only analyse",
+    "only review",
+    "do not implement",
+    "don't implement",
+    "do not change",
+    "don't change",
+    "do not execute",
+    "don't execute",
+    "without changing anything",
+];
+
+/// Narrow file-scope limits ("不要修改其他文件") bound the requested mutation;
+/// they do not revoke it. Removed before any read-only scan so the scoped form
+/// never reads as a global directive.
+const SCOPED_FILE_LIMITS: &[&str] = &[
+    "不要修改其他文件",
+    "别修改其他文件",
+    "不要改其他文件",
+    "别改其他文件",
+    "不要动其他文件",
+    "别动其他文件",
+    "do not modify other files",
+    "don't modify other files",
+    "do not change other files",
+    "don't change other files",
+];
+
+fn without_scoped_file_limits(lowercased: &str) -> String {
+    SCOPED_FILE_LIMITS
+        .iter()
+        .fold(lowercased.to_string(), |text, scope| {
+            text.replace(scope, "")
+        })
+}
+
+fn ceiling_declaration(lowercased: &str) -> bool {
+    tokens(lowercased)
+        .windows(2)
+        .any(|pair| pair[0] == "ceiling" && DELIVERY_CEILINGS.contains(&pair[1]))
+}
+
+/// Did the user explicitly authorize delivery in THIS message? (M48 R1/R2)
+///
+/// The 10-09 field report: a kickoff message said "授权交付，ceiling: pr_only"
+/// and then asked "先核实个人账户仓库能否用 merge queue"; the answer came back
+/// "not authorized" because a posture cue in the same sentence vetoed the
+/// delivery cue. That inverted the rule this module exists to enforce — the
+/// wording may guess a *posture*, never a *permission*. An explicit grant wins
+/// over questions, hesitation and posture cues; only an explicit revocation or
+/// an explicit read-only directive can override it.
+pub fn is_explicit_delivery_authorization(user_msg: &str) -> bool {
+    let m = user_msg.trim().to_lowercase();
+    if m.is_empty() || is_delivery_revocation(&m) {
+        return false;
+    }
+    let declared = DELIVERY_AUTHORIZATION_CJK.iter().any(|cue| m.contains(cue))
+        || DELIVERY_AUTHORIZATION_EN_PHRASES
+            .iter()
+            .any(|cue| m.contains(cue))
+        || ceiling_declaration(&m);
+    if !declared {
+        return false;
+    }
+    let scoped = without_scoped_file_limits(&m);
+    !(HARD_READ_ONLY_CJK.iter().any(|cue| scoped.contains(cue))
+        || HARD_READ_ONLY_EN_PHRASES
+            .iter()
+            .any(|cue| scoped.contains(cue)))
+}
+
 /// Tokenize on non-alphanumeric boundaries for whole-word English matching.
 /// CJK runs survive as multi-char tokens but we match those by substring, so
 /// the tokenization only matters for the ASCII cues.
@@ -495,20 +628,7 @@ fn planning_cue_present(user_msg: &str) -> bool {
     // Remove only explicit "other files" scopes before looking for a global
     // read-only directive. The unscoped forms ("不要修改 / don't change") stay
     // fail-closed and continue to select ReviewOnly.
-    let review_text = [
-        "不要修改其他文件",
-        "别修改其他文件",
-        "不要改其他文件",
-        "别改其他文件",
-        "不要动其他文件",
-        "别动其他文件",
-        "do not modify other files",
-        "don't modify other files",
-        "do not change other files",
-        "don't change other files",
-    ]
-    .iter()
-    .fold(m.clone(), |text, scope| text.replace(scope, ""));
+    let review_text = without_scoped_file_limits(&m);
     let toks = tokens(&review_text);
     PLAN_ONLY_CJK.iter().any(|cue| review_text.contains(cue))
         || PLAN_ONLY_EN_PHRASES
@@ -534,7 +654,16 @@ fn is_direct_execution_request(user_msg: &str) -> bool {
 
 fn is_delivery_request(user_msg: &str) -> bool {
     let m = user_msg.trim().to_lowercase();
-    if m.is_empty() || planning_cue_present(&m) || is_delivery_revocation(&m) {
+    if m.is_empty() || is_delivery_revocation(&m) {
+        return false;
+    }
+    // M48 R1/R2: an explicit authorization declaration is a permission
+    // statement. It is evaluated BEFORE the posture cue table, so a question or
+    // a "先分析一下" in the same message can no longer downgrade it.
+    if is_explicit_delivery_authorization(&m) {
+        return true;
+    }
+    if planning_cue_present(&m) {
         return false;
     }
     let toks = tokens(&m);
@@ -731,6 +860,48 @@ pub fn with_persisted_delivery_authorization(
         }
     } else {
         contract
+    }
+}
+
+/// What a single user message does to the session's durable delivery grant.
+///
+/// The GUI input path (`send_message`) and the anonymous quick-chat path both
+/// persisted `sessions.delivery_authorized` with their own copy of the same
+/// if/else. M48 extracted the decision so a wording fix cannot land in one
+/// path only — the 10-09 session that lost its authorization went through the
+/// GUI path while the background dispatch entry passed the flag structurally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryAuthorizationUpdate {
+    /// The message explicitly revoked delivery; persist 0.
+    Revoked,
+    /// The message explicitly authorized delivery; persist 1.
+    Granted,
+    /// Nothing to persist; keep whatever the session row holds.
+    Unchanged,
+}
+
+/// Resolve one turn's contract together with the grant update it implies.
+///
+/// `persisted` is the session row's current `delivery_authorized` value. A
+/// message with no delivery wording keeps the standing grant (so follow-up
+/// fixes still end in shipping), an explicit revocation clears it, and an
+/// explicit authorization wins over question/hesitation cues (M48 R1).
+pub fn resolve_turn_delivery_authorization(
+    prev_assistant: Option<&str>,
+    user_msg: &str,
+    intent: TurnIntent,
+    persisted: bool,
+) -> (ChatContract, DeliveryAuthorizationUpdate) {
+    let mut contract = decide_chat_contract_with_intent(prev_assistant, user_msg, intent);
+    if is_delivery_revocation(user_msg) {
+        (contract, DeliveryAuthorizationUpdate::Revoked)
+    } else if contract.capability == TurnCapability::Deliver {
+        (contract, DeliveryAuthorizationUpdate::Granted)
+    } else if persisted {
+        contract = with_persisted_delivery_authorization(contract, true);
+        (contract, DeliveryAuthorizationUpdate::Unchanged)
+    } else {
+        (contract, DeliveryAuthorizationUpdate::Unchanged)
     }
 }
 
@@ -1729,5 +1900,86 @@ mod tests {
             .is_some(),
             "a review-only turn must not edit product code"
         );
+    }
+
+    // M48 R1/R3 — an explicit delivery-authorization sentence beats every
+    // question/hesitation cue in the same message. Field message 10-09
+    // (session d074ba4a) read "授权交付，ceiling: pr_only" and then asked
+    // "先核实个人账户仓库能否用 merge queue"; the posture cue table matched
+    // and `sessions.delivery_authorized` stayed 0.
+    #[test]
+    fn explicit_authorization_beats_question_cues_in_the_same_message() {
+        for message in [
+            "授权交付，ceiling: merged。先核实个人账户仓库能否用 merge queue，再分析一下风险。",
+            "先核实个人账户仓库是否可以用 merge queue？授权交付，ceiling: pr_only。",
+            "授权交付，ceiling: pr_only。可不可以先看看 CI 再动手？",
+        ] {
+            assert!(
+                is_explicit_delivery_authorization(message),
+                "{message} carries an explicit delivery authorization"
+            );
+            assert_eq!(
+                decide_chat_contract(None, message).capability,
+                TurnCapability::Deliver,
+                "{message} must authorize delivery"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_position_and_language_do_not_matter() {
+        for message in [
+            // authorization in the trailing sentence
+            "先修好问题，最后授权交付。",
+            // authorization in the middle, question before and after
+            "能否先用 pr_only？这件事已授权交付，ceiling: pr_only，是否可行？",
+            // English wording
+            "Delivery authorized — ceiling: merged. Can you first check whether the personal account repo supports a merge queue?",
+        ] {
+            assert_eq!(
+                decide_chat_contract(None, message).capability,
+                TurnCapability::Deliver,
+                "{message} must authorize delivery"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_consultation_without_authorization_stays_undelivered() {
+        // R3/约束: no authorization sentence anywhere → the default stays
+        // "do not deliver", even though the wording asks about shipping.
+        for message in [
+            "先核实个人账户仓库能否用 merge queue，再分析一下风险。",
+            "我们是否应该先看看 CI 的结果，再决定下一步怎么做？",
+            "Could you check how the personal account repo is configured for the queue?",
+        ] {
+            assert!(
+                !is_explicit_delivery_authorization(message),
+                "{message} carries no explicit delivery authorization"
+            );
+            let contract = decide_chat_contract(None, message);
+            assert_ne!(
+                contract.capability,
+                TurnCapability::Deliver,
+                "{message} must not grant delivery"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_read_only_constraints_still_veto_an_authorization() {
+        // R2: posture cues no longer lower permission, but an explicit
+        // read-only directive is a permission constraint and stays fail-closed.
+        for message in [
+            "授权交付，但只分析，不要修改任何文件。",
+            "authorized to deliver, but do not implement anything yet.",
+        ] {
+            assert!(!is_explicit_delivery_authorization(message), "{message}");
+            assert_ne!(
+                decide_chat_contract(None, message).capability,
+                TurnCapability::Deliver,
+                "{message} keeps the read-only constraint"
+            );
+        }
     }
 }
