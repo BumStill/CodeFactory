@@ -227,6 +227,12 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }));
     let result = async {
     let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
+    if let (Some(db), Some(run)) = (ctx.db.as_ref(), durable.as_ref()) {
+        // A foreground re-admission advances the epoch just like a startup
+        // takeover. It must reconcile before the first mutation too.
+        await_delivery_with_lease_heartbeat(db, run,
+            reconcile_foreground_claim(db, run, remote.as_ref())).await??;
+    }
 
     loop {
         let delivery_future = delivery::deliver(
@@ -1021,6 +1027,50 @@ where
         DELIVERY_LEASE_TTL_MS,
     )
     .await
+}
+
+async fn reconcile_foreground_claim<R: delivery::DeliveryRemote>(
+    db: &sqlx::SqlitePool,
+    run: &PreparedDurableRun,
+    remote: Option<&R>,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    if delivery_run::verify_delivery_mutation_permit(db, &run.id, &run.process, run.claim_epoch, now).await? {
+        return Ok(());
+    }
+    let row = sqlx::query("SELECT * FROM delivery_runs WHERE id=? AND lease_owner=? AND claim_epoch=?")
+        .bind(&run.id).bind(&run.process.instance_id).bind(run.claim_epoch)
+        .fetch_one(db).await?;
+    let claimed = delivery_run::ClaimedRecovery {
+        run_id: run.id.clone(), claim_epoch: run.claim_epoch,
+        objective_id: run.objective_id.clone(),
+        workspace_path: run.workspace_path.to_string_lossy().into_owned(),
+        worktree_identity: run.worktree_identity.clone(), repo_identity: run.repo_identity.clone(),
+        base_branch: row.try_get("base_branch")?, head_branch: run.head_branch.clone(),
+        change_set_digest: run.change_set_digest.clone(), expected_head_sha: run.expected_head_sha.clone(),
+        requested_ceiling: row.try_get("requested_ceiling")?, autonomous_completion: row.try_get::<i64,_>("autonomous_completion")? != 0,
+        canonical_pr_number: row.try_get("canonical_pr_number")?, canonical_pr_url: row.try_get("canonical_pr_url")?,
+        canonical_head_sha: row.try_get("canonical_head_sha")?, pr_title_intent: row.try_get("pr_title_intent")?, pr_body_intent: row.try_get("pr_body_intent")?,
+        reached_ceiling: row.try_get("reached_ceiling")?, stage: row.try_get("stage")?, status: row.try_get("status")?,
+        wait_class: row.try_get("wait_class")?, next_action: row.try_get("next_action")?,
+        next_action_authorized: row.try_get::<i64,_>("next_action_authorized")? != 0,
+        failure_signature: row.try_get("failure_signature")?, stage_attempt: row.try_get("stage_attempt")?, progress_revision: row.try_get("progress_revision")?,
+        action: delivery_run::RecoveryAction::ObserveOnly,
+    };
+    let mut observed = delivery::observe_delivery_takeover_with_receipted_parent(
+        &run.workspace_path, Some(&claimed.base_branch), &run.head_branch, &run.identity_snapshot(),
+        claimed.canonical_pr_number.map(|n| n as u64), claimed.canonical_pr_url.as_deref(), None, remote,
+    ).await.map_err(crate::errors::AppError::Other)?;
+    let release_seen = reconcile_unresolved_delivery_mutation_intents(db, &claimed, &run.process, remote, &mut observed)
+        .await?;
+    delivery::reconcile_local_release_intent(&run.workspace_path, Some(&claimed.base_branch),
+        &run.head_branch, &run.expected_head_sha, !release_seen, remote)
+        .await.map_err(crate::errors::AppError::Other)?;
+    if !delivery_run::mark_delivery_claim_reconciled(db, &run.id, &run.process, run.claim_epoch,
+        chrono::Utc::now().timestamp_millis()).await? {
+        return Err(crate::errors::AppError::Other("foreground reconciliation lost its owner/epoch; no mutation dispatched".into()));
+    }
+    Ok(())
 }
 
 async fn prepare_durable_run(
@@ -5501,6 +5551,36 @@ mod tests {
             head_sha: claimed.expected_head_sha.clone(),
             change_set_digest: claimed.change_set_digest.clone(),
         }
+    }
+
+    #[tokio::test]
+    async fn foreground_readmission_reconciles_before_first_mutation() {
+        let (root, worktree) = u22_base_advanced_repo();
+        let pool = u22_pool().await;
+        let id = "foreground-readmission";
+        let objective = "objective-foreground-readmission";
+        u22_seed_objective(&pool, id, objective).await;
+        let head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
+        u22_create_run(&pool, &worktree, id, objective, &head, None).await;
+        let process = ProcessIdentity::new("synthetic-restarted-owner", "test", "test");
+        let claimed = u22_expire_and_claim(&pool, id, &process).await;
+        let prepared = PreparedDurableRun {
+            id: id.into(), process: process.clone(), claim_epoch: claimed.claim_epoch,
+            objective_id: objective.into(), workspace_path: worktree.clone(),
+            worktree_identity: claimed.worktree_identity, repo_identity: claimed.repo_identity,
+            change_set_digest: claimed.change_set_digest, expected_head_sha: head.clone(),
+            head_branch: claimed.head_branch,
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(!delivery_run::verify_delivery_mutation_permit(&pool, id, &process, prepared.claim_epoch, now).await.unwrap());
+        reconcile_foreground_claim::<LocalCommitRecoveryRemote>(&pool, &prepared, None).await.unwrap();
+        assert!(delivery_run::verify_delivery_mutation_permit(&pool, id, &process, prepared.claim_epoch,
+            chrono::Utc::now().timestamp_millis()).await.unwrap());
+        assert_eq!(recovery_git(&worktree, &["rev-parse", "HEAD"]), head);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_mutation_intents WHERE run_id=?")
+            .bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 0, "reconciliation must dispatch no mutation");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A read-only provider observer whose canonical PR has moved to a foreign
