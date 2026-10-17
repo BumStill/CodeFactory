@@ -42,6 +42,7 @@ def main():
                 for iteration in range(1, count + 1):
                     command = [str(binary), *filters, "--test-threads=8"]
                     result = subprocess.run(command, cwd=directory, text=True,
+                                            encoding="utf-8", errors="replace",
                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                             timeout=60, check=False)
                     Path(directory, f"{label}-{iteration}.log").write_text(result.stdout)

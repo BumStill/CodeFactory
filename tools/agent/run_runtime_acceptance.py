@@ -171,6 +171,8 @@ def lookup_api_key(key_ref: str, *, timeout_sec: int = 8) -> str:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=max(1, timeout_sec),
         )
     except subprocess.TimeoutExpired as exc:
@@ -193,6 +195,8 @@ def detect_macos_screen_locked() -> bool:
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=5,
     )
     return '"CGSSessionScreenIsLocked"=Yes' in completed.stdout
@@ -332,6 +336,8 @@ def _execute_command(
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=max(1, min(timeout_sec, 900)),
         )
         return {
@@ -499,6 +505,8 @@ def run_runtime_acceptance(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             env=tool_env,
         )

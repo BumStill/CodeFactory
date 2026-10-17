@@ -129,6 +129,8 @@ def gh_api(
         input=encoded,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if result.returncode != 0:
@@ -149,6 +151,8 @@ def gh_graphql(query: str, variables: dict[str, str]) -> dict[str, Any]:
         command,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if result.returncode != 0:

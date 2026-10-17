@@ -2,6 +2,10 @@ name: Release
 
 run-name: Release ${{ inputs.tag }}
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 on:
   workflow_dispatch:
     inputs:

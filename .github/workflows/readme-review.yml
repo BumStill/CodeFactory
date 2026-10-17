@@ -1,5 +1,9 @@
 name: README review
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 on:
   workflow_dispatch:
   schedule:

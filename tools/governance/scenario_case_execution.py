@@ -205,10 +205,10 @@ def validate_case_execution_inputs(plan: dict, repo: Path, runner: str, policy_r
     actual_os = {"Windows": "windows", "Darwin": "macos"}.get(platform.system(), "unsupported")
     actual_arch = {"AMD64": "x86_64", "arm64": "aarch64"}.get(platform.machine(), platform.machine())
     identity = {"name": runner, "os": actual_os, "arch": actual_arch}
-    source = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True)
+    source = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if source.returncode or source.stdout.strip() != plan["head_sha"]:
         errors.append("case candidate checkout does not match the planned head")
-    dirty = subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--"], capture_output=True, text=True)
+    dirty = subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD", "--"], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if dirty.returncode:
         errors.append("case candidate tracked tree is dirty or cannot be verified")
     for case in cases:

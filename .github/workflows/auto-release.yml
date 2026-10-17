@@ -25,6 +25,10 @@ name: Auto Release
 # immutable tag. Bump commits ("chore: bump version to …") are excluded so they
 # can never themselves cause a release.
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 on:
   workflow_dispatch:
     inputs:

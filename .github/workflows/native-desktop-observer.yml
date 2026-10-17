@@ -1,5 +1,9 @@
 name: Native desktop observer experiment
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 on:
   pull_request:
     branches: [main]
