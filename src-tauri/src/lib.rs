@@ -235,6 +235,37 @@ impl ChatRunControl {
 /// cancellation handles — stopping a chat turn never cancels delegated tasks.
 pub type ChatCancelMap = Arc<Mutex<HashMap<String, Arc<ChatRunControl>>>>;
 
+/// Run an isolated extension fixture before desktop initialization.
+#[cfg(not(test))]
+pub fn run_browser_extension_lifecycle_smoke_cli() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) != Some("--browser-extension-lifecycle-smoke") {
+        return false;
+    }
+    desktop_context::reject_world_request_for_cli();
+    if args.len() != 3 {
+        eprintln!("usage: CodeFactory --browser-extension-lifecycle-smoke <receipt.json>");
+        std::process::exit(2);
+    }
+    let result = tokio::runtime::Builder::new_multi_thread().enable_all().build()
+        .map_err(|_| ())
+        .and_then(|runtime| {
+            if std::env::var_os("CODEFACTORY_LIFECYCLE_SMOKE_FAIL").is_some() {
+                return Err(());
+            }
+            runtime.block_on(browser::extension::lifecycle_smoke::run()).map_err(|_| ())
+        });
+    let receipt = result.as_ref().cloned().unwrap_or_else(|_| serde_json::json!({
+        "ok": false, "scenario_id": "E2E-008", "failure_code": "lifecycle_probe_failed"
+    }));
+    // Transport errors may contain tokens or paths. Only serialize fixed codes.
+    let rendered = serde_json::to_vec_pretty(&receipt).expect("receipt JSON");
+    if std::fs::write(&args[2], rendered).is_err() || result.is_err() {
+        std::process::exit(1);
+    }
+    true
+}
+
 /// Execute historical-session continuation and durable-stop restart oracles
 /// before Tauri initializes. Parent and workers are the exact same executable.
 #[cfg(not(test))]

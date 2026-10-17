@@ -401,6 +401,21 @@ jobs:
 
       # E2E-002/E2E-003/E2E-007: use production SQLite admission, cancellation
       # and recovery exhaustion through distinct copies of this exact executable.
+      - name: Browser extension loopback lifecycle smoke
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "browser-extension-lifecycle.json"
+          cargo run --manifest-path src-tauri/Cargo.toml -- --browser-extension-lifecycle-smoke $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Extension lifecycle smoke failed" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          foreach ($field in @('ok', 'old_generation_cancelled', 'half_open_evicted', 'same_session', 'cleanup_ok')) {
+            if ($smoke.$field -ne $true) { throw "Lifecycle oracle failed: $field" }
+          }
+          if ($smoke.duplicate_command_count -ne 0) { throw "Duplicate extension command" }
+          if ($smoke.human_prompt_count -ne 0) { throw "Unexpected human prompt" }
+          Get-Content $receipt
+
       - name: Historical session continue/stop/incident cross-process smoke
         if: ${{ !cancelled() }}
         shell: pwsh
