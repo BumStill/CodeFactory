@@ -87,6 +87,18 @@
 - L3/L4、manual_canary 均保留。真机验收由编排方发版后完成：同一任务追加约束和纠正可见顺序、重连恢复、CI 等待释放 owner、重启续接原 run、实际交付回执及无重复副作用。
 - AI Collaboration：context scope 为任务文件、registry 和既有 FakeForge；assumption 为合成 fixture 不等于生产验收；review point 为本组反例与身份/字节断言；validation result 以 PR 中最终命令和 CI 为准。按任务模板禁止 `delegate_tasks`，本轮单执行流，不伪称独立 QA 已执行。
 
+## E2E-004 第二段进展（2026-10-17，未完成交付）
+
+- 已追加第二段获批规格；新增 `e2e004_steer_reconnect_repair_resumes_same_durable_run`，先在旧 worker 上失败，再补组合 fixture 后通过。
+- 已组合生产 `SessionSteerInbox` / queue、loopback HTTP 首次断连与生产 retry、真实 rustc 五组输入验收先失败再最小表达式修复、FakeForge CI 失败后新 PID 恢复、持久 run 身份与 lease 释放、artifact 摘要及无重复交付。
+- 证据边界：诊断/修复目前由 fixture 驱动，尚非完整 agent-loop；objective_id 目前是 delivery row 的关联字段，尚未组合真实 durable objective 生命周期；canonical PR 由 fixture 回填，尚未覆盖生产工具准入 wrapper。因此 R1 仍为 partial，不能声称第二段完成。
+- R2 已最小登记两项 Rust 硬门禁，状态仅 `partially_implemented`；validator 本地 OK（28 scenarios / 11 complex E2E）。nightly 复用已有全 workspace 步骤，无 workflow/validator 修改；信任根 cannot self-modify 仍由编排方处理。
+- 全 Rust workspace：无窗口保护发现三个新增命令问题，已补 `.no_window()`；其后默认并发触发既有 SQLite 锁等待计时测试失败，低并发 `RUST_TEST_THREADS=2 CARGO_TARGET_DIR="$PWD/.codefactory-cache/cargo-target-e2e004-slice2" CARGO_INCREMENTAL=0 cargo test --manifest-path src-tauri/Cargo.toml --workspace --no-fail-fast` 全部通过。日志 `/tmp/e2e004-slice2-workspace.log`。未修改/放宽测试或 validator。
+- 最终实现补充：已用真实 `run_agent_loop` 驱动确定性 provider/tool adapter，在运行中入队两条 steer 并断言顺序；真实测试退出码 101→0，读取实现后只修复表达式。已通过 ObjectiveStore 创建和跨进程回读同一 objective；canonical PR 改用生产 record_delivery_observation 与 identity revision receipt，不再 SQL 回填。仍不代表桌面工具准入或 L3/L4 验收。
+- R3 已删除旧正文草稿。最新全 Rust workspace 低并发通过，前端 151 文件/1013 测试（含 lightModeAudit）和 build 通过；最终 PR 正文场景 validator（--ci）及 README contract 均通过。正文仅存 ignored cache，PR/CI/queue merge 与 §8 收尾以实际交付结果为准。
+- 真机验收由编排方发版后完成：安装 exact release，核对同 session 两条 steer 顺序、重连后原 objective/run、测试修复、CI 等待 owner 释放、恢复与单次 artifact 身份。当前无 UI 改动，不声称 L3/L4。
+- AI Collaboration：context scope 为任务/模板、FakeForge、queue、HTTP retry、delivery_run 与 registry；assumptions 为合成切片不等于完整 agent-loop；review point 为身份与副作用断言；validation result 为上述 Rust 全量和 registry 结果。模板禁止 delegate_tasks，故单执行流，无独立 QA 声明。
+
 ## Stop Boundary
 
 - 不在文档完成、本地绿色、PR 通过、merge、公开资产或安装成功任一单点停止。
