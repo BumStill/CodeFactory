@@ -2924,27 +2924,8 @@ pub fn observe_receipted_local_commit(
         return Err("observed local commit does not match the exact write-ahead commit SHA".into());
     }
     verify_receipted_commit_object(&repo.root, persisted_identity, evidence)?;
-    if evidence.source_manifest_digest.is_empty() {
-        if !git(
-            &repo.root,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )?
-        .is_empty()
-        {
-            return Err("local commit receipt cannot absorb edits made after the commit".into());
-        }
-    } else {
-        if worktree_source_manifest_digest(&repo.root)? != evidence.source_manifest_digest {
-            return Err(
-                "local commit receipt cannot absorb source edits made after the commit".into(),
-            );
-        }
-        if git(&repo.root, &["write-tree"])? != evidence.staged_tree_sha {
-            return Err(
-                "local commit receipt found an index outside the exact committed tree".into(),
-            );
-        }
-    }
+    // A materialized receipt proves an immutable commit, not the mutable
+    // checkout after it. Follow-up edits belong to a new permitted commit.
     Ok(current)
 }
 
@@ -3424,7 +3405,7 @@ fn is_excluded(path: &str, extra: &[String]) -> bool {
 /// The untracked source files delivery WOULD add (for tests + previews):
 /// `??` porcelain entries minus the noise denylist.
 pub fn untracked_source_paths(root: &Path, extra: &[String]) -> Result<Vec<String>, String> {
-    let porcelain = git(root, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let porcelain = git(root, &["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"])?;
     let mut out = Vec::new();
     for line in porcelain.lines() {
         if line.len() < 4 {
@@ -5156,14 +5137,16 @@ pub async fn deliver<R: DeliveryRemote>(
         if fresh_identity != persisted_identity
             || worktree_source_manifest_digest(&repo.root).ok().as_deref()
                 != Some(commit_plan.source_manifest_digest.as_str())
-            || git(&repo.root, &["write-tree"]).ok().as_deref()
-                != Some(commit_plan.original_index_tree_sha.as_str())
             || current_index_digest(&repo.root).ok().as_deref()
                 != Some(commit_plan.original_index_digest.as_str())
+            || git2::Repository::open(&repo.root)
+                .and_then(|repository| repository.index()?.write_tree())
+                .ok().map(|oid| oid.to_string()).as_deref()
+                != Some(commit_plan.original_index_tree_sha.as_str())
         {
             return outcome.blocked_at(StepResult::blocked(
                 "identity",
-                "隔离 index 规划期间 checkout 内容或真实 index 已变化；未写入提交意图，也未覆盖外来暂存。",
+                format!("隔离 index 规划期间 checkout 内容或真实 index 已变化；未写入提交意图，也未覆盖外来暂存。 identity={} source={} index={} tree={}", fresh_identity == persisted_identity, worktree_source_manifest_digest(&repo.root).ok().as_deref() == Some(commit_plan.source_manifest_digest.as_str()), current_index_digest(&repo.root).ok().as_deref() == Some(commit_plan.original_index_digest.as_str()), git2::Repository::open(&repo.root).and_then(|repository| repository.index()?.write_tree()).ok().map(|oid| oid.to_string()).as_deref() == Some(commit_plan.original_index_tree_sha.as_str())),
             ));
         }
         // `commit-tree` writes only an unreachable content-addressed object;
@@ -14791,6 +14774,40 @@ Release-Urgency: hold"
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn m100_receipt_survives_edits_and_delivery_appends_without_rewinding() {
+        for edits in [1, 2] {
+            let root = feature_branch_repo(&format!("m100-edits-{edits}"));
+            let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+            let parent = capture_delivery_identity(&repo).unwrap();
+            let plan = prepare_scoped_commit(&root, &[]).unwrap();
+            let message = "fix: initial receipted change";
+            let head = git(&root, &["-c", "user.name=CodeFactory", "-c", "user.email=noreply@codefactory.local", "commit-tree", &plan.target_tree_sha, "-p", &parent.head_sha, "-m", message]).unwrap();
+            let evidence = LocalCommitIntentEvidence::prepared(&parent, &repo.branch, &plan.original_index_tree_sha, &plan.original_index_digest, &plan.target_index_digest, &plan.source_manifest_digest, &plan.target_tree_sha, &head, message);
+            materialize_receipted_local_commit(&root, Some("main"), "feat/x", &parent, &evidence).unwrap();
+            for edit in 0..edits {
+                std::fs::write(root.join("feature.rs"), format!("// follow-up {edit}\n")).unwrap();
+            }
+            git(&root, &["add", "feature.rs"]).unwrap();
+            let index = git(&root, &["write-tree"]).unwrap();
+            let observed = observe_receipted_local_commit(&root, Some("main"), "feat/x", &parent, &evidence).unwrap();
+            assert_eq!(observed.head_sha, head);
+            assert_eq!(git(&root, &["write-tree"]).unwrap(), index);
+            assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), head);
+            let calls = stub_calls();
+            let remote = StubRemote { ci: CiStatus::Success, existing_pr: None, merge_queues: false, merge_ok: true, caps: every_capability(), calls };
+            let outcome = deliver(&root, DeliveryCeiling::PrOnly, MergeMethod::Squash, 1, &DeliverOpts { title: Some("fix: follow-up edit".into()), expect_branch: Some("feat/x".into()), expected_identity: Some(observed), ..DeliverOpts::default() }, Some(&remote), Some("main")).await;
+            assert_ne!(outcome.final_state, "blocked", "{:?}", outcome.steps);
+            let next = git(&root, &["rev-parse", "HEAD"]).unwrap();
+            assert_ne!(next, head);
+            assert_eq!(git(&root, &["rev-parse", "HEAD^"]).unwrap(), head);
+            assert_eq!(observe_remote_branch_head(&repo).unwrap().as_deref(), Some(next.as_str()));
+            assert!(remote_head_is_own_pushed_commit(&repo, &head, &next));
+            assert_eq!(std::fs::read_to_string(root.join("feature.rs")).unwrap(), format!("// follow-up {}\n", edits - 1));
+            std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]
