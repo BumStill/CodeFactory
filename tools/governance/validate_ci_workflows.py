@@ -114,7 +114,16 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.actionlint:
-        command = [args.actionlint, "-no-color", *[str(p) for p in workflows]]
+        # External linters (shellcheck/pyflakes) are disabled on purpose: whether
+        # they are installed differs between runners, and shell style of existing
+        # scripts is not what this gate is about. Workflow syntax/semantics is.
+        command = [
+            args.actionlint,
+            "-no-color",
+            "-shellcheck=",
+            "-pyflakes=",
+            *[str(p) for p in workflows],
+        ]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.stdout:
             sys.stdout.write(result.stdout)
