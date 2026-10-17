@@ -5,6 +5,9 @@ fn main() {
     if codefactory_lib::unattended_smoke_cli::run() {
         return;
     }
+    if codefactory_lib::run_browser_extension_lifecycle_smoke_cli() {
+        return;
+    }
     if codefactory_lib::run_history_session_smoke_cli() {
         return;
     }

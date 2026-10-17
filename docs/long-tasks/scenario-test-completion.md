@@ -87,6 +87,16 @@
 - L3/L4、manual_canary 均保留。真机验收由编排方发版后完成：同一任务追加约束和纠正可见顺序、重连恢复、CI 等待释放 owner、重启续接原 run、实际交付回执及无重复副作用。
 - AI Collaboration：context scope 为任务文件、registry 和既有 FakeForge；assumption 为合成 fixture 不等于生产验收；review point 为本组反例与身份/字节断言；validation result 以 PR 中最终命令和 CI 为准。按任务模板禁止 `delegate_tasks`，本轮单执行流，不伪称独立 QA 已执行。
 
+## CodeFactory 接续 E2E-008 L2（2026-10-18）
+
+- 规格：`docs/specs/feature-specs/browser-extension-lifecycle-smoke.md`；原文 R1–R5 保持不变。备份 diff 在当前 main 可应用，但重写隔离 smoke，修复 listener abort 后未 await 的清理竞态。
+- 正式 binary 新增 `--browser-extension-lifecycle-smoke <receipt.json>`，在 Tauri 初始化前执行；真实 loopback WebSocket 覆盖 heartbeat idle、旧代际 pending 取消、旧连接关闭不清新连接、瞬断自动重连、半开命令 deadline 驱逐与恢复。全程同一内存 bridge/合成 tab，6 条唯一命令，pending 为空，listener 退出后原端口可重新绑定；不读写生产 pairing/profile/DB，不启动真实浏览器。
+- 失败优先：Node 契约首次 0/4（入口、失败 receipt、CI、registry 均缺失），实现后原命令 4/4。完整 Rust workspace 首轮仅入口录制 facade 缺新函数失败，补齐 fixture 后同命令全绿，未放宽原顺序断言。生命周期 Rust 测试内部重复三轮真实 loopback。
+- 正式 binary 从源码目录外实测成功 receipt 全字段；注入失败时写固定匿名失败 receipt 后 exit 1。前端 151 files / 1013 tests（含 lightModeAudit）及 build 通过。治理校验发现 execution_policy 缺 binary receipt oracle，按既有格式补齐；scenario --ci 与 README validator 均 OK。
+- R3/R4：CI check-rust 阶段运行 binary 并逐字段断言；registry 增加 automated_by、PR required target 和 receipt oracle，移除仅 L2 gap，仍保持 partially_implemented、L3/L4。信任根变更由本单明确授权，cannot self-modify 交由编排方处理，不改 validator。
+- 真机验收由编排方发版后完成：同一会话选择 tab、空闲/瞬断/交错重连/升级，核对续接、prompt、去重和审计日志；L2 不等于真实桌面或 exact release 验收（not live）。无待决 Spec Amendment。
+- AI Collaboration：context scope 为任务、备份、transport、registry；assumption 为合成 bridge session 不是生产 DB；review point 为清理竞态及失败路径；validation result 见 `docs/evidence-packs/e2e008-lifecycle-smoke.md` 和 PR CI。遵循任务模板单执行流、不调用 delegate_tasks。
+
 ## Stop Boundary
 
 - 不在文档完成、本地绿色、PR 通过、merge、公开资产或安装成功任一单点停止。
