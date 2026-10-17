@@ -96,9 +96,9 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 
 <!-- scenario-registry-summary:start -->
 - 逻辑 Scenario：`28`（P0 `14`，P1 `14`，P2 `0`）
-- Complex E2E：`11`（implemented `0`，partially_implemented `10`，designed `1`）
+- Complex E2E：`11`（implemented `0`，partially_implemented `11`，designed `0`）
 - 剩余自动化缺口：`26`
-- PR slice：implemented `10`，partially_implemented `0`，missing `1`
+- PR slice：implemented `11`，partially_implemented `0`，missing `0`
 <!-- scenario-registry-summary:end -->
 
 <!-- scenario-registry-categories:start -->
