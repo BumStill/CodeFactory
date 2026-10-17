@@ -53,8 +53,9 @@ pub mod worktree;
 pub use dispatch::{
     constraint_audit_payload, constraint_instruction_block, decide_chat_contract,
     decide_chat_contract_with_intent, decide_chat_mode, is_contextual_approval,
-    is_delivery_revocation, proposal_capability, steer_capability_override_with_authorization,
-    with_persisted_delivery_authorization, TurnGrants, TurnIntent,
+    is_delivery_revocation, is_explicit_delivery_authorization, proposal_capability,
+    resolve_turn_delivery_authorization, steer_capability_override_with_authorization,
+    with_persisted_delivery_authorization, DeliveryAuthorizationUpdate, TurnGrants, TurnIntent,
 };
 pub(crate) use internal_text::{generate_bounded_text, InternalTextOutput};
 
@@ -3196,6 +3197,117 @@ mod tests {
         // Revocation clears the grant.
         set_session_delivery_authorized(&db, "s1", false).await;
         assert!(!fetch_session_delivery_authorized(&db, "s1").await);
+    }
+
+    // M48 R0: the GUI input path lost an explicit delivery authorization when
+    // the same message also asked a question (session d074ba4a, 10-09:
+    // "授权交付，ceiling: pr_only … 先核实…能否用 merge queue" left
+    // `sessions.delivery_authorized` at 0). The fixture drives the exact
+    // decision `send_message`/`send_message_anonymous` now share and asserts on
+    // the persisted row, not on an in-memory guess.
+    async fn m48_synthetic_sessions() -> SqlitePool {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        for id in ["synthetic-m48-gui", "synthetic-m48-plain"] {
+            sqlx::query("INSERT INTO sessions (id) VALUES (?)")
+                .bind(id)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        db
+    }
+
+    /// One GUI turn: read the row, resolve, write back — the `send_message` shape.
+    async fn m48_apply_gui_turn(db: &SqlitePool, session_id: &str, message: &str) -> TurnCapability {
+        let persisted = fetch_session_delivery_authorized(db, session_id).await;
+        let (contract, update) = resolve_turn_delivery_authorization(
+            None,
+            message,
+            TurnIntent::default(),
+            persisted,
+        );
+        match update {
+            DeliveryAuthorizationUpdate::Revoked => {
+                set_session_delivery_authorized(db, session_id, false).await;
+            }
+            DeliveryAuthorizationUpdate::Granted => {
+                set_session_delivery_authorized(db, session_id, true).await;
+            }
+            DeliveryAuthorizationUpdate::Unchanged => {}
+        }
+        contract.capability
+    }
+
+    async fn m48_delivery_row(db: &SqlitePool, session_id: &str) -> bool {
+        let value: i64 = sqlx::query_scalar("SELECT delivery_authorized FROM sessions WHERE id=?")
+            .bind(session_id)
+            .fetch_one(db)
+            .await
+            .unwrap();
+        value != 0
+    }
+
+    #[tokio::test]
+    async fn gui_input_path_keeps_delivery_authorization_when_message_also_asks() {
+        let db = m48_synthetic_sessions().await;
+        let session = "synthetic-m48-gui";
+        assert!(!m48_delivery_row(&db, session).await);
+
+        let message = "开始实施：按任务文件修复。授权交付，ceiling: merged。\
+                       先核实个人账户仓库能否用 merge queue，再分析一下风险。";
+        let capability = m48_apply_gui_turn(&db, session, message).await;
+        assert_eq!(
+            capability,
+            TurnCapability::Deliver,
+            "the authorization sentence must win over the question in the same message"
+        );
+        assert!(
+            m48_delivery_row(&db, session).await,
+            "sessions.delivery_authorized must be 1 after the authorization turn"
+        );
+
+        // A follow-up with no delivery wording keeps the grant.
+        assert_eq!(
+            m48_apply_gui_turn(&db, session, "继续修 CI 里挂掉的那个测试。").await,
+            TurnCapability::Deliver
+        );
+        assert!(m48_delivery_row(&db, session).await);
+
+        // Only an explicit revocation clears it.
+        assert_ne!(
+            m48_apply_gui_turn(&db, session, "取消交付，先别发布。").await,
+            TurnCapability::Deliver
+        );
+        assert!(!m48_delivery_row(&db, session).await);
+    }
+
+    #[tokio::test]
+    async fn gui_input_path_does_not_authorize_a_plain_consultation() {
+        let db = m48_synthetic_sessions().await;
+        let session = "synthetic-m48-plain";
+
+        let capability = m48_apply_gui_turn(
+            &db,
+            session,
+            "先核实个人账户仓库能否用 merge queue，再分析一下风险。",
+        )
+        .await;
+
+        assert_ne!(capability, TurnCapability::Deliver);
+        assert!(
+            !m48_delivery_row(&db, session).await,
+            "no authorization sentence means the default stays 'do not deliver'"
+        );
     }
 
     #[test]
