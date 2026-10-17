@@ -749,6 +749,9 @@ impl RoutedDesktopModelTransport {
             episode_hash.trim_start_matches("sha256:")
         );
         let store = ProviderRecoveryStore::new(self.db.clone());
+        super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
+            .reconcile_provider_boundary(permit.objective_id(), permit.binding_id(), permit.resource_generation())
+            .await.map_err(|error| provider_transport_error("observe local tool receipts", error))?;
         // This transport only starts a new request after the previous request
         // future returned. Reconcile before episode admission as well as attempt
         // admission, so the same failure cannot burn the recovery ladder.

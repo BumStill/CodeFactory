@@ -198,6 +198,43 @@ impl ToolRecoveryStore {
         Ok(())
     }
 
+    /// Called only after the serial provider request boundary has fenced the
+    /// previous request. Observe local receipts before the provider safety gate.
+    pub(crate) async fn reconcile_provider_boundary(
+        &self, objective_id: &str, binding_id: &str, generation: i64,
+    ) -> Result<()> {
+        let rows = sqlx::query("SELECT receipt.id, objective.session_id FROM side_effect_receipts receipt
+            JOIN tool_recovery_contracts contract ON contract.receipt_id=receipt.id
+            JOIN objectives objective ON objective.id=receipt.objective_id
+            WHERE receipt.objective_id=? AND receipt.binding_id=?
+            AND contract.resource_generation=? AND contract.resource_kind='workspace_git'
+            AND receipt.status IN ('started','unknown')")
+            .bind(objective_id).bind(binding_id).bind(generation).fetch_all(&self.pool).await?;
+        for row in rows {
+            let receipt: String = row.get("id");
+            if self.local_receipt_is_bounded(&receipt).await? {
+                let session: String = row.get("session_id");
+                let cwd: String = sqlx::query_scalar("SELECT cwd FROM sessions WHERE id=?")
+                    .bind(session).fetch_one(&self.pool).await?;
+                self.settle_foreground(&receipt, Path::new(&cwd), false).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn local_receipt_is_bounded(&self, receipt_id: &str) -> Result<bool> {
+        let calls = sqlx::query("SELECT tool.tool_name, tool.arguments FROM tool_recovery_call_links link
+            JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?")
+            .bind(receipt_id).fetch_all(&self.pool).await?;
+        Ok(!calls.is_empty() && calls.iter().all(|call| {
+            let name: String = call.get("tool_name");
+            let arguments: String = call.get("arguments");
+            let args: serde_json::Value = serde_json::from_str(&arguments).unwrap_or_default();
+            name == "bash" && args.get("command").and_then(|v| v.as_str())
+                .is_some_and(command_has_bounded_local_effects)
+        }))
+    }
+
     pub(crate) async fn settle_foreground(
         &self,
         receipt_id: &str,
@@ -218,6 +255,7 @@ impl ToolRecoveryStore {
         let locator: String = row.try_get("safe_locator_json")?;
         let pre: String = row.try_get("precondition_digest")?;
         let current = snapshot_digest(&self.pool, cwd, &kind, &locator).await?;
+        let local = kind == "workspace_file" || (kind == "workspace_git" && self.local_receipt_is_bounded(receipt_id).await?);
         let now = chrono::Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
         if succeeded {
@@ -283,10 +321,36 @@ impl ToolRecoveryStore {
             .bind(receipt_id)
             .execute(&mut *tx)
             .await?;
+            // M106: a bounded local snapshot is an observation, not an
+            // unknown external write. Preserve non-replay authority when the
+            // workspace changed; unchanged means the agent must retry/replan.
+            let receipt_status = if local && observed == Some(pre.as_str()) {
+                "cancelled"
+            } else if local && observed.is_some() {
+                "reconciled"
+            } else {
+                "unknown"
+            };
+            if receipt_status != "unknown" {
+                sqlx::query("UPDATE tool_recovery_contracts SET state=?, postcondition_digest=?, settled_at=?,
+                    dispatch_owner=NULL, dispatch_claim_epoch=0,
+                    dispatch_generation=CASE WHEN ?='cancelled' THEN 0 ELSE dispatch_generation END,
+                    dispatch_started_at=CASE WHEN ?='cancelled' THEN NULL ELSE dispatch_started_at END
+                    WHERE receipt_id=?")
+                    .bind(if receipt_status == "cancelled" { "cancelled" } else { "settled_reconciled" })
+                    .bind(observed).bind(now).bind(receipt_status).bind(receipt_status).bind(receipt_id)
+                    .execute(&mut *tx).await?;
+            }
             sqlx::query(
-                "UPDATE side_effect_receipts SET status='unknown', observed_at=?
+                "UPDATE side_effect_receipts SET status=?, summary_json=?, observed_at=?
                  WHERE id=? AND status IN ('started','unknown')",
             )
+            .bind(receipt_status)
+            .bind(serde_json::json!({"status": "error", "recovery": if receipt_status == "cancelled" {
+                "workspace unchanged; previous command failed; re-execute corrected command"
+            } else if receipt_status == "reconciled" {
+                "workspace changed; inspect current diff before continuing; do not replay blindly"
+            } else { "external state remains unknown" }}).to_string())
             .bind(now)
             .bind(receipt_id)
             .execute(&mut *tx)
@@ -1077,6 +1141,38 @@ fn file_mutator_leaves_the_workspace(lower: &str) -> bool {
 /// effect is only honest when the effect is genuinely unobservable, not when the
 /// verb is merely unfamiliar — which binary may run is what the permission mode
 /// decides.
+fn command_has_bounded_local_effects(command: &str) -> bool {
+    if escapes_workspace_observation(command) { return false; }
+    if codefactory_agent_core::command_is_read_only_probe(command) { return true; }
+    // Only literal Python subprocess queries and workspace-relative Path
+    // edits are admitted here. Arbitrary interpreter/program code is NOT
+    // proven local merely because a workspace digest can be computed.
+    let Some((header, body)) = command.split_once("<<'PY'\n") else { return false; };
+    if !matches!(header.trim(), "python3 -" | "python -" | "cd src && python3 -" | "cd src-tauri/src/agent && python3 -") {
+        return false;
+    }
+    let Some(body) = body.strip_suffix("\nPY") else { return false; };
+    let query = regex::Regex::new(r#"^(?:print\()?subprocess\.(?:check_output|run)\(\[([\w\s'",/.-]+)\]\)\)?$"#).expect("static regex");
+    let path = regex::Regex::new(r#"^p = Path\('([a-zA-Z0-9_./-]+)'\)$"#).expect("static regex");
+    let edit = regex::Regex::new(r#"^p\.write_text\(p\.read_text\(\)\.replace\('[a-zA-Z0-9_ ]*', '[a-zA-Z0-9_ ]*'\)\)$"#).expect("static regex");
+    let mut declared_path = false;
+    let mut effect = false;
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if matches!(line, "import subprocess" | "from pathlib import Path") { continue; }
+        if let Some(capture) = query.captures(line) {
+            let argv = capture[1].replace(['\'', '"', ','], " ");
+            if !codefactory_agent_core::is_forge_query_segment(&argv) { return false; }
+            effect = true;
+        } else if let Some(capture) = path.captures(line) {
+            if !safe_relative(Path::new(&capture[1])) { return false; }
+            declared_path = true;
+        } else if declared_path && edit.is_match(line) {
+            effect = true;
+        } else { return false; }
+    }
+    effect
+}
+
 fn escapes_workspace_observation(command: &str) -> bool {
     let trimmed = command.trim_end();
     let lower = trimmed.to_ascii_lowercase();
@@ -1094,6 +1190,20 @@ fn escapes_workspace_observation(command: &str) -> bool {
     // local file can attest to. A plain fetch is a read and stays admissible.
     if super::tool_backend::bash_has_explicit_external_mutation(command) {
         return true;
+    }
+    // M106: reuse M52b's method/body-aware forge vocabulary for shell and
+    // literal Python subprocess argv. Unknown interpreter code remains opaque.
+    let normalized = command.replace(['\'', '"', ',', '[', ']', '(', ')'], " ");
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    for (index, word) in words.iter().enumerate() {
+        if *word == "gh" {
+            let segment = words[index..].join(" ");
+            if !codefactory_agent_core::is_forge_query_segment(&segment) {
+                return true;
+            }
+        } else if *word == "git" && words.get(index + 1) == Some(&"push") {
+            return true;
+        }
     }
     if file_mutator_leaves_the_workspace(&lower) {
         return true;
@@ -1459,6 +1569,56 @@ async fn terminalize_linked_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m106_python_forge_writes_cannot_use_workspace_receipts() {
+        for command in [
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.check_output(['gh', 'api', 'repos/example/project/pulls/7', '-X', 'POST'])\nPY",
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['git', 'push', 'origin', 'HEAD'])\nPY",
+            "gh api repos/example/project/pulls/7 --field=state=closed",
+        ] {
+            assert!(escapes_workspace_observation(command), "external write: {command}");
+        }
+    }
+
+    #[tokio::test]
+    async fn m106_failed_local_tool_observation_does_not_remain_unknown() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF").execute(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../../migrations/0007_unified_objective_control_plane.sql"))
+            .execute(&pool).await.unwrap();
+        ToolRecoveryStore::ensure_schema(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE tool_calls (id TEXT PRIMARY KEY, tool_name TEXT, arguments TEXT)")
+            .execute(&pool).await.unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let store = ToolRecoveryStore::new(pool.clone());
+        for (index, command) in [
+            "python3 - <<'PY'\nimport subprocess\nprint(subprocess.check_output(['gh','api','repos/example/project/pulls/7']))\nPY",
+            "cd src && python3 - <<'PY'\nfrom pathlib import Path\np = Path('repair.rs')\np.write_text(p.read_text().replace('old', 'new'))\nPY",
+        ].iter().enumerate() {
+            let plan = store.prepare("bash", &serde_json::json!({"command":command}), cwd.path(), None, None)
+                .await.unwrap().expect("local snapshot observer");
+            let receipt = format!("receipt-{index}");
+            sqlx::query("INSERT INTO side_effect_receipts (id,objective_id,binding_id,revision,action_fingerprint,idempotency_key,status,created_at,observed_at) VALUES (?, 'objective', 'binding', 1, ?, ?, 'started', 1, 1)")
+                .bind(&receipt).bind(format!("sha256:{}", "a".repeat(64))).bind(&receipt).execute(&pool).await.unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            ToolRecoveryStore::create_contract_in_tx(&mut tx, &receipt, "objective", 1, "binding", 1,
+                &format!("sha256:{}", "a".repeat(64)), &format!("tool-{index}"), plan, None, 0, 1)
+                .await.unwrap();
+            tx.commit().await.unwrap();
+            sqlx::query("INSERT INTO tool_calls (id,tool_name,arguments) VALUES (?, 'bash', ?)")
+                .bind(format!("tool-{index}")).bind(serde_json::json!({"command":command}).to_string())
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO tool_recovery_call_links (receipt_id,tool_call_id,created_at) VALUES (?, ?, 1)")
+                .bind(&receipt).bind(format!("tool-{index}")).execute(&pool).await.unwrap();
+            if index == 1 { std::fs::write(cwd.path().join("repair.rs"), "new").unwrap(); }
+            assert!(store.settle_foreground(&receipt, cwd.path(), false).await.unwrap());
+            let status: String = sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE id=?")
+                .bind(&receipt).fetch_one(&pool).await.unwrap();
+            assert_eq!(status, if index == 0 { "cancelled" } else { "reconciled" });
+        }
+    }
 
     /// A download's destination is the whole point of the command, and a file
     /// digest observes it exactly. Before this, `curl` was on a deny list with

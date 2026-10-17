@@ -762,7 +762,11 @@ fn gh_api_is_read_only(words: &[&str]) -> bool {
             method = Some(value.to_ascii_uppercase());
         } else if let Some(value) = word.strip_prefix("-x").filter(|value| !value.is_empty()) {
             method = Some(value.trim_start_matches('=').to_ascii_uppercase());
-        } else if matches!(word, "-f" | "--field" | "-F" | "--raw-field" | "--input") {
+        } else if matches!(word, "-f" | "--field" | "-F" | "--raw-field" | "--input")
+            || word.starts_with("--field=") || word.starts_with("--raw-field=")
+            || word.starts_with("--input=")
+            || word.strip_prefix("-f").is_some_and(|value| !value.is_empty())
+        {
             sends_body = true;
         }
         index += 1;
