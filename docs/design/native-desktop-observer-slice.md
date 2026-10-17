@@ -1,5 +1,7 @@
 # 原生只读 AX 观察器与持有租约的 supervisor
 
+> 2026-10-17 状态：GitHub 托管 macOS runner 没有可用的 GUI 会话，`native-desktop-observer.yml` 自 2026-09-08 起 48 次运行全部在 preflight 以退出码 3 失败、从未通过，且不是 required check，只产生失败通知噪音，已删除该 workflow 及其契约测试 `tests/test_native_observer_workflow.py`。脚本、Swift driver 与回执校验保留，供本机真实桌面验收复用；如以后接入带 GUI 会话的自托管 runner，再恢复 workflow。
+
 本轮只实现真实 Tauri 的只读 AX 可达性和 main child 回收。必须复用经过审核的 Synthetic 产品入口；没有 AppKit demo，不更改 registry/judge/workflow。本地只做 typecheck 和合成合同测试，不查询本机原生环境或占用另一条线的桌面；真实运行留给独立 macOS CI。
 
 ## 接口
