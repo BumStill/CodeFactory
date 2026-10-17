@@ -154,7 +154,7 @@ Scenario-Test: HLT-003, HLT-004
 | E2E-001 | 用户离开后长任务跨进程自动完成 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-002 | 历史 session 简短继续精确续接 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
 | E2E-003 | 显式停止清除整个 session 并跨重启保持 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
-| E2E-004 | 长任务中追加约束并完成完整交付链 | P1 | `designed` | 3 | `missing` | 0 |
+| E2E-004 | 长任务中追加约束并完成完整交付链 | P1 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-005 | 浏览器逻辑失败后回收并可继续任务 | P0 | `partially_implemented` | 1 | `implemented` | 0 |
 | E2E-006 | 历史卡住任务存在时仍可完成应用更新 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
 | E2E-007 | 计划拒绝与只读误判后恢复耗尽一致收敛 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
