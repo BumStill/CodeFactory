@@ -2520,6 +2520,25 @@ async fn reconcile_receipted_local_commit_head(
             "local commit intent operation key does not match its write-ahead evidence".into(),
         ));
     }
+    // The durable head already includes this receipt. New checkout edits are
+    // a separate delivery revision, not another parent-to-child recovery.
+    if current.head_sha == persisted.head_sha
+        && evidence.expected_head_sha == persisted.head_sha
+        && current.repo_identity == persisted.repo_identity
+        && current.worktree_identity == persisted.worktree_identity
+        && current.change_set_digest != persisted.change_set_digest
+    {
+        let previous = DeliveryIdentitySnapshot {
+            repo_identity: evidence.repo_identity.clone(),
+            worktree_identity: evidence.worktree_identity.clone(),
+            head_sha: evidence.previous_head_sha.clone(),
+            change_set_digest: evidence.previous_change_set_digest.clone(),
+        };
+        delivery::observe_receipted_local_commit(
+            &cwd, Some(&claimed.base_branch), &claimed.head_branch, &previous, &evidence,
+        ).map_err(crate::errors::AppError::Other)?;
+        return Ok(None);
+    }
     if current.head_sha == persisted.head_sha && evidence.expected_head_sha != persisted.head_sha {
         current = delivery_run::with_receipted_local_commit_cas(
             db,
@@ -6189,7 +6208,17 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(persisted_after_recovery, (committed_head, 1));
+        assert_eq!(persisted_after_recovery, (committed_head.clone(), 1));
+        // M100: a later owner may edit after the child identity was persisted.
+        std::fs::write(worktree.join("recovery.txt"), "follow-up after restart\n").unwrap();
+        assert_eq!(
+            reconcile_receipted_local_commit_head(&pool, &mut claimed_after_second_loss, &third_process)
+                .await.unwrap(),
+            None,
+            "the settled child is not a fresh parent-to-child recovery"
+        );
+        assert_eq!(recovery_git(&worktree, &["rev-parse", "HEAD"]), committed_head);
+        assert_eq!(std::fs::read_to_string(worktree.join("recovery.txt")).unwrap(), "follow-up after restart\n");
         std::fs::remove_dir_all(fixture_root).ok();
     }
 
