@@ -525,6 +525,8 @@ impl ProviderRecoveryStore {
              WHERE objective_id=? AND binding_id=? AND resource_generation=?
                AND objective_revision<=?
                AND status IN ('in_flight','streaming','unknown','response_committed')
+               AND NOT (status='response_committed' AND objective_revision=?
+                   AND owner_kind=? AND owner_id=? AND owner_epoch=?)
                AND (objective_revision<? OR (owner_kind=? AND owner_id=? AND owner_epoch=?))
                AND side_effect_started=0 AND side_effect_receipt_id IS NULL
                AND id=(SELECT latest.id FROM provider_route_attempts latest
@@ -536,6 +538,8 @@ impl ProviderRecoveryStore {
         )
         .bind(now).bind(now).bind(&permit.objective_id).bind(&permit.binding_id)
         .bind(permit.resource_generation).bind(permit.objective_revision)
+        .bind(permit.objective_revision).bind(&permit.owner_kind)
+        .bind(&permit.owner_id).bind(permit.owner_epoch)
         .bind(permit.objective_revision).bind(&permit.owner_kind)
         .bind(&permit.owner_id).bind(permit.owner_epoch)
         .execute(&mut *tx).await?.rows_affected();
