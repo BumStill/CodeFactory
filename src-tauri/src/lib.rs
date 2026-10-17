@@ -10,6 +10,15 @@ pub mod headless_dispatch;
 /// without a private per-user socket implementation this is a no-op, so the GUI
 /// still starts normally.
 pub fn run_headless_dispatch_cli() -> bool {
+    #[cfg(not(test))]
+    if std::env::args().nth(1).as_deref() == Some("--measure-first-request-latency") {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("latency runtime");
+        match runtime.block_on(agent::first_request_latency::measure()) {
+            Ok(receipt) => println!("{}", serde_json::to_string_pretty(&receipt).expect("latency receipt")),
+            Err(error) => { eprintln!("first request measurement failed: {error:#}"); std::process::exit(1); }
+        }
+        return true;
+    }
     #[cfg(unix)]
     {
         headless_dispatch::run_client_cli()

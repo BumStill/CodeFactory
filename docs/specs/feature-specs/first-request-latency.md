@@ -17,6 +17,29 @@
 ## 标题
 `perf(chat): the first model request of a turn no longer waits ~3.5s behind work that can run off the critical path`
 
+## M4B 原始任务（逐字保留）
+
+# 任务：把首请求前的 3.5 秒完整测清楚，并修掉剩下最大的一段（M4 第二段）
+
+按 `/Users/leo/.codefactory/agent-tools/task-template.md` 执行（harness + SDD + TDD + 自验收 + §8 收尾；交付 ceiling: merged）。
+上一段 #672 只修了额度刷新锁这一段等待（102ms → 0），完整的分段测量还没有做，PR 里已经如实说明。规格见 `docs/specs/feature-specs/first-request-latency.md`。
+
+## 要做的
+1. 写一个可重复的测量入口，例如 `scripts/measure-first-request-latency.mjs`，或者 Rust 侧的集成测试。用合成会话加本地假模型端点（不要访问外网），跑完整的「消息准入 → 首个 HTTP 请求发出」路径，输出每一段的耗时：admission、workspace_checkpoint、route_quota、quota_refresh_lock、context_assembly、skills/memory 加载、provider_post 之前。连续跑 5 轮，给出中位数。
+2. 根据测量结果，修掉剩下最大的一段。前提是不改变门禁语义：额度、时段、权限仍然必须在首请求之前生效。
+3. 写回归测试，锁住首请求前的关键路径，例如关键路径上不得有同步网络调用，或者某个阈值以内的测量断言（阈值要宽松，避免 CI 抖动）。
+4. PR 里附上修复前后的分段耗时表。
+
+## 约束
+不改 `.github/` 工作流、场景注册表与校验器；只用合成数据；其余同模板。
+
+## 标题
+`perf(chat): measure every step before the first model request and remove the largest remaining wait`
+
+### M4B Implementation Notes
+
+追踪项 M4B-1/2/3/4 对应以上四项；沿用本文 Harness 与真实应用验收分工。完整路径测量必须使用生产准入与 AgentLoop，不能以手写 sleep 或局部耗时推断历史 3.5 秒。测量原始样本、阶段覆盖、首个本地 HTTP 请求及门禁断言均需机器检查。模板明确禁止 delegate_tasks，按单执行流执行。
+
 ## Implementation Notes
 
 原任务未提供 Req ID、指定规格路径或完整测试矩阵；本文件保留原文，不自行扩大验收语义。追踪标识 M4-1/2/3 分别对应上述三项。

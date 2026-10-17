@@ -6415,7 +6415,11 @@ pub fn delivery_readiness_from_origin(
     origin_url: Option<&str>,
     settings: &crate::config::settings::Settings,
 ) -> Option<String> {
-    delivery_readiness_with_gh(origin_url, settings, gh_cli_available())
+    // No remote means no delivery capability to describe. In particular, do
+    // not run `gh auth status` (which may contact GitHub) just to discard its
+    // answer for a local-only workspace.
+    let origin = origin_url?;
+    delivery_readiness_with_gh(Some(origin), settings, gh_cli_available())
 }
 
 /// Testable core of [`delivery_readiness_from_origin`] with the gh probe
@@ -6506,10 +6510,18 @@ pub fn delivery_readiness_note(
     cwd: &Path,
     settings: &crate::config::settings::Settings,
 ) -> Option<String> {
-    let root = git(cwd, &["rev-parse", "--show-toplevel"]).ok()?;
-    let remote = default_remote(Path::new(&root));
-    let origin = git(Path::new(&root), &["remote", "get-url", &remote]).ok();
-    delivery_readiness_from_origin(origin.as_deref(), settings)
+    // These are local metadata reads, not delivery operations. The bounded
+    // subprocess wrapper polls at 30ms intervals; three trivial git commands
+    // therefore added ~90ms before every first request even without a remote.
+    let repo = git2::Repository::discover(cwd).ok()?;
+    let remotes = repo.remotes().ok()?;
+    let name = if remotes.iter().flatten().any(|name| name == "origin") {
+        "origin"
+    } else {
+        remotes.iter().flatten().next()?
+    };
+    let remote = repo.find_remote(name).ok()?;
+    delivery_readiness_from_origin(remote.url(), settings)
 }
 
 fn block_unverified_release(
