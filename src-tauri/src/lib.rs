@@ -108,6 +108,36 @@ pub fn register_chat_run_stop_flag(run_instance_id: &str, cancel: &Arc<AtomicBoo
     // without bound across a long-lived desktop session.
     flags.retain(|_, weak| weak.strong_count() > 0);
     flags.insert(run_instance_id.to_string(), Arc::downgrade(cancel));
+    // M99: provenance may not outlive the flag it describes.
+    lock_chat_run_internal_stops().retain(|id| {
+        flags.get(id).is_some_and(|weak| weak.strong_count() > 0) || id == run_instance_id
+    });
+}
+
+/// M99: *who* raised a run's cooperative stop flag.
+///
+/// `chat_session_cancel_intents` is the durable statement "the user stopped
+/// this". Raising the flag is not that statement: background settlement
+/// (incident controller, convergence, the delivery supervisor) stops a live run
+/// so nothing keeps writing after the closing statement. Without provenance the
+/// setup-convergence path could only observe "the flag is up" and turned a
+/// system stop into a user stop intent, so an internal settlement ended up
+/// recorded with `cancellation_provenance=explicit_cancel` (2026-10-17,
+/// session a1ce7c0b).
+static CHAT_RUN_INTERNAL_STOPS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+fn chat_run_internal_stops()
+-> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    CHAT_RUN_INTERNAL_STOPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn lock_chat_run_internal_stops()
+-> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    chat_run_internal_stops()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Raise the cooperative stop flag for `run_instance_id`.
@@ -117,6 +147,10 @@ pub fn register_chat_run_stop_flag(run_instance_id: &str, cancel: &Arc<AtomicBoo
 /// means the process-local half is already gone (the run finished, or another
 /// process owns it), which callers treat as "nothing to wait for".
 pub fn request_chat_run_stop(run_instance_id: &str) -> bool {
+    raise_chat_run_stop_flag(run_instance_id)
+}
+
+fn raise_chat_run_stop_flag(run_instance_id: &str) -> bool {
     let flags = lock_chat_run_stop_flags();
     let Some(weak) = flags.get(run_instance_id) else {
         return false;
@@ -126,6 +160,33 @@ pub fn request_chat_run_stop(run_instance_id: &str) -> bool {
     };
     cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     true
+}
+
+/// Raise the cooperative stop flag from an *internal* actor: settlement,
+/// reconciliation, a fencing stop. The run must still stop, but the stop is not
+/// a user statement and no durable user-cancel intent may be derived from it.
+pub fn request_chat_run_stop_internal(run_instance_id: &str) -> bool {
+    if !raise_chat_run_stop_flag(run_instance_id) {
+        return false;
+    }
+    let mut internal = lock_chat_run_internal_stops();
+    internal.insert(run_instance_id.to_string());
+    true
+}
+
+/// Was this run's currently raised stop flag placed by an internal actor?
+///
+/// Only a process that actually saw the internal raise can answer `true`; a
+/// restarted process has no provenance and must rely on the durable rows, which
+/// are exactly the ones an internal stop never writes as a user intent.
+pub fn chat_run_stop_is_internal(run_instance_id: &str) -> bool {
+    lock_chat_run_internal_stops().contains(run_instance_id)
+}
+
+/// Drop stop provenance for a run that is no longer live, so a recycled id can
+/// never inherit an earlier internal classification.
+pub fn forget_chat_run_stop_provenance(run_instance_id: &str) {
+    lock_chat_run_internal_stops().remove(run_instance_id);
 }
 
 /// Is a live stop flag still registered for this run in this process? A live
