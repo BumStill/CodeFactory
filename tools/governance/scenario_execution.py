@@ -459,6 +459,7 @@ def execute_plan(plan: dict[str, Any], repo: Path, runner: str) -> dict[str, Any
         "base_sha": plan.get("base_sha"),
         "head_sha": plan.get("head_sha"),
         "runner": runner,
+        "run_attempt": int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")),
         "targets": [results[target] for target in selected],
         "cases": list(case_results.values()),
         "receipt_errors": ["runner_execution_failed"] if execution_errors else [],
@@ -472,6 +473,7 @@ def aggregate_receipts(
     cases: list[dict[str, Any]] = []
     errors: list[str] = []
     seen_runners: set[str] = set()
+    seen_attempts: set[tuple[str, int]] = set()
     for path in receipt_paths:
         try:
             receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -487,17 +489,24 @@ def aggregate_receipts(
         ):
             errors.append("runner receipt identity or schema does not match the plan")
             continue
-        if set(receipt) - {"schema_version", "base_sha", "head_sha", "runner", "targets", "cases", "receipt_errors"}:
+        if set(receipt) - {"schema_version", "base_sha", "head_sha", "runner", "run_attempt", "targets", "cases", "receipt_errors"}:
             errors.append("runner receipt has unexpected fields")
         runner = receipt.get("runner")
-        if not isinstance(runner, str) or runner not in plan.get("runners", {}) or runner in seen_runners:
+        attempt = receipt.get("run_attempt", 1)
+        if type(attempt) is not int or attempt < 1:
+            errors.append("runner receipt attempt is invalid")
+            continue
+        if not isinstance(runner, str) or runner not in plan.get("runners", {}) or (runner, attempt) in seen_attempts:
             errors.append("duplicate or unplanned runner receipt")
             continue
+        seen_attempts.add((runner, attempt))
         seen_runners.add(runner)
         if not isinstance(receipt.get("receipt_errors"), list):
             errors.append("runner receipt diagnostics must be a list")
         if receipt.get("receipt_errors"):
             errors.append("runner reported execution or cleanup errors")
+        seen_targets: set[str] = set()
+        seen_cases: set[str] = set()
         for field, destination in (("targets", targets), ("cases", cases)):
             entries = receipt.get(field)
             if not isinstance(entries, list):
@@ -512,6 +521,9 @@ def aggregate_receipts(
                     if not isinstance(target, str) or target not in plan.get("required_targets", []):
                         errors.append("unplanned execution target")
                         continue
+                    if target in seen_targets:
+                        errors.append("duplicate execution target within attempt")
+                    seen_targets.add(target)
                     if set(entry) - {"target", "outcome", "command_sha256", "alias_of", "detail", "runner"}:
                         errors.append("execution target has unexpected fields")
                     if "detail" in entry and (not isinstance(entry["detail"], str) or entry["detail"] not in {"target_execution_failed", "case_observations_rejected"}):
@@ -535,11 +547,34 @@ def aggregate_receipts(
                     if case is None:
                         errors.append("unplanned case execution entry")
                         continue
-                    if validate_case_entry({**entry, "runner": runner}, case):
+                    if entry["case_id"] in seen_cases:
+                        errors.append("duplicate case within attempt")
+                    seen_cases.add(entry["case_id"])
+                    projected = {**build_case_entry(entry.get("raw_observations"), case), "runner": runner}
+                    # A genuine failed oracle may be superseded by a successful
+                    # attempt; malformed, forged or wrong-identity evidence may not.
+                    from tools.governance.scenario_case_execution import raw_observation_errors
+                    if (set(entry) - {"case_id", "raw_observations", "receipt", "runner"}
+                            or raw_observation_errors(entry.get("raw_observations"), case["expectation"])
+                            or any(json.dumps(entry.get(key), sort_keys=True) != json.dumps(value, sort_keys=True) for key, value in projected.items() if key != "runner")
+                            or runner != case["expectation"]["runner"]["name"]):
                         errors.append("case evidence failed trusted recomputation")
-                    # Re-export only the trusted privacy projection, retaining a
-                    # failure marker if the uploaded claims disagreed with it.
-                    destination.append({**build_case_entry(entry.get("raw_observations"), case), "runner": runner})
+                    destination.append(projected)
+    targets_by_name: dict[str, dict[str, Any]] = {}
+    cases_by_id: dict[str, dict[str, Any]] = {}
+    for entry in targets:
+        target = entry["target"]
+        if entry["outcome"] == "passed" and "command_sha256" not in entry:
+            errors.append("successful target has no valid command digest")
+        if entry.get("runner") != next((runner for runner, selected in plan.get("runners", {}).items() if target in selected), None):
+            errors.append("execution target runner does not match the plan")
+        previous = targets_by_name.get(target)
+        if previous is None or entry["outcome"] == "passed":
+            targets_by_name[target] = entry
+    for entry in cases:
+        previous = cases_by_id.get(entry["case_id"])
+        if previous is None or entry["receipt"].get("outcome") == "passed":
+            cases_by_id[entry["case_id"]] = entry
     if seen_runners != set(plan.get("runners", {})):
         errors.append("missing required runner receipt")
     aggregate = {
@@ -548,8 +583,8 @@ def aggregate_receipts(
         "head_sha": plan.get("head_sha"),
         "scenario_ids": plan.get("scenario_ids") or [],
         "e2e_ids": plan.get("e2e_ids") or [],
-        "targets": targets,
-        "cases": cases,
+        "targets": list(targets_by_name.values()),
+        "cases": list(cases_by_id.values()),
         "receipt_errors": ["runner_artifacts_invalid"] if errors else [],
     }
     # The independent await-github verifier repeats this calculation using a
@@ -657,12 +692,13 @@ def await_github_receipt(
             ]
         artifacts = _github_json(f"{api_root}/actions/runs/{run['id']}/artifacts", token)
         expected_name = f"affected-scenario-receipt-{plan.get('head_sha')}"
+        expected_names = [
+            f"{expected_name}-attempt-{int(run.get('run_attempt') or 1)}",
+            expected_name,  # Compatibility with pre-attempt receipt uploads.
+        ]
         artifact = next(
-            (
-                item
-                for item in artifacts.get("artifacts") or []
-                if item.get("name") == expected_name and not item.get("expired")
-            ),
+            (item for name in expected_names for item in artifacts.get("artifacts") or []
+             if item.get("name") == name and not item.get("expired")),
             None,
         )
         if artifact is None:
