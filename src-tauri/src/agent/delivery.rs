@@ -798,6 +798,7 @@ pub(crate) async fn arm_merge_queue_with_bounded_retry<R: DeliveryRemote + ?Size
     remote: &R,
     number: u64,
     expected_head: &str,
+    opts: &DeliverOpts,
 ) -> Result<u32, String> {
     let mut attempts_used = 0;
     let mut last_error = String::new();
@@ -810,8 +811,19 @@ pub(crate) async fn arm_merge_queue_with_bounded_retry<R: DeliveryRemote + ?Size
             ));
         };
         attempts_used = attempt;
+        if let Some(reason) = stop_reason(opts).await {
+            return Err(format!("已停止，未继续合并排队: {reason}"));
+        }
         match remote.arm_merge_queue(number, expected_head).await {
-            Ok(()) => return Ok(attempt),
+            Ok(()) => {
+                // Stop may arrive while the provider request is in flight.
+                // Withdraw a label we just wrote instead of leaving it armed.
+                if let Some(reason) = stop_reason(opts).await {
+                    let withdrawal = remote.clear_merge_queue_arm(number).await;
+                    return Err(format!("已停止: {reason}; 合并排队撤回结果: {withdrawal:?}"));
+                }
+                return Ok(attempt);
+            }
             Err(error) => last_error = error,
         }
     }
@@ -5896,8 +5908,11 @@ pub async fn deliver<R: DeliveryRemote>(
         // green PR must go to the repository merge queue, and nothing else will
         // ever arm it. Arm here, with a bounded retry, and if every attempt
         // fails, say so truthfully instead of parking in a wait nobody pushes.
+        if let Some(reason) = stop_reason(opts).await {
+            return outcome.stopped_at("merge_queue_arm", &reason);
+        }
         if merge_queue_arm_is_owed(&ceiling) || merge_queue_arm_is_owed(&requested_ceiling) {
-            match arm_merge_queue_with_bounded_retry(remote, pr_number, &sha).await {
+            match arm_merge_queue_with_bounded_retry(remote, pr_number, &sha, opts).await {
                 Ok(attempt) => outcome.steps.push(StepResult::ok(
                     "merge_queue_arm",
                     format!(
@@ -13069,6 +13084,7 @@ README-Update-Reason: synthetic fixture\n\nbody"
         /// CF-STOP-R1: tripped by the first CI poll, so the stop arrives exactly
         /// while the ladder is parked waiting for CI (the M47 timing).
         stop_gate_on_ci: Mutex<Option<Arc<crate::agent::stop_fence::FlagStopGate>>>,
+        queue_arms: AtomicUsize,
     }
 
     fn stub_calls() -> Arc<StubCalls> {
@@ -13086,6 +13102,11 @@ README-Update-Reason: synthetic fixture\n\nbody"
     }
 
     impl DeliveryRemote for StubRemote {
+        async fn arm_merge_queue(&self, _number: u64, _expected_head: &str) -> Result<(), String> {
+            self.calls.queue_arms.fetch_add(1, Ordering::SeqCst);
+            Err("adapter cannot arm the merge queue".into())
+        }
+
         fn capabilities(&self) -> DeliveryCapabilities {
             self.caps
         }
@@ -15491,6 +15512,33 @@ Release-Urgency: hold"
             "结论必须如实说明 PR 的处境: {}",
             out.summary
         );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn m47_stop_on_green_ci_never_arms_the_queue() {
+        let root = feature_branch_repo("m47-green-ci-stop");
+        let calls = stub_calls();
+        let gate = crate::agent::stop_fence::FlagStopGate::new("user_stop");
+        *calls.stop_gate_on_ci.lock().unwrap() = Some(gate.clone());
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let out = deliver(
+            &root, DeliveryCeiling::ThroughMerge, MergeMethod::Squash, 5,
+            &DeliverOpts { stop_gate: Some(gate), ..DeliverOpts::default() },
+            Some(&remote), Some("main"),
+        ).await;
+        assert_eq!(out.final_state, "stopped", "{:?}", out.steps);
+        assert_eq!(calls.queue_arms.load(Ordering::SeqCst), 0,
+            "M47: a green CI response must not authorize merging after explicit stop");
+        assert_eq!(calls.open_pr.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

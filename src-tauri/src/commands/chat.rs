@@ -602,13 +602,15 @@ pub async fn cancel_chat(
     )
     .await
     {
-        Ok(report) => tracing::info!(
-            session_id,
-            pr_number = ?report.pr_number,
-            complete = report.is_complete(),
-            notes = ?report.notes,
-            "cancel_chat: 停止栅栏已写入，PR 侧收尾已执行"
-        ),
+        Ok(report) => {
+            let content = format!("{}\n{}", report.notice, report.notes.join("\n"));
+            sqlx::query("INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)")
+                .bind(Uuid::new_v4().to_string()).bind(&session_id).bind(&content)
+                .bind(Utc::now().timestamp_millis()).execute(&pool).await?;
+            tracing::info!(session_id, pr_number = ?report.pr_number,
+                complete = report.is_complete(), notes = ?report.notes,
+                "cancel_chat: 停止栅栏及 PR 撤回结果已写入会话");
+        }
         Err(error) => tracing::warn!(
             session_id,
             %error,
@@ -2323,6 +2325,7 @@ async fn admit_persisted_chat_turn(
     .bind(&root_turn_id)
     .fetch_optional(&mut *tx)
     .await?;
+    let fresh_user_message = existing_message.is_none();
     if let Some((bound_session, role, stored_content)) = existing_message {
         if (
             bound_session.as_str(),
@@ -2546,6 +2549,14 @@ async fn admit_persisted_chat_turn(
             .execute(&mut *tx)
             .await?;
     } else if contract.capability == crate::agent::TurnCapability::Deliver {
+        // M47 R4: only fresh explicit authorization may lift a delivery stop.
+        // An existing root replay or a concurrent stop must never unfence it.
+        if fresh_user_message && !cancelled {
+            sqlx::query("DELETE FROM delivery_stop_fences WHERE session_id=?")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id=?")
             .bind(session_id)
             .execute(&mut *tx)
@@ -4571,6 +4582,21 @@ mod tests {
         // for a moment (os error 32). Cleanup of a temp dir is not what this test
         // asserts, so it must never be the thing that fails it.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn m47_explicit_new_delivery_authorization_clears_the_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::storage::db::connect(dir.path().join("synthetic.sqlite").to_str().unwrap()).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at) VALUES ('m47-session', 'synthetic', '/tmp', 'model', 1, 1)")
+            .execute(&pool).await.unwrap();
+        crate::agent::stop_fence::record_stop(&pool, "m47-session", "user_stop", None).await.unwrap();
+        let receipt = admit_persisted_chat_turn(&pool, &crate::ChatRunControl::pending(), "m47-session", None,
+            "开始实施修复，授权交付（ceiling: merged）").await.unwrap();
+        assert_eq!(receipt.contract.capability, crate::agent::TurnCapability::Deliver);
+        assert!(crate::agent::stop_fence::stop_fence(&pool, "m47-session").await.unwrap().is_none(),
+            "R4: a new explicit delivery authorization must not remain permanently stopped");
+        pool.close().await;
     }
 
     async fn reprompt_test_pool() -> sqlx::SqlitePool {
