@@ -1,7 +1,7 @@
 ## M107 — Req ID 与验收
 - R1/R5：规格 `docs/specs/feature-specs/m107-reconcile-replay-real-incidents.md` 保留任务需求并记录 M98/M103/M106 的假设、遗漏与对账边界。
 - R2d：`m107_normal_committed_steps_are_not_recovery_failures` 十二步 SQLite 回放先红（Applied(1) != Applied(0)）后绿。
-- R2a–c/R3：`m107_replay_finished_regression_error_continues`、`m107_replay_finished_python_get_error_continues`、`m107_replay_waiting_local_edit_continues` 检查真实工具恢复存储的本地失败/等待形状；临时目录用例先红（unknown != reconciled）后绿。`m103_current_owner_reconciles_effect_free_request_at_serial_boundary` 与 `m103_reconciliation_closes_prior_episode_before_revision_resume` 覆盖第四现场及 revision 接管；`m103_reconciliation_refuses_unproven_side_effect` 保留无回执副作用停止反例。
+- R2a–c/R3：`m107_replay_finished_regression_error_continues`、`m107_replay_finished_python_get_error_continues`、`m107_replay_waiting_local_edit_continues` 检查真实工具恢复存储的本地失败/等待形状；临时目录用例先红（unknown != reconciled）后绿。`m103_current_owner_reconciles_effect_free_request_at_serial_boundary` 与 `m103_reconciliation_closes_prior_episode_before_revision_resume` 覆盖第四现场及 revision 接管；`m107_in_flight_attempt_continues_after_reconciliation`（现场 4 独立回放）与 m107_real_push_with_unknown_receipt_stops`（真实 push 回执未知必须 UNSAFE 且不结算本地）。
 - R2e：`forge_read_only_queries_are_probes_not_checks` 新增 gh run view && git show && git fetch 链，现有 M52b 分类已经正确；根因是 agent-loop 每个工具批次之后主动生成完成拒绝。删除该分支，最终响应的完成门禁保持。`m107_tool_steps_do_not_request_completion_recovery` 验证三步工具正常执行，不强迫下一轮工具恢复。
 - R4：E2E-001/E2E-007 automated_by 登记真实测试，已有 PR Cargo / nightly workspace 执行，保留 partially_implemented，不声称完整桌面 E2E 已实现。
 

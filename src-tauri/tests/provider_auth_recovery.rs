@@ -139,6 +139,55 @@ fn episode() -> ProviderEpisodeSpec {
 }
 
 #[tokio::test]
+async fn m107_in_flight_attempt_continues_after_reconciliation() {
+    // Replay of incident 4 (22:46–23:01): an in-flight provider attempt with no
+    // output and no side effect must be reconciled by the live owner and the
+    // episode must admit the next round — not fence it until recovery dies.
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store.begin_attempt(&permit, &attempt("interrupted", "episode-1", "a"), NOW + 1).await.unwrap();
+    store.mark_in_flight(&permit, "interrupted", NOW + 2).await.unwrap();
+    assert_eq!(
+        store.reconcile_finished_request(&permit, NOW + 3).await.unwrap(),
+        ProviderMutation::Applied(1),
+        "an effect-free in-flight attempt is reconciled by its live owner",
+    );
+    store.begin_attempt(&permit, &attempt("continued", "episode-1", "b"), NOW + 4)
+        .await
+        .expect("the reconciled episode admits the next attempt under the same owner");
+    let status: String = sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='interrupted'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "failed_replayable");
+    let budget: i64 = sqlx::query_scalar("SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(budget, 7, "reconciliation never spends recovery budget");
+}
+
+#[tokio::test]
+async fn m107_real_push_with_unknown_receipt_stops() {
+    // The counter-example: a genuine external write whose receipt is unknown
+    // stays a terminal UNSAFE. Local snapshots must never settle it.
+    let pool = pool().await;
+    let permit = insert_claimed_provider_objective(&pool).await;
+    let store = ProviderRecoveryStore::new(pool.clone());
+    store.open_episode(&permit, &episode(), NOW).await.unwrap();
+    store.begin_attempt(&permit, &attempt("push", "episode-1", "a"), NOW + 1).await.unwrap();
+    store.mark_in_flight(&permit, "push", NOW + 2).await.unwrap();
+    store
+        .begin_side_effect(&permit, "push", "tool:bash", "git-push-origin-main", NOW + 3)
+        .await
+        .unwrap();
+    let error = store.reconcile_finished_request(&permit, NOW + 4).await.unwrap_err();
+    assert!(error.to_string().contains("PROVIDER_RECONCILIATION_UNSAFE"), "{error}");
+    let status: String = sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE objective_id='objective-opaque'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "started", "an unknown push receipt is never settled locally");
+    assert!(store.begin_attempt(&permit, &attempt("after-push", "episode-1", "b"), NOW + 5).await.is_err());
+}
+
+#[tokio::test]
 async fn m107_normal_committed_steps_are_not_recovery_failures() {
     let pool = pool().await;
     let permit = insert_claimed_provider_objective(&pool).await;
