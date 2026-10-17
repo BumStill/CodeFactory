@@ -5054,7 +5054,7 @@ impl ObjectiveStore {
             // to spend the recovery budget on a path that is simply down.
             return self.bound_transport_outage(decision).await;
         }
-        if decision.failure_code.as_deref() == Some(CHAT_IDENTITY_UNRECONCILABLE) {
+        if matches!(decision.failure_code.as_deref(), Some(CHAT_IDENTITY_UNRECONCILABLE | "provider_reconciliation_unsafe")) {
             // U18/R3: the remediation's turn identity cannot be reconciled with
             // the Objective's live turn, so replaying the same call returns the
             // same answer. Waiting for a budget to run out would only make the
@@ -15294,6 +15294,20 @@ CREATE TABLE objectives (
         .await
         .unwrap();
         assert_eq!(audit, 1, "the takeover is auditable");
+    }
+
+    #[tokio::test]
+    async fn m103_unprovable_side_effect_settles_without_recovery_budget() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "objective-m103-unsafe").await;
+        let settled = route_technical_failure(
+            &store, &current, "provider_reconciliation_unsafe", "sha256:m103-unsafe-synthetic",
+        ).await;
+        assert_eq!(settled.status, ObjectiveStatus::Failed);
+        assert_eq!(settled.failure_code.as_deref(), Some("provider_reconciliation_unsafe"));
+        assert_eq!(claimable_remediations(&pool, &settled.id).await, 0);
     }
 
     /// U18/R3: an identity disagreement that reconciliation cannot resolve is

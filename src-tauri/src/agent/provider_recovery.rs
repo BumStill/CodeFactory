@@ -457,7 +457,7 @@ impl ProviderRecoveryStore {
             .await?;
             sqlx::query(
                 "UPDATE provider_route_episodes SET status='completed', completed_at=?, updated_at=?
-                 WHERE id=? AND status IN ('active', 'waiting')",
+                 WHERE id=? AND status IN ('active', 'waiting', 'unknown')",
             )
             .bind(now)
             .bind(now)
@@ -499,6 +499,63 @@ impl ProviderRecoveryStore {
             .context("inserted provider episode disappeared")?;
         tx.commit().await?;
         Ok(ProviderMutation::Applied(snapshot))
+    }
+
+    /// Reconcile at the transport's serial request boundary, after its previous
+    /// request future has returned. Never call this from a concurrent observer:
+    /// same-owner liveness alone is not proof that a POST has stopped.
+    pub async fn reconcile_finished_request(
+        &self,
+        permit: &ProviderOwnerPermit,
+        now: i64,
+    ) -> Result<ProviderMutation<u64>> {
+        permit.validate()?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
+        if !permit_is_current(&mut tx, permit, now).await? {
+            return Ok(ProviderMutation::Fenced);
+        }
+        let changed = sqlx::query(
+            "UPDATE provider_route_attempts
+             SET status='failed_replayable', failure_class='provider_reconciliation',
+                 failure_code=CASE WHEN status='response_committed'
+                     THEN 'provider_response_checkpoint_reconciled'
+                     WHEN output_started<>0 THEN 'provider_stream_interrupted_no_side_effect'
+                     ELSE 'provider_request_finished_no_side_effect' END,
+                 observed_at=?, completed_at=COALESCE(completed_at, ?)
+             WHERE objective_id=? AND binding_id=? AND resource_generation=?
+               AND objective_revision<=?
+               AND status IN ('in_flight','streaming','unknown','response_committed')
+               AND (objective_revision<? OR (owner_kind=? AND owner_id=? AND owner_epoch=?))
+               AND side_effect_started=0 AND side_effect_receipt_id IS NULL
+               AND id=(SELECT latest.id FROM provider_route_attempts latest
+                   WHERE latest.episode_id=provider_route_attempts.episode_id
+                   ORDER BY latest.attempt_order DESC LIMIT 1)
+               AND NOT EXISTS (SELECT 1 FROM side_effect_receipts receipt
+                   WHERE receipt.objective_id=provider_route_attempts.objective_id
+                     AND receipt.status IN ('started','unknown'))",
+        )
+        .bind(now).bind(now).bind(&permit.objective_id).bind(&permit.binding_id)
+        .bind(permit.resource_generation).bind(permit.objective_revision)
+        .bind(permit.objective_revision).bind(&permit.owner_kind)
+        .bind(&permit.owner_id).bind(permit.owner_epoch)
+        .execute(&mut *tx).await?.rows_affected();
+        let unsafe_attempt: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM provider_route_attempts a
+             WHERE a.objective_id=? AND a.binding_id=? AND a.resource_generation=?
+               AND a.status IN ('in_flight','streaming','unknown','response_committed')
+               AND a.id=(SELECT latest.id FROM provider_route_attempts latest
+                   WHERE latest.episode_id=a.episode_id ORDER BY latest.attempt_order DESC LIMIT 1)
+               AND (a.side_effect_started<>0 OR a.side_effect_receipt_id IS NOT NULL
+                 OR EXISTS(SELECT 1 FROM side_effect_receipts receipt
+                   WHERE receipt.objective_id=a.objective_id AND receipt.status IN ('started','unknown'))))",
+        )
+        .bind(&permit.objective_id).bind(&permit.binding_id).bind(permit.resource_generation)
+        .fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        if unsafe_attempt {
+            bail!("PROVIDER_RECONCILIATION_UNSAFE: 无法确认上一步外部操作是否完成，已停止以避免重复执行；已有输出保留在当前会话，文件改动保留在项目工作目录，请查看工具记录与交付回执");
+        }
+        Ok(ProviderMutation::Applied(changed))
     }
 
     /// Persist a prepared attempt before a caller can issue any network
