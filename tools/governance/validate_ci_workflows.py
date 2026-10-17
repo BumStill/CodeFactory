@@ -124,7 +124,13 @@ def main(argv: list[str] | None = None) -> int:
             "-pyflakes=",
             *[str(p) for p in workflows],
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         if result.stdout:
             sys.stdout.write(result.stdout)
         if result.stderr:

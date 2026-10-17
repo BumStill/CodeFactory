@@ -59,6 +59,8 @@ class FlakyRetryTest(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
         )
 
@@ -137,6 +139,8 @@ class FlakyRetryTest(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=dict(os.environ, FLAKY_COUNTER=str(self.counter)),
         )
         self.assertEqual(result.returncode, 0, self.output(result))
@@ -166,6 +170,8 @@ class FlakyRetryTest(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=dict(os.environ, FLAKY_COUNTER=str(self.counter)),
         )
         self.assertNotEqual(result.returncode, 0, self.output(result))
@@ -206,6 +212,8 @@ class FlakyRetryTest(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         self.assertEqual(result.returncode, 0, self.output(result))
         self.assertIn("1", result.stdout)
@@ -223,6 +231,8 @@ class FlakyRetryTest(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         self.assertNotEqual(result.returncode, 0, self.output(result))
 
