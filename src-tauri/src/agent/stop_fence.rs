@@ -285,12 +285,17 @@ pub fn stop_pending_pr_actions(
             false
         }
     };
+    let notice = if cleared_merge_queue_arm {
+        format!("已撤回合并排队；PR 保留未合并。{}", stopped_delivery_notice(Some(number)))
+    } else {
+        format!("已停止本地交付，但合并排队撤回失败，PR #{number} 仍可能被远端队列处理；请核对远端状态。")
+    };
     StopDisarmReport {
         pr_number: Some(number),
         cleared_merge_queue_arm,
         disabled_auto_merge,
         notes,
-        notice: stopped_delivery_notice(Some(number)),
+        notice,
     }
 }
 
@@ -394,6 +399,15 @@ pub async fn stop_session_delivery(
         pr_number.map(|number| number as i64),
     )
     .await?;
+    sqlx::query(
+        "UPDATE delivery_runs SET status='cancelled', next_action_authorized=0,
+         lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+         WHERE session_id=? AND status NOT IN ('completed','failed','cancelled','rejected')",
+    )
+    .bind(chrono::Utc::now().timestamp_millis())
+    .bind(session_id)
+    .execute(pool)
+    .await?;
     let workspace = match workspace_hint {
         Some(path) => path.to_path_buf(),
         None => latest_session_workspace(pool, session_id)
@@ -447,6 +461,7 @@ mod tests {
         assert!(report.cleared_merge_queue_arm && report.disabled_auto_merge);
         assert!(report.is_complete());
         assert!(report.notice.contains("PR #584 保持打开，没有合并"));
+        assert!(report.notice.contains("已撤回合并排队；PR 保留未合并"), "{}", report.notice);
     }
 
     /// 停止是幂等的：重复停止不会变成另一种动作，也不会漏掉任何一次关闭。
