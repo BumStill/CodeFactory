@@ -883,6 +883,7 @@ impl DesktopModelTransport {
     }
 
     async fn admit_provider_post(&self) -> Result<()> {
+        let started = std::time::Instant::now();
         if let Some(attempt) = self.provider_attempt.as_ref() {
             if attempt.post_admitted.load(Ordering::SeqCst) {
                 return Err(crate::errors::AppError::Other(
@@ -895,7 +896,7 @@ impl DesktopModelTransport {
                 .await
                 .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
         }
-        tracing::debug!(stage = "provider_post_admitted", "first request preparation");
+        super::first_request_latency::record("provider_post", started);
         Ok(())
     }
 

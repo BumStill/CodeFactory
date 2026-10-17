@@ -18,6 +18,7 @@ pub mod events;
 pub(crate) mod execution_workspace;
 mod fact_checker;
 pub mod failover;
+pub(crate) mod first_request_latency;
 #[cfg(not(test))]
 pub(crate) mod history_session_smoke;
 pub mod hooks;
@@ -1136,6 +1137,7 @@ impl AgentLoop {
         // post-mortem loop captured them but only spec decomposition read them).
         // See `agent::context_budget`.
         let cwd_str = self.cwd.to_string_lossy();
+        let skills_memory_started = std::time::Instant::now();
         let mut blocks = project_knowledge_blocks(&self.cwd);
         let skill_bodies = match &self.app {
             Some(app) => crate::commands::skills::enabled_skill_prompts(app).await,
@@ -1152,12 +1154,13 @@ impl AgentLoop {
         if !user_ctx.is_empty() {
             blocks.push(context_budget::Block::new(user_ctx, 0, 2500));
         }
+        first_request_latency::record("skills_memory", skills_memory_started);
         let mut system_prompt = context_budget::assemble(
             base_system_prompt(self.mode, &self.cwd),
             blocks,
             SYSTEM_PROMPT_BUDGET,
         );
-        tracing::debug!(stage = "context_assembly", elapsed_ms = context_started.elapsed().as_millis() as u64, "first request preparation");
+        first_request_latency::record("context_assembly", context_started);
         if supports_plan {
             system_prompt.push_str(STRUCTURED_EXECUTION_ROUTE_PROMPT);
         }
@@ -1167,12 +1170,14 @@ impl AgentLoop {
         // Delivery-chain readiness: surface a broken chain (e.g. missing
         // GitHub token) in the model's FIRST reply instead of letting it be
         // discovered when deliver_changes blocks after the work is done.
+        let delivery_started = std::time::Instant::now();
         {
             let settings = self.settings.read().await;
             if let Some(note) = delivery::delivery_readiness_note(&self.cwd, &settings) {
                 system_prompt.push_str(&note);
             }
         }
+        first_request_latency::record("delivery_readiness", delivery_started);
         let api_style = self.api_style.clone();
 
         let result = match api_style {
