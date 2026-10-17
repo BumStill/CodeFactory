@@ -517,6 +517,26 @@ jobs:
           if (-not $smoke.cleanup_ok) { throw "Release historical session smoke leaked isolated state" }
           Get-Content $receipt
 
+      - name: Verify Windows release executable browser extension lifecycle
+        shell: pwsh
+        run: |
+          # E2E-008: the same loopback lifecycle oracle the PR gate runs, but
+          # against the exact release executable, so a release that touches the
+          # extension bridge carries exact-artifact proof.
+          $exe = Get-ChildItem "src-tauri/target/release" -Filter "codefactory.exe" -File | Select-Object -First 1
+          if (-not $exe) { throw "Windows release executable was not produced" }
+          $receipt = Join-Path $env:RUNNER_TEMP "browser-extension-lifecycle-release.json"
+          $process = Start-Process -FilePath $exe.FullName `
+            -ArgumentList @("--browser-extension-lifecycle-smoke", $receipt) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Extension lifecycle release smoke exited $($process.ExitCode)" }
+          $smoke = Get-Content $receipt -Raw | ConvertFrom-Json
+          foreach ($field in @('ok', 'old_generation_cancelled', 'half_open_evicted', 'same_session', 'cleanup_ok')) {
+            if ($smoke.$field -ne $true) { throw "Release lifecycle oracle failed: $field" }
+          }
+          if ($smoke.duplicate_command_count -ne 0) { throw "Release duplicated an extension command" }
+          if ($smoke.human_prompt_count -ne 0) { throw "Release lifecycle smoke prompted a human" }
+          Get-Content $receipt
+
   # ── Step 3: build the macOS (Apple Silicon) app + dmg ─────────────────────
   # Runs in parallel with Windows after prepare-release creates the draft;
   # tauri-action uploads the .app.tar.gz (+ .sig) and the .dmg. The updater
