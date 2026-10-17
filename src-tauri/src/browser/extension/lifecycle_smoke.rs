@@ -119,8 +119,26 @@ async fn probe() -> anyhow::Result<Value> {
     ensure!(seen.len() == 6, "exact command ledger");
     guard.0.abort();
     ensure!((&mut guard.0).await.unwrap_err().is_cancelled(), "listener stopped");
-    let rebound = TcpListener::bind(("127.0.0.1", port)).await?;
-    drop(rebound);
+    // A just-closed listener does not free its port at the same instant on every
+    // platform: Windows keeps it reserved while the socket is torn down and
+    // accepted connections sit in TIME_WAIT, so an immediate rebind fails with
+    // WSAEADDRINUSE (10048). Poll the release instead of assuming Unix's
+    // instantaneous close, and fail only when the port never comes back.
+    let released = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(rebound) => return Ok(rebound),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .context("listener did not release its port")?
+    .context("port release probe")?;
+    drop(released);
     Ok(json!({"ok": true, "scenario_id": "E2E-008", "old_generation_cancelled": true,
         "half_open_evicted": true, "same_session": true, "selected_tab": 7,
         "command_count": seen.len(), "duplicate_command_count": 0,
