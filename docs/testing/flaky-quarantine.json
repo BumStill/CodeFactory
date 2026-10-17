@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "description": "Known-flaky tests. An entry only allows ONE automatic re-run inside the same CI job when the test actually fails; it never skips a test. Every entry must carry source evidence and an expiry date, and an expired entry fails the governance gate.",
+  "entries": []
+}

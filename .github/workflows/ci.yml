@@ -92,7 +92,9 @@ jobs:
       # broken in v0.3.7 and v0.3.9 before tests existed.
       - name: Vitest
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: pnpm test
+        # Quarantined flaky tests (docs/testing/flaky-quarantine.json) get one
+        # automatic re-run inside this same job; everything else fails as usual.
+        run: python tools/governance/run_flaky_retry.py --job check-frontend -- pnpm test
 
       - name: Release workflow contract tests
         if: ${{ !cancelled() }}
@@ -270,7 +272,7 @@ jobs:
 
       - name: Cargo test
         if: ${{ !cancelled() }}
-        run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
+        run: python tools/governance/run_flaky_retry.py --job check-rust -- cargo test --manifest-path src-tauri/Cargo.toml --quiet
 
       # The command classifier and shared execution contracts live in their
       # own workspace member. If this package is omitted, a production command
@@ -278,14 +280,14 @@ jobs:
       # while the root and loop test jobs remain green.
       - name: Cargo test (agent-core crate)
         if: ${{ !cancelled() }}
-        run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-core --quiet
+        run: python tools/governance/run_flaky_retry.py --job check-rust -- cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-core --quiet
 
       # The root `cargo test` covers only the `codefactory` package. The shared
       # tauri-free loop crate (keystone slice 4) is a separate workspace member,
       # so test it explicitly — future slices move real loop logic here.
       - name: Cargo test (agent-loop crate)
         if: ${{ !cancelled() }}
-        run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-loop --quiet
+        run: python tools/governance/run_flaky_retry.py --job check-rust -- cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-loop --quiet
 
       # Same reason as agent-loop: the headless eval sidecar is its own workspace
       # member, so neither the root `cargo test` nor the agent-loop step compiles
@@ -293,7 +295,7 @@ jobs:
       # #260 shipped three red sidecar tests (tool_choice regressions) unnoticed.
       - name: Cargo test (agent-headless crate)
         if: ${{ !cancelled() }}
-        run: cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-headless --quiet
+        run: python tools/governance/run_flaky_retry.py --job check-rust -- cargo test --manifest-path src-tauri/Cargo.toml -p codefactory-agent-headless --quiet
 
       - name: Evolution executable closed-loop smoke
         if: ${{ !cancelled() }}

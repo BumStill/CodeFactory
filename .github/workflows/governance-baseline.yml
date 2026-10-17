@@ -22,6 +22,25 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install pyyaml
+      - name: Lint workflow files and ruleset JSON
+        env:
+          # Pinned: #674 merged a workflow that could not be parsed and the
+          # merge queue sat idle for 80 minutes. This step makes that impossible.
+          ACTIONLINT_VERSION: "1.7.7"
+          ACTIONLINT_LINUX_AMD64_SHA256: "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
+        run: |
+          set -euo pipefail
+          # Parse layer: every workflow plus .github/rulesets/*.json and other .github YAML.
+          python tools/governance/validate_ci_workflows.py
+          # Quarantine list must be well formed and unexpired (it can never skip a test).
+          python tools/governance/run_flaky_retry.py --check-only
+          # Semantic layer: fixed actionlint release, verified by sha256 before use.
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "/tmp/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_LINUX_AMD64_SHA256}  /tmp/${archive}" | sha256sum -c -
+          tar -xzf "/tmp/${archive}" -C /tmp actionlint
+          python tools/governance/validate_ci_workflows.py --actionlint /tmp/actionlint
       - run: python tools/governance/validate_repo_governance_baseline.py
       - name: Enforce the Windows CI UTF-8 contract
         run: python tools/governance/validate_python_utf8_contract.py
