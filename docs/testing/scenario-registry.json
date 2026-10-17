@@ -53,6 +53,7 @@
       "workflow:New-session composer overlap headless gate": ["node", "scripts/verify-composer-overlap-headless.mjs"]
     },
     "binary_receipt_oracles": {
+      "--browser-extension-lifecycle-smoke": {"field": "ok", "equals": true},
       "--unattended-long-task-smoke": {"field": "ok", "equals": true},
       "--history-session-smoke": {"field": "ok", "equals": true},
       "--delivery-recovery-smoke": {"field": "ok", "equals": true},
@@ -627,9 +628,9 @@
       },
       "execution": {"pull_request": "deterministic loopback generation and fake-clock heartbeat", "nightly": "native managed-profile extension lifecycle smoke", "release_artifact": "exact installed App plus existing extension upgrade/restart canary"},
       "automation_status": "partially_implemented",
-      "automated_by": ["rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:a_command_timeout_evicts_the_half_open_connection", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "path:src/lib/browserExtension.test.ts", "path:src/pages/Settings/SettingsPage.browser.test.tsx"],
-      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:a_command_timeout_evicts_the_half_open_connection", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "path:src/lib/browserExtension.test.ts", "path:src/pages/Settings/SettingsPage.browser.test.tsx"], "remaining_gaps": []},
-      "remaining_gaps": ["L2 --browser-extension-lifecycle-smoke 尚未实现", "L3 真实 CodeFactoryDev 会话内断线续接尚未自动化", "L4 exact release artifact 的扩展升级与重启 canary 尚未接入"]
+      "automated_by": ["binary:--browser-extension-lifecycle-smoke", "rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:a_command_timeout_evicts_the_half_open_connection", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "path:src/lib/browserExtension.test.ts", "path:src/pages/Settings/SettingsPage.browser.test.tsx"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["binary:--browser-extension-lifecycle-smoke", "rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:a_command_timeout_evicts_the_half_open_connection", "rust:an_attached_transport_drop_gets_one_system_owned_retry", "path:src/lib/browserExtension.test.ts", "path:src/pages/Settings/SettingsPage.browser.test.tsx"], "remaining_gaps": []},
+      "remaining_gaps": ["L3 真实 CodeFactoryDev 会话内断线续接尚未自动化", "L4 exact release artifact 的扩展升级与重启 canary 尚未接入"]
     },
     {
       "id": "E2E-009",
