@@ -7039,8 +7039,19 @@ impl ObjectiveStore {
                 work.branch = Some(view.branch_name.clone());
                 work.changes = changes;
                 work.total_changed_files = total;
-                work.commits_ahead = workspace_git_count(&root, &format!("{}..HEAD", view.base_sha), false);
-                work.unpushed_commits = workspace_git_count(&root, "HEAD", true);
+                let own_range = format!("{}..HEAD", view.base_sha);
+                work.commits_ahead = workspace_git_count(&root, &own_range, false);
+                // M46: the unpushed count must be scoped to the task's own
+                // commits. Counting the whole branch history (`HEAD --not
+                // --remotes`) made unrelated local commits look like this
+                // task's unpushed work, which is how a working tree with no
+                // commit at all got described as "committed locally".
+                work.unpushed_commits = workspace_git_count(&root, &own_range, true);
+                work.uncommitted_files = workspace_uncommitted_count(&root);
+                if work.unpushed_commits.is_some_and(|count| count > 0) {
+                    work.latest_unpushed_subject =
+                        workspace_latest_unpushed_subject(&root, &own_range);
+                }
             }
         }
         if let Some((url, status)) = self.latest_delivery_pr(&current.id).await {
@@ -7326,7 +7337,7 @@ fn workspace_changes(
 /// Commits the execution workspace already carries beyond its baseline (U1b).
 /// Read-only, and a missing or non-repository path counts as zero: a delivery
 /// claim is only ever made on positive evidence.
-fn workspace_git_count(root: &std::path::Path, revision: &str, unpushed: bool) -> Option<i64> {
+pub(crate) fn workspace_git_count(root: &std::path::Path, revision: &str, unpushed: bool) -> Option<i64> {
     use crate::util::no_window::NoWindow;
     let mut command = std::process::Command::new("git").no_window();
     command.arg("-C").arg(root).args(["rev-list", "--count", revision]);
@@ -7336,6 +7347,50 @@ fn workspace_git_count(root: &std::path::Path, revision: &str, unpushed: bool) -
     let output = command.output().ok()?;
     if !output.status.success() { return None; }
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// Paths still carrying uncommitted work (staged, unstaged, or untracked).
+/// Read-only, and `None` when the question could not be answered: the user
+/// report must never invent that answer.
+pub(crate) fn workspace_uncommitted_count(root: &std::path::Path) -> Option<i64> {
+    use crate::util::no_window::NoWindow;
+    let output = std::process::Command::new("git")
+        .no_window()
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count() as i64,
+    )
+}
+
+/// Title of the newest commit inside `revision` that no remote carries. Read
+/// only, and silent when git cannot answer.
+pub(crate) fn workspace_latest_unpushed_subject(
+    root: &std::path::Path,
+    revision: &str,
+) -> Option<String> {
+    use crate::util::no_window::NoWindow;
+    let output = std::process::Command::new("git")
+        .no_window()
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--format=%s", revision, "--not", "--remotes"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let subject = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!subject.is_empty()).then_some(subject)
 }
 
 fn workspace_commits_ahead(root: &std::path::Path, base_sha: &str) -> i64 {
