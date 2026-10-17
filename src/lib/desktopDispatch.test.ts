@@ -86,6 +86,50 @@ describe("本地派单入口的前端路由", () => {
     expect(handlers.calls[handlers.calls.length - 1]).toBe("closeObjective");
   });
 
+  it("同一会话有多条待验收记录时，派单入口把显式 objective_id 传给处理器", async () => {
+    const seen: Array<{ sessionId: string; outcome: string; objectiveId?: string }> = [];
+    const handlers: DispatchHandlers = {
+      ...stubHandlers(),
+      closeObjective: async (input) => {
+        seen.push(input);
+        return { ok: true };
+      },
+    };
+    const withId = await applyDispatchRequest(
+      request("close_objective", {
+        session_id: "s-1",
+        outcome: "accepted",
+        objective_id: "objective-3749ff64",
+      }),
+      handlers,
+    );
+    expect(withId.ok).toBe(true);
+    expect(seen[0]).toEqual({
+      sessionId: "s-1",
+      outcome: "accepted",
+      objectiveId: "objective-3749ff64",
+    });
+
+    const without = await applyDispatchRequest(
+      request("close_objective", { session_id: "s-1", outcome: "accepted" }),
+      handlers,
+    );
+    expect(without.ok).toBe(true);
+    expect(seen[1]).toEqual({ sessionId: "s-1", outcome: "accepted", objectiveId: undefined });
+
+    const blank = await applyDispatchRequest(
+      request("close_objective", {
+        session_id: "s-1",
+        outcome: "accepted",
+        objective_id: "   ",
+      }),
+      handlers,
+    );
+    expect(blank.ok).toBe(false);
+    if (!blank.ok) expect(blank.error.message).toContain("objective_id");
+    expect(seen).toHaveLength(2);
+  });
+
   it("没有结案处理器的旧版接收端会明确报错，而不是静默成功", async () => {
     const { closeObjective: _omitted, ...withoutClose } = stubHandlers();
     const result = await applyDispatchRequest(

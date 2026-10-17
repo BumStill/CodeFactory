@@ -496,7 +496,7 @@ function SessionRow({
                   onClick={async () => {
                     try {
                       const { invoke: call } = await import("../lib/tauri");
-                      await call("close_objective", { sessionId: session.id, outcome: "accepted" });
+                      await call("close_objective", { sessionId: session.id, outcome: "accepted", objectiveId: waitingActivity?.objectiveId });
                       await useChatStore.getState().loadSessions();
                       setCloseError(null);
                       setMenuOpen(false);
