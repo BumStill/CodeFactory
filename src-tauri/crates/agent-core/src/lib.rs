@@ -685,6 +685,201 @@ const READ_ONLY_PROBE_VERBS: &[&str] = &[
     "stat", "tail", "tr", "tree", "type", "uniq", "wc", "which",
 ];
 
+/// M52b-R1: forge query vocabulary, expressed as structure — binary, then
+/// subcommand chain — instead of substrings of the raw command. `run view`
+/// reports a CI result that is already history; `run rerun` changes it.
+const GH_QUERY_SUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("run", &["view", "list", "watch"]),
+    ("pr", &["view", "checks", "list", "diff", "status"]),
+    ("release", &["view", "list"]),
+    ("workflow", &["list", "view"]),
+    ("issue", &["view", "list", "status"]),
+    ("repo", &["view", "list"]),
+    ("search", &["code", "issues", "prs", "repos", "commits"]),
+    ("auth", &["status"]),
+    ("status", &[]),
+];
+
+/// A git query only reads refs, the index or the working tree. Anything that
+/// moves a ref, the index or a file is deliberately absent: `fetch` is the one
+/// network read the spec names, and it does not touch tracked files.
+const GIT_QUERY_SUBCOMMANDS: &[&str] = &[
+    "blame",
+    "describe",
+    "diff",
+    "fetch",
+    "log",
+    "ls-files",
+    "merge-base",
+    "rev-parse",
+    "show",
+    "show-ref",
+    "shortlog",
+    "status",
+];
+
+/// `gh <owner>/<repo> ...`, `gh --repo ...`, `gh -R ...` shape: the global flags
+/// come before the subcommand. Skip the ones this host passes, so the structure
+/// below still sees the real subcommand.
+fn skip_gh_global_flags<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
+    let mut rest = words;
+    while let Some((head, tail)) = rest.split_first() {
+        match *head {
+            "-R" | "--repo" | "--hostname" | "-H" | "--config" => {
+                rest = tail.get(1..).unwrap_or(&[]);
+            }
+            flag if flag.starts_with("--repo=") || flag.starts_with("--hostname=") => {
+                rest = tail;
+            }
+            flag if flag.starts_with('-') => {
+                rest = tail;
+            }
+            _ => return rest,
+        }
+    }
+    rest
+}
+
+/// `gh api` is a read only when the HTTP method is GET (explicit or implied)
+/// and no argument carries a request body. `-f/--field`, `-F/--raw-field` and
+/// `--input` all send one, and those spellings are checked as flags rather than
+/// substrings so a repo path containing `-f` cannot flip the verdict.
+fn gh_api_is_read_only(words: &[&str]) -> bool {
+    let mut index = 0;
+    let mut method: Option<String> = None;
+    let mut sends_body = false;
+    while index < words.len() {
+        let word = words[index];
+        if word == "-x" || word == "--method" {
+            let Some(value) = words.get(index + 1) else {
+                return false;
+            };
+            method = Some(value.to_ascii_uppercase());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = word.strip_prefix("--method=") {
+            method = Some(value.to_ascii_uppercase());
+        } else if let Some(value) = word.strip_prefix("-x").filter(|value| !value.is_empty()) {
+            method = Some(value.trim_start_matches('=').to_ascii_uppercase());
+        } else if matches!(word, "-f" | "--field" | "-F" | "--raw-field" | "--input") {
+            sends_body = true;
+        }
+        index += 1;
+    }
+    !sends_body && method.as_deref().is_none_or(|method| method == "GET")
+}
+
+/// Structural read-only forge query, shared by the completion classifier and
+/// the admission receipt check. Returns false for anything unrecognised, so an
+/// unknown `gh`/`git` invocation is never admitted as a probe by accident.
+pub fn is_forge_query_segment(segment: &str) -> bool {
+    let lower = segment.trim().to_ascii_lowercase();
+    let mut words = lower.split_whitespace().map(|word| word.trim_matches(['\'', '"']));
+    let Some(binary) = words.next() else {
+        return false;
+    };
+    let rest = words.collect::<Vec<_>>();
+    match binary {
+        "gh" => {
+            let rest = skip_gh_global_flags(&rest);
+            let Some((subcommand, tail)) = rest.split_first() else {
+                return false;
+            };
+            if *subcommand == "api" {
+                return gh_api_is_read_only(tail);
+            }
+            match GH_QUERY_SUBCOMMANDS
+                .iter()
+                .find(|(name, _)| name == subcommand)
+            {
+                None => false,
+                Some((_, allowed)) if allowed.is_empty() => true,
+                Some((_, allowed)) => tail
+                    .first()
+                    .is_some_and(|subsub| allowed.contains(subsub)),
+            }
+        }
+        "git" => rest
+            .first()
+            .is_some_and(|subcommand| GIT_QUERY_SUBCOMMANDS.contains(subcommand)),
+        _ => false,
+    }
+}
+
+/// The mirrored boundary: forge/git invocations that change remote or local
+/// state must stay mutations even though every branch above leaves them
+/// unclassified. Kept next to the query table so the two cannot drift.
+fn is_forge_mutation_segment(segment: &str) -> bool {
+    let lower = segment.trim().to_ascii_lowercase();
+    let mut words = lower.split_whitespace().map(|word| word.trim_matches(['\'', '"']));
+    let Some(binary) = words.next() else {
+        return false;
+    };
+    let rest = words.collect::<Vec<_>>();
+    match binary {
+        "gh" => {
+            let rest = skip_gh_global_flags(&rest);
+            let Some((subcommand, tail)) = rest.split_first() else {
+                return false;
+            };
+            if *subcommand == "api" {
+                return !gh_api_is_read_only(tail);
+            }
+            if is_forge_query_segment(segment) {
+                return false;
+            }
+            // Every non-query `gh <group> <verb>` is a write (merge, rerun,
+            // workflow run, release create/upload, …); a bare group listing is
+            // not, so require a following verb.
+            tail.first().is_some()
+        }
+        "git" => rest.first().is_some_and(|subcommand| {
+            matches!(
+                *subcommand,
+                "add"
+                    | "am"
+                    | "apply"
+                    | "archive"
+                    | "branch"
+                    | "checkout"
+                    | "cherry-pick"
+                    | "clean"
+                    | "clone"
+                    | "commit"
+                    | "config"
+                    | "init"
+                    | "merge"
+                    | "mv"
+                    | "pull"
+                    | "push"
+                    | "rebase"
+                    | "reset"
+                    | "restore"
+                    | "revert"
+                    | "rm"
+                    | "stash"
+                    | "submodule"
+                    | "switch"
+                    | "tag"
+                    | "update-ref"
+                    | "worktree"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn command_has_forge_mutation(command: &str) -> bool {
+    let control = shell_control_text(command);
+    shell_verification_segments(&control)
+        .iter()
+        .flat_map(|statement| shell_pipeline_segments(statement))
+        .map(|segment| execution_payload(segment.as_str()))
+        .filter(|segment| !segment.trim().is_empty())
+        .any(|segment| is_forge_mutation_segment(&segment))
+}
+
 /// M52-R1/R2: is this command a pure read-only probe?
 ///
 /// The rule is structural, not a keyword scan of the raw string: split the
@@ -706,6 +901,10 @@ pub fn command_is_read_only_probe(command: &str) -> bool {
 }
 
 fn probe_segment(segment: &str) -> bool {
+    // M52b-R1: forge/git queries are probes by structure, not by verb word.
+    if is_forge_query_segment(segment) {
+        return true;
+    }
     let words = segment.split_whitespace().collect::<Vec<_>>();
     let Some(verb) = words.first().copied() else {
         return false;
@@ -767,6 +966,12 @@ pub fn classify_command(command: &str, timeout_ms: u64) -> ToolKind {
     // status answers "what is there", so it must be settled before any
     // runner-shaped word in an argument can promote it to a check. A mixed
     // command (`ls x && pnpm test`) is not a probe and keeps its verdict.
+    // M52b-R1 boundary: `gh pr merge`, `gh api -X POST`, `gh workflow run`,
+    // `git push` … write. Resolve them before the probe short-circuit so the
+    // read-only rule can never launder a writer.
+    if command_has_forge_mutation(command) {
+        return ToolKind::Mutation;
+    }
     if command_is_read_only_probe(command) {
         return ToolKind::ReadOnly;
     }
@@ -1047,7 +1252,9 @@ fn has_workspace_mutation(command: &str) -> bool {
             "git branch -M",
             "git switch ",
             "git checkout ",
-            "git fetch ",
+            // M52b-R1: `git fetch` only advances remote-tracking refs; it never
+            // rewrites the working tree, so the completion classifier treats it
+            // as the read it is instead of a mutation to be observed.
             "git pull ",
             "git stash ",
         ],
@@ -5780,6 +5987,111 @@ mod tests {
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
     }
 
+    /// M52b-R1: a forge query reports *remote* state. `gh run view --log-failed`
+    /// exits non-zero when the CI run it inspects failed, which says nothing
+    /// about the workspace — so it is a probe, never a must-pass check. These
+    /// are the two live shapes from 13350c96 and 3b87a1b6, plus the rest of the
+    /// query surface.
+    #[test]
+    fn forge_read_only_queries_are_probes_not_checks() {
+        let commands = [
+            "cd \"/Users/leo/Library/Application Support/com.codefactory.app/execution-workspaces/94eef8f7b2987cbf/9f46f397de7898fddc323c6e\" && gh run view --job 117365381431 --log-failed",
+            "gh run view 39018633201 --log-failed",
+            "gh run list --limit 5",
+            "gh run watch 117365381431",
+            "gh pr view 64",
+            "gh pr checks 64",
+            "gh pr list --state open",
+            "gh pr diff 64",
+            "gh pr status",
+            "gh api repos/BumStill/CodeFactory/pulls/64",
+            "gh api --method GET repos/BumStill/CodeFactory/pulls",
+            "git log --oneline -5",
+            "git show HEAD",
+            "git status --short",
+            "git diff origin/main...HEAD",
+            "git fetch --prune origin main",
+        ];
+        for command in commands {
+            assert_eq!(
+                classify_command(command, 300_000),
+                ToolKind::ReadOnly,
+                "{command} reports remote/workspace state and must stay a probe"
+            );
+            assert!(
+                command_is_read_only_probe(command),
+                "{command} must be recognised structurally as a probe"
+            );
+        }
+    }
+
+    /// M52b-R1 boundary: the same binaries become writers through a subcommand
+    /// or an HTTP method/body flag. Those must never be laundered into probes.
+    #[test]
+    fn forge_write_commands_are_never_probes() {
+        let commands = [
+            "gh pr merge 64 --squash --delete-branch",
+            "gh api -X POST repos/BumStill/CodeFactory/merges",
+            "gh api --method DELETE repos/BumStill/CodeFactory/git/refs/heads/x",
+            "gh api repos/BumStill/CodeFactory/issues -f title=oops",
+            "gh api --method POST repos/BumStill/CodeFactory/pulls/64/reviews --input body.json",
+            "gh workflow run release.yml",
+            "gh release create v9.9.9",
+            "gh run rerun 117365381431",
+            "git push origin main",
+            "git checkout -b scratch",
+            "git fetch --prune origin main && git merge --ff-only origin/main",
+            "gh pr view 64 && gh pr merge 64 --squash",
+        ];
+        for command in commands {
+            assert_ne!(
+                classify_command(command, 300_000),
+                ToolKind::ReadOnly,
+                "{command} writes and must not be treated as a read-only probe"
+            );
+            assert!(
+                !command_is_read_only_probe(command),
+                "{command} writes and must fail the structural probe rule"
+            );
+        }
+    }
+
+    /// M52b-R2/R4: replay of the live verdict input. A failing forge query is
+    /// reference information only; once the declared acceptance checks pass the
+    /// gate completes and no `failed_verification` ticket is opened for it.
+    #[test]
+    fn a_failed_forge_query_never_opens_a_must_pass_check() {
+        let probe = "cd \"/Users/leo/Library/Application Support/com.codefactory.app/execution-workspaces/94eef8f7b2987cbf/9f46f397de7898fddc323c6e\" && gh run view --job 117365381431 --log-failed";
+        let mut gate = CompletionGate::new(true);
+        gate.record(&command_outcome(1, ToolKind::Mutation, 0, "edit_file"));
+        gate.record(&command_outcome(
+            2,
+            classify_command(probe, 300_000),
+            1,
+            probe,
+        ));
+
+        let blocked = gate.evidence();
+        assert!(
+            !blocked
+                .blockers_structured
+                .iter()
+                .any(|blocker| blocker.kind == "failed_verification"),
+            "a forge query failure must not open a check ticket: {:?}",
+            blocked.blockers
+        );
+
+        gate.record(&command_outcome(
+            3,
+            classify_command("gh pr checks 64", 300_000),
+            1,
+            "gh pr checks 64",
+        ));
+        gate.record(&command_outcome(4, ToolKind::Verification, 0, "pnpm test"));
+        let evidence = gate.evidence();
+        assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
+    }
+
     #[test]
     fn a_failed_acceptance_check_still_blocks_until_it_passes() {
         let mut gate = CompletionGate::new(true);
@@ -5968,7 +6280,6 @@ mod tests {
             "git branch -m feature/new-name",
             "git switch -c feature/new-name",
             "git checkout -b feature/new-name",
-            "git fetch --prune origin main",
             "git stash push -u",
         ] {
             assert_eq!(
@@ -5977,6 +6288,12 @@ mod tests {
                 "{command:?} changes local repository state"
             );
         }
+        // M52b-R1: `git fetch` only advances remote-tracking refs and never
+        // rewrites the working tree, so it is the read the spec says it is.
+        assert_eq!(
+            classify_command("git fetch --prune origin main", 30_000),
+            ToolKind::ReadOnly
+        );
         assert_eq!(
             classify_command("git status --short --branch", 30_000),
             ToolKind::ReadOnly
@@ -6195,33 +6512,29 @@ mod tests {
         }
     }
 
+    /// M52b-R1 supersedes the older "gh queries are verification" contract:
+    /// a forge query reports state that already exists, so it is a probe. Its
+    /// non-zero exit (the CI it inspects failed) must not become a must-pass
+    /// check; successful acceptance evidence comes from real checks. This was
+    /// the live failure in 13350c96 / 3b87a1b6.
     #[test]
-    fn gh_read_only_queries_count_as_verification() {
-        // Week-audit finding: the model verified a hotfix end-to-end with
-        // eight `gh run view` / `gh pr checks` calls and the gate still
-        // rejected its report as "unverified" — the allowlist's third bite
-        // (pnpm test → vitest/tsc → gh). Read-only gh queries against the
-        // authoritative remote ARE verification.
+    fn gh_read_only_queries_are_probes_not_must_pass_checks() {
         for command in [
             "gh run view 29917625521 --repo BumStill/CodeFactory --json status",
             "gh run list --repo BumStill/CodeFactory --limit 5",
             "gh pr checks 166 --repo BumStill/CodeFactory",
             "gh pr view 166 --json statusCheckRollup",
             "gh api repos/BumStill/CodeFactory/commits/abc/check-runs",
-            // 2026-09-08 field report: `gh release view` was the ONE query the
-            // agent needed to confirm a fix had actually shipped, and it was
-            // the one this list forgot. Missing here it fell through to the
-            // mutation branch, where bash can supply no observation contract,
-            // and the turn settled `Waiting` with "系统未执行".
-            // `is_long_running_observation_command` already treats it as an
-            // observation; these two answers must not disagree.
+            // 2026-09-08 field report: `gh release view` must not fall through
+            // to the mutation branch, where bash can supply no observation
+            // contract and the turn settles `Waiting` with "系统未执行".
             "gh release view --json tagName,url,body,assets",
             "gh release view v1.81.44 --repo BumStill/CodeFactory",
             "gh release list --repo BumStill/CodeFactory --limit 5",
         ] {
             assert_eq!(
                 classify_command(command, 300_000),
-                ToolKind::Verification,
+                ToolKind::ReadOnly,
                 "{command}"
             );
         }
@@ -7217,14 +7530,14 @@ mod tests {
         );
         assert_eq!(
             classify_command("gh pr checks 151 --repo owner/repo --watch", 120_000),
-            ToolKind::Verification,
+            ToolKind::ReadOnly,
         );
         assert_eq!(
             classify_command(
                 "gh run watch 29833845752 --repo owner/repo --interval 20 --exit-status",
                 120_000,
             ),
-            ToolKind::Verification,
+            ToolKind::ReadOnly,
         );
 
         let mut gate = CompletionGate::default();
@@ -7232,25 +7545,23 @@ mod tests {
         delivery.command = "gh workflow run 'Auto Release' --repo owner/repo".to_owned();
         gate.record(&delivery);
 
-        // A watch that actually landed on a red run. (It used to be a timeout
-        // here, but a timed-out observation no longer opens a ticket — see
-        // `a_timed_out_remote_poll_does_not_open_a_failure_ticket`. The subject
-        // of THIS test is scope matching, so it needs a genuine failure.)
+        // M52b-R1/R2: a watch that lands on a red run is reference information,
+        // not a failed check. The delivery mutation still needs real acceptance
+        // evidence afterwards, which is exactly the ordering this test guards.
         let failed_watch = "gh run watch 29833845752 --repo owner/repo --interval 20 --exit-status";
         let mut observed_failure = outcome(2, classify_command(failed_watch, 120_000), 1);
         observed_failure.command = failed_watch.to_owned();
         observed_failure.stderr = "Run Release completed with 'failure'".to_owned();
         gate.record(&observed_failure);
-        assert!(gate.evidence().failed_verification_fingerprint.is_some());
+        assert!(
+            gate.evidence().failed_verification_fingerprint.is_none(),
+            "a forge query must not open a must-pass ticket"
+        );
+        assert!(!gate.evidence().completed);
 
-        // Poll cadence is operational, not verification scope. A retry of the
-        // same run with a shorter interval must close the timeout ticket.
-        let completed_watch =
-            "gh run watch 29833845752 --repo owner/repo --interval 5 --exit-status";
-        let mut completed = outcome(3, classify_command(completed_watch, 120_000), 0);
-        completed.command = completed_watch.to_owned();
-        completed.stdout = "Run Release has already completed with 'success'".to_owned();
-        gate.record(&completed);
+        let mut accepted = outcome(3, ToolKind::Verification, 0);
+        accepted.command = "pnpm test".to_owned();
+        gate.record(&accepted);
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
     }
@@ -7282,13 +7593,22 @@ mod tests {
             "an observation that never landed must not be filed as a failure",
         );
 
-        // A later poll that does land settles the turn, with no stale ticket
-        // left to "cover".
+        // A later poll that does land is still reference information (M52b-R1):
+        // it closes no ticket and does not itself verify the delivery.
         let later = "gh run view 30152394315 --repo owner/repo --json conclusion";
         let mut landed = outcome(3, classify_command(later, 120_000), 0);
         landed.command = later.to_owned();
         landed.stdout = "success".to_owned();
         gate.record(&landed);
+        assert!(
+            gate.evidence().failed_verification_fingerprint.is_none(),
+            "a landed poll is a probe, not a check"
+        );
+        assert!(!gate.evidence().completed);
+
+        let mut accepted = outcome(4, ToolKind::Verification, 0);
+        accepted.command = "pnpm test".to_owned();
+        gate.record(&accepted);
         let evidence = gate.evidence();
         assert!(evidence.completed, "blockers: {:?}", evidence.blockers);
     }
