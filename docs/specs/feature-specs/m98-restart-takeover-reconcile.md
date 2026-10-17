@@ -85,4 +85,4 @@
 - R2 的结算写在新 owner `begin_attempt` 的同一事务里，条件收紧为：`response_committed` 且 `output_started<>0` 且 `side_effect_started=0` 且无 `started`/`unknown` 的 `side_effect_receipts`。审计上使用独立的 `failure_code='provider_response_checkpoint_reconciled'`，与真实 provider 失败区分。
 - R4 在 `startup_recovery_candidates` 里排除已可对账的 `response_committed`（以及已结算记录），使对账不进入恢复候选、不产生 `technical_failure_detail`。
 - R3 的判定顺序：等于持久化 head → 等于 receipted parent → 是本地 head 的祖先；否则 fail-closed。只放宽「本工作区可解释」的方向（远端落后），不放开「远端超前且本地无法解释」。
-- R6：`docs/testing/scenario-registry.json` 属于编排方维护的权威源（本任务约束禁止修改）。相应测试已落在 `src-tauri/tests/provider_auth_recovery.rs` 与 `src-tauri/src/tools/delivery.rs` 的 `m98_*` 用例中，可分别挂到 E2E-001 / E2E-006 的 `automated_by`（`rust:m98_restart_reconciles_committed_response_before_next_attempt`、`rust:m98_foreign_remote_head_still_blocks_takeover`）。registry 登记作为后续建议项，不在本 PR 内改动。
+- R6：场景自动化登记已落到 `docs/testing/scenario-registry.json`——E2E-001 / E2E-006 的 `automated_by` 增加 `rust:m98_remote_ancestor_head_continues_the_same_identity`（validator 只扫描 `src-tauri/src` 与 `src-tauri/crates` 下的 `#[test]`，`src-tauri/tests/` 的集成测试无法被引用）。`remaining_gaps` 中仍待 real-nightly 与真机 UI 的条目保持不变，不做虚假关闭。

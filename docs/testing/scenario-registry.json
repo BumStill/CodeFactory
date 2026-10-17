@@ -431,7 +431,7 @@
       },
       "execution": {"pull_request": "deterministic Windows process smoke", "nightly": "fault matrix", "release_artifact": "exact Windows executable"},
       "automation_status": "partially_implemented",
-      "automated_by": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke", "workflow:Unattended long task smoke (macOS)"],
+      "automated_by": ["binary:--unattended-long-task-smoke", "rust:m98_remote_ancestor_head_continues_the_same_identity", "workflow:Unattended long-task cross-process smoke", "workflow:Unattended long task smoke (macOS)"],
       "pull_request_gate": {"status": "implemented", "required_targets": ["binary:--unattended-long-task-smoke", "workflow:Unattended long-task cross-process smoke"], "remaining_gaps": []},
       "remaining_gaps": ["L2 macOS 侧进程 smoke 已接 nightly；PR 门禁本身仍只跑 Windows", "L3 真实桌面会话内的无人值守完成尚未自动化，现仅覆盖 headless worker", "L4 exact release artifact 的 macOS 安装版 canary 尚未接入"]
     },
@@ -569,7 +569,7 @@
       },
       "execution": {"pull_request": "file-backed previous/current identity reconciliation", "nightly": "Windows install-upgrade fixture", "release_artifact": "previous public manifest plus exact candidate executable"},
       "automation_status": "partially_implemented",
-      "automated_by": ["rust:previous_to_current_fixture_reconciles_once_with_historical_stuck_objective", "binary:--update-upgrade-smoke", "workflow:Verify Windows release executable previous-to-current update reconciliation"],
+      "automated_by": ["rust:previous_to_current_fixture_reconciles_once_with_historical_stuck_objective", "rust:m98_remote_ancestor_head_continues_the_same_identity", "binary:--update-upgrade-smoke", "workflow:Verify Windows release executable previous-to-current update reconciliation"],
       "pull_request_gate": {"status": "implemented", "required_targets": ["rust:previous_to_current_fixture_reconciles_once_with_historical_stuck_objective"], "remaining_gaps": []},
       "remaining_gaps": ["nightly 的真实 Windows 旧安装包到新安装包切换尚未实现", "真实桌面 UI 中历史 session 与版本投影仍待自动化"]
     },
