@@ -4088,22 +4088,38 @@ pub(crate) async fn recover_delivery_recovery_smoke(
         autonomous_completion: true,
     };
     delivery_run::create_delivery_run(&pool, &foreign_run, &foreign_owner, now + 1, 90_000).await?;
-    std::fs::write(worktree.join("foreign.txt"), "unreceipted foreign edit\n")?;
-    delivery_recovery_smoke_git(&worktree, &["add", "foreign.txt"])?;
-    delivery_recovery_smoke_git(
-        &worktree,
+    // M98-R3: a remote head this workspace can explain (equal to the persisted
+    // head, the receipted parent, or an ancestor of it) is now correctly the
+    // same identity, so the foreign fixture must be a commit the local
+    // worktree has never seen. Build it in the remote from the remote's own
+    // tree and move the managed ref there. The worktree therefore stays at the
+    // head its local receipt proves, while the canonical branch points at a
+    // truly foreign write.
+    let remote_tree = delivery_recovery_smoke_git(
+        &origin,
+        &["rev-parse", "refs/heads/fix/delivery-recovery-smoke^{tree}"],
+    )?;
+    let foreign_head = delivery_recovery_smoke_git(
+        &origin,
         &[
             "-c",
             "user.name=Foreign Fixture",
             "-c",
             "user.email=foreign@example.invalid",
-            "commit",
-            "-q",
+            "commit-tree",
+            &remote_tree,
             "-m",
             "chore: unreceipted foreign commit",
         ],
     )?;
-    let foreign_head = delivery_recovery_smoke_git(&worktree, &["rev-parse", "HEAD"])?;
+    delivery_recovery_smoke_git(
+        &origin,
+        &[
+            "update-ref",
+            "refs/heads/fix/delivery-recovery-smoke",
+            &foreign_head,
+        ],
+    )?;
     let remote_head_before = delivery_recovery_smoke_git(
         &origin,
         &["rev-parse", "refs/heads/fix/delivery-recovery-smoke"],
@@ -4225,8 +4241,8 @@ pub(crate) async fn recover_delivery_recovery_smoke(
         && claim_epoch == last_epoch
         && claim_epoch_after_third == claim_epoch;
     let remote_unchanged = remote_head_before == remote_head_after
-        && remote_head_after == reconciled_head
-        && foreign_head != remote_head_after;
+        && remote_head_after == foreign_head
+        && foreign_head != reconciled_head;
     if !foreign_identity_failed_closed
         || !claim_epoch_plateau
         || !remote_unchanged
