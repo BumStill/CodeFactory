@@ -57,24 +57,80 @@ pub struct PreservedWork {
     /// Fresh git observations; None means observation failed or was not run.
     pub commits_ahead: Option<i64>,
     pub unpushed_commits: Option<i64>,
+    /// Paths that still carry uncommitted work, observed with
+    /// `git status --porcelain`. None means the observation failed or was not
+    /// run, so no uncommitted claim can be made.
+    pub uncommitted_files: Option<i64>,
+    /// Title of the newest commit the task made that no remote carries.
+    pub latest_unpushed_subject: Option<String>,
 }
 
 impl PreservedWork {
+    /// How many paths carry uncommitted work. The baseline diff is only a
+    /// fallback for the case where the task made no commit at all, which is
+    /// exactly when every listed change has to be uncommitted. An unobserved
+    /// status stays unobserved instead of being guessed.
+    pub fn uncommitted_count(&self) -> Option<i64> {
+        self.uncommitted_files.or_else(|| {
+            (self.commits_ahead == Some(0) && self.total_changed_files > 0)
+                .then_some(self.total_changed_files)
+        })
+    }
+
+    /// The single-sentence status. Every branch is driven by an observation:
+    /// a commit is only ever claimed when the observation counted one, so a
+    /// working tree with edits can never be described as committed.
     pub fn change_status(&self) -> &'static str {
         if self.pr_url.is_some() {
-            "已开 PR"
-        } else if self.commits_ahead.is_some_and(|n| n > 0) {
-            match self.unpushed_commits {
-                Some(0) => "改动已推送",
-                Some(n) if n > 0 => "改动已经提交在本机（还没推送）",
-                _ => "改动已提交，无法确认是否已推送",
+            return "已开 PR";
+        }
+        match self.commits_ahead {
+            Some(0) => {
+                if self.uncommitted_count().is_some_and(|count| count > 0) {
+                    "改动仅在工作区，未提交"
+                } else {
+                    "没有留下改动"
+                }
             }
-        } else if self.commits_ahead == Some(0) && self.total_changed_files > 0 {
-            "改动仅在工作区，未提交"
-        } else {
-            "无法确认改动的提交和推送状态"
+            Some(_) => match self.unpushed_commits {
+                Some(0) => "改动已推送",
+                Some(count) if count > 0 => "改动已经提交在本机（还没推送）",
+                _ => "改动已提交，无法确认是否已推送",
+            },
+            None => "无法确认改动的提交和推送状态",
         }
     }
+}
+
+/// The commit half of the work status, stated as its own fact: how many commits
+/// the task made, how many of them no remote carries, and the newest one's
+/// title. Built only from observations — a missing observation says nothing
+/// rather than guessing, and a PR already states the commit fact.
+pub fn commit_status_lines(work: &PreservedWork) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(ahead) = work.commits_ahead else {
+        return lines;
+    };
+    if ahead <= 0 || work.pr_url.is_some() {
+        return lines;
+    }
+    match work.unpushed_commits {
+        Some(unpushed) if unpushed > 0 => {
+            let mut line = format!("这个任务的 {ahead} 个提交里，有 {unpushed} 个还没推送");
+            let subject = work
+                .latest_unpushed_subject
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(subject) = subject {
+                line.push_str(&format!("，最新一个是「{subject}」"));
+            }
+            lines.push(format!("{line}。"));
+        }
+        Some(_) => lines.push(format!("这个任务的 {ahead} 个提交都已经推送到远端。")),
+        None => lines.push(format!("这个任务的 {ahead} 个提交是否已推送没能确认。")),
+    }
+    lines
 }
 
 /// One check the system could not confirm was rerun and passed (U1b). Gathered
@@ -275,11 +331,37 @@ pub fn render_failure_report(report: &FailureReport) -> String {
 
     let _ = writeln!(out, "保留下来的成果：");
     let _ = writeln!(out, "- {}。", report.work.change_status());
-    if let Some(location) = report.work.location.as_deref() {
-        if let Some(branch) = report.work.branch.as_deref() {
-            let _ = writeln!(out, "- 改动都在 {location}（分支 {branch}），没有丢掉。");
-        } else {
-            let _ = writeln!(out, "- 改动都在 {location}，没有丢掉。");
+    for line in commit_status_lines(&report.work) {
+        let _ = writeln!(out, "- {line}");
+    }
+    match report.work.uncommitted_count().filter(|count| *count > 0) {
+        Some(files) => {
+            let _ = writeln!(
+                out,
+                "- 还有 {files} 个文件改了还没提交：这些改动还没提交，清理工作区就会丢失。"
+            );
+            if let Some(location) = report.work.location.as_deref() {
+                if let Some(branch) = report.work.branch.as_deref() {
+                    let _ = writeln!(
+                        out,
+                        "- 它们就在工作区 {location}（分支 {branch}）。系统不会自动提交，只是把工作区留着。"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "- 它们就在工作区 {location}。系统不会自动提交，只是把工作区留着。"
+                    );
+                }
+            }
+        }
+        None => {
+            if let Some(location) = report.work.location.as_deref() {
+                if let Some(branch) = report.work.branch.as_deref() {
+                    let _ = writeln!(out, "- 改动都在 {location}（分支 {branch}），没有丢掉。");
+                } else {
+                    let _ = writeln!(out, "- 改动都在 {location}，没有丢掉。");
+                }
+            }
         }
     }
     for line in render_change_list(&report.work) {
@@ -414,7 +496,18 @@ fn render_delivered_unverified_report(
     }
 
     let _ = writeln!(out, "改动本身已经落地，没有丢掉：");
-    if let Some(location) = work.location.as_deref() {
+    if let Some(files) = work.uncommitted_count().filter(|count| *count > 0) {
+        let _ = writeln!(
+            out,
+            "- 另外还有 {files} 个文件改了还没提交：这些改动还没提交，清理工作区就会丢失。"
+        );
+        if let Some(location) = work.location.as_deref() {
+            let _ = writeln!(
+                out,
+                "- 它们就在工作区 {location}。系统不会自动提交，只是把工作区留着。"
+            );
+        }
+    } else if let Some(location) = work.location.as_deref() {
         if let Some(branch) = work.branch.as_deref() {
             let _ = writeln!(out, "- 改动都在 {location}（分支 {branch}），没有丢掉。");
         } else {
@@ -785,5 +878,176 @@ mod tests {
             !reason.contains("provider_episode_unreconciled"),
             "raw identifiers must not reach the user: {reason}"
         );
+    }
+
+    // ---- M46: the summary must state the real git state -------------------
+
+    fn m46_work(
+        commits_ahead: i64,
+        unpushed: i64,
+        uncommitted: i64,
+        pr: bool,
+        subject: Option<&str>,
+    ) -> PreservedWork {
+        PreservedWork {
+            branch: Some("codefactory/m46".to_string()),
+            location: Some("/tmp/synthetic-workspace".to_string()),
+            total_changed_files: uncommitted.max(0),
+            pr_url: pr.then(|| "https://example.test/pull/46".to_string()),
+            pr_state: pr.then(|| "等待合并".to_string()),
+            commits_ahead: Some(commits_ahead),
+            unpushed_commits: Some(unpushed),
+            uncommitted_files: Some(uncommitted),
+            latest_unpushed_subject: subject.map(str::to_string),
+            ..PreservedWork::default()
+        }
+    }
+
+    /// R0/R2/R4 — only uncommitted work: nothing may be described as committed,
+    /// and the loss warning plus the workspace path must be present.
+    #[test]
+    fn m46_uncommitted_only_never_claims_a_commit() {
+        let work = m46_work(0, 0, 3, false, None);
+        let text = build_failure_report("把导出改成流式写入", vec![], work).unwrap();
+        assert!(text.contains("改动仅在工作区，未提交"), "{text}");
+        assert!(!text.contains("已经提交"), "{text}");
+        assert!(!text.contains("还没推送"), "{text}");
+        assert!(text.contains("3 个文件改了还没提交"), "{text}");
+        assert!(text.contains("清理工作区就会丢失"), "{text}");
+        assert!(text.contains("/tmp/synthetic-workspace"), "{text}");
+        assert!(!text.contains("没有丢掉"), "{text}");
+        assert_no_internal_vocabulary(&text).unwrap();
+    }
+
+    /// R1/R4 — local commits only: the count and the newest title are stated,
+    /// and nothing is claimed to be uncommitted.
+    #[test]
+    fn m46_local_commits_name_the_count_and_newest_title() {
+        let work = m46_work(2, 2, 0, false, Some("fix: keep the export stream open"));
+        let text = build_failure_report("把导出改成流式写入", vec![], work).unwrap();
+        assert!(text.contains("改动已经提交在本机（还没推送）"), "{text}");
+        assert!(text.contains("有 2 个还没推送"), "{text}");
+        assert!(text.contains("fix: keep the export stream open"), "{text}");
+        assert!(!text.contains("清理工作区就会丢失"), "{text}");
+        assert_no_internal_vocabulary(&text).unwrap();
+    }
+
+    /// R1/R4 — already pushed: neither "unpushed" nor "uncommitted" may appear.
+    #[test]
+    fn m46_pushed_commits_are_not_reported_as_unpushed() {
+        let work = m46_work(2, 0, 0, false, None);
+        let text = build_failure_report("把导出改成流式写入", vec![], work).unwrap();
+        assert!(text.contains("改动已推送"), "{text}");
+        assert!(!text.contains("还没推送"), "{text}");
+        assert!(!text.contains("清理工作区就会丢失"), "{text}");
+        assert_no_internal_vocabulary(&text).unwrap();
+    }
+
+    /// R1/R4 — mixed: an open PR, one unpushed local commit and two uncommitted
+    /// files are three separate facts, each stated as itself.
+    #[test]
+    fn m46_mixed_state_lists_all_three_facts_separately() {
+        let work = m46_work(3, 1, 2, true, Some("feat: stream the export"));
+        let text = build_failure_report("把导出改成流式写入", vec![], work).unwrap();
+        assert!(text.contains("已开 PR"), "{text}");
+        assert!(text.contains("https://example.test/pull/46"), "{text}");
+        assert!(text.contains("还有 2 个文件改了还没提交"), "{text}");
+        assert!(text.contains("清理工作区就会丢失"), "{text}");
+        assert!(text.contains("它们就在工作区 /tmp/synthetic-workspace"), "{text}");
+        assert_no_internal_vocabulary(&text).unwrap();
+    }
+
+    fn m46_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "synthetic")
+            .env("GIT_AUTHOR_EMAIL", "synthetic@example.test")
+            .env("GIT_COMMITTER_NAME", "synthetic")
+            .env("GIT_COMMITTER_EMAIL", "synthetic@example.test")
+            .output()
+            .expect("git must run for the fixture");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// R0: a synthetic repository (no production database) reproduces the field
+    /// session — edits in the working tree and no commit of its own — and the
+    /// observers that feed the terminal must report exactly that, so no
+    /// "committed locally" claim is possible.
+    #[test]
+    fn m46_synthetic_repo_reports_working_tree_only() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let root = std::env::temp_dir().join(format!("m46-fixture-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        m46_git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("keep.txt"), "baseline\n").unwrap();
+        m46_git(&root, &["add", "."]);
+        m46_git(&root, &["commit", "-q", "-m", "baseline"]);
+        let base = m46_git(&root, &["rev-parse", "HEAD"]);
+        let range = format!("{base}..HEAD");
+
+        std::fs::write(root.join("keep.txt"), "baseline\nedited\n").unwrap();
+        std::fs::write(root.join("new.txt"), "brand new\n").unwrap();
+        assert_eq!(
+            crate::agent::objective::workspace_git_count(&root, &range, false),
+            Some(0),
+            "no commit exists beyond the baseline"
+        );
+        assert_eq!(
+            crate::agent::objective::workspace_git_count(&root, &range, true),
+            Some(0)
+        );
+        assert_eq!(
+            crate::agent::objective::workspace_uncommitted_count(&root),
+            Some(2)
+        );
+        let work = PreservedWork {
+            branch: Some("synthetic".into()),
+            location: Some(root.display().to_string()),
+            commits_ahead: Some(0),
+            unpushed_commits: Some(0),
+            uncommitted_files: Some(2),
+            total_changed_files: 2,
+            ..Default::default()
+        };
+        assert_eq!(work.change_status(), "改动仅在工作区，未提交");
+        let text = build_failure_report("合成任务", vec![], work).unwrap();
+        assert!(!text.contains("已经提交"), "{text}");
+        assert!(text.contains("清理工作区就会丢失"), "{text}");
+
+        // One real commit makes the same observers report a local, unpushed
+        // commit with its title — the fact the user is allowed to see.
+        m46_git(&root, &["add", "."]);
+        m46_git(
+            &root,
+            &["commit", "-q", "-m", "synthetic: keep the export stream open"],
+        );
+        assert_eq!(
+            crate::agent::objective::workspace_git_count(&root, &range, false),
+            Some(1)
+        );
+        assert_eq!(
+            crate::agent::objective::workspace_git_count(&root, &range, true),
+            Some(1)
+        );
+        assert_eq!(
+            crate::agent::objective::workspace_uncommitted_count(&root),
+            Some(0)
+        );
+        assert_eq!(
+            crate::agent::objective::workspace_latest_unpushed_subject(&root, &range).as_deref(),
+            Some("synthetic: keep the export stream open")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

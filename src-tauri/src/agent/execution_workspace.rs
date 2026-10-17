@@ -1052,9 +1052,18 @@ fn inspect_and_remove_candidate(
             }
         };
         if !status.is_empty() {
+            // R3: uncommitted or untracked content means the cleanup stops here,
+            // and the reason the user reads names the files and the path.
+            let dirty_files = status
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count();
             return Ok(CandidateDisposition::Preserved {
                 code: "workspace_cleanup_dirty",
-                detail: "canonical merged workspace has uncommitted or untracked changes".into(),
+                detail: format!(
+                    "这个工作区里还有 {dirty_files} 个文件没提交，清理会丢掉这些改动，所以整个工作区先保留：{}",
+                    workspace_path.display()
+                ),
             });
         }
         if let Err(error) = git(
@@ -3599,8 +3608,8 @@ mod tests {
         assert_eq!(outcome.preserved, 1);
         assert!(workspace.worktree_path.join("uncommitted.txt").is_file());
         assert!(super::branch_exists(&root, &workspace.branch_name));
-        let state: (String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT state, failure_code, lease_owner
+        let state: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT state, failure_code, lease_owner, failure_detail
              FROM execution_workspaces WHERE objective_id=?",
         )
         .bind(&workspace.objective_id)
@@ -3610,6 +3619,12 @@ mod tests {
         assert_eq!(state.0, "cleanup_pending");
         assert_eq!(state.1.as_deref(), Some("workspace_cleanup_dirty"));
         assert_eq!(state.2, None);
+        let detail = state.3.unwrap_or_default();
+        assert!(detail.contains("没提交"), "{detail}");
+        assert!(
+            detail.contains(&workspace.worktree_path.display().to_string()),
+            "the kept path must be visible: {detail}"
+        );
         let deferred = run_cleanup_pass(&pool, &container, "cleanup-process")
             .await
             .unwrap();
