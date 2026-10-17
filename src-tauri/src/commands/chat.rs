@@ -1029,19 +1029,75 @@ async fn settle_finished_turn_provider_episodes(
     Ok(())
 }
 
+/// Session-scoped acceptance close.
+///
+/// The session rail only knows the session, but a session accumulates several
+/// objectives (this one, plus older failures). Picking "the newest objective"
+/// selected an already failed record while the delivered objective kept waiting
+/// for acceptance forever. Resolution therefore works on the exact definition of
+/// "merged, waiting for acceptance": a unique candidate is used, several
+/// candidates fail closed with the list, and an explicit `objective_id` wins.
 async fn close_objective_in_pool(
     pool: &sqlx::SqlitePool,
     session_id: &str,
     outcome: &str,
+    objective_id: Option<&str>,
 ) -> anyhow::Result<crate::agent::objective::ObjectiveSnapshot> {
     anyhow::ensure!(outcome == "accepted", "outcome must be accepted");
     let mut tx = pool.begin().await?;
-    let id: String = sqlx::query_scalar("SELECT id FROM objectives WHERE session_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1")
-        .bind(session_id).fetch_one(&mut *tx).await?;
-    let (status, reached): (String, Option<String>) = sqlx::query_as("SELECT status,reached_acceptance FROM objectives WHERE id=?")
-        .bind(&id).fetch_one(&mut *tx).await?;
-    anyhow::ensure!(status == "completed" || (status == "waiting_system" && reached.as_deref() == Some("merged")),
-        "only a merged task awaiting acceptance can be closed");
+    let id = match objective_id {
+        Some(requested) => {
+            let found: Option<(String, Option<String>)> = sqlx::query_as(
+                "SELECT status,reached_acceptance FROM objectives WHERE id=? AND session_id=?",
+            )
+            .bind(requested)
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let (status, reached) = found.ok_or_else(|| {
+                anyhow::anyhow!("objective {requested} does not belong to this session")
+            })?;
+            anyhow::ensure!(
+                status == "completed"
+                    || (status == "waiting_system" && reached.as_deref() == Some("merged")),
+                "objective {requested} is not a merged task awaiting acceptance"
+            );
+            requested.to_string()
+        }
+        None => {
+            let awaiting: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM objectives WHERE session_id=? AND status='waiting_system' AND reached_acceptance='merged' ORDER BY created_at DESC, rowid DESC",
+            )
+            .bind(session_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            match awaiting.len() {
+                1 => awaiting.into_iter().next().expect("single candidate"),
+                0 => sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM objectives WHERE session_id=? AND status='completed' ORDER BY completed_at DESC, created_at DESC, rowid DESC LIMIT 1",
+                )
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("only a merged task awaiting acceptance can be closed")
+                })?,
+                _ => anyhow::bail!(
+                    "multiple merged tasks awaiting acceptance; specify objective_id (candidates: {})",
+                    serde_json::to_string(&awaiting)?
+                ),
+            }
+        }
+    };
+    let (status, _reached): (String, Option<String>) =
+        sqlx::query_as("SELECT status,reached_acceptance FROM objectives WHERE id=?")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?;
+    anyhow::ensure!(
+        status == "completed" || status == "waiting_system",
+        "only a merged task awaiting acceptance can be closed"
+    );
     if status != "completed" {
         let now = Utc::now().timestamp_millis();
         let event_id = uuid::Uuid::new_v4().to_string();
@@ -1061,15 +1117,23 @@ async fn close_objective_in_pool(
 pub async fn close_objective(
     session_id: String,
     outcome: String,
+    objective_id: Option<String>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
+    if objective_id.as_deref().is_some_and(|id| id.trim().is_empty()) {
+        return Err(AppError::Other(
+            "objective_id must be a non-empty string".into(),
+        ));
+    }
     if state.chat_cancels.lock().await.contains_key(&session_id) {
         return Err(AppError::Other("task is currently running".into()));
     }
     let pool = state.db.read().await.clone();
-    let objective = close_objective_in_pool(&pool, &session_id, &outcome).await
-        .map_err(|error| AppError::Other(error.to_string()))?;
+    let objective =
+        close_objective_in_pool(&pool, &session_id, &outcome, objective_id.as_deref())
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?;
     publish_committed_objective_transition(&app, &objective).await?;
     Ok(objective)
 }
@@ -3983,15 +4047,188 @@ mod tests {
             domain: crate::agent::objective::RecoveryDomain::Delivery,
             requested_acceptance: "live_verification".into(), created_surface: "synthetic-test".into(),
         }).await.unwrap();
-        assert!(close_objective_in_pool(&pool, "synthetic-close", "accepted").await.is_err());
+        assert!(close_objective_in_pool(&pool, "synthetic-close", "accepted", None).await.is_err());
         sqlx::query("UPDATE objectives SET status='waiting_system',decision_type='waiting',reached_acceptance='merged'").execute(&pool).await.unwrap();
-        let closed = close_objective_in_pool(&pool, "synthetic-close", "accepted").await.unwrap();
+        let closed = close_objective_in_pool(&pool, "synthetic-close", "accepted", None).await.unwrap();
         assert_eq!(closed.status, crate::agent::objective::ObjectiveStatus::Completed);
-        let repeated = close_objective_in_pool(&pool, "synthetic-close", "accepted").await.unwrap();
+        let repeated = close_objective_in_pool(&pool, "synthetic-close", "accepted", None).await.unwrap();
         assert_eq!(repeated.revision, closed.revision);
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objective_events WHERE event_type='acceptance_confirmed'").fetch_one(&pool).await.unwrap();
         assert_eq!(count, 1);
-        assert!(close_objective_in_pool(&pool, "synthetic-close", "unknown").await.is_err());
+        assert!(close_objective_in_pool(&pool, "synthetic-close", "unknown", None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn m90_close_objective_selects_the_merged_awaiting_acceptance_objective() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-multi','synthetic','/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
+        let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+        for (id, root_turn_id, created_at) in [
+            ("synthetic-multi-merged", "synthetic-root-merged", 100_i64),
+            ("synthetic-multi-failed", "synthetic-root-failed", 200_i64),
+        ] {
+            store
+                .create(crate::agent::objective::CreateObjective {
+                    id: id.into(),
+                    kind: crate::agent::objective::ObjectiveKind::Live,
+                    session_id: Some("synthetic-multi".into()),
+                    root_turn_id: Some(root_turn_id.into()),
+                    domain: crate::agent::objective::RecoveryDomain::Delivery,
+                    requested_acceptance: "live_verification".into(),
+                    created_surface: "synthetic-test".into(),
+                })
+                .await
+                .unwrap();
+            sqlx::query("UPDATE objectives SET created_at=? WHERE id=?")
+                .bind(created_at)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE objectives SET status='waiting_system',decision_type='waiting',reached_acceptance='merged',failure_code='delivered_awaiting_ci' WHERE id='synthetic-multi-merged'").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE objectives SET status='failed',decision_type='failed_internal',failure_code='technical_recovery_exhausted' WHERE id='synthetic-multi-failed'").execute(&pool).await.unwrap();
+
+        let closed = close_objective_in_pool(&pool, "synthetic-multi", "accepted", None)
+            .await
+            .unwrap();
+        assert_eq!(closed.id, "synthetic-multi-merged");
+        assert_eq!(
+            closed.status,
+            crate::agent::objective::ObjectiveStatus::Completed
+        );
+        let failed: (String, Option<String>) =
+            sqlx::query_as("SELECT status,failure_code FROM objectives WHERE id='synthetic-multi-failed'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(failed.0, "failed");
+        assert_eq!(failed.1.as_deref(), Some("technical_recovery_exhausted"));
+    }
+
+    async fn seed_multi_objective(
+        pool: &sqlx::SqlitePool,
+        session_id: &str,
+        id: &str,
+        root_turn_id: &str,
+        created_at: i64,
+        status: &str,
+        decision_type: &str,
+        reached_acceptance: Option<&str>,
+        failure_code: Option<&str>,
+    ) {
+        crate::agent::objective::ObjectiveStore::new(pool.clone())
+            .create(crate::agent::objective::CreateObjective {
+                id: id.into(),
+                kind: crate::agent::objective::ObjectiveKind::Live,
+                session_id: Some(session_id.into()),
+                root_turn_id: Some(root_turn_id.into()),
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "live_verification".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET created_at=?,status=?,decision_type=?,reached_acceptance=?,failure_code=? WHERE id=?")
+            .bind(created_at)
+            .bind(status)
+            .bind(decision_type)
+            .bind(reached_acceptance)
+            .bind(failure_code)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn m90_close_objective_requires_an_explicit_id_when_several_await_acceptance() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        for session in ["synthetic-ambiguous", "synthetic-elsewhere"] {
+            sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES (?,?,?,?,1,1)")
+                .bind(session)
+                .bind(session)
+                .bind("/synthetic")
+                .bind("synthetic")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        seed_multi_objective(
+            &pool, "synthetic-ambiguous", "synthetic-await-1", "root-await-1", 100,
+            "waiting_system", "waiting", Some("merged"), Some("delivered_awaiting_ci"),
+        )
+        .await;
+        seed_multi_objective(
+            &pool, "synthetic-ambiguous", "synthetic-await-2", "root-await-2", 200,
+            "waiting_system", "waiting", Some("merged"), Some("delivered_awaiting_ci"),
+        )
+        .await;
+        seed_multi_objective(
+            &pool, "synthetic-elsewhere", "synthetic-elsewhere-await", "root-elsewhere", 300,
+            "waiting_system", "waiting", Some("merged"), Some("delivered_awaiting_ci"),
+        )
+        .await;
+
+        let error = close_objective_in_pool(&pool, "synthetic-ambiguous", "accepted", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("objective_id"), "{error}");
+        assert!(error.contains("synthetic-await-1"), "{error}");
+        assert!(error.contains("synthetic-await-2"), "{error}");
+        let untouched: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objectives WHERE session_id='synthetic-ambiguous' AND status='waiting_system'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched, 2);
+
+        let cross = close_objective_in_pool(
+            &pool,
+            "synthetic-ambiguous",
+            "accepted",
+            Some("synthetic-elsewhere-await"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(cross.contains("does not belong"), "{cross}");
+
+        let closed = close_objective_in_pool(
+            &pool,
+            "synthetic-ambiguous",
+            "accepted",
+            Some("synthetic-await-1"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(closed.id, "synthetic-await-1");
+        assert_eq!(
+            closed.status,
+            crate::agent::objective::ObjectiveStatus::Completed
+        );
+
+        // The remaining candidate is now unique, so the session-scoped call
+        // resolves it without an explicit id.
+        let second = close_objective_in_pool(&pool, "synthetic-ambiguous", "accepted", None)
+            .await
+            .unwrap();
+        assert_eq!(second.id, "synthetic-await-2");
+
+        let repeated = close_objective_in_pool(&pool, "synthetic-ambiguous", "accepted", None)
+            .await
+            .unwrap();
+        assert_eq!(repeated.id, "synthetic-await-2");
+        assert_eq!(repeated.revision, second.revision);
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_events WHERE objective_id='synthetic-await-2' AND event_type='acceptance_confirmed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 1);
     }
 
     #[test]

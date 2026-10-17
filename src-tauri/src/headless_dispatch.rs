@@ -96,7 +96,14 @@ pub enum Request {
     /// CF-HDE-R1: query objective state / latest reply summary / PR number.
     Status { session_id: String },
     /// Explicit acceptance; does not authorize execution or remote mutations.
-    CloseObjective { session_id: String, outcome: String },
+    /// `objective_id` disambiguates a session that holds several merged
+    /// objectives awaiting acceptance.
+    CloseObjective {
+        session_id: String,
+        outcome: String,
+        #[serde(default)]
+        objective_id: Option<String>,
+    },
     /// CF-HDE-R6: pick or change the model (session-scoped, or the default).
     SetModel {
         #[serde(default)]
@@ -292,9 +299,16 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             require_non_empty("session_id", session_id)?;
             require_permission_mode(permission_mode)?;
         }
-        Request::CloseObjective { session_id, outcome } => {
+        Request::CloseObjective {
+            session_id,
+            outcome,
+            objective_id,
+        } => {
             require_non_empty("session_id", session_id)?;
             if outcome != "accepted" { return Err(ErrorBody::invalid("outcome must be accepted")); }
+            if let Some(objective_id) = objective_id {
+                require_non_empty("objective_id", objective_id)?;
+            }
         }
         Request::Status { session_id } => require_non_empty("session_id", session_id)?,
         Request::SetModel { session_id, model } => {

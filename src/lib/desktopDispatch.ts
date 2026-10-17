@@ -87,7 +87,11 @@ export interface DispatchHandlers {
     deliveryAuthorized: boolean;
   }) => Promise<unknown>;
   setPermission: (input: { sessionId: string; mode: DispatchPermissionMode }) => Promise<unknown>;
-  closeObjective?: (input: { sessionId: string; outcome: "accepted" }) => Promise<unknown>;
+  closeObjective?: (input: {
+    sessionId: string;
+    outcome: "accepted";
+    objectiveId?: string;
+  }) => Promise<unknown>;
   status: (input: { sessionId: string }) => Promise<unknown>;
   setModel: (input: { sessionId?: string; model: string }) => Promise<unknown>;
   switchSession: (input: { sessionId: string }) => Promise<unknown>;
@@ -197,11 +201,23 @@ export async function applyDispatchRequest(
           mode: requiredPermissionMode(body.permission_mode),
         });
         break;
-      case "close_objective":
+      case "close_objective": {
         if (!handlers.closeObjective) return invalid("close_objective is not available");
         if (body.outcome !== "accepted") return invalid("outcome must be accepted");
-        result = await handlers.closeObjective({ sessionId: requiredString(body.session_id, "session_id"), outcome: "accepted" });
+        // An objective id is optional: the session-scoped call is the normal
+        // path, and only a session with several merged objectives awaiting
+        // acceptance needs the explicit one.
+        const objectiveId = optionalString(body.objective_id, "objective_id");
+        if (objectiveId !== undefined && !objectiveId.trim()) {
+          return invalid("objective_id must be a non-empty string");
+        }
+        result = await handlers.closeObjective({
+          sessionId: requiredString(body.session_id, "session_id"),
+          outcome: "accepted",
+          objectiveId,
+        });
         break;
+      }
       case "status":
         result = await handlers.status({
           sessionId: requiredString(body.session_id, "session_id"),
