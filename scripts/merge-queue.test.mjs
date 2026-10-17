@@ -5,6 +5,11 @@
 // the spec requires.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { createGhAdapter } from './merge-queue.mjs';
 
 import {
   REQUIRED_CHECKS,
@@ -304,6 +309,110 @@ test('R6: a stop request halts the queue before the next merge', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// M94 / M78 / squash trailer regressions (synthetic GitHub client only).
+// ---------------------------------------------------------------------------
+function ghFixture({ failure, messages = ['fix: synthetic change'] } = {}) {
+  const calls = [];
+  const open = new Map([1, 2].map((number) => [number, {
+    number, title: 'fix: synthetic change', headRefName: `synthetic-${number}`,
+    headRefOid: String(number).repeat(40), isDraft: false,
+    labels: [{ name: ARM_LABEL }], mergeStateStatus: 'CLEAN',
+  }]));
+  const run = (args) => {
+    calls.push(args);
+    const number = Number(args[3]);
+    if (args[1] === 'label') return '';
+    if (args[2] === 'list') return JSON.stringify([...open.values()]);
+    if (args[1] === 'api' && args[2].endsWith('/check-runs')) {
+      const sha = args[2].split('/').at(-2);
+      if (failure === 'checks' && sha === '1'.repeat(40)) throw Error('synthetic checks error');
+      return JSON.stringify({ check_runs: greenChecks(sha).map((c) => ({
+        ...c, head_sha: sha, conclusion: failure === 'label' && sha === '1'.repeat(40) ? 'failure' : 'success',
+      })) });
+    }
+    if (args[1] === 'api' && args[2].includes('/commits')) {
+      return JSON.stringify(messages.map((message) => ({ commit: { message } })));
+    }
+    if (args[2] === 'edit' && number === 1 && failure === 'label') throw Error('synthetic label error');
+    if (args[2] === 'edit' || args[2] === 'comment') return '';
+    if (args[2] === 'merge') {
+      if (number === 1 && failure === 'merge') throw Error('synthetic merge error');
+      open.delete(number);
+      return '';
+    }
+    if (args[2] === 'view' && args.at(-1) === 'title') {
+      return JSON.stringify({ title: 'fix: synthetic change' });
+    }
+    if (args[2] === 'view') return JSON.stringify({ state: 'MERGED', mergeCommit: { oid: SHA_C } });
+    throw Error(`Unexpected synthetic gh call: ${args.join(' ')}`);
+  };
+  return { calls, adapter: createGhAdapter({ repo: 'synthetic/queue', run }) };
+}
+
+for (const failure of ['label', 'merge', 'checks']) {
+  test(`M94: synthetic gh ${failure} error on first PR does not stop second PR`, async () => {
+    const { adapter, calls } = ghFixture({ failure });
+    const outcomes = await runQueue(adapter, { maxIterations: 4 });
+    assert.ok(outcomes.some((o) => o.number === 2 && o.status === 'merged'));
+    assert.ok(outcomes.some((o) => o.number === 1 && o.status === 'error' && /synthetic/.test(o.reason)));
+    assert.ok(calls.filter((a) => a[2] === 'merge' && a[3] === '1').length <= 1);
+  });
+}
+
+test('M94: fixed blocked label is ensured and detailed reason is commented', async () => {
+  const { adapter, calls } = ghFixture();
+  await adapter.markBlocked(1, 'required check synthetic failed');
+  assert.ok(calls.some((a) => a[1] === 'label' && a.includes('merge-queue: blocked')));
+  const edit = calls.find((a) => a[2] === 'edit');
+  assert.equal(edit.at(-1), 'merge-queue: blocked');
+  assert.match(calls.find((a) => a[2] === 'comment').at(-1), /required check synthetic failed/);
+});
+
+test('M78: arming triggers only trusted default-branch queue tooling', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/merge-queue.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /pull_request_target:\s*\n\s*types: \[labeled\]/);
+  assert.match(workflow, /if:.*github.event_name != 'pull_request_target'.*github.event.label.name == 'merge-queue: armed'/);
+  assert.match(workflow, /ref: \$\{\{ github.event.repository.default_branch \}\}/);
+  assert.doesNotMatch(workflow, /ref:.*(?:head|pull_request)/);
+  assert.match(workflow, /schedule:/);
+  assert.match(workflow, /workflow_run:/);
+});
+
+for (const [name, messages] of [
+  ['single', ['fix: single\n\nRelease-Urgency: immediate\nCo-Authored-By: Synthetic <synthetic@example.invalid>']],
+  ['multiple', ['fix: first\n\nRelease-Urgency: immediate', 'fix: next\n\nCo-Authored-By: Synthetic <synthetic@example.invalid>']],
+  ['non-final paragraph', ['fix: footer misplaced\n\nRelease-Urgency: immediate\nCo-Authored-By: Synthetic <synthetic@example.invalid>\n\nLater prose']],
+]) {
+  test(`squash: ${name} trailers are final and recognized by plan_release`, async () => {
+    const { adapter, calls } = ghFixture({ messages });
+    await adapter.merge(1, { expectedHead: SHA_A });
+    const merge = calls.find((a) => a[2] === 'merge');
+    assert.ok(merge.includes('--body'));
+    assert.equal(merge[merge.indexOf('--subject') + 1], 'fix: synthetic change');
+    const body = merge[merge.indexOf('--body') + 1];
+    const footer = body.trim().split(/\n\s*\n/).at(-1);
+    assert.match(footer, /^Release-Urgency: immediate/m);
+    assert.match(footer, /^Co-Authored-By: Synthetic/m);
+    const dir = mkdtempSync(join(tmpdir(), 'queue-trailers-'));
+    const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+    try {
+      git('init', '-q');
+      git('config', 'user.name', 'Synthetic');
+      git('config', 'user.email', 'synthetic@example.invalid');
+      git('commit', '--allow-empty', '-qm', 'chore: initial');
+      git('commit', '--allow-empty', '-qm', `fix: synthetic change\n\n${body}`);
+      const plan = JSON.parse(execFileSync('python3', [
+        decodeURIComponent(new URL('../tools/release/plan_release.py', import.meta.url).pathname),
+        '--repo', dir, '--range', 'HEAD~1..HEAD',
+      ], { encoding: 'utf8' }));
+      assert.equal(plan.immediate, 1);
+      assert.equal(plan.slot, 'patch');
+      assert.equal(plan.skip, false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
 // Observation — the run is traceable
 // ---------------------------------------------------------------------------
 

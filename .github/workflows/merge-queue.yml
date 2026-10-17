@@ -20,6 +20,8 @@ name: merge-queue
 # a candidate PR cannot rewrite the queue to certify itself.
 
 on:
+  pull_request_target:
+    types: [labeled]
   schedule:
     - cron: "*/10 * * * *" # sweep the queue every 10 minutes
   workflow_dispatch:
@@ -47,6 +49,7 @@ permissions:
 
 jobs:
   drain-queue:
+    if: ${{ github.event_name != 'pull_request_target' || github.event.label.name == 'merge-queue: armed' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
