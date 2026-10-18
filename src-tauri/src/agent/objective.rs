@@ -81,6 +81,13 @@ string_enum!(ObjectiveStatus {
 /// objective that produced it name the same thing.
 pub const TECHNICAL_RECOVERY_EXHAUSTED: &str = "technical_recovery_exhausted";
 
+/// M112 (2026-10-18). The agent loop stopped because something outside the run
+/// blocked it, and it did not name a typed reason. Repeating the same round
+/// cannot change that condition — the run had no new information on attempt two
+/// than on attempt one — so this code is a handoff to the only actor who can
+/// unblock it (the user / orchestrator), not a transient failure to retry.
+pub const RUN_BLOCKED: &str = "run_blocked";
+
 /// U21 (2026-10-07). The provider episode fence, in the one case U21 keeps:
 /// the last model request started a tool or other external mutation whose
 /// receipt is still unresolved, so nothing proves the request safe to replay
@@ -1606,6 +1613,38 @@ pub fn decision_for_run_outcome_with_reason(
         }
     }
 
+    // M112 (2026-10-18): a plain `Blocked` stop has no typed reason, and
+    // repeating the same round cannot change whatever blocked it. Routing it as
+    // a chat-domain technical failure queued a remediation that replayed the
+    // identical round every 5s→320s against one constant failure signature,
+    // then parked the Objective as `failed / technical_recovery_exhausted`
+    // about four minutes later with nothing new to report. The only actor who
+    // can unblock it is the user (or the orchestrator acting for them), so the
+    // decision hands it over: no owner, no remediation, no observation
+    // deadline, no recovery budget — and the `resume_cursor` the user's
+    // "继续" continues from.
+    if outcome.stop_reason == StopReason::Blocked && terminal_reason.is_none() {
+        let resume_cursor = objective
+            .resume_cursor
+            .clone()
+            .or_else(|| objective.root_turn_id.clone())
+            .or_else(|| objective.task_id.clone());
+        let mut decision = DecisionRouter::route(
+            objective,
+            RouteSignal::CoreInputRequired {
+                domain: RecoveryDomain::Chat,
+                request_key: format!("run-blocked:{}", objective.id),
+                missing_inputs: vec!["确认是否继续这轮被卡住的任务".into()],
+                attempted_routes: vec!["same_run_retry".into()],
+                resume_cursor,
+            },
+        )?;
+        // Keep the stable code for observation: the wait is a handoff, not a
+        // silent state, and the event stream must still name what happened.
+        decision.failure_code = Some(RUN_BLOCKED.into());
+        return Ok(decision);
+    }
+
     if outcome.stop_reason == StopReason::Blocked
         && terminal_reason == Some("browser_pairing_required")
     {
@@ -1725,6 +1764,31 @@ pub fn decision_for_run_outcome_with_reason(
             },
         },
     )
+}
+
+/// M113 (2026-10-18): the user-visible failure report may only promise "回一句
+/// 继续" when there is something to continue from. The field saw a report offer
+/// exactly that, and the next message died on `cannot reconcile a terminal
+/// durable delivery run` — the copy promised a capability the run did not have.
+/// A record with no resume anchor says what the user can actually do instead.
+pub(crate) fn resume_after_failure_hint(objective: &ObjectiveSnapshot) -> String {
+    let has_anchor = [
+        objective.root_turn_id.as_deref(),
+        objective.resume_cursor.as_deref(),
+        objective.task_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty());
+    if has_anchor {
+        "这件事没做成。你交代的目标没有达成，当前进度已保留在会话里；\
+直接回一句「继续」或「把这些改动交付」就会从这些改动上接着做。"
+            .to_string()
+    } else {
+        "这件事没做成。你交代的目标没有达成，而且这轮没有可续做的会话锚点，\
+所以「继续」不会接着做；请在原工作目录新开一个会话，把要接手的目标再说一次。"
+            .to_string()
+    }
 }
 
 #[derive(Clone)]
@@ -5474,11 +5538,7 @@ impl ObjectiveStore {
         } else {
             None
         }
-        .unwrap_or_else(|| {
-            "这件事没做成。你交代的目标没有达成，当前进度已保留在会话里；\
-直接回一句「继续」或「把这些改动交付」就可以接着做。"
-                .to_string()
-        });
+        .unwrap_or_else(|| resume_after_failure_hint(&current));
         let mut tx = self.pool.begin().await?;
         // The decision transaction may be the only SQLite connection in a
         // deterministic test or embedded deployment. Inspect schema through
@@ -12315,6 +12375,134 @@ CREATE TABLE objectives (
             );
             assert!(!decision.requires_user_action);
         }
+    }
+
+    /// M112: a plain `Blocked` stop is not a transient chat-domain failure that
+    /// the supervisor can retry into existence. Nothing about the run changes
+    /// between two identical attempts, so the only party who can unblock it is
+    /// the user (or the orchestrator acting for them). The decision must say so
+    /// instead of queueing a remediation that spends the recovery budget and
+    /// then parks as an undiagnosed `technical_recovery_exhausted`.
+    #[test]
+    fn m112_blocked_run_hands_off_to_the_user() {
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-run-blocked",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "validated_change",
+        );
+        objective.root_turn_id = Some("turn-blocked-anchor".into());
+        let outcome = RunOutcome {
+            final_text: String::new(),
+            final_message_id: None,
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::Blocked,
+        };
+        let decision = decision_for_run_outcome_with_reason(&objective, &outcome, None).unwrap();
+        assert_eq!(
+            decision.status,
+            ObjectiveStatus::WaitingCoreInput,
+            "a blocked run must ask the only actor who can unblock it"
+        );
+        assert_eq!(decision.decision_type, DecisionType::CoreInputRequired);
+        assert!(decision.requires_user_action);
+        assert_eq!(
+            decision.remediation_id, None,
+            "no automatic retry: repeating the same blocked round spends the recovery budget"
+        );
+        assert_eq!(decision.recovery_owner, None);
+        assert_eq!(
+            decision.next_observation_at, None,
+            "a user-owned wait must not schedule a system re-drive"
+        );
+        assert_eq!(decision.failure_code.as_deref(), Some(RUN_BLOCKED));
+        assert_eq!(
+            decision.resume_cursor.as_deref(),
+            Some("turn-blocked-anchor"),
+            "resuming must continue the blocked turn, not start a new task"
+        );
+        let request = decision
+            .attention_request
+            .expect("a blocked run must surface a user-facing request");
+        assert_eq!(request.kind, "core_input");
+        assert!(
+            request.prompt.contains("继续"),
+            "the request must name the resume action: {}",
+            request.prompt
+        );
+    }
+
+    /// M112: the typed blocked outcomes keep their own owners. The plain-blocked
+    /// handoff must not swallow a browser pairing wait (system/browser owns it)
+    /// or a denied permission (that is an explicit cancellation).
+    #[test]
+    fn m112_typed_blocked_reasons_keep_their_owner() {
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-typed-blocked",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "validated_change",
+        );
+        objective.root_turn_id = Some("turn-typed-anchor".into());
+        let outcome = RunOutcome {
+            final_text: String::new(),
+            final_message_id: None,
+            completion_evidence: CompletionEvidence::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::Blocked,
+        };
+
+        let pairing =
+            decision_for_run_outcome_with_reason(&objective, &outcome, Some("browser_pairing_required"))
+                .unwrap();
+        assert_eq!(pairing.domain, RecoveryDomain::Browser);
+        assert_eq!(pairing.status, ObjectiveStatus::WaitingCoreInput);
+        assert_eq!(
+            pairing.request_key.as_deref(),
+            Some("browser-pairing:objective-typed-blocked")
+        );
+
+        let denied = decision_for_run_outcome_with_reason(
+            &objective,
+            &outcome,
+            Some("permission_denied_by_user"),
+        )
+        .unwrap();
+        assert_eq!(denied.decision_type, DecisionType::Cancelled);
+        assert_eq!(denied.status, ObjectiveStatus::Cancelled);
+    }
+
+    /// M113: the failure report may only promise "回一句继续" when the record
+    /// actually has something to continue from. Otherwise it has to say what the
+    /// user can do instead — the field saw the promise, followed it, and hit
+    /// `cannot reconcile a terminal durable delivery run`.
+    #[test]
+    fn m113_failure_copy_only_promises_resume_when_resume_is_possible() {
+        let mut objective = ObjectiveSnapshot::new(
+            "objective-copy",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "validated_change",
+        );
+        objective.root_turn_id = None;
+        objective.resume_cursor = None;
+        objective.task_id = None;
+        let anchored = resume_after_failure_hint(&objective);
+        assert!(
+            !anchored.contains("直接回一句「继续」"),
+            "no anchor means no resume promise: {anchored}"
+        );
+        assert!(anchored.contains("新开一个会话"), "{anchored}");
+
+        objective.root_turn_id = Some("turn-copy-anchor".into());
+        let resumable = resume_after_failure_hint(&objective);
+        assert!(
+            resumable.contains("直接回一句「继续」"),
+            "an anchored record can honestly offer resume: {resumable}"
+        );
     }
 
     #[test]
