@@ -37,7 +37,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut socket, _) = listener.accept().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        };
         // Model Windows accept inheritance on every platform, deterministically.
         socket.set_nonblocking(true).unwrap();
         configure_provider_socket(&socket).unwrap();
