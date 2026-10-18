@@ -8365,6 +8365,65 @@ impl GhCliRemote {
 
     /// M114/R6: `gh api rate_limit` costs no core quota, so it is the polling
     /// source for the shared user budget.
+    /// M115/R2: `Some(default_branch)` when `actual_head` is a two-parent merge
+    /// commit whose parents are `known_head` and a commit the default branch
+    /// already contains — the exact shape GitHub's update-branch and the merge
+    /// queue produce when they sync a PR. Anything else is `None`; any lookup
+    /// failure is `Err`, so every caller keeps failing closed.
+    pub(crate) fn queue_synced_head(
+        &self,
+        known_head: &str,
+        actual_head: &str,
+    ) -> Result<Option<String>, String> {
+        if known_head == actual_head {
+            return Ok(None);
+        }
+        let raw = self.gh(&[
+            "api".into(),
+            format!("repos/{}/commits/{}", self.repo, actual_head),
+        ])?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("commit response non-JSON: {e}"))?;
+        let parents: Vec<String> = value
+            .get("parents")
+            .and_then(serde_json::Value::as_array)
+            .map(|parents| {
+                parents
+                    .iter()
+                    .filter_map(|parent| {
+                        parent
+                            .get("sha")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(other) = queue_sync_other_parent(known_head, &parents) else {
+            return Ok(None);
+        };
+        let raw = self.gh(&[
+            "api".into(),
+            format!(
+                "repos/{}/compare/{}...{}",
+                self.repo, other, self.default_branch
+            ),
+        ])?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("compare response non-JSON: {e}"))?;
+        let status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        Ok(match status {
+            // `compare <parent>...<default>` reports "ahead" when the default
+            // branch already contains the parent, and "identical" when the
+            // parent *is* the default branch head.
+            "ahead" | "identical" => Some(self.default_branch.clone()),
+            _ => None,
+        })
+    }
+
     pub(crate) fn observed_rate_limit(
         &self,
     ) -> Option<github_api_budget::RateLimitSnapshot> {
@@ -8380,6 +8439,26 @@ pub(crate) struct BatchPrState {
     pub head_sha: String,
     pub merge_sha: Option<String>,
     pub armed: bool,
+}
+
+/// M115/R2: the pure half of the queue-sync proof. A provider sync merge has
+/// exactly two parents and one of them is the head this delivery already
+/// observed; rebases, force-pushes, unrelated merges and octopus merges do not
+/// qualify.
+pub(crate) fn queue_sync_other_parent<'a>(
+    known_head: &str,
+    parents: &'a [String],
+) -> Option<&'a str> {
+    if known_head.is_empty()
+        || parents.len() != 2
+        || !parents.iter().any(|parent| parent == known_head)
+    {
+        return None;
+    }
+    parents
+        .iter()
+        .map(String::as_str)
+        .find(|parent| *parent != known_head)
 }
 
 /// Build a [`GhCliRemote`] for `cwd` when it is a GitHub checkout. Does not
@@ -18029,5 +18108,45 @@ GITHUB.COM:
         let placeholder = plan(&format!("{head}..HEAD"));
         assert_eq!(placeholder["skip"], true);
         assert_eq!(placeholder["slot"], "none");
+    }
+}
+
+#[cfg(test)]
+mod m115_queue_head_tests {
+    use super::queue_sync_other_parent;
+
+    fn parents(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// M115/R2: only a two-parent merge that contains the already-observed head
+    /// is a provider sync. Rebases, force-pushes and octopus merges stay foreign.
+    #[test]
+    fn only_a_two_parent_merge_of_the_known_head_is_a_queue_sync() {
+        let known = "0357e6fe";
+        assert_eq!(
+            queue_sync_other_parent(known, &parents(&[known, "main-head"])),
+            Some("main-head")
+        );
+        assert_eq!(
+            queue_sync_other_parent(known, &parents(&["main-head", known])),
+            Some("main-head")
+        );
+        // A head that does not descend from ours (force-push/rebase).
+        assert_eq!(
+            queue_sync_other_parent(known, &parents(&["other", "main-head"])),
+            None
+        );
+        // An octopus merge is not the provider's update-branch shape.
+        assert_eq!(
+            queue_sync_other_parent(known, &parents(&[known, "a", "b"])),
+            None
+        );
+        // A root commit / missing parents.
+        assert_eq!(queue_sync_other_parent(known, &parents(&[])), None);
+        assert_eq!(
+            queue_sync_other_parent("", &parents(&[known, "main-head"])),
+            None
+        );
     }
 }
