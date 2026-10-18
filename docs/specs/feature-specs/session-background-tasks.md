@@ -163,3 +163,117 @@
 - 唤醒入队走与用户消息同一个通道：后台监视器只在**终态写入成功后**调用注入的 `WakeSink`，由调度层负责入队，因此监视任务不直接持有会话锁；
 - 为便于 headless 测试，核心逻辑不依赖 Tauri `AppHandle`：进程启动、监视、对账、上限、回收都在纯 Rust 模块内，数据库用 `sqlx::SqlitePool`，测试用临时目录与临时库；
 - 进程启动时间在 Unix 上取进程统计里的 starttime（与 pid 合并判定），Windows 取创建时间；取不到时记为 `null` 并在对账时落到 `lost` 分支（不猜 `running`）。
+
+---
+
+# 阶段 2：定时唤醒（R2）+ 使用规矩（R5 / R5b）
+
+- 状态：阶段 2 规格；实现于本 PR
+- 任务来源：`task-cf-bg-stage2.md`（总规格 `task-cf-bg-background-tasks.md` 的 R2 / R5 / R5b）
+- 前置：阶段 1 已由 #728 合并并在 v1.88.25 上线（R1 / R3 / R4）。本阶段在阶段 1 的实现（`src-tauri/src/agent/background_tasks.rs`、`src-tauri/src/tools/background_task.rs`）上扩展，不另起一套。
+
+## 背景
+
+阶段 1 给了 agent "开一个后台命令、结束被唤醒"的能力，但**只有命令结束才会唤醒**。真实长流程里还有一大类等待没有可结束的进程：CI 排队、合并队列按序跑、发版轮询、线上状态巡检。这类等待需要一个**定时唤醒**：N 秒后、或每 N 秒，用一句话把本会话叫醒，让它自己看一次状态再决定下一步。同时，agent 侧需要一条使用规矩：交付开 PR 后自己挂 CI 监视，结束回合前不能把"外部还在进行中的事项"留在那里没人管。
+
+## 需求（本阶段）
+
+### R2 定时唤醒工具
+
+| 工具 | 作用 |
+| --- | --- |
+| `schedule_wakeup` | 在 N 秒后（一次性）或每 N 秒（周期性）以一句提示唤醒本会话，返回 `wakeup_id` |
+| `wakeup_list` | 列出本会话的定时唤醒（提示、下次到点时间、周期、状态） |
+| `wakeup_cancel` | 按 `wakeup_id` 取消，取消后不再触发 |
+
+- 参数：`prompt`（唤醒时注入的那句话）、`after_sec`（一次性）**或** `every_sec`（周期性），二选一必填；`source`（`agent_decided` | `user_requested`，默认 `agent_decided`）。
+- 间隔下限 60 秒、上限 6 小时（21600 秒）；越界**明确报错**（说明下限/上限与合法示例），不创建记录。
+- 每会话最多 8 条待触发唤醒，超限明确报错并给出可执行下一步（先取消一条）。
+- 唤醒文本固定形状：`定时唤醒 <id>：<prompt>` + 周期信息（一次性 / 每 N 秒）；周期性唤醒带"第 n 次"。
+- **持久化**：记录落 SQLite；应用重启后按原计划继续——到点时间在应用关闭期间已过的，启动后立即补一次并在文本中说明"计划时间已过，启动后补发"，然后按周期继续。
+- **回收**：会话被用户停止/结案时，取消该会话全部待触发唤醒，与阶段 1 的后台任务回收同一入口。
+
+### R5 使用规矩（系统提示 + 任务模板）
+
+1. 交付开 PR 后，用后台任务监视 CI（`gh pr checks <n> --watch`，或间隔 ≥180 秒的轮询脚本；注意 GitHub API 额度，见 M114），被唤醒后：失败 → 修复并推送；只差信任根自修改 → 明确"等编排方放行"；全绿 → 打 `merge-queue: armed`。
+2. 结束回合前若仍有外部进行中的事项（CI、合并队列、发版），必须已经挂了后台任务或定时唤醒；否则不放行。这条只约束 agent 的下一步，**不写进对话、不展示内部词汇**。
+3. 规矩落在两处并且必须同时存在：agent 系统提示（交互 / 执行 / 自主三种模式）与仓库内任务模板文档（`docs/agent-task-template.md`，编排方同步 `~/.codefactory/agent-tools/task-template.md`）。
+
+### R5b 谁来决定开后台任务
+
+- `agent_decided`：agent 自己判断什么时候开后台任务 / 定时唤醒（等 CI、等长构建、等部署、定期检查状态、长时间测试放后台跑同时继续别的事），不限于交付流程。
+- `user_requested`：用户用自然语言要求（"盯着这个 PR，合并了告诉我"、"每小时检查一次线上状态"、"这个测试放后台跑，跑完叫我"）时，agent 创建对应任务/唤醒，并在回复里说明建了什么、怎么停（`background_task_stop` / `wakeup_cancel`）。
+- 两种来源走同一套权限与审批，任务记录里标明来源，界面可见可停（界面属阶段 3 R6）。
+
+## 决策
+
+### D9 数据模型（SQLite，`wakeup_schedules`）
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | `wk-<uuid 简写>`，主键 |
+| `session_id` | 所属会话；列表/取消/回收都按它过滤 |
+| `root_turn_id` | 创建它的回合（审计用） |
+| `prompt` | 唤醒时注入的那句话 |
+| `source` | `agent_decided` / `user_requested` |
+| `after_sec` | 一次性唤醒的延迟（一次性时为非空） |
+| `every_sec` | 周期（周期性时为非空，两者互斥） |
+| `next_at` | 下次到点的 Unix 秒（周期唤醒每次触发后推进 `every_sec`） |
+| `status` | `pending` / `done` / `cancelled` |
+| `fire_count` | 已触发次数 |
+| `created_at` / `last_fired_at` | 创建 / 最近触发时间 |
+
+一次性唤醒触发后转 `done`；周期性唤醒保持 `pending` 并推进 `next_at`；取消转 `cancelled`。表只在 `ensure_schema` 里 `CREATE TABLE IF NOT EXISTS` 追加，旧库启动自动补齐（Compatibility）。
+
+### D10 触发与投递
+
+- 调度是一个每秒执行一次的纯 Rust 函数 `drain_due_wakeups_at(pool, sink, now)`：取 `status='pending' AND next_at<=now` 的行，逐条投递到与用户消息相同的会话入队通道（复用阶段 1 的 `WakeSink`）。
+- 投递失败（会话正在跑回合）保持 `pending`，下一轮重试，不丢；投递成功才推进 `next_at` / `fire_count`，因此重启不会重复触发同一次。
+- 周期性唤醒的"晚到"语义：应用关闭期间错过多次，只补**一次**并把 `next_at` 推到 `now + every_sec`（不在启动瞬间灌一堆唤醒）。
+
+### D11 与完成门禁的关系（R5 第 2 条）
+
+- 完成门禁只约束 agent 的下一步：当会话有外部进行中的事项时，要求 `wake_source_cover(session)` 至少有 1 个后台任务在跑或 1 条待触发唤醒；
+- 缺唤醒源时给出可执行的一句话（"给这个等待挂一个 `schedule_wakeup` 或 `background_task_start`"），不写进对话、不展示内部词汇；
+- 该判断是纯查询，不新建任何状态机，也不改变交付授权、CI 证据链或 objective 状态推进。
+
+## Requirements Traceability（阶段 2）
+
+| Req ID | 需求 | 最低证据 |
+| --- | --- | --- |
+| R2-触发 | 到点触发一次，唤醒文本含提示与 id | 集成：到点后 `drain_due_wakeups_at` 投递 1 条，未到点投递 0 条 |
+| R2-周期 | `every_sec` 在每次触发后推进 `next_at`，可再次触发 | 集成：连续两次推进时间点各投递 1 条，`fire_count=2` |
+| R2-取消 | `wakeup_cancel` 后不再触发 | 集成：取消后到点投递 0 条，`status=cancelled` |
+| R2-重启继续 | 重启后按原计划继续，错过的只补一次 | 集成：模拟重启（重新打开库）后到点行仍触发；关闭期间错过 3 次只投递 1 条且 `next_at=now+every_sec` |
+| R2-上下限 | <60s / >6h 明确报错，且不建记录 | 单元：59 与 21601 被拒，错误句含边界；60 与 21600 通过 |
+| R2-回收 | 会话停止/结案取消其全部唤醒 | 集成：回收后该会话无 `pending` 行，投递 0 条 |
+| R5-规矩 | 系统提示与任务模板都含交付后 CI 监视、结束回合前的唤醒源规矩 | 单元：三种系统提示都含规矩锚点；`docs/agent-task-template.md` 含同一规矩 |
+| R5-门禁 | 缺唤醒源时门禁给出可执行提示，有则放行 | 单元：`wake_source_cover` 在有/无任务与唤醒时分别返回 covered / missing |
+| R5b-来源 | 两种来源都落库并在列表可见 | 集成：`user_requested` 与 `agent_decided` 各建一条，列表显示来源 |
+
+## Applicable Harnesses（阶段 2）
+
+- **Spec Harness**：本文件为权威规格；实现只做 R2 / R5 / R5b，R6 留给阶段 3。
+- **Payload Harness**：唤醒提示文本落库、长度上限（4 000 字符）与唤醒文本固定的头部形状。
+- **Compatibility Harness**：新表只 `CREATE TABLE IF NOT EXISTS` 追加；旧库启动自动补齐；阶段 1 的 `background_task_*` 行为与返回结构不变。
+- **Observation Harness**：触发、取消、回收、晚到补发都写 `tracing` 事件，便于事后追溯。
+- **AI Collaboration Harness**：context scope / assumptions / review point / validation result 见 PR body。
+- **Viewport Harness**：本阶段不改界面（"N 个后台任务"标记属阶段 3），无需浏览器截图。
+
+## 测试矩阵（阶段 2）
+
+| 场景 | 类型 | 断言 |
+| --- | --- | --- |
+| 到点触发 | 集成 | 投递 1 条，文本含 `定时唤醒 <id>` 与提示原文 |
+| 未到点不触发 | 集成 | `now < next_at` 时投递 0 条 |
+| 周期推进 | 集成 | 两次推进各 1 条，`fire_count=2`，`next_at` 递增 `every_sec` |
+| 取消 | 集成 | 取消后投递 0 条，`status=cancelled`，重复取消幂等 |
+| 重启继续 | 集成 | 重新打开库后待触发行仍在并能触发 |
+| 晚到只补一次 | 集成 | 错过 3 个周期只投递 1 条，`next_at≈now+every_sec` |
+| 上下限 | 单元 | 59 / 21601 被拒；60 / 21600 通过 |
+| 每会话上限 | 单元/集成 | 第 9 条被拒，错误句含上限与下一步 |
+| 会话回收 | 集成 | 回收后无 `pending` 行、投递 0 条 |
+| 来源标注 | 集成 | `user_requested` / `agent_decided` 各自落库且列表可见 |
+| 系统提示规矩 | 单元 | 三种提示都含交付后监视 CI 与结束回合前唤醒源锚点 |
+| 任务模板规矩 | 单元 | `docs/agent-task-template.md` 含同一规矩 |
+| 唤醒源门禁 | 单元 | 有任务/唤醒 → covered；两者皆无 → missing + 可执行提示 |

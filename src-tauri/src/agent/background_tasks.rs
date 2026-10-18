@@ -168,6 +168,8 @@ pub async fn ensure_schema(pool: &SqlitePool) -> sqlx::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_background_tasks_wake ON background_tasks(wake_state)")
         .execute(pool)
         .await?;
+    // R2：定时唤醒表同属本模块 schema，旧库启动时一并补齐（Compatibility）。
+    ensure_wakeup_schema(pool).await?;
     Ok(())
 }
 
@@ -756,7 +758,7 @@ pub async fn stop(pool: &SqlitePool, session_id: &str, id: &str) -> Result<Backg
         .ok_or_else(|| format!("后台任务 {id} 在停止后消失。"))
 }
 
-/// R3：会话被停止/结案时回收全部后台任务，不再发唤醒。
+/// R3 / R2：会话被停止/结案时回收全部后台任务与定时唤醒，不再发唤醒。
 pub async fn reclaim_session(pool: &SqlitePool, session_id: &str) -> usize {
     if ensure_schema(pool).await.is_err() {
         return 0;
@@ -775,6 +777,8 @@ pub async fn reclaim_session(pool: &SqlitePool, session_id: &str) -> usize {
         }
         reclaimed += 1;
     }
+    // 定时唤醒与后台任务同一回收入口：结案后不该再被叫醒。
+    cancel_session_wakeups(pool, session_id).await;
     reclaimed
 }
 
@@ -813,6 +817,481 @@ pub async fn drain_pending_wakes(pool: &SqlitePool, sink: &dyn WakeSink) -> usiz
         }
     }
     delivered
+}
+
+// ── R2 定时唤醒 ──────────────────────────────────────────────────────────────
+
+/// R2：唤醒间隔下限（60 秒）。
+pub const MIN_WAKEUP_SECS: u64 = 60;
+/// R2：唤醒间隔上限（6 小时）。
+pub const MAX_WAKEUP_SECS: u64 = 6 * 3_600;
+/// R2：每会话待触发唤醒上限。
+pub const MAX_WAKEUPS_PER_SESSION: i64 = 8;
+/// 唤醒提示文本长度上限（Payload Harness）。
+pub const WAKEUP_PROMPT_LIMIT: usize = 4_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WakeupSchedule {
+    pub id: String,
+    pub session_id: String,
+    pub root_turn_id: Option<String>,
+    pub prompt: String,
+    pub source: TaskSource,
+    pub after_sec: Option<u64>,
+    pub every_sec: Option<u64>,
+    pub next_at: i64,
+    pub status: String,
+    pub fire_count: i64,
+    pub created_at: i64,
+    pub last_fired_at: Option<i64>,
+}
+
+impl WakeupSchedule {
+    pub fn is_pending(&self) -> bool {
+        self.status == "pending"
+    }
+
+    /// 唤醒节奏的一行说明（列表与唤醒文本共用）。
+    pub fn cadence(&self) -> String {
+        match self.every_sec {
+            Some(every) => format!("每 {every} 秒一次"),
+            None => format!("一次性（{} 秒后）", self.after_sec.unwrap_or(MIN_WAKEUP_SECS)),
+        }
+    }
+}
+
+pub struct WakeupRequest {
+    pub session_id: String,
+    pub root_turn_id: Option<String>,
+    pub prompt: String,
+    pub source: TaskSource,
+    pub after_sec: Option<u64>,
+    pub every_sec: Option<u64>,
+}
+
+/// R2：`after_sec` / `every_sec` 二选一，且都必须落在 [60s, 6h]。
+pub fn validate_wakeup_delay(
+    after_sec: Option<u64>,
+    every_sec: Option<u64>,
+) -> Result<(Option<u64>, Option<u64>), String> {
+    if after_sec.is_some() && every_sec.is_some() {
+        return Err(
+            "after_sec 与 every_sec 只能二选一：要一次性唤醒用 after_sec，要周期性唤醒用 every_sec。"
+                .to_string(),
+        );
+    }
+    let value = match (after_sec, every_sec) {
+        (Some(value), None) => value,
+        (None, Some(value)) => value,
+        // 上面已拒绝两者同时给出，这里保持穷尽。
+        (Some(_), Some(_)) => unreachable!("after_sec 与 every_sec 已在前面互斥校验"),
+        (None, None) => {
+            return Err(format!(
+                "必须给出唤醒时间：after_sec（{MIN_WAKEUP_SECS} 秒后唤醒一次）或 every_sec\
+                 （每 N 秒唤醒一次），范围 {MIN_WAKEUP_SECS}–{MAX_WAKEUP_SECS} 秒。"
+            ))
+        }
+    };
+    if value < MIN_WAKEUP_SECS {
+        return Err(format!(
+            "唤醒间隔 {value} 秒低于下限 {MIN_WAKEUP_SECS} 秒。请用 ≥{MIN_WAKEUP_SECS} 秒的间隔\
+             （上限 {MAX_WAKEUP_SECS} 秒 / 6 小时）；需要更早看到结果时，用 background_task_start 跑命令，\
+             命令结束会立刻唤醒本会话。"
+        ));
+    }
+    if value > MAX_WAKEUP_SECS {
+        return Err(format!(
+            "唤醒间隔 {value} 秒超过上限 {MAX_WAKEUP_SECS} 秒（6 小时）。请改用更短的间隔多次检查，\
+             或挂一个带截止时间的后台命令。"
+        ));
+    }
+    Ok((after_sec, every_sec))
+}
+
+fn row_to_wakeup(row: &sqlx::sqlite::SqliteRow) -> WakeupSchedule {
+    let source: String = row.get("source");
+    let after_sec: Option<i64> = row.get("after_sec");
+    let every_sec: Option<i64> = row.get("every_sec");
+    WakeupSchedule {
+        id: row.get("id"),
+        session_id: row.get("session_id"),
+        root_turn_id: row.get("root_turn_id"),
+        prompt: row.get("prompt"),
+        source: TaskSource::parse(&source),
+        after_sec: after_sec.map(|value| value.max(0) as u64),
+        every_sec: every_sec.map(|value| value.max(0) as u64),
+        next_at: row.get("next_at"),
+        status: row.get("status"),
+        fire_count: row.get("fire_count"),
+        created_at: row.get("created_at"),
+        last_fired_at: row.get("last_fired_at"),
+    }
+}
+
+async fn ensure_wakeup_schema(pool: &SqlitePool) -> sqlx::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS wakeup_schedules (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            root_turn_id TEXT,
+            prompt TEXT NOT NULL,
+            source TEXT NOT NULL,
+            after_sec INTEGER,
+            every_sec INTEGER,
+            next_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            fire_count INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            last_fired_at INTEGER
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_wakeup_schedules_due ON wakeup_schedules(status, next_at)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_wakeup_schedules_session ON wakeup_schedules(session_id, status)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// R2：创建唤醒。时限、提示文本、上限都在落库前校验，因此被拒时不留任何行。
+pub async fn schedule_wakeup_at(
+    pool: &SqlitePool,
+    request: WakeupRequest,
+    now: i64,
+) -> Result<WakeupSchedule, String> {
+    ensure_wakeup_schema(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let prompt = request.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err(
+            "prompt 不能为空：唤醒时要有一句话告诉本会话醒来做什么（例如「看一下 PR 的 CI 状态」）。"
+                .to_string(),
+        );
+    }
+    if prompt.chars().count() > WAKEUP_PROMPT_LIMIT {
+        return Err(format!(
+            "prompt 过长（{} 字符，上限 {WAKEUP_PROMPT_LIMIT} 字符）。请改成一句可执行的提示。",
+            prompt.chars().count()
+        ));
+    }
+    let (after_sec, every_sec) = validate_wakeup_delay(request.after_sec, request.every_sec)?;
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id = ? AND status = 'pending'",
+    )
+    .bind(&request.session_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if pending >= MAX_WAKEUPS_PER_SESSION {
+        return Err(format!(
+            "本会话已有 {pending} 条定时唤醒，达到每会话上限 {MAX_WAKEUPS_PER_SESSION}。\
+             先用 wakeup_cancel 取消不再需要的唤醒，或等它们触发后再创建。"
+        ));
+    }
+
+    let delay = every_sec.or(after_sec).unwrap_or(MIN_WAKEUP_SECS);
+    let id = format!("wk-{}", uuid::Uuid::new_v4().simple());
+    let next_at = now + delay as i64;
+    sqlx::query(
+        "INSERT INTO wakeup_schedules
+            (id, session_id, root_turn_id, prompt, source, after_sec, every_sec, next_at,
+             status, fire_count, created_at, last_fired_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL)",
+    )
+    .bind(&id)
+    .bind(&request.session_id)
+    .bind(&request.root_turn_id)
+    .bind(&prompt)
+    .bind(request.source.as_str())
+    .bind(after_sec.map(|value| value as i64))
+    .bind(every_sec.map(|value| value as i64))
+    .bind(next_at)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    tracing::info!(
+        wakeup = %id,
+        session = %request.session_id,
+        source = request.source.as_str(),
+        interval = delay,
+        repeating = every_sec.is_some(),
+        "wakeup scheduled"
+    );
+
+    Ok(WakeupSchedule {
+        id,
+        session_id: request.session_id,
+        root_turn_id: request.root_turn_id,
+        prompt,
+        source: request.source,
+        after_sec,
+        every_sec,
+        next_at,
+        status: "pending".to_string(),
+        fire_count: 0,
+        created_at: now,
+        last_fired_at: None,
+    })
+}
+
+pub async fn schedule_wakeup(
+    pool: &SqlitePool,
+    request: WakeupRequest,
+) -> Result<WakeupSchedule, String> {
+    schedule_wakeup_at(pool, request, now_secs()).await
+}
+
+pub async fn list_wakeups(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Vec<WakeupSchedule>, String> {
+    ensure_wakeup_schema(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let rows = sqlx::query(
+        "SELECT * FROM wakeup_schedules WHERE session_id = ? ORDER BY created_at DESC, id",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(rows.iter().map(row_to_wakeup).collect())
+}
+
+pub async fn get_wakeup(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Option<WakeupSchedule>, String> {
+    ensure_wakeup_schema(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let row = sqlx::query("SELECT * FROM wakeup_schedules WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(row.as_ref().map(row_to_wakeup))
+}
+
+/// R2：取消一条唤醒。幂等——已取消/已触发的行原样返回，不报错。
+pub async fn cancel_wakeup(
+    pool: &SqlitePool,
+    session_id: &str,
+    id: &str,
+) -> Result<WakeupSchedule, String> {
+    let wakeup = get_wakeup(pool, id)
+        .await?
+        .ok_or_else(|| format!("定时唤醒 {id} 不存在。"))?;
+    if wakeup.session_id != session_id {
+        return Err(format!("定时唤醒 {id} 不属于本会话，不能从本会话取消。"));
+    }
+    if !wakeup.is_pending() {
+        return Ok(wakeup);
+    }
+    sqlx::query("UPDATE wakeup_schedules SET status = 'cancelled' WHERE id = ? AND status = 'pending'")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    tracing::info!(wakeup = %id, session = %session_id, "wakeup cancelled");
+    get_wakeup(pool, id)
+        .await?
+        .ok_or_else(|| format!("定时唤醒 {id} 在取消后消失。"))
+}
+
+/// R2：会话停止/结案时取消其全部待触发唤醒（与后台任务回收同一入口）。
+pub async fn cancel_session_wakeups(pool: &SqlitePool, session_id: &str) -> usize {
+    if ensure_wakeup_schema(pool).await.is_err() {
+        return 0;
+    }
+    let result = sqlx::query(
+        "UPDATE wakeup_schedules SET status = 'cancelled'
+          WHERE session_id = ? AND status = 'pending'",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await;
+    match result {
+        Ok(done) => {
+            let cancelled = done.rows_affected() as usize;
+            if cancelled > 0 {
+                tracing::info!(session = %session_id, cancelled, "session wakeups cancelled");
+            }
+            cancelled
+        }
+        Err(error) => {
+            tracing::warn!(%error, session = %session_id, "session wakeups cancel failed");
+            0
+        }
+    }
+}
+
+/// R2 / D10：唤醒文本固定形状——id + 提示原文 + 节奏（周期唤醒带序号）。
+pub fn wakeup_text(wakeup: &WakeupSchedule, occurrence: i64, late: bool) -> String {
+    let mut text = format!(
+        "定时唤醒 {}：{}\n节奏：{}",
+        wakeup.id,
+        wakeup.prompt,
+        wakeup.cadence()
+    );
+    if wakeup.every_sec.is_some() {
+        text.push_str(&format!("（第 {occurrence} 次）"));
+    }
+    if late {
+        text.push_str("\n计划时间已过（应用重启后补发），之后按原周期继续。");
+    }
+    text
+}
+
+/// R2 / D10：投递所有到点唤醒。
+///
+/// `now` 注入以便 headless 测试精确推进时间；生产由运行时循环传 `now_secs()`。
+/// 投递失败（会话正在跑回合）保持 `pending`，下一轮重试；推进用
+/// `next_at` 做比较并交换，因此并发/重启都不会重复投递同一次到点。
+pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i64) -> usize {
+    if ensure_wakeup_schema(pool).await.is_err() {
+        return 0;
+    }
+    let rows = sqlx::query(
+        "SELECT * FROM wakeup_schedules WHERE status = 'pending' AND next_at <= ?
+          ORDER BY next_at, id LIMIT 32",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut delivered = 0;
+    for row in rows {
+        let wakeup = row_to_wakeup(&row);
+        // 关闭期间错过的周期只补一次：只要晚于一个周期就算迟到，文本里说明。
+        let grace = wakeup.every_sec.unwrap_or(1).max(1) as i64;
+        let late = now - wakeup.next_at >= grace;
+        let text = wakeup_text(&wakeup, wakeup.fire_count + 1, late);
+        if !sink.enqueue(wakeup.session_id.clone(), text).await {
+            continue;
+        }
+        let advanced = match wakeup.every_sec {
+            Some(every) => sqlx::query(
+                "UPDATE wakeup_schedules
+                    SET next_at = ?, fire_count = fire_count + 1, last_fired_at = ?
+                  WHERE id = ? AND status = 'pending' AND next_at = ?",
+            )
+            .bind(now + every as i64)
+            .bind(now)
+            .bind(&wakeup.id)
+            .bind(wakeup.next_at)
+            .execute(pool)
+            .await
+            .map(|done| done.rows_affected() == 1),
+            None => sqlx::query(
+                "UPDATE wakeup_schedules
+                    SET status = 'done', fire_count = fire_count + 1, last_fired_at = ?
+                  WHERE id = ? AND status = 'pending' AND next_at = ?",
+            )
+            .bind(now)
+            .bind(&wakeup.id)
+            .bind(wakeup.next_at)
+            .execute(pool)
+            .await
+            .map(|done| done.rows_affected() == 1),
+        };
+        if matches!(advanced, Ok(true)) {
+            delivered += 1;
+            tracing::info!(
+                wakeup = %wakeup.id,
+                session = %wakeup.session_id,
+                occurrence = wakeup.fire_count + 1,
+                late,
+                "wakeup fired"
+            );
+        }
+    }
+    delivered
+}
+
+/// 生产入口：用当前时间投递到点唤醒。
+pub async fn drain_due_wakeups(pool: &SqlitePool, sink: &dyn WakeSink) -> usize {
+    drain_due_wakeups_at(pool, sink, now_secs()).await
+}
+
+// ── R5：结束回合前的唤醒源门禁查询 ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeSourceCover {
+    pub running_tasks: usize,
+    pub pending_wakeups: usize,
+}
+
+impl WakeSourceCover {
+    pub fn is_covered(&self) -> bool {
+        self.running_tasks + self.pending_wakeups > 0
+    }
+
+    /// 缺唤醒源时给 agent 的一句可执行提示（不针对用户、不进对话）。
+    pub fn missing_hint(&self) -> Option<String> {
+        if self.is_covered() {
+            return None;
+        }
+        Some(
+            "结束这个等待前先挂一个唤醒源：background_task_start（等待的命令结束时唤醒本会话）\
+             或 schedule_wakeup（到点唤醒）。没有唤醒源就没人会把你叫回来继续收尾。"
+                .to_string(),
+        )
+    }
+}
+
+/// R5 / D11：本会话当前的唤醒源（运行中的后台任务 + 待触发的定时唤醒）。
+pub async fn wake_source_cover(pool: &SqlitePool, session_id: &str) -> WakeSourceCover {
+    if ensure_schema(pool).await.is_err() {
+        return WakeSourceCover {
+            running_tasks: 0,
+            pending_wakeups: 0,
+        };
+    }
+    let running_tasks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM background_tasks WHERE session_id = ? AND status = 'running'",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let pending_wakeups: i64 = if ensure_wakeup_schema(pool).await.is_ok() {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id = ? AND status = 'pending'",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+    } else {
+        0
+    };
+    WakeSourceCover {
+        running_tasks: running_tasks.max(0) as usize,
+        pending_wakeups: pending_wakeups.max(0) as usize,
+    }
+}
+
+/// R5：只约束仍有外部等待的回合，不改变 objective 或交付状态。
+pub async fn external_wait_completion_hint(
+    pool: &SqlitePool,
+    session_id: &str,
+    external_wait_pending: bool,
+) -> Option<String> {
+    if !external_wait_pending {
+        return None;
+    }
+    wake_source_cover(pool, session_id).await.missing_hint()
 }
 
 // ── 应用装配（非测试构建） ────────────────────────────────────────────────────
@@ -856,7 +1335,12 @@ pub fn start_runtime(app: tauri::AppHandle) {
             if delivered > 0 {
                 tracing::info!(delivered, "background task wakes enqueued");
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // R2：每秒检查一次到点唤醒（重启后错过的在启动首轮补发一次）。
+            let fired = drain_due_wakeups(&pool, &sink).await;
+            if fired > 0 {
+                tracing::info!(fired, "scheduled wakeups enqueued");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 }
@@ -1347,6 +1831,314 @@ mod tests {
 
     async fn reclaimed_count(pool: &SqlitePool, session: &str) -> usize {
         reclaim_session(pool, session).await
+    }
+
+    // ── 阶段 2：R2 定时唤醒 ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn external_wait_requires_a_session_owned_wake_source() {
+        let pool = memory_pool().await;
+        assert!(external_wait_completion_hint(&pool, "s1", false).await.is_none());
+        assert!(external_wait_completion_hint(&pool, "s1", true).await.unwrap().contains("schedule_wakeup"));
+        schedule_wakeup_at(&pool, wakeup_request("s2", "other", Some(180)), 1000).await.unwrap();
+        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_some());
+        schedule_wakeup_at(&pool, wakeup_request("s1", "check CI", Some(180)), 1000).await.unwrap();
+        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_none());
+        reclaim_session(&pool, "s1").await;
+        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_some());
+    }
+
+    fn wakeup_request(session: &str, prompt: &str, every_sec: Option<u64>) -> WakeupRequest {
+        WakeupRequest {
+            session_id: session.to_string(),
+            root_turn_id: Some("turn-1".to_string()),
+            prompt: prompt.to_string(),
+            source: TaskSource::AgentDecided,
+            after_sec: None,
+            every_sec,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_due_wakeup_wakes_the_session_and_is_not_fired_early() {
+        let pool = memory_pool().await;
+        // R2 规格：after_sec / every_sec 二选一必填；一次性唤醒用 after_sec。
+        let request = WakeupRequest {
+            after_sec: Some(MIN_WAKEUP_SECS),
+            ..wakeup_request("s1", "看一下 CI 状态", None)
+        };
+        let schedule = schedule_wakeup_at(&pool, request, 1_000).await.unwrap();
+        assert_eq!(schedule.next_at, 1_060, "one-shot fires after its delay");
+
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 1_059).await, 0);
+        assert!(recorder.take().is_empty());
+
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 1_060).await, 1);
+        let delivered = recorder.take();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, "s1");
+        assert!(delivered[0].1.contains("定时唤醒"), "{}", delivered[0].1);
+        assert!(delivered[0].1.contains(&schedule.id), "{}", delivered[0].1);
+        assert!(delivered[0].1.contains("看一下 CI 状态"), "{}", delivered[0].1);
+
+        let stored = list_wakeups(&pool, "s1").await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].status, "done");
+        assert_eq!(stored[0].fire_count, 1);
+        // 一次性唤醒不会二次触发。
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 9_999).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_repeating_wakeup_advances_its_schedule_and_fires_again() {
+        let pool = memory_pool().await;
+        let schedule = schedule_wakeup_at(
+            &pool,
+            wakeup_request("s1", "每小时检查线上状态", Some(60)),
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(schedule.every_sec, Some(60));
+        assert_eq!(schedule.next_at, 1_060);
+
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 1_060).await, 1);
+        let first = list_wakeups(&pool, "s1").await.unwrap();
+        assert_eq!(first[0].status, "pending");
+        assert_eq!(first[0].fire_count, 1);
+        assert_eq!(first[0].next_at, 1_120);
+        assert_eq!(first[0].last_fired_at, Some(1_060));
+
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 1_119).await, 0);
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 1_120).await, 1);
+        let delivered = recorder.take();
+        assert_eq!(delivered.len(), 2);
+        assert!(delivered[1].1.contains("第 2 次"), "{}", delivered[1].1);
+        let second = list_wakeups(&pool, "s1").await.unwrap();
+        assert_eq!(second[0].fire_count, 2);
+        assert_eq!(second[0].next_at, 1_180);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_wakeup_never_fires_and_cancel_is_idempotent() {
+        let pool = memory_pool().await;
+        let schedule =
+            schedule_wakeup_at(&pool, wakeup_request("s1", "不该触发", Some(60)), 1_000)
+                .await
+                .unwrap();
+        let cancelled = cancel_wakeup(&pool, "s1", &schedule.id).await.unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        // 重复取消不报错、状态不变。
+        assert_eq!(
+            cancel_wakeup(&pool, "s1", &schedule.id).await.unwrap().status,
+            "cancelled"
+        );
+
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 5_000).await, 0);
+        assert!(recorder.take().is_empty());
+
+        // 别的会话不能取消本会话的唤醒。
+        let error = cancel_wakeup(&pool, "intruder", &schedule.id)
+            .await
+            .unwrap_err();
+        assert!(error.contains("不属于本会话"), "{error}");
+    }
+
+    async fn file_pool(dir: &Path) -> SqlitePool {
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.join("db.sqlite").to_string_lossy()
+        );
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        ensure_schema(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn a_wakeup_survives_a_restart_and_catches_up_only_once() {
+        let dir = scratch_dir("wakeup-restart");
+        let pool = file_pool(&dir).await;
+        let schedule = schedule_wakeup_at(
+            &pool,
+            wakeup_request("s1", "重启后继续巡检", Some(300)),
+            1_000,
+        )
+        .await
+        .unwrap();
+        // 应用关闭：连接关掉。
+        pool.close().await;
+
+        // 重启：重新打开同一个库，计划仍在。
+        let reopened = file_pool(&dir).await;
+        let stored = list_wakeups(&reopened, "s1").await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, schedule.id);
+        assert_eq!(stored[0].status, "pending");
+
+        // 关闭期间错过 3 个周期：启动后只补一次，然后按周期继续。
+        let late = 1_000 + 300 * 3;
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&reopened, sink(&recorder), late).await, 1);
+        let delivered = recorder.take();
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            delivered[0].1.contains("补发"),
+            "catch-up wake must say the plan was missed: {}",
+            delivered[0].1
+        );
+        let after = list_wakeups(&reopened, "s1").await.unwrap();
+        assert_eq!(after[0].fire_count, 1, "a missed schedule catches up once");
+        assert_eq!(after[0].next_at, late + 300);
+
+        // 同一次到点不会被重复投递（幂等）。
+        assert_eq!(drain_due_wakeups_at(&reopened, sink(&recorder), late).await, 0);
+        reopened.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wakeup_delays_outside_the_bounds_are_refused_with_a_readable_error() {
+        assert_eq!(MIN_WAKEUP_SECS, 60);
+        assert_eq!(MAX_WAKEUP_SECS, 21_600);
+        for value in [MIN_WAKEUP_SECS, MAX_WAKEUP_SECS] {
+            validate_wakeup_delay(None, Some(value)).unwrap();
+            validate_wakeup_delay(Some(value), None).unwrap();
+        }
+        let too_soon = validate_wakeup_delay(None, Some(MIN_WAKEUP_SECS - 1)).unwrap_err();
+        assert!(too_soon.contains("下限"), "{too_soon}");
+        assert!(too_soon.contains("60"), "{too_soon}");
+        let too_late = validate_wakeup_delay(Some(MAX_WAKEUP_SECS + 1), None).unwrap_err();
+        assert!(too_late.contains("上限"), "{too_late}");
+        assert!(too_late.contains("6 小时"), "{too_late}");
+        assert!(validate_wakeup_delay(None, Some(0)).is_err());
+        assert!(validate_wakeup_delay(None, None).is_err());
+        assert!(validate_wakeup_delay(Some(600), Some(600)).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_wakeup_cap_refuses_the_ninth_with_a_readable_limit() {
+        let pool = memory_pool().await;
+        for _ in 0..MAX_WAKEUPS_PER_SESSION {
+            schedule_wakeup_at(&pool, wakeup_request("s1", "巡检", Some(60)), 1_000)
+                .await
+                .unwrap();
+        }
+        let error = schedule_wakeup_at(&pool, wakeup_request("s1", "巡检", Some(60)), 1_000)
+            .await
+            .unwrap_err();
+        assert!(error.contains("上限"), "{error}");
+        assert!(
+            error.contains(&MAX_WAKEUPS_PER_SESSION.to_string()),
+            "{error}"
+        );
+        assert!(error.contains("wakeup_cancel"), "{error}");
+        assert_eq!(
+            list_wakeups(&pool, "s1").await.unwrap().len() as i64,
+            MAX_WAKEUPS_PER_SESSION
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaiming_a_session_cancels_its_wakeups_and_keeps_other_sessions() {
+        let pool = memory_pool().await;
+        schedule_wakeup_at(&pool, wakeup_request("s1", "巡检一", Some(60)), 1_000)
+            .await
+            .unwrap();
+        schedule_wakeup_at(&pool, wakeup_request("s1", "巡检二", Some(60)), 1_000)
+            .await
+            .unwrap();
+        schedule_wakeup_at(&pool, wakeup_request("s2", "别人还在用", Some(60)), 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(cancel_session_wakeups(&pool, "s1").await, 2);
+        assert!(list_wakeups(&pool, "s1")
+            .await
+            .unwrap()
+            .iter()
+            .all(|wakeup| wakeup.status == "cancelled"));
+
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 5_000).await, 1);
+        let delivered = recorder.take();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, "s2");
+    }
+
+    #[tokio::test]
+    async fn both_task_sources_are_recorded_and_visible() {
+        let pool = memory_pool().await;
+        let dir = scratch_dir("sources");
+        let user_asked = start(
+            &pool,
+            StartRequest {
+                source: TaskSource::UserRequested,
+                ..request("s1", &dir, "sleep 60", None)
+            },
+        )
+        .await
+        .unwrap();
+        let agent_chose = start(&pool, request("s1", &dir, "sleep 60", None))
+            .await
+            .unwrap();
+        let tasks = list_session(&pool, "s1").await.unwrap();
+        let by_id = |id: &str| tasks.iter().find(|task| task.id == id).cloned().unwrap();
+        assert_eq!(
+            by_id(&user_asked.id).source,
+            TaskSource::UserRequested,
+            "a user-requested task records its source"
+        );
+        assert_eq!(by_id(&agent_chose.id).source, TaskSource::AgentDecided);
+
+        let mut wakeup = wakeup_request("s1", "盯着 PR，合并了告诉我", Some(60));
+        wakeup.source = TaskSource::UserRequested;
+        let scheduled = schedule_wakeup_at(&pool, wakeup, 1_000).await.unwrap();
+        assert_eq!(scheduled.source, TaskSource::UserRequested);
+
+        reclaim_session(&pool, "s1").await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_completion_gate_sees_a_running_task_or_a_pending_wakeup_as_a_wake_source() {
+        let pool = memory_pool().await;
+        let dir = scratch_dir("cover");
+
+        let empty = wake_source_cover(&pool, "s1").await;
+        assert!(!empty.is_covered());
+        let hint = empty.missing_hint().expect("missing hint");
+        assert!(hint.contains("background_task_start"), "{hint}");
+        assert!(hint.contains("schedule_wakeup"), "{hint}");
+
+        let started = start(&pool, request("s1", &dir, "sleep 60", None))
+            .await
+            .unwrap();
+        let with_task = wake_source_cover(&pool, "s1").await;
+        assert!(with_task.is_covered());
+        assert_eq!(with_task.running_tasks, 1);
+        assert!(with_task.missing_hint().is_none());
+
+        stop(&pool, "s1", &started.id).await.unwrap();
+        assert!(!wake_source_cover(&pool, "s1").await.is_covered());
+
+        schedule_wakeup_at(&pool, wakeup_request("s1", "巡检", Some(60)), 1_000)
+            .await
+            .unwrap();
+        let with_wakeup = wake_source_cover(&pool, "s1").await;
+        assert!(with_wakeup.is_covered());
+        assert_eq!(with_wakeup.pending_wakeups, 1);
+
+        // 别的会话的唤醒不算本会话的唤醒源。
+        assert!(!wake_source_cover(&pool, "s2").await.is_covered());
+        cancel_session_wakeups(&pool, "s1").await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
