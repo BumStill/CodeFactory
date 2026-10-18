@@ -2,6 +2,7 @@
 use crate::util::no_window::NoWindow;
 pub mod anthropic_client;
 pub mod attachments;
+pub mod background_tasks;
 pub(crate) mod auth_recovery;
 pub(crate) mod browser_recovery;
 pub mod checkpoint;
