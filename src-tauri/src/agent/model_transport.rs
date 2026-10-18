@@ -519,7 +519,7 @@ impl RoutedDesktopModelTransport {
     async fn resolve_provider_owner(
         &self,
     ) -> std::result::Result<Option<ProviderOwnerPermit>, TransportError> {
-        if self.anonymous {
+        if self.anonymous || super::thin::is_thin(&self.db, &self.session_id).await {
             return Ok(None);
         }
         let Some(root_turn_id) = self.root_turn_id.as_deref() else {

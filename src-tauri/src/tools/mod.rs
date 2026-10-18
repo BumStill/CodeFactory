@@ -5,6 +5,7 @@ pub mod wakeup;
 pub mod browser_session;
 pub mod delegate_tasks;
 pub mod delivery;
+mod delivery_thin;
 pub mod docx;
 pub mod edit;
 pub mod file_lock;

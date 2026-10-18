@@ -207,6 +207,14 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         return Ok(tool_output_for_outcome(&outcome));
     }
 
+    if let (Some(db), Some(session_id)) = (&ctx.db, &ctx.session_id) {
+        if crate::agent::thin::is_thin(db, session_id).await {
+            let ceiling = requested_ceiling.map(|requested| settings.delivery_ceiling.clamp_request(requested))
+                .unwrap_or(settings.delivery_ceiling);
+            return super::delivery_thin::execute(&args, ctx, ceiling, &settings.delivery_exclude_globs).await;
+        }
+    }
+
     let mut durable = match prepare_durable_run(
         &args,
         ctx,
