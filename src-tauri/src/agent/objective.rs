@@ -7750,6 +7750,16 @@ fn ci_failure_line(check: &CiCheckState) -> String {
 
 /// M104/R2+R3: the wake input for one CI outcome. Every arm is a decision the
 /// session can act on; none of them is "assume it is still running".
+/// M115/R3: the queue (or GitHub's update-branch) rewrote the PR head into a
+/// merge commit the session's clone may never have fetched, so a fix committed
+/// on the old head cannot be pushed. The wake has to name that head and tell
+/// the session to start from it instead of force-pushing over it.
+pub fn advanced_head_rebase_note(head_sha: &str) -> String {
+    format!(
+        "注意：PR 的 head 已被合并队列/update-branch 改写为合并提交 {head_sha}（父提交包含你上次推送的 head 与主干）。修复前先 `git fetch origin`，把该 head 合入本地分支（`git merge {head_sha}`，或把本地修复 rebase 到它之上），再提交并推送；直接在旧 head 上提交会被远端拒绝，force-push 会覆盖队列同步。"
+    )
+}
+
 pub fn ci_outcome_wake_prompt(reference: &str, outcome: &CiOutcome) -> String {
     match outcome {
         CiOutcome::StillRunning => format!(
