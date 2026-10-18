@@ -119,6 +119,17 @@
 - **Viewport Harness**：阶段 1 不改界面（界面标记属阶段 3 R6），无需浏览器截图；将在阶段 3 PR 内补。
 - **AI Collaboration Harness**：context scope、assumptions、review point、validation result 见 PR body。
 
+## Implementation Notes：阶段 1 Windows 续做（2026-10-18）
+
+取代 #724，范围仍为 R1/R3/R4/R7，不实现阶段 2/3。
+
+- 原 Windows CI job 117571544611：进程树测试在 PowerShell 中执行 POSIX `sleep 60 & echo $!`，未产生 child.pid；对账测试启动 `/bin/sh`，Windows 返回 OS error 3。两者均为真实失败，不能用 cfg 排除测试。
+- 平台 fixture 必须使用与生产相同的 shell_invocation；Windows 用 Start-Process 派生真实子进程并以 ASCII 写 pid，Unix 对路径做 shell 引号转义，覆盖含空格与单引号的路径。
+- Windows 继续使用 `taskkill /PID <pid> /T /F` 回收整棵进程树；测试必须断言父子进程实际退出，而非仅检查命令成功。
+- Windows 进程身份改用 OpenProcess + GetProcessTimes 获取创建 FILETIME，避免每次额外启动 PowerShell、区域格式和快速退出竞态；探活用进程句柄查询退出状态，不解析本地化 tasklist。不能取得身份时仍 fail closed 为 lost。
+- 对账 fixture 使用真实运行过且 wait 回收的本机 shell，不用虚构不存在的固定 PID。
+- 真机验收由编排方发版安装后完成：后台命令完成唤醒、停止父子进程、应用重启三分类与审计记录；会话内以真实子进程集成测试与 Windows CI 提供证据。
+
 ## 测试矩阵（阶段 1）
 
 | 场景 | 类型 | 断言 |

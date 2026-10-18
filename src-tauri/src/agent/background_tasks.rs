@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
+use crate::util::no_window::NoWindow;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 
@@ -385,6 +386,7 @@ fn shell_invocation(command: &str) -> (String, Vec<String>) {
 #[cfg(target_os = "macos")]
 pub fn process_start_marker(pid: u32) -> Option<String> {
     let output = std::process::Command::new("/bin/ps")
+        .no_window()
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .output()
         .ok()?;
@@ -404,20 +406,37 @@ pub fn process_start_marker(pid: u32) -> Option<String> {
 }
 
 #[cfg(windows)]
-pub fn process_start_marker(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("(Get-Process -Id {pid}).StartTime.ToUniversalTime().Ticks"),
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+fn windows_process_identity(pid: u32) -> Option<(String, bool)> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FILETIME},
+        System::Threading::{GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    // SAFETY: 只以查询权限打开进程；所有输出指针均为有效局部变量，句柄在返回前关闭。
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exited: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let mut code = 0;
+        let times_ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        let exit_ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        if !times_ok || !exit_ok {
+            return None;
+        }
+        let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        // .NET DateTime ticks（原持久化格式）与 FILETIME 的纪元差，保留旧记录兼容性。
+        Some(((ticks + 504_911_232_000_000_000).to_string(), code == 259))
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(windows)]
+pub fn process_start_marker(pid: u32) -> Option<String> {
+    windows_process_identity(pid).and_then(|(marker, live)| live.then_some(marker))
 }
 
 #[cfg(unix)]
@@ -428,13 +447,7 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output();
-    match output {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()),
-        Err(_) => false,
-    }
+    windows_process_identity(pid).is_some_and(|(_, live)| live)
 }
 
 #[cfg(unix)]
@@ -455,6 +468,7 @@ fn process_group_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn signal_process_group(pid: u32, _signal: i32) {
     let _ = std::process::Command::new("taskkill")
+        .no_window()
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output();
 }
@@ -542,7 +556,7 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
     .map_err(|error| error.to_string())?;
 
     let (program, args) = shell_invocation(&request.command);
-    let mut command = tokio::process::Command::new(&program);
+    let mut command = tokio::process::Command::new(&program).no_window();
     command
         .args(&args)
         .current_dir(&request.cwd)
@@ -1076,17 +1090,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 使用各平台真实 shell，并覆盖含空格、单引号的路径。
+    fn grandchild_command(pid_file: &Path) -> String {
+        let path = pid_file.to_string_lossy();
+        #[cfg(unix)]
+        {
+            format!("sleep 60 & echo $! > '{}'; wait", path.replace('\'', "'\"'\"'"))
+        }
+        #[cfg(windows)]
+        {
+            format!(
+                "$p = Start-Process -FilePath powershell -PassThru -ArgumentList '-NoProfile','-Command','Start-Sleep 60'; Set-Content -LiteralPath '{}' -Value $p.Id -Encoding Ascii; Wait-Process -Id $p.Id",
+                path.replace('\'', "''")
+            )
+        }
+    }
+
     #[tokio::test]
     async fn stop_kills_the_whole_process_tree_not_just_the_shell() {
         let pool = memory_pool().await;
-        let dir = scratch_dir("tree");
+        let dir = scratch_dir("tree space's");
         let child_pid_path = dir.join("child.pid");
         let started = start(
             &pool,
             request(
                 "s1",
                 &dir,
-                &format!("sleep 60 & echo $! > {}; wait", child_pid_path.display()),
+                &grandchild_command(&child_pid_path),
                 None,
             ),
         )
@@ -1210,8 +1240,10 @@ mod tests {
 
         // 2) 已结束：一个真实存在过、现在已退出的进程 pid。
         let dead_pid = {
-            let mut child = std::process::Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
+            let (program, args) = shell_invocation("exit 0");
+            let mut child = std::process::Command::new(program)
+                .no_window()
+                .args(args)
                 .spawn()
                 .unwrap();
             let pid = child.id();
