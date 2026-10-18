@@ -514,9 +514,11 @@
         "side_effects": ["不覆盖预存改动，不创建重复 PR 或重复发布"],
         "delivery": ["测试、PR、required CI、merge、artifact identity 缺一不可 completed"]
       },
-      "execution": {"nightly": "local fake-forge end-to-end", "manual_canary": "real governed delivery without external mutation by default"},
-      "automation_status": "designed",
-      "remaining_gaps": ["尚无任何自动化：nightly 的 local fake-forge 端到端与 manual_canary 均未实现", "追加约束后的完整交付链（PR→CI→merge→release）未自动验证", "L3/L4 证据全缺"]
+      "execution": {"pull_request": "local fake-forge integration", "nightly": "local fake-forge end-to-end via existing full Rust workspace matrix", "manual_canary": "real governed delivery without external mutation by default"},
+      "automation_status": "partially_implemented",
+      "automated_by": ["rust:e2e004_steer_reconnect_repair_resumes_same_durable_run", "rust:e2e004_ci_failure_recovers_same_pr_and_artifact"],
+      "pull_request_gate": {"status": "implemented", "required_targets": ["rust:e2e004_steer_reconnect_repair_resumes_same_durable_run", "rust:e2e004_ci_failure_recovers_same_pr_and_artifact"], "remaining_gaps": []},
+      "remaining_gaps": ["L3 真实桌面同会话中追加约束与方向纠正的可见顺序、provider 重连与完整交付 UI", "L4 exact release 安装版 manual_canary 由编排方发版后完成；合成 fixture 不代表真实发布验收", "L2 合成 provider/tool adapter 覆盖真实 agent-loop、ObjectiveStore 与 DeliveryRun API；不替代桌面生产工具准入及真实安装版行为"]
     },
     {
       "id": "E2E-005",

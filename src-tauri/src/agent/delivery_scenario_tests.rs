@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::util::process_tree::{isolate_std_process_tree, StdProcessTree};
+use crate::util::no_window::NoWindow;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
@@ -600,6 +601,136 @@ fn assert_blocked(outcome: &DeliveryOutcome) {
         .any(|s| s.step == "live" && s.status == "ok"));
 }
 
+#[path = "delivery_scenario_repair.rs"]
+mod repair;
+
+#[path = "delivery_scenario_socket.rs"]
+mod socket;
+
+async fn slice2_prepare(world: &Path) -> serde_json::Value {
+    let steers = vec!["accept: double(7) = 14", "correct: multiply, do not add"];
+    // A real local HTTP disconnect, then the production bounded model retry.
+    // The server accepts only loopback requests and is joined before delivery.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+    let expected = steers.clone();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut requests = 0;
+        while requests < 2 {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    socket::configure_provider_socket(&socket).unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buf = [0; 4096];
+                    loop {
+                        let n = socket.read(&mut buf).unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                            let size: usize = headers.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap();
+                            if bytes.len() >= end + 4 + size { break; }
+                        }
+                    }
+                    let request = String::from_utf8(bytes).unwrap();
+                    for steer in &expected { assert!(request.contains(steer)); }
+                    requests += 1;
+                    if requests == 1 { continue; }
+                    let body = r#"{"expression":"value * 2"}"#;
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "provider retry never arrived");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("synthetic provider: {e}"),
+            }
+        }
+        requests
+    });
+    let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap();
+    let response = crate::http_util::send_with_retry("synthetic provider reconnect", || client.post(&url).json(&json!({"messages": steers}))).await.unwrap();
+    let patch: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(patch["expression"], "value * 2");
+    let requests = server.join().unwrap();
+    let (steers, exits) = repair::repair_in_loop(world, patch["expression"].as_str().unwrap()).await;
+    let trace = json!({"steers": steers, "provider_requests": requests, "verification_exits": exits});
+    std::fs::write(world.join("slice2-trace.json"), serde_json::to_vec(&trace).unwrap()).unwrap();
+    trace
+}
+
+async fn slice2_run(world: &Path, forge: &FakeForge, phase: &str) -> (DeliveryOutcome, serde_json::Value) {
+    use crate::agent::delivery_run::*;
+    let db = SqlitePoolOptions::new().max_connections(1).connect_with(SqliteConnectOptions::new().filename(world.join("durable.sqlite")).create_if_missing(true)).await.unwrap();
+    ensure_schema(&db).await.unwrap();
+    crate::agent::objective::ensure_schema(&db).await.unwrap();
+    let objectives = crate::agent::objective::ObjectiveStore::new(db.clone());
+    if phase == "slice2-failure" {
+        objectives.create(crate::agent::objective::CreateObjective {
+            id: "synthetic-objective".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
+            session_id: Some("synthetic-session".into()), root_turn_id: Some("synthetic-root".into()),
+            domain: crate::agent::objective::RecoveryDomain::Delivery,
+            requested_acceptance: "implement double, verify, and deliver once".into(), created_surface: "synthetic-fixture".into(),
+        }).await.unwrap();
+        slice2_prepare(world).await;
+    }
+    let objective = objectives.get("synthetic-objective").await.unwrap().unwrap();
+    assert_eq!(objective.session_id.as_deref(), Some("synthetic-session"));
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(world.join("slice2-trace.json")).unwrap()).unwrap();
+    let source = std::fs::read(world.join("delivery-worktree/app.rs")).unwrap();
+    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&source));
+    let head = git(&world.join("delivery-worktree"), &["rev-parse", "HEAD"]).unwrap();
+    let original_head = if phase == "slice2-failure" {
+        std::fs::write(world.join("slice2-original-head"), &head).unwrap(); head
+    } else { std::fs::read_to_string(world.join("slice2-original-head")).unwrap() };
+    let expected_head = if phase == "slice2-failure" { original_head } else {
+        sqlx::query_scalar::<_, String>("SELECT expected_head_sha FROM delivery_runs WHERE id='synthetic-run'").fetch_one(&db).await.unwrap()
+    };
+    let run = NewDeliveryRun {
+        id: "synthetic-run".into(), objective_id: "synthetic-objective".into(), run_kind: "deliver_changes".into(),
+        session_id: Some("synthetic-session".into()), root_turn_id: Some("synthetic-root".into()), task_segment_id: None, task_id: None,
+        workspace_path: world.join("delivery-worktree").to_string_lossy().into_owned(), worktree_identity: "synthetic-worktree".into(), repo_identity: "synthetic-repo".into(),
+        base_branch: "main".into(), head_branch: "feat/synthetic".into(), change_set_digest: digest.clone(), expected_head_sha: expected_head,
+        canonical_pr_number: None, canonical_pr_url: None, canonical_head_sha: None,
+        requested_ceiling: "through_release".into(), reached_ceiling: "local".into(), stage: "delivery".into(), status: "waiting".into(),
+        wait_class: Some("wait_retryable".into()), next_action: Some("observe_ci".into()), next_action_authorized: true, autonomous_completion: true,
+    };
+    let owner = ProcessIdentity::new(format!("worker-{}", std::process::id()), "synthetic", "synthetic");
+    let epoch = create_delivery_run(&db, &run, &owner, 100, 90_000).await.unwrap();
+    std::fs::write(world.join("ci-state"), if phase == "slice2-failure" { "failure" } else { "success" }).unwrap();
+    let outcome = run_delivery(world, forge).await;
+    assert!(mark_delivery_claim_reconciled(&db, &run.id, &owner, epoch, 101).await.unwrap());
+    let next_head = outcome.commit_sha.clone().unwrap();
+    let revision = if next_head != run.expected_head_sha {
+        let mut revision = DeliveryIdentityRevision {
+            receipt_id: String::new(), objective_id: run.objective_id.clone(), repo_identity: run.repo_identity.clone(),
+            worktree_identity: run.worktree_identity.clone(), previous_expected_head_sha: run.expected_head_sha.clone(),
+            previous_change_set_digest: digest.clone(), next_expected_head_sha: next_head.clone(), next_change_set_digest: digest.clone(),
+        };
+        revision.receipt_id = delivery_identity_revision_receipt_id(&run.id, &revision);
+        Some(revision)
+    } else { None };
+    record_delivery_observation(&db, &run.id, &owner, epoch, &DeliveryObservation {
+        head_branch: run.head_branch.clone(), stage: outcome.stage.clone(), status: "waiting".into(),
+        wait_class: Some("wait_retryable".into()), next_action: Some("observe_ci".into()),
+        reached_ceiling: outcome.reached_state.clone(), expected_head_sha: next_head,
+        canonical_pr_number: outcome.pr_number.map(|n| n as i64), canonical_pr_url: outcome.pr_url.clone(),
+        canonical_head_sha: outcome.commit_sha.clone(), failure_signature: None, core_input: None, identity_revision: revision,
+    }, 105, 90_000).await.unwrap();
+    assert!(release_delivery_lease(&db, &run.id, &owner, epoch, 110, "invocation_return").await.unwrap());
+    let (objective, run_id, stored_digest, pr, url, lease): (String, String, String, Option<i64>, Option<String>, Option<String>) = sqlx::query_as("SELECT objective_id, id, change_set_digest, canonical_pr_number, canonical_pr_url, lease_owner FROM delivery_runs").fetch_one(&db).await.unwrap();
+    assert_eq!(stored_digest, digest);
+    let mut evidence = trace;
+    for (key, value) in [("objective_id", json!(objective)), ("run_id", json!(run_id)), ("change_set_digest", json!(stored_digest)), ("canonical_pr_number", json!(pr)), ("canonical_pr_url", json!(url)), ("lease_owner", json!(lease))] {
+        evidence[key] = value;
+    }
+    db.close().await;
+    (outcome, evidence)
+}
+
 #[test]
 #[ignore = "only the scoped supervisor may run this with a temporary world"]
 fn delivery_fake_forge_worker() {
@@ -662,8 +793,12 @@ fn delivery_fake_forge_worker() {
             assert_eq!(local_receipt(&world).state, "intent_release");
             assert_eq!(forge.counts().await, (1, 1, 1));
         }
-        let outcome = run_delivery(&world, &forge).await;
-        if phase == "ci-failure" || phase == "ci-pending" {
+        let (outcome, slice2) = if phase.starts_with("slice2-") {
+            slice2_run(&world, &forge, &phase).await
+        } else {
+            (run_delivery(&world, &forge).await, serde_json::Value::Null)
+        };
+        if phase == "ci-failure" || phase == "ci-pending" || phase == "slice2-failure" {
             assert_blocked(&outcome);
             assert_eq!(forge.counts().await, (1, 0, 0));
             assert!(!outcome
@@ -690,7 +825,7 @@ fn delivery_fake_forge_worker() {
         std::fs::write(
             world.join(format!("{phase}-result.json")),
             serde_json::to_vec(&json!({
-                "pid": std::process::id(), "outcome": outcome,
+                "pid": std::process::id(), "outcome": outcome, "slice2": slice2,
             }))
             .unwrap(),
         )
@@ -1056,6 +1191,37 @@ fn e2e004_ci_failure_recovers_same_pr_and_artifact() {
     assert_eq!(artifact, serde_json::from_slice::<serde_json::Value>(
         &std::fs::read(world.path().join("artifact-receipt.json")).unwrap(),
     ).unwrap());
+    close_world(world);
+}
+
+#[test]
+fn e2e004_steer_reconnect_repair_resumes_same_durable_run() {
+    let world = supervised_world();
+    Worker::spawn(world.path(), "slice2-failure").wait();
+    let failed = result(world.path(), "slice2-failure");
+    assert_eq!(failed["outcome"]["pr_number"], 1);
+    assert_ne!(failed["outcome"]["final_state"], "delivered");
+    assert_eq!(failed["slice2"]["lease_owner"], serde_json::Value::Null);
+    assert_eq!(failed["slice2"]["provider_requests"], 2);
+    assert_eq!(failed["slice2"]["verification_exits"], json!([101, 0]));
+    assert_eq!(failed["slice2"]["steers"], json!(["accept: double(7) = 14", "correct: multiply, do not add"]));
+    Worker::spawn(world.path(), "slice2-resume").wait();
+    let resumed = result(world.path(), "slice2-resume");
+    assert_ne!(failed["pid"], resumed["pid"]);
+    for field in ["objective_id", "run_id", "change_set_digest", "canonical_pr_number", "canonical_pr_url"] {
+        assert_eq!(failed["slice2"][field], resumed["slice2"][field], "identity drift: {field}");
+        assert!(!resumed["slice2"][field].is_null(), "missing identity: {field}");
+    }
+    assert_eq!(resumed["slice2"]["lease_owner"], serde_json::Value::Null);
+    assert_eq!(resumed["outcome"]["final_state"], "delivered");
+    let artifact: serde_json::Value = serde_json::from_slice(&std::fs::read(world.path().join("artifact-receipt.json")).unwrap()).unwrap();
+    assert_eq!(artifact["merge_sha"], resumed["outcome"]["commit_sha"]);
+    let content = std::fs::read(world.path().join("synthetic-artifact.txt")).unwrap();
+    assert_eq!(artifact["artifact_sha256"], format!("{:x}", sha2::Sha256::digest(&content)));
+    assert!(String::from_utf8(content).unwrap().contains("value * 2"));
+    Worker::spawn(world.path(), "slice2-retry").wait();
+    let retry = result(world.path(), "slice2-retry");
+    assert_eq!(retry["slice2"], resumed["slice2"]);
     close_world(world);
 }
 
