@@ -84,6 +84,8 @@ pub fn is_launch_failure(message: &str) -> bool {
 
 /// One launched browser and the page we drive in it.
 struct LiveSession {
+    #[cfg(target_os = "macos")]
+    process: Option<super::macos_spawn::Child>,
     browser: Browser,
     page: Page,
     /// Drives the CDP connection; aborted on close.
@@ -230,6 +232,8 @@ impl ChromiumDriver {
         self.sessions.lock().await.insert(
             session_id.to_string(),
             LiveSession {
+                #[cfg(target_os = "macos")]
+                process: None,
                 browser,
                 page,
                 handler,
@@ -475,7 +479,42 @@ impl BrowserDriver for ChromiumDriver {
         authorizer
             .record_connection_endpoint(&reconnect_endpoint, None)
             .await?;
+        #[cfg(not(target_os = "macos"))]
         let launched = tokio::time::timeout(LAUNCH_WATCHDOG, Browser::launch(config)).await;
+        #[cfg(target_os = "macos")]
+        let mut process = None;
+        #[cfg(target_os = "macos")]
+        let launched = tokio::time::timeout(LAUNCH_WATCHDOG, async {
+            // Configuration's launch hook is private. Own the process ourselves;
+            // cancellation at any await drops the owner before the profile.
+            drop(config);
+            let plan = super::macos_spawn::LaunchPlan::managed(
+                &user_data_dir, debugging_port, headless_requested(),
+            );
+            debug_assert!(plan.disclaim);
+            process = Some(super::macos_spawn::spawn(&executable, &plan.args)
+                .map_err(|error| error.to_string())?);
+            let client = reqwest::Client::builder().no_proxy().build()
+                .map_err(|error| error.to_string())?;
+            let connected = tokio::time::timeout(LAUNCH_TIMEOUT, async {
+                loop {
+                    // Use our existing reqwest 0.12 client for loopback discovery;
+                    // chromiumoxide's 0.13 HTTP connector requires a TLS provider
+                    // even for HTTP. Direct ws:// connect has no TLS dependency.
+                    if let Ok(response) = client.get(format!("{reconnect_endpoint}/json/version")).send().await {
+                        if let Ok(value) = response.json::<serde_json::Value>().await {
+                            if let Some(endpoint) = value["webSocketDebuggerUrl"].as_str() {
+                                if endpoint.starts_with(&format!("ws://127.0.0.1:{debugging_port}/")) {
+                                    if let Ok(pair) = Browser::connect(endpoint.to_string()).await { break pair; }
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }).await.map_err(|_| "DevTools endpoint launch timed out".to_string())?;
+            Ok::<_, String>(connected)
+        }).await;
         let (mut browser, mut handler) = match launched {
             Ok(Ok(pair)) => pair,
             Ok(Err(error)) => {
@@ -492,9 +531,12 @@ impl BrowserDriver for ChromiumDriver {
                 ));
             }
         };
+        #[cfg(not(target_os = "macos"))]
         let browser_pid = browser
             .get_mut_child()
             .and_then(|child| child.as_mut_inner().id());
+        #[cfg(target_os = "macos")]
+        let browser_pid = process.as_ref().map(|child| child.pid as u32);
         if let Err(error) = authorizer
             .record_connection_endpoint(&reconnect_endpoint, browser_pid)
             .await
@@ -536,6 +578,8 @@ impl BrowserDriver for ChromiumDriver {
         };
 
         let mut live = LiveSession {
+            #[cfg(target_os = "macos")]
+            process,
             browser,
             page,
             handler,
@@ -792,6 +836,12 @@ async fn teardown(live: &mut LiveSession, session_id: &str) -> Result<()> {
     };
     live.handler.abort();
     let stopped = graceful_proven || matches!(forced, Some(Ok(Some(Ok(())))));
+    #[cfg(target_os = "macos")]
+    let stopped = if let Some(process) = live.process.as_mut() {
+        process.stop().is_ok()
+    } else {
+        stopped
+    };
     if !stopped {
         return Err(AppError::Other(
             "browser close and forced kill could not prove process exit".into(),
