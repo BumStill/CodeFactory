@@ -233,10 +233,13 @@ export function versionBumpHandoff(title) {
  * `stopRequested` is consulted before each merge; when it returns true the
  * queue stops and emits a terminal `stopped` outcome (R6).
  */
-export async function runQueue(adapter, { stopRequested, maxIterations = 100 } = {}) {
+export async function runQueue(adapter, { stopRequested, maxIterations = 100, initialPrs = null } = {}) {
   const outcomes = [];
   const seen = new Set();
   let iterations = 0;
+  // R8(b): the caller may hand over the snapshot it already fetched (the
+  // `drain` command plans and merges from ONE listing instead of two).
+  let pendingPrs = Array.isArray(initialPrs) ? initialPrs : null;
 
   while (iterations++ < maxIterations) {
     if (typeof stopRequested === 'function' && stopRequested()) {
@@ -244,7 +247,8 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
       break;
     }
 
-    const prs = await adapter.listOpenPrs();
+    const prs = pendingPrs ?? (await adapter.listOpenPrs());
+    pendingPrs = null;
     if (prs.length === 0) break;
 
     const eligible = [];
@@ -303,6 +307,7 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
     const result = await adapter.merge(target.number, {
       expectedHead: target.headSha,
       method: 'squash',
+      title: target.title,
     });
     if (result.merged) {
       outcomes.push({ number: target.number, status: 'merged', sha: result.sha });
@@ -318,6 +323,37 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100 } =
     }
   }
   return outcomes;
+}
+
+/**
+ * R8: plan and drain from ONE snapshot.
+ *
+ * Before this, `.github/workflows/merge-queue.yml` ran `plan` and then `run` as
+ * two processes; each re-listed every open PR and re-read the ruleset, and every
+ * listing pulled check-runs for PRs that were not even armed. This is the single
+ * entry point both the workflow and the CLI now use.
+ *
+ * Order is deliberate and fail-closed:
+ *   (a) one cheap "is anything armed?" listing — exit immediately otherwise;
+ *   (d) exactly one ruleset read per run (a drifted ruleset must never run);
+ *   (b) one PR listing, shared by the plan and the merge loop;
+ *   (c) the adapter only pulls check-runs/comments/events for armed PRs.
+ */
+export async function drainQueue(adapter, { stopRequested, maxIterations = 100, dryRun = false } = {}) {
+  if (typeof adapter.anyArmed === 'function' && !(await adapter.anyArmed())) {
+    return { skipped: 'no_armed_pr', plan: [], outcomes: [] };
+  }
+  const guard = await adapter.rulesetGuard();
+  const prs = await adapter.listOpenPrs();
+  const plan = orderQueue(prs.filter((pr) => evaluateEligibility(pr).eligible)).map((pr) => ({
+    number: pr.number,
+    title: pr.title,
+    mergeStateStatus: pr.mergeStateStatus,
+    action: pr.mergeStateStatus === 'BEHIND' ? 'update_then_merge' : 'merge',
+  }));
+  if (dryRun) return { guard, plan, outcomes: [] };
+  const outcomes = await runQueue(adapter, { stopRequested, maxIterations, initialPrs: prs });
+  return { guard, plan, outcomes };
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +444,17 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
   }
 
   return {
+    /// R8(a): the cheap "is anything armed?" probe. One listing call, no
+    /// check-runs, no rulesets — used to exit a workflow_run sweep immediately
+    /// when the queue has nothing to do.
+    async anyArmed() {
+      const raw = run([
+        'gh', 'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1',
+        '--label', ARM_LABEL, '--json', 'number',
+      ]);
+      const list = JSON.parse(raw);
+      return Array.isArray(list) && list.length > 0;
+    },
     async listOpenPrs() {
       const raw = run([
         'gh', 'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100', '--json',
@@ -416,6 +463,14 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       const list = JSON.parse(raw);
       const out = [];
       for (const pr of list) {
+        const labels = (pr.labels ?? []).map((label) => label.name);
+        // R8(c): an unarmed PR can never be eligible (evaluateEligibility
+        // rejects it on the label alone), so its check-runs and blocked-head
+        // evidence are not worth an API call.
+        if (!labels.includes(ARM_LABEL)) {
+          out.push(mapPr(pr, []));
+          continue;
+        }
         try {
           const checks = await headChecks(pr.headRefOid);
           out.push(mapPr(pr, checks, await blockedFields(pr)));
@@ -435,14 +490,18 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
         '-f', `expected_head_sha=${expectedHead}`,
       ]);
     },
-    async merge(number, { expectedHead } = {}) {
+    async merge(number, { expectedHead, title } = {}) {
       const commits = JSON.parse(run([
         'gh', 'api', `repos/${repo}/pulls/${number}/commits`, '--paginate', '--slurp',
       ])).flat();
       // Pin metadata to the same head GitHub is asked to merge. Never execute it.
-      const metadata = JSON.parse(run([
-        'gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'title',
-      ]));
+      // R8(b): reuse the title from the listing the run already fetched instead
+      // of spending another call on `gh pr view`.
+      const metadata = title
+        ? { title }
+        : JSON.parse(run([
+          'gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'title',
+        ]));
       const messages = commits.map((commit) => commit.commit.message);
       const trailers = [...new Set(messages.flatMap((message) => message.split(/\r?\n/)
         .map((line) => line.trim())
@@ -540,6 +599,21 @@ async function main(argv) {
       action: pr.mergeStateStatus === 'BEHIND' ? 'update_then_merge' : 'merge',
     }));
     process.stdout.write(`${JSON.stringify({ repo, command, plan }, null, 2)}\n`);
+    return 0;
+  }
+
+  if (command === 'drain') {
+    // R8: the single entry point — one armed-probe, one ruleset read, one PR
+    // listing shared by the plan and the merge loop.
+    const adapter = createGhAdapter({ repo });
+    const result = await drainQueue(adapter, {
+      stopRequested: flags.stopFile
+        ? () => existsSync(flags.stopFile)
+        : undefined,
+      maxIterations: flags.limit ? Number(flags.limit) : 100,
+      dryRun: flags.dryRun === true,
+    });
+    process.stdout.write(`${JSON.stringify({ repo, ...result }, null, 2)}\n`);
     return 0;
   }
 
