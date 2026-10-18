@@ -1593,6 +1593,28 @@ fn pr_body_update_confirmation(
     }))
 }
 
+/// M118/R1: the single head question every delivery reconcile checkpoint asks.
+///
+/// Before this, the unresolved-mutation reconciler compared the observed PR
+/// head with the persisted head using plain equality and therefore rejected
+/// the two-parent merge commit the merge queue's `update-branch` writes
+/// (session b48cc1e5, PR #743: `observed PR does not prove the persisted
+/// delivery head`). The M115b policy already answers the real question, so the
+/// checkpoint now delegates to `DeliveryRemote::head_is_explained` instead of
+/// keeping its own copy of the rule.
+///
+/// Fail-closed is unchanged: a missing observation, an empty durable head, or a
+/// head the provider cannot explain still refuses.
+fn observed_head_proves_delivery<R: DeliveryRemote>(
+    remote: &R,
+    persisted_head: &str,
+    observed_head: Option<&str>,
+) -> bool {
+    observed_head.is_some_and(|observed| {
+        !persisted_head.is_empty() && remote.head_is_explained(persisted_head, observed)
+    })
+}
+
 async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
     db: &sqlx::SqlitePool,
     claimed: &delivery_run::ClaimedRecovery,
@@ -1659,7 +1681,22 @@ async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
                 })
             }
             "git_push" => {
-                if takeover.remote_head_sha.as_deref() != Some(claimed.expected_head_sha.as_str()) {
+                // M118/R1: the pushed branch head is one more place where the
+                // delivery's own head can legitimately appear as a queue-synced
+                // merge commit. Ask the same policy; a head nothing can prove
+                // still refuses, and a missing observation is still a refusal.
+                let pushed_head_proven = match takeover.remote_head_sha.as_deref() {
+                    Some(observed) if observed == claimed.expected_head_sha => true,
+                    Some(observed) => remote.is_some_and(|remote| {
+                        observed_head_proves_delivery(
+                            remote,
+                            &claimed.expected_head_sha,
+                            Some(observed),
+                        )
+                    }),
+                    None => false,
+                };
+                if !pushed_head_proven {
                     return Err(crate::errors::AppError::Other(format!(
                         "unresolved git push {} has no positive matching remote-head observation",
                         intent.intent_id
@@ -1703,7 +1740,11 @@ async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
                         ))
                     }
                 };
-                if state.head_sha.as_deref() != Some(claimed.expected_head_sha.as_str()) {
+                if !observed_head_proves_delivery(
+                    remote,
+                    &claimed.expected_head_sha,
+                    state.head_sha.as_deref(),
+                ) {
                     return Err(crate::errors::AppError::Other(
                         "observed PR does not prove the persisted delivery head".into(),
                     ));
@@ -1793,7 +1834,11 @@ async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
                         ))
                     }
                 };
-                if state.head_sha.as_deref() != Some(claimed.expected_head_sha.as_str()) {
+                if !observed_head_proves_delivery(
+                    remote,
+                    &claimed.expected_head_sha,
+                    state.head_sha.as_deref(),
+                ) {
                     return Err(crate::errors::AppError::Other(
                         "observed PR body is attached to a foreign head; no update was replayed"
                             .into(),
@@ -1871,7 +1916,7 @@ async fn reconcile_unresolved_delivery_mutation_intents<R: DeliveryRemote>(
                         ))
                     }
                 };
-                if state.head_sha.as_deref() != Some(head) {
+                if !observed_head_proves_delivery(remote, head, state.head_sha.as_deref()) {
                     return Err(crate::errors::AppError::Other(
                         "committed PR branch update result differs from the current PR head".into(),
                     ));
@@ -2867,8 +2912,19 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
                 chrono::Utc::now().timestamp_millis(), "canonical_pr_observation_concluded").await?;
             return Ok(());
         }
-        let observed = match (remote, claimed.canonical_head_sha.as_deref()) {
-            (Some(remote), Some(head)) => remote.observe_merge(number as u64, head).await,
+        // M118/R3: the persisted expected head is a perfectly good known head
+        // for asking "was this merged?". Requiring `canonical_head_sha` here
+        // demoted a real merge to `Unsupported`, which fell into the `unknown`
+        // retry arm and left the session silently active (PR #743 shape).
+        let known_head = claimed
+            .canonical_head_sha
+            .as_deref()
+            .filter(|head| !head.is_empty())
+            .unwrap_or(claimed.expected_head_sha.as_str());
+        let observed = match remote {
+            Some(remote) if !known_head.is_empty() => {
+                remote.observe_merge(number as u64, known_head).await
+            }
             _ => Ok(delivery::MergeObservation::Unsupported),
         };
         match observed {
@@ -2911,6 +2967,22 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
                     )
                     .await
                     .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+            }
+            Ok(delivery::MergeObservation::HeadChanged { actual_head }) => {
+                // M118/R3: a positively observed head the delivery cannot
+                // explain is not an offline provider. Retrying it as `unknown`
+                // forever is what left session b48cc1e5 active with no events
+                // for 20 minutes. Give it an explicit bounded terminal answer:
+                // merged runs settle by their merge, and everything else parks
+                // with a named reason after the identical-failure bound.
+                tracing::warn!(
+                    run_id = %claimed.run_id,
+                    observed_head = %actual_head,
+                    expected_head = %claimed.expected_head_sha,
+                    "recovery supervisor: canonical PR head is not this delivery's; ending the silent retry"
+                );
+                record_or_park_local_takeover_identity_conflict(&db, &claimed, &process).await?;
+                return Ok(());
             }
             _ => {
                 // No identity failure may be inferred from an offline/unknown
@@ -3267,11 +3339,68 @@ pub(crate) fn should_resume_claimed_delivery(claimed: &delivery_run::ClaimedReco
     ) && claimed.next_action_authorized
 }
 
+/// M118/R2: the one durable "this delivery already succeeded" question, asked
+/// before any head drift observed afterwards can be turned into a failure.
+///
+/// Field evidence (session 70c73a35, PR #742, 2026-10-18): the queue merged the
+/// PR at 20:00, the remote branch then drifted/vanished, the recovery
+/// supervisor re-claimed the still-`armed` run, its takeover observed a head it
+/// could not explain, and after `MAX_IDENTICAL_TAKEOVER_FAILURES` identical
+/// attempts the objective that had already shipped was displayed as "failed".
+/// Merge is a conclusion: head drift after it is history, never a failure.
+async fn delivery_run_settled_by_merge(
+    db: &sqlx::SqlitePool,
+    claimed: &delivery_run::ClaimedRecovery,
+) -> bool {
+    if matches!(
+        claimed.reached_ceiling.as_str(),
+        "merged" | "release_triggered" | "deployment_succeeded" | "live_verified"
+    ) {
+        return true;
+    }
+    if crate::agent::execution_workspace::pr_observation_concluded(db, &claimed.run_id)
+        .await
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // The ceiling column can lag behind the merge itself: the queue merged a
+    // PR whose run was still armed, so the durable merge receipt is the first
+    // place the conclusion appears. A recorded `provider_pr_merge` receipt is
+    // equally binding.
+    let merge_receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_mutation_intents \
+         WHERE run_id=? AND rung='provider_pr_merge' \
+           AND status IN ('committed','reconciled_committed')",
+    )
+    .bind(&claimed.run_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    merge_receipts > 0
+}
+
 async fn record_or_park_local_takeover_identity_conflict(
     db: &sqlx::SqlitePool,
     claimed: &delivery_run::ClaimedRecovery,
     process: &ProcessIdentity,
 ) -> Result<()> {
+    // M118/R2: settle by the merge result instead of re-litigating it. This is
+    // deliberately the first thing this function asks: every caller reaches it
+    // with an observed head it could not explain, and a merged run explains
+    // itself through its merge, not through its branch head.
+    if delivery_run_settled_by_merge(db, claimed).await {
+        delivery_run::release_delivery_lease(
+            db,
+            &claimed.run_id,
+            process,
+            claimed.claim_epoch,
+            chrono::Utc::now().timestamp_millis(),
+            "delivery_settled_by_merge",
+        )
+        .await?;
+        return Ok(());
+    }
     let mut failure = local_takeover_identity_conflict_observation(claimed);
     // A PR number alone is not merge evidence. Genuine foreign identities
     // retain the original bounded fail-closed path until merge is confirmed.
@@ -5914,6 +6043,334 @@ mod tests {
                 actual_head: self.foreign_head.clone(),
             })
         }
+    }
+
+    /// M118/R1 fixture: a read-only provider whose canonical PR head is the
+    /// two-parent merge commit the merge queue's `update-branch` writes. Only
+    /// the M115b policy can prove that head; plain equality cannot.
+    struct M118PrRemote {
+        head: String,
+        title: String,
+        body: String,
+        explained: bool,
+    }
+
+    impl delivery::DeliveryRemote for M118PrRemote {
+        fn capabilities(&self) -> delivery::DeliveryCapabilities {
+            delivery::DeliveryCapabilities::default()
+        }
+
+        async fn open_or_get_pr(
+            &self,
+            _title: &str,
+            _body: &str,
+            _head: &str,
+            _base: &str,
+            _expected_head_sha: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<delivery::DeliveryPr, String> {
+            Err("reconciliation observation is read-only".into())
+        }
+
+        fn head_is_explained(&self, known: &str, observed: &str) -> bool {
+            observed == known || (self.explained && observed == self.head)
+        }
+
+        async fn ci_status(&self, _sha: &str) -> std::result::Result<delivery::CiStatus, String> {
+            Err("reconciliation does not inspect CI".into())
+        }
+
+        async fn merge_pr(
+            &self,
+            _number: u64,
+            _method: crate::config::settings::MergeMethod,
+            _commit_message: Option<&delivery::MergeCommitMessage>,
+            _expected_head: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<delivery::MergeRequestResult, String> {
+            Err("reconciliation must never merge".into())
+        }
+
+        async fn trigger_release(
+            &self,
+            _head_sha: &str,
+            _mutation_permit: Option<&delivery::DeliveryMutationPermit>,
+        ) -> std::result::Result<String, String> {
+            Err("reconciliation must never release".into())
+        }
+
+        async fn observe_open_pr(
+            &self,
+            _head: &str,
+            _base: &str,
+        ) -> std::result::Result<delivery::OpenPrObservation, String> {
+            Ok(delivery::OpenPrObservation::Open(delivery::OpenPrState {
+                pr: delivery::DeliveryPr {
+                    number: 743,
+                    url: "https://example.invalid/pr/743".into(),
+                    title: self.title.clone(),
+                    body: self.body.clone(),
+                },
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                head_sha: Some(self.head.clone()),
+            }))
+        }
+    }
+
+    async fn m118_run_with_open_pr_intent(
+        run_id: &str,
+    ) -> (sqlx::SqlitePool, ProcessIdentity, delivery_run::ClaimedRecovery) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        delivery_run::ensure_schema(&pool).await.unwrap();
+        let owner = ProcessIdentity::new("process-m118", "test", "test");
+        let now = chrono::Utc::now().timestamp_millis();
+        let run = NewDeliveryRun {
+            id: run_id.into(),
+            objective_id: format!("objective-{run_id}"),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session-m118".into()),
+            root_turn_id: Some("turn-m118".into()),
+            task_segment_id: None,
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:m118".into(),
+            repo_identity: "repo:m118".into(),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "aaaa".into(),
+            canonical_pr_number: Some(743),
+            canonical_pr_url: Some("https://example.invalid/pr/743".into()),
+            canonical_head_sha: Some("aaaa".into()),
+            requested_ceiling: "through_merge".into(),
+            reached_ceiling: "pr_open".into(),
+            stage: "pr".into(),
+            status: "waiting".into(),
+            wait_class: Some("external_state_uncertain".into()),
+            next_action: Some("observe_only_reconcile".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        let epoch = delivery_run::create_delivery_run(&pool, &run, &owner, now, 60_000)
+            .await
+            .unwrap();
+        let operation_key = delivery::external_operation_key(
+            "provider_pr_open_or_get",
+            &["fix: synthetic", "body", "feature", "main", "aaaa"],
+        );
+        assert!(delivery_run::begin_delivery_mutation_intent(
+            &pool,
+            "m118-pr-intent",
+            run_id,
+            &owner,
+            epoch,
+            "provider_pr_open_or_get",
+            &operation_key,
+            Some("{}"),
+            now + 1,
+        )
+        .await
+        .unwrap());
+        assert!(delivery_run::mark_delivery_mutation_intent_unknown(
+            &pool,
+            "m118-pr-intent",
+            &owner,
+            epoch,
+            Some(r#"{"classification":"timeout"}"#),
+            now + 2,
+        )
+        .await
+        .unwrap());
+        sqlx::query("UPDATE delivery_runs SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let competitor = ProcessIdentity::new("process-m118-recovery", "test", "test");
+        let plan = delivery_run::plan_startup_recovery(&pool, &competitor, now + 3, 60_000)
+            .await
+            .unwrap();
+        let claimed = plan
+            .claimed
+            .into_iter()
+            .find(|claimed| claimed.run_id == run_id)
+            .expect("the expired run is claimable");
+        (pool, competitor, claimed)
+    }
+
+    fn m118_takeover() -> delivery::DeliveryTakeoverObservation {
+        delivery::DeliveryTakeoverObservation {
+            identity: DeliveryIdentitySnapshot {
+                repo_identity: "repo:m118".into(),
+                worktree_identity: "worktree:m118".into(),
+                head_sha: "aaaa".into(),
+                change_set_digest: "digest".into(),
+            },
+            remote_head_sha: None,
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+        }
+    }
+
+    /// M118/R1 (field shape of PR #743): the unresolved-PR reconciler must ask
+    /// the unified policy, not compare heads. A queue-synced head is proven and
+    /// continues; a foreign head still fails closed with the same diagnostic.
+    #[tokio::test]
+    async fn m118_queue_synced_pr_head_is_proven_instead_of_compared() {
+        let (pool, owner, claimed) = m118_run_with_open_pr_intent("m118-queue-head").await;
+        let mut takeover = m118_takeover();
+
+        let foreign = M118PrRemote {
+            head: "cccc".into(),
+            title: "fix: synthetic".into(),
+            body: "body".into(),
+            explained: false,
+        };
+        let error = reconcile_unresolved_delivery_mutation_intents(
+            &pool,
+            &claimed,
+            &owner,
+            Some(&foreign),
+            &mut takeover,
+        )
+        .await
+        .expect_err("a head the policy cannot prove must still fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not prove the persisted delivery head"),
+            "{error}"
+        );
+        assert!(takeover.canonical_pr_number.is_none());
+
+        let queue = M118PrRemote {
+            head: "bbbb".into(),
+            title: "fix: synthetic".into(),
+            body: "body".into(),
+            explained: true,
+        };
+        reconcile_unresolved_delivery_mutation_intents(
+            &pool,
+            &claimed,
+            &owner,
+            Some(&queue),
+            &mut takeover,
+        )
+        .await
+        .expect("the queue-synced head is this delivery's own head");
+        assert_eq!(takeover.canonical_pr_number, Some(743));
+        assert_eq!(
+            takeover.canonical_pr_url.as_deref(),
+            Some("https://example.invalid/pr/743")
+        );
+        assert_eq!(takeover.canonical_head_sha.as_deref(), Some("aaaa"));
+    }
+
+    /// M118/R2 (field shape of PR #742): once the PR is merged, later head drift
+    /// must settle as merged instead of parking an already-shipped objective as
+    /// failed. Without a merge the same conflict keeps its bounded fail-closed
+    /// escalation, so the security boundary is unchanged.
+    #[tokio::test]
+    async fn m118_merged_run_settles_head_drift_as_merged_not_failed() {
+        for merged in [false, true] {
+            let (pool, owner, claimed) = m118_run_with_open_pr_intent(if merged {
+                "m118-merged-drift"
+            } else {
+                "m118-unmerged-drift"
+            })
+            .await;
+            if merged {
+                let now = chrono::Utc::now().timestamp_millis();
+                sqlx::query(
+                    "INSERT INTO delivery_mutation_intents \
+                     (intent_id, run_id, claim_epoch, rung, operation_key, status, \
+                      process_instance, evidence_json, started_at, updated_at) \
+                     VALUES (?, ?, ?, 'provider_pr_merge', ?, 'reconciled_committed', ?, ?, ?, ?)",
+                )
+                .bind("m118-merge-receipt")
+                .bind(&claimed.run_id)
+                .bind(claimed.claim_epoch)
+                .bind(delivery::external_operation_key(
+                    "provider_pr_merge",
+                    &["742", "squash", "aaaa"],
+                ))
+                .bind(&owner.instance_id)
+                .bind(r#"{"pr_number":742,"merge_sha":"dddd"}"#)
+                .bind(now)
+                .bind(now)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            record_or_park_local_takeover_identity_conflict(&pool, &claimed, &owner)
+                .await
+                .unwrap();
+            let failure: Option<String> =
+                sqlx::query_scalar("SELECT failure_signature FROM delivery_runs WHERE id=?")
+                    .bind(&claimed.run_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if merged {
+                assert!(
+                    failure.is_none(),
+                    "a merged delivery must settle by its merge, not by a head it no longer owns"
+                );
+                let objective_status: String =
+                    sqlx::query_scalar("SELECT status FROM delivery_runs WHERE id=?")
+                        .bind(&claimed.run_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_ne!(objective_status, "failed");
+            } else {
+                assert!(
+                    failure.is_some(),
+                    "an unmerged foreign head must still record its failure"
+                );
+            }
+        }
+    }
+
+    /// M118/R4: one entry, no private copies. Every delivery head checkpoint in
+    /// the reconciler asks the M115b policy; none compares a head itself.
+    #[test]
+    fn m118_head_checkpoints_share_the_unified_policy() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/tools/delivery.rs"
+        ))
+        .unwrap();
+        let start = source
+            .find("async fn reconcile_unresolved_delivery_mutation_intents")
+            .unwrap();
+        let after_signature = start + "async fn ".len();
+        let end = source[after_signature..]
+            .find("\nasync fn ")
+            .map(|offset| after_signature + offset)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+        assert!(
+            !body.contains("head_sha.as_deref() != Some("),
+            "a delivery head checkpoint may not compare heads itself"
+        );
+        assert_eq!(
+            body.matches("observed_head_proves_delivery(").count(),
+            4,
+            "every head checkpoint in the reconciler (pushed branch, PR create, body update, branch update) must ask the unified policy"
+        );
+        assert!(
+            body.contains("remote.head_is_explained")
+                || source.contains("remote.head_is_explained(persisted_head, observed)"),
+            "the checkpoint must delegate to DeliveryRemote::head_is_explained"
+        );
     }
 
     /// (a) A base branch that moves mid-delivery is merged into the same managed
