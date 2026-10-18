@@ -134,7 +134,7 @@ pub enum Request {
     /// CF-QUOTA-R2: read the same subscription status as Settings.
     SetSessionUsageWindowOverride { session_id: String, ignore: bool },
     GetUsageWindows {},
-    SetUsageWindow { endpoint: String, model: String, rule: crate::agent::usage_windows::UsageWindow },
+    SetUsageWindow { endpoint: String, #[serde(default)] model: Option<String>, rule: Option<crate::agent::usage_windows::UsageWindow> },
     GetQuota {},
     /// CF-QUOTA-R2: partial per-endpoint cap update; no paid endpoint changes.
     SetQuotaCap {
@@ -332,8 +332,8 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
         Request::GetUsageWindows {} => {}
         Request::SetUsageWindow { endpoint, model, rule } => {
             require_non_empty("endpoint", endpoint)?;
-            require_non_empty("model", model)?;
-            rule.validate().map_err(ErrorBody::invalid)?;
+            if let Some(model) = model { require_non_empty("model", model)?; }
+            if let Some(rule) = rule { rule.validate().map_err(ErrorBody::invalid)?; }
         }
         Request::CleanBuildCache {} | Request::GetQuota {} => {}
         Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
@@ -464,7 +464,7 @@ impl AuditEntry {
             }
             Request::GetUsageWindows {} => {}
             Request::SetUsageWindow { endpoint, model, rule } => {
-                entry.message = Some(format!("endpoint={endpoint}; model={model}; rule={}", serde_json::to_string(rule).unwrap_or_default()));
+                entry.message = Some(format!("endpoint={endpoint}; model={}; rule={}", model.as_deref().unwrap_or("<endpoint>"), serde_json::to_string(rule).unwrap_or_default()));
             }
             Request::GetQuota {} => {}
             Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
@@ -1481,14 +1481,16 @@ mod unix_tests {
                 let mut settings = self.0.lock().unwrap();
                 match request {
                     Request::SetUsageWindow { endpoint, model, rule } => {
-                        rule.validate().map_err(ErrorBody::invalid)?;
-                        settings.model_usage_windows.insert(crate::agent::usage_windows::model_key(endpoint, model), rule.clone());
+                        if let Some(rule) = rule { rule.validate().map_err(ErrorBody::invalid)?; }
+                        let key = model.as_deref().map(|model| crate::agent::usage_windows::model_key(endpoint, model)).unwrap_or_else(|| endpoint.clone());
+                        let rules = if model.is_some() { &mut settings.model_usage_windows } else { &mut settings.endpoint_usage_windows };
+                        if let Some(rule) = rule { rules.insert(key, rule.clone()); } else { rules.remove(&key); }
                         Ok(serde_json::json!({"endpoint":endpoint,"model":model,"rule":rule}))
                     }
                     Request::GetUsageWindows {} => Ok(serde_json::to_value(&settings.model_usage_windows).unwrap()),
                     Request::SetSessionUsageWindowOverride { session_id, ignore } => {
                         // 后台入口落到界面按钮用的同一个函数上，不另造一条路径。
-                        crate::agent::usage_windows::set_session_usage_window_override(session_id.clone(), *ignore)
+                        crate::agent::usage_windows::cache_session_override(session_id.clone(), *ignore)
                             .map_err(ErrorBody::invalid)?;
                         Ok(serde_json::json!({"session_id":session_id,"ignore":ignore}))
                     }
@@ -1527,7 +1529,7 @@ mod unix_tests {
         assert!(reply.ok, "{:?}", reply.error);
         assert_eq!(reply.result.unwrap()["ignore"], true);
         assert!(crate::agent::usage_windows::session_ignores_windows(session), "后台入口必须落到界面用的同一份状态上");
-        crate::agent::usage_windows::set_session_usage_window_override(session.into(), false).unwrap();
+        crate::agent::usage_windows::cache_session_override(session.into(), false).unwrap();
         assert!(!crate::agent::usage_windows::session_ignores_windows(session));
         worker.join().unwrap();
         let log = std::fs::read_to_string(audit_path).unwrap();

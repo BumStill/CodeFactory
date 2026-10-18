@@ -35,7 +35,7 @@ try {
     // CF-WINDOW-R3：没有官方节假日数据的年份必须被如实说明。
     assert(await page.getByText("已内置节假日／调休数据的年份：2026。其余年份按保守口径（工作日算高峰）。").isVisible(),"conservative fallback statement missing");
     // CF-WINDOW-R8：每个模型都要显示"现在是否可用、下一次切换时间"。
-    const status = await page.getByRole("status").first().innerText();
+    const status = await page.getByRole("status").nth(1).innerText();
     assert(/现在可用|当前不在允许时段/.test(status),`model status missing: ${status}`);
     assert(/无切换时间|下一次切换：/.test(status),`next transition missing: ${status}`);
     assert(status.includes("下一次切换："),`the preset model must show its next transition: ${status}`);
@@ -45,6 +45,11 @@ try {
     await page.getByLabel("flash 时区").waitFor();
     assert(await page.getByLabel("deepseek pro 使用时段").inputValue() === "official_off_peak","editing flash changed pro");
     assert(await page.getByLabel("deepseek flash 使用时段").inputValue() === "custom","custom did not persist");
+    await page.getByRole("button", { name: "恢复继承服务商" }).last().click();
+    await page.getByLabel("deepseek 服务商默认 使用时段").selectOption("official_off_peak");
+    assert(await page.getByLabel("deepseek flash 使用时段").inputValue() === "official_off_peak", "inherited endpoint default missing");
+    await page.getByRole("button", { name: "恢复继承服务商" }).first().click();
+    assert(await page.getByText("deepseek / pro · 继承服务商").isVisible(), "pro did not restore inheritance");
     // CF-WINDOW-R5（M86 返修）：等待说明必须出现在**会话界面**上，不是只进日志。
     const waitNotice = page.getByTestId("usage-window-wait-notice");
     assert(await waitNotice.isVisible(),`${theme}: the usage-window wait notice is not visible in the session`);

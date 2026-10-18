@@ -502,7 +502,7 @@ impl ActiveRouteState {
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) { return Err("cancelled".into()); }
             let now = super::usage_windows::now_ms();
             let config = settings.read().await;
-            if config.model_usage_windows.is_empty() { return Ok(None); }
+            if config.model_usage_windows.is_empty() && config.endpoint_usage_windows.is_empty() { return Ok(None); }
             let delay = {
             let mut inner = self.inner.lock().expect("active route mutex poisoned");
             let from = inner.candidates[inner.current_index].clone();
@@ -516,8 +516,7 @@ impl ActiveRouteState {
             let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
                 let label = endpoint_label(&route.endpoint_name);
                 if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name) { return None; }
-                let key = super::usage_windows::model_key(&route.endpoint_name, &route.model_id);
-                if let Some(rule) = config.model_usage_windows.get(&key) {
+                if let Some(rule) = super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id) {
                     let status = rule.evaluate(now);
                     if !status.available && !ignore_windows {
                         skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(format!("outside_usage_window:{}", serde_json::json!({"rule":rule,"next_available_ms":status.next_transition_ms}))) });
