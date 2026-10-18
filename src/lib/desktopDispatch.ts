@@ -101,7 +101,7 @@ export interface DispatchHandlers {
   /** CF-BLD-R4: the panel's one-click cleanup, reachable from the background. */
   /** CF-QUOTA-R2: same reads and persistence as Settings. */
   getUsageWindows?: () => Promise<unknown> | unknown;
-  setUsageWindow?: (input: { endpoint: string; model: string; rule: import("./usageWindows").UsageWindow }) => Promise<unknown>;
+  setUsageWindow?: (input: { endpoint: string; model?: string; rule: import("./usageWindows").UsageWindow | null }) => Promise<unknown>;
   /** CF-WINDOW-R6/R7: the same one-shot per-session exemption the picker offers. */
   setSessionUsageWindowOverride?: (input: { sessionId: string; ignore: boolean }) => Promise<unknown>;
   getQuota?: () => Promise<unknown>;
@@ -248,8 +248,8 @@ export async function applyDispatchRequest(
         break;
       case "set_usage_window":
         if (!handlers.setUsageWindow) return invalid("set_usage_window is not available");
-        if (!body.rule || typeof body.rule !== "object") return invalid("rule must be an object");
-        result = await handlers.setUsageWindow({ endpoint: requiredString(body.endpoint, "endpoint"), model: requiredString(body.model, "model"), rule: body.rule as import("./usageWindows").UsageWindow });
+        if (body.rule !== null && (!body.rule || typeof body.rule !== "object")) return invalid("rule must be an object or null");
+        result = await handlers.setUsageWindow({ endpoint: requiredString(body.endpoint, "endpoint"), model: body.model === undefined ? undefined : requiredString(body.model, "model"), rule: body.rule as import("./usageWindows").UsageWindow | null });
         break;
       case "set_session_usage_window_override":
         if (!handlers.setSessionUsageWindowOverride) return invalid("set_session_usage_window_override is not available");

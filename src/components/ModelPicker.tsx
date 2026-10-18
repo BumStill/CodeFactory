@@ -311,7 +311,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
                 m.id === activeModel ? "text-accent" : "text-gray-300"
               }`}
               onClick={() => {
-                const rule = settings?.model_usage_windows?.[modelWindowKey(activeEndpoint, m.id)];
+                const rule = settings?.model_usage_windows?.[modelWindowKey(activeEndpoint, m.id)] ?? settings?.endpoint_usage_windows?.[activeEndpoint];
                 const status = evaluateWindow(rule, Date.now());
                 if (!status.available) {
                   // CF-WINDOW-R6：不静默改用别的模型，也不静默违反配置。说明

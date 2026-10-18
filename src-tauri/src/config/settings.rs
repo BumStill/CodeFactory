@@ -185,6 +185,8 @@ pub struct Settings {
     /// CF-WINDOW-R1: JSON [endpoint, model] tuple keys, default unrestricted.
     #[serde(default)]
     pub model_usage_windows: HashMap<String, crate::agent::usage_windows::UsageWindow>,
+    #[serde(default)]
+    pub endpoint_usage_windows: HashMap<String, crate::agent::usage_windows::UsageWindow>,
     /// CF-WINDOW-R6（M86 返修）: session ids whose owner chose "本会话忽略时段
     /// 限制". Persisted so the exemption survives an app restart; still scoped
     /// to those sessions only, and revocable from the model menu.
@@ -709,6 +711,7 @@ impl Default for Settings {
             usage_budget: UsageBudget::default(),
             subscription_quota_caps: HashMap::new(),
             model_usage_windows: HashMap::new(),
+            endpoint_usage_windows: HashMap::new(),
             session_usage_window_overrides: Vec::new(),
         }
     }
@@ -1162,6 +1165,10 @@ pub fn load() -> Settings {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
+    if let Err(error) = migrate_usage_windows_at_path(&new_path, &mut settings) {
+        tracing::warn!("settings: usage-window migration skipped: {error}");
+    }
+
     // Schema migration v0.3.5 -> v0.3.6:
     //   Promote the legacy top-level `default_model` into the matching
     //   endpoint's `active_model` field (per-endpoint model selection).
@@ -1536,6 +1543,20 @@ pub fn force_max_completion_tokens_with_minimum(body: &mut serde_json::Value, mi
         }
         obj.remove("temperature");
     }
+}
+
+fn migrate_usage_windows_at_path(path: &Path, settings: &mut Settings) -> crate::errors::Result<()> {
+    let mut candidate = settings.clone();
+    if !crate::agent::usage_windows::migrate_endpoint_defaults(&mut candidate) { return Ok(()); }
+    // A unique, durable pre-migration copy; never overwrite an earlier backup.
+    let parent = path.parent().unwrap();
+    let mut backup = tempfile::Builder::new().prefix("settings.usage-windows-backup.").suffix(".json").tempfile_in(parent)?;
+    backup.write_all(&std::fs::read(path)?)?;
+    backup.as_file().sync_all()?;
+    backup.keep().map_err(|error| error.error)?;
+    save_to_path(path, &candidate)?;
+    *settings = candidate;
+    Ok(())
 }
 
 fn save_to_path(path: &Path, settings: &Settings) -> crate::errors::Result<()> {

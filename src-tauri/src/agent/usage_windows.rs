@@ -51,12 +51,18 @@ pub fn clear_session_overrides_for_test() {
 }
 
 #[tauri::command]
-pub fn set_session_usage_window_override(session_id: String, ignore: bool) -> Result<(), String> {
+pub async fn set_session_usage_window_override(session_id: String, ignore: bool, state: tauri::State<'_, crate::AppState>) -> Result<(), String> {
     if session_id.trim().is_empty() { return Err("session_id must be nonempty".into()); }
-    let mut settings = crate::config::settings::load();
-    if persist_session_override(&mut settings, &session_id, ignore) {
-        crate::config::settings::save(&settings).map_err(|error| error.to_string())?;
+    let mut current = state.settings.write().await;
+    let mut candidate = current.clone();
+    if persist_session_override(&mut candidate, &session_id, ignore) {
+        crate::config::settings::save(&candidate).map_err(|error| error.to_string())?;
+        *current = candidate;
     }
+    cache_session_override(session_id, ignore)
+}
+
+pub(crate) fn cache_session_override(session_id: String, ignore: bool) -> Result<(), String> {
     let mut cache = overrides().lock().map_err(|e| e.to_string())?;
     if ignore { cache.insert(session_id); } else { cache.remove(&session_id); }
     Ok(())
@@ -93,6 +99,36 @@ pub struct UsageWindow {
 pub struct WindowStatus { pub available: bool, pub next_transition_ms: Option<i64> }
 pub fn model_key(endpoint: &str, model: &str) -> String {
     serde_json::to_string(&(endpoint, model)).expect("string tuple")
+}
+
+pub fn effective_rule<'a>(settings: &'a crate::config::settings::Settings, endpoint: &str, model: &str) -> Option<&'a UsageWindow> {
+    settings.model_usage_windows.get(&model_key(endpoint, model)).or_else(|| settings.endpoint_usage_windows.get(endpoint))
+}
+
+/// Only identical legacy rules are promoted; mixed groups retain their exact rules.
+pub fn migrate_endpoint_defaults(settings: &mut crate::config::settings::Settings) -> bool {
+    let mut groups: std::collections::HashMap<String, Vec<(String, UsageWindow)>> = Default::default();
+    for (key, rule) in &settings.model_usage_windows {
+        if let Ok((endpoint, _)) = serde_json::from_str::<(String, String)>(key) {
+            groups.entry(endpoint).or_default().push((key.clone(), rule.clone()));
+        }
+    }
+    let mut changed = false;
+    for (endpoint, rules) in groups {
+        if settings.endpoint_usage_windows.contains_key(&endpoint) || !rules.iter().all(|(_, rule)| rule == &rules[0].1) { continue; }
+        if let Some(config) = settings.endpoints.get(&endpoint) {
+            for model in config.custom_models.iter().map(|m| m.id.as_str()).chain(config.active_model.as_deref()) {
+                let key = model_key(&endpoint, model);
+                if !settings.model_usage_windows.contains_key(&key) {
+                    settings.model_usage_windows.insert(key, serde_json::from_value(serde_json::json!({"mode":"anytime"})).unwrap());
+                }
+            }
+        }
+        settings.endpoint_usage_windows.insert(endpoint, rules[0].1.clone());
+        for (key, _) in rules { settings.model_usage_windows.remove(&key); }
+        changed = true;
+    }
+    changed
 }
 
 /// 未固定时的哨兵值：沿用系统时钟。
@@ -255,6 +291,32 @@ mod tests {
     use super::*;
     // CF-WINDOW-R3: the bundled notice covers 2026 only. A year with no notice
     // must fall back conservatively (weekday = peak) instead of guessing.
+    #[test]
+    fn endpoint_default_migration_preserves_existing_admission() {
+        let mut settings = crate::config::settings::Settings::default();
+        let rule = presets().remove("deepseek_off_peak").unwrap();
+        settings.model_usage_windows.insert(model_key("synthetic", "pro"), rule.clone());
+        settings.model_usage_windows.insert(model_key("synthetic", "flash"), rule);
+        let before = settings.clone();
+        assert!(migrate_endpoint_defaults(&mut settings));
+        assert!(settings.model_usage_windows.is_empty());
+        assert!(!migrate_endpoint_defaults(&mut settings));
+        for model in ["pro", "flash"] {
+            for hour in 0..24 {
+                let at = chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{hour:02}:00:00+08:00")).unwrap().timestamp_millis();
+                assert_eq!(effective_rule(&before, "synthetic", model).unwrap().evaluate(at).available, effective_rule(&settings, "synthetic", model).unwrap().evaluate(at).available);
+            }
+        }
+        assert!(effective_rule(&settings, "synthetic", "new-model").is_some());
+        let anytime: UsageWindow = serde_json::from_value(serde_json::json!({"mode":"anytime"})).unwrap();
+        settings.model_usage_windows.insert(model_key("synthetic", "pro"), anytime);
+        assert_eq!(effective_rule(&settings, "synthetic", "pro").unwrap().mode, "anytime");
+        let mut mixed = before;
+        mixed.model_usage_windows.get_mut(&model_key("synthetic", "pro")).unwrap().mode = "anytime".into();
+        assert!(!migrate_endpoint_defaults(&mut mixed));
+        assert!(mixed.endpoint_usage_windows.is_empty());
+    }
+
     #[test]
     fn years_without_a_bundled_notice_stay_conservative() {
         let rule = presets().remove("deepseek_off_peak").unwrap();

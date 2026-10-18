@@ -701,6 +701,7 @@ export interface Settings {
    *  CodeFactory may consume before it hands the turn to the next endpoint.
    *  Missing → 80% / 80%. Only consulted for subscription (ChatGPT) endpoints;
    *  pay-per-token endpoints are never capped. */
+  endpoint_usage_windows?: Record<string, import("./usageWindows").UsageWindow>;
   model_usage_windows?: Record<string, import("./usageWindows").UsageWindow>;
   subscription_quota_caps?: Record<
     string,

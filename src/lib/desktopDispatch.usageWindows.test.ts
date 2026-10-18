@@ -24,6 +24,17 @@ describe("CF-WINDOW-R1/R7 model settings dispatch", () => {
     expect(await dispatch("get_usage_windows")).toMatchObject({ok:true,result:[{endpoint:"a",model:"pro"},{endpoint:"a",model:"flash"}]});
     expect(mocks.invoke.mock.calls.every(([command]) => command === "save_settings")).toBe(true);
   });
+  it("R1/R3/R6 endpoint default covers new models and model exceptions override it", async () => {
+    const rule = applyPreset("deepseek_off_peak");
+    expect(await dispatch("set_usage_window", { endpoint: "a", rule })).toMatchObject({ ok: true });
+    const current = useSettingsStore.getState().settings!;
+    useSettingsStore.setState({ settings: { ...current, endpoints: { ...current.endpoints, a: { ...current.endpoints.a, custom_models: [...(current.endpoints.a.custom_models ?? []), { id: "new-model", name: "New" }] } } } });
+    expect(await dispatch("get_usage_windows")).toMatchObject({ ok: true, result: expect.arrayContaining([expect.objectContaining({ endpoint: "a", model: "new-model", source: "endpoint", rule })]) });
+    expect(await dispatch("set_usage_window", { endpoint: "a", model: "pro", rule: { mode: "anytime" } })).toMatchObject({ ok: true });
+    expect(getUsageWindows().find(row => row.model === "pro")).toMatchObject({ source: "model", rule: { mode: "anytime" } });
+    expect(await dispatch("set_usage_window", { endpoint: "a", model: "pro", rule: null })).toMatchObject({ ok: true });
+    expect(getUsageWindows().find(row => row.model === "pro")).toMatchObject({ source: "endpoint", rule });
+  });
   it.each([{mode:"bad"},{mode:"custom",timezone:"bad-zone"},{mode:"custom",periods:[{start:"99:00",end:"12:00"}]}])("rejects invalid rules %j", async rule => {
     expect(await dispatch("set_usage_window",{endpoint:"a",model:"pro",rule})).toMatchObject({ok:false,error:{code:"invalid_request"}});
     expect(mocks.invoke).not.toHaveBeenCalled();
