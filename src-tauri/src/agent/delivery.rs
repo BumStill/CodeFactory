@@ -6083,13 +6083,23 @@ pub async fn deliver<R: DeliveryRemote>(
                 )
             }
             CiStatus::Pending => {
+                // CF-BG-R2 / R5：把等待交还给 agent，而不是在工具里轮询。
+                // agent 必须自己挂一个后台监视，被唤醒后再回来核对同一 PR/head。
+                let _ = ci_timeout_secs;
                 return outcome.waiting_at(
                     StepResult::waiting(
                         "ci",
-                        format!("CI 在 {ci_timeout_secs}s 内仍未出结论，交付保持运行中。"),
+                        format!(
+                            "PR #{pr_number} 已打开，CI 正在进行（本轮只做了一次观察，不阻塞等待）。"
+                        ),
                     ),
-                    30_000,
-                    "等待退避后重新调用 deliver_changes，从同一 PR 和 head 继续核对 CI。",
+                    180_000,
+                    format!(
+                        "现在立刻用 `background_task_start` 监视这个 PR 的 CI：\
+`gh pr checks {pr_number} --watch`（或每 ≥180s 轮询一次的脚本，避免 M114 的 GitHub API 额度问题），\
+source=agent_decided。任务结束被唤醒后：失败→修复并 push 后重新调用 deliver_changes；\
+全绿→重新调用 deliver_changes 续接合并且打 `merge-queue: armed`。"
+                    ),
                 )
             }
         }
@@ -6836,104 +6846,90 @@ fn ci_failure_is_retryable(detail: &str) -> bool {
 async fn wait_for_ci<R: DeliveryRemote>(
     remote: &R,
     sha: &str,
-    timeout_secs: u32,
+    _timeout_secs: u32,
     opts: &DeliverOpts,
 ) -> CiWaitOutcome {
-    let deadline = timeout_secs.max(1);
-    let mut waited = 0u32;
-    let mut reruns = 0u8;
+    // CF-BG-R2（M117 真机证据）：这里以前是一个 10s→60s 退避、最长
+    // `ci_timeout_secs` 的阻塞轮询，把整个工具调用和回合占满。结果是 agent
+    // 从来没机会按 R5 挂 `background_task_start` 监视 CI，`background_tasks`
+    // 表在真机上始终是 0 行。
+    //
+    // 交付工具只做**一次**观察：CI 已出结论就继续（成功/失败/不可用），还在跑
+    // 就把「CI 正在进行」明确交还 agent，由它自己开后台任务或定时唤醒继续盯。
+    // 停止栅栏仍然在观察前读一次（M47）。
+    if let Some(reason) = stop_reason(opts).await {
+        return CiWaitOutcome {
+            status: CiStatus::Pending,
+            recoveries: Vec::new(),
+            mutation_permit_failure: None,
+            stop_reason: Some(reason),
+        };
+    }
+
     let mut recoveries = Vec::new();
-    // Exponential backoff: 10s → 20s → 40s → 60s (capped). GitHub check-runs
-    // polling is the biggest API cost of a delivery run; a fixed 10s cadence
-    // burns ~30 requests for a 5-minute CI. Backoff keeps the first polls
-    // snappy while slashing total calls on longer runs.
-    let mut interval = 10u32;
-    loop {
-        // CF-STOP-R1: this wait is the exact place M47 escaped through — the
-        // user stopped the session, the ladder kept polling, CI turned green,
-        // and the PR was merged minutes later. Read the stop fence before every
-        // poll, so a stop ends the wait instead of merely decorating it.
-        if let Some(reason) = stop_reason(opts).await {
-            return CiWaitOutcome {
-                status: CiStatus::Pending,
-                recoveries,
-                mutation_permit_failure: None,
-                stop_reason: Some(reason),
-            };
-        }
-        match remote.ci_status(sha).await {
-            Ok(CiStatus::Pending) => {}
-            Ok(CiStatus::Failure(detail)) if ci_failure_is_retryable(&detail) && reruns < 1 => {
-                if let Err(step) = verify_mutation_permit(opts, "rerun_ci").await {
-                    return CiWaitOutcome {
-                        status: CiStatus::Failure(detail),
-                        recoveries,
-                        mutation_permit_failure: Some(step),
-                        stop_reason: None,
-                    };
+    let mut outcome = match remote.ci_status(sha).await {
+        Ok(CiStatus::Failure(detail)) if ci_failure_is_retryable(&detail) => {
+            if let Err(step) = verify_mutation_permit(opts, "rerun_ci").await {
+                CiWaitOutcome {
+                    status: CiStatus::Failure(detail),
+                    recoveries,
+                    mutation_permit_failure: Some(step),
+                    stop_reason: None,
                 }
+            } else {
                 match remote.rerun_ci(sha, opts.mutation_permit.as_ref()).await {
                     Ok(true) => {
-                        reruns += 1;
-                        waited = 0;
-                        interval = 10;
                         recoveries.push(format!(
                             "检测到可重试的 CI 基础设施结论 `{detail}`，已触发一次有界 rerun"
                         ));
-                        continue;
-                    }
-                    Ok(false) => {
-                        return CiWaitOutcome {
-                            status: CiStatus::Failure(format!(
-                                "{detail}; 当前 provider 没有 CI rerun 能力"
-                            )),
+                        // 重跑后立刻再看一次：基础设施抖动通常会马上回到 pending/success。
+                        let status = match remote.ci_status(sha).await {
+                            Ok(status) => status,
+                            Err(error) => CiStatus::Unavailable(error),
+                        };
+                        CiWaitOutcome {
+                            status,
                             recoveries,
                             mutation_permit_failure: None,
                             stop_reason: None,
                         }
                     }
-                    Err(error) => {
-                        return CiWaitOutcome {
-                            status: CiStatus::Failure(format!(
-                                "{detail}; 自动 rerun 失败: {error}"
-                            )),
-                            recoveries,
-                            mutation_permit_failure: None,
-                            stop_reason: None,
-                        }
-                    }
-                }
-            }
-            Ok(other) => {
-                return CiWaitOutcome {
-                    status: other,
-                    recoveries,
-                    mutation_permit_failure: None,
-                    stop_reason: None,
-                }
-            }
-            Err(e) => {
-                return CiWaitOutcome {
-                    status: CiStatus::Unavailable(e),
-                    recoveries,
-                    mutation_permit_failure: None,
-                    stop_reason: None,
+                    Ok(false) => CiWaitOutcome {
+                        status: CiStatus::Failure(format!(
+                            "{detail}; 当前 provider 没有 CI rerun 能力"
+                        )),
+                        recoveries,
+                        mutation_permit_failure: None,
+                        stop_reason: None,
+                    },
+                    Err(error) => CiWaitOutcome {
+                        status: CiStatus::Failure(format!("{detail}; 自动 rerun 失败: {error}")),
+                        recoveries,
+                        mutation_permit_failure: None,
+                        stop_reason: None,
+                    },
                 }
             }
         }
-        if waited >= deadline {
-            return CiWaitOutcome {
-                status: CiStatus::Pending,
-                recoveries,
-                mutation_permit_failure: None,
-                stop_reason: None,
-            };
-        }
-        let sleep_secs = interval.min(deadline - waited);
-        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs as u64)).await;
-        waited += sleep_secs;
-        interval = (interval * 2).min(60);
+        Ok(status) => CiWaitOutcome {
+            status,
+            recoveries,
+            mutation_permit_failure: None,
+            stop_reason: None,
+        },
+        Err(error) => CiWaitOutcome {
+            status: CiStatus::Unavailable(error),
+            recoveries,
+            mutation_permit_failure: None,
+            stop_reason: None,
+        },
+    };
+    // M47 / CF-STOP-R1：停止可能就发生在这一次观察期间（旧实现靠轮询前的
+    // 重复检查覆盖这段窗口）。观察结束后再读一次栅栏，停止优先于任何结论。
+    if outcome.stop_reason.is_none() {
+        outcome.stop_reason = stop_reason(opts).await;
     }
+    outcome
 }
 
 // ── GitHub provider (gh CLI, preferred) ─────────────────────────────────────
@@ -15439,6 +15435,47 @@ else:
         ] {
             assert!(!is_managed_objective_placeholder_title(real), "{real}");
         }
+    }
+
+    /// CF-BG-R2：CI 还在跑时交付工具必须尽快交还 agent，而不是自己把回合挂在
+    /// `gh` 轮询里。真机上 R5「用后台任务监视 CI」之所以从未发生，就是因为这条
+    /// 阻塞等待把回合占满（background_tasks 表 0 行）。
+    #[tokio::test]
+    async fn pending_ci_is_handed_back_to_the_agent_with_a_background_watch_instead_of_looping() {
+        let root = feature_branch_repo("ci-pending-handoff");
+        let calls = stub_calls();
+        let remote = StubRemote {
+            ci: CiStatus::Pending,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+
+        let started = std::time::Instant::now();
+        let out = deliver(
+            &root,
+            DeliveryCeiling::ThroughCiGreen,
+            MergeMethod::Squash,
+            600,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+
+        assert_eq!(out.final_state, "waiting", "{:?}", out.steps);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "交付工具把 600s 的 CI 等待塞进了工具调用：{:?}",
+            started.elapsed()
+        );
+        assert_eq!(calls.ci.load(Ordering::SeqCst), 1, "只做一次观察");
+        assert!(out.summary.contains("CI 正在进行"), "{}", out.summary);
+        let next = out.next_action.as_deref().unwrap_or_default();
+        assert!(next.contains("background_task_start"), "{next}");
+        assert!(next.contains("180"), "推荐间隔必须说明 M114 的 180s 下限：{next}");
     }
 
     #[tokio::test]
