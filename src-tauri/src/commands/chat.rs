@@ -585,6 +585,11 @@ pub async fn cancel_chat(
         .request_chat_session_cancel(&session_id)
         .await
         .map_err(|error| AppError::Other(error.to_string()))?;
+    // CF-BG R3：会话被用户停止时回收它的全部后台任务（杀进程树、终态化、不再唤醒）。
+    let reclaimed = crate::agent::background_tasks::reclaim_session(&pool, &session_id).await;
+    if reclaimed > 0 {
+        tracing::info!(reclaimed, "background tasks reclaimed for stopped session");
+    }
     if let Some(control) = control.as_ref() {
         if control.durable {
             request_chat_run_cancel(&pool, &control.run_instance_id, &session_id).await?;

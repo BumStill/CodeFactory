@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
+pub mod background_task;
 pub mod browser_session;
 pub mod delegate_tasks;
 pub mod delivery;
@@ -182,6 +183,10 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         knowledge::search_definition(),
         knowledge::get_chunk_definition(),
         bash::definition(),
+        background_task::start_definition(),
+        background_task::list_definition(),
+        background_task::output_definition(),
+        background_task::stop_definition(),
         browser_session::definition(),
         pptx::definition(),
         pptx_edit::read_definition(),
@@ -213,6 +218,10 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "kb_search" => knowledge::execute_search(args, ctx).await,
         "kb_get_chunk" => knowledge::execute_get_chunk(args, ctx).await,
         "bash" => bash::execute(args, ctx).await,
+        "background_task_start" => background_task::execute_start(args, ctx).await,
+        "background_task_list" => background_task::execute_list(args, ctx).await,
+        "background_task_output" => background_task::execute_output(args, ctx).await,
+        "background_task_stop" => background_task::execute_stop(args, ctx).await,
         "browser_session" => browser_session::execute(args, ctx).await,
         "write_pptx" => pptx::execute(args, ctx).await,
         "read_pptx" => pptx_edit::execute_read(args, ctx).await,

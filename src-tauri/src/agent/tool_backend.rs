@@ -383,7 +383,8 @@ fn desktop_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (Strin
         // This is an explicit read-only capability list. Every new native tool
         // defaults to Mutation until it receives an audited typed classifier.
         "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" | "read_pptx"
-        | "skill_list" | "skill_search" | "read_xlsx" => ToolKind::ReadOnly,
+        | "skill_list" | "skill_search" | "read_xlsx" | "background_task_list"
+        | "background_task_output" => ToolKind::ReadOnly,
         _ => ToolKind::Mutation,
     };
     (command, kind)
@@ -3654,6 +3655,11 @@ mod tests {
             "skill_list",
             "skill_search",
             "read_xlsx",
+            // CF-BG: these two only read one session's rows and one output file
+            // — no spawn, no state change. `background_task_start` and
+            // `background_task_stop` stay Mutation, so they still need approval.
+            "background_task_list",
+            "background_task_output",
         ];
         for definition in crate::tools::all_definitions() {
             let name = definition.function.name;

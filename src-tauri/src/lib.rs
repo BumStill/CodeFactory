@@ -1675,6 +1675,8 @@ pub fn run() {
             let scheduler_handles: commands::tasks::SchedulerHandles =
                 Arc::new(Mutex::new(HashMap::new()));
             app.manage(scheduler_handles);
+            // CF-BG：启动后台任务对账 + 唤醒投递循环（重启后继续监视/补发唤醒）。
+            crate::agent::background_tasks::start_runtime(app.handle().clone());
             let objective_store = agent::objective::ObjectiveStore::new(objective_pool.clone());
             let cancelled_sessions = tauri::async_runtime::block_on(
                 objective_store.consume_pending_chat_session_cancellations(),
