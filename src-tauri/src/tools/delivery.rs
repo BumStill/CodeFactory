@@ -2850,12 +2850,34 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
     // CF-TRUTH-R7/R8/R9: remote truth precedes every local replay check.
     // Observing a merge grants settlement authority, never mutation authority.
     if let Some(number) = claimed.canonical_pr_number {
+        // M114b/R2: a canonical PR that already reached a conclusion (merged,
+        // or closed without merge) must never be re-observed. Field evidence:
+        // #680/#704/#710 belonged to objectives waiting for the user
+        // (`waiting_core_input` / `agent_action_required`), which the cleanup
+        // reconcile set did not cover, so this supervisor re-claimed them every
+        // 15s and re-ran `gh pr view` four times a minute, forever.
+        let concluded = crate::agent::execution_workspace::pr_observation_concluded(
+            &db,
+            &claimed.run_id,
+        )
+        .await
+        .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+        if concluded {
+            delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
+                chrono::Utc::now().timestamp_millis(), "canonical_pr_observation_concluded").await?;
+            return Ok(());
+        }
         let observed = match (remote, claimed.canonical_head_sha.as_deref()) {
             (Some(remote), Some(head)) => remote.observe_merge(number as u64, head).await,
             _ => Ok(delivery::MergeObservation::Unsupported),
         };
         match observed {
             Ok(delivery::MergeObservation::Merged { merge_sha }) if !merge_sha.trim().is_empty() => {
+                crate::agent::execution_workspace::record_supervisor_pr_observation(
+                    &db, &claimed.run_id, "merged", true,
+                )
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
                 delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
                     chrono::Utc::now().timestamp_millis(), "canonical_pr_observed_before_takeover").await?;
                 crate::agent::execution_workspace::reconcile_parked_delivery_progress(
@@ -2863,12 +2885,43 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
                 ).await.map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
                 return Ok(());
             }
-            Ok(delivery::MergeObservation::OpenSameHead { .. } | delivery::MergeObservation::ClosedUnmerged) => {}
+            Ok(delivery::MergeObservation::ClosedUnmerged) => {
+                // Closed without merge is a conclusion: nothing can change it
+                // by asking again, and the next pass must not re-observe.
+                crate::agent::execution_workspace::record_supervisor_pr_observation(
+                    &db, &claimed.run_id, "closed", true,
+                )
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+                delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
+                    chrono::Utc::now().timestamp_millis(), "canonical_pr_observation_concluded").await?;
+                return Ok(());
+            }
+            Ok(delivery::MergeObservation::OpenSameHead { .. }) => {
+                crate::agent::execution_workspace::record_supervisor_pr_observation(
+                    &db, &claimed.run_id, "open", false,
+                )
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+            }
             Ok(delivery::MergeObservation::HeadChanged { actual_head })
-                if remote.is_some_and(|remote| remote.head_is_explained(&claimed.expected_head_sha, &actual_head)) => {}
+                if remote.is_some_and(|remote| remote.head_is_explained(&claimed.expected_head_sha, &actual_head)) => {
+                    crate::agent::execution_workspace::record_supervisor_pr_observation(
+                        &db, &claimed.run_id, "open", false,
+                    )
+                    .await
+                    .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+            }
             _ => {
                 // No identity failure may be inferred from an offline/unknown
-                // provider. Release the claim without rewriting progress.
+                // provider. Release the claim without rewriting progress, but
+                // do remember the answer so the next claim backs off instead of
+                // re-asking every poll.
+                crate::agent::execution_workspace::record_supervisor_pr_observation(
+                    &db, &claimed.run_id, "unknown", false,
+                )
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
                 delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
                     chrono::Utc::now().timestamp_millis(), "canonical_pr_observed_before_takeover").await?;
                 return Ok(());
