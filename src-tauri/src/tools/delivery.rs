@@ -111,6 +111,29 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         .and_then(Value::as_str)
         .and_then(parse_ceiling);
 
+    // M116-R2: the ceiling this session's own dispatch/steer message declared is
+    // the authorization the first delivery must default to — not the global
+    // setting, which is a standing default and may be lower (production
+    // 2026-10-18: dispatch said `ceiling: merged`, the run was recorded pr_only).
+    // M116-R3: a request above that authorization is refused here, before any
+    // side effect, instead of being silently clamped or reported as an identity
+    // collision of the caller's own delivery.
+    let session_ceiling =
+        load_session_delivery_ceiling(ctx).await;
+    if let Some(refusal) = ceiling_request_refusal(
+        settings.delivery_ceiling,
+        session_ceiling,
+        requested_ceiling,
+    ) {
+        return Ok(ToolOutput::err(refusal));
+    }
+    let settings = {
+        let mut settings = settings;
+        settings.delivery_ceiling =
+            resolve_authorized_ceiling(settings.delivery_ceiling, session_ceiling);
+        settings
+    };
+
     let mut opts = DeliverOpts {
         title,
         body,
@@ -3464,14 +3487,55 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
 }
 
 fn parse_ceiling(s: &str) -> Option<DeliveryCeiling> {
-    match s {
-        "off" => Some(DeliveryCeiling::Off),
-        "pr_only" => Some(DeliveryCeiling::PrOnly),
-        "through_ci_green" => Some(DeliveryCeiling::ThroughCiGreen),
-        "through_merge" => Some(DeliveryCeiling::ThroughMerge),
-        "through_release" => Some(DeliveryCeiling::ThroughRelease),
-        _ => None,
+    DeliveryCeiling::from_label(s)
+}
+
+/// M116-R2: the ceiling this delivery is actually authorized for.
+///
+/// The global configuration remains the hard maximum. A session declaration
+/// narrows the default to that task's authorized ceiling; absent a declaration,
+/// the standing configuration is used. Messages cannot widen global authority.
+pub(crate) fn resolve_authorized_ceiling(
+    configured: DeliveryCeiling,
+    session: Option<DeliveryCeiling>,
+) -> DeliveryCeiling {
+    if configured == DeliveryCeiling::Off {
+        return DeliveryCeiling::Off;
     }
+    session.map(|ceiling| configured.clamp_request(ceiling)).unwrap_or(configured)
+}
+
+/// M116-R3: refuse an explicit request that exceeds the authorized ceiling.
+/// Returns the user-facing explanation, or `None` when the request is inside the
+/// boundary (including "no ceiling passed", which then defaults to it).
+pub(crate) fn ceiling_request_refusal(
+    configured: DeliveryCeiling,
+    session: Option<DeliveryCeiling>,
+    requested: Option<DeliveryCeiling>,
+) -> Option<String> {
+    let requested = requested?;
+    let authorized = resolve_authorized_ceiling(configured, session);
+    if requested.rank() <= authorized.rank() {
+        return None;
+    }
+    let scope = if session.is_some() {
+        "本会话已授权的交付上限"
+    } else {
+        "当前设置的交付上限"
+    };
+    Some(format!(
+        "本次请求交付到 {}，高于{} {}；未执行提交、推送或 PR 操作，也没有放宽授权边界。同一任务的交付记录仍属同一条交付：请在 {} 以内重试，或用你本人的消息显式提高授权上限（例如「授权交付，ceiling: through_release」）。",
+        requested.label(),
+        scope,
+        authorized.label(),
+        authorized.label(),
+    ))
+}
+
+async fn load_session_delivery_ceiling(ctx: &ExecCtx) -> Option<DeliveryCeiling> {
+    let db = ctx.db.as_ref()?;
+    let session_id = ctx.session_id.as_deref()?;
+    crate::agent::fetch_session_delivery_ceiling(db, session_id).await
 }
 
 fn parse_release_urgency(s: &str) -> Option<ReleaseUrgency> {
@@ -7516,5 +7580,55 @@ mod tests {
             error.to_string().contains("different pull request"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn m116_tool_refuses_above_session_before_repository_side_effects() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY, delivery_ceiling TEXT)")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO sessions VALUES ('synthetic-m116', 'pr_only')")
+            .execute(&db).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = ExecCtx::new(temp.path().into(), Some(db));
+        ctx.session_id = Some("synthetic-m116".into());
+        ctx.settings = Some(crate::config::settings::Settings::default());
+        assert_eq!(load_session_delivery_ceiling(&ctx).await, Some(DeliveryCeiling::PrOnly));
+        let output = execute(json!({"ceiling": "merged"}), &ctx).await.unwrap();
+        let value = serde_json::to_value(&output).unwrap().to_string();
+        assert!(value.contains("本会话已授权的交付上限"), "{value}");
+        assert!(!value.contains("请回到原任务的原工作区"), "{value}");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn m116_ceiling_above_the_session_authorization_is_refused_with_a_readable_reason() {
+        use DeliveryCeiling::*;
+        // The production shape: global setting pr_only, dispatch authorized
+        // merged, the agent asked for through_merge.
+        assert_eq!(resolve_authorized_ceiling(ThroughRelease, Some(ThroughMerge)), ThroughMerge);
+        assert_eq!(resolve_authorized_ceiling(PrOnly, Some(ThroughMerge)), PrOnly);
+        assert_eq!(
+            ceiling_request_refusal(ThroughRelease, Some(ThroughMerge), Some(ThroughMerge)),
+            None,
+            "a request inside the session authorization is not refused"
+        );
+        // Unchanged behaviour when the session declared nothing.
+        assert_eq!(resolve_authorized_ceiling(PrOnly, None), PrOnly);
+        let refusal = ceiling_request_refusal(PrOnly, Some(PrOnly), Some(ThroughMerge))
+            .expect("a request above the session authorization is refused");
+        assert!(refusal.contains("本会话已授权的交付上限"), "{refusal}");
+        assert!(refusal.contains("pr_only"), "{refusal}");
+        assert!(refusal.contains("through_merge"), "{refusal}");
+        assert!(
+            !refusal.contains("请回到原任务的原工作区"),
+            "the caller is in the original workspace: {refusal}"
+        );
+        // A session may narrow the global setting; the narrowed bound wins.
+        assert_eq!(resolve_authorized_ceiling(ThroughRelease, Some(PrOnly)), PrOnly);
+        // `off` is an absolute veto: no message turns delivery back on.
+        assert_eq!(resolve_authorized_ceiling(Off, Some(ThroughRelease)), Off);
+        assert!(ceiling_request_refusal(Off, Some(ThroughRelease), Some(PrOnly)).is_some());
     }
 }

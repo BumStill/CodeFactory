@@ -1371,6 +1371,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    ensure_column(pool, "sessions", "delivery_ceiling", "TEXT").await?;
     // Per-session permission preset. Existing sessions get standard so old
     // global allow/ask/deny details no longer leak into the primary UX.
     ensure_column(

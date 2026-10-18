@@ -2651,6 +2651,12 @@ async fn admit_persisted_chat_turn(
                 .bind(session_id)
                 .execute(&mut *tx)
                 .await?;
+            // M116-R2: a revoked session must not keep a stale ceiling that a
+            // later, unrelated grant would inherit.
+            let _ = sqlx::query("UPDATE sessions SET delivery_ceiling=NULL WHERE id=?")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
         }
         crate::agent::DeliveryAuthorizationUpdate::Granted => {
             // M47 R4: only fresh explicit authorization may lift a delivery stop.
@@ -2665,6 +2671,19 @@ async fn admit_persisted_chat_turn(
                 .bind(session_id)
                 .execute(&mut *tx)
                 .await?;
+            // M116-R2: keep the ceiling the user actually wrote down
+            // ("授权交付（ceiling: merged）") instead of only recording that some
+            // delivery was authorized. Without this the first delivery falls back
+            // to the global setting and can be recorded below what the dispatch
+            // authorized. A message that declares no ceiling leaves the previous
+            // value alone; nothing here can widen the global `off`.
+            if let Some(declared) = crate::agent::declared_delivery_ceiling(content) {
+                let _ = sqlx::query("UPDATE sessions SET delivery_ceiling=? WHERE id=?")
+                    .bind(declared.label())
+                    .bind(session_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         crate::agent::DeliveryAuthorizationUpdate::Unchanged => {}
     }

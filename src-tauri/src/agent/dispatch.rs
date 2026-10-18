@@ -472,6 +472,66 @@ fn ceiling_declaration(lowercased: &str) -> bool {
     tokens(lowercased)
         .windows(2)
         .any(|pair| pair[0] == "ceiling" && DELIVERY_CEILINGS.contains(&pair[1]))
+        || declared_ceiling_word(lowercased).is_some()
+}
+
+/// M116-R2: read the ceiling word that follows `ceiling` without discarding its
+/// value. `tokens()` splits on every non-alphanumeric character, which is why a
+/// compound label (`through_ci_green`) could never be read from a message and a
+/// dispatch saying `ceiling: merged` only ever produced a boolean grant.
+fn declared_ceiling_word(lowercased: &str) -> Option<&'static str> {
+    const WORDS: &[(&str, &str)] = &[
+        ("through_release", "through_release"),
+        ("through_ci_green", "through_ci_green"),
+        ("through_merge", "through_merge"),
+        ("pr_only", "pr_only"),
+        ("merged", "through_merge"),
+    ];
+    let mut widest: Option<&'static str> = None;
+    for (index, _) in lowercased.match_indices("ceiling") {
+        let rest = lowercased[index + "ceiling".len()..].trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, ':' | '：' | '=' | '(' | '（')
+        });
+        let Some((_, label)) = WORDS.iter().find(|(word, _)| {
+            rest.starts_with(word)
+                && rest[word.len()..]
+                    .chars()
+                    .next()
+                    .map(|next| !next.is_alphanumeric())
+                    .unwrap_or(true)
+        }) else {
+            continue;
+        };
+        let label = *label;
+        let rank = |value: &str| {
+            crate::config::settings::DeliveryCeiling::from_label(value)
+                .map(|c| c.rank())
+                .unwrap_or(0)
+        };
+        if widest.map_or(true, |current| rank(label) > rank(current)) {
+            widest = Some(label);
+        }
+    }
+    widest
+}
+
+/// M116-R2: the delivery ceiling this message actually declared, e.g.
+/// "授权交付（ceiling: merged）". Only an explicit delivery grant may declare a
+/// ceiling — a question about a ceiling is not an authorization — and the widest
+/// declaration in the message wins.
+pub fn declared_delivery_ceiling(user_msg: &str) -> Option<crate::config::settings::DeliveryCeiling> {
+    if !is_explicit_delivery_authorization(user_msg) {
+        return None;
+    }
+    let lowercased = user_msg.trim().to_lowercase();
+    // Preserve underscores in labels; do not match `nonceiling` or label suffixes.
+    let words: Vec<&str> = lowercased
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.windows(2).filter(|pair| pair[0] == "ceiling")
+        .filter_map(|pair| crate::config::settings::DeliveryCeiling::from_label(pair[1]))
+        .max_by_key(|ceiling| ceiling.rank())
 }
 
 /// Did the user explicitly authorize delivery in THIS message? (M48 R1/R2)
@@ -1981,5 +2041,47 @@ mod tests {
                 "{message} keeps the read-only constraint"
             );
         }
+    }
+
+    /// M116-R2/R4: the dispatch message's declared ceiling must survive parsing.
+    /// Before this, `ceiling: merged` only produced a boolean grant, so the first
+    /// delivery fell back to the global `pr_only` and was recorded there.
+    #[test]
+    fn m116_declared_ceiling_is_read_from_the_dispatch_message() {
+        use crate::config::settings::DeliveryCeiling;
+        let cases = [
+            ("授权交付（ceiling: merged）。按分支交付。", DeliveryCeiling::ThroughMerge),
+            ("开始实施：授权交付（ceiling: through_merge）", DeliveryCeiling::ThroughMerge),
+            ("授权交付，ceiling: pr_only。", DeliveryCeiling::PrOnly),
+            ("授权交付（ceiling: through_ci_green）", DeliveryCeiling::ThroughCiGreen),
+            ("授权交付（ceiling: through_release）", DeliveryCeiling::ThroughRelease),
+            ("Delivery authorized — ceiling: merged.", DeliveryCeiling::ThroughMerge),
+            // The widest declaration in one message wins.
+            ("授权交付，ceiling: pr_only，最终 ceiling: merged", DeliveryCeiling::ThroughMerge),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                declared_delivery_ceiling(message),
+                Some(expected),
+                "{message}"
+            );
+        }
+    }
+
+    /// A message that authorizes delivery but names no ceiling must leave the
+    /// previous/default ceiling alone, and an explicit read-only directive must
+    /// not produce a ceiling at all.
+    #[test]
+    fn m116_declared_ceiling_requires_a_writable_delivery_grant() {
+        assert_eq!(declared_delivery_ceiling("继续，你被授权交付。"), None);
+        assert_eq!(
+            declared_delivery_ceiling("授权交付，ceiling: merged，但只分析，不要修改任何文件。"),
+            None
+        );
+        // Existing dispatch contract: a ceiling declaration is itself a grant.
+        assert_eq!(
+            declared_delivery_ceiling("ceiling: merged"),
+            Some(crate::config::settings::DeliveryCeiling::ThroughMerge)
+        );
     }
 }
