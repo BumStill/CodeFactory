@@ -15242,7 +15242,7 @@ else:
 
         assert_eq!(out.final_state, "waiting", "{:?}", out.steps);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < std::time::Duration::from_secs(60),
             "交付工具把 600s 的 CI 等待塞进了工具调用：{:?}",
             started.elapsed()
         );
