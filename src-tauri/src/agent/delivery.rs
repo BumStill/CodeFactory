@@ -1732,6 +1732,14 @@ pub trait DeliveryRemote {
         std::future::ready(Err("adapter cannot arm the merge queue".into()))
     }
 
+    /// M114c: does this adapter actually implement queue arming? Only then may a
+    /// merge-or-higher ceiling *block* on an arming failure; an adapter with no
+    /// such rung (provider hook, GitLab) keeps the previous partial-truth
+    /// behaviour instead of stalling delivery forever.
+    fn supports_merge_queue_arm(&self) -> bool {
+        false
+    }
+
     /// U31: clear a PR's merge-queue arm. Called when a delivery task stops, so a
     /// stopped task cannot keep merging in the background (M47).
     fn clear_merge_queue_arm(
@@ -6093,7 +6101,7 @@ pub async fn deliver<R: DeliveryRemote>(
         if let Some(reason) = stop_reason(opts).await {
             return outcome.stopped_at("merge_queue_arm", &reason);
         }
-        if merge_queue_arm_is_owed(&ceiling) || merge_queue_arm_is_owed(&requested_ceiling) {
+        if merge_queue_arm_is_owed(&ceiling) {
             match arm_merge_queue_with_bounded_retry(remote, pr_number, &sha, opts).await {
                 Ok(attempt) => outcome.steps.push(StepResult::ok(
                     "merge_queue_arm",
@@ -6101,6 +6109,14 @@ pub async fn deliver<R: DeliveryRemote>(
                         "已为 PR/MR #{pr_number} 打上 `{MERGE_QUEUE_ARM_LABEL}`（第 {attempt} 次尝试），交给合并队列处理合并。"
                     ),
                 )),
+                Err(report) if remote.supports_merge_queue_arm() => {
+                    // M114c: the adapter can arm, and failed. The PR is NOT in
+                    // the queue, so the ladder must stop rather than merge it
+                    // itself. Field incident PR #742: arming failed three times,
+                    // the ladder continued and squash-merged directly, bypassing
+                    // the queue's ordered re-verification.
+                    return outcome.blocked_at(StepResult::blocked("merge_queue_arm", report));
+                }
                 Err(report) => outcome
                     .steps
                     .push(StepResult::blocked("merge_queue_arm", report)),
@@ -8142,6 +8158,36 @@ fn gh_ensure_merge_queue_label_args() -> Vec<String> {
     ]
 }
 
+/// Percent-encode one REST path segment (label names carry `:` and spaces).
+fn encode_rest_path_segment(raw: &str) -> String {
+    let mut out = String::new();
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn github_repo_label_path(repo: &str, label: &str) -> String {
+    format!("/repos/{repo}/labels/{}", encode_rest_path_segment(label))
+}
+
+fn github_issue_labels_path(repo: &str, number: u64) -> String {
+    format!("/repos/{repo}/issues/{number}/labels")
+}
+
+fn github_issue_label_path(repo: &str, number: u64, label: &str) -> String {
+    format!(
+        "{}/{}",
+        github_issue_labels_path(repo, number),
+        encode_rest_path_segment(label)
+    )
+}
+
 /// `gh` args that arm a PR for the merge queue.
 fn gh_arm_merge_queue_args(number: u64) -> Vec<String> {
     vec![
@@ -8713,6 +8759,10 @@ impl DeliveryRemote for GhCliRemote {
     /// U31: clear the arm so a stopped task cannot keep merging (M47).
     async fn clear_merge_queue_arm(&self, number: u64) -> Result<(), String> {
         self.gh(&gh_clear_merge_queue_arm_args(number)).map(|_| ())
+    }
+
+    fn supports_merge_queue_arm(&self) -> bool {
+        true
     }
 
     fn capabilities(&self) -> DeliveryCapabilities {
@@ -9503,6 +9553,14 @@ impl DeliveryRemote for EitherRemote {
             EitherRemote::Gh(r) => r.capabilities(),
             EitherRemote::Github(r) => r.capabilities(),
             EitherRemote::Gitlab(r) => r.capabilities(),
+        }
+    }
+    fn supports_merge_queue_arm(&self) -> bool {
+        match self {
+            EitherRemote::Hook(r) => r.supports_merge_queue_arm(),
+            EitherRemote::Gh(r) => r.supports_merge_queue_arm(),
+            EitherRemote::Github(r) => r.supports_merge_queue_arm(),
+            EitherRemote::Gitlab(r) => r.supports_merge_queue_arm(),
         }
     }
 
@@ -10486,6 +10544,50 @@ impl DeliveryRemote for GitlabRemote {
 }
 
 impl DeliveryRemote for GithubRemote {
+    /// M114c: the token+REST remote is a first-class delivery adapter, so it
+    /// must be able to hand a green PR to the merge queue. Before this it fell
+    /// through to the trait default ("adapter cannot arm the merge queue"), so
+    /// `ceiling: merged` silently degraded to a direct squash merge.
+    async fn arm_merge_queue(&self, number: u64, _expected_head: &str) -> Result<(), String> {
+        // The label may not exist yet in the repository; creating it first keeps
+        // the arm idempotent instead of failing with 422 on every attempt.
+        if self
+            .client
+            .get(&github_repo_label_path(&self.repo, MERGE_QUEUE_ARM_LABEL))
+            .await
+            .is_err()
+        {
+            self.client
+                .post(
+                    &format!("/repos/{}/labels", self.repo),
+                    json!({
+                        "name": MERGE_QUEUE_ARM_LABEL,
+                        "color": "0e8a16",
+                        "description": "Authorized for the repository merge queue (U31)",
+                    }),
+                )
+                .await?;
+        }
+        self.client
+            .post(
+                &github_issue_labels_path(&self.repo, number),
+                json!({ "labels": [MERGE_QUEUE_ARM_LABEL] }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_merge_queue_arm(&self, number: u64) -> Result<(), String> {
+        self.client
+            .delete(&github_issue_label_path(
+                &self.repo,
+                number,
+                MERGE_QUEUE_ARM_LABEL,
+            ))
+            .await?;
+        Ok(())
+    }
+
     fn capabilities(&self) -> DeliveryCapabilities {
         DeliveryCapabilities {
             review: true,
@@ -12559,6 +12661,118 @@ README-Update: reviewed\nREADME-Update-Reason: 本轮不改变产品承诺与安
         assert!(report.contains("HTTP 502"), "{report}");
     }
 
+    /// M114c: a failed merge-queue arm must block, never fall back to merging.
+    /// Field incident: PR #742 arming failed three times, the ladder continued
+    /// and squash-merged directly — bypassing the queue entirely.
+    #[tokio::test]
+    async fn m114c_arm_failure_blocks_instead_of_merging_directly() {
+        use std::sync::atomic::Ordering;
+        let root = feature_branch_repo("m114c-arm-failure");
+        let calls = stub_calls();
+        calls.arm_fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let outcome = deliver(
+            &root,
+            DeliveryCeiling::ThroughMerge,
+            MergeMethod::Squash,
+            42,
+            &DeliverOpts::default(),
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
+        assert_eq!(outcome.final_state, "blocked", "{:?}", outcome.steps);
+        assert_eq!(outcome.stage, "merge_queue_arm");
+        assert_eq!(
+            calls.queue_arms.load(Ordering::SeqCst),
+            usize::try_from(MERGE_QUEUE_ARM_ATTEMPTS).unwrap(),
+            "the bounded arming budget must still be spent"
+        );
+        assert_eq!(
+            calls.merge.load(Ordering::SeqCst),
+            0,
+            "an unarmed PR must never be merged by the delivery ladder itself"
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// M114c: the token+REST GitHub adapter can arm and clear the queue label,
+    /// and bootstraps the label when the repository does not have it yet.
+    #[tokio::test]
+    async fn m114c_rest_remote_arms_and_clears_the_queue_label() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind label server");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_for_thread = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let responses = [
+                ("404 Not Found", r#"{"message":"Not Found"}"#),
+                ("201 Created", r#"{"name":"merge-queue: armed"}"#),
+                ("200 OK", r#"[{"name":"merge-queue: armed"}]"#),
+            ];
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..read]).to_string();
+                let first = head.lines().next().unwrap_or_default().to_string();
+                seen_for_thread.lock().unwrap().push(first);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let remote = super::GithubRemote {
+            client: crate::git_remote::client::RemoteGitClient::new(
+                &base,
+                "synthetic-token",
+                crate::config::settings::GitProvider::Github,
+            ),
+            repo: "owner/repo".into(),
+            default_branch: "main".into(),
+            release_workflow: "release.yml".into(),
+            ci_stability: super::CiObservationStability {
+                candidate: std::sync::Mutex::new(None),
+            },
+        };
+        use super::DeliveryRemote as _;
+        remote
+            .arm_merge_queue(42, "head-sha")
+            .await
+            .expect("the REST adapter must arm the queue");
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(
+            requests[0].starts_with("GET /repos/owner/repo/labels/merge-queue%3A%20armed"),
+            "{requests:?}"
+        );
+        assert!(
+            requests[1].starts_with("POST /repos/owner/repo/labels "),
+            "a missing label must be created first: {requests:?}"
+        );
+        assert!(
+            requests[2].starts_with("POST /repos/owner/repo/issues/42/labels "),
+            "{requests:?}"
+        );
+    }
+
     struct FlakyPermit {
         failures_left: std::sync::atomic::AtomicUsize,
         rungs: std::sync::Mutex<Vec<String>>,
@@ -14048,6 +14262,10 @@ README-Update-Reason: synthetic fixture\n\nbody"
         /// while the ladder is parked waiting for CI (the M47 timing).
         stop_gate_on_ci: Mutex<Option<Arc<crate::agent::stop_fence::FlagStopGate>>>,
         queue_arms: AtomicUsize,
+        /// M114c: when set, arming the merge queue fails so the ladder's
+        /// blocked-not-merged behaviour can be exercised. Defaults to "arm
+        /// succeeds", which is what a real adapter does on a green PR.
+        arm_fails: AtomicBool,
     }
 
     fn stub_calls() -> Arc<StubCalls> {
@@ -14067,7 +14285,14 @@ README-Update-Reason: synthetic fixture\n\nbody"
     impl DeliveryRemote for StubRemote {
         async fn arm_merge_queue(&self, _number: u64, _expected_head: &str) -> Result<(), String> {
             self.calls.queue_arms.fetch_add(1, Ordering::SeqCst);
-            Err("adapter cannot arm the merge queue".into())
+            if self.calls.arm_fails.load(Ordering::SeqCst) {
+                return Err("adapter cannot arm the merge queue".into());
+            }
+            Ok(())
+        }
+
+        fn supports_merge_queue_arm(&self) -> bool {
+            true
         }
 
         fn capabilities(&self) -> DeliveryCapabilities {

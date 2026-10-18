@@ -70,3 +70,27 @@
 ## 约束
 - 合成 fixture，不写生产 DB。
 - 真机验收（装好后 60s 采样无这 4 个 PR）由编排方在发版后完成。
+
+## M114c：交付链在打标失败后仍直接合并（本次追加）
+
+现象：本次 M114b 交付（PR #742，`ceiling: merged`）打到 `merge-queue: armed` 失败 3 次，
+但交付阶梯没有停下，紧接着自己 squash 合并了 PR #742 —— 绕过了队列的「并入最新 main 后再复验」环节。
+
+根因两条：
+1. `GithubRemote`（token + REST 适配器）没有实现 `arm_merge_queue` / `clear_merge_queue_arm`，
+   直接落到 trait 默认的 "adapter cannot arm the merge queue"。
+2. 交付阶梯把打标失败当成一条 `blocked` 步骤记录后继续往下走，于是 `ceiling: merged` 退化成直接合并。
+
+修复：
+- `RemoteGitClient` 增加 `delete`；`GithubRemote` 实现打标（标签不存在时先创建）与撤标。
+- 交付阶梯：只有适配器**确实支持**打标（新增 `supports_merge_queue_arm`）且失败时，才阻塞在
+  `merge_queue_arm`，绝不回退到直接合并；不支持打标的适配器（hook / GitLab）保持原有 partial-truth 行为。
+- 只对**实际生效**的 ceiling 打标；能力降级后（如适配器不支持 merge）不再做无意义打标。
+
+### Requirements Traceability（追加）
+
+| Req ID | requirement | minimum evidence |
+| --- | --- | --- |
+| R5 | 支持打标的适配器打标失败后，交付必须阻塞，不得直接合并。 | `m114c_arm_failure_blocks_instead_of_merging_directly`（禁用修复时 final_state=delivered 且 merge 计数 1） |
+| R6 | token + REST 的 GitHub 适配器必须能打标/撤标，并在标签缺失时先创建。 | `m114c_rest_remote_arms_and_clears_the_queue_label`（断言 GET→创建→打标三条请求） |
+| R7 | 不支持打标的适配器不得因缺少该能力而卡住交付。 | 既有 `deliver_state_machine_uses_delivery_provider_hook_after_push`、`a_missing_merge_adapter_descends_to_ci_green_and_reports_partial_truth` |

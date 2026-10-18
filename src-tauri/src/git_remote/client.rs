@@ -91,4 +91,21 @@ impl RemoteGitClient {
         }
         serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))
     }
+
+    /// DELETE wrapper (e.g. removing a label from an issue/PR). An empty body is
+    /// a success shape: GitHub answers 200 with the remaining labels.
+    pub async fn delete(&self, path: &str) -> Result<Value, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let req = self.apply_auth(self.inner.delete(&url));
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}: {}", status, text.trim()));
+        }
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))
+    }
 }
