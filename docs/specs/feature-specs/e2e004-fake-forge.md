@@ -17,9 +17,32 @@
 - 合成 fixture，不写生产 DB，不访问真实 GitHub。
 - 结束时在 docs/long-tasks/scenario-test-completion.md 追加一段进展（中文），注明 E2E-004 L2 已由 CodeFactory 接手完成到什么程度。
 
-## Implementation Notes
+## E2E-004 第二段：把剩余 L2 串成一条端到端，并登记到场景注册表
+
+### 前置
+- 第一段已合并（#701，b988a7de）：`rust:e2e004_ci_failure_recovers_same_pr_and_artifact` 覆盖 FakeForge 上 CI 失败→成功、跨进程恢复同一 PR、合并、artifact 绑定合并 SHA、预存 dirty file 不被覆盖。
+- 读：docs/specs/feature-specs/e2e004-fake-forge.md、docs/long-tasks/scenario-test-completion.md（含第一段追加的进展）、registry 中 E2E-004 定义。
+
+### 需求
+- R1 在同一条端到端里串起第一段未组合的部分：运行中追加一条验收约束 + 一次方向纠正（通过同一会话的 steer/queue 入口）、provider 重连、改动后测试失败→自动诊断最小修复→复验；断言 durable objective / delivery run / change set / PR identity 自始至终相同，等 CI 时释放本地执行 owner、恢复后继续同一 run。
+- R2 本单**明确授权修改** `docs/testing/scenario-registry.json`：为 E2E-004 增加 automated_by 与对应的硬门禁声明（参照 E2E-007 等已有条目的 `pull_request_gate` / nightly 结构，满足 validate_scenario_test_governance.py 的 hard-gate 要求），automation_status 按实际只能是 `partially_implemented`；remaining_gaps 如实列出仍缺的 L3/L4（UI 顺序可见、manual_canary）。本地跑 validator 通过；scenario-gate-pr 的 cannot self-modify 由编排方处理。
+- R3 删除第一段误提交的 `docs/long-tasks/e2e004-pr-body.md`（PR 正文草稿不应进仓库）。
+- R4 先失败；在长任务记录追加第二段进展。
+
+### 约束
+- 合成 fixture，不访问真实 GitHub，不写生产 DB。不放宽任何 validator。
 
 - 使用已有 `delivery_scenario_tests.rs` 的真实 Git、SQLite FakeForge、隔离跨进程 worker 和 production `deliver` 入口，不引入第二套 forge。
 - 模板 §6 禁止修改 registry、validator 和 workflow，与 R6 的直接修改冲突；保持信任根不变，PR 记录 Spec Amendment，供编排方决定后续可信接入。
 - 现有 nightly 已执行全 Rust workspace；新增非 ignored Rust 回归自动包含于该步骤。PR required 的 exact target 注册仍须编排方批准更新 registry。
 - Harness：Spec、AI Collaboration；本任务无 UI/安装包变更，不将本地 fake-forge 视为 L3/L4 或真实发布验收。
+
+### Implementation Notes（Windows 第四次修复定位，2026-10-18）
+
+以下为诊断记录，不改变 R1–R4 任何要求的含义：
+- 626:55：夹具 listener 为 nonblocking；Windows 上 accepted socket 继承该模式，请求数据尚未到齐时 `read` 返回 `WSAEWOULDBLOCK`（10035），`unwrap` 使服务线程 panic。`set_read_timeout` 不会恢复 blocking 模式。
+- 652:149：服务线程 panic 退出并释放 listener 后，生产 `send_with_retry` 的重试命中 `ConnectionRefused`（10061），是同一 panic 的连带失败。
+- 934:17：supervisor 回收 worker 后 `status.success()` 失败，同样是上述 panic 的传播，不是进程回收超时。
+- 修复：新增 `src-tauri/src/agent/delivery_scenario_socket.rs` 的 `configure_provider_socket`，accept 后显式 `set_nonblocking(false)` 再设读写超时；以 `#[path]` 挂在 scenario tests 下，夹具改为调用它。
+- 回归（跨平台确定性、不跳过 Windows）：`socket::tests::accepted_socket_reads_fragmented_request_after_nonblocking_listener` 用 `set_nonblocking(true)` 的 accepted socket 模拟 Windows 继承语义，读取分段到达的请求；修复前在 macOS 上也以 `WouldBlock` 失败，修复后通过。
+- 先前 #710 认定的 `link.exe` 冲突修复按原样保留（隔离 worker 内现场链接确实会失败），但它不是本场景在 Windows 上失败的根因。
