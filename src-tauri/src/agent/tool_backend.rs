@@ -1249,6 +1249,9 @@ impl DesktopToolBackend {
         kind: ToolKind,
         is_mcp_tool: bool,
     ) -> Result<MutationAdmission, ToolError> {
+        if super::thin::is_thin(&self.db, ctx.session_id.as_deref().unwrap_or("")).await {
+            return Ok(MutationAdmission::Dispatch { receipt_id: None, browser_execution: None });
+        }
         self.ensure_observation_schema().await?;
         if call.function.name == "browser_session" && !browser_has_observation_contract(args) {
             return Ok(MutationAdmission::Waiting(waiting_result(
@@ -2551,7 +2554,13 @@ async fn mark_side_effect_started_in_tx(
 
 #[async_trait::async_trait]
 impl ToolBackend for DesktopToolBackend {
+    async fn thin_mode(&self, session_id: &str) -> bool { super::thin::is_thin(&self.db, session_id).await }
     async fn external_wait_completion_hint(&self, session_id: &str) -> Option<String> {
+        if super::thin::is_thin(&self.db, session_id).await {
+            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_delivery_refs WHERE session_id=?")
+                .bind(session_id).fetch_one(&self.db).await.unwrap_or(0);
+            return super::background_tasks::external_wait_completion_hint(&self.db, session_id, pending > 0).await;
+        }
         // Older/headless databases may not have delivery tables yet.
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'")
             .fetch_one(&self.db).await.unwrap_or(0);
@@ -2707,6 +2716,7 @@ impl ToolBackend for DesktopToolBackend {
         args: &serde_json::Value,
         ctx: &ToolCtx,
     ) -> Option<String> {
+        if super::thin::is_thin(&self.db, ctx.session_id.as_deref().unwrap_or("")).await { return None; }
         let (command, native_kind) = desktop_command_and_kind(&call.function.name, args);
         let is_mcp_tool = self
             .mcp_tool_names

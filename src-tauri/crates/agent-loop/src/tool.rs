@@ -114,6 +114,8 @@ impl std::error::Error for ToolError {}
 /// Where and how the loop's tool calls execute.
 #[async_trait::async_trait]
 pub trait ToolBackend: Send + Sync {
+    /// Task-scoped thin policy; legacy backends keep the full completion gate.
+    async fn thin_mode(&self, _session_id: &str) -> bool { false }
     /// Internal next-step guard; never persisted as a user-facing message.
     async fn external_wait_completion_hint(&self, _session_id: &str) -> Option<String> {
         None

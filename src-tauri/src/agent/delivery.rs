@@ -1785,7 +1785,7 @@ pub trait DeliveryRemote {
 /// `util::github_cli::gh_command`; the root cause of "deliver_changes gh PATH
 /// blocked" even though the CLI works from a terminal. EVERY production spawn of
 /// gh/git in this module MUST go through here (pinned by a source-text test).
-fn dev_command(program: &str) -> Command {
+pub(crate) fn dev_command(program: &str) -> Command {
     let mut command = Command::new(command_env::resolve_developer_command(program)).no_window();
     command_env::apply_developer_path_std(&mut command);
     command
@@ -1822,7 +1822,7 @@ fn remote_error_is_rate_limited(detail: &str) -> bool {
     lower.contains("rate limit") || lower.contains("429")
 }
 
-fn bounded_delivery_output(command: &mut Command) -> Result<String, String> {
+pub(crate) fn bounded_delivery_output(command: &mut Command) -> Result<String, String> {
     use std::io::Read;
     command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = command.spawn().map_err(|error| format!("failed to spawn delivery command: {error}"))?;
@@ -1846,7 +1846,7 @@ fn bounded_delivery_output(command: &mut Command) -> Result<String, String> {
     else { Err(String::from_utf8_lossy(&stderr).trim().into()) }
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let network = matches!(args.first(), Some(&"fetch" | &"push" | &"ls-remote"));
     let mut operation = || bounded_delivery_output(dev_command("git").arg("-C").arg(cwd).args(args));
     if network {

@@ -493,6 +493,11 @@ where
     Execute: FnOnce(AdapterExecutor) -> ExecuteFuture,
     ExecuteFuture: Future<Output = Result<(), crate::errors::AppError>>,
 {
+    if let Some(session) = claim.objective.session_id.as_deref() {
+        if super::thin::is_thin(&store.pool, session).await {
+            return execute(AdapterExecutor::Chat).await;
+        }
+    }
     let observation = adapter.observe(claim);
     let plan = adapter.reconcile(observation);
     let executor = match plan.action {
@@ -692,6 +697,11 @@ async fn process_claim(
                     &claim,
                     &permit,
                     move |executor| async move {
+                        if let Some(session) = objective.session_id.as_deref() {
+                            if super::thin::is_thin(&pool, session).await {
+                                return crate::commands::chat::resume_chat_objective(app, objective, execution_permit).await;
+                            }
+                        }
                         match executor {
                             AdapterExecutor::Chat => {
                                 crate::commands::chat::resume_chat_objective(

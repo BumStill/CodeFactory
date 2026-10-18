@@ -98,8 +98,8 @@ async fn materialize_session_and_first_message(
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO sessions
-         (id, title, title_source, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, title, title_source, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, kind, delivery_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'thin')",
     )
     .bind(draft_id)
     .bind(PLACEHOLDER_TITLE)
@@ -350,8 +350,8 @@ pub async fn create_session(
 
     sqlx::query(
         "INSERT INTO sessions
-         (id, title, title_source, cwd, endpoint_id, model_id, model_policy, created_at, updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?)",
+         (id, title, title_source, cwd, endpoint_id, model_id, model_policy, created_at, updated_at, delivery_mode)
+         VALUES (?,?,?,?,?,?,?,?,?,'thin')",
     )
     .bind(&id)
     .bind(PLACEHOLDER_TITLE)
@@ -1406,6 +1406,7 @@ mod tests {
                 total_output_tokens INTEGER NOT NULL DEFAULT 0,
                 parent_session_id TEXT,
                 kind TEXT NOT NULL DEFAULT 'project',
+                delivery_mode TEXT NOT NULL DEFAULT 'legacy' CHECK (delivery_mode IN ('thin','legacy')),
                 reasoning_effort TEXT
             )",
         )

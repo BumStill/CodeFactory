@@ -263,6 +263,9 @@ async fn table_exists(pool: &SqlitePool, table: &str) -> crate::errors::Result<b
 }
 
 async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
+    ensure_column(pool, "sessions", "delivery_mode", "TEXT NOT NULL DEFAULT 'legacy' CHECK (delivery_mode IN ('thin', 'legacy'))").await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs (session_id TEXT PRIMARY KEY, branch TEXT NOT NULL, pr_number INTEGER NOT NULL, ceiling TEXT NOT NULL)")
+        .execute(pool).await?;
     // Session → PR is durable product intent: the workspace may return to main
     // after merge, while the conversation still needs to show its own delivery.
     sqlx::query(

@@ -1793,7 +1793,7 @@ pub(crate) fn resume_after_failure_hint(objective: &ObjectiveSnapshot) -> String
 
 #[derive(Clone)]
 pub struct ObjectiveStore {
-    pool: SqlitePool,
+    pub(super) pool: SqlitePool,
 }
 
 #[derive(Debug, Clone)]
@@ -3779,8 +3779,11 @@ impl ObjectiveStore {
             let failure_signature: String = row.try_get("failure_signature")?;
             let strategy: String = row.try_get("strategy")?;
             let lease_expires_at = now + lease_ms.max(1);
+            let session: Option<String> = sqlx::query_scalar("SELECT session_id FROM objectives WHERE id=?")
+                .bind(&objective_id).fetch_optional(&self.pool).await?.flatten();
+            let thin = if let Some(session) = session { super::thin::is_thin(&self.pool, &session).await } else { false };
             let mut tx = self.pool.begin().await?;
-            if strategy == "reconcile_then_resume" {
+            if strategy == "reconcile_then_resume" && !thin {
                 let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
                     "SELECT
                        COALESCE(SUM(CASE WHEN remediation.failure_signature=?
@@ -5130,6 +5133,28 @@ impl ObjectiveStore {
         &self,
         mut decision: DecisionEnvelope,
     ) -> anyhow::Result<DecisionEnvelope> {
+        let session: Option<String> = sqlx::query_scalar("SELECT session_id FROM objectives WHERE id=?")
+            .bind(&decision.objective_id).fetch_optional(&self.pool).await?.flatten();
+        if let Some(session) = session {
+            if super::thin::is_thin(&self.pool, &session).await {
+                if decision.failure_signature.is_some() && decision.status == ObjectiveStatus::WaitingSystem {
+                    let previous: Vec<Option<String>> = sqlx::query_scalar("SELECT failure_signature FROM objective_decisions WHERE objective_id=? ORDER BY revision DESC LIMIT 2")
+                        .bind(&decision.objective_id).fetch_all(&self.pool).await?;
+                    if previous.len() == 2 && previous.iter().all(|signature| signature == &decision.failure_signature) {
+                        decision.status = ObjectiveStatus::Failed;
+                        decision.decision_type = DecisionType::FailedInternal;
+                        decision.remediation_id = None;
+                        decision.recovery_owner = None;
+                        decision.next_observation_at = None;
+                        decision.next_action_authorized = false;
+                        decision.requires_user_action = false;
+                    } else {
+                        decision.domain = RecoveryDomain::Chat;
+                    }
+                }
+                return Ok(decision);
+            }
+        }
         if decision.domain == RecoveryDomain::Update
             && decision.failure_code.as_deref() == Some(UPDATE_SAFE_POINT_PENDING)
         {
