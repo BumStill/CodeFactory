@@ -184,6 +184,44 @@ pub(crate) trait CanonicalPrObserver: Send + Sync {
     ) -> Option<Vec<crate::agent::objective::CiCheckState>> {
         None
     }
+
+    /// M114/R4: one batched lookup per repository covers every due candidate
+    /// (one `gh pr list --state all` instead of one `gh pr view` per record).
+    /// The default keeps per-PR observers — the offline pass and the scripted
+    /// tests — behaving exactly as before.
+    async fn observe_many(
+        &self,
+        repo_root: &Path,
+        requests: &[PrObservationRequest],
+    ) -> std::collections::HashMap<i64, Result<CanonicalPrState>> {
+        let mut out = std::collections::HashMap::new();
+        for request in requests {
+            if out.contains_key(&request.pr_number) {
+                continue;
+            }
+            let state = self
+                .observe(repo_root, request.pr_number, "", &request.expected_head_sha)
+                .await;
+            out.insert(request.pr_number, state);
+        }
+        out
+    }
+
+    /// M114/R6: the shared user-level core budget, read from
+    /// `gh api rate_limit` (an endpoint that costs no quota). `None` keeps the
+    /// previous policy so offline/scripted observers stay inert.
+    async fn observe_rate_limit(
+        &self,
+    ) -> Option<crate::agent::delivery::github_api_budget::RateLimitSnapshot> {
+        None
+    }
+}
+
+/// M114/R4: one candidate the reconcile pass needs the remote truth for.
+#[derive(Debug, Clone)]
+pub(crate) struct PrObservationRequest {
+    pub pr_number: i64,
+    pub expected_head_sha: String,
 }
 
 /// No-network observer used by the deterministic offline pass and by tests: it
@@ -257,6 +295,99 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         let remote = gh_remote_for(repo_root)
             .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)))?;
         remote.observed_ci_checks(expected_head_sha).await.ok()
+    }
+
+    /// M114/R4: one `gh pr list --state all` for the whole repository, shared by
+    /// every due candidate, instead of one `gh pr view` (plus a second for the
+    /// queue label) per record.
+    async fn observe_many(
+        &self,
+        repo_root: &Path,
+        requests: &[PrObservationRequest],
+    ) -> std::collections::HashMap<i64, Result<CanonicalPrState>> {
+        use crate::agent::delivery::gh_remote_for;
+        use std::collections::HashSet;
+        let mut out = std::collections::HashMap::new();
+        let remote = gh_remote_for(repo_root)
+            .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)));
+        let Some(remote) = remote else {
+            let detail = "no delivery remote is resolvable for this repository".to_string();
+            for request in requests {
+                out.insert(
+                    request.pr_number,
+                    Ok(CanonicalPrState::Unknown(detail.clone())),
+                );
+            }
+            return out;
+        };
+        let mut seen = HashSet::new();
+        let numbers: Vec<i64> = requests
+            .iter()
+            .map(|request| request.pr_number)
+            .filter(|number| seen.insert(*number))
+            .collect();
+        match remote.observed_pr_states(&numbers) {
+            Ok(states) => {
+                for request in requests {
+                    if out.contains_key(&request.pr_number) {
+                        continue;
+                    }
+                    let state = match states.get(&request.pr_number) {
+                        Some(summary) => canonical_state_from_batch(summary, &request.expected_head_sha),
+                        None => CanonicalPrState::Unknown(format!(
+                            "PR #{} was not returned by the batched listing",
+                            request.pr_number
+                        )),
+                    };
+                    out.insert(request.pr_number, Ok(state));
+                }
+            }
+            Err(error) => {
+                for request in requests {
+                    out.insert(
+                        request.pr_number,
+                        Err(anyhow!("observe canonical PRs in one batch: {error}")),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// M114/R6: `gh api rate_limit` costs no core quota, which is exactly why it
+    /// is the polling source.
+    async fn observe_rate_limit(
+        &self,
+    ) -> Option<crate::agent::delivery::github_api_budget::RateLimitSnapshot> {
+        use crate::agent::delivery::gh_remote_for;
+        let cwd = std::env::current_dir().ok()?;
+        gh_remote_for(&cwd)?.observed_rate_limit()
+    }
+}
+
+/// Map one batched `gh pr list` row onto the read-only canonical state.
+fn canonical_state_from_batch(
+    summary: &crate::agent::delivery::BatchPrState,
+    expected_head_sha: &str,
+) -> CanonicalPrState {
+    match summary.state.to_ascii_uppercase().as_str() {
+        // Positive merge evidence is authoritative; the queue may advance the
+        // head before merging, so a merged row never needs a head match.
+        "MERGED" => match summary.merge_sha.as_deref().map(str::trim) {
+            Some(sha) if !sha.is_empty() => CanonicalPrState::Merged {
+                merge_sha: sha.to_string(),
+            },
+            _ => CanonicalPrState::Unknown(
+                "GitHub reports MERGED but returned no merge commit SHA".into(),
+            ),
+        },
+        "CLOSED" => CanonicalPrState::ClosedUnmerged,
+        "OPEN" if !summary.head_sha.is_empty() && summary.head_sha != expected_head_sha => {
+            CanonicalPrState::Unknown(format!("PR head moved to {}", summary.head_sha))
+        }
+        "OPEN" if summary.armed => CanonicalPrState::Queued,
+        "OPEN" => CanonicalPrState::Open,
+        other => CanonicalPrState::Unknown(format!("unknown GitHub PR state '{other}'")),
     }
 }
 
@@ -718,6 +849,133 @@ async fn load_canonical_pr_reference_with_identity(
         return Ok(Some(row));
     }
     Ok(None)
+}
+
+/// M114/R2: durable observation bookkeeping stored on `delivery_runs`.
+#[derive(Debug, Clone)]
+struct ObservationState {
+    concluded_at: Option<i64>,
+    next_at: Option<i64>,
+    stable_count: i64,
+    last_state: Option<String>,
+    last_observed_at: i64,
+}
+
+/// Columns added by M114. `ensure_pr_observation_columns` adds them with the
+/// same nullable/idempotent pattern the rest of `delivery_runs` uses, so an
+/// existing database keeps every prior row untouched.
+const OBSERVATION_COLUMNS: [(&str, &str); 4] = [
+    ("pr_observation_concluded_at", "INTEGER"),
+    ("pr_observation_next_at", "INTEGER"),
+    ("pr_observation_stable_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("pr_observation_last_state", "TEXT"),
+];
+
+/// Idempotent migration. Returns `false` for a minimal/legacy schema that
+/// cannot carry the bookkeeping (some deterministic fixtures only create the
+/// handful of columns they need); the pass then keeps the previous behaviour
+/// instead of failing.
+async fn ensure_pr_observation_columns(pool: &SqlitePool) -> Result<bool> {
+    let mut columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('delivery_runs')")
+            .fetch_all(pool)
+            .await?;
+    if columns.is_empty() {
+        return Ok(false);
+    }
+    for (name, definition) in OBSERVATION_COLUMNS {
+        if columns.iter().any(|column| column == name) {
+            continue;
+        }
+        sqlx::query(&format!(
+            "ALTER TABLE delivery_runs ADD COLUMN {name} {definition}"
+        ))
+        .execute(pool)
+        .await?;
+        columns.push(name.to_string());
+    }
+    Ok(true)
+}
+
+async fn load_observation_state(
+    pool: &SqlitePool,
+    run_id: &str,
+    available: bool,
+) -> Result<ObservationState> {
+    if !available {
+        let last_observed_at: i64 =
+            sqlx::query_scalar("SELECT COALESCE(last_observed_at,0) FROM delivery_runs WHERE id=?")
+                .bind(run_id)
+                .fetch_one(pool)
+                .await?;
+        return Ok(ObservationState {
+            concluded_at: None,
+            next_at: None,
+            stable_count: 0,
+            last_state: None,
+            last_observed_at,
+        });
+    }
+    let row: (Option<i64>, Option<i64>, i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT pr_observation_concluded_at, pr_observation_next_at,
+                COALESCE(pr_observation_stable_count,0), pr_observation_last_state,
+                COALESCE(last_observed_at,0)
+         FROM delivery_runs WHERE id=?",
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(ObservationState {
+        concluded_at: row.0,
+        next_at: row.1,
+        stable_count: row.2,
+        last_state: row.3,
+        last_observed_at: row.4,
+    })
+}
+
+/// R2/R3: persist "what we learned and when to ask again". A changed answer (or
+/// an explicit session request, which passes `previous.stable_count = 0`)
+/// resets the backoff; an unchanged one doubles it up to one hour; a concluded
+/// record keeps its conclusion and never schedules another observation.
+async fn conclude_or_schedule(
+    pool: &SqlitePool,
+    run_id: &str,
+    now: i64,
+    state_label: &str,
+    conclude: bool,
+    previous: &ObservationState,
+    policy: crate::agent::delivery::github_api_budget::RateLimitPolicy,
+) -> Result<()> {
+    let unchanged = previous.last_state.as_deref() == Some(state_label);
+    let stable = if unchanged { previous.stable_count + 1 } else { 0 };
+    let concluded_at = if conclude { Some(now) } else { None };
+    let next_at = if conclude {
+        None
+    } else {
+        Some(crate::agent::delivery::github_api_budget::next_observation_at(
+            now,
+            stable.clamp(0, i64::from(u32::MAX)) as u32,
+            policy,
+        ))
+    };
+    sqlx::query(
+        "UPDATE delivery_runs
+         SET last_observed_at=?, pr_observation_last_state=?,
+             pr_observation_stable_count=?,
+             pr_observation_concluded_at=COALESCE(pr_observation_concluded_at, ?),
+             pr_observation_next_at=?
+         WHERE id=?",
+    )
+    .bind(now)
+    .bind(state_label)
+    .bind(stable)
+    .bind(concluded_at)
+    .bind(next_at)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Record a remote-observed merge as a `reconciled_committed` local receipt so
@@ -1222,47 +1480,248 @@ pub(crate) async fn reconcile_parked_delivery_progress(
     observer: &dyn CanonicalPrObserver,
     owner: &str,
 ) -> Result<()> {
+    reconcile_parked_delivery_progress_at(pool, observer, owner, Utc::now().timestamp_millis())
+        .await
+}
+
+/// M114/R2+R3+R4+R6: the same reconciliation with an explicit clock (so the 60s
+/// cleanup cadence can be simulated without sleeping) plus the budget guards
+/// that stop the pass from re-asking about deliveries that already concluded.
+pub(crate) async fn reconcile_parked_delivery_progress_at(
+    pool: &SqlitePool,
+    observer: &dyn CanonicalPrObserver,
+    owner: &str,
+    now: i64,
+) -> Result<()> {
     let has_runs: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
     ).fetch_one(pool).await?;
     if has_runs == 0 { return Ok(()); }
-    let now = Utc::now().timestamp_millis();
-    let candidates = sqlx::query_as::<_, CleanupCandidate>(
-        "SELECT w.id, w.objective_id, w.repo_identity, w.repo_root, w.git_common_dir,
-                COALESCE(w.worktree_path,'') AS worktree_path,
-                COALESCE(w.worktree_identity,'') AS worktree_identity, w.branch_name,
-                COALESCE(w.head_sha,'') AS head_sha
-         FROM execution_workspaces w JOIN objectives o ON o.id=w.objective_id
-         WHERE (o.status IN ('running','waiting_system','cancelled','failed')
-                OR (o.status='completed' AND EXISTS (
-                    SELECT 1 FROM delivery_runs broken WHERE broken.objective_id=o.id
-                    AND broken.status IN ('failed','cancelled','platform_incident'))))
-           AND w.state IN ('active','delivering','cleanup_pending','closed','incident')
-           AND EXISTS (SELECT 1 FROM delivery_runs r WHERE r.objective_id=o.id
-               AND r.canonical_pr_number IS NOT NULL
-               AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?))
-         ORDER BY w.updated_at LIMIT 64",
-    ).bind(now).fetch_all(pool).await?;
+    let observation_columns = ensure_pr_observation_columns(pool).await?;
+    // R6: one free `gh api rate_limit` reading at most every five minutes. The
+    // endpoint consumes no core quota, so quota awareness cannot itself become
+    // a cost.
+    if crate::agent::delivery::github_api_budget::rate_limit_refresh_due() {
+        if let Some(snapshot) = observer.observe_rate_limit().await {
+            crate::agent::delivery::github_api_budget::record_gh_call(
+                crate::agent::delivery::github_api_budget::CALLER_RATE_LIMIT,
+            );
+            crate::agent::delivery::github_api_budget::record_rate_limit(snapshot);
+        }
+    }
+    let policy = crate::agent::delivery::github_api_budget::current_rate_limit_policy();
+    if crate::agent::delivery::github_api_budget::record_policy_transition(policy) {
+        tracing::info!(
+            status = %crate::agent::delivery::github_api_budget::status_line(),
+            "background canonical-PR observation policy"
+        );
+    }
+    if !policy.allows_observation() {
+        // Below 5% of the shared user budget: stay out of GitHub's way
+        // entirely. No conclusion changes; the question is only deferred.
+        return Ok(());
+    }
+    let terminal_cutoff = now
+        .saturating_sub(crate::agent::delivery::github_api_budget::terminal_observation_window_ms());
+    if observation_columns {
+        // R2: persist the conclusion for terminal deliveries outside the
+        // observation window, so they stop consuming candidate slots and are
+        // never queried again.
+        sqlx::query(
+            "UPDATE delivery_runs SET pr_observation_concluded_at=?
+             WHERE pr_observation_concluded_at IS NULL
+               AND COALESCE(pr_observation_last_state,'') <> 'open'
+               AND COALESCE(last_observed_at,0) < ?
+               AND objective_id IN (
+                   SELECT id FROM objectives WHERE status IN ('failed','cancelled','completed'))",
+        ).bind(now).bind(terminal_cutoff).execute(pool).await?;
+    }
+    let candidates = if observation_columns {
+        sqlx::query_as::<_, CleanupCandidate>(
+            "SELECT w.id, w.objective_id, w.repo_identity, w.repo_root, w.git_common_dir,
+                    COALESCE(w.worktree_path,'') AS worktree_path,
+                    COALESCE(w.worktree_identity,'') AS worktree_identity, w.branch_name,
+                    COALESCE(w.head_sha,'') AS head_sha
+             FROM execution_workspaces w JOIN objectives o ON o.id=w.objective_id
+             WHERE (o.status IN ('running','waiting_system','cancelled','failed')
+                    OR (o.status='completed' AND EXISTS (
+                        SELECT 1 FROM delivery_runs broken WHERE broken.objective_id=o.id
+                        AND broken.status IN ('failed','cancelled','platform_incident'))))
+               AND w.state IN ('active','delivering','cleanup_pending','closed','incident')
+               AND EXISTS (SELECT 1 FROM delivery_runs r WHERE r.objective_id=o.id
+                   AND r.canonical_pr_number IS NOT NULL
+                   AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?)
+                   AND r.pr_observation_concluded_at IS NULL
+                   AND (r.pr_observation_next_at IS NULL OR r.pr_observation_next_at<=?)
+                   AND (o.status NOT IN ('failed','cancelled','completed')
+                        OR r.pr_observation_last_state='open'
+                        OR COALESCE(r.last_observed_at,0)>=?))
+             ORDER BY w.updated_at LIMIT 64",
+        ).bind(now).bind(now).bind(terminal_cutoff).fetch_all(pool).await?
+    } else {
+        sqlx::query_as::<_, CleanupCandidate>(
+            "SELECT w.id, w.objective_id, w.repo_identity, w.repo_root, w.git_common_dir,
+                    COALESCE(w.worktree_path,'') AS worktree_path,
+                    COALESCE(w.worktree_identity,'') AS worktree_identity, w.branch_name,
+                    COALESCE(w.head_sha,'') AS head_sha
+             FROM execution_workspaces w JOIN objectives o ON o.id=w.objective_id
+             WHERE (o.status IN ('running','waiting_system','cancelled','failed')
+                    OR (o.status='completed' AND EXISTS (
+                        SELECT 1 FROM delivery_runs broken WHERE broken.objective_id=o.id
+                        AND broken.status IN ('failed','cancelled','platform_incident'))))
+               AND w.state IN ('active','delivering','cleanup_pending','closed','incident')
+               AND EXISTS (SELECT 1 FROM delivery_runs r WHERE r.objective_id=o.id
+                   AND r.canonical_pr_number IS NOT NULL
+                   AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?))
+             ORDER BY w.updated_at LIMIT 64",
+        ).bind(now).fetch_all(pool).await?
+    };
     let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('objectives')")
         .fetch_all(pool).await?;
+    // R4: resolve every due reference first, then ask the provider once per
+    // repository instead of once per record.
+    let mut pending: Vec<(CleanupCandidate, CanonicalPrReference)> = Vec::new();
     for candidate in candidates {
+        if let Some(reference) =
+            load_canonical_pr_reference_with_identity(pool, &candidate, false).await?
+        {
+            pending.push((candidate, reference));
+        }
+    }
+    let mut observations: std::collections::HashMap<usize, Result<CanonicalPrState>> =
+        std::collections::HashMap::new();
+    if !pending.is_empty() {
+        let mut by_root: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, (candidate, _)) in pending.iter().enumerate() {
+            by_root.entry(candidate.repo_root.clone()).or_default().push(index);
+        }
+        for (repo_root, indexes) in by_root {
+            let requests: Vec<PrObservationRequest> = indexes
+                .iter()
+                .map(|index| PrObservationRequest {
+                    pr_number: pending[*index].1.canonical_pr_number,
+                    expected_head_sha: pending[*index].1.canonical_head_sha.clone(),
+                })
+                .collect();
+            let observed = observer.observe_many(Path::new(&repo_root), &requests).await;
+            crate::agent::delivery::github_api_budget::record_gh_call(
+                crate::agent::delivery::github_api_budget::CALLER_OBSERVE,
+            );
+            for (index, request) in indexes.iter().zip(requests.iter()) {
+                let state = match observed.get(&request.pr_number) {
+                    Some(Ok(state)) => Ok(state.clone()),
+                    Some(Err(error)) => Err(anyhow!("{error}")),
+                    None => Ok(CanonicalPrState::Unknown(
+                        "batched observation omitted this PR".into(),
+                    )),
+                };
+                observations.insert(*index, state);
+            }
+        }
+    }
+    for (index, (candidate, reference)) in pending.iter().enumerate() {
         // Read-only remote truth does not grant replay or cleanup authority.
-        let Some(reference) = load_canonical_pr_reference_with_identity(pool, &candidate, false).await? else { continue; };
-        let state = observer.observe(Path::new(&candidate.repo_root), reference.canonical_pr_number,
-            &reference.canonical_pr_url, &reference.canonical_head_sha).await;
+        let state = observations
+            .remove(&index)
+            .unwrap_or_else(|| Ok(CanonicalPrState::Unknown("not observed".into())));
+        let previous = load_observation_state(pool, &reference.run_id, observation_columns).await?;
+        if previous.concluded_at.is_some() {
+            continue;
+        }
+        let objective_status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+            .bind(&candidate.objective_id).fetch_one(pool).await?;
+        // R2: durable second guard — outside every window in which the
+        // conclusion could still change, record the conclusion instead of
+        // asking again.
+        if observation_columns
+            && !crate::agent::delivery::github_api_budget::should_observe(
+                &objective_status,
+                previous.last_observed_at,
+                previous.last_state.as_deref(),
+                now,
+            )
+        {
+            conclude_or_schedule(
+                pool,
+                &reference.run_id,
+                now,
+                previous.last_state.as_deref().unwrap_or("unknown"),
+                true,
+                &previous,
+                policy,
+            )
+            .await?;
+            continue;
+        }
+        let state_label = match &state {
+            Ok(CanonicalPrState::Merged { .. }) => "merged",
+            Ok(CanonicalPrState::ClosedUnmerged) => "closed",
+            Ok(CanonicalPrState::Open) => "open",
+            Ok(CanonicalPrState::Queued) => "queued",
+            Ok(CanonicalPrState::Unknown(_)) | Err(_) => "unknown",
+        };
+        let unchanged = previous
+            .last_state
+            .as_deref()
+            .is_some_and(|last| last == state_label);
+        let stable_now = if unchanged { previous.stable_count + 1 } else { 0 };
+        // R2: a merged PR is a conclusion. A *closed* PR is too, but only for a
+        // terminal objective — a live wait can still see its PR reopened and
+        // merged, so that path keeps the (bounded) backoff and concludes at the
+        // stable limit instead of going silent on the first closed answer.
+        let conclude = matches!(&state, Ok(CanonicalPrState::Merged { .. }))
+            || (matches!(&state, Ok(CanonicalPrState::ClosedUnmerged))
+                && crate::agent::delivery::github_api_budget::is_terminal_objective_status(
+                    &objective_status,
+                ))
+            || stable_now >= crate::agent::delivery::github_api_budget::OBSERVATION_STABLE_LIMIT as i64;
         let (stage, status, reached, merged) = match &state {
             Ok(CanonicalPrState::Open) => ("pr_open", "waiting", "pr_open", false),
             Ok(CanonicalPrState::Queued) => ("merge_queued", "waiting", "merge_queued", false),
             Ok(CanonicalPrState::Merged { merge_sha }) if !merge_sha.trim().is_empty() =>
                 ("complete", "completed", "merged", true),
-            _ => continue, // Unknown/closed/head drift never proves success or authorises deletion.
+            _ => {
+                // Unknown/closed/head drift never proves success or authorises
+                // deletion; it is remembered and revisited on a backoff.
+                conclude_or_schedule(
+                    pool,
+                    &reference.run_id,
+                    now,
+                    state_label,
+                    conclude,
+                    &previous,
+                    policy,
+                )
+                .await?;
+                continue;
+            }
         };
-        let objective_status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
-            .bind(&candidate.objective_id).fetch_one(pool).await?;
         if matches!(objective_status.as_str(), "failed" | "completed") && !merged {
-            continue; // Historical terminal settlements need positive merge evidence.
+            // Historical terminal settlements need positive merge evidence.
+            conclude_or_schedule(
+                pool,
+                &reference.run_id,
+                now,
+                state_label,
+                conclude,
+                &previous,
+                policy,
+            )
+            .await?;
+            continue;
         }
         if objective_status == "cancelled" && !merged {
+            conclude_or_schedule(
+                pool,
+                &reference.run_id,
+                now,
+                state_label,
+                conclude,
+                &previous,
+                policy,
+            )
+            .await?;
             continue;
         }
         // M108/R4: an open PR whose checks already concluded must hand the
@@ -1272,8 +1731,18 @@ pub(crate) async fn reconcile_parked_delivery_progress(
         // the expected trust-root refusal) sat unread until a human transcribed
         // it. `classify_ci_checks` excludes the trust-root refusal per check, so
         // any ordinary failure still wakes the session.
-        let ci_decision = if matches!(&state, Ok(CanonicalPrState::Open)) {
+        //
+        // M114/R4: only ask for CI checks when a session is actually waiting on
+        // them. Terminal objectives (failed/cancelled/completed) can still hold
+        // an open PR worth observing, but no live wait depends on its checks, so
+        // the extra REST call is skipped.
+        let ci_decision = if matches!(&state, Ok(CanonicalPrState::Open))
+            && matches!(objective_status.as_str(), "running" | "active" | "waiting_system")
+        {
             let reference_label = format!("PR #{}", reference.canonical_pr_number);
+            crate::agent::delivery::github_api_budget::record_gh_call(
+                crate::agent::delivery::github_api_budget::CALLER_OBSERVE_CI,
+            );
             match observer
                 .observe_ci_checks(
                     Path::new(&candidate.repo_root),
@@ -1434,7 +1903,20 @@ pub(crate) async fn reconcile_parked_delivery_progress(
         } else { "" };
         if objective_status == "completed" {
             tx.commit().await?;
-            continue; // Acceptance is immutable; only delivery evidence may advance.
+            // Acceptance is immutable; only delivery evidence may advance — but
+            // the observation is still recorded so the record stops being asked
+            // about once it has a conclusion.
+            conclude_or_schedule(
+                pool,
+                &reference.run_id,
+                now,
+                state_label,
+                conclude,
+                &previous,
+                policy,
+            )
+            .await?;
+            continue;
         }
         let eligible_statuses = if complete {
             "'running','active','waiting_system','cancelled','failed'"
@@ -1463,6 +1945,16 @@ pub(crate) async fn reconcile_parked_delivery_progress(
         if let Ok(CanonicalPrState::Merged { merge_sha }) = &state {
             record_reconciled_merge_receipt(pool, &reference, merge_sha, owner).await?;
         }
+        conclude_or_schedule(
+            pool,
+            &reference.run_id,
+            now,
+            state_label,
+            conclude,
+            &previous,
+            policy,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -3059,6 +3551,27 @@ mod tests {
         (temp, root, remote, container)
     }
 
+    /// M114/R3: successive scripted polls must advance the clock. Before the
+    /// backoff gate a test could call `reconcile` in a tight loop and observe
+    /// every time — that tight loop IS the field bug (17 PRs, 43 `gh pr view`
+    /// per minute). Each call here represents the next scheduled cleanup tick.
+    async fn reconcile_next_poll(
+        pool: &SqlitePool,
+        observer: &dyn super::CanonicalPrObserver,
+        owner: &str,
+    ) -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static NEXT_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+        let offset = NEXT_OFFSET_MS.fetch_add(61_000, Ordering::SeqCst);
+        super::reconcile_parked_delivery_progress_at(
+            pool,
+            observer,
+            owner,
+            chrono::Utc::now().timestamp_millis() + offset,
+        )
+        .await
+    }
+
     async fn pool_with_objective(objective_id: &str) -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::query("PRAGMA foreign_keys=ON")
@@ -4652,7 +5165,7 @@ mod tests {
                     let before: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
                     for _ in 0..2 {
                         let state = if merged { super::CanonicalPrState::Merged { merge_sha: "synthetic-m102-merge".into() } } else { super::CanonicalPrState::Open };
-                        super::reconcile_parked_delivery_progress(&pool, &ScriptedPrObserver::new(vec![Ok(state)]), "m102").await.unwrap();
+                        reconcile_next_poll(&pool, &ScriptedPrObserver::new(vec![Ok(state)]), "m102").await.unwrap();
                         let (status, revision): (String, i64) = sqlx::query_as("SELECT status,revision FROM objectives").fetch_one(&pool).await.unwrap();
                         let advances = (merged && initial != "completed")
                             || (!merged && initial == "waiting_system" && reached == "pr_open");
@@ -4664,6 +5177,255 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// M114 (R2/R3/R4/R7): a scheduled cleanup pass must not re-query every
+    /// historical delivery. 20 failed/cancelled records far outside the
+    /// observation window plus 2 active open PRs: the historical records are
+    /// never observed, and the active ones are reached on a backoff schedule
+    /// (1m → 2m → 4m …) instead of once per 60s tick.
+    ///
+    /// Field evidence: 60s sampling caught 43 `gh pr view` calls/minute across
+    /// 17 PRs, 15 of which belonged to deliveries that had ended months
+    /// earlier — that is what exhausted the 5000/h user budget.
+    #[tokio::test]
+    async fn m114_historical_delivery_records_are_not_reobserved() {
+        struct CountingObserver {
+            observed: std::sync::Mutex<Vec<i64>>,
+            batches: std::sync::atomic::AtomicU32,
+        }
+        #[async_trait::async_trait]
+        impl super::CanonicalPrObserver for CountingObserver {
+            async fn observe(
+                &self,
+                _repo_root: &Path,
+                pr_number: i64,
+                _pr_url: &str,
+                _expected_head_sha: &str,
+            ) -> anyhow::Result<super::CanonicalPrState> {
+                self.observed.lock().unwrap().push(pr_number);
+                Ok(super::CanonicalPrState::Open)
+            }
+
+            /// R4: the pass must batch per repository, not per record.
+            async fn observe_many(
+                &self,
+                _repo_root: &Path,
+                requests: &[super::PrObservationRequest],
+            ) -> std::collections::HashMap<i64, anyhow::Result<super::CanonicalPrState>> {
+                self.batches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut out = std::collections::HashMap::new();
+                for request in requests {
+                    self.observed.lock().unwrap().push(request.pr_number);
+                    out.insert(request.pr_number, Ok(super::CanonicalPrState::Open));
+                }
+                out
+            }
+        }
+
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone())
+            .create(crate::agent::objective::CreateObjective {
+                id: "m114-template".into(),
+                kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None,
+                root_turn_id: None,
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "merged".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "m114-template", "process-a"),
+        )
+        .await
+        .unwrap();
+        record_open_canonical_pr(&pool, &workspace, 900, "through_merge").await;
+
+        // Copy a valid workspace + delivery-run row for each synthetic
+        // objective, replacing only the identity/number columns. This keeps the
+        // fixture on the real schema without allocating 22 git worktrees.
+        async fn copy_row(
+            pool: &SqlitePool,
+            table: &str,
+            source_id: &str,
+            replacements: &[(&str, String)],
+        ) {
+            let cols: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT name FROM pragma_table_info('{table}')"
+            ))
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            let projections: Vec<String> = cols
+                .iter()
+                .map(|col| {
+                    if replacements.iter().any(|(name, _)| name == col) {
+                        "?".to_string()
+                    } else {
+                        format!("\"{col}\"")
+                    }
+                })
+                .collect();
+            let statement = format!(
+                "INSERT INTO {table} ({}) SELECT {} FROM {table} WHERE id=?",
+                cols.iter()
+                    .map(|col| format!("\"{col}\""))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                projections.join(",")
+            );
+            let mut query = sqlx::query(&statement);
+            for col in &cols {
+                if let Some((_, value)) = replacements.iter().find(|(name, _)| *name == col.as_str())
+                {
+                    query = query.bind(value.clone());
+                }
+            }
+            query.bind(source_id).execute(pool).await.unwrap();
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let long_ago = now - 30 * 24 * 60 * 60 * 1000;
+        let mut historical = Vec::new();
+        let mut active = Vec::new();
+        for index in 0..22 {
+            let objective_id = format!("m114-objective-{index}");
+            crate::agent::objective::ObjectiveStore::new(pool.clone())
+                .create(crate::agent::objective::CreateObjective {
+                    id: objective_id.clone(),
+                    kind: crate::agent::objective::ObjectiveKind::Delivery,
+                    session_id: None,
+                    root_turn_id: None,
+                    domain: crate::agent::objective::RecoveryDomain::Delivery,
+                    requested_acceptance: "merged".into(),
+                    created_surface: "synthetic-test".into(),
+                })
+                .await
+                .unwrap();
+            let run_id = format!("m114-run-{index}");
+            let pr_number = 1000 + index as i64;
+            copy_row(
+                &pool,
+                "execution_workspaces",
+                &workspace.id,
+                &[
+                    ("id", format!("m114-workspace-{index}")),
+                    ("objective_id", objective_id.clone()),
+                    ("branch_name", format!("m114-branch-{index}")),
+                    ("worktree_identity", format!("m114-worktree-{index}")),
+                    ("worktree_path", root.join(format!("m114-{index}")).to_string_lossy().into_owned()),
+                    ("state", "active".into()),
+                    ("updated_at", now.to_string()),
+                ],
+            )
+            .await;
+            copy_row(
+                &pool,
+                "delivery_runs",
+                &format!("delivery-{}", workspace.id),
+                &[
+                    ("id", run_id),
+                    ("objective_id", objective_id.clone()),
+                    ("canonical_pr_number", pr_number.to_string()),
+                    ("updated_at", now.to_string()),
+                    ("last_observed_at", now.to_string()),
+                ],
+            )
+            .await;
+            if index < 20 {
+                let status = if index % 2 == 0 { "failed" } else { "cancelled" };
+                if status == "cancelled" {
+                    sqlx::query(
+                        "UPDATE objectives SET status='cancelled', decision_type='cancelled',
+                             completed_at=?, cancellation_provenance='explicit_cancel' WHERE id=?",
+                    )
+                    .bind(long_ago)
+                    .bind(&objective_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                } else {
+                    sqlx::query(
+                        "UPDATE objectives SET status='failed', decision_type='failed_internal',
+                             completed_at=?, failure_code='delivery_internal_failure' WHERE id=?",
+                    )
+                    .bind(long_ago)
+                    .bind(&objective_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+                sqlx::query("UPDATE delivery_runs SET last_observed_at=?, updated_at=?, status='failed' WHERE objective_id=?")
+                    .bind(long_ago)
+                    .bind(long_ago)
+                    .bind(&objective_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                historical.push(pr_number);
+            } else {
+                sqlx::query("UPDATE objectives SET status='active' WHERE id=?")
+                    .bind(&objective_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                active.push(pr_number);
+            }
+        }
+
+        let observer = CountingObserver {
+            observed: std::sync::Mutex::new(Vec::new()),
+            batches: std::sync::atomic::AtomicU32::new(0),
+        };
+        for _ in 0..60 {
+            reconcile_next_poll(&pool, &observer, "m114").await.unwrap();
+        }
+
+        // R4: one batched lookup per repository per due round — not one call
+        // per candidate, and never a second per-PR lookup.
+        let batches = observer
+            .batches
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            batches <= 8,
+            "60 ticks must batch the due candidates (1m→2m→4m→…), made {batches} batched lookups"
+        );
+
+        let observed = observer.observed.lock().unwrap().clone();
+        let historical_seen: Vec<i64> = observed
+            .iter()
+            .copied()
+            .filter(|number| historical.contains(number))
+            .collect();
+        assert!(
+            historical_seen.is_empty(),
+            "historical deliveries must never be re-observed, saw {historical_seen:?}"
+        );
+        // 60 ticks × 22 candidates would be 1320 observations before the fix.
+        // The budget allows the two active PRs on a backoff schedule, not per
+        // tick: at most ~6 observations each inside one simulated hour.
+        assert!(
+            observed.len() <= 24,
+            "60 cleanup ticks must stay inside the observation budget, made {} observations",
+            observed.len()
+        );
+        // The 20 historical rows are durably concluded, not merely skipped.
+        let concluded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_runs WHERE id LIKE 'm114-run-%' AND pr_observation_concluded_at IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+        assert!(
+            concluded >= 20,
+            "historical records must persist a conclusion, only {concluded} did"
+        );
     }
 
     #[tokio::test]
@@ -4686,13 +5448,13 @@ mod tests {
         sqlx::query("UPDATE execution_workspaces SET lease_owner=NULL, lease_expires_at=NULL").execute(&pool).await.unwrap();
         sqlx::query("UPDATE delivery_runs SET stage='complete',reached_ceiling='merged',status='waiting' WHERE objective_id='synthetic-m84'").execute(&pool).await.unwrap();
         let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m84-merge".into() })]);
-        super::reconcile_parked_delivery_progress(&pool, &observer, "synthetic-observer").await.unwrap();
+        reconcile_next_poll(&pool, &observer, "synthetic-observer").await.unwrap();
         let settled: (String, String, String, i64) = sqlx::query_as("SELECT status,kind,requested_acceptance,revision FROM objectives").fetch_one(&pool).await.unwrap();
         assert_eq!(settled.0, "completed");
         assert_eq!(settled.1, "delivery");
         assert_eq!(settled.2, "merged");
         let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m84-merge".into() })]);
-        super::reconcile_parked_delivery_progress(&pool, &observer, "synthetic-observer").await.unwrap();
+        reconcile_next_poll(&pool, &observer, "synthetic-observer").await.unwrap();
         let revision: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
         assert_eq!(revision, settled.3);
     }
@@ -4772,7 +5534,7 @@ mod tests {
             let before: (String, String, i64) = sqlx::query_as(
                 "SELECT o.status,r.status,o.revision FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
             ).fetch_one(&pool).await.unwrap();
-            super::reconcile_parked_delivery_progress(&pool,
+            reconcile_next_poll(&pool,
                 &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Unknown("offline".into()))]), "m74-restart",
             ).await.unwrap();
             let unknown: (String, String, i64) = sqlx::query_as(
@@ -4780,7 +5542,7 @@ mod tests {
             ).fetch_one(&pool).await.unwrap();
             assert_eq!(unknown, before, "R9: uncertainty must leave history unchanged");
             for _ in 0..2 {
-                super::reconcile_parked_delivery_progress(&pool,
+                reconcile_next_poll(&pool,
                     &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m74-merge".into() })]), "m74-restart",
                 ).await.unwrap();
                 let repaired: (String, Option<String>, String, String, Option<String>, i64) = sqlx::query_as(
@@ -4828,7 +5590,7 @@ mod tests {
         sqlx::query("UPDATE objectives SET status='failed', decision_type='failed_internal', completed_at=1, failure_code='technical_recovery_exhausted', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
             .execute(&pool).await.unwrap();
         // The remote is authoritative: GitHub already merged PR #644.
-        super::reconcile_parked_delivery_progress(&pool,
+        reconcile_next_poll(&pool,
             &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m74c-merge".into() })]), "m74c-restart",
         ).await.unwrap();
         let settled: (String, Option<String>, String, String) = sqlx::query_as(
@@ -4949,7 +5711,7 @@ mod tests {
             // The session is parked exactly as the field incident left it.
             sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', failure_code='delivered_awaiting_ci', next_observation_at=NULL, attention_request_json=NULL")
                 .execute(&pool).await.unwrap();
-            super::reconcile_parked_delivery_progress(
+            reconcile_next_poll(
                 &pool,
                 &SyntheticCiObserver { checks },
                 "m108-observer",
@@ -5010,13 +5772,13 @@ mod tests {
             sqlx::query("UPDATE delivery_runs SET reached_ceiling=?, stage=CASE WHEN ?='merged' THEN 'complete' ELSE 'pr_open' END, status=CASE WHEN ?='merged' THEN 'completed' ELSE 'waiting' END WHERE id<>'older-run'")
                 .bind(reached).bind(reached).bind(reached).execute(&pool).await.unwrap();
             for state in [super::CanonicalPrState::Unknown("offline".into()), super::CanonicalPrState::ClosedUnmerged] {
-                super::reconcile_parked_delivery_progress(&pool, &ScriptedPrObserver::new(vec![Ok(state)]), "lagged-test").await.unwrap();
+                reconcile_next_poll(&pool, &ScriptedPrObserver::new(vec![Ok(state)]), "lagged-test").await.unwrap();
                 let status: String = sqlx::query_scalar("SELECT status FROM objectives").fetch_one(&pool).await.unwrap();
                 assert_eq!(status, "waiting_system", "only positive merge evidence settles");
             }
             let before: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
             for _ in 0..2 {
-                super::reconcile_parked_delivery_progress(&pool, &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-merge".into() })]), "lagged-test").await.unwrap();
+                reconcile_next_poll(&pool, &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-merge".into() })]), "lagged-test").await.unwrap();
                 let actual: (String, String, String, i64) = sqlx::query_as("SELECT o.status,o.reached_acceptance,r.reached_ceiling,o.revision FROM objectives o JOIN delivery_runs r ON r.id=o.delivery_run_id")
                     .fetch_one(&pool).await.unwrap();
                 assert_eq!(actual, ("completed".into(), "merged".into(), "merged".into(), before + 1), "latest {reached} run must settle once despite a stale objective pointer");
@@ -5049,11 +5811,17 @@ mod tests {
         sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', failure_code='run_blocked', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)").execute(&pool).await.unwrap();
         sqlx::query("UPDATE execution_workspaces SET state='delivering', lease_owner=NULL, lease_expires_at=NULL")
             .execute(&pool).await.unwrap();
+        // M114: the observation bookkeeping columns are added on demand.
+        super::ensure_pr_observation_columns(&pool).await.unwrap();
         for (observed, expected) in [
             (super::CanonicalPrState::Open, "pr_open"),
             (super::CanonicalPrState::Queued, "merge_queued"),
         ] {
             let observer = ScriptedPrObserver::new(vec![Ok(observed)]);
+            // M114/R3: represent the next scheduled poll (the pass itself now
+            // refuses to re-ask inside the backoff window).
+            sqlx::query("UPDATE delivery_runs SET pr_observation_next_at=NULL")
+                .execute(&pool).await.unwrap();
             super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer).await.unwrap();
             let (stage, status, reached): (String, String, String) = sqlx::query_as(
                 "SELECT stage, status, reached_ceiling FROM delivery_runs",
@@ -5082,6 +5850,9 @@ mod tests {
         let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
             merge_sha: "synthetic-m71-merge".into(),
         })]);
+        // M114/R3: the next scheduled poll (outside the backoff window).
+        sqlx::query("UPDATE delivery_runs SET pr_observation_next_at=NULL")
+            .execute(&pool).await.unwrap();
         let outcome = super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer).await.unwrap();
         assert_eq!(outcome.closed, 1);
         let status: String = sqlx::query_scalar("SELECT status FROM objectives").fetch_one(&pool).await.unwrap();

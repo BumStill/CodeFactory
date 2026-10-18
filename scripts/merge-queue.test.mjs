@@ -20,6 +20,7 @@ import {
   orderQueue,
   parseBlockedMarker,
   runQueue,
+  drainQueue,
   versionBumpHandoff,
   verifyRequiredChecks,
 } from './merge-queue.mjs';
@@ -590,4 +591,95 @@ test('M101-R3: a legacy blocked label stays blocked when the head is not newer t
   assert.equal(outcomes.find((o) => o.number === 1).status, 'not-eligible');
   assert.ok(!calls.some((a) => a[2] === 'edit' && a.includes('--remove-label')));
   assert.ok(!calls.some((a) => a[2] === 'merge' && a[3] === '1'));
+});
+
+// ---------------------------------------------------------------------------
+// M114 / R8 — merging must not spend the shared user API budget
+// ---------------------------------------------------------------------------
+
+test('M114-R8a: drain exits after ONE listing when no PR is armed', async () => {
+  const calls = [];
+  const adapter = createGhAdapter({
+    repo: 'synthetic/queue',
+    run: (args) => {
+      calls.push(args.join(' '));
+      if (args[1] === 'pr' && args[2] === 'list') return '[]';
+      throw new Error(`unexpected call: ${args.join(' ')}`);
+    },
+  });
+  const result = await drainQueue(adapter, {});
+  assert.deepEqual(result, { skipped: 'no_armed_pr', plan: [], outcomes: [] });
+  assert.equal(calls.length, 1, 'the empty sweep must cost exactly one call');
+  assert.ok(calls[0].includes('--label merge-queue: armed'));
+});
+
+test('M114-R8c: an unarmed open PR costs no check-runs or blocked-evidence calls', async () => {
+  const calls = [];
+  const adapter = createGhAdapter({
+    repo: 'synthetic/queue',
+    run: (args) => {
+      calls.push(args.join(' '));
+      if (args[1] === 'pr' && args[2] === 'list') {
+        return JSON.stringify([
+          { number: 1, title: 'plain', headRefName: 'b1', headRefOid: 's1', isDraft: false, labels: [{ name: 'some-other-label' }], mergeStateStatus: 'CLEAN' },
+          { number: 2, title: 'armed', headRefName: 'b2', headRefOid: 's2', isDraft: false, labels: [{ name: ARM_LABEL }], mergeStateStatus: 'CLEAN' },
+        ]);
+      }
+      if (Array.isArray(args) && args[1] === 'api' && String(args[2]).includes('/check-runs')) {
+        return JSON.stringify({ check_runs: [] });
+      }
+      if (args[1] === 'api' && String(args[2]).includes('/rules/branches/')) {
+        throw new Error('synthetic rules are unavailable');
+      }
+      throw new Error(`unexpected call: ${args.join(' ')}`);
+    },
+  });
+  const prs = await adapter.listOpenPrs();
+  assert.equal(prs.length, 2);
+  const checkCalls = calls.filter((call) => call.includes('/check-runs'));
+  assert.equal(checkCalls.length, 1, 'only the armed PR may cost a check-runs call');
+  assert.ok(checkCalls[0].includes('s2'));
+  assert.ok(!calls.some((call) => call.includes('/comments') || call.includes('/events')));
+});
+
+test('M114-R8b: the merge loop consumes the shared snapshot instead of listing again', async () => {
+  let listCalls = 0;
+  const adapter = {
+    async listOpenPrs() {
+      listCalls += 1;
+      return [];
+    },
+  };
+  const outcomes = await runQueue(adapter, {
+    initialPrs: [
+      { number: 3, title: 'draft', headRefName: 'b3', headSha: 's3', isDraft: true, labels: [], checks: [], mergeStateStatus: 'CLEAN' },
+    ],
+    maxIterations: 2,
+  });
+  assert.equal(listCalls, 0, 'plan and merge must share one listing');
+  assert.equal(outcomes[0].status, 'not-eligible');
+});
+
+test('M114-R8b: merging reuses the listed title instead of another gh pr view', async () => {
+  const calls = [];
+  const adapter = createGhAdapter({
+    repo: 'synthetic/queue',
+    run: (args) => {
+      calls.push(args.join(' '));
+      if (args[1] === 'api' && String(args[2]).includes('/pulls/2/commits')) {
+        return JSON.stringify([[{ commit: { message: 'fix: synthetic merge' } }]]);
+      }
+      if (args[1] === 'pr' && args[2] === 'merge') return '';
+      if (args[1] === 'pr' && args[2] === 'view') {
+        return JSON.stringify({ state: 'MERGED', mergeCommit: { oid: 'synthetic-sha' } });
+      }
+      throw new Error(`unexpected call: ${args.join(' ')}`);
+    },
+  });
+  const result = await adapter.merge(2, { expectedHead: 's2', title: 'fix: synthetic merge' });
+  assert.equal(result.merged, true);
+  assert.ok(
+    !calls.some((call) => call.includes('--json title')),
+    'the title already came from the shared listing',
+  );
 });

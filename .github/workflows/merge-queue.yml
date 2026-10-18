@@ -81,13 +81,19 @@ jobs:
       - name: Verify the queue logic (unit tests)
         run: node --test scripts/merge-queue.test.mjs
 
-      - name: Plan the queue
+      - name: Drain the queue (plan + merge share one snapshot)
+        # M114/R8: `drain` first asks "is anything armed?" with ONE listing and
+        # exits immediately when nothing is queued (most workflow_run sweeps),
+        # then reads the ruleset once and reuses a single PR listing for both the
+        # plan and the merge loop. Previously `plan` and `run` were two separate
+        # processes, each re-listing every open PR + its check-runs, which alone
+        # cost ~1000-1300 REST calls/hour on the same 5000/h user budget the
+        # desktop app uses.
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-        run: node scripts/merge-queue.mjs plan --repo "$GITHUB_REPOSITORY"
-
-      - name: Drain the queue (merge in order)
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-        run: node scripts/merge-queue.mjs run --repo "$GITHUB_REPOSITORY"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            node scripts/merge-queue.mjs drain --repo "$GITHUB_REPOSITORY" --dry-run
+          else
+            node scripts/merge-queue.mjs drain --repo "$GITHUB_REPOSITORY"
+          fi
