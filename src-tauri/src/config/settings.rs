@@ -315,6 +315,31 @@ impl DeliveryCeiling {
             self
         }
     }
+
+    /// M116: the stable label used in `settings`, `sessions.delivery_ceiling`
+    /// and `delivery_runs.requested_ceiling`.
+    pub fn label(self) -> &'static str {
+        match self {
+            DeliveryCeiling::Off => "off",
+            DeliveryCeiling::PrOnly => "pr_only",
+            DeliveryCeiling::ThroughCiGreen => "through_ci_green",
+            DeliveryCeiling::ThroughMerge => "through_merge",
+            DeliveryCeiling::ThroughRelease => "through_release",
+        }
+    }
+
+    /// Inverse of [`Self::label`]. Unknown labels return `None` so callers can
+    /// fail closed instead of inventing an authorization.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(DeliveryCeiling::Off),
+            "pr_only" => Some(DeliveryCeiling::PrOnly),
+            "through_ci_green" => Some(DeliveryCeiling::ThroughCiGreen),
+            "through_merge" | "merged" => Some(DeliveryCeiling::ThroughMerge),
+            "through_release" => Some(DeliveryCeiling::ThroughRelease),
+            _ => None,
+        }
+    }
 }
 
 /// Merge strategy for `ThroughMerge`+.

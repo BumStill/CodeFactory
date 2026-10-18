@@ -54,9 +54,9 @@ pub mod worktree;
 
 pub use dispatch::{
     constraint_audit_payload, constraint_instruction_block, decide_chat_contract,
-    decide_chat_contract_with_intent, decide_chat_mode, is_contextual_approval,
-    is_delivery_revocation, is_explicit_delivery_authorization, proposal_capability,
-    resolve_turn_delivery_authorization, steer_capability_override_with_authorization,
+    decide_chat_contract_with_intent, decide_chat_mode, declared_delivery_ceiling,
+    is_contextual_approval, is_delivery_revocation, is_explicit_delivery_authorization,
+    proposal_capability, resolve_turn_delivery_authorization, steer_capability_override_with_authorization,
     with_persisted_delivery_authorization, DeliveryAuthorizationUpdate, TurnGrants, TurnIntent,
 };
 pub(crate) use internal_text::{generate_bounded_text, InternalTextOutput};
@@ -650,6 +650,42 @@ pub async fn fetch_session_delivery_authorized(db: &SqlitePool, session_id: &str
 pub async fn set_session_delivery_authorized(db: &SqlitePool, session_id: &str, authorized: bool) {
     let _ = sqlx::query("UPDATE sessions SET delivery_authorized = ? WHERE id = ?")
         .bind(if authorized { 1 } else { 0 })
+        .bind(session_id)
+        .execute(db)
+        .await;
+}
+
+/// M116-R2: the ceiling this session's own dispatch/steer message declared.
+///
+/// `delivery_authorized` only recorded that delivery was allowed, so a kickoff
+/// message saying `ceiling: merged` lost that value and the first delivery fell
+/// back to the global setting (production 2026-10-18: session 74b33b1e recorded
+/// `pr_only` while the dispatch authorized `merged`). A missing column/row reads
+/// as `None`, which keeps the previous fallback and never widens authorization.
+pub async fn fetch_session_delivery_ceiling(
+    db: &SqlitePool,
+    session_id: &str,
+) -> Option<crate::config::settings::DeliveryCeiling> {
+    let label = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT delivery_ceiling FROM sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()?;
+    crate::config::settings::DeliveryCeiling::from_label(&label)
+}
+
+/// Persist (or clear, with `None`) the session's declared delivery ceiling.
+pub async fn set_session_delivery_ceiling(
+    db: &SqlitePool,
+    session_id: &str,
+    ceiling: Option<crate::config::settings::DeliveryCeiling>,
+) {
+    let _ = sqlx::query("UPDATE sessions SET delivery_ceiling = ? WHERE id = ?")
+        .bind(ceiling.map(|value| value.label()))
         .bind(session_id)
         .execute(db)
         .await;
@@ -3199,6 +3235,39 @@ mod tests {
         // Revocation clears the grant.
         set_session_delivery_authorized(&db, "s1", false).await;
         assert!(!fetch_session_delivery_authorized(&db, "s1").await);
+    }
+
+    /// M116-R2/R4: the ceiling the user wrote in the dispatch message survives in
+    /// the session row, so the first delivery no longer falls back to the global
+    /// `pr_only` while the task itself was authorized `merged`.
+    #[tokio::test]
+    async fn m116_session_delivery_ceiling_round_trips() {
+        use crate::config::settings::DeliveryCeiling;
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 0, delivery_ceiling TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sessions (id) VALUES ('s1')")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(fetch_session_delivery_ceiling(&db, "s1").await, None);
+        set_session_delivery_ceiling(&db, "s1", Some(DeliveryCeiling::ThroughMerge)).await;
+        assert_eq!(
+            fetch_session_delivery_ceiling(&db, "s1").await,
+            Some(DeliveryCeiling::ThroughMerge)
+        );
+        // Revoking clears the declared ceiling instead of leaving it for a later
+        // unrelated grant to inherit.
+        set_session_delivery_ceiling(&db, "s1", None).await;
+        assert_eq!(fetch_session_delivery_ceiling(&db, "s1").await, None);
     }
 
     // M48 R0: the GUI input path lost an explicit delivery authorization when

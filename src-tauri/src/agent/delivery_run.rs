@@ -19,14 +19,43 @@ const NON_TERMINAL_PREDICATE: &str =
 const TERMINAL_STATUS_PREDICATE: &str =
     "status IN ('completed', 'failed', 'cancelled', 'rejected')";
 pub(crate) const MAX_IDENTICAL_TAKEOVER_FAILURES: i64 = 2;
-pub(crate) fn delivery_ceiling_allows_resume(previous: &str, requested: &str) -> bool {
-    fn rank(value: &str) -> Option<u8> {
-        match value {
-            "off" => Some(0), "pr_only" => Some(1), "through_ci_green" => Some(2),
-            "through_merge" => Some(3), "through_release" => Some(4), _ => None,
-        }
+/// Rank of a persisted ceiling label. `None` means this build does not
+/// understand the value, so it must stay a conflict instead of being silently
+/// reinterpreted.
+pub(crate) fn delivery_ceiling_rank(label: &str) -> Option<u8> {
+    match label {
+        "off" => Some(0),
+        "pr_only" => Some(1),
+        "through_ci_green" => Some(2),
+        "through_merge" => Some(3),
+        "through_release" => Some(4),
+        _ => None,
     }
-    previous == requested || matches!((rank(previous), rank(requested)), (Some(a), Some(b)) if b <= a)
+}
+
+/// M116-R3: recognized ceilings may resume at the same or a higher level.
+/// Authorization is checked by the tool before durable admission; lowering is
+/// refused without changing identity or rewriting the recorded ceiling.
+pub(crate) fn delivery_ceiling_allows_resume(previous: &str, requested: &str) -> bool {
+    previous == requested
+        || matches!(
+            (
+                delivery_ceiling_rank(previous),
+                delivery_ceiling_rank(requested)
+            ),
+            (Some(a), Some(b)) if b >= a
+        )
+}
+
+/// M116-R3: true only when the requested ceiling widens the recorded one.
+pub(crate) fn delivery_ceiling_is_upgrade(previous: &str, requested: &str) -> bool {
+    matches!(
+        (
+            delivery_ceiling_rank(previous),
+            delivery_ceiling_rank(requested)
+        ),
+        (Some(recorded), Some(requested)) if requested > recorded
+    )
 }
 
 fn delivery_identity_conflict(existing: &sqlx::sqlite::SqliteRow, run: &NewDeliveryRun) -> Result<String> {
@@ -42,8 +71,28 @@ fn delivery_identity_conflict(existing: &sqlx::sqlite::SqliteRow, run: &NewDeliv
     }
     if existing.try_get::<Option<String>, _>("session_id")? != run.session_id
         || existing.try_get::<Option<String>, _>("task_id")? != run.task_id { fields.push("任务来源"); }
-    if !delivery_ceiling_allows_resume(&existing.try_get::<String, _>("requested_ceiling")?, &run.requested_ceiling) {
+    let recorded_ceiling: String = existing.try_get("requested_ceiling")?;
+    if !delivery_ceiling_allows_resume(&recorded_ceiling, &run.requested_ceiling) {
+        if let (Some(previous), Some(requested)) =
+            (delivery_ceiling_rank(&recorded_ceiling), delivery_ceiling_rank(&run.requested_ceiling))
+        {
+            if requested < previous {
+                return Ok(format!(
+                    "本次交付上限 {} 低于同一交付已记录的上限 {}；不允许降低交付上限，未执行提交、推送或 PR 操作。请沿用已记录的上限继续同一交付。",
+                    run.requested_ceiling, recorded_ceiling
+                ));
+            }
+        }
         fields.push("交付授权上限");
+    }
+    // M116-R3: a ceiling-only difference is never a "wrong workspace" problem —
+    // the caller is already in the right workspace. Only an unreadable label
+    // lands here now, so say exactly that instead of contradicting the caller.
+    if fields.len() == 1 && fields[0] == "交付授权上限" {
+        return Ok(format!(
+            "delivery run identity collision: 交付授权上限无法识别（记录 {}，本次 {}）；未执行提交、推送或 PR 操作。请改用 off/pr_only/through_ci_green/through_merge/through_release 之一重试，系统会继续同一条交付记录。",
+            recorded_ceiling, run.requested_ceiling
+        ));
     }
     Ok(format!("delivery run identity collision: {}发生变化；未执行提交、推送或 PR 操作。请回到原任务的原工作区继续；若确实要交付另一任务，请使用该任务自己的交付记录。", fields.join("、")))
 }
@@ -583,12 +632,26 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     ] {
         sqlx::query(index).execute(pool).await?;
     }
+    // M116: historical installations still have the immutable trigger.
+    sqlx::query("DROP TRIGGER IF EXISTS trg_delivery_runs_requested_ceiling_immutable")
+        .execute(pool).await?;
+    // M116-R3: keep parity with `migrations/0021_delivery_ceiling_upgrade.sql` —
+    // the recorded ceiling may only move UP inside the same delivery.
     sqlx::query(
-        "CREATE TRIGGER IF NOT EXISTS trg_delivery_runs_requested_ceiling_immutable
+        "CREATE TRIGGER IF NOT EXISTS trg_delivery_runs_requested_ceiling_no_lower
          BEFORE UPDATE OF requested_ceiling ON delivery_runs
          WHEN NEW.requested_ceiling <> OLD.requested_ceiling
+          AND NOT (
+            (CASE NEW.requested_ceiling
+               WHEN 'off' THEN 0 WHEN 'pr_only' THEN 1 WHEN 'through_ci_green' THEN 2
+               WHEN 'through_merge' THEN 3 WHEN 'through_release' THEN 4 ELSE -1 END)
+            >
+            (CASE OLD.requested_ceiling
+               WHEN 'off' THEN 0 WHEN 'pr_only' THEN 1 WHEN 'through_ci_green' THEN 2
+               WHEN 'through_merge' THEN 3 WHEN 'through_release' THEN 4 ELSE -1 END)
+          )
          BEGIN
-           SELECT RAISE(ABORT, 'delivery requested ceiling is immutable');
+           SELECT RAISE(ABORT, 'delivery requested ceiling may only be raised');
          END",
     )
     .execute(pool)
@@ -906,6 +969,22 @@ pub async fn create_delivery_run(
             return Err(crate::errors::AppError::Other(
                 delivery_identity_conflict(&existing, run)?,
             ));
+        }
+        // M116-R3: the same delivery asked for a higher ceiling (pr_only →
+        // through_merge) after the user's own dispatch/steer message raised the
+        // authorization. That is a widening of this delivery, so the durable
+        // record follows it and the run continues; the DB trigger still refuses
+        // any downward rewrite (M69 / CF-TRUTH-R5).
+        let recorded_ceiling: String = existing.try_get("requested_ceiling")?;
+        if delivery_ceiling_is_upgrade(&recorded_ceiling, &run.requested_ceiling) {
+            sqlx::query(
+                "UPDATE delivery_runs SET requested_ceiling=?, updated_at=? WHERE id=?",
+            )
+            .bind(&run.requested_ceiling)
+            .bind(now)
+            .bind(&run.id)
+            .execute(&mut *tx)
+            .await?;
         }
         let existing_owner = existing.try_get::<Option<String>, _>("lease_owner")?;
         let existing_lease_expires_at = existing.try_get::<Option<i64>, _>("lease_expires_at")?;
@@ -6212,17 +6291,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cf_truth_r5_m69_lower_ceiling_resumes_the_same_run() {
+    async fn m116_lower_ceiling_is_refused_without_rewriting_the_same_run() {
         let pool = pool().await;
         let owner = ProcessIdentity::new("fixture-owner", "test", "test");
         create_mutation_test_run(&pool, "truth-ceiling", &owner, 100, 90).await;
         let mut run: NewDeliveryRun = truth_run("truth-ceiling");
         run.requested_ceiling = "through_ci_green".into();
-        create_delivery_run(&pool, &run, &owner, 110, 90)
-            .await.expect("waiting for CI is not a different task");
+        let error = create_delivery_run(&pool, &run, &owner, 110, 90)
+            .await.expect_err("M116-R3 rejects lowering the delivery ceiling");
+        assert!(error.to_string().contains("不允许降低交付上限"), "{error}");
+        assert!(!error.to_string().contains("请回到原任务的原工作区"));
         let ceiling: String = sqlx::query_scalar("SELECT requested_ceiling FROM delivery_runs WHERE id='truth-ceiling'")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(ceiling, "through_release", "a lowered call cannot rewrite durable authorization");
+    }
+
+    /// M116-R3/R4: the first delivery recorded `pr_only` (the global default at
+    /// the time), then the same delivery asked for `through_merge` after the
+    /// dispatch message's `ceiling: merged` finally reached the tool. That is a
+    /// widening of the *same* authorized delivery, so it must continue and the
+    /// durable record must follow — not fail as a foreign identity.
+    #[tokio::test]
+    async fn m116_raising_the_ceiling_continues_the_same_delivery_and_updates_the_record() {
+        let pool = pool().await;
+        let owner = ProcessIdentity::new("fixture-owner", "test", "test");
+        let mut pr_only = truth_run("m116-upgrade");
+        pr_only.requested_ceiling = "pr_only".into();
+        create_delivery_run(&pool, &pr_only, &owner, 100, 90)
+            .await
+            .expect("first delivery at the configured pr_only ceiling");
+
+        let mut merged = truth_run("m116-upgrade");
+        merged.requested_ceiling = "through_merge".into();
+        create_delivery_run(&pool, &merged, &owner, 110, 90)
+            .await
+            .expect("M116: raising the ceiling inside the same identity is the same delivery");
+
+        let ceiling: String =
+            sqlx::query_scalar("SELECT requested_ceiling FROM delivery_runs WHERE id='m116-upgrade'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            ceiling, "through_merge",
+            "the durable record follows the authorized upgrade"
+        );
+    }
+
+    /// M116-R3: lowering the *recorded* ceiling is still refused — a later call
+    /// may deliver less, but it may not rewrite durable authorization downward
+    /// (M69 / CF-TRUTH-R5).
+    #[tokio::test]
+    async fn m116_recorded_ceiling_cannot_be_lowered() {
+        let pool = pool().await;
+        let owner = ProcessIdentity::new("fixture-owner", "test", "test");
+        let mut merged = truth_run("m116-lower");
+        merged.requested_ceiling = "through_merge".into();
+        create_delivery_run(&pool, &merged, &owner, 100, 90)
+            .await
+            .unwrap();
+
+        let lowered = sqlx::query(
+            "UPDATE delivery_runs SET requested_ceiling='pr_only' WHERE id='m116-lower'",
+        )
+        .execute(&pool)
+        .await;
+        let error = lowered.expect_err("the recorded ceiling may only be raised");
+        assert!(
+            error.to_string().contains("may only be raised"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn m116_historical_immutable_trigger_is_replaced_idempotently() {
+        let pool = pool().await;
+        sqlx::query("CREATE TRIGGER trg_delivery_runs_requested_ceiling_immutable BEFORE UPDATE OF requested_ceiling ON delivery_runs WHEN NEW.requested_ceiling <> OLD.requested_ceiling BEGIN SELECT RAISE(ABORT, 'delivery requested ceiling is immutable'); END")
+            .execute(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        ensure_schema(&pool).await.unwrap();
+        let owner = ProcessIdentity::new("synthetic-owner", "test", "test");
+        let mut run = truth_run("m116-historical");
+        run.requested_ceiling = "pr_only".into();
+        create_delivery_run(&pool, &run, &owner, 100, 90).await.unwrap();
+        run.requested_ceiling = "through_ci_green".into();
+        create_delivery_run(&pool, &run, &owner, 110, 90).await.unwrap();
+        run.requested_ceiling = "through_merge".into();
+        create_delivery_run(&pool, &run, &owner, 120, 90).await.unwrap();
+        let (count, ceiling): (i64, String) = sqlx::query_as(
+            "SELECT COUNT(*), requested_ceiling FROM delivery_runs WHERE id='m116-historical'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!((count, ceiling.as_str()), (1, "through_merge"));
     }
 
     fn truth_run(id: &str) -> NewDeliveryRun {
