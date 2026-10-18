@@ -1,6 +1,6 @@
 # M119：受管浏览器启动的 Chrome 不再把 CodeFactory 当「责任进程」
 
-## 原始任务规格（逐字保留）
+## 任务规格（R4 按治理规则澄清产品权限引导，其余保留）
 
 ### 证据（编排方 10-18 用系统日志实测）
 - 23:10:37 与 23:15:23，tccd 记录：`requesting=com.google.Chrome (/Applications/Google Chrome.app)`，`responsible=com.codefactory.app`，服务 `kTCCServiceSystemPolicyAppBundles`，结果 `does not allow prompting for unentitled binaries; returning denied`，随即系统通知「已阻止 CodeFactory 修改 Mac 上的 App」。
@@ -11,7 +11,7 @@
 - R1（根治）macOS 上启动 Chrome/Chromium/Edge（受管浏览器会话、`browser_open_extensions_page` 等所有启动点）时**放弃责任归属**：用 `posix_spawn` + `responsibility_spawnattrs_setdisclaim(attr, 1)`（libSystem 私有符号，Terminal/VS Code/Chromium 自身都在用；用 `dlsym` 取，取不到就退回普通 spawn 并记一条日志，不失败）。chromiumoxide 若不能定制 spawn：改为自己启动 Chrome（带 `--remote-debugging-port`、`--user-data-dir` 等现有参数），再用 `Browser::connect` 连 DevTools 端点；保留现有超时、清理（会话结束必须杀掉进程、回收临时 profile）与「受管会话持有和回收」约束。
 - R2 Windows/Linux 行为不变。
 - R3 测试（先失败）：单测覆盖「macOS 启动参数构造包含 disclaim 路径 / dlsym 失败时回退」；真机验收由编排方做：开一个浏览器会话 → `log show --predicate 'process=="tccd" AND eventMessage CONTAINS "SystemPolicyAppBundles"'` 里不再出现 `responsible=com.codefactory.app` 的拒绝，且不再弹系统通知；浏览器会话照常可用、结束后无残留 Chrome 进程。
-- R4（兜底，小）若今后 CodeFactory 自己确实需要改别的 App（目前没有）：写入 `/Applications/*.app` 遇到 EPERM 时，界面给一张卡片「需要在 系统设置 › 隐私与安全性 › App 管理 里允许 CodeFactory」+ 打开 `x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles` 的按钮；用户回到应用时自动重试一次，成功后按需提示重启。不自动改系统设置（macOS 也不允许）。本条可以只写规格+最小实现，不要扩大范围。
+- R4（兜底，小）若今后 CodeFactory 自己确实需要改别的 App（目前没有）：写入 `/Applications/*.app` 遇到 EPERM 时，产品界面展示 App 管理权限引导卡片，说明 macOS 的用户权限要求，并提供打开 `x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles` 的按钮。该开关属于 macOS 用户权限决定，应用不自动修改系统设置。CodeFactory 持续持有待完成操作；应用恢复前台时自动检测权限并执行一次受控恢复，成功后按需展示重启提示，不依赖聊天消息或操作接管来推进系统技术状态。本条可以只写规格+最小实现，不要扩大范围。
 
 ### 约束
 - 合成 fixture，不写生产 DB。在规格文档（docs/specs/）补一节说明。授权交付（ceiling: merged）。
