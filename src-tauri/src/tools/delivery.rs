@@ -96,6 +96,23 @@ pub fn definition() -> ToolDefinition {
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
+    match execute_inner(args, ctx).await {
+        Err(crate::errors::AppError::ToolArgument(message)) => Ok(ToolOutput::err(message)),
+        result => result,
+    }
+}
+
+async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
+    if let Some(value) = args.get("ceiling").filter(|value| !value.is_null()) {
+        if value.as_str().and_then(parse_ceiling).is_none() {
+            return Ok(ToolOutput::err("无效 ceiling：请使用 off/pr_only/through_ci_green/through_merge/through_release（或 merged）。"));
+        }
+    }
+    for field in ["title", "body", "expect_branch"] {
+        if args.get(field).is_some_and(|value| !value.is_null() && !value.is_string()) {
+            return Ok(ToolOutput::err(format!("参数 {field} 必须是字符串，请修正后重试。")));
+        }
+    }
     let Some(settings) = ctx.settings.clone() else {
         return Ok(ToolOutput::err("交付不可用:当前上下文没有可用的设置快照。"));
     };
@@ -228,6 +245,11 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         }
         Err(error) => return Err(error),
     };
+    let ceiling_note = if let (Some(db), Some(run)) = (ctx.db.as_ref(), durable.as_ref()) {
+        let (effective, note) = resume_ceiling(db, &run.id, settings.delivery_ceiling, requested_ceiling).await?;
+        opts.requested_ceiling = Some(effective);
+        note
+    } else { None };
     if opts.expect_branch.is_none() {
         opts.expect_branch = durable.as_ref().map(|run| run.head_branch.clone());
     }
@@ -296,7 +318,12 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     if let Some(guard) = lease_guard.as_mut() {
         guard.release("invocation_return").await?;
     }
-    result
+    result.map(|mut output| {
+        if let Some(note) = ceiling_note {
+            output.content = format!("{note}\n{}", output.content);
+        }
+        output
+    })
 }
 
 struct DeliveryLeaseGuard {
@@ -1096,6 +1123,30 @@ async fn reconcile_foreground_claim<R: delivery::DeliveryRemote>(
     Ok(())
 }
 
+/// Preserve the existing delivery scope, but never exceed today's authorization.
+async fn resume_ceiling(
+    db: &sqlx::SqlitePool,
+    id: &str,
+    authorized: DeliveryCeiling,
+    requested: Option<DeliveryCeiling>,
+) -> Result<(DeliveryCeiling, Option<String>)> {
+    let selected = requested.map(|value| authorized.clamp_request(value)).unwrap_or(authorized);
+    let recorded = sqlx::query_scalar::<_, String>(
+        "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
+    ).bind(id).fetch_optional(db).await?;
+    let Some(recorded) = recorded else { return Ok((selected, None)); };
+    let previous = parse_ceiling(&recorded).ok_or_else(||
+        crate::errors::AppError::Other(format!("unrecognized recorded delivery ceiling: {recorded}")))?;
+    if authorized.clamp_request(previous) != previous {
+        return Err(crate::errors::AppError::ToolArgument(format!(
+            "已记录上限 {recorded} 超出当前会话/配置授权上限 {}；未执行交付，请使用当前授权范围。", ceiling_label(authorized))));
+    }
+    if selected.clamp_request(previous) != previous {
+        return Ok((previous, Some(format!("同一交付沿用 {recorded}（本次请求 {}），未扩大授权范围。", ceiling_label(selected)))));
+    }
+    Ok((selected, None))
+}
+
 async fn prepare_durable_run(
     args: &Value,
     ctx: &ExecCtx,
@@ -1121,7 +1172,11 @@ async fn prepare_durable_run(
             })?;
     }
     let (repo, _) = delivery::resolve_delivery_repo(&ctx.cwd, None, expected_branch)
-        .map_err(crate::errors::AppError::Other)?;
+        .map_err(crate::errors::AppError::ToolArgument)?;
+    if expected_branch.is_some_and(|expected| expected != repo.branch) {
+        return Err(crate::errors::AppError::ToolArgument(format!(
+            "expect_branch 不匹配当前交付分支 {}；未执行交付，请核对后重试。", repo.branch)));
+    }
     let identity =
         delivery::capture_delivery_identity(&repo).map_err(crate::errors::AppError::Other)?;
     let repo_identity = identity.repo_identity;
@@ -1130,9 +1185,10 @@ async fn prepare_durable_run(
     let worktree_identity = identity.worktree_identity;
     let id = durable_run_id(&objective_id, &repo_identity);
     let process = foreground_delivery_process_identity();
-    let selected_ceiling = requested_ceiling
-        .map(|requested| configured_ceiling.clamp_request(requested))
-        .unwrap_or(configured_ceiling);
+    let (selected_ceiling, _) = {
+        delivery_run::ensure_schema(db).await?;
+        resume_ceiling(db, &id, configured_ceiling, requested_ceiling).await?
+    };
     let head_branch = repo.branch.clone();
     // Record the agent's PR title/body intent on the durable run BEFORE
     // admission, so a call that is subsequently blocked (a competing lease, an
@@ -7580,6 +7636,60 @@ mod tests {
             error.to_string().contains("different pull request"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn m117_resume_retains_recorded_ceiling_within_authorization() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE delivery_runs(id TEXT, requested_ceiling TEXT)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO delivery_runs VALUES ('same-run', 'through_merge')").execute(&db).await.unwrap();
+        let (ceiling, note) = resume_ceiling(&db, "same-run", DeliveryCeiling::ThroughMerge,
+            Some(DeliveryCeiling::ThroughCiGreen)).await.unwrap();
+        assert_eq!(ceiling, DeliveryCeiling::ThroughMerge);
+        assert!(note.unwrap().contains("沿用 through_merge"));
+        assert!(resume_ceiling(&db, "same-run", DeliveryCeiling::PrOnly,
+            Some(DeliveryCeiling::PrOnly)).await.is_err());
+        let stored: String = sqlx::query_scalar("SELECT requested_ceiling FROM delivery_runs WHERE id='same-run'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(stored, "through_merge");
+        let (new_ceiling, note) = resume_ceiling(&db, "new-run", DeliveryCeiling::ThroughMerge,
+            Some(DeliveryCeiling::PrOnly)).await.unwrap();
+        assert_eq!(new_ceiling, DeliveryCeiling::PrOnly);
+        assert!(note.is_none());
+    }
+
+    #[tokio::test]
+    async fn m117_invalid_ceiling_is_an_ordinary_correctable_tool_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = ExecCtx::new(temp.path().into(), None);
+        ctx.settings = Some(crate::config::settings::Settings::default());
+        let output = execute(json!({"ceiling": "typo"}), &ctx).await
+            .expect("argument errors must not abort the agent loop");
+        assert!(output.is_error);
+        assert!(serde_json::to_value(output).unwrap().to_string().contains("无效 ceiling"));
+        let retry = execute(json!({"ceiling": "pr_only"}), &ctx).await.unwrap();
+        assert!(!serde_json::to_value(retry).unwrap().to_string().contains("无效 ceiling"));
+    }
+
+    #[tokio::test]
+    async fn m117_bad_branch_is_an_ordinary_tool_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(temp.path()).unwrap();
+        let signature = git2::Signature::now("Synthetic", "fixture@example.invalid").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[]).unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE task_runs(id TEXT, objective_id TEXT)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO task_runs VALUES ('task', 'objective')").execute(&db).await.unwrap();
+        let mut ctx = ExecCtx::new(temp.path().into(), Some(db));
+        ctx.task_id = Some("task".into());
+        ctx.settings = Some(crate::config::settings::Settings::default());
+        let output = execute(json!({"expect_branch": "wrong-branch"}), &ctx).await
+            .expect("a correctable branch argument must reach the model, not recovery");
+        assert!(output.is_error);
     }
 
     #[tokio::test]

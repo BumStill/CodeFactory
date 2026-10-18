@@ -19,6 +19,9 @@ pub enum AppError {
     Migration(#[from] sqlx::migrate::MigrateError),
 
     #[error("{0}")]
+    ToolArgument(String),
+
+    #[error("{0}")]
     Other(String),
 }
 
