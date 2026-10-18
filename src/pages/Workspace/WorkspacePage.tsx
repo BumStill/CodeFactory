@@ -27,6 +27,7 @@ import { PermissionModePicker } from "../../components/PermissionModePicker";
 import { PermissionDialog } from "../../components/PermissionDialog";
 import { ContextUsageBar } from "../../components/ContextUsageBar";
 import { GitStatusBar } from "../../components/GitStatusBar";
+import { SessionBackgroundTasks } from "../../components/SessionBackgroundTasks";
 import { WorkspaceDeliveryStatus, type WorkspaceDeliveryState } from "../../components/WorkspaceDeliveryStatus";
 import { GitChangesPanel } from "../../components/GitChangesPanel";
 import { GitHistoryPanel } from "../../components/GitHistoryPanel";
@@ -813,6 +814,7 @@ export function WorkspacePage({
           </button>
         )}
         <div className="flex items-center gap-1.5">
+          <SessionBackgroundTasks sessionId={sessionId} />
           <GitStatusBar
             cwd={activeCwd}
             detailsId={auxiliaryPaneOpen && auxiliaryPaneKind === "git"

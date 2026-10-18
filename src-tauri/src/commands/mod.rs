@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod backup;
+pub mod background;
 pub mod benchmark;
 pub mod browser_sessions;
 pub mod build_cache;
