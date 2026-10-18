@@ -347,16 +347,11 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         else {
             return UpdatedHeadVerdict::Foreign("no delivery remote is resolvable".into());
         };
-        match remote.queue_synced_head(known_head_sha, actual_head_sha) {
-            Ok(Some(on_default_branch)) => {
-                UpdatedHeadVerdict::SameDelivery { synced_from_default_branch: on_default_branch }
-            }
-            Ok(None) => UpdatedHeadVerdict::Foreign(format!(
-                "{actual_head_sha} is not a merge of {known_head_sha} with the default branch"
-            )),
-            Err(error) => UpdatedHeadVerdict::Foreign(format!(
-                "cannot prove {actual_head_sha} is a queue sync of {known_head_sha}: {error}"
-            )),
+        use crate::agent::delivery::DeliveryRemote;
+        if remote.head_is_explained(known_head_sha, actual_head_sha) {
+            UpdatedHeadVerdict::SameDelivery { synced_from_default_branch: "default branch / known delivery history".into() }
+        } else {
+            UpdatedHeadVerdict::Foreign(format!("cannot explain {actual_head_sha} from delivery head {known_head_sha}"))
         }
     }
 

@@ -2808,6 +2808,8 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
                 return Ok(());
             }
             Ok(delivery::MergeObservation::OpenSameHead { .. } | delivery::MergeObservation::ClosedUnmerged) => {}
+            Ok(delivery::MergeObservation::HeadChanged { actual_head })
+                if remote.is_some_and(|remote| remote.head_is_explained(&claimed.expected_head_sha, &actual_head)) => {}
             _ => {
                 // No identity failure may be inferred from an offline/unknown
                 // provider. Release the claim without rewriting progress.
