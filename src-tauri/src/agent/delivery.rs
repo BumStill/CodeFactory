@@ -3170,9 +3170,14 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
         })?;
         match remote.observe_merge(pr_number, &identity.head_sha).await? {
             MergeObservation::OpenSameHead { .. } | MergeObservation::Merged { .. } => {}
+            // M111: the PR head is the branch head, which the remote-branch
+            // check above already accepted as explained (own push or an
+            // ancestor of the receipted local head). Accept the same head here;
+            // anything else is still foreign and fails closed.
             MergeObservation::HeadChanged { actual_head }
                 if actual_head == persisted_identity.head_sha
-                    || Some(actual_head.as_str()) == receipted_parent_head => {}
+                    || Some(actual_head.as_str()) == receipted_parent_head
+                    || remote_head.as_deref() == Some(actual_head.as_str()) => {}
             MergeObservation::HeadChanged { actual_head } => {
                 return Err(format!(
                     "canonical PR #{pr_number} moved to unrecognized head {actual_head}"
@@ -13193,6 +13198,9 @@ README-Update-Reason: synthetic fixture\n\nbody"
         last_ci_sha: Mutex<Option<String>>,
         ci_sequence: Mutex<VecDeque<CiStatus>>,
         merge_readiness: Mutex<Option<MergeReadiness>>,
+        /// M111: the head GitHub reports for the canonical PR, when it differs
+        /// from the local head passed to observe_merge.
+        pr_head: Mutex<Option<String>>,
         release_observation: Mutex<Option<ReleaseDispatchObservation>>,
         created_pr: Mutex<Option<DeliveryPr>>,
         branch_update_repo: Mutex<Option<PathBuf>>,
@@ -13533,12 +13541,15 @@ README-Update-Reason: synthetic fixture\n\nbody"
         async fn observe_merge(
             &self,
             _number: u64,
-            _expected_head: &str,
+            expected_head: &str,
         ) -> Result<MergeObservation, String> {
+            let pr_head = self.calls.pr_head.lock().unwrap().clone();
             if self.calls.merged.load(Ordering::SeqCst) {
                 Ok(MergeObservation::Merged {
                     merge_sha: "merge-sha".into(),
                 })
+            } else if let Some(actual_head) = pr_head.filter(|head| head != expected_head) {
+                Ok(MergeObservation::HeadChanged { actual_head })
             } else {
                 Ok(MergeObservation::OpenSameHead {
                     auto_merge: self.merge_queues && self.calls.merge.load(Ordering::SeqCst) > 0,
@@ -15135,6 +15146,106 @@ Release-Urgency: hold"
         )
         .await
         .expect("a run's own pushed child must not be refused as a foreign head");
+    }
+
+    /// M111: the canonical PR check must accept the same explained heads as the
+    /// remote-branch check above it. CF-BG (#724, 2026-10-18) pushed its own
+    /// commit, kept working locally, and the next takeover failed with
+    /// "canonical PR #724 moved to unrecognized head" although the remote
+    /// branch check had already accepted that head as the run's own push.
+    #[tokio::test]
+    async fn own_pushed_pr_head_behind_local_work_is_not_unrecognized() {
+        let (root, parent, child) = own_push_then_local_commit("takeover-own-pr-head");
+        let calls = stub_calls();
+        *calls.pr_head.lock().unwrap() = Some(child.clone());
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        observe_delivery_takeover_with_receipted_parent(
+            &root,
+            Some("main"),
+            "feat/x",
+            &parent,
+            Some(724),
+            Some("https://github.com/example/project/pull/724"),
+            None,
+            Some(&remote),
+        )
+        .await
+        .expect("the PR head is the run's own pushed commit");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_foreign_pr_head_still_fails_closed() {
+        let (root, parent, _child) = own_push_then_local_commit("takeover-foreign-pr-head");
+        let calls = stub_calls();
+        *calls.pr_head.lock().unwrap() = Some("f".repeat(40));
+        let remote = StubRemote {
+            ci: CiStatus::Success,
+            existing_pr: None,
+            merge_queues: false,
+            merge_ok: true,
+            caps: every_capability(),
+            calls: calls.clone(),
+        };
+        let error = observe_delivery_takeover_with_receipted_parent(
+            &root,
+            Some("main"),
+            "feat/x",
+            &parent,
+            Some(724),
+            Some("https://github.com/example/project/pull/724"),
+            None,
+            Some(&remote),
+        )
+        .await
+        .expect_err("a PR head nobody here pushed must not be adopted");
+        assert!(error.contains("moved to unrecognized head"), "{error}");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Parent pushed, child pushed (the PR head), then one more receipted local
+    /// commit that has not been pushed yet — the shape CF-BG was in.
+    fn own_push_then_local_commit(name: &str) -> (PathBuf, DeliveryIdentitySnapshot, String) {
+        let root = feature_branch_repo(name);
+        let commit = |message: &str| {
+            git(
+                &root,
+                &[
+                    "-c",
+                    "user.name=CodeFactory",
+                    "-c",
+                    "user.email=noreply@codefactory.local",
+                    "commit",
+                    "--no-verify",
+                    "-m",
+                    message,
+                ],
+            )
+            .unwrap();
+        };
+        git(&root, &["add", "feature.rs"]).unwrap();
+        commit("fix: delivery parent");
+        git(&root, &["push", "-q", "-u", "origin", "feat/x"]).unwrap();
+        std::fs::write(root.join("child.rs"), "pub fn child() {}\n").unwrap();
+        git(&root, &["add", "child.rs"]).unwrap();
+        commit("fix: delivery child");
+        git(&root, &["push", "-q", "origin", "feat/x"]).unwrap();
+        let child = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        std::fs::write(root.join("local.rs"), "pub fn local() {}\n").unwrap();
+        git(&root, &["add", "local.rs"]).unwrap();
+        commit("fix: local follow-up");
+        // The local follow-up (CF-BG: a merge of main) is the receipted
+        // identity; the PR still shows the earlier pushed child.
+        let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+        let receipted = capture_delivery_identity(&repo).unwrap();
+        (root, receipted, child)
     }
 
     #[tokio::test]
