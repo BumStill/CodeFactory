@@ -376,7 +376,9 @@ how to stop it.\n\
 \n\
 After you open a delivery PR, watch its CI in the background (`gh pr checks\n\
 <n> --watch`, or a polling script with an interval of at least 180s so you do\n\
-not burn the GitHub API budget). When you are woken: failures -> fix and push;\n\
+not burn the GitHub API budget). `deliver_changes` itself never waits on CI: it\n\
+returns `waiting` with the PR number, so this background watch is what keeps\n\
+the wait alive. When you are woken: failures -> fix and push;\n\
 a trust-root-only self-modification -> say you are waiting for the orchestrator\n\
 to lift the gate; all green -> apply `merge-queue: armed`.\n\
 \n\
@@ -476,7 +478,9 @@ when the user asked.\n\
 \n\
 After you open a delivery PR, watch its CI in the background (`gh pr checks\n\
 <n> --watch`, or polling with an interval of at least 180s to protect the\n\
-GitHub API budget). When woken: failures -> fix and push; trust-root-only\n\
+GitHub API budget). `deliver_changes` itself never waits on CI: it returns\n\
+`waiting` with the PR number, so this background watch is what keeps the wait\n\
+alive. When woken: failures -> fix and push; trust-root-only\n\
 self-modification -> report that you are waiting for the orchestrator; all\n\
 green -> apply `merge-queue: armed`.\n\
 \n\
@@ -551,7 +555,9 @@ to stop it.\n\
 \n\
 After you open a delivery PR, watch its CI in the background (`gh pr checks\n\
 <n> --watch`, or polling with an interval of at least 180s for the GitHub API\n\
-budget). When woken: failures -> fix and push; trust-root-only\n\
+budget). `deliver_changes` itself never waits on CI: it returns `waiting` with\n\
+the PR number, so this background watch is what keeps the wait alive. When\n\
+woken: failures -> fix and push; trust-root-only\n\
 self-modification -> state that you are waiting for the orchestrator; all\n\
 green -> apply `merge-queue: armed`.\n\
 \n\

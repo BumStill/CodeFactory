@@ -1244,7 +1244,9 @@ impl WakeSourceCover {
         }
         Some(
             "结束这个等待前先挂一个唤醒源：background_task_start（等待的命令结束时唤醒本会话）\
-             或 schedule_wakeup（到点唤醒）。没有唤醒源就没人会把你叫回来继续收尾。"
+             或 schedule_wakeup（到点唤醒）。没有唤醒源就没人会把你叫回来继续收尾。\
+             等 CI 时推荐 `background_task_start` + `gh pr checks <n> --watch`；\
+             如果要自己轮询，间隔必须 ≥180s（M114：GitHub API 额度）。"
                 .to_string(),
         )
     }

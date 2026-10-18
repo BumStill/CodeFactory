@@ -63,7 +63,7 @@ pub fn definition() -> ToolDefinition {
                     "ceiling": {
                         "type": "string",
                         "enum": ["off", "pr_only", "through_ci_green", "through_merge", "through_release"],
-                        "description": "Optional per-call ceiling. Clamped to at most the user's configured ceiling — a call can lower, never raise it. Use `through_ci_green` to WAIT for CI on the PR this branch already has: this tool polls with backoff (10s→60s) and is the supported way to wait. Never shell out to `gh pr checks --watch` or a tight `gh` polling loop — those refresh every 10s until CI ends, exhaust the shared GitHub quota, and the resulting 403s break unrelated releases."
+                        "description": "Optional per-call ceiling. Clamped to at most the user's configured ceiling — a call can lower, never raise it. This tool never blocks on CI: when the PR's checks are still running it returns `waiting` right away. Then watch the PR with `background_task_start` (`gh pr checks <n> --watch`, or a poll loop with an interval of at least 180s to protect the GitHub API budget) and call deliver_changes again from the same branch when you are woken. Never run a tight `gh` polling loop."
                     },
                     "hold_requested_by_user": {
                         "type": "string",
@@ -5430,16 +5430,23 @@ mod tests {
     /// nothing said so — so the model reached for `--watch` and burned the
     /// quota (2026-08-03/04). Deny without an alternative just moves the bypass.
     #[test]
-    fn the_schema_points_at_the_managed_way_to_wait_for_ci() {
+    fn the_schema_hands_ci_waiting_to_a_background_watch() {
+        // CF-BG-R1/R2 取代了旧契约：交付工具不再自己 `WAIT for CI`，而是立刻
+        // 返回 `waiting`，由 agent 用后台任务监视。旧断言（"WAIT for CI"）正是
+        // 真机上 background_tasks 表 0 行的原因，因此按规格改为断言新契约。
         let schema = definition().function.parameters.to_string();
         assert!(schema.contains("through_ci_green"));
         assert!(
-            schema.contains("WAIT for CI"),
-            "the ceiling doc must name waiting as its purpose"
+            schema.contains("never blocks on CI"),
+            "the ceiling doc must say the tool hands the wait back: {schema}"
         );
         assert!(
-            schema.contains("--watch"),
-            "and must name the bypass it replaces: {schema}"
+            schema.contains("background_task_start"),
+            "and must name the background watch that replaces it: {schema}"
+        );
+        assert!(
+            schema.contains("--watch") && schema.contains("180"),
+            "and must name the recommended command shape and quota floor: {schema}"
         );
     }
 
