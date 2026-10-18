@@ -3044,6 +3044,21 @@ pub async fn plan_startup_recovery(
         .execute(&mut *tx)
         .await?;
 
+    // M114b/R2: a run whose canonical PR already reached a conclusion (merged,
+    // or closed without merge) is not recovery work. Without this filter the
+    // 15s supervisor re-claimed the same settled runs forever (field: PR
+    // #680/#704/#710, four `gh pr view` calls a minute each).
+    let has_observation_conclusion: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('delivery_runs')
+         WHERE name='pr_observation_concluded_at'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let concluded_filter = if has_observation_conclusion != 0 {
+        " AND pr_observation_concluded_at IS NULL"
+    } else {
+        ""
+    };
     let candidate_sql = format!(
         "SELECT id, objective_id, workspace_path, worktree_identity, repo_identity,
                 base_branch, head_branch, change_set_digest,
@@ -3057,7 +3072,7 @@ pub async fn plan_startup_recovery(
            AND status IN ('running','waiting','platform_incident','agent_action_required',
                           'failed_internal','awaiting_completion_arbitration')
            AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
-           AND {STABLE_IDENTITY_PREDICATE}
+           AND {STABLE_IDENTITY_PREDICATE}{concluded_filter}
          ORDER BY created_at, id"
     );
     let candidates = sqlx::query(&candidate_sql)
