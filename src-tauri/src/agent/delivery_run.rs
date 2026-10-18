@@ -1214,14 +1214,18 @@ pub async fn reconcile_delivery_run_identity(
     })?;
 
     let status: String = existing.try_get("status")?;
-    if matches!(
+    // M113 (2026-10-18): a terminal attempt is not a reason to refuse the same
+    // delivery forever. The user's "继续" (or a "把这些改动交付" after an honest
+    // failure) arrives with the same objective/repo/worktree/branch and a head
+    // that legitimately moved past the failed attempt; refusing it with
+    // `cannot reconcile a terminal durable delivery run` burned the objective's
+    // recovery budget instead of continuing the work. The identity checks below
+    // still run first, so a genuinely foreign identity keeps failing closed —
+    // only the same delivery reopens, as the next attempt.
+    let previous_terminal = matches!(
         status.as_str(),
         "completed" | "failed" | "cancelled" | "rejected"
-    ) {
-        return Err(crate::errors::AppError::Other(
-            "cannot reconcile a terminal durable delivery run".into(),
-        ));
-    }
+    );
 
     // A legitimate advance only moves expected-head/change-set; every other
     // identity field must be unchanged, otherwise this is a genuine conflict.
@@ -1244,15 +1248,12 @@ pub async fn reconcile_delivery_run_identity(
 
     let previous_head: String = existing.try_get("expected_head_sha")?;
     let previous_digest: String = existing.try_get("change_set_digest")?;
-    if previous_head == run.expected_head_sha && previous_digest == run.change_set_digest {
-        // Already reconciled; idempotent no-op.
-        return Ok(());
-    }
-    if previous_head == run.expected_head_sha
-        && previous_digest == run.change_set_digest
-    {
-        // Idempotent no-op handling is above; a digest-only advance below is
-        // still a legitimate same-worktree revision (CF-TRUTH-R6).
+    let identity_already_current = previous_head == run.expected_head_sha
+        && previous_digest == run.change_set_digest;
+    if identity_already_current && !previous_terminal {
+        // Already reconciled; idempotent no-op. A *terminal* row with the same
+        // identity still has to reopen below, otherwise the caller leaves with
+        // `Ok` while holding no claim on a dead run.
         return Ok(());
     }
 
@@ -1293,17 +1294,76 @@ pub async fn reconcile_delivery_run_identity(
     .execute(&mut *tx)
     .await?;
 
-    let updated = sqlx::query(
-        "UPDATE delivery_runs
-         SET change_set_digest=?, expected_head_sha=?, updated_at=?
-         WHERE id=? AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')",
-    )
-    .bind(&run.change_set_digest)
-    .bind(&run.expected_head_sha)
-    .bind(now)
-    .bind(&run.id)
-    .execute(&mut *tx)
-    .await?;
+    let updated = if previous_terminal {
+        // M113: reopen the same durable delivery as its next attempt. The
+        // previous attempt stays auditable in `delivery_run_events`, and the
+        // canonical PR / repo / worktree / branch identity is carried over —
+        // "same branch with an explainable head" is the same delivery, so the
+        // user's "继续" continues the PR instead of starting a second one.
+        let reopened = sqlx::query(
+            "UPDATE delivery_runs
+             SET status=?, stage=?, wait_class=?, next_action=?,
+                 next_action_authorized=0, reached_ceiling=?,
+                 change_set_digest=?, expected_head_sha=?,
+                 failure_signature=NULL, stage_attempt=0,
+                 claim_epoch=claim_epoch+1,
+                 lease_owner=NULL, lease_expires_at=NULL,
+                 last_progress_at=?, updated_at=?
+             WHERE id=? AND status IN ('completed','failed','cancelled','rejected')",
+        )
+        .bind(&run.status)
+        .bind(&run.stage)
+        .bind(&run.wait_class)
+        .bind(&run.next_action)
+        .bind(&run.reached_ceiling)
+        .bind(&run.change_set_digest)
+        .bind(&run.expected_head_sha)
+        .bind(now)
+        .bind(now)
+        .bind(&run.id)
+        .execute(&mut *tx)
+        .await?;
+        if reopened.rows_affected() == 1 {
+            sqlx::query(
+                "INSERT INTO delivery_run_events
+                 (id, run_id, event_kind, stage, status, wait_class, detail_json, process_instance, created_at)
+                 VALUES (?, ?, 'delivery_run_continuation', ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&run.id)
+            .bind(&run.stage)
+            .bind(&run.status)
+            .bind(&run.wait_class)
+            .bind(
+                serde_json::json!({
+                    "previous_status": status,
+                    "previous_expected_head_sha": previous_head,
+                    "previous_change_set_digest": previous_digest,
+                    "next_expected_head_sha": run.expected_head_sha,
+                    "next_change_set_digest": run.change_set_digest,
+                    "reason": "terminal_attempt_continued_on_same_branch",
+                })
+                .to_string(),
+            )
+            .bind(&process.instance_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        reopened
+    } else {
+        sqlx::query(
+            "UPDATE delivery_runs
+             SET change_set_digest=?, expected_head_sha=?, updated_at=?
+             WHERE id=? AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')",
+        )
+        .bind(&run.change_set_digest)
+        .bind(&run.expected_head_sha)
+        .bind(now)
+        .bind(&run.id)
+        .execute(&mut *tx)
+        .await?
+    };
     if updated.rows_affected() == 0 {
         return Err(crate::errors::AppError::Other(
             "delivery run identity reconciliation lost its row".into(),
@@ -3960,6 +4020,104 @@ mod tests {
         .unwrap();
         assert_eq!(head, "aaa");
         assert_eq!(digest, "digest-a");
+    }
+
+    /// M113: the user's "继续" after an honest failure arrives while the
+    /// previous durable run is terminal. Same objective, same repo, same
+    /// worktree, same branch, and a head that legitimately advanced past the
+    /// failed attempt is the SAME delivery, so it must reopen as the next
+    /// attempt instead of failing with
+    /// `cannot reconcile a terminal durable delivery run` and burning the
+    /// objective's recovery budget.
+    #[tokio::test]
+    async fn m113_terminal_delivery_run_continues_on_same_branch() {
+        let pool = pool().await;
+        let process = ProcessIdentity::new("process", "1.88.25", "1882501");
+        let original = NewDeliveryRun {
+            id: "m113-continuation".into(),
+            objective_id: "objective-m113".into(),
+            run_kind: "deliver_changes".into(),
+            session_id: Some("session".into()),
+            root_turn_id: Some("turn".into()),
+            task_segment_id: Some("segment".into()),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: "worktree:m113".into(),
+            repo_identity: "example.invalid/repo".into(),
+            base_branch: "main".into(),
+            head_branch: "codefactory/objective-m113".into(),
+            change_set_digest: "digest-a".into(),
+            expected_head_sha: "aaa".into(),
+            canonical_pr_number: Some(723),
+            canonical_pr_url: Some("https://example.invalid/pr/723".into()),
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "preflight".into(),
+            status: "running".into(),
+            wait_class: None,
+            next_action: Some("deliver".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
+        };
+        create_delivery_run(&pool, &original, &process, 100, 30)
+            .await
+            .unwrap();
+        // The failed attempt left a terminal record behind, exactly like the
+        // honest-failure terminal in the field.
+        sqlx::query(
+            "UPDATE delivery_runs
+             SET status='failed', stage='failed', failure_signature='m113', last_progress_at=120
+             WHERE id='m113-continuation'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut advanced = original.clone();
+        advanced.expected_head_sha = "bbb".into();
+        advanced.change_set_digest = "digest-b".into();
+        let mut revision = DeliveryIdentityRevision {
+            receipt_id: String::new(),
+            objective_id: advanced.objective_id.clone(),
+            repo_identity: advanced.repo_identity.clone(),
+            worktree_identity: advanced.worktree_identity.clone(),
+            previous_expected_head_sha: "aaa".into(),
+            previous_change_set_digest: "digest-a".into(),
+            next_expected_head_sha: "bbb".into(),
+            next_change_set_digest: "digest-b".into(),
+        };
+        revision.receipt_id = delivery_identity_revision_receipt_id(&advanced.id, &revision);
+        reconcile_delivery_run_identity(&pool, &advanced, &process, 200, &revision)
+            .await
+            .expect("a terminal attempt on the same branch must continue, not refuse");
+
+        let row: (String, Option<i64>, String, String) = sqlx::query_as(
+            "SELECT status, canonical_pr_number, expected_head_sha, change_set_digest
+             FROM delivery_runs WHERE id='m113-continuation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !matches!(
+                row.0.as_str(),
+                "completed" | "failed" | "cancelled" | "rejected"
+            ),
+            "the continued delivery must be live again, got {}",
+            row.0
+        );
+        assert_eq!(row.1, Some(723), "the same delivery keeps its PR identity");
+        assert_eq!(row.2, "bbb");
+        assert_eq!(row.3, "digest-b");
+        let continuations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_run_events
+             WHERE run_id='m113-continuation' AND event_kind='delivery_run_continuation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(continuations, 1, "the reopened attempt must be auditable");
     }
 
     /// CF-TRUTH-R6: continuing the same delivery in the same worktree with a new

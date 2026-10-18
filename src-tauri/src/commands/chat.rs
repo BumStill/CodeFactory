@@ -1083,6 +1083,23 @@ async fn close_objective_in_pool(
     outcome: &str,
     objective_id: Option<&str>,
 ) -> anyhow::Result<crate::agent::objective::ObjectiveSnapshot> {
+    close_objective_in_pool_with_live_run(pool, session_id, outcome, objective_id, false).await
+}
+
+/// M112 (2026-10-18): `live_chat_run` is the in-memory "this session still has a
+/// chat control block" fact, and it must not outrank the durable record. A
+/// merged task awaiting acceptance is already a finished attempt — the PR is on
+/// `main` — so a lingering control block from the orchestrator's own stop must
+/// not turn closing it into `task is currently running`. For anything else the
+/// guard stays exactly as strict as before: no acceptance close while a run may
+/// still be writing.
+async fn close_objective_in_pool_with_live_run(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    outcome: &str,
+    objective_id: Option<&str>,
+    live_chat_run: bool,
+) -> anyhow::Result<crate::agent::objective::ObjectiveSnapshot> {
     anyhow::ensure!(outcome == "accepted", "outcome must be accepted");
     let mut tx = pool.begin().await?;
     let id = match objective_id {
@@ -1129,7 +1146,7 @@ async fn close_objective_in_pool(
             }
         }
     };
-    let (status, _reached): (String, Option<String>) =
+    let (status, reached): (String, Option<String>) =
         sqlx::query_as("SELECT status,reached_acceptance FROM objectives WHERE id=?")
             .bind(&id)
             .fetch_one(&mut *tx)
@@ -1138,6 +1155,16 @@ async fn close_objective_in_pool(
         status == "completed" || status == "waiting_system",
         "only a merged task awaiting acceptance can be closed"
     );
+    if live_chat_run {
+        // M112: only a record that is already a finished attempt may be closed
+        // while a control block lingers. An unfinished run keeps the strict
+        // refusal, exactly as before.
+        anyhow::ensure!(
+            status == "completed"
+                || (status == "waiting_system" && reached.as_deref() == Some("merged")),
+            "task is currently running"
+        );
+    }
     if status != "completed" {
         let now = Utc::now().timestamp_millis();
         let event_id = uuid::Uuid::new_v4().to_string();
@@ -1166,14 +1193,17 @@ pub async fn close_objective(
             "objective_id must be a non-empty string".into(),
         ));
     }
-    if state.chat_cancels.lock().await.contains_key(&session_id) {
-        return Err(AppError::Other("task is currently running".into()));
-    }
+    let live_chat_run = state.chat_cancels.lock().await.contains_key(&session_id);
     let pool = state.db.read().await.clone();
-    let objective =
-        close_objective_in_pool(&pool, &session_id, &outcome, objective_id.as_deref())
-            .await
-            .map_err(|error| AppError::Other(error.to_string()))?;
+    let objective = close_objective_in_pool_with_live_run(
+        &pool,
+        &session_id,
+        &outcome,
+        objective_id.as_deref(),
+        live_chat_run,
+    )
+    .await
+    .map_err(|error| AppError::Other(error.to_string()))?;
     publish_committed_objective_transition(&app, &objective).await?;
     Ok(objective)
 }
@@ -4142,6 +4172,85 @@ mod tests {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objective_events WHERE event_type='acceptance_confirmed'").fetch_one(&pool).await.unwrap();
         assert_eq!(count, 1);
         assert!(close_objective_in_pool(&pool, "synthetic-close", "unknown", None).await.is_err());
+    }
+
+    /// M112-1 (真机 2026-10-18): `fd8fe429` 的 PR 已合并，objective 停在
+    /// `waiting_system` + `reached_acceptance='merged'`，但会话里还挂着一次
+    /// chat 控制块，于是 `close_objective` 直接回「task is currently running」，
+    /// 编排方只能改用 stop 收尾。已完成的尝试必须能从正门结案。
+    #[tokio::test]
+    async fn m112_merged_objective_is_closable_while_a_chat_control_lingers() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-m112','synthetic','/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
+        let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+        store
+            .create(crate::agent::objective::CreateObjective {
+                id: "synthetic-m112-merged".into(),
+                kind: crate::agent::objective::ObjectiveKind::Live,
+                session_id: Some("synthetic-m112".into()),
+                root_turn_id: Some("synthetic-m112-root".into()),
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "live_verification".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET status='waiting_system',decision_type='waiting',reached_acceptance='merged' WHERE id='synthetic-m112-merged'").execute(&pool).await.unwrap();
+
+        let closed = close_objective_in_pool_with_live_run(
+            &pool,
+            "synthetic-m112",
+            "accepted",
+            Some("synthetic-m112-merged"),
+            true,
+        )
+        .await
+        .expect("a merged task must be closable even while a control block lingers");
+        assert_eq!(
+            closed.status,
+            crate::agent::objective::ObjectiveStatus::Completed
+        );
+    }
+
+    /// M112: the relaxation above is scoped to finished attempts. An objective
+    /// that has not reached the merged gate keeps the original strict refusal,
+    /// so acceptance can never be confirmed while a run may still be writing.
+    #[tokio::test]
+    async fn m112_unfinished_objective_still_refuses_a_live_chat_run() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-m112-open','synthetic','/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
+        let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+        store
+            .create(crate::agent::objective::CreateObjective {
+                id: "synthetic-m112-open-objective".into(),
+                kind: crate::agent::objective::ObjectiveKind::Live,
+                session_id: Some("synthetic-m112-open".into()),
+                root_turn_id: Some("synthetic-m112-open-root".into()),
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "live_verification".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE objectives SET status='waiting_system',decision_type='waiting',failure_code='run_blocked' WHERE id='synthetic-m112-open-objective'").execute(&pool).await.unwrap();
+
+        let error = close_objective_in_pool_with_live_run(
+            &pool,
+            "synthetic-m112-open",
+            "accepted",
+            Some("synthetic-m112-open-objective"),
+            true,
+        )
+        .await
+        .expect_err("an unfinished attempt must not be closed while a run is live");
+        // The merged-gate refusal fires first for a record that never reached
+        // `reached_acceptance='merged'`; either way acceptance can never be
+        // confirmed while the work is unfinished, which is the behaviour under
+        // test. The M112 relaxation above only ever applies to a merged row.
+        assert!(
+            error.to_string().contains("merged task awaiting acceptance"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
