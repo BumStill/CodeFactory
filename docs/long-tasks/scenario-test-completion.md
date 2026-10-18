@@ -1,5 +1,15 @@
 # 场景测试完整补全长任务记录
 
+## CodeFactory E2E-002 L2 schema matrix（2026-10-18）
+
+- 规格原文：`docs/specs/feature-specs/e2e002-schema-matrix.md`；R1–R4，匿名 SQLite 迁移前缀 1/6/10/19，生产 connect 自动迁移后通过正式 binary admission 发送继续。
+- 失败优先：同一 integration 测试先因缺 `schema_matrix` 失败，再复现无身份旧历史错误创建新任务；修复为中文明确拒绝且事务回滚。6 保留历史 root，10/19 保留既有 Objective；重新打开无重复消息、Objective 或副作用。
+- 矩阵暴露生产迁移宏路径错误：`../migrations` 指向根目录旧 1–5；改为 crate `./migrations`，真实迁移至 20。checksum mismatch 的防御性 schema sync 保留。
+- 验证：源码目录外正式 binary 四行矩阵通过；focused integration 通过；完整 Rust workspace 重跑通过（首轮已有 socket accept WouldBlock，按模板重跑一次全绿）；前端 151 files / 1013 tests 和 build；scenario --ci、README、baseline、历史 Node 合同均通过。详见 `docs/evidence-packs/e2e002-schema-matrix.md`。
+- registry 最小登记真实迁移单测，移除已完成旧 schema L2 gap；保持 partially_implemented、L3。cannot self-modify 交编排方，不调整保护门禁。
+- 真机验收由编排方发版后完成（not live），步骤见规格和证据包；本任务仅 merged，不发版。无待决 Spec Amendment。遵循模板单执行流，不调用 delegate_tasks，不声称独立 QA。
+
+
 ## 当前进展（通俗版）
 
 已经修好了测试结果格式不一致、可能把不完整结果误判为通过的问题，新检查程序已合入，原来的保护已恢复。随后通过普通 PR #512 在 Windows 和 Mac 上实际复测：113 个执行项全部通过，原始记录独立核对一致，六项合并检查通过后正常合入。

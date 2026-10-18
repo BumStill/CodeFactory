@@ -19,6 +19,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod schema_matrix;
+
 const CONTINUE_SESSION: &str = "history-continue-session";
 const STOP_SESSION: &str = "history-stop-session";
 const INCIDENT_SESSION: &str = "history-incident-session";
@@ -896,6 +898,7 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
     ));
     std::fs::create_dir_all(&root)?;
     let result = async {
+        let schema_matrix = schema_matrix::run(&root).await?;
         let phases = ["seed", "verify-incident", "continue", "verify-continue"];
         let mut pids = Vec::new();
         for phase in phases {
@@ -986,6 +989,7 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         }
         Ok(serde_json::json!({
             "ok": true,
+            "schema_matrix": schema_matrix,
             "scenario_ids": ["E2E-002", "E2E-003", "E2E-007"],
             "build_git_sha": option_env!("CODEFACTORY_BUILD_GIT_SHA").unwrap_or("unknown"),
             "process_restart_count": 10,
