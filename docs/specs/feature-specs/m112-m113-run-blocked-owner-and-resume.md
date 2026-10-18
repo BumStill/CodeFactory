@@ -23,7 +23,7 @@
 | R3 | 终态交付记录可在同分支续做；文案与能力一致 | `agent::delivery_run::tests::m113_*` + `agent::objective` 失败摘要文案断言 |
 | R4 | 先失败后通过的测试 | 测试矩阵；首轮运行中全部 4 个 `m112_*` / `m113_*` 用例失败 |
 
-## R1 结论（代码与数据）
+## R1 根因结论（代码与数据）
 
 1. **`run_blocked` 是「agent loop 自己停下、且没有类型化原因」的兜底码。** `decision_for_run_outcome_with_reason` 里 `StopReason::Blocked => ("run_blocked", RecoveryDomain::Chat)`，只有 `browser_pairing_required` 和 `permission_denied_by_user` 两个类型化分支被单独处理。因此一次普通的 `Blocked` 会被当成 **Chat 域的临时技术故障**。
 2. **它的「解除者」被登记成 objective-supervisor，但 chat 域的 remediation 只是把同一轮再跑一次。** `DecisionRouter::route(TechnicalFailure)` 写 `recovery_owner = objective-supervisor:chat`、`remediation_id = <新 uuid>`、`next_action_authorized = true`、`next_observation_at = now + 5s`。于是 `run_blocked` 进入 `waiting_system` 并**排了一条不改变任何外部条件的重试**：模型拿着同样的上下文、同样的阻塞原因再跑一遍——这正是「进入后无事件」的观感（事件表里只有 `waiting` 决策，没有外部动作）。
