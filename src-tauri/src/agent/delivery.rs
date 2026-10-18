@@ -1570,6 +1570,11 @@ pub fn load_delivery_config(root: &Path) -> Result<Option<RepositoryDeliveryConf
 pub trait DeliveryRemote {
     fn capabilities(&self) -> DeliveryCapabilities;
 
+    /// Read-only head proof shared by branch, canonical and metadata observers.
+    fn head_is_explained(&self, known: &str, observed: &str) -> bool {
+        delivery_head_is_explained(None, known, None, observed, || false)
+    }
+
     /// Return the existing open PR for `head`, or open a new one. Idempotent:
     /// callers rely on this never double-opening.
     fn open_or_get_pr(
@@ -1592,6 +1597,20 @@ pub trait DeliveryRemote {
     ) -> impl std::future::Future<Output = Result<OpenPrObservation, String>> {
         std::future::ready(Ok(OpenPrObservation::Unsupported))
     }
+    /// Projection-only normalization after the shared proof. Provider evidence
+    /// remains raw everywhere else (CI and durable canonical-head advancement).
+    async fn observe_explained_open_pr(
+        &self, head: &str, base: &str, expected: &str,
+    ) -> Result<OpenPrObservation, String> {
+        let mut observation = self.observe_open_pr(head, base).await?;
+        if let OpenPrObservation::Open(observed) = &mut observation {
+            if observed.head_sha.as_deref().is_some_and(|actual| self.head_is_explained(expected, actual)) {
+                observed.head_sha = Some(expected.to_string());
+            }
+        }
+        Ok(observation)
+    }
+
     /// Converge governance metadata on an existing PR without replacing its
     /// identity. Called when the desired title and/or body differ from the live
     /// PR. `title` is `None` when only the body must converge and the live title
@@ -2990,6 +3009,44 @@ fn remote_head_is_own_pushed_commit(
     .is_ok()
 }
 
+/// M115b/R1: the single delivery-head policy. Evidence acquisition is separate:
+/// local Git proves own pushes/ancestry; the provider proves queue-sync parents.
+/// Without a repository or provider proof only exact durable heads are accepted.
+pub(crate) fn delivery_head_is_explained(
+    repo: Option<&RepoContext>,
+    known_head: &str,
+    receipted_parent: Option<&str>,
+    observed: &str,
+    queue_sync: impl FnOnce() -> bool,
+) -> bool {
+    if observed.is_empty() || known_head.is_empty() {
+        return false;
+    }
+    observed == known_head
+        || Some(observed) == receipted_parent
+        || repo.is_some_and(|repo| {
+            remote_head_is_own_pushed_commit(repo, known_head, observed)
+                || remote_head_is_explained_by_local(&repo.root, observed, known_head)
+                || local_queue_synced_head(repo, known_head, observed)
+        })
+        || queue_sync()
+}
+
+/// Read-only proof for commits already present locally. Never infer a queue
+/// merge merely from ancestry: require exactly the known head and main parents.
+fn local_queue_synced_head(repo: &RepoContext, known: &str, actual: &str) -> bool {
+    let Ok(repository) = git2::Repository::open(&repo.root) else { return false; };
+    let Some(commit) = git2::Oid::from_str(actual).ok()
+        .and_then(|oid| repository.find_commit(oid).ok()) else { return false; };
+    let parents: Vec<String> = commit.parent_ids().map(|oid| oid.to_string()).collect();
+    let Some(other) = queue_sync_other_parent(known, &parents) else { return false; };
+    // A stale local main is conservative; the provider can prove newer main.
+    let reference = format!("refs/remotes/{}/{}", repo.remote, repo.default_branch);
+    let Some(main) = repository.revparse_single(&reference).ok() else { return false; };
+    let Ok(other) = git2::Oid::from_str(other) else { return false; };
+    main.id() == other || repository.graph_descendant_of(main.id(), other).unwrap_or(false)
+}
+
 fn observe_remote_ref_head(repo: &RepoContext, branch: &str) -> Result<Option<String>, String> {
     let reference = format!("refs/heads/{branch}");
     let observed = git(
@@ -3077,14 +3134,22 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
 ) -> Result<DeliveryTakeoverObservation, String> {
     let (repo, _) = resolve_delivery_repo(cwd, default_branch_hint, Some(expected_branch))?;
     let identity = capture_delivery_identity(&repo)?;
+    // Observe terminal truth before any mutable head fence, including local drift.
+    let merge_observation = if let Some(number) = persisted_canonical_pr_number {
+        Some(remote.ok_or_else(|| "canonical PR exists but no read-only provider observer is available".to_string())?
+            .observe_merge(number, &persisted_identity.head_sha).await?)
+    } else { None };
+    let merged = matches!(&merge_observation, Some(MergeObservation::Merged { merge_sha }) if !merge_sha.is_empty());
     // M99 / R3: the run's own child commit may already exist locally (and on the
     // remote) while the durable identity still names its parent. That is a
     // receipted-parent-equivalent state, not unreceipted drift.
     let own_pushed_local_head = identity.head_sha != persisted_identity.head_sha
-        && remote_head_is_own_pushed_commit(
-            &repo,
+        && delivery_head_is_explained(
+            Some(&repo),
             &persisted_identity.head_sha,
+            receipted_parent_head,
             &identity.head_sha,
+            || remote.is_some_and(|remote| remote.head_is_explained(&persisted_identity.head_sha, &identity.head_sha)),
         );
     // Only the head may differ, and only for a proven own push: the worktree
     // must be clean, so no unreceipted edit rides along with the new head.
@@ -3095,32 +3160,20 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
     .is_empty();
     let own_push_identity_matches = own_pushed_local_head && worktree_clean;
     let identity_matches = &identity == persisted_identity || own_push_identity_matches;
-    if !identity_matches {
+    if !identity_matches && !merged {
         return Err(
             "observe-only takeover found repo/worktree/head/change-set state that was not durably receipted; mutation remains fenced"
                 .to_string(),
         );
     }
 
+    // R2: branch movement cannot override positive canonical merge evidence.
     let remote_head = observe_remote_branch_head(&repo)?;
-    // M98-R3 + M99-R3: the same objective on the same branch is one identity as
-    // long as the remote head is explained — equal to the persisted head, the
-    // receipted parent, a commit this delivery itself pushed, or an ancestor of
-    // the local head (the push simply had not run yet). A foreign head still
-    // fails closed, so an external write can never be adopted here.
-    let remote_explainable = match remote_head.as_deref() {
-        None => true,
-        Some(head) => {
-            head == persisted_identity.head_sha
-                || Some(head) == receipted_parent_head
-                || remote_head_is_own_pushed_commit(&repo, &persisted_identity.head_sha, head)
-                || remote_head_is_explained_by_local(
-                    cwd,
-                    head,
-                    &persisted_identity.head_sha,
-                )
-        }
-    };
+    let head_explained = |head: &str| delivery_head_is_explained(
+        Some(&repo), &persisted_identity.head_sha, receipted_parent_head, head,
+        || remote.is_some_and(|remote| remote.head_is_explained(&persisted_identity.head_sha, head)),
+    );
+    let remote_explainable = merged || remote_head.as_deref().is_none_or(head_explained);
     if !remote_explainable {
         return Err(format!(
             "remote branch {} moved to an unrecognized head {}; expected persisted {}{}",
@@ -3185,16 +3238,18 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
         let remote = remote.ok_or_else(|| {
             "canonical PR exists but no read-only provider observer is available".to_string()
         })?;
-        match remote.observe_merge(pr_number, &identity.head_sha).await? {
+        let observation = match merge_observation {
+            Some(observation) => observation,
+            None => remote.observe_merge(pr_number, &identity.head_sha).await?,
+        };
+        match observation {
             MergeObservation::OpenSameHead { .. } | MergeObservation::Merged { .. } => {}
             // M111: the PR head is the branch head, which the remote-branch
             // check above already accepted as explained (own push or an
             // ancestor of the receipted local head). Accept the same head here;
             // anything else is still foreign and fails closed.
             MergeObservation::HeadChanged { actual_head }
-                if actual_head == persisted_identity.head_sha
-                    || Some(actual_head.as_str()) == receipted_parent_head
-                    || remote_head.as_deref() == Some(actual_head.as_str()) => {}
+                if head_explained(&actual_head) => {}
             MergeObservation::HeadChanged { actual_head } => {
                 return Err(format!(
                     "canonical PR #{pr_number} moved to unrecognized head {actual_head}"
@@ -3214,11 +3269,12 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
     }
 
     Ok(DeliveryTakeoverObservation {
-        identity,
+        // A merge is settlement evidence, never permission to adopt drift.
+        identity: if merged { persisted_identity.clone() } else { identity },
         remote_head_sha: remote_head,
         canonical_pr_number,
         canonical_pr_url,
-        canonical_head_sha,
+        canonical_head_sha: if merged { Some(persisted_identity.head_sha.clone()) } else { canonical_head_sha },
     })
 }
 
@@ -7075,6 +7131,10 @@ impl HookRemote {
 }
 
 impl DeliveryRemote for HookRemote {
+    fn head_is_explained(&self, known: &str, observed: &str) -> bool {
+        let repo = resolve_repo(&self.cwd, None).ok();
+        delivery_head_is_explained(repo.as_ref(), known, None, observed, || false)
+    }
     fn capabilities(&self) -> DeliveryCapabilities {
         DeliveryCapabilities {
             review: true,
@@ -7115,7 +7175,7 @@ impl DeliveryRemote for HookRemote {
         {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                let observation = self.observe_open_pr(head, base).await?;
+                let observation = self.observe_explained_open_pr(head, base, expected_head_sha).await?;
                 return observed_committed_pr_projection(
                     &receipt,
                     observation,
@@ -7149,7 +7209,7 @@ impl DeliveryRemote for HookRemote {
         match result {
             Ok(pr) => {
                 let pr = match self
-                    .observe_open_pr(head, base)
+                    .observe_explained_open_pr(head, base, expected_head_sha)
                     .await
                     .and_then(|observation| {
                         exact_created_pr_projection(
@@ -7247,7 +7307,7 @@ impl DeliveryRemote for HookRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<(), String> {
         exact_open_pr_projection(
-            self.observe_open_pr(head, base).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
             Some(number),
             expected_head_sha,
         )?
@@ -7287,7 +7347,7 @@ impl DeliveryRemote for HookRemote {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
                 exact_updated_pr_projection(
-                    self.observe_open_pr(head, base).await?,
+                    self.observe_explained_open_pr(head, base, expected_head_sha).await?,
                     number,
                     body,
                     head,
@@ -7324,7 +7384,7 @@ impl DeliveryRemote for HookRemote {
         match result {
             Ok(()) => {
                 if let Err(error) = self
-                    .observe_open_pr(head, base)
+                    .observe_explained_open_pr(head, base, expected_head_sha)
                     .await
                     .and_then(|observation| {
                         exact_updated_pr_projection(
@@ -7520,7 +7580,7 @@ impl DeliveryRemote for HookRemote {
                     self.id
                 )
             })?;
-        if response
+        if response.status != "merged" && response
             .head_sha
             .as_deref()
             .is_some_and(|head| head != expected_head)
@@ -8637,6 +8697,12 @@ fn parse_gh_open_pr_state(raw: &str, head: &str, base: &str) -> Result<OpenPrObs
 }
 
 impl DeliveryRemote for GhCliRemote {
+    fn head_is_explained(&self, known: &str, observed: &str) -> bool {
+        let repo = resolve_repo(&self.cwd, Some(&self.default_branch)).ok();
+        delivery_head_is_explained(repo.as_ref(), known, None, observed, || {
+            self.queue_synced_head(known, observed).ok().flatten().is_some()
+        })
+    }
     /// U31: arm the PR for the repository merge queue. Idempotent and
     /// best-effort — arming must never fail a delivery that is otherwise ready.
     async fn arm_merge_queue(&self, number: u64, _expected_head: &str) -> Result<(), String> {
@@ -8669,7 +8735,7 @@ impl DeliveryRemote for GhCliRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         if let Some(pr) = exact_open_pr_projection(
-            self.observe_open_pr(head, base).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
             None,
             expected_head_sha,
         )? {
@@ -8696,7 +8762,7 @@ impl DeliveryRemote for GhCliRemote {
         {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                let observation = self.observe_open_pr(head, base).await?;
+                let observation = self.observe_explained_open_pr(head, base, expected_head_sha).await?;
                 return observed_committed_pr_projection(
                     &receipt,
                     observation,
@@ -8743,7 +8809,7 @@ impl DeliveryRemote for GhCliRemote {
         match result {
             Ok(pr) => {
                 let pr = match self
-                    .observe_open_pr(head, base)
+                    .observe_explained_open_pr(head, base, expected_head_sha)
                     .await
                     .and_then(|observation| {
                         exact_created_pr_projection(
@@ -8806,7 +8872,7 @@ impl DeliveryRemote for GhCliRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<(), String> {
         exact_open_pr_projection(
-            self.observe_open_pr(head, base).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
             Some(number),
             expected_head_sha,
         )?
@@ -8846,7 +8912,7 @@ impl DeliveryRemote for GhCliRemote {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
                 exact_updated_pr_projection(
-                    self.observe_open_pr(head, base).await?,
+                    self.observe_explained_open_pr(head, base, expected_head_sha).await?,
                     number,
                     body,
                     head,
@@ -8865,7 +8931,7 @@ impl DeliveryRemote for GhCliRemote {
         match self.gh(&gh_pr_edit_args(number, title, body)) {
             Ok(_) => {
                 if let Err(error) = self
-                    .observe_open_pr(head, base)
+                    .observe_explained_open_pr(head, base, expected_head_sha)
                     .await
                     .and_then(|observation| {
                         exact_updated_pr_projection(
@@ -9423,6 +9489,14 @@ pub enum EitherRemote {
 }
 
 impl DeliveryRemote for EitherRemote {
+    fn head_is_explained(&self, known: &str, observed: &str) -> bool {
+        match self {
+            Self::Hook(r) => r.head_is_explained(known, observed),
+            Self::Gh(r) => r.head_is_explained(known, observed),
+            Self::Github(r) => r.head_is_explained(known, observed),
+            Self::Gitlab(r) => r.head_is_explained(known, observed),
+        }
+    }
     fn capabilities(&self) -> DeliveryCapabilities {
         match self {
             EitherRemote::Hook(r) => r.capabilities(),
@@ -10044,7 +10118,7 @@ impl DeliveryRemote for GitlabRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         if let Some(pr) = exact_open_pr_projection(
-            self.observe_open_pr(head, base).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
             None,
             expected_head_sha,
         )? {
@@ -10071,7 +10145,7 @@ impl DeliveryRemote for GitlabRemote {
         {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                let observation = self.observe_open_pr(head, base).await?;
+                let observation = self.observe_explained_open_pr(head, base, expected_head_sha).await?;
                 return observed_committed_pr_projection(
                     &receipt,
                     observation,
@@ -10100,7 +10174,7 @@ impl DeliveryRemote for GitlabRemote {
                     body: mr.body,
                 };
                 let pr = match self
-                    .observe_open_pr(head, base)
+                    .observe_explained_open_pr(head, base, expected_head_sha)
                     .await
                     .and_then(|observation| {
                         exact_created_pr_projection(
@@ -10184,7 +10258,7 @@ impl DeliveryRemote for GitlabRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<(), String> {
         exact_open_pr_projection(
-            self.observe_open_pr(head, base).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
             Some(number),
             expected_head_sha,
         )?
@@ -10224,7 +10298,7 @@ impl DeliveryRemote for GitlabRemote {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
                 exact_updated_pr_projection(
-                    self.observe_open_pr(head, base).await?,
+                    self.observe_explained_open_pr(head, base, expected_head_sha).await?,
                     number,
                     body,
                     head,
@@ -10245,7 +10319,7 @@ impl DeliveryRemote for GitlabRemote {
         {
             Ok(()) => {
                 if let Err(error) = self
-                    .observe_open_pr(head, base)
+                    .observe_explained_open_pr(head, base, expected_head_sha)
                     .await
                     .and_then(|observation| {
                         exact_updated_pr_projection(
@@ -10372,7 +10446,8 @@ impl DeliveryRemote for GitlabRemote {
                     .and_then(serde_json::Value::as_str)
             })
             .unwrap_or("");
-        if !actual_head.is_empty() && actual_head != expected_head {
+        if !actual_head.is_empty() && actual_head != expected_head
+            && value.get("state").and_then(serde_json::Value::as_str) != Some("merged") {
             return Ok(MergeObservation::HeadChanged {
                 actual_head: actual_head.to_string(),
             });
@@ -10431,7 +10506,7 @@ impl DeliveryRemote for GithubRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         if let Some(pr) = exact_open_pr_projection(
-            self.observe_open_pr(head, base).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
             None,
             expected_head_sha,
         )? {
@@ -10458,7 +10533,7 @@ impl DeliveryRemote for GithubRemote {
         {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                let observation = self.observe_open_pr(head, base).await?;
+                let observation = self.observe_explained_open_pr(head, base, expected_head_sha).await?;
                 return observed_committed_pr_projection(
                     &receipt,
                     observation,
@@ -10487,7 +10562,7 @@ impl DeliveryRemote for GithubRemote {
                     body: pr.body,
                 };
                 let pr = match self
-                    .observe_open_pr(head, base)
+                    .observe_explained_open_pr(head, base, expected_head_sha)
                     .await
                     .and_then(|observation| {
                         exact_created_pr_projection(
@@ -10585,7 +10660,7 @@ impl DeliveryRemote for GithubRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<(), String> {
         exact_open_pr_projection(
-            self.observe_open_pr(head, base).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
             Some(number),
             expected_head_sha,
         )?
@@ -10625,7 +10700,7 @@ impl DeliveryRemote for GithubRemote {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
                 exact_updated_pr_projection(
-                    self.observe_open_pr(head, base).await?,
+                    self.observe_explained_open_pr(head, base, expected_head_sha).await?,
                     number,
                     body,
                     head,
@@ -10646,7 +10721,7 @@ impl DeliveryRemote for GithubRemote {
         {
             Ok(()) => {
                 if let Err(error) = self
-                    .observe_open_pr(head, base)
+                    .observe_explained_open_pr(head, base, expected_head_sha)
                     .await
                     .and_then(|observation| {
                         exact_updated_pr_projection(
@@ -10943,7 +11018,8 @@ impl DeliveryRemote for GithubRemote {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
-        if !actual_head.is_empty() && actual_head != expected_head {
+        if !actual_head.is_empty() && actual_head != expected_head
+            && value.get("merged").and_then(serde_json::Value::as_bool) != Some(true) {
             return Ok(MergeObservation::HeadChanged { actual_head });
         }
         if value
@@ -14085,7 +14161,7 @@ README-Update-Reason: synthetic fixture\n\nbody"
             mutation_permit: Option<&DeliveryMutationPermit>,
         ) -> Result<(), String> {
             exact_open_pr_projection(
-                self.observe_open_pr(head, base).await?,
+                self.observe_explained_open_pr(head, base, expected_head_sha).await?,
                 Some(number),
                 expected_head_sha,
             )?
@@ -14122,7 +14198,7 @@ README-Update-Reason: synthetic fixture\n\nbody"
                 DeliveryMutationBegin::Dispatch(intent) => intent,
                 DeliveryMutationBegin::AlreadyCommitted(receipt) => {
                     exact_updated_pr_projection(
-                        self.observe_open_pr(head, base).await?,
+                        self.observe_explained_open_pr(head, base, expected_head_sha).await?,
                         number,
                         body,
                         head,
@@ -14147,7 +14223,7 @@ README-Update-Reason: synthetic fixture\n\nbody"
             *remote = Some((title, body.to_string()));
             drop(remote);
             exact_updated_pr_projection(
-                self.observe_open_pr(head, base).await?,
+                self.observe_explained_open_pr(head, base, expected_head_sha).await?,
                 number,
                 body,
                 head,
@@ -15797,6 +15873,109 @@ Release-Urgency: hold"
         assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
         assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), before_head);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn m115b_four_heads_across_observation_entry_points() {
+        for kind in ["own-push", "ancestor", "queue", "foreign"] {
+            let root = feature_branch_repo("m115b-matrix");
+            git(&root, &["add", "feature.rs"]).unwrap();
+            git(&root, &["commit", "-q", "-m", "fix: known delivery"]).unwrap();
+            git(&root, &["push", "-q", "origin", "feat/x"]).unwrap();
+            let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+            let mut persisted = capture_delivery_identity(&repo).unwrap();
+            let tree = git(&root, &["rev-parse", "HEAD^{tree}"]).unwrap();
+            let main = git(&root, &["rev-parse", "main"]).unwrap();
+            let actual = match kind {
+                "own-push" => {
+                    let next = git(&root, &["commit-tree", &tree, "-p", &persisted.head_sha, "-m", "own child"]).unwrap();
+                    git(&root, &["push", "-q", "origin", &format!("{next}:refs/heads/feat/x")]).unwrap();
+                    next
+                }
+                "ancestor" => main.clone(),
+                "queue" => git(&root, &["commit-tree", &tree, "-p", &persisted.head_sha, "-p", &main, "-m", "queue update"]).unwrap(),
+                _ => git(&root, &["commit-tree", &tree, "-m", "foreign root"]).unwrap(),
+            };
+            // Test the policy and actual metadata read path with a real hook
+            // subprocess, not a bool-injected verdict.
+            let hook_dir = tempfile::tempdir().unwrap();
+            let hook = hook_dir.path().join("forge.py");
+            std::fs::write(&hook, format!(
+                "import json,sys\nr=json.load(sys.stdin)\nprint(json.dumps({{'status':'open','number':7,'url':'https://example/pr/7','title':'fix: synthetic','body':'body','head_sha':'{actual}'}}))\n"
+            )).unwrap();
+            let adapter = HookRemote::new("synthetic".into(), format!("python3 {}", hook.display()), root.clone());
+            let expected = kind != "foreign";
+            assert_eq!(adapter.head_is_explained(&persisted.head_sha, &actual), expected, "policy {kind}");
+            let metadata = adapter.observe_explained_open_pr("feat/x", "main", &persisted.head_sha).await.unwrap();
+            assert_eq!(exact_updated_pr_projection(metadata, 7, "body", "feat/x", "main", &persisted.head_sha).is_ok(), expected, "metadata {kind}");
+            // Isolate canonical checking from branch checking, then exercise
+            // the remote-branch fence with the very same head.
+            for branch_moved in [false, true] {
+                if branch_moved {
+                    git(&root, &["push", "-q", "origin", &format!("{actual}:refs/fixture/observed")]).unwrap();
+                    git(&root.parent().unwrap().join("origin.git"), &["update-ref", "refs/heads/feat/x", &actual]).unwrap();
+                }
+                let calls = stub_calls();
+                *calls.pr_head.lock().unwrap() = Some(actual.clone());
+                let remote = StubRemote { ci: CiStatus::Success, existing_pr: None,
+                    merge_queues: false, merge_ok: true, caps: every_capability(), calls };
+                let result = observe_delivery_takeover_with_receipted_parent(
+                    &root, Some("main"), "feat/x", &persisted, Some(7), Some("https://example/pr/7"), None, Some(&remote),
+                ).await;
+                assert_eq!(result.is_ok(), expected, "takeover/canonical {kind}, branch_moved={branch_moved}: {result:?}");
+            }
+            // Local takeover after a queue-sync fast forward uses the policy too.
+            if kind == "queue" {
+                git(&root, &["reset", "--hard", &actual]).unwrap();
+                let result = observe_delivery_takeover_with_receipted_parent::<StubRemote>(
+                    &root, Some("main"), "feat/x", &persisted, None, None, None, None,
+                ).await;
+                assert!(result.is_ok(), "local takeover queue: {result:?}");
+            }
+            persisted.head_sha.clear();
+            assert!(!adapter.head_is_explained(&persisted.head_sha, &actual));
+            std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+        }
+    }
+
+    /// M115b R2/R3: a provider sync must survive the remote-branch fence;
+    /// a confirmed merge must settle even if that branch is later rewritten.
+    #[tokio::test]
+    async fn m115b_queue_head_and_merged_branch_drift() {
+        for merged in [false, true] {
+            let root = feature_branch_repo("m115b-sync-takeover");
+            git(&root, &["add", "feature.rs"]).unwrap();
+            git(&root, &["commit", "-q", "-m", "fix: synthetic delivery"]).unwrap();
+            git(&root, &["push", "-q", "origin", "feat/x"]).unwrap();
+            let (repo, _) = resolve_delivery_repo(&root, Some("main"), Some("feat/x")).unwrap();
+            let persisted = capture_delivery_identity(&repo).unwrap();
+            let tree = git(&root, &["rev-parse", "main^{tree}"]).unwrap();
+            let main = git(&root, &["rev-parse", "main"]).unwrap();
+            let sync = if merged {
+                git(&root, &["commit-tree", &tree, "-m", "foreign after merge"]).unwrap()
+            } else {
+                git(&root, &["commit-tree", &tree, "-p", &persisted.head_sha, "-p", &main, "-m", "queue update"]).unwrap()
+            };
+            // Simulate the forge writing origin without updating this checkout's
+            // tracking ref. Merely looking like our own push cannot pass it.
+            let origin = root.parent().unwrap().join("origin.git");
+            git(&root, &["push", "-q", "origin", &format!("{sync}:refs/fixture/sync")]).unwrap();
+            git(&origin, &["update-ref", "refs/heads/feat/x", &sync]).unwrap();
+            let calls = stub_calls();
+            *calls.pr_head.lock().unwrap() = Some(sync.clone());
+            calls.merged.store(merged, Ordering::SeqCst);
+            let remote = StubRemote {
+                ci: CiStatus::Success, existing_pr: None, merge_queues: false,
+                merge_ok: true, caps: every_capability(), calls,
+            };
+            let observation = observe_delivery_takeover_with_receipted_parent(
+                &root, Some("main"), "feat/x", &persisted, Some(7),
+                Some("https://github.com/example/project/pull/7"), None, Some(&remote),
+            ).await.expect("queue sync or confirmed merge must not fail on branch drift");
+            assert_eq!(observation.canonical_pr_number, Some(7));
+            assert_eq!(observation.remote_head_sha.as_deref(), Some(sync.as_str()));
+            std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+        }
     }
 
     /// M99 / R3: a delivery run's own successful push must not surface as
