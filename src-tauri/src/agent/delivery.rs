@@ -1768,6 +1768,15 @@ fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T
     for attempt in 1..=3 {
         match operation() {
             Ok(value) => return Ok(value),
+            // M114/R6: a rate-limited answer must never be retried immediately.
+            // Retrying three times in two seconds (and then re-polling on the
+            // next 60s tick) is what turned one exhausted hour into a deeper
+            // hole. The budget guard backs off instead; quota recovers.
+            Err(error) if remote_error_is_rate_limited(&error) => {
+                return Err(format!(
+                    "交付卡在 {step}：GitHub API 额度受限，本次不立即重试（后台观测按额度退避）；已有提交、分支和 PR 未删除；额度恢复后由系统续接。原因：{error}"
+                ));
+            }
             Err(error) if remote_error_is_retryable(&error) && attempt < 3 => {
                 tracing::warn!(step, attempt, "delivery network retry scheduled");
                 sleep(1 << (attempt - 1));
@@ -1776,6 +1785,14 @@ fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T
         }
     }
     unreachable!()
+}
+
+/// M114/R6: is this failure the shared GitHub quota rather than a transient
+/// network error? Kept separate from [`remote_error_is_retryable`] (which still
+/// classifies it as retryable) because the retry must be delayed, not immediate.
+fn remote_error_is_rate_limited(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("rate limit") || lower.contains("429")
 }
 
 fn bounded_delivery_output(command: &mut Command) -> Result<String, String> {
@@ -7709,6 +7726,16 @@ pub fn gh_cli_available() -> bool {
 }
 
 pub fn gh_cli_available_for_host(hostname: &str) -> bool {
+    // M114/R5: `gh auth status` is itself a GitHub API call and the system
+    // prompt is rebuilt on EVERY model request (the field trace saw 18/minute).
+    // Cache the answer per process: 10 minutes for "logged in", 1 minute for
+    // "not logged in" so a fresh `gh auth login` is picked up quickly.
+    github_api_budget::cached_auth_probe(hostname, || {
+        gh_cli_available_probe(hostname)
+    })
+}
+
+fn gh_cli_available_probe(hostname: &str) -> bool {
     // Standard PATH first.
     if gh_auth_status_for_host("gh", hostname) {
         return true;
@@ -7727,6 +7754,9 @@ pub fn gh_cli_available_for_host(hostname: &str) -> bool {
 }
 
 fn gh_auth_status_for_host(bin: &str, hostname: &str) -> bool {
+    github_api_budget::record_gh_call(
+        github_api_budget::CALLER_AUTH_PROBE,
+    );
     dev_command(bin)
         .args(["auth", "status", "--hostname", hostname])
         .stdout(std::process::Stdio::null())
@@ -8262,6 +8292,94 @@ impl GhCliRemote {
         ]))?;
         Ok(crate::git_remote::github::ci_check_states(&value, &required))
     }
+
+    /// M114/R4: one batched listing for every due candidate in this repository.
+    /// Replaces one `gh pr view` (state) + one `gh pr view` (labels) per record
+    /// with a single `gh pr list --state all`, which also carries the queue-arm
+    /// label so the second lookup disappears entirely.
+    pub(crate) fn observed_pr_states(
+        &self,
+        numbers: &[i64],
+    ) -> Result<std::collections::HashMap<i64, BatchPrState>, String> {
+        let mut out = std::collections::HashMap::new();
+        if numbers.is_empty() {
+            return Ok(out);
+        }
+        let raw = self.gh(&[
+            "pr".into(),
+            "list".into(),
+            "-R".into(),
+            self.repo.clone(),
+            "--state".into(),
+            "all".into(),
+            "--limit".into(),
+            "200".into(),
+            "--json".into(),
+            "number,state,headRefOid,mergeCommit,autoMergeRequest,labels".into(),
+        ])?;
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|error| format!("gh pr list returned non-JSON: {error}"))?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| "gh pr list returned JSON that is not an array".to_string())?;
+        for row in rows {
+            let Some(number) = row.get("number").and_then(serde_json::Value::as_i64) else {
+                continue;
+            };
+            if !numbers.contains(&number) {
+                continue;
+            }
+            let armed = row
+                .get("labels")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|labels| {
+                    labels.iter().any(|label| {
+                        label.get("name").and_then(serde_json::Value::as_str)
+                            == Some(MERGE_QUEUE_ARM_LABEL)
+                    })
+                });
+            out.insert(
+                number,
+                BatchPrState {
+                    state: row
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    head_sha: row
+                        .get("headRefOid")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    merge_sha: row
+                        .get("mergeCommit")
+                        .and_then(|merge| merge.get("oid"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    armed,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// M114/R6: `gh api rate_limit` costs no core quota, so it is the polling
+    /// source for the shared user budget.
+    pub(crate) fn observed_rate_limit(
+        &self,
+    ) -> Option<github_api_budget::RateLimitSnapshot> {
+        let raw = self.gh(&["api".into(), "rate_limit".into()]).ok()?;
+        github_api_budget::parse_rate_limit(&raw)
+    }
+}
+
+/// M114/R4: one row of the batched `gh pr list --state all` lookup.
+#[derive(Debug, Clone)]
+pub(crate) struct BatchPrState {
+    pub state: String,
+    pub head_sha: String,
+    pub merge_sha: Option<String>,
+    pub armed: bool,
 }
 
 /// Build a [`GhCliRemote`] for `cwd` when it is a GitHub checkout. Does not
@@ -10896,6 +11014,368 @@ impl DeliveryRemote for GithubRemote {
 #[path = "delivery_scenario_tests.rs"]
 mod scenario_tests;
 
+/// M114: background GitHub API budget guards.
+///
+/// GitHub's REST core budget is 5000 requests/hour **per user**. CodeFactory's
+/// desktop process shares that budget with the merge-queue workflow (same
+/// `RELEASE_PAT` user) and with any operator scripting. Before this module the
+/// process could burn the whole hour by re-observing every historical delivery
+/// once per 60s cleanup tick, and by running `gh auth status` (an API call) on
+/// every model request.
+///
+/// Four independent guards live here:
+/// * `record_gh_call` — an injectable counter so tests assert a call budget
+///   instead of sampling process traces.
+/// * `observation_delay_ms` / `next_observation_at` — exponential backoff for
+///   one delivery record (1m → 2m → 4m … capped at 60m).
+/// * `cached_auth_probe` — per-process cache of `gh auth status`
+///   (10 minutes on success, 1 minute on failure).
+/// * `current_rate_limit_policy` — quota awareness (≤20% throttles, ≤5% pauses
+///   all background observation) plus a change-visible status line.
+///
+/// Nothing here may turn an unknown observation into success; these guards only
+/// decide *when* the process is allowed to ask again.
+pub(crate) mod github_api_budget {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// Caller labels for `record_gh_call`. Kept as a closed set so a typo
+    /// cannot silently create a new bucket that no test looks at.
+    pub(crate) const CALLER_AUTH_PROBE: &str = "gh_auth_status";
+    pub(crate) const CALLER_OBSERVE: &str = "canonical_pr_observe";
+    pub(crate) const CALLER_OBSERVE_CI: &str = "canonical_pr_ci_checks";
+    pub(crate) const CALLER_RATE_LIMIT: &str = "gh_rate_limit";
+
+    static GH_CALLS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+    fn gh_call_map() -> &'static Mutex<HashMap<String, u64>> {
+        GH_CALLS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Record one outbound GitHub call. Called at the observation boundary so
+    /// the scripted test observer is counted exactly like the real `gh`
+    /// observer.
+    pub(crate) fn record_gh_call(caller: &str) {
+        if let Ok(mut counts) = gh_call_map().lock() {
+            *counts.entry(caller.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    pub(crate) fn gh_call_count(caller: &str) -> u64 {
+        gh_call_map()
+            .lock()
+            .map(|counts| counts.get(caller).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn total_gh_calls() -> u64 {
+        gh_call_map()
+            .lock()
+            .map(|counts| counts.values().sum())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn reset_gh_call_counter() {
+        if let Ok(mut counts) = gh_call_map().lock() {
+            counts.clear();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // R5: per-process `gh auth status` cache
+    // -----------------------------------------------------------------------
+
+    const AUTH_SUCCESS_TTL: Duration = Duration::from_secs(600);
+    const AUTH_FAILURE_TTL: Duration = Duration::from_secs(60);
+
+    struct AuthCacheEntry {
+        available: bool,
+        checked_at: Instant,
+    }
+
+    fn auth_cache() -> &'static Mutex<HashMap<String, AuthCacheEntry>> {
+        static CACHE: OnceLock<Mutex<HashMap<String, AuthCacheEntry>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// `gh auth status` is itself a GitHub API call. The model-request path
+    /// builds the system prompt every turn, so an uncached probe cost ~1 call
+    /// per request (the field trace saw 18/minute). Cache the answer per
+    /// hostname instead.
+    ///
+    /// The probe runs at most once per TTL window: 10 minutes for "logged in",
+    /// 1 minute for "not logged in" so a fresh `gh auth login` is picked up
+    /// quickly.
+    pub(crate) fn cached_auth_probe(hostname: &str, probe: impl FnOnce() -> bool) -> bool {
+        let now = Instant::now();
+        if let Ok(cache) = auth_cache().lock() {
+            if let Some(entry) = cache.get(hostname) {
+                let ttl = if entry.available {
+                    AUTH_SUCCESS_TTL
+                } else {
+                    AUTH_FAILURE_TTL
+                };
+                if now.saturating_duration_since(entry.checked_at) < ttl {
+                    return entry.available;
+                }
+            }
+        }
+        let available = probe();
+        if let Ok(mut cache) = auth_cache().lock() {
+            cache.insert(
+                hostname.to_string(),
+                AuthCacheEntry {
+                    available,
+                    checked_at: now,
+                },
+            );
+        }
+        available
+    }
+
+    /// Forget every cached auth answer (used when credentials change inside the
+    /// app, and by tests).
+    pub(crate) fn clear_auth_probe_cache() {
+        if let Ok(mut cache) = auth_cache().lock() {
+            cache.clear();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // R3: observation backoff
+    // -----------------------------------------------------------------------
+
+    /// First re-observation delay after an unchanged observation.
+    pub(crate) const OBSERVATION_BASE_DELAY_MS: i64 = 60_000;
+    /// Backoff ceiling: a parked delivery is re-checked at most hourly.
+    pub(crate) const OBSERVATION_CAP_DELAY_MS: i64 = 3_600_000;
+    /// Consecutive-unchanged observations after which a record is treated as
+    /// stable enough to stop asking about (R2).
+    pub(crate) const OBSERVATION_STABLE_LIMIT: u32 = 12;
+
+    /// Delay before the next observation, given how many *unchanged*
+    /// observations were already recorded. `unchanged = 1` → 60s, `2` → 120s,
+    /// … capped at 60m.
+    pub(crate) fn observation_delay_ms(unchanged: u32) -> i64 {
+        if unchanged == 0 {
+            return 0;
+        }
+        let exponent = unchanged.saturating_sub(1).min(20);
+        OBSERVATION_BASE_DELAY_MS
+            .saturating_mul(1_i64 << exponent)
+            .min(OBSERVATION_CAP_DELAY_MS)
+    }
+
+    /// `next_observation_at` for one record. A changed observation resets
+    /// `unchanged` to 0 and schedules the base delay; the quota policy can
+    /// stretch every delay while the shared budget is low (R6).
+    pub(crate) fn next_observation_at(now_ms: i64, unchanged: u32, policy: RateLimitPolicy) -> i64 {
+        let base = if unchanged == 0 {
+            OBSERVATION_BASE_DELAY_MS
+        } else {
+            observation_delay_ms(unchanged)
+        };
+        now_ms.saturating_add(policy.stretch(base))
+    }
+
+    /// R2: the configurable window in which a *terminal* objective
+    /// (failed/cancelled/completed) is still worth observing. Past it, only
+    /// records whose last known state was `open` keep a (backed-off) schedule.
+    pub(crate) const DEFAULT_TERMINAL_OBSERVATION_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+    pub(crate) fn terminal_observation_window_ms() -> i64 {
+        std::env::var("CODEFACTORY_TERMINAL_OBSERVATION_WINDOW_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .filter(|value| *value >= 0)
+            .unwrap_or(DEFAULT_TERMINAL_OBSERVATION_WINDOW_MS)
+    }
+
+    pub(crate) fn is_terminal_objective_status(status: &str) -> bool {
+        matches!(status, "failed" | "cancelled" | "completed")
+    }
+
+    /// Should this record be observed at all, judged from durable state only?
+    pub(crate) fn should_observe(
+        objective_status: &str,
+        last_observed_at_ms: i64,
+        last_state: Option<&str>,
+        now_ms: i64,
+    ) -> bool {
+        if !is_terminal_objective_status(objective_status) {
+            return true;
+        }
+        if last_state == Some("open") {
+            // The PR can still be merged by the queue, so the conclusion can
+            // still change. Backoff keeps the cost bounded.
+            return true;
+        }
+        now_ms.saturating_sub(last_observed_at_ms) <= terminal_observation_window_ms()
+    }
+
+    // -----------------------------------------------------------------------
+    // R6: quota awareness
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RateLimitPolicy {
+        /// Plenty of budget: observe on the plain backoff schedule.
+        Normal,
+        /// Below 20% remaining: stretch every background delay.
+        Throttled,
+        /// Below 5% remaining: no background observation at all.
+        Paused,
+    }
+
+    impl RateLimitPolicy {
+        pub(crate) fn label(self) -> &'static str {
+            match self {
+                RateLimitPolicy::Normal => "normal",
+                RateLimitPolicy::Throttled => "throttled",
+                RateLimitPolicy::Paused => "paused",
+            }
+        }
+
+        /// Multiplier applied to background observation delays.
+        pub(crate) fn multiplier(self) -> i64 {
+            match self {
+                RateLimitPolicy::Normal => 1,
+                RateLimitPolicy::Throttled => 5,
+                RateLimitPolicy::Paused => 1,
+            }
+        }
+
+        pub(crate) fn stretch(self, delay_ms: i64) -> i64 {
+            delay_ms
+                .saturating_mul(self.multiplier())
+                .min(OBSERVATION_CAP_DELAY_MS * 4)
+        }
+
+        pub(crate) fn allows_observation(self) -> bool {
+            !matches!(self, RateLimitPolicy::Paused)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct RateLimitSnapshot {
+        pub remaining: i64,
+        pub limit: i64,
+    }
+
+    impl RateLimitSnapshot {
+        pub(crate) fn policy(self) -> RateLimitPolicy {
+            if self.limit <= 0 {
+                return RateLimitPolicy::Normal;
+            }
+            // Integer percent, rounded down: 5% of 5000 = 250 remaining.
+            let percent = self.remaining.saturating_mul(100) / self.limit;
+            if percent < 5 {
+                RateLimitPolicy::Paused
+            } else if percent < 20 {
+                RateLimitPolicy::Throttled
+            } else {
+                RateLimitPolicy::Normal
+            }
+        }
+    }
+
+    /// Parse the `gh api rate_limit` body. That endpoint is free (it does not
+    /// consume core quota), which is why it is the polling source.
+    pub(crate) fn parse_rate_limit(raw: &str) -> Option<RateLimitSnapshot> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let core = value.get("resources").and_then(|v| v.get("core"))?;
+        let remaining = core.get("remaining").and_then(|v| v.as_i64())?;
+        let limit = core.get("limit").and_then(|v| v.as_i64())?;
+        Some(RateLimitSnapshot { remaining, limit })
+    }
+
+    fn rate_limit_state() -> &'static Mutex<Option<(RateLimitSnapshot, Instant)>> {
+        static STATE: OnceLock<Mutex<Option<(RateLimitSnapshot, Instant)>>> = OnceLock::new();
+        STATE.get_or_init(|| Mutex::new(None))
+    }
+
+    /// How long a rate-limit reading is reused before asking again.
+    pub(crate) const RATE_LIMIT_TTL: Duration = Duration::from_secs(300);
+
+    pub(crate) fn record_rate_limit(snapshot: RateLimitSnapshot) {
+        if let Ok(mut state) = rate_limit_state().lock() {
+            *state = Some((snapshot, Instant::now()));
+        }
+    }
+
+    /// The current policy. No reading yet (fresh process) is `Normal`: the first
+    /// pass is allowed to observe, and the reading it makes decides the next
+    /// one.
+    pub(crate) fn current_rate_limit_policy() -> RateLimitPolicy {
+        rate_limit_state()
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().map(|(snapshot, _)| snapshot.policy()))
+            .unwrap_or(RateLimitPolicy::Normal)
+    }
+
+    pub(crate) fn rate_limit_snapshot() -> Option<RateLimitSnapshot> {
+        rate_limit_state()
+            .lock()
+            .ok()
+            .and_then(|state| state.as_ref().map(|(snapshot, _)| *snapshot))
+    }
+
+    /// Is a fresh `gh api rate_limit` reading due? At most one per
+    /// `RATE_LIMIT_TTL`, so quota observation cannot itself become a cost.
+    pub(crate) fn rate_limit_refresh_due() -> bool {
+        match rate_limit_state().lock() {
+            Ok(state) => match state.as_ref() {
+                Some((_, at)) => at.elapsed() >= RATE_LIMIT_TTL,
+                None => true,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// Human-visible status line (R6). Logged when the policy changes and
+    /// exposed to callers that render delivery status.
+    pub(crate) fn status_line() -> String {
+        let policy = current_rate_limit_policy();
+        match rate_limit_snapshot() {
+            Some(snapshot) => {
+                let percent = if snapshot.limit > 0 {
+                    snapshot.remaining.saturating_mul(100) / snapshot.limit
+                } else {
+                    100
+                };
+                format!(
+                    "github-api: {}/{} ({}%) policy={}",
+                    snapshot.remaining,
+                    snapshot.limit,
+                    percent,
+                    policy.label()
+                )
+            }
+            None => format!("github-api: rate limit unknown policy={}", policy.label()),
+        }
+    }
+
+    /// One-shot state so the status line is logged on transitions instead of
+    /// every pass.
+    pub(crate) fn record_policy_transition(policy: RateLimitPolicy) -> bool {
+        static LAST: OnceLock<Mutex<Option<RateLimitPolicy>>> = OnceLock::new();
+        let last = LAST.get_or_init(|| Mutex::new(None));
+        match last.lock() {
+            Ok(mut guard) => {
+                if *guard == Some(policy) {
+                    false
+                } else {
+                    *guard = Some(policy);
+                    true
+                }
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11293,6 +11773,165 @@ mod tests {
                 "production delivery code must spawn via dev_command(), not `{bad}`"
             );
         }
+    }
+
+    // M114: unit coverage for the inline budget guard.
+    mod m114_budget {
+        use super::super::github_api_budget::*;
+
+        #[test]
+        fn backoff_doubles_and_caps_at_one_hour() {
+            // R3: 1m → 2m → 4m … ≤ 60m.
+            let seconds: Vec<i64> = (1..=9).map(|n| observation_delay_ms(n) / 1000).collect();
+            assert_eq!(seconds, vec![60, 120, 240, 480, 960, 1920, 3600, 3600, 3600]);
+            assert_eq!(observation_delay_ms(0), 0);
+            // A changed observation resets to the base delay, not to the cap.
+            assert_eq!(
+                next_observation_at(1_000, 0, RateLimitPolicy::Normal),
+                61_000
+            );
+            assert_eq!(
+                next_observation_at(1_000, 8, RateLimitPolicy::Normal),
+                1_000 + OBSERVATION_CAP_DELAY_MS
+            );
+        }
+
+        #[test]
+        fn throttled_policy_stretches_delays_and_paused_blocks_them() {
+            assert_eq!(RateLimitPolicy::Normal.multiplier(), 1);
+            assert!(RateLimitPolicy::Throttled.multiplier() > 1);
+            assert!(!RateLimitPolicy::Paused.allows_observation());
+            assert!(RateLimitPolicy::Throttled.allows_observation());
+            assert!(
+                RateLimitPolicy::Throttled.stretch(OBSERVATION_CAP_DELAY_MS)
+                    >= OBSERVATION_CAP_DELAY_MS
+            );
+        }
+
+        #[test]
+        fn quota_policy_levels_follow_remaining_percentage() {
+            // R6: <20% throttles, <5% pauses.
+            let policy = |remaining: i64| {
+                RateLimitSnapshot {
+                    remaining,
+                    limit: 5000,
+                }
+                .policy()
+            };
+            assert_eq!(policy(5000), RateLimitPolicy::Normal);
+            assert_eq!(policy(1000), RateLimitPolicy::Normal);
+            assert_eq!(policy(999), RateLimitPolicy::Throttled);
+            assert_eq!(policy(250), RateLimitPolicy::Throttled);
+            assert_eq!(policy(249), RateLimitPolicy::Paused);
+            assert_eq!(policy(0), RateLimitPolicy::Paused);
+        }
+
+        #[test]
+        fn parses_rate_limit_body_but_not_garbage() {
+            let raw = r#"{"resources":{"core":{"limit":5000,"remaining":1200,"reset":1}}}"#;
+            assert_eq!(
+                parse_rate_limit(raw),
+                Some(RateLimitSnapshot {
+                    remaining: 1200,
+                    limit: 5000
+                })
+            );
+            assert_eq!(parse_rate_limit("not json"), None);
+            assert_eq!(parse_rate_limit(r#"{"resources":{}}"#), None);
+        }
+
+        #[test]
+        fn auth_probe_runs_once_per_ttl_window() {
+            // R5/R7: 100 system-prompt builds must not issue 100 API calls.
+            clear_auth_probe_cache();
+            let mut probes = 0;
+            for _ in 0..100 {
+                let available = cached_auth_probe("cache-test.invalid", || {
+                    probes += 1;
+                    true
+                });
+                assert!(available);
+            }
+            assert_eq!(probes, 1);
+            clear_auth_probe_cache();
+            let answer = cached_auth_probe("cache-test.invalid", || false);
+            assert!(!answer);
+            // A cached failure is reused inside its (shorter) TTL too.
+            let mut probes = 0;
+            for _ in 0..10 {
+                cached_auth_probe("cache-test.invalid", || {
+                    probes += 1;
+                    true
+                });
+            }
+            assert_eq!(probes, 0);
+            clear_auth_probe_cache();
+        }
+
+        #[test]
+        fn terminal_window_bounds_historical_observation() {
+            // R2: a terminal record older than the window is not observed
+            // unless its last known state was an open PR.
+            let now = 1_000_000_000i64;
+            let old = now - DEFAULT_TERMINAL_OBSERVATION_WINDOW_MS - 1;
+            assert!(!should_observe("failed", old, None, now));
+            assert!(!should_observe("cancelled", old, Some("closed"), now));
+            assert!(should_observe("failed", old, Some("open"), now));
+            assert!(should_observe("failed", now - 1_000, None, now));
+            assert!(should_observe("running", old, None, now));
+            assert!(should_observe("waiting_system", old, Some("open"), now));
+        }
+
+        #[test]
+        fn gh_call_counter_is_injectable() {
+            reset_gh_call_counter();
+            record_gh_call(CALLER_OBSERVE);
+            record_gh_call(CALLER_OBSERVE);
+            record_gh_call(CALLER_AUTH_PROBE);
+            assert_eq!(gh_call_count(CALLER_OBSERVE), 2);
+            assert_eq!(gh_call_count(CALLER_AUTH_PROBE), 1);
+            assert_eq!(total_gh_calls(), 3);
+            reset_gh_call_counter();
+            assert_eq!(total_gh_calls(), 0);
+        }
+    }
+
+    /// M114/R6: a rate-limited answer must not be retried in-place. Ahead of
+    /// this change three attempts fired within two seconds, and the next 60s
+    /// cleanup tick asked again — exactly how an exhausted hour got worse
+    /// instead of recovering.
+    #[test]
+    fn m114_rate_limited_delivery_is_not_retried_immediately() {
+        let mut attempts = 0;
+        let mut sleeps = 0;
+        let error = retry_delivery_network::<String>(
+            "gh pr view",
+            || {
+                attempts += 1;
+                Err("HTTP 403: API rate limit exceeded".to_string())
+            },
+            |_| sleeps += 1,
+        )
+        .expect_err("rate limited delivery must fail");
+        assert_eq!(attempts, 1, "a rate-limited call must not be retried at all");
+        assert_eq!(sleeps, 0, "no immediate backoff-sleep retry");
+        assert!(error.contains("额度受限"), "{error}");
+
+        // A transient non-quota failure still uses the ordinary retry budget.
+        let mut attempts = 0;
+        let mut sleeps = 0;
+        let error = retry_delivery_network::<String>(
+            "gh pr view",
+            || {
+                attempts += 1;
+                Err("HTTP 503 Service Unavailable".to_string())
+            },
+            |_| sleeps += 1,
+        )
+        .expect_err("transient failure still fails after retries");
+        assert_eq!(attempts, 3);
+        assert_eq!(sleeps, 2);
+        assert!(error.contains("已尝试 3/3"), "{error}");
     }
 
     #[test]
