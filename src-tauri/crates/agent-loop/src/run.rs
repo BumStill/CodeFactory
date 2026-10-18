@@ -1648,6 +1648,19 @@ pub async fn run_agent_loop(
                         continue;
                     }
                 }
+                if let Some(prompt) = tool_backend.external_wait_completion_hint(&audit_session_id).await {
+                    events.round_ended().await;
+                    require_tool_next = true;
+                    messages.push(crate::types::ChatMessage {
+                        role: "user".into(),
+                        content: crate::types::MessageContent::Text(prompt),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                    });
+                    continue;
+                }
                 let evidence = completion_gate.evidence();
                 match crate::policy::completion_finalization(
                     &evidence,

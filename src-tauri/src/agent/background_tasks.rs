@@ -1282,6 +1282,18 @@ pub async fn wake_source_cover(pool: &SqlitePool, session_id: &str) -> WakeSourc
     }
 }
 
+/// R5：只约束仍有外部等待的回合，不改变 objective 或交付状态。
+pub async fn external_wait_completion_hint(
+    pool: &SqlitePool,
+    session_id: &str,
+    external_wait_pending: bool,
+) -> Option<String> {
+    if !external_wait_pending {
+        return None;
+    }
+    wake_source_cover(pool, session_id).await.missing_hint()
+}
+
 // ── 应用装配（非测试构建） ────────────────────────────────────────────────────
 
 /// 后台任务输出目录：应用数据目录内，绝不写工作区。
@@ -1822,6 +1834,19 @@ mod tests {
     }
 
     // ── 阶段 2：R2 定时唤醒 ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn external_wait_requires_a_session_owned_wake_source() {
+        let pool = memory_pool().await;
+        assert!(external_wait_completion_hint(&pool, "s1", false).await.is_none());
+        assert!(external_wait_completion_hint(&pool, "s1", true).await.unwrap().contains("schedule_wakeup"));
+        schedule_wakeup_at(&pool, wakeup_request("s2", "other", Some(180)), 1000).await.unwrap();
+        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_some());
+        schedule_wakeup_at(&pool, wakeup_request("s1", "check CI", Some(180)), 1000).await.unwrap();
+        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_none());
+        reclaim_session(&pool, "s1").await;
+        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_some());
+    }
 
     fn wakeup_request(session: &str, prompt: &str, every_sec: Option<u64>) -> WakeupRequest {
         WakeupRequest {

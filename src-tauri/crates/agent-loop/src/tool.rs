@@ -114,6 +114,11 @@ impl std::error::Error for ToolError {}
 /// Where and how the loop's tool calls execute.
 #[async_trait::async_trait]
 pub trait ToolBackend: Send + Sync {
+    /// Internal next-step guard; never persisted as a user-facing message.
+    async fn external_wait_completion_hint(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
     /// Schemas advertised to the model. Async because MCP discovery is async on
     /// the desktop. Desktop = `tools::all_definitions()` + MCP; sidecar =
     /// exactly `[run_shell]`.

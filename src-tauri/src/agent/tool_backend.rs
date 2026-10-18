@@ -2551,6 +2551,24 @@ async fn mark_side_effect_started_in_tx(
 
 #[async_trait::async_trait]
 impl ToolBackend for DesktopToolBackend {
+    async fn external_wait_completion_hint(&self, session_id: &str) -> Option<String> {
+        // Older/headless databases may not have delivery tables yet.
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'")
+            .fetch_one(&self.db).await.unwrap_or(0);
+        if exists == 0 {
+            return None;
+        }
+        let pending = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM delivery_runs WHERE session_id=?
+             AND status NOT IN ('completed','failed','cancelled','rejected')
+             AND stage IN ('ci','ci_observation','merge','merge_queue','release')",
+        ).bind(session_id).fetch_one(&self.db).await;
+        match pending {
+            Ok(count) => super::background_tasks::external_wait_completion_hint(&self.db, session_id, count > 0).await,
+            Err(_) => Some("请重新检查交付等待状态，并为仍在进行的等待挂 schedule_wakeup。".into()),
+        }
+    }
+
     async fn list_schemas(&self) -> Vec<ToolDefinition> {
         // Desktop surface = native tools + every connected MCP tool. (The
         // anonymous KB-tool strip stays in the loop for now — it depends on the
@@ -2946,6 +2964,29 @@ mod tests {
             .unwrap();
         }
         backend
+    }
+
+    #[tokio::test]
+    async fn desktop_completion_guard_reads_real_ci_wait_and_requires_own_timer() {
+        let backend = objective_backend(false).await;
+        // Synthetic durable forge state; no production database or GitHub writes.
+        sqlx::query("CREATE TABLE IF NOT EXISTS delivery_runs (session_id TEXT, status TEXT, stage TEXT)")
+            .execute(&backend.db).await.unwrap();
+        // The normal fixture does not initialise the delivery coordinator schema.
+        sqlx::query("INSERT INTO delivery_runs (session_id,status,stage) VALUES ('watch-session','waiting','ci')")
+            .execute(&backend.db).await.unwrap();
+        assert!(backend.external_wait_completion_hint("other-session").await.is_none());
+        assert!(backend.external_wait_completion_hint("watch-session").await.unwrap().contains("schedule_wakeup"));
+        crate::agent::background_tasks::schedule_wakeup(&backend.db, crate::agent::background_tasks::WakeupRequest {
+            session_id: "watch-session".into(), root_turn_id: None, prompt: "Check synthetic CI and repair failures".into(),
+            source: crate::agent::background_tasks::TaskSource::AgentDecided, after_sec: Some(180), every_sec: None,
+        }).await.unwrap();
+        assert!(backend.external_wait_completion_hint("watch-session").await.is_none());
+        crate::agent::background_tasks::reclaim_session(&backend.db, "watch-session").await;
+        assert!(backend.external_wait_completion_hint("watch-session").await.is_some());
+        sqlx::query("UPDATE delivery_runs SET status='completed' WHERE session_id='watch-session'")
+            .execute(&backend.db).await.unwrap();
+        assert!(backend.external_wait_completion_hint("watch-session").await.is_none());
     }
 
     fn call_with_args(id: &str, name: &str, args: &serde_json::Value) -> ToolCall {
