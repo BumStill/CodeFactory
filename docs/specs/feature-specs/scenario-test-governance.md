@@ -97,7 +97,7 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 <!-- scenario-registry-summary:start -->
 - 逻辑 Scenario：`28`（P0 `14`，P1 `14`，P2 `0`）
 - Complex E2E：`11`（implemented `0`，partially_implemented `11`，designed `0`）
-- 剩余自动化缺口：`25`
+- 剩余自动化缺口：`24`
 - PR slice：implemented `11`，partially_implemented `0`，missing `0`
 <!-- scenario-registry-summary:end -->
 
@@ -152,7 +152,7 @@ Scenario-Test: HLT-003, HLT-004
 | Case | 名称 | 优先级 | 总体状态 | 剩余缺口 | PR slice | PR 缺口 |
 | --- | --- | --- | --- | ---: | --- | ---: |
 | E2E-001 | 用户离开后长任务跨进程自动完成 | P0 | `partially_implemented` | 3 | `implemented` | 0 |
-| E2E-002 | 历史 session 简短继续精确续接 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
+| E2E-002 | 历史 session 简短继续精确续接 | P0 | `partially_implemented` | 1 | `implemented` | 0 |
 | E2E-003 | 显式停止清除整个 session 并跨重启保持 | P0 | `partially_implemented` | 2 | `implemented` | 0 |
 | E2E-004 | 长任务中追加约束并完成完整交付链 | P1 | `partially_implemented` | 3 | `implemented` | 0 |
 | E2E-005 | 浏览器逻辑失败后回收并可继续任务 | P0 | `partially_implemented` | 1 | `implemented` | 0 |

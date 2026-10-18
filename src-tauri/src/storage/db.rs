@@ -220,7 +220,7 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     // We ignore the result on a checksum/version mismatch so that the
     // ensure_schema pass below can still run; the row-level damage from
     // a half-applied migration is what we're working around here.
-    if let Err(e) = sqlx::migrate!("../migrations").run(&pool).await {
+    if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
         tracing::warn!("sqlx::migrate reported {e}; falling back to idempotent ensure_schema");
     }
 
@@ -1748,6 +1748,31 @@ fn sidecar_path(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn historical_schema_migration_prefixes_preserve_sessions() {
+        for version in [1, 6, 10, 19] {
+            let root = tempfile::tempdir().unwrap();
+            let url = format!("sqlite:{}", root.path().join("synthetic.db").display());
+            let pool = SqlitePoolOptions::new().max_connections(1)
+                .connect_with(url.parse::<SqliteConnectOptions>().unwrap().create_if_missing(true))
+                .await.unwrap();
+            let all = sqlx::migrate!("./migrations");
+            let prefix = sqlx::migrate::Migrator {
+                migrations: std::borrow::Cow::Owned(all.iter().filter(|m| m.version <= version).cloned().collect()),
+                ..sqlx::migrate::Migrator::DEFAULT
+            };
+            prefix.run(&pool).await.unwrap();
+            sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-schema-session','synthetic','.','synthetic',1,1)").execute(&pool).await.unwrap();
+            close_and_release_files(pool).await;
+            let pool = connect(&url).await.unwrap();
+            let ledger: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success=1").fetch_one(&pool).await.unwrap();
+            assert_eq!(ledger, all.iter().map(|m| m.version).max().unwrap());
+            let identity: String = sqlx::query_scalar("SELECT id FROM sessions").fetch_one(&pool).await.unwrap();
+            assert_eq!(identity, "synthetic-schema-session");
+            close_and_release_files(pool).await;
+        }
+    }
     use crate::util::no_window::NoWindow;
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::ConnectOptions;

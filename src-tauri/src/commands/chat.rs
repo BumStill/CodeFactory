@@ -2523,6 +2523,23 @@ async fn admit_persisted_chat_turn(
     } else {
         None
     };
+    if matches!(resolution, ChatContinuationResolution::None)
+        && legacy_continuation.is_none()
+        && crate::agent::is_contextual_approval(content)
+    {
+        let historical_user_messages: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user' AND id<>?",
+        )
+        .bind(session_id)
+        .bind(&root_turn_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if historical_user_messages > 0 {
+            return Err(AppError::Other(
+                "这段历史记录缺少可续接的任务身份，无法安全继续；本次未启动新任务。".into(),
+            ));
+        }
+    }
     let setup = match resolution {
         ChatContinuationResolution::AlreadyBound { objective_id } => ChatContinuationSetup {
             continuation_root_turn_id: None,
