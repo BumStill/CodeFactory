@@ -1,17 +1,23 @@
 # E2E-002 schema matrix 验收与交付证据
 
+## 接手续做（2026-10-18）
+
+接手自会话 `89e69673`。在当前受管分支合入原远端分支的四个提交，未向原分支推送；按备份恢复目标名称及 socket 修正说明。本次复验：前端 151 files / 1013 tests、生产 build；任务专属目录正式 binary 在源码目录外的四版本字段断言；`RUST_TEST_THREADS=2` 完整 workspace（lib 1673 passed / 10 ignored，其余 integration/crates/doc tests 全绿）。原失败优先证据沿用原会话记录，本次未新增功能或伪称重新观察红灯。
+
+原备份中的 1671 是上次基线的结果；本次 lib 为 1673。当前 registry 仍为 partially_implemented，仅保留 L3 真实桌面缺口。统一 harness 使用 Homebrew Python 3.14（系统 Python 缺少 tomllib）。本次开新 PR，不复用已终止交付记录。
+
 ## R1–R4 / Acceptance
 
 | Req | 测试与证据 | 结果 |
 | --- | --- | --- |
 | R1 | 生产迁移前缀 1/6/10/19，真实 SQLite ledger 和 provider 表边界断言 | pass |
 | R2 | 正式 binary 在源码目录外运行；四行 schema_matrix；历史 session/root/Objective 身份、重开幂等、零副作用与无额外人工 prompt | pass |
-| R3 | binary 现有 PR/nightly 硬门禁强制运行矩阵；新增 rust:historical_schema_matrix_preserves_identity；registry 保留 partially_implemented/L3 | local pass，CI 待交付 |
+| R3 | binary 现有 PR/nightly 硬门禁强制运行矩阵；新增 rust:historical_schema_migration_prefixes_preserve_sessions；registry 保留 partially_implemented/L3 | local pass，CI 待交付 |
 | R4 | 先 missing old-schema matrix，再 identity-free history must not create a new task 红灯，同一测试修复后绿灯 | pass |
 
 前端 `pnpm test`：151 files / 1013 tests（含 lightModeAudit）；`pnpm build` 通过。
 Rust focused：`cargo test --manifest-path src-tauri/Cargo.toml --test history_schema_matrix -- --nocapture` 1 passed。
-完整 workspace 相同命令重跑通过（lib 1671 passed / 10 ignored；其余 integration/crates/doc tests 全绿）。首轮既有 socket accept 竞态 `WouldBlock`，按模板仅重跑一次即通过，未修改无关 socket 代码。
+完整 workspace 通过（lib 1671 passed / 10 ignored；其余 integration/crates/doc tests 全绿）。同步最新版本号基线后，默认并发出现既有 SQLite 计时波动，低并发复验该断言通过；另复现 socket 非阻塞 accept 尚未就绪的竞态，最小修正为 3 秒有界轮询，保留分片读取断言。最终 `RUST_TEST_THREADS=2` 完整 workspace、前端 1013 项与 build 全绿。
 治理 `validate_scenario_test_governance.py --ci`、README validator、repo baseline 均 OK；历史 smoke Node 合同 5/5。新增 registry 目标为 `rust:historical_schema_migration_prefixes_preserve_sessions`，正式 binary 集成测试继续实际运行，不以静态合同代替行为验收。
 
 ## 实现与边界
