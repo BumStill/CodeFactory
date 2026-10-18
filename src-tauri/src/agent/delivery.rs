@@ -11339,6 +11339,25 @@ pub(crate) mod github_api_budget {
     /// records whose last known state was `open` keep a (backed-off) schedule.
     pub(crate) const DEFAULT_TERMINAL_OBSERVATION_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+    /// M114b/R2: an objective that is explicitly waiting for the *user*
+    /// (core input or an explicit action) must not have its PR re-observed on
+    /// the ordinary 1m→60m backoff. Field evidence: PR #680 (objective
+    /// `waiting_core_input`) and #710 (`agent_action_required`) were re-queried
+    /// four times a minute by the recovery supervisor, because those statuses
+    /// were not part of any reconcile candidate set and therefore never got a
+    /// persisted conclusion.
+    pub(crate) const USER_WAIT_OBSERVATION_MIN_DELAY_MS: i64 = 30 * 60 * 1000;
+
+    /// Minimum gap before the next background observation of a PR that belongs
+    /// to an objective that is waiting for the user.
+    pub(crate) fn min_observation_delay_ms(objective_status: &str, requires_user_action: bool) -> i64 {
+        if requires_user_action || matches!(objective_status, "waiting_core_input") {
+            USER_WAIT_OBSERVATION_MIN_DELAY_MS
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn terminal_observation_window_ms() -> i64 {
         std::env::var("CODEFACTORY_TERMINAL_OBSERVATION_WINDOW_MS")
             .ok()
@@ -11961,6 +11980,23 @@ mod tests {
                 RateLimitPolicy::Throttled.stretch(OBSERVATION_CAP_DELAY_MS)
                     >= OBSERVATION_CAP_DELAY_MS
             );
+        }
+
+        #[test]
+        fn user_waiting_objectives_back_off_at_least_thirty_minutes() {
+            // M114b/R2: waiting for the user means at most one observation per
+            // half hour, whatever the ordinary backoff would allow.
+            assert_eq!(min_observation_delay_ms("active", false), 0);
+            assert_eq!(min_observation_delay_ms("waiting_system", false), 0);
+            assert_eq!(
+                min_observation_delay_ms("waiting_core_input", true),
+                USER_WAIT_OBSERVATION_MIN_DELAY_MS
+            );
+            assert_eq!(
+                min_observation_delay_ms("active", true),
+                USER_WAIT_OBSERVATION_MIN_DELAY_MS
+            );
+            assert!(USER_WAIT_OBSERVATION_MIN_DELAY_MS >= 30 * 60 * 1000);
         }
 
         #[test]
