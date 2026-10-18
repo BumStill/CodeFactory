@@ -7,13 +7,13 @@
 <!-- scenario-registry-summary:start -->
 - 逻辑 Scenario：`28`（P0 `14`，P1 `14`，P2 `0`）
 - Complex E2E：`11`（implemented `0`，partially_implemented `11`，designed `0`）
-- 剩余自动化缺口：`25`
+- 剩余自动化缺口：`24`
 - PR slice：implemented `11`，partially_implemented `0`，missing `0`
 <!-- scenario-registry-summary:end -->
 
 以上区块由 `scenario-registry.json` 派生并由 CI 校验，不手工估算。PR、nightly、release 对同一场景的重复执行只算不同证据层，不重复计数。`implemented 0` 的含义是 11 个复杂旅程目前都还没有同时清零 PR、nightly、真实桌面和 exact release 证据；现有局部测试仍是有效证据，但不能被包装成整条旅程已完成。
 
-E2E-002/E2E-003/E2E-007 已由 `--history-session-smoke` 覆盖真实 SQLite、正式二进制多进程、hard kill 和两次重启的 L2/L4 断言；E2E-007 另由真实浏览器中的 production reducer、MessageList、ToolCallCard 与 MessageInput 覆盖 handback UI。它们接入 required Windows CI、nightly 和 release exact executable。真实桌面 WebView 的完整 provider 路径、旧 schema 矩阵和部分投影失败并发仍是显式缺口，不计为已覆盖。
+E2E-002/E2E-003/E2E-007 已由 `--history-session-smoke` 覆盖真实 SQLite、正式二进制多进程、hard kill 和两次重启的 L2/L4 断言；E2E-007 另由真实浏览器中的 production reducer、MessageList、ToolCallCard 与 MessageInput 覆盖 handback UI。它们接入 required Windows CI、nightly 和 release exact executable。E2E-002 的合成旧 schema 迁移矩阵（1/6/10/19）已由同一正式 binary 入口覆盖。真实桌面 WebView 的完整 provider 路径和部分投影失败并发仍是显式缺口，不计为已覆盖。
 
 `gates` 表示当前真实 workflow 覆盖，不表示目标。存在脚本但未接入 CI 的场景标为 `manual_canary`；复杂 E2E 的未来层级记录在 `execution`，并由 `automation_status` 明确区分 designed、partial 和 implemented。
 
