@@ -18,6 +18,8 @@
 
 pub mod bridge;
 pub mod chromium;
+#[cfg(target_os = "macos")]
+pub mod macos_spawn;
 pub mod download;
 pub mod extension;
 pub mod extension_package;
