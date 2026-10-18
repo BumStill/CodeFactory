@@ -1661,7 +1661,12 @@ pub async fn run_agent_loop(
                     });
                     continue;
                 }
-                let evidence = completion_gate.evidence();
+                let mut evidence = completion_gate.evidence();
+                if tool_backend.thin_mode(&audit_session_id).await {
+                    evidence.blockers.clear();
+                    evidence.blockers_structured.clear();
+                    evidence.completed = true;
+                }
                 match crate::policy::completion_finalization(
                     &evidence,
                     completion_recovery_attempts,

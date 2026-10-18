@@ -1062,6 +1062,7 @@ async fn settle_finished_turn_provider_episodes(
     else {
         return Ok(());
     };
+    if crate::agent::thin::is_thin(pool, &session_id).await { return Ok(()); }
     crate::agent::provider_recovery::ProviderRecoveryStore::new(pool.clone())
         .settle_finished_turn_episodes(&session_id, &root_turn_id, now)
         .await
@@ -1532,11 +1533,23 @@ async fn project_chat_objective(
 ) -> Result<(), AppError> {
     let now = Utc::now().timestamp_millis();
     let ChatTurnProjection {
-        phase,
-        activity_kind,
-        activity_label,
+        mut phase,
+        mut activity_kind,
+        mut activity_label,
         terminal_reason,
     } = chat_turn_projection(objective);
+    if let Some(session) = objective.session_id.as_deref() {
+        if crate::agent::thin::is_thin(db, session).await {
+            use crate::agent::objective::ObjectiveStatus;
+            let projected = match objective.status {
+                ObjectiveStatus::Active => ("working", "thin_running", "运行中"),
+                ObjectiveStatus::WaitingSystem => ("waiting", "thin_waiting_wake", "等唤醒"),
+                ObjectiveStatus::WaitingCoreInput | ObjectiveStatus::WaitingAuthorization | ObjectiveStatus::WaitingBusinessDecision => ("waiting", "thin_waiting_user", "等用户"),
+                _ => ("finalizing", "thin_ended", "已结束；原因与成果见本会话记录"),
+            };
+            (phase, activity_kind, activity_label) = projected;
+        }
+    }
     let waiting_reason = objective
         .failure_code
         .as_deref()
@@ -3738,7 +3751,21 @@ async fn resume_chat_objective_inner(
     .bind(&session_id)
     .fetch_one(&db)
     .await?;
+    let thin_mode = crate::agent::thin::is_thin(&db, &session_id).await;
     let mut history = crate::storage::load_agent_history(&db, &session_id).await?;
+    if thin_mode {
+        let last: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT tool.tool_name, tool.arguments, tool.created_at FROM tool_calls tool JOIN messages message ON message.id=tool.message_id WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1"
+        ).bind(&session_id).fetch_optional(&db).await?;
+        let (summary, interrupted_at) = last.map(|(name, arguments, at)| (format!("{name}: {}", arguments.chars().take(500).collect::<String>()), at))
+            .unwrap_or_else(|| ("模型请求（结果未知）".into(), objective.updated_at));
+        history.push(crate::storage::Message {
+            id: format!("thin-resume:{}:{}", objective.id, objective.revision), session_id: session_id.clone(), role: "system".into(),
+            content: crate::agent::thin::resume_prompt(interrupted_at, &summary),
+            endpoint_id: None, model_id: None, input_tokens: None, output_tokens: None, tool_calls: None, reasoning_content: None, completion_state: None,
+            created_at: Utc::now().timestamp_millis(),
+        });
+    }
     if let Some(continuation) = crate::agent::objective::incomplete_objective_continuation_prompt(
         objective.failure_code.as_deref(),
     ) {

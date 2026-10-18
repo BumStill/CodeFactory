@@ -1249,6 +1249,9 @@ impl DesktopToolBackend {
         kind: ToolKind,
         is_mcp_tool: bool,
     ) -> Result<MutationAdmission, ToolError> {
+        if super::thin::is_thin(&self.db, ctx.session_id.as_deref().unwrap_or("")).await {
+            return Ok(MutationAdmission::Dispatch { receipt_id: None, browser_execution: None });
+        }
         self.ensure_observation_schema().await?;
         if call.function.name == "browser_session" && !browser_has_observation_contract(args) {
             return Ok(MutationAdmission::Waiting(waiting_result(
@@ -2551,7 +2554,11 @@ async fn mark_side_effect_started_in_tx(
 
 #[async_trait::async_trait]
 impl ToolBackend for DesktopToolBackend {
+    async fn thin_mode(&self, session_id: &str) -> bool { super::thin::is_thin(&self.db, session_id).await }
     async fn external_wait_completion_hint(&self, session_id: &str) -> Option<String> {
+        if super::thin::is_thin(&self.db, session_id).await {
+            return super::thin::external_wait_hint(&self.db, session_id).await;
+        }
         // Older/headless databases may not have delivery tables yet.
         let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'")
             .fetch_one(&self.db).await.unwrap_or(0);
@@ -2707,6 +2714,7 @@ impl ToolBackend for DesktopToolBackend {
         args: &serde_json::Value,
         ctx: &ToolCtx,
     ) -> Option<String> {
+        if super::thin::is_thin(&self.db, ctx.session_id.as_deref().unwrap_or("")).await { return None; }
         let (command, native_kind) = desktop_command_and_kind(&call.function.name, args);
         let is_mcp_tool = self
             .mcp_tool_names
@@ -3292,6 +3300,19 @@ mod tests {
             binding_id: Some(TEST_BINDING_ID.into()),
             resource_generation: Some(1),
         }
+    }
+
+    #[tokio::test]
+    async fn thin_mutation_dispatches_without_any_receipt_even_with_unknown_legacy_effect() {
+        let backend = objective_backend(true).await;
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'thin'").execute(&backend.db).await.unwrap();
+        let args = serde_json::json!({"command":"synthetic-command"});
+        let call = call_with_args("thin-bash", "bash", &args);
+        let (command, kind) = backend.classify(&call, &args);
+        let admission = backend.mutation_preflight(&call, &args, &objective_ctx(Path::new(".")), &command, kind, false).await.unwrap();
+        assert!(matches!(admission, MutationAdmission::Dispatch { receipt_id: None, browser_execution: None }));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts").fetch_one(&backend.db).await.unwrap();
+        assert_eq!(count, 0);
     }
 
     async fn assert_objective_bound_call_starts_receipt(
