@@ -35,7 +35,6 @@ mod tests {
     #[test]
     fn accepted_socket_reads_fragmented_request_after_nonblocking_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (mut socket, _) = listener.accept().unwrap();
         // Model Windows accept inheritance on every platform, deterministically.
