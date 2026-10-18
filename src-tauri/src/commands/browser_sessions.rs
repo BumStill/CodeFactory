@@ -218,6 +218,14 @@ pub async fn browser_open_extensions_page() -> Result<(), AppError> {
                 .into(),
         )
     })?;
+    #[cfg(target_os = "macos")]
+    {
+        return crate::browser::macos_spawn::spawn(&chrome, &["chrome://extensions".into()])
+            .map(|child| child.detach())
+            .map_err(|error| AppError::Other(format!("Could not start {}: {error}", chrome.display())));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     use crate::util::no_window::NoWindow;
     std::process::Command::new(&chrome)
         .no_window()
@@ -225,6 +233,7 @@ pub async fn browser_open_extensions_page() -> Result<(), AppError> {
         .spawn()
         .map(|_| ())
         .map_err(|error| AppError::Other(format!("Could not start {}: {error}", chrome.display())))
+    }
 }
 
 /// Open a path in the platform's file manager.
