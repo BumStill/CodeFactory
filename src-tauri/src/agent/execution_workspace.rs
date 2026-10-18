@@ -152,9 +152,28 @@ pub(crate) enum CanonicalPrState {
     ClosedUnmerged,
     Open,
     Queued,
+    /// M115/R2: the PR still belongs to this delivery but its head moved to a
+    /// provider-produced commit. Whether that is the same delivery is a
+    /// separate, explicit question ([`UpdatedHeadVerdict`]) — GitHub's
+    /// update-branch and the merge queue rewrite the head into a merge commit
+    /// whose parents are the session's head plus the default branch, which is
+    /// exactly the same work under a new SHA.
+    HeadAdvanced { head_sha: String, queued: bool },
     /// The observer could not establish the truth (no remote, network, schema).
     /// This is never a reason to delete or to claim the work is done.
     Unknown(String),
+}
+
+/// M115/R2: the read-only answer to "is this new head the same delivery?".
+///
+/// Only a merge commit that has the already-observed head as one parent and a
+/// parent that is on the default branch may continue the delivery. Everything
+/// else — a rebase, a force-push, an octopus merge, a lookup failure — stays a
+/// stranger and keeps the previous fail-closed `Unknown` path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdatedHeadVerdict {
+    SameDelivery { synced_from_default_branch: String },
+    Foreign(String),
 }
 
 /// Read-only authority for "was this session's PR merged?".
@@ -183,6 +202,19 @@ pub(crate) trait CanonicalPrObserver: Send + Sync {
         _expected_head_sha: &str,
     ) -> Option<Vec<crate::agent::objective::CiCheckState>> {
         None
+    }
+
+    /// M115/R2: resolve a moved PR head. The default is `Foreign`, so an
+    /// observer that cannot prove the provenance (offline pass, scripted
+    /// observer) keeps the old "unknown, back off, never settle" behaviour.
+    async fn observe_updated_head(
+        &self,
+        _repo_root: &Path,
+        _pr_number: i64,
+        _known_head_sha: &str,
+        _actual_head_sha: &str,
+    ) -> UpdatedHeadVerdict {
+        UpdatedHeadVerdict::Foreign("observer cannot prove the new head's provenance".into())
     }
 
     /// M114/R4: one batched lookup per repository covers every due candidate
@@ -276,9 +308,11 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
                 .observed_queue_arm(pr_number as u64, expected_head_sha)
                 .map(|armed| if armed { CanonicalPrState::Queued } else { CanonicalPrState::Open })
                 .map_err(|error| anyhow!(error)),
-            Ok(MergeObservation::HeadChanged { actual_head }) => Ok(CanonicalPrState::Unknown(
-                format!("PR head moved to {actual_head}"),
-            )),
+            // M115/R2: a moved head is not a conclusion by itself; the caller
+            // asks `observe_updated_head` whether it is the same delivery.
+            Ok(MergeObservation::HeadChanged { actual_head }) => {
+                Ok(CanonicalPrState::HeadAdvanced { head_sha: actual_head, queued: false })
+            }
             Ok(MergeObservation::Unsupported) => Ok(CanonicalPrState::Unknown(
                 "provider cannot report merge state".into(),
             )),
@@ -295,6 +329,35 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         let remote = gh_remote_for(repo_root)
             .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)))?;
         remote.observed_ci_checks(expected_head_sha).await.ok()
+    }
+
+    /// M115/R2: prove the moved head is the queue/update-branch merge of the
+    /// already-observed head with the default branch. Read-only: parents and a
+    /// `compare` lookup, no mutation, no label change.
+    async fn observe_updated_head(
+        &self,
+        repo_root: &Path,
+        _pr_number: i64,
+        known_head_sha: &str,
+        actual_head_sha: &str,
+    ) -> UpdatedHeadVerdict {
+        use crate::agent::delivery::gh_remote_for;
+        let Some(remote) = gh_remote_for(repo_root)
+            .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)))
+        else {
+            return UpdatedHeadVerdict::Foreign("no delivery remote is resolvable".into());
+        };
+        match remote.queue_synced_head(known_head_sha, actual_head_sha) {
+            Ok(Some(on_default_branch)) => {
+                UpdatedHeadVerdict::SameDelivery { synced_from_default_branch: on_default_branch }
+            }
+            Ok(None) => UpdatedHeadVerdict::Foreign(format!(
+                "{actual_head_sha} is not a merge of {known_head_sha} with the default branch"
+            )),
+            Err(error) => UpdatedHeadVerdict::Foreign(format!(
+                "cannot prove {actual_head_sha} is a queue sync of {known_head_sha}: {error}"
+            )),
+        }
     }
 
     /// M114/R4: one `gh pr list --state all` for the whole repository, shared by
@@ -383,7 +446,13 @@ fn canonical_state_from_batch(
         },
         "CLOSED" => CanonicalPrState::ClosedUnmerged,
         "OPEN" if !summary.head_sha.is_empty() && summary.head_sha != expected_head_sha => {
-            CanonicalPrState::Unknown(format!("PR head moved to {}", summary.head_sha))
+            // M115/R2: the queue's strict-up-to-date sync rewrites the head
+            // into a merge commit. Carry the moved head and its arm state so
+            // the caller can prove the provenance instead of going silent.
+            CanonicalPrState::HeadAdvanced {
+                head_sha: summary.head_sha.clone(),
+                queued: summary.armed,
+            }
         }
         "OPEN" if summary.armed => CanonicalPrState::Queued,
         "OPEN" => CanonicalPrState::Open,
@@ -394,7 +463,7 @@ fn canonical_state_from_batch(
 /// The canonical PR a `delivery_runs` row recorded for this workspace, with the
 /// exact identity fields that must agree with the workspace before cleanup may
 /// touch anything.
-#[derive(Debug, FromRow)]
+#[derive(Debug, FromRow, Clone)]
 struct CanonicalPrReference {
     run_id: String,
     claim_epoch: i64,
@@ -1100,6 +1169,17 @@ async fn resolve_unrecorded_merge(
             code: "workspace_cleanup_merge_pending",
             detail: plain_keep_message(pr_number, &candidate.worktree_path, "尚未合并"),
         }),
+        // M115/R2: a moved head proves nothing about the merge, so the cleanup
+        // pass keeps the workspace exactly as it does for an unknown state.
+        Ok(CanonicalPrState::HeadAdvanced { head_sha, .. }) => {
+            Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_merge_unproven",
+                detail: format!(
+                    "PR #{pr_number} 的 head 已移动到 {head_sha}，尚未证明是同一交付；{}",
+                    plain_keep_message(pr_number, &candidate.worktree_path, "head 已变化")
+                ),
+            })
+        }
         Ok(CanonicalPrState::Unknown(reason)) => Ok(CandidateDisposition::Preserved {
             code: "workspace_cleanup_merge_unproven",
             detail: format!(
@@ -1622,10 +1702,100 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
     }
     for (index, (candidate, reference)) in pending.iter().enumerate() {
         // Read-only remote truth does not grant replay or cleanup authority.
-        let state = observations
+        let mut state = observations
             .remove(&index)
             .unwrap_or_else(|| Ok(CanonicalPrState::Unknown("not observed".into())));
+        let mut reference = reference.clone();
         let previous = load_observation_state(pool, &reference.run_id, observation_columns).await?;
+        // M115/R2: the queue's strict sync (or GitHub's update-branch) rewrites
+        // the PR head into a merge commit. Before that was treated as an
+        // unknown head, so the canonical head froze at the session's commit and
+        // M108's CI wake never fired on the new head (field PR #728: 57 minutes
+        // of silence). Prove the provenance first; only a merge of *this*
+        // delivery with the default branch may continue it.
+        let mut head_advanced = false;
+        let mut advanced_head: Option<String> = None;
+        let advanced_state = match &state {
+            Ok(CanonicalPrState::HeadAdvanced { head_sha, queued }) => {
+                Some((head_sha.clone(), *queued))
+            }
+            _ => None,
+        };
+        if let Some((head_sha, queued)) = advanced_state {
+            match observer
+                .observe_updated_head(
+                    Path::new(&candidate.repo_root),
+                    reference.canonical_pr_number,
+                    &reference.canonical_head_sha,
+                    &head_sha,
+                )
+                .await
+            {
+                UpdatedHeadVerdict::SameDelivery {
+                    synced_from_default_branch,
+                } => {
+                    let advanced = sqlx::query(
+                        "UPDATE delivery_runs SET canonical_head_sha=?, last_observed_at=?, updated_at=?
+                         WHERE id=? AND claim_epoch=? AND expected_head_sha=? AND canonical_head_sha=?
+                           AND canonical_pr_number=? AND (lease_expires_at IS NULL OR lease_expires_at<=?)",
+                    )
+                    .bind(&head_sha)
+                    .bind(now)
+                    .bind(now)
+                    .bind(&reference.run_id)
+                    .bind(reference.claim_epoch)
+                    .bind(&reference.expected_head_sha)
+                    .bind(&reference.canonical_head_sha)
+                    .bind(reference.canonical_pr_number)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+                    if advanced.rows_affected() != 1 {
+                        // Takeover or a second observer moved the row; never
+                        // guess which head is canonical.
+                        continue;
+                    }
+                    sqlx::query(
+                        "INSERT INTO delivery_run_events (id,run_id,event_kind,stage,status,detail_json,process_instance,created_at)
+                         VALUES (?,?,'canonical_pr_head_advanced','pr_open','waiting',?,?,?)",
+                    )
+                    .bind(uuid::Uuid::new_v4().to_string())
+                    .bind(&reference.run_id)
+                    .bind(
+                        serde_json::json!({
+                            "pr_number": reference.canonical_pr_number,
+                            "pr_url": reference.canonical_pr_url,
+                            "previous_head_sha": reference.canonical_head_sha,
+                            "head_sha": head_sha,
+                            "synced_from_default_branch": synced_from_default_branch,
+                            "queued": queued,
+                        })
+                        .to_string(),
+                    )
+                    .bind(owner)
+                    .bind(now)
+                    .execute(pool)
+                    .await?;
+                    // Only the observed head moves. `expected_head_sha` stays
+                    // the session's own commit, so resuming the delivery does
+                    // not require the local clone to know the merge commit
+                    // (R3) — the wake prompt tells it to fetch it first.
+                    reference.canonical_head_sha = head_sha.clone();
+                    advanced_head = Some(head_sha);
+                    head_advanced = true;
+                    state = Ok(if queued {
+                        CanonicalPrState::Queued
+                    } else {
+                        CanonicalPrState::Open
+                    });
+                }
+                UpdatedHeadVerdict::Foreign(reason) => {
+                    state = Ok(CanonicalPrState::Unknown(format!(
+                        "PR head moved to {head_sha}: {reason}"
+                    )));
+                }
+            }
+        }
         if previous.concluded_at.is_some() {
             continue;
         }
@@ -1659,7 +1829,9 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
             Ok(CanonicalPrState::ClosedUnmerged) => "closed",
             Ok(CanonicalPrState::Open) => "open",
             Ok(CanonicalPrState::Queued) => "queued",
-            Ok(CanonicalPrState::Unknown(_)) | Err(_) => "unknown",
+            Ok(CanonicalPrState::HeadAdvanced { .. })
+            | Ok(CanonicalPrState::Unknown(_))
+            | Err(_) => "unknown",
         };
         let unchanged = previous
             .last_state
@@ -1736,7 +1908,8 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         // them. Terminal objectives (failed/cancelled/completed) can still hold
         // an open PR worth observing, but no live wait depends on its checks, so
         // the extra REST call is skipped.
-        let ci_decision = if matches!(&state, Ok(CanonicalPrState::Open))
+        let ci_decision = if (matches!(&state, Ok(CanonicalPrState::Open))
+            || (head_advanced && matches!(&state, Ok(CanonicalPrState::Queued))))
             && matches!(objective_status.as_str(), "running" | "active" | "waiting_system")
         {
             let reference_label = format!("PR #{}", reference.canonical_pr_number);
@@ -1765,6 +1938,19 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         } else {
             None
         };
+        // M115/R3: a queue-synced head is a merge commit the session's clone may
+        // not know. Every non-green decision therefore tells it to start from
+        // that head instead of committing on the old one.
+        let ci_decision = ci_decision.map(|(code, prompt)| match advanced_head.as_deref() {
+            Some(head) if code != crate::agent::objective::DELIVERED_CI_GREEN => (
+                code,
+                format!(
+                    "{prompt}\n\n{}",
+                    crate::agent::objective::advanced_head_rebase_note(head)
+                ),
+            ),
+            _ => (code, prompt),
+        });
         let sql_text = |value: &str| format!("'{}'", value.replace('\'', "''"));
         let wait_failure_code = ci_decision
             .as_ref()
@@ -1826,11 +2012,19 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         } else { true };
         if matches!(objective_status.as_str(), "failed" | "cancelled") && !complete { continue; }
         let settle_merged = i32::from(complete);
+        // M115/R2: a queue-synced head is genuinely new progress, so it must not
+        // be swallowed by the "same stage/status twice" idempotence fence that
+        // keeps repeated identical observations from spamming events.
+        let progress_fence = if head_advanced {
+            "1=1"
+        } else {
+            "NOT (stage=? AND reached_ceiling=? AND status IN ('waiting','completed'))"
+        };
         let run_statement = format!(
             "UPDATE delivery_runs SET reached_ceiling=?{}{} WHERE id=? AND claim_epoch=? AND expected_head_sha=?
                AND canonical_head_sha=? AND canonical_pr_number=?
                AND (lease_expires_at IS NULL OR lease_expires_at<=?)
-               AND NOT (stage=? AND reached_ceiling=? AND status IN ('waiting','completed'))
+               AND {progress_fence}
                AND (reached_ceiling IN ('local','committed','pushed','pr_open')
                     OR (?='merge_queued' AND reached_ceiling='merge_queued')
                     OR (?='merged' AND (reached_ceiling NOT IN ('release_triggered','deployment_succeeded','live_verified') OR {settle_merged})))",
@@ -1847,9 +2041,13 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         let mut tx = pool.begin().await?;
         // Fence observations against a takeover that acquired a lease while we
         // were reading the provider; this path never grants mutation authority.
-        let changed = run_query.bind(&reference.run_id).bind(reference.claim_epoch)
+        let mut changed_query = run_query.bind(&reference.run_id).bind(reference.claim_epoch)
             .bind(&reference.expected_head_sha).bind(&reference.canonical_head_sha)
-            .bind(reference.canonical_pr_number).bind(now).bind(stage).bind(reached).bind(reached).bind(reached)
+            .bind(reference.canonical_pr_number).bind(now);
+        if !head_advanced {
+            changed_query = changed_query.bind(stage).bind(reached);
+        }
+        let changed = changed_query.bind(reached).bind(reached).bind(reached)
             .execute(&mut *tx).await?;
         if changed.rows_affected() == 0 {
             if !repair && !merged { continue; }
@@ -5743,6 +5941,173 @@ mod tests {
                 assert!(
                     prompt.contains("windows_worktree_target_is_shared"),
                     "the failing test name must reach the next turn: {prompt}"
+                );
+            }
+        }
+    }
+
+    /// M115/R2+R3+R4: GitHub's update-branch / the merge queue rewrite a PR head
+    /// into a merge commit whose parents are the session's head and the default
+    /// branch. That is the same delivery: the canonical head follows it, the CI
+    /// of the NEW head is read, and a red run wakes the parked session with the
+    /// queue-head instructions. A head whose parents are not ours stays closed.
+    struct QueueUpdatedHeadObserver {
+        queue_head: String,
+        known_head: String,
+        same_delivery: bool,
+        checks: Vec<crate::agent::objective::CiCheckState>,
+        ci_heads: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::CanonicalPrObserver for QueueUpdatedHeadObserver {
+        async fn observe(
+            &self,
+            _repo_root: &Path,
+            _pr_number: i64,
+            _pr_url: &str,
+            _expected_head_sha: &str,
+        ) -> anyhow::Result<super::CanonicalPrState> {
+            Ok(super::CanonicalPrState::HeadAdvanced {
+                head_sha: self.queue_head.clone(),
+                queued: true,
+            })
+        }
+
+        async fn observe_updated_head(
+            &self,
+            _repo_root: &Path,
+            _pr_number: i64,
+            known_head_sha: &str,
+            actual_head_sha: &str,
+        ) -> super::UpdatedHeadVerdict {
+            if self.same_delivery
+                && known_head_sha == self.known_head
+                && actual_head_sha == self.queue_head
+            {
+                super::UpdatedHeadVerdict::SameDelivery {
+                    synced_from_default_branch: "main".into(),
+                }
+            } else {
+                super::UpdatedHeadVerdict::Foreign(
+                    "parents do not include the session head".into(),
+                )
+            }
+        }
+
+        async fn observe_ci_checks(
+            &self,
+            _repo_root: &Path,
+            head_sha: &str,
+        ) -> Option<Vec<crate::agent::objective::CiCheckState>> {
+            self.ci_heads.lock().unwrap().push(head_sha.to_string());
+            Some(self.checks.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn m115_a_queue_updated_head_is_the_same_delivery_and_wakes_on_ci_failure() {
+        use crate::agent::objective::DELIVERED_CI_FAILED;
+        for same_delivery in [true, false] {
+            let (_temp, root, _remote, container) = init_repo();
+            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+            crate::agent::objective::ObjectiveStore::new(pool.clone())
+                .create(crate::agent::objective::CreateObjective {
+                    id: "synthetic-m115".into(),
+                    kind: crate::agent::objective::ObjectiveKind::Delivery,
+                    session_id: None,
+                    root_turn_id: None,
+                    domain: crate::agent::objective::RecoveryDomain::Delivery,
+                    requested_acceptance: "merged".into(),
+                    created_surface: "synthetic-test".into(),
+                })
+                .await
+                .unwrap();
+            let workspace = allocate_or_attach(
+                &pool,
+                request_for(&root, &container, "synthetic-m115", "process-a"),
+            )
+            .await
+            .unwrap();
+            let session_head = git(&workspace.worktree_path, &["rev-parse", "HEAD"]);
+            record_open_canonical_pr(&pool, &workspace, 728, "through_merge").await;
+            // The session is parked exactly as the field incident left it.
+            sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', failure_code='delivered_awaiting_ci', next_observation_at=NULL, attention_request_json=NULL")
+                .execute(&pool).await.unwrap();
+            let queue_head = "aacde6dd00000000000000000000000000000000".to_string();
+            let observer = QueueUpdatedHeadObserver {
+                queue_head: queue_head.clone(),
+                known_head: session_head.clone(),
+                same_delivery,
+                checks: vec![ci_state(
+                    "check-rust",
+                    "failure",
+                    Some("test windows_worktree_target_is_shared ... FAILED"),
+                )],
+                ci_heads: std::sync::Mutex::new(Vec::new()),
+            };
+            reconcile_next_poll(&pool, &observer, "m115-observer")
+                .await
+                .unwrap();
+            let (canonical, expected): (Option<String>, String) = sqlx::query_as(
+                "SELECT canonical_head_sha, expected_head_sha FROM delivery_runs WHERE objective_id='synthetic-m115'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let (code, attention): (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT failure_code, attention_request_json FROM objectives WHERE id='synthetic-m115'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if same_delivery {
+                assert_eq!(
+                    canonical.as_deref(),
+                    Some(queue_head.as_str()),
+                    "the canonical head must follow the queue-synced merge commit"
+                );
+                assert_eq!(
+                    expected, session_head,
+                    "R3: the session's own head stays the identity; only the observed head moves"
+                );
+                assert_eq!(
+                    code.as_deref(),
+                    Some(DELIVERED_CI_FAILED),
+                    "a red CI on the new head must wake the session"
+                );
+                let prompt = attention.unwrap_or_default();
+                assert!(
+                    prompt.contains("windows_worktree_target_is_shared"),
+                    "the failing test name must reach the next turn: {prompt}"
+                );
+                assert!(
+                    prompt.contains(&queue_head),
+                    "R3: the wake must name the queue head: {prompt}"
+                );
+                assert!(
+                    prompt.contains("git fetch"),
+                    "R3: the wake must tell the session to fetch the new head: {prompt}"
+                );
+                assert_eq!(
+                    *observer.ci_heads.lock().unwrap(),
+                    vec![queue_head.clone()],
+                    "CI must be read for the advanced head, not the stale one"
+                );
+            } else {
+                assert_eq!(
+                    canonical.as_deref(),
+                    Some(session_head.as_str()),
+                    "a stranger head must not move the canonical head"
+                );
+                assert_ne!(
+                    code.as_deref(),
+                    Some(DELIVERED_CI_FAILED),
+                    "a stranger head must not produce a repair decision"
+                );
+                assert!(
+                    observer.ci_heads.lock().unwrap().is_empty(),
+                    "a stranger head must not be observed for CI"
                 );
             }
         }
