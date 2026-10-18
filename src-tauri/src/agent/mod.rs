@@ -358,7 +358,33 @@ a test fails, you MUST first diagnose:\n\
   to make it pass.\n\
 \n\
 Editing a test purely because it failed, without a stated reason rooted\n\
-in the spec, is a hard failure of the engineering contract.";
+in the spec, is a hard failure of the engineering contract.\n\
+\n\
+# Never leave a wait unwatched\n\
+When you would otherwise wait on something outside this turn — CI, the merge\n\
+queue, a release, a long build or test run, a deploy, a periodic status check\n\
+— put it in the background and keep going. Two tools exist for that:\n\
+`background_task_start` (wakes you with the exit code and output tail when the\n\
+command ends) and `schedule_wakeup` (wakes you after N seconds or every N\n\
+seconds, 60s–6h; `wakeup_list` / `wakeup_cancel` inspect or stop it). Use them\n\
+whenever your own judgement says the wait is long, and whenever the user asks\n\
+you to watch something (\"watch this PR and tell me when it merges\", \"check the\n\
+site every hour\", \"run that test in the background and ping me\"): those\n\
+records carry source `user_requested`, anything you chose yourself carries\n\
+`agent_decided`. When the user asked, say in your reply what you created and\n\
+how to stop it.\n\
+\n\
+After you open a delivery PR, watch its CI in the background (`gh pr checks\n\
+<n> --watch`, or a polling script with an interval of at least 180s so you do\n\
+not burn the GitHub API budget). When you are woken: failures -> fix and push;\n\
+a trust-root-only self-modification -> say you are waiting for the orchestrator\n\
+to lift the gate; all green -> apply `merge-queue: armed`.\n\
+\n\
+Before you end a turn while something outside is still in flight (CI, merge\n\
+queue, release), there must already be a background task or a scheduled\n\
+wakeup that will call you back; if there is none, create one first. This rule\n\
+governs your own next step only: act on it silently, in plain operational\n\
+language, and never show internal gate vocabulary to the user.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SYSTEM_PROMPT_AUTONOMOUS — used by subagents executing approved tasks.
@@ -436,7 +462,28 @@ Anything less is a contract violation — the parent scheduler will\n\
 catch it and respawn you with a 'previous attempt incomplete' brief.\n\
 \n\
 You can communicate as engineer-to-engineer in your reasoning, but\n\
-prose without verification is wasted tokens. Verify, then summarize.";
+prose without verification is wasted tokens. Verify, then summarize.\n\
+\n\
+# Never leave a wait unwatched\n\
+Waits happen inside a delivered task too: CI, the merge queue, a release, a\n\
+long build or test run, a deploy, a periodic status check. Put them in the\n\
+background instead of blocking: `background_task_start` wakes you with the\n\
+exit code and output tail when the command ends; `schedule_wakeup` wakes you\n\
+after N seconds or every N seconds (60s–6h), and `wakeup_list` /\n\
+`wakeup_cancel` inspect or stop it. Both survive an app restart, and every\n\
+record carries its source: `agent_decided` when you chose it, `user_requested`\n\
+when the user asked.\n\
+\n\
+After you open a delivery PR, watch its CI in the background (`gh pr checks\n\
+<n> --watch`, or polling with an interval of at least 180s to protect the\n\
+GitHub API budget). When woken: failures -> fix and push; trust-root-only\n\
+self-modification -> report that you are waiting for the orchestrator; all\n\
+green -> apply `merge-queue: armed`.\n\
+\n\
+Before you end this run while something outside is still in flight, a\n\
+background task or scheduled wakeup must already be in place to call you\n\
+back. Create one first if there is none, and keep it in operational language\n\
+only.";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SYSTEM_PROMPT_EXECUTE — one chat turn when the user wants action now:
@@ -489,7 +536,29 @@ implement, change, publish, deploy, or otherwise act now. Carry it out NOW.\n\
    ceiling (commit -> push -> PR -> CI -> merge -> release). A green build\n\
    without delivery is not done; narrating the missing PR instead of opening\n\
    it is the exact failure this rule exists to prevent. The tool is idempotent\n\
-   and commits only real source files.";
+   and commits only real source files.\n\
+\n\
+# Never leave a wait unwatched\n\
+Waits beyond this turn — CI, the merge queue, a release, a long build, a long\n\
+test run, a deploy, a periodic status check — belong in the background, not in\n\
+a spin. `background_task_start` wakes you with the exit code and output tail\n\
+when the command ends; `schedule_wakeup` wakes you after N seconds or every N\n\
+seconds (60s–6h), with `wakeup_list` / `wakeup_cancel` to inspect or stop it.\n\
+Use them on your own judgement, and whenever the user asks you to watch\n\
+something: those records carry source `user_requested`, anything you chose\n\
+yourself carries `agent_decided`, and your reply says what you created and how\n\
+to stop it.\n\
+\n\
+After you open a delivery PR, watch its CI in the background (`gh pr checks\n\
+<n> --watch`, or polling with an interval of at least 180s for the GitHub API\n\
+budget). When woken: failures -> fix and push; trust-root-only\n\
+self-modification -> state that you are waiting for the orchestrator; all\n\
+green -> apply `merge-queue: armed`.\n\
+\n\
+Before you end this turn while something outside is still in flight, a\n\
+background task or scheduled wakeup must already be in place to call you back.\n\
+Create one first if there is none — silently, in operational language, without\n\
+internal gate vocabulary.";
 
 const STRUCTURED_EXECUTION_ROUTE_PROMPT: &str = "\
 \n\n# Structured execution route\n\
@@ -4575,6 +4644,48 @@ mod tests {
                 "Denied by shell safety policy: matches permanent deny 'shutdown'".into()
             )
         );
+    }
+
+    #[test]
+    fn every_system_prompt_teaches_background_waits_and_the_ci_watch_rule() {
+        for (name, prompt) in [
+            ("interactive", SYSTEM_PROMPT),
+            ("execute", SYSTEM_PROMPT_EXECUTE),
+            ("autonomous", SYSTEM_PROMPT_AUTONOMOUS),
+        ] {
+            for anchor in [
+                "Never leave a wait unwatched",
+                "background_task_start",
+                "schedule_wakeup",
+                "wakeup_cancel",
+                "gh pr checks",
+                "merge-queue: armed",
+                "agent_decided",
+                "user_requested",
+            ] {
+                assert!(prompt.contains(anchor), "{name} prompt missing {anchor}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_in_repo_task_template_carries_the_same_wait_rules() {
+        let template = include_str!("../../../docs/agent-task-template.md");
+        for anchor in [
+            "background_task_start",
+            "schedule_wakeup",
+            "wakeup_cancel",
+            "gh pr checks",
+            "merge-queue: armed",
+            "agent_decided",
+            "user_requested",
+            "180",
+        ] {
+            assert!(
+                template.contains(anchor),
+                "docs/agent-task-template.md missing {anchor}"
+            );
+        }
     }
 
     #[test]

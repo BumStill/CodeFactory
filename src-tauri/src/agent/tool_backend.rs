@@ -384,7 +384,7 @@ fn desktop_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (Strin
         // defaults to Mutation until it receives an audited typed classifier.
         "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" | "read_pptx"
         | "skill_list" | "skill_search" | "read_xlsx" | "background_task_list"
-        | "background_task_output" => ToolKind::ReadOnly,
+        | "background_task_output" | "wakeup_list" => ToolKind::ReadOnly,
         _ => ToolKind::Mutation,
     };
     (command, kind)
@@ -3660,6 +3660,10 @@ mod tests {
             // `background_task_stop` stay Mutation, so they still need approval.
             "background_task_list",
             "background_task_output",
+            // CF-BG R2: listing scheduled wakeups only reads THIS session's rows.
+            // `schedule_wakeup` / `wakeup_cancel` create/cancel a timer, so they
+            // stay Mutation and keep going through approval.
+            "wakeup_list",
         ];
         for definition in crate::tools::all_definitions() {
             let name = definition.function.name;

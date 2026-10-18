@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod bash;
 pub mod background_task;
+pub mod wakeup;
 pub mod browser_session;
 pub mod delegate_tasks;
 pub mod delivery;
@@ -187,6 +188,9 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         background_task::list_definition(),
         background_task::output_definition(),
         background_task::stop_definition(),
+        wakeup::schedule_definition(),
+        wakeup::list_definition(),
+        wakeup::cancel_definition(),
         browser_session::definition(),
         pptx::definition(),
         pptx_edit::read_definition(),
@@ -222,6 +226,9 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "background_task_list" => background_task::execute_list(args, ctx).await,
         "background_task_output" => background_task::execute_output(args, ctx).await,
         "background_task_stop" => background_task::execute_stop(args, ctx).await,
+        "schedule_wakeup" => wakeup::execute_schedule(args, ctx).await,
+        "wakeup_list" => wakeup::execute_list(args, ctx).await,
+        "wakeup_cancel" => wakeup::execute_cancel(args, ctx).await,
         "browser_session" => browser_session::execute(args, ctx).await,
         "write_pptx" => pptx::execute(args, ctx).await,
         "read_pptx" => pptx_edit::execute_read(args, ctx).await,
