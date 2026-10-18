@@ -2657,6 +2657,9 @@ impl ToolBackend for DesktopToolBackend {
         } else {
             match crate::tools::dispatch(&call.function.name, args.clone(), &exec_ctx).await {
                 Ok(output) => output,
+                Err(crate::errors::AppError::ToolArgument(message)) => {
+                    crate::tools::ToolOutput::err(message)
+                }
                 Err(error) => {
                     if let Some(receipt_id) = receipt_id.as_deref() {
                         self.settle_mutation_receipt(receipt_id, None, ctx).await?;
@@ -3340,6 +3343,27 @@ mod tests {
                 arguments: "{}".into(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn m117_delivery_argument_error_allows_next_backend_call_without_recovery() {
+        let backend = objective_backend(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = objective_ctx(dir.path());
+        let before: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(attempt_index), 0) FROM objective_remediations WHERE objective_id=?")
+            .bind(TEST_OBJECTIVE_ID).fetch_one(&backend.db).await.unwrap();
+        let args = serde_json::json!({"ceiling":"invalid"});
+        let call = call_with_args("m117-invalid", "deliver_changes", &args);
+        register_tool_call(&backend, &call, &args).await;
+        let result = backend.execute(&call, &args, &ctx).await.expect("ordinary tool result");
+        assert!(result.is_error && result.content.contains("无效 ceiling"), "{}", result.content);
+        let read_args = serde_json::json!({"path":"fixture.txt"});
+        tokio::fs::write(dir.path().join("fixture.txt"), "next round works").await.unwrap();
+        let result = backend.execute(&call_with_args("m117-next", "read_file", &read_args), &read_args, &ctx).await.unwrap();
+        assert!(!result.is_error && result.content.contains("next round works"));
+        let after: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(attempt_index), 0) FROM objective_remediations WHERE objective_id=?")
+            .bind(TEST_OBJECTIVE_ID).fetch_one(&backend.db).await.unwrap();
+        assert_eq!(before, after, "argument errors must not spend objective recovery budget");
     }
 
     #[tokio::test]
