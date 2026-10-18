@@ -5143,8 +5143,10 @@ impl ObjectiveStore {
                     if previous.len() == 2 && previous.iter().all(|signature| signature == &decision.failure_signature) {
                         decision.status = ObjectiveStatus::Failed;
                         decision.decision_type = DecisionType::FailedInternal;
+                        decision.failure_code = Some(TECHNICAL_RECOVERY_EXHAUSTED.into());
+                        decision.request_key = None;
                         decision.remediation_id = None;
-                        decision.recovery_owner = None;
+                        decision.recovery_owner = Some(OBJECTIVE_INCIDENT_CONTROLLER.into());
                         decision.next_observation_at = None;
                         decision.next_action_authorized = false;
                         decision.requires_user_action = false;
@@ -5559,7 +5561,16 @@ impl ObjectiveStore {
         // before the transaction opens — the pool may allow a single
         // connection, and the report reads the real workspace on disk.
         let failure_summary_message = if decision.is_parked_system_incident() {
-            self.build_failure_summary(&current, &decision).await
+            let thin = if let Some(session) = current.session_id.as_deref() {
+                super::thin::is_thin(&self.pool, session).await
+            } else { false };
+            if thin {
+                Some(format!("已结束：连续三次遇到相同失败。已尝试读取现场并重新执行；最后错误：{}。成果与命令记录保留在本会话及任务工作区 {}。",
+                    current.failure_code.as_deref().unwrap_or("执行失败"),
+                    "（见本会话项目目录与工具输出）"))
+            } else {
+                self.build_failure_summary(&current, &decision).await
+            }
         } else {
             None
         }
@@ -16027,6 +16038,27 @@ CREATE TABLE objectives (
     }
 
     // ── CF-TRUTH: the session state must be true after delivery ─────────────
+
+    #[tokio::test]
+    async fn thin_three_identical_failures_end_with_summary_without_legacy_budget() {
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'legacy'").execute(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "thin-failures").await;
+        sqlx::query("INSERT INTO sessions VALUES (?, 'synthetic', '.', 'synthetic', 0, 0, 'thin')")
+            .bind(current.session_id.as_deref().unwrap()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state (root_turn_id,session_id,status,objective_id) VALUES (?,?,'working',?)")
+            .bind(current.root_turn_id.as_deref().unwrap()).bind(current.session_id.as_deref().unwrap()).bind(&current.id)
+            .execute(&pool).await.unwrap();
+        for round in 1..=3 {
+            current = route_technical_failure(&store, &current, "adapter_error", "sha256:same-thin-failure").await;
+            assert_eq!(current.status, if round == 3 { ObjectiveStatus::Failed } else { ObjectiveStatus::WaitingSystem });
+        }
+        let summary: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant'")
+            .bind(current.session_id.as_deref().unwrap()).fetch_one(&pool).await.unwrap();
+        assert!(summary > 0, "thin terminal must explain attempts and artifact location");
+    }
 
     /// Synthetic chat Objective on the completion-gate route, already parked in
     /// a system wait with a burned signature budget.

@@ -26,6 +26,29 @@
 - 推送、PR、合并、发版之外不新增任何「拿不准就停」的检查。合成 fixture，不写生产 DB。授权交付（ceiling: merged）。
 
 ## Implementation Notes
-- 本文以上逐字保留任务规格。切换与回退入口将在实现后记录于本节，不改变需求含义。
+- 开关位于 `sessions.delivery_mode`：迁移的默认值是 `legacy`，两个新建会话入口显式写入 `thin`；匿名会话不创建任务行。回退：任务停止后将该任务的 `sessions.delivery_mode` 改为 `legacy`，重启后走原路径，不删除薄映射或旧表；不要在运行中的任务切换模式。
+- 接手自会话 2ceb489c 的分支；本分支取代原 WIP 分支，不向原分支推送。
+- 本次不调用 delegate_tasks：按任务模板要求单执行流；context scope 为任务规格、WIP 与 thin 分流；assumptions 为保留旧 schema/状态承载兼容；review point 为外部写入幂等和旧恢复隔离；validation result 见下表。
+
+## Requirements Traceability / 自验记录
+| Req | 实现及证据 | 结果 |
+| --- | --- | --- |
+| R1 | `migration_keeps_old_rows_legacy_and_accepts_explicit_thin`；新会话入口显式 thin | 通过 |
+| R2 | `pushed_then_interrupted_resumes_without_repush_or_duplicate_pr`、`existing_pr_and_label_are_reused_while_ci_returns_immediately`、`label_failure_returns_error_never_merges`、`merged_same_head_is_delivered_without_new_pr_or_label` | 通过；最后一项在修复前见失败 |
+| R3 | `resumed_bash_always_has_system_prompt_for_success_failure_unknown`；resume_chat_objective 装配系统提示；provider owner 在 thin 下返回 None | 单元通过；完整重启真机路径待编排验收 |
+| R4 | `thin_three_identical_failures_end_with_summary_without_legacy_budget` | 先失败后通过；三次结束、保留说明与成果指引 |
+| R5 | `external_wait_tracks_forge_not_mapping_existence` 与现有 background_tasks 的 session-owned wake tests | 通过；完成前只查询一次 forge，不以映射存在代替 pending |
+| R6 | tool metadata 与 tracing 中记录 gh_calls、steps、失败信息；completion_observe 单次计数 | 已实现，真机会话日志待编排验收 |
+| R7 | Rust workspace 全测；前端 152 文件、1,016 测试；pnpm build | 通过 |
+| R8 | 旧代码保留；`thin_mutation_dispatches_without_any_receipt_even_with_unknown_legacy_effect` | 通过 |
+
+## 编排方发版后真实应用验收
+1. 新建任务，核对 delivery_mode=thin；历史任务仍为 legacy。
+2. bash 成功/失败/未知时重启，确认系统提示出现、会话自动继续，不出现「无法确认」终态。
+3. 推送后中断，恢复时核对远端 head 与 PR 号不重复；CI 未结束时工具立即返回且后台监视存在。
+4. 打标失败必须返回错误，不能直接合并；合并后再次执行不得开第二个同 head PR。
+5. 同类错误连续三次后核对「已结束」说明及成果位置。
+6. 连续十个新任务记录人工介入次数（≤1）、无重复推送/PR，以及 GitHub REST ≤600/h；这些指标不以本地单测替代。
+
 - Applicable Harnesses：Spec、Compatibility（旧任务/数据库）、Observation（调用计数）、Release（只交付至合并）、Payload（工具命令）、AI Collaboration。
 - 真机验收由编排方发版安装后执行；本任务不发版，不操作生产数据库。

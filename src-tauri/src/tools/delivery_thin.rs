@@ -60,9 +60,16 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
         log.step("push", "pushed");
     } else { log.step("push", "unchanged"); }
     let body = args.get("body").and_then(Value::as_str).unwrap_or("");
-    let listed = log.gh(commands, &["pr", "list", "--head", &branch, "--state", "open", "--json", "number,url,title,body"])?;
+    let listed = log.gh(commands, &["pr", "list", "--head", &branch, "--state", "all", "--json", "number,url,title,body,state,headRefOid"])?;
     let prs: Vec<Value> = serde_json::from_str(&listed).map_err(|e| e.to_string())?;
-    let pr = if let Some(pr) = prs.first() {
+    let existing = prs.iter().find(|pr| pr["state"] == "OPEN")
+        .or_else(|| prs.iter().find(|pr| pr["state"] == "MERGED" && pr["headRefOid"].as_str() == Some(sha.as_str())));
+    if let Some(pr) = existing.filter(|pr| pr["state"] == "MERGED") {
+        log.pr_number = pr["number"].as_u64();
+        log.step("pr", "already merged");
+        return Ok(json!({"state":"delivered", "pr_url":pr["url"], "pr_number":pr["number"], "branch":branch, "commit_sha":sha}));
+    }
+    let pr = if let Some(pr) = existing {
         let number = pr["number"].as_u64().ok_or("PR number missing")?.to_string();
         if pr["title"].as_str() != Some(title.as_str()) || pr["body"].as_str() != Some(body) {
             log.gh(commands, &["pr", "edit", &number, "--title", &title, "--body", body])?;
@@ -102,7 +109,11 @@ pub(super) async fn execute(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeilin
     }
     let mut metadata = json!({"delivery_mode":"thin","gh_calls":log.gh_calls,"steps":log.steps});
     let output = match result {
-        Ok(value) => { metadata["delivery"] = value.clone(); ToolOutput::waiting(value.to_string()) }
+        Ok(value) => {
+            metadata["delivery"] = value.clone();
+            if value["state"] == "waiting" { ToolOutput::waiting(value.to_string()) }
+            else { ToolOutput::ok(value.to_string()) }
+        }
         Err(error) => { metadata["error"] = json!(error); ToolOutput::err(error) }
     };
     tracing::info!(session_id=?ctx.session_id, evidence=%metadata, "thin_delivery");
@@ -113,7 +124,7 @@ pub(super) async fn execute(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeilin
 mod tests {
     use super::*;
     #[derive(Default)]
-    struct Forge { pushed: bool, pr: bool, armed: bool, fail_label: bool, pushes: usize, creates: usize, merges: usize }
+    struct Forge { pushed: bool, pr: bool, armed: bool, fail_label: bool, merged: bool, pushes: usize, creates: usize, merges: usize }
     impl Commands for Forge {
         fn stage(&mut self, _: &[String]) -> Result<Vec<String>,String> { Ok(vec![]) }
         fn git(&mut self, a: &[&str]) -> Result<String,String> {
@@ -125,7 +136,7 @@ mod tests {
             })
         }
         fn gh(&mut self, a: &[&str]) -> Result<String,String> {
-            let pr = json!({"number":42,"url":"https://forge.invalid/pr/42","title":"fix: thin","body":"synthetic"});
+            let pr = json!({"number":42,"url":"https://forge.invalid/pr/42","title":"fix: thin","body":"synthetic","state":if self.merged {"MERGED"} else {"OPEN"},"headRefOid":"abc123"});
             match a[1] {
                 "list" => Ok(if self.pr {json!([pr])} else {json!([])}.to_string()),
                 "create" => {self.pr=true; self.creates+=1; Ok(String::new())},
@@ -162,6 +173,13 @@ mod tests {
         assert_eq!(result["state"], "waiting");
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!((forge.pushes,forge.creates,forge.merges), (0,0,0));
+    }
+    #[test]
+    fn merged_same_head_is_delivered_without_new_pr_or_label() {
+        let mut forge = Forge { pushed:true, pr:true, merged:true, fail_label:true, ..Default::default() };
+        let result = deliver(&mut forge).unwrap();
+        assert_eq!(result["state"], "delivered");
+        assert_eq!((forge.pushes, forge.creates, forge.merges), (0,0,0));
     }
     #[test]
     fn label_failure_returns_error_never_merges() {
