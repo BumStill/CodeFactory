@@ -295,8 +295,13 @@ jobs:
           # new releasable fix, retrying the old source can never exercise that
           # fix. Keep the failed tag as an auditable tombstone and let the
           # normal planner cut the next patch from the current exact main.
+          # `force` is the operator's explicit "cut from current main" — the
+          # same override the planner below honours. Without it, a failed tag
+          # followed only by a ci/chore repair (the v1.88.21 release-gate fix,
+          # 2026-10-18) was retried from the old source forever.
           if [ "$RUN_CONCLUSION" = "failure" ]; then
-            FIX_PLAN=$(python3 tools/release/plan_release.py --range "$TAG..HEAD")
+            FIX_PLAN=$(python3 tools/release/plan_release.py --range "$TAG..HEAD" \
+              --force "${{ github.event.inputs.force || 'false' }}")
             if [ "$(jq -r '.skip' <<< "$FIX_PLAN")" = "false" ]; then
               echo "Release $TAG failed and main contains a releasable fix; continuing with a new immutable patch tag"
               echo "abandoned_tag=$TAG" >> "$GITHUB_OUTPUT"
