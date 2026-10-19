@@ -3049,6 +3049,7 @@ mod tests {
     async fn begin_write_waits_for_a_contended_writer_instead_of_failing() {
         let (pool, root) = temp_file_pool().await;
 
+        let (holding, holds_lock) = tokio::sync::oneshot::channel();
         let holder_pool = pool.clone();
         let holder = tokio::spawn(async move {
             let mut tx = holder_pool.begin().await.unwrap();
@@ -3056,27 +3057,39 @@ mod tests {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            // The write lock is held from here until `commit` releases it.
+            holding.send(()).unwrap();
             tokio::time::sleep(Duration::from_millis(300)).await;
             tx.commit().await.unwrap();
+            std::time::Instant::now()
         });
-        tokio::time::sleep(Duration::from_millis(40)).await;
 
-        let started = std::time::Instant::now();
+        // Never guess how quickly the spawned holder gets scheduled: wait until
+        // it really holds the write lock. A fixed sleep turns a scheduler stall
+        // into a coin flip about who wins the race, which is what made this
+        // test fail intermittently on a loaded runtime.
+        holds_lock
+            .await
+            .expect("the holder must report when it holds the write lock");
+
         let mut tx = begin_write(&pool)
             .await
             .expect("a busy-but-live writer must not surface as an error");
-        let waited = started.elapsed();
+        let acquired = std::time::Instant::now();
+        let released = holder.await.expect("the holder must not panic");
+
+        // Lock ordering, not a guessed millisecond window: the second writer can
+        // only acquire once the holder's commit released the lock, never before.
+        assert!(
+            acquired >= released,
+            "the second writer acquired the write lock while the holder still held it"
+        );
         sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
             .execute(&mut *tx)
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        holder.await.unwrap();
 
-        assert!(
-            waited >= Duration::from_millis(150),
-            "the second writer must have waited for the lock, waited only {waited:?}"
-        );
         assert_eq!(counter(&pool).await, 2, "both writes must land");
         pool.close().await;
         let _ = std::fs::remove_dir_all(&root);

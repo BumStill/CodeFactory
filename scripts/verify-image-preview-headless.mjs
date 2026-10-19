@@ -9,6 +9,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -68,8 +69,10 @@ async function main() {
     await waitForServer(vite);
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox"] });
     const page = await browser.newPage({ viewport: { width: 960, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-    await page.getByRole("main", { name: "Image preview acceptance" }).waitFor({ timeout: 10_000 });
+    await gotoScenario(page, baseUrl, {
+      landmark: page.getByRole("main", { name: "Image preview acceptance" }),
+      label: "image preview acceptance shell",
+    });
 
     const transcriptImage = page.getByRole("img", { name: "IMG_6190.png" }).first();
     await transcriptImage.waitFor({ timeout: 10_000 });

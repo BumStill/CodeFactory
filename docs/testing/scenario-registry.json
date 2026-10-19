@@ -404,6 +404,17 @@
       "automated_by": ["path:src/components/ModelPicker.test.tsx", "path:src/lib/chatgptModels.test.ts", "path:src/stores/chatgptCatalog.freshness.test.ts"],
       "required_evidence": ["L0"],
       "gates": ["pull_request"]
+    },
+    {
+      "id": "DAT-001",
+      "name": "SQLite 写锁争用：第二个写者等待而非失败，且不早于释放取得锁",
+      "category": "runtime_lifecycle",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": ["src-tauri/src/storage/db.rs"],
+      "automated_by": ["rust:begin_write_waits_for_a_contended_writer_instead_of_failing"],
+      "required_evidence": ["L1"],
+      "gates": ["pull_request"]
     }
   ],
   "complex_e2e_cases": [

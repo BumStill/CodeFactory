@@ -21,6 +21,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -219,22 +220,12 @@ async function main() {
       // A short viewport is deliberate: the start page is taller than the
       // column, so an inherited offset is visible rather than clamped away.
       const page = await browser.newPage({ viewport: { width: 900, height: 560 } });
-      const pageErrors = [];
-      page.on("pageerror", (error) => pageErrors.push(String(error).split("\n")[0]));
-      page.on("console", (message) => {
-        if (message.type() === "error") pageErrors.push(`console: ${message.text().slice(0, 300)}`);
+      // gotoScenario's observePage captures pageerror/console/requestfailed and
+      // prints them with the timeout, so this page no longer keeps its own copy.
+      await gotoScenario(page, pageUrl, {
+        landmark: page.getByRole("main", { name: "New session start acceptance" }),
+        label: `${entry.key}: the acceptance page did not render`,
       });
-      page.on("requestfailed", (request) => {
-        pageErrors.push(`requestfailed: ${request.url().slice(0, 160)} (${request.failure()?.errorText ?? "unknown"})`);
-      });
-      await page.goto(pageUrl, { waitUntil: "domcontentloaded" });
-      try {
-        await page.getByRole("main", { name: "New session start acceptance" }).waitFor({ timeout: 10_000 });
-      } catch {
-        throw new Error(
-          `${entry.key}: the acceptance page did not render — ${pageErrors.join(" | ") || "no page error reported"}`,
-        );
-      }
       await page.getByRole("textbox", { name: "消息输入" }).waitFor({ timeout: 10_000 });
 
       const layout = await runEntryPath(page, entry);

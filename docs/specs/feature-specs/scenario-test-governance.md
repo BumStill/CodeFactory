@@ -95,7 +95,7 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 ## 分类
 
 <!-- scenario-registry-summary:start -->
-- 逻辑 Scenario：`28`（P0 `14`，P1 `14`，P2 `0`）
+- 逻辑 Scenario：`29`（P0 `14`，P1 `15`，P2 `0`）
 - Complex E2E：`11`（implemented `0`，partially_implemented `11`，designed `0`）
 - 剩余自动化缺口：`24`
 - PR slice：implemented `11`，partially_implemented `0`，missing `0`
@@ -110,7 +110,7 @@ Complex E2E Case 是多个 Scenario 的组合旅程。它必须定义：
 | 内容输入与呈现 (`content_rendering`) | 2 | 0 | 2 | 0 |
 | 权限与安全 (`permission_safety`) | 1 | 0 | 1 | 0 |
 | 能力演进与用量 (`capability_usage`) | 2 | 0 | 2 | 0 |
-| 运行时资源生命周期 (`runtime_lifecycle`) | 4 | 4 | 0 | 0 |
+| 运行时资源生命周期 (`runtime_lifecycle`) | 5 | 4 | 1 | 0 |
 | Skill 安装、审核与运行生命周期 (`skill_lifecycle`) | 3 | 3 | 0 | 0 |
 <!-- scenario-registry-categories:end -->
 

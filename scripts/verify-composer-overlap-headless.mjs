@@ -16,7 +16,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
-import { allocateLoopbackPort, waitForAcceptanceDocument, waitForStableAnimationFrames } from "./headless-acceptance-support.mjs";
+import { allocateLoopbackPort, gotoScenario, waitForAcceptanceDocument, waitForStableAnimationFrames } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -128,8 +128,10 @@ async function main() {
     // compensate. The vacuity assertion below enforces both.
     for (const viewport of [{ width: 900, height: 420 }, { width: 1280, height: 380 }]) {
       const page = await browser.newPage({ viewport });
-      await page.goto(baseUrl, { waitUntil: "networkidle" });
-      await page.getByRole("main", { name: "Composer overlap acceptance" }).waitFor({ timeout: 10_000 });
+      await gotoScenario(page, baseUrl, {
+        landmark: page.getByRole("main", { name: "Composer overlap acceptance" }),
+        label: "composer overlap acceptance shell",
+      });
       await page.getByRole("textbox", { name: "消息输入" }).waitFor({ timeout: 10_000 });
       await waitForStableAnimationFrames(page);
       const layout = await page.evaluate(probeLayout);

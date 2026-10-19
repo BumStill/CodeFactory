@@ -18,6 +18,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium } from "playwright-core";
+import { waitForAppBoot } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const artifactDir =
@@ -178,7 +179,9 @@ async function main() {
     });
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
     try {
-      await page.getByLabel("Session title acceptance").waitFor({ timeout: 10_000 });
+      await waitForAppBoot(page, page.getByLabel("Session title acceptance"), {
+        label: "session title acceptance shell",
+      });
       await page.locator('span[title$="· 双击重命名"]').first().waitFor({ timeout: 10_000 });
     } catch {
       throw new Error(

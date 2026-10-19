@@ -15,6 +15,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const entry = path.join(root, "src", "acceptance", "enter-steer.tsx");
@@ -193,8 +194,10 @@ async function main() {
 
     for (const theme of ["dark", "light"]) {
       const page = await browser.newPage({ viewport: { width: 1366, height: 768 } });
-      await page.goto(baseUrl, { waitUntil: "networkidle" });
-      await page.getByRole("main", { name: "Enter steering acceptance" }).waitFor({ timeout: 10_000 });
+      await gotoScenario(page, baseUrl, {
+        landmark: page.getByRole("main", { name: "Enter steering acceptance" }),
+        label: `enter steering acceptance shell (${theme})`,
+      });
       await page.getByLabel("切换主题").click();
       const applied = await page.evaluate(() => document.documentElement.dataset.theme);
       assert(applied === "light", `theme toggle must apply before assertion; got ${applied}`);
