@@ -9,7 +9,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
-import { allocateLoopbackPort, waitForAcceptanceDocument, waitForStableAnimationFrames } from "./headless-acceptance-support.mjs";
+import { allocateLoopbackPort, gotoScenario, waitForAcceptanceDocument, waitForStableAnimationFrames } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -89,8 +89,10 @@ async function main() {
     const executablePath = await firstBrowser();
     browser = await chromium.launch({ executablePath, headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-    await page.getByRole("main", { name: "Reconnect banner acceptance" }).waitFor({ timeout: 10_000 });
+    await gotoScenario(page, baseUrl, {
+      landmark: page.getByRole("main", { name: "Reconnect banner acceptance" }),
+      label: "reconnect banner acceptance shell",
+    });
 
     const toolPanel = page.locator("section", { hasText: "Tool command is still running" });
     const modelPanel = page.locator("section", { hasText: "Actually waiting on model transport" });

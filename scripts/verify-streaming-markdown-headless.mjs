@@ -9,6 +9,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -70,9 +71,11 @@ async function stopServer(child) {
 
 async function verifyViewport(page, viewport) {
   await page.setViewportSize(viewport);
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   const main = page.getByRole("main", { name: "Streaming Markdown acceptance" });
-  await main.waitFor({ timeout: 10_000 });
+  await gotoScenario(page, baseUrl, {
+    landmark: main,
+    label: "streaming markdown acceptance shell",
+  });
   await page.getByRole("button", { name: "模拟工具与后续文本" }).click();
 
   const firstStep = page.locator("[data-segment='step']").first();

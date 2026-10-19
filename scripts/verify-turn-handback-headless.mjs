@@ -12,6 +12,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -90,8 +91,10 @@ async function main() {
     const executablePath = await firstBrowser();
     browser = await chromium.launch({ executablePath, headless: true, args: ["--disable-gpu", "--no-sandbox"] });
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "networkidle" });
-    await page.getByRole("main", { name: "Turn terminal convergence acceptance" }).waitFor({ timeout: 10_000 });
+    await gotoScenario(page, baseUrl, {
+      landmark: page.getByRole("main", { name: "Turn terminal convergence acceptance" }),
+      label: "turn terminal convergence acceptance shell",
+    });
 
     const incident = page.getByRole("region", { name: "System-owned incident" });
     const running = page.getByRole("region", { name: "Still running" });

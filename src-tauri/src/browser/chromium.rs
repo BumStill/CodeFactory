@@ -52,6 +52,26 @@ const LAUNCH_WATCHDOG: Duration = Duration::from_secs(75);
 /// Any single page operation. Generous enough for a slow site, short enough
 /// that a wedged page surfaces as an error instead of hanging the turn.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a freshly created page gets to commit and finish its initial
+/// load before `open` reports what it last observed instead of returning an
+/// empty document.
+const PAGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Page creation is a launch-class step, not an operation-class one: it creates
+/// the target and attaches to the first navigation, which on a cold runner is
+/// bounded by the same realities as `LAUNCH_TIMEOUT`. Sharing `OP_TIMEOUT` made
+/// a real cold-runner wait surface as the opaque "browser operation timed out".
+const PAGE_CREATE_TIMEOUT: Duration = Duration::from_secs(60);
+/// One settle probe. Bounded well under `OP_TIMEOUT` so a probe that blocks
+/// while the target swaps execution contexts still leaves room for the next
+/// probe instead of spending the whole operation budget in silence.
+const PAGE_SETTLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Readiness probe; returns JSON so the caller can distinguish "committed but
+/// still loading" from about:blank.
+const PAGE_SETTLE_PROBE: &str = r#"(() => JSON.stringify({
+  state: document.readyState,
+  href: location.href,
+  text: (document.body ? document.body.innerText : "").slice(0, 120)
+}))()"#;
 
 /// The marker every "the browser would not start" message carries.
 ///
@@ -393,6 +413,91 @@ async fn timeout<T, E: std::fmt::Display>(
     }
 }
 
+/// Wait until `page` has committed `requested` and finished its initial load.
+///
+/// Polls `document.readyState` instead of listening for a navigation event:
+/// the event may already have fired by the time this runs, and a missed event
+/// must not hang the caller. `interactive` is accepted only when the body
+/// already has visible text, so an SPA that is still fetching modules is not
+/// reported as ready with an empty document.
+async fn wait_for_document_settled(page: &Page, requested: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + PAGE_SETTLE_TIMEOUT;
+    let mut last = String::from("no observation");
+
+    // Phase 1 — wait for the navigation to commit, using `Target.targetInfo`
+    // only. It needs no execution context, so it cannot block on the context
+    // swap every navigation performs; a `Runtime.evaluate` issued too early
+    // can sit there until its own operation timeout, which on a cold runner
+    // surfaced as an opaque "browser operation timed out".
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Other(format!(
+                "The page did not commit {requested} within {}s: {last}",
+                PAGE_SETTLE_TIMEOUT.as_secs()
+            )));
+        }
+        match tokio::time::timeout(PAGE_SETTLE_PROBE_TIMEOUT, page.url()).await {
+            Ok(Ok(Some(current))) if committed_url(&current) => {
+                last = format!("url={current}");
+                break;
+            }
+            Ok(Ok(current)) => last = format!("url={}", current.unwrap_or_default()),
+            Ok(Err(error)) => last = format!("url probe failed: {error}"),
+            Err(_) => {
+                last = format!("url probe silent for {}ms", PAGE_SETTLE_PROBE_TIMEOUT.as_millis())
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Phase 2 — wait for the document itself. Each probe is bounded so that a
+    // single one cannot spend the remaining budget in silence.
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Other(format!(
+                "The page did not settle on {requested} within {}s: {last}",
+                PAGE_SETTLE_TIMEOUT.as_secs()
+            )));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let probe_budget = remaining.min(PAGE_SETTLE_PROBE_TIMEOUT);
+        match tokio::time::timeout(
+            probe_budget,
+            ChromiumDriver::eval_with_script(page, PAGE_SETTLE_PROBE.to_string()),
+        )
+        .await
+        {
+            Ok(Ok(raw)) => {
+                last = raw.clone();
+                if settled_probe(&raw) {
+                    return Ok(());
+                }
+            }
+            Ok(Err(error)) => last = format!("probe failed: {error}"),
+            Err(_) => last = format!("probe silent for {}ms", probe_budget.as_millis()),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A target URL counts as a committed navigation once it names a document.
+fn committed_url(url: &str) -> bool {
+    !url.is_empty() && url != "about:blank"
+}
+
+/// `complete` is ready; `interactive` is ready only once the body has visible
+/// text, so an SPA still fetching modules is not read as an empty page.
+fn settled_probe(raw: &str) -> bool {
+    let Ok(observed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let state = observed["state"].as_str().unwrap_or_default();
+    let href = observed["href"].as_str().unwrap_or_default();
+    let text = observed["text"].as_str().unwrap_or_default();
+    committed_url(href)
+        && (state == "complete" || (state == "interactive" && !text.trim().is_empty()))
+}
+
 #[async_trait]
 impl BrowserDriver for ChromiumDriver {
     async fn open(&self, session_id: &str, url: &str, scope: &ProfileScope) -> Result<PageContent> {
@@ -565,7 +670,19 @@ impl BrowserDriver for ChromiumDriver {
             release_profile(&profile_dir, session_id);
             return Err(error);
         }
-        let page = match timeout(browser.new_page(url)).await {
+        let page = match tokio::time::timeout(PAGE_CREATE_TIMEOUT, browser.new_page("about:blank"))
+            .await
+            .map_err(|_| {
+                AppError::Other(format!(
+                    "Creating a page for {url} timed out after {}s",
+                    PAGE_CREATE_TIMEOUT.as_secs()
+                ))
+            })
+            .and_then(|created| {
+                created.map_err(|error| {
+                    AppError::Other(format!("Creating a page for {url} failed: {error}"))
+                })
+            }) {
             Ok(page) => page,
             Err(error) => {
                 let _ = authorizer.unknown().await;
@@ -587,8 +704,38 @@ impl BrowserDriver for ChromiumDriver {
             profile_dir: profile_dir.clone(),
         };
 
+        // Create the target before issuing navigation. Unlike CreateTarget's
+        // initial URL, goto tracks the navigation through the attached page's
+        // lifecycle, so the old document's `complete` cannot satisfy readiness.
+        let navigation = tokio::time::timeout(OP_TIMEOUT, live.page.goto(url)).await;
+        let navigation_error = match navigation {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(format!("Navigation to {url} failed: {error}")),
+            Err(_) => Some(format!("Navigation to {url} timed out after {}s", OP_TIMEOUT.as_secs())),
+        };
+        if let Some(error) = navigation_error {
+            let _ = authorizer.unknown().await;
+            let _ = teardown(&mut live, session_id).await;
+            return Err(AppError::Other(error));
+        }
+
+        // `Target.createTarget` resolves when the page exists, not when the
+        // requested document has committed and settled. Reading straight after
+        // it can observe a document that is still loading — wide enough on a
+        // cold windows-latest runner to surface as "session exists but no page
+        // content". `open` therefore returns only once the navigation it
+        // started has settled, and says what it last saw when it cannot.
+        if let Err(error) = wait_for_document_settled(&live.page, url).await {
+            let _ = authorizer.unknown().await;
+            let _ = teardown(&mut live, session_id).await;
+            return Err(error);
+        }
+
         let content = match Self::eval_with_script(&live.page, page_script::readable_expression())
             .await
+            .map_err(|error| {
+                AppError::Other(format!("Reading {url} after it settled failed: {error}"))
+            })
             .and_then(|json| {
                 page_script::parse_readable(&json).ok_or_else(|| {
                     AppError::Other("Could not extract readable content from the page".into())
@@ -862,6 +1009,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_uncommitted_target_never_counts_as_settled() {
+        // Phase 1 of the settle wait must not treat a fresh target as a loaded
+        // document: reading it is exactly the empty-page bug this family fixes.
+        assert!(!committed_url(""));
+        assert!(!committed_url("about:blank"));
+        assert!(committed_url("http://127.0.0.1:9/fixture"));
+        // And the readiness probe must never report settled for a commit-less
+        // observation, even when readyState already says `complete`.
+        assert!(!settled_probe(
+            r#"{"state":"complete","href":"about:blank","text":"hi"}"#
+        ));
+        assert!(!settled_probe("not json"));
+    }
+
+    #[test]
+    fn a_loading_document_with_visible_text_is_still_not_settled() {
+        // `interactive` with text is accepted (SPA shell rendered), but
+        // `interactive` with an empty body is not, and neither is `loading`.
+        assert!(settled_probe(
+            r#"{"state":"interactive","href":"http://127.0.0.1:9/","text":"ready"}"#
+        ));
+        assert!(!settled_probe(
+            r#"{"state":"interactive","href":"http://127.0.0.1:9/","text":"   "}"#
+        ));
+        assert!(!settled_probe(
+            r#"{"state":"loading","href":"http://127.0.0.1:9/","text":"ready"}"#
+        ));
+        assert!(settled_probe(
+            r#"{"state":"complete","href":"http://127.0.0.1:9/","text":""}"#
+        ));
+    }
+
+    #[test]
+    fn a_single_probe_cannot_spend_the_whole_settle_budget() {
+        // The Windows CI failure this pins: one probe blocked on the context
+        // swap, consumed the operation timeout, and surfaced as an opaque
+        // "browser operation timed out" instead of a page observation.
+        assert!(PAGE_SETTLE_PROBE_TIMEOUT < PAGE_SETTLE_TIMEOUT);
+        assert!(PAGE_SETTLE_TIMEOUT < OP_TIMEOUT);
+    }
+
+    #[test]
     fn the_crate_default_launch_timeout_never_preempts_ours() {
         // The bug this pins: chromiumoxide's own 20s default fired first and
         // made LAUNCH_TIMEOUT unreachable, so a merely-slow Chrome on a cold CI
@@ -1000,6 +1189,19 @@ mod tests {
         assert!(driver.read("codefactory-nope").await.is_err());
         assert!(driver.snapshot("codefactory-nope").await.is_err());
         assert!(driver.click("codefactory-nope", "ref_1").await.is_err());
+    }
+
+    #[test]
+    fn page_creation_gets_a_launch_class_budget() {
+        // Creating a target is a launch-class action, not an operation: on a cold
+        // runner `Target.createTarget` took over two minutes to answer, so the 30s
+        // operation budget turned a slow start into a hard failure. The two budgets
+        // must stay distinct, and the launch one must stay the larger.
+        assert!(
+            PAGE_CREATE_TIMEOUT > OP_TIMEOUT,
+            "page creation must not inherit the operation budget"
+        );
+        assert_eq!(PAGE_CREATE_TIMEOUT, Duration::from_secs(60));
     }
 
     #[tokio::test]
