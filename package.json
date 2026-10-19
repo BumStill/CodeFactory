@@ -10,7 +10,6 @@
     "cargo:shared": "node scripts/cargo-shared.mjs",
     "test:merge-queue": "node --test scripts/merge-queue.test.mjs",
     "test:cargo-shared": "node --test scripts/cargo-shared.test.mjs",
-    "test:acceptance-readiness": "node --test scripts/headless-acceptance-readiness.test.mjs scripts/headless-acceptance-support.test.mjs",
     "build-cache": "node scripts/build-cache-budget.mjs",
     "build-cache:enforce": "node scripts/build-cache-budget.mjs --enforce",
     "test:build-cache": "node --test scripts/build-cache-budget.test.mjs",

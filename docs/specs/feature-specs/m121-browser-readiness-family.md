@@ -26,19 +26,20 @@
 - 被替换的是**导航后的第一次等待**，语义是"进程启动完成"，不是产品断言。
 - 断言预算仍是 10s；把产品交互也放宽会让"启动慢"掩盖真实的渲染回归。
 - 每次 boot 都记录实测耗时；若某次 boot 真的逼近预算，日志会直接给出数字，而不是再攒一次重跑。
-- 新增静态守卫 `scripts/headless-acceptance-readiness.test.mjs`：`page.goto`/`page.reload` 之后的第一处等待若仍用 10s 常量，测试失败。新脚本必须走 `gotoScenario`/`waitForAppBoot`。
+- 新增静态守卫 `src/acceptance/headlessReadiness.test.ts`：`page.goto`/`page.reload` 之后的第一处等待若仍用 10s 常量，测试失败。新脚本必须走 `gotoScenario`/`waitForAppBoot`。守卫放在 `src/` 下是因为 `pnpm test`（vitest）已经在每个 PR 的前端必需检查里执行它，不需要改动受信根工作流。
 
 ## 3. 覆盖范围
 
 - `scripts/headless-acceptance-support.mjs`：新增 `observePage` / `describePageState` / `waitForAppBoot` / `gotoScenario` / `APP_BOOT_BUDGET_MS` / `ASSERTION_BUDGET_MS`。
+- `src/acceptance/headlessReadiness.test.ts`：预算归属、诊断输出、家族守卫（由 `pnpm test` 自动执行）。
 - 19 处 boot 等待改为共享 helper，涉及 15 个验收脚本（含本 family 点名的 startup-session、turn-handback）。
 - `src-tauri/src/browser/chromium.rs`：`open` 读取前等待导航提交。
 - `src-tauri/src/tools/browser_session.rs`：延迟 body 的确定性复现测试。
-- `.github/workflows/scenario-execution.yml`：`execute-windows-soak`（标签触发，×5）。
+- 重复验证不放工作流改动：`.github/workflows/*` 属于受信 scenario gate 根，普通 PR 自改会被 `scenario-gate-pr` 拒绝（本次已验证该拒绝生效）。因此 R4 的重复证据通过在同一 PR 上多次重跑 `execute-windows`（每次都是全新冷 runner）取得，而不是新增 job。
 
 ## 4. 验收
 
 1. `node --test scripts/headless-acceptance-readiness.test.mjs` — helper 语义 + 家族守卫。
 2. `cargo test browser_open_waits_for_the_navigation` — 修复前失败、修复后通过。
-3. Windows 上 `flake-soak` ×5 全绿（PR 内证据）。
+3. 同一 PR 上 `execute-windows` 连续多次重跑全绿（每次冷 runner，PR 内证据）。
 4. `verify-startup-session-headless.mjs`、`verify-turn-handback-headless.mjs` 在本机真实浏览器跑通，boot 耗时出现在日志里。

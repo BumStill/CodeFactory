@@ -116,12 +116,6 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:cargo-shared
 
-      # M121: boot budget vs assertion budget, and the family rule that a
-      # fresh navigation is never gated on the 10s assertion budget.
-      - name: Acceptance readiness contract
-        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
-        run: pnpm test:acceptance-readiness
-
       - name: README contract
         if: ${{ !cancelled() }}
         env:
