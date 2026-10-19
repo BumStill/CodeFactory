@@ -1028,6 +1028,17 @@ impl DecisionEnvelope {
             && !self.requires_user_action
     }
 
+    fn is_parked_wake_wait(&self) -> bool {
+        self.status == ObjectiveStatus::WaitingSystem
+            && self.decision_type == DecisionType::Waiting
+            && self.failure_code.as_deref() == Some("thin_waiting_for_wake")
+            && self.recovery_owner.as_deref() == Some("background_tasks")
+            && self.remediation_id.is_none()
+            && self.next_observation_at.is_none()
+            && self.failure_signature.is_none()
+            && !self.requires_user_action
+    }
+
     fn validate(&self, objective: &ObjectiveSnapshot) -> anyhow::Result<()> {
         if self.objective_id != objective.id || self.revision != objective.revision + 1 {
             bail!("objective decision revision/identity mismatch");
@@ -1053,6 +1064,7 @@ impl DecisionEnvelope {
         if self.status == ObjectiveStatus::WaitingSystem
             && !self.is_parked_system_incident()
             && !self.is_parked_delivery_wait()
+            && !self.is_parked_wake_wait()
             && (self
                 .recovery_owner
                 .as_deref()
@@ -5137,6 +5149,19 @@ impl ObjectiveStore {
             .bind(&decision.objective_id).fetch_optional(&self.pool).await?.flatten();
         if let Some(session) = session {
             if super::thin::is_thin(&self.pool, &session).await {
+                if decision.failure_code.as_deref() == Some(COMPLETION_EVIDENCE_INCOMPLETE) {
+                    if super::background_tasks::wake_source_cover(&self.pool, &session).await.is_covered() {
+                        decision.failure_code = Some("thin_waiting_for_wake".into());
+                        decision.failure_signature = None;
+                        decision.decision_type = DecisionType::Waiting;
+                        decision.recovery_owner = Some("background_tasks".into());
+                        decision.remediation_id = None;
+                        decision.next_observation_at = None;
+                        decision.next_action_authorized = false;
+                    }
+                    // A missing-monitor reminder is not a technical failure either.
+                    return Ok(decision);
+                }
                 if decision.failure_signature.is_some() && decision.status == ObjectiveStatus::WaitingSystem {
                     let previous: Vec<Option<String>> = sqlx::query_scalar("SELECT failure_signature FROM objective_decisions WHERE objective_id=? ORDER BY revision DESC LIMIT 2")
                         .bind(&decision.objective_id).fetch_all(&self.pool).await?;
@@ -6946,6 +6971,7 @@ impl ObjectiveStore {
         if decision.status == ObjectiveStatus::WaitingSystem
             && !decision.is_parked_system_incident()
             && !decision.is_parked_delivery_wait()
+            && !decision.is_parked_wake_wait()
             && !decision.transport_probe_wait
         {
             let strategy = if decision.domain == RecoveryDomain::Update
@@ -16038,6 +16064,56 @@ CREATE TABLE objectives (
     }
 
     // ── CF-TRUTH: the session state must be true after delivery ─────────────
+
+    #[tokio::test]
+    async fn thin_wait_gate_five_rounds_never_exhausts_technical_failures() {
+        for coverage in ["missing", "schedule", "process"] {
+            let pool = pool().await;
+            settlement_tables(&pool).await;
+            sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'legacy'").execute(&pool).await.unwrap();
+            let store = ObjectiveStore::new(pool.clone());
+            let mut current = recovery_ceiling_objective(&pool, "thin-wait").await;
+            let session = current.session_id.clone().unwrap();
+            sqlx::query("INSERT INTO sessions VALUES (?, 'synthetic', '.', 'synthetic', 0, 0, 'thin')")
+                .bind(&session).execute(&pool).await.unwrap();
+            let covered = coverage != "missing";
+            let process_dir = tempfile::tempdir().unwrap();
+            if coverage == "process" {
+                super::super::background_tasks::start(&pool, super::super::background_tasks::StartRequest {
+                    session_id: session.clone(), root_turn_id: None,
+                    cwd: process_dir.path().to_path_buf(), output_dir: process_dir.path().join("logs"),
+                    command: "sleep 30".into(), source: super::super::background_tasks::TaskSource::AgentDecided,
+                    timeout_sec: Some(60),
+                }).await.unwrap();
+            }
+            if coverage == "schedule" {
+                super::super::background_tasks::schedule_wakeup_at(&pool,
+                    super::super::background_tasks::WakeupRequest {
+                        root_turn_id: None, session_id: session.clone(), prompt: "synthetic CI observation".into(),
+                        after_sec: Some(180), every_sec: None,
+                        source: super::super::background_tasks::TaskSource::AgentDecided,
+                    }, chrono::Utc::now().timestamp()).await.unwrap();
+            }
+            for _ in 0..5 {
+                let decision = DecisionRouter::route(&current, RouteSignal::TechnicalFailure {
+                    domain: RecoveryDomain::Chat, failure_code: COMPLETION_EVIDENCE_INCOMPLETE.into(),
+                    failure_signature: "synthetic:wait".into(), next_observation_at: Utc::now().timestamp_millis() + 5_000,
+                    resume_cursor: current.root_turn_id.clone(),
+                }).unwrap();
+                current = store.apply_decision(current.revision, decision).await.unwrap();
+                assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+                if covered {
+                    assert!(current.failure_signature.is_none(), "waiting is not a technical failure");
+                    assert!(current.next_observation_at.is_none(), "only the wake source should resume the wait");
+                    assert!(current.remediation_id.is_none(), "no system nudge while covered");
+                }
+            }
+            if coverage == "process" {
+                super::super::background_tasks::reclaim_session(&pool, &session).await;
+                assert!(!super::super::background_tasks::wake_source_cover(&pool, &session).await.is_covered());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn thin_three_identical_failures_end_with_summary_without_legacy_budget() {

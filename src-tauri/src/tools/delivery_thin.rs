@@ -96,7 +96,12 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
     let ci = log.gh(commands, &["pr", "view", &number_arg, "--json", "state,statusCheckRollup"])?;
     let ci: Value = serde_json::from_str(&ci).map_err(|e| e.to_string())?;
     log.step("ci", "observed once");
+    let ceiling_note = args.get("ceiling").and_then(Value::as_str)
+        .and_then(DeliveryCeiling::from_label)
+        .filter(|requested| requested.rank() < ceiling.rank())
+        .map(|_| format!("按本会话授权继续交付至 {}，不在较低的请求 ceiling 停止。", ceiling.label()));
     Ok(json!({"state":"waiting", "pr_url":pr["url"], "pr_number":number,
+        "effective_ceiling":ceiling.label(), "ceiling_note":ceiling_note,
         "branch":branch,"commit_sha":sha,"ci":ci,"next_action":"请用后台任务监视 CI；由合并队列合并，不要直接合并。"}))
 }
 
@@ -156,6 +161,16 @@ mod tests {
     fn deliver(f: &mut Forge) -> Result<Value,String> {
         run(f, &json!({"title":"fix: thin","body":"synthetic"}), DeliveryCeiling::ThroughMerge, &[], &mut Log::default())
     }
+    #[test]
+    fn thin_explicit_lower_ceiling_reports_authorized_merge_requirement() {
+        let mut forge = Forge::default();
+        let result = run(&mut forge, &json!({"title":"fix: thin", "body":"synthetic", "ceiling":"through_ci_green"}),
+            DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+        assert!(forge.armed);
+        assert_eq!(result["effective_ceiling"], "through_merge");
+        assert!(result["ceiling_note"].as_str().unwrap().contains("授权"));
+    }
+
     #[test]
     fn pushed_then_interrupted_resumes_without_repush_or_duplicate_pr() {
         let mut forge = Forge { pushed:true, pushes:1, ..Default::default() };
