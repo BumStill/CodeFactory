@@ -1400,17 +1400,13 @@ impl CompletionArbiter {
         Self::decide_accepting(objective, evidence, false)
     }
 
-    /// Thin sessions (phase-1 P0-3) accept a plain answer as completion for
-    /// read-only and local work. Delivery/Live are untouched here: saying it
-    /// shipped is not shipping, so their receipts stay mandatory.
+    /// Thin completion is guarded by the external-wait observer before
+    /// settlement, not by legacy objective-kind receipt requirements.
     pub fn decide_thin(
         objective: &ObjectiveSnapshot,
         evidence: &[ObjectiveEvidence],
     ) -> anyhow::Result<DecisionEnvelope> {
-        let thin_satisfied = matches!(
-            objective.kind,
-            ObjectiveKind::Informational | ObjectiveKind::LocalMutation
-        ) && evidence
+        let thin_satisfied = evidence
             .iter()
             .any(|item| item.kind == EvidenceKind::InformationalAnswer);
         Self::decide_accepting(objective, evidence, thin_satisfied)
@@ -12329,21 +12325,22 @@ CREATE TABLE objectives (
         );
     }
 
-    /// R1: 交付/上线目标仍然必须有交付回执——「说完成了」不等于已交付。
+    /// P0-4 R2: final answers settle every thin kind; legacy receipts stay strict.
     #[test]
-    fn thin_delivery_still_requires_a_delivery_receipt() {
-        let objective = ObjectiveSnapshot::new(
-            "objective-thin-delivery",
-            ObjectiveKind::Delivery,
-            RecoveryDomain::Delivery,
-            "merged_pr",
-        );
-        let decision = decision_for_thin_run_outcome(
-            &objective,
-            &thin_outcome("已开 PR", StopReason::Finished),
-        ).expect("thin delivery must return a routable decision, not a settlement error");
-        assert_eq!(decision.status, ObjectiveStatus::WaitingSystem);
-        assert_ne!(decision.decision_type, DecisionType::Complete);
+    fn thin_final_answer_completes_all_kinds_after_browser_errors() {
+        for kind in [ObjectiveKind::Informational, ObjectiveKind::LocalMutation,
+                     ObjectiveKind::Delivery, ObjectiveKind::Live, ObjectiveKind::LegacyOrphan] {
+            let objective = ObjectiveSnapshot::new(
+                "synthetic-browser-error", kind, RecoveryDomain::Chat, "answer",
+            );
+            let outcome = thin_outcome("Example Domain；后续浏览器工具报错，已说明。", StopReason::Finished);
+            let decision = decision_for_thin_run_outcome(&objective, &outcome).unwrap();
+            assert_eq!(decision.status, ObjectiveStatus::Completed, "{kind:?}");
+            if matches!(kind, ObjectiveKind::Delivery | ObjectiveKind::Live) {
+                assert_ne!(decision_for_run_outcome(&objective, &outcome).unwrap().status,
+                           ObjectiveStatus::Completed, "legacy {kind:?}");
+            }
+        }
     }
 
     #[test]

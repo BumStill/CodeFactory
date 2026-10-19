@@ -812,8 +812,21 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                     "session_id": session_id,
                 })));
             }
-            // Managed-browser and lifecycle errors close the owned session, so
-            // a caller that aborts the turn cannot leak a browser process.
+            // Thin task resources survive command/argument errors. Only a
+            // failed creation or explicit close ends the lease here; task
+            // settlement and the 20-minute idle TTL remain cleanup owners.
+            if thin && session_kind == BrowserSessionKind::Managed
+                && !matches!(args.action.as_str(), "open" | "close") {
+                if let Some(mut lease) = read_leases().into_iter()
+                    .find(|lease| lease.session_id == session_id) {
+                    lease.updated_at_unix_secs = now_secs();
+                    write_lease(&lease);
+                }
+                return Ok(ToolOutput::err(error).with_metadata(json!({
+                    "session_preserved": true, "session_id": session_id,
+                })));
+            }
+            // Failed creation/close and legacy errors retain existing cleanup.
             shutdown(&session_id, session_kind).await;
             remove_lease(&session_id);
             if args.action == "attach" {
@@ -1115,8 +1128,9 @@ async fn dispatch(
                 .map_err(to_message)
         }
         (BrowserSessionKind::Managed, "tabs" | "select_tab") => Err(
-            "browser_session.tabs only applies to the user's own browser — use \
-             browser_session.attach first."
+            "This managed session owns one page. Use browser_session.snapshot or \
+             browser_session.read with this session_id; select_tab is unnecessary. \
+             To inspect the user's own tabs, create a separate session with attach."
                 .into(),
         ),
         (BrowserSessionKind::Managed, "close") => {
@@ -1541,13 +1555,25 @@ mod tests {
             }
         });
         let output = execute(json!({"action":"open", "url":format!("http://{address}/fixture")}), &ctx).await.unwrap();
+        let followup_ctx = mode_ctx("thin").await;
+        let tabs = execute(json!({"action":"tabs"}), &followup_ctx).await.unwrap();
+        let invalid = execute(json!({"action":"find"}), &followup_ctx).await.unwrap();
+        let snapshot = execute(json!({"action":"snapshot"}), &followup_ctx).await.unwrap();
+        let read = execute(json!({"action":"read"}), &followup_ctx).await.unwrap();
+        let closed = execute(json!({"action":"close"}), &followup_ctx).await.unwrap();
         let cleanup = close_all_for_owner_session("synthetic-browser").await;
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
         assert_eq!(output.status, super::super::ToolExecutionStatus::Done, "{output:?}");
         assert!(output.content.contains("Thin Browser Fixture"), "{output:?}");
         assert!(output.content.contains("Receipt-free navigation works"));
-        assert_eq!(cleanup, 1);
+        assert!(tabs.content.contains("snapshot"), "{tabs:?}");
+        assert_eq!(invalid.status, super::super::ToolExecutionStatus::Error);
+        assert_eq!(snapshot.status, super::super::ToolExecutionStatus::Done, "{snapshot:?}");
+        assert_eq!(read.status, super::super::ToolExecutionStatus::Done, "{read:?}");
+        assert!(read.content.contains("Receipt-free navigation works"), "{read:?}");
+        assert_eq!(closed.status, super::super::ToolExecutionStatus::Done, "{closed:?}");
+        assert_eq!(cleanup, 0);
     }
 
     /// R3 repeatability: opening the same URL twice must read the same
