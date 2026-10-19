@@ -225,6 +225,32 @@ export function versionBumpHandoff(title) {
   return /\bbump version to\b/i.test(t) || /^chore:\s*bump version\b/i.test(t);
 }
 
+/** M122: PR intent wins conflicts, except a hold from any source is sticky. */
+export function squashMessage(title, prBody, messages) {
+  const readTrailers = (text) => text.split(/\r?\n/).map((line) => line.trim())
+    .filter((line) => /^(Release-Urgency|Co-Authored-By):\s*\S/i.test(line));
+  const commitTrailers = messages.flatMap(readTrailers);
+  const bodyTrailers = readTrailers(prBody);
+  const all = [...bodyTrailers, ...commitTrailers];
+  const urgency = all.filter((line) => /^Release-Urgency:/i.test(line));
+  const hold = urgency.find((line) => /^Release-Urgency:\s*hold$/i.test(line));
+  const chosen = hold ? [hold] : (bodyTrailers.some((line) => /^Release-Urgency:/i.test(line))
+    ? bodyTrailers : commitTrailers).filter((line) => /^Release-Urgency:/i.test(line));
+  const trailers = [...new Set([...chosen, ...all.filter((line) => /^Co-Authored-By:/i.test(line))])];
+  const subjects = new Set([title.trim(), ...messages.map((message) => message.split(/\r?\n/)[0].trim())]);
+  const seenSubjects = new Set([title.trim()]);
+  const prose = messages.map((message) => message.split(/\r?\n/).filter((line) => {
+    const text = line.trim();
+    if (/^(Release-Urgency|Co-Authored-By):/i.test(text) || /^Merge branch ['"]main['"] into /i.test(text)) return false;
+    if (subjects.has(text)) {
+      if (seenSubjects.has(text)) return false;
+      seenSubjects.add(text);
+    }
+    return true;
+  }).join('\n').trim()).filter(Boolean).join('\n\n');
+  return { body: [prose, trailers.join('\n')].filter(Boolean).join('\n\n'), trailers };
+}
+
 /** M120: one deliberate dispatch per drain, pinned to its final merged head. */
 export async function releaseMergedBatch(adapter, merged) {
   if (!merged.length) return;
@@ -344,6 +370,7 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100, in
       expectedHead: target.headSha,
       method: 'squash',
       title: target.title,
+      prBody: target.body,
     });
     if (result.merged) {
       outcomes.push({ number: target.number, status: 'merged', sha: result.sha });
@@ -355,6 +382,7 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100, in
     outcomes.push({ number: target.number, status: 'waiting', reason: result.reason });
     seen.add(target.number);
     } catch (error) {
+      if (error.mergedTrailerFailure) throw error;
       seen.add(head.number);
       outcomes.push({ number: head.number, status: 'error', reason: String(error.message ?? error) });
     }
@@ -404,7 +432,7 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
   async function prView(number) {
     const raw = run([
       'gh', 'pr', 'view', String(number), '--repo', repo, '--json',
-      'number,title,headRefName,headRefOid,isDraft,labels,mergeStateStatus',
+      'number,title,body,headRefName,headRefOid,isDraft,labels,mergeStateStatus',
     ]);
     const pr = JSON.parse(raw);
     const checks = await headChecks(pr.headRefOid);
@@ -470,6 +498,7 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
     return {
       number: pr.number,
       title: pr.title,
+      body: pr.body,
       headRefName: pr.headRefName,
       headSha: pr.headRefOid,
       isDraft: pr.isDraft,
@@ -498,7 +527,7 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
     async listOpenPrs() {
       const raw = run([
         'gh', 'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100', '--json',
-        'number,title,headRefName,headRefOid,isDraft,labels,mergeStateStatus',
+        'number,title,body,headRefName,headRefOid,isDraft,labels,mergeStateStatus',
       ]);
       const list = JSON.parse(raw);
       const out = [];
@@ -552,35 +581,45 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
         '-f', `expected_head_sha=${expectedHead}`,
       ]);
     },
-    async merge(number, { expectedHead, title } = {}) {
+    async merge(number, { expectedHead, title, prBody } = {}) {
       const commits = JSON.parse(run([
         'gh', 'api', `repos/${repo}/pulls/${number}/commits`, '--paginate', '--slurp',
       ])).flat();
-      // Pin metadata to the same head GitHub is asked to merge. Never execute it.
-      // R8(b): reuse the title from the listing the run already fetched instead
-      // of spending another call on `gh pr view`.
-      const metadata = title
-        ? { title }
+      // Reuse the listing snapshot, including PR intent, without another read.
+      const metadata = title && prBody !== undefined
+        ? { title, body: prBody }
         : JSON.parse(run([
-          'gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'title',
+          'gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'title,body',
         ]));
-      const messages = commits.map((commit) => commit.commit.message);
-      const trailers = [...new Set(messages.flatMap((message) => message.split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => /^(Release-Urgency|Co-Authored-By):\s*\S/i.test(line))))];
-      const prose = messages.map((message) => message.split(/\r?\n/)
-        .filter((line) => !/^(Release-Urgency|Co-Authored-By):/i.test(line.trim())).join('\n').trim())
-        .filter(Boolean).join('\n\n');
-      const body = [prose, trailers.join('\n')].filter(Boolean).join('\n\n');
+      const subject = title ?? metadata.title ?? 'fix: synthetic change';
+      const { body, trailers } = squashMessage(subject, prBody ?? metadata.body ?? '',
+        commits.map((commit) => commit.commit.message));
       run([
         'gh', 'pr', 'merge', String(number), '--repo', repo, '--squash',
         '--match-head-commit', expectedHead,
-        '--subject', metadata.title ?? 'fix: synthetic change', '--body', body,
+        '--subject', subject, '--body', body,
       ]);
       const after = JSON.parse(
         run(['gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'state,mergeCommit']),
       );
       if (after.state === 'MERGED') {
+        if (trailers.length) {
+          try {
+            const commit = JSON.parse(run(['gh', 'api', `repos/${repo}/commits/${after.mergeCommit?.oid}`]));
+            const footer = (commit?.commit?.message ?? '').trimEnd().split(/\r?\n\s*\r?\n/).at(-1);
+            const lines = footer.split(/\r?\n/).map((line) => line.trim());
+            const missing = trailers.filter((line) => !lines.includes(line));
+            if (missing.length) throw new Error(`missing final trailer(s): ${missing.join(', ')}`);
+          } catch (cause) {
+            const error = new Error(`Merged trailer verification failed: ${cause.message ?? cause}`);
+            error.mergedTrailerFailure = true;
+            try {
+              run(['gh', 'pr', 'comment', String(number), '--repo', repo, '--body', error.message]);
+            } finally {
+              throw error;
+            }
+          }
+        }
         return { merged: true, sha: after.mergeCommit?.oid ?? '' };
       }
       return { merged: false, reason: `PR #${number} is still ${after.state}` };

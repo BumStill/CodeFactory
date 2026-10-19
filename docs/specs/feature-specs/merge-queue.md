@@ -106,3 +106,32 @@ values and rollback.
    做决定。
 
 回滚：删除队列运行末尾的这一步，即恢复「只保留 trailer、由人工 dispatch」的旧行为。
+
+## M122：合并队列 squash 时丢失 PR 正文里的 Release-Urgency（M120 首次实测未触发）
+
+### 已批准任务规格（原文）
+
+#### 证据（编排方 10-19 14:4x）
+- #759 PR 正文第 15 行有 `Release-Urgency: immediate`；队列 06:35Z squash 合并后 main 提交 a08da6c4 的消息只有三行重复标题 + "Merge branch 'main' into ..."，**没有 trailer**；M120 因此正确地没有 dispatch auto-release。
+- 原因：`scripts/merge-queue.mjs` 约 508 行只从 PR 的各个提交消息里收集 `Release-Urgency|Co-Authored-By` trailer，不读 PR 正文。交付工具（legacy 与 thin）把 trailer 写在 PR 正文。
+
+#### 需求
+- R1 合成 squash 消息时，trailer 来源 = PR 正文 ∪ 各提交消息；同名冲突时以 PR 正文为准（正文是交付工具与人最后确认的意图）；`hold` 优先于 `immediate`（任一来源出现 hold 即 hold）。
+- R2 trailer 必须落在 squash 消息**最后一个段落**（见 release-cadence 与已知坑：Co-Authored-By 单独成段会吞掉 Release-Urgency），合并后复读 main 提交验证 trailer 存在，不存在则在 PR 评论并让队列运行非零结束。
+- R3 顺带清理消息体：去掉重复的标题行与 "Merge branch 'main' into ..." 噪声（保留有意义的正文）。
+- R4 测试（先失败）：正文 immediate、提交无 → squash 有 immediate 且 M120 dispatch；正文 hold、提交 immediate → hold；两边都无 → 无；Co-Authored-By 与 Release-Urgency 同段在末尾。
+- R5 更新 docs/specs/feature-specs/merge-queue.md。
+
+#### 约束
+- 改 CI/工作流脚本属 release-facing，PR 写明风险与回滚。授权交付（ceiling: merged）。PR 正文带 `Release-Urgency: immediate`——本修复合并后应由自己触发自动切版，作为真机验证。
+
+### Implementation Notes
+
+- 继续启用 Spec、Compatibility、Release、Observation、AI Collaboration Harness；无 UI 变更，不触发 Viewport Harness。
+- 同一次 PR 列表携带 `body`，与标题一起传给 squash，保留 M114 的列表复用预算；独立调用 adapter 时才补读 `title,body`。
+- urgency 冲突采用正文值；任一来源 hold 优先。Co-Authored-By 保留所有唯一作者行。
+- R1/R4：`M122 R1/R4` 参数化测试覆盖正文 immediate、正文 hold、提交 hold、正文非法值覆盖提交 immediate、无 urgency；immediate 同时执行 M120 dispatch 路径。
+- R2/R3：`M122 R2/R3` 校验保留有效正文、去重标题、清理 main merge 噪声及连续末段；`M122 R2` 模拟合并后丢失 footer，要求评论并拒绝整轮队列运行。
+- 首次 `pnpm test:merge-queue`：45 通过、5 失败；修复后同命令 50 通过。已有临时 Git 仓库测试执行真实 `plan_release.py` 验证末段解析。
+- 风险：PR 正文里的合法 trailer 行现在成为 squash 元数据来源；丢失元数据的已合并提交不能回滚合并，只能报警并阻止本轮发布。回滚只 revert 本次脚本 patch，不变更 ruleset、工作流或发布 planner。
+- 线上验收：合并后复读 main footer，执行 release planner；核对队列 dispatch 的 expected_head_sha 与合并提交，并由编排方发版安装后完成真机验收。默认分支 trusted runner 在本 PR 合并时仍运行旧脚本，不能将本 PR 自举触发当作已验证事实；若旧 runner 丢 trailer，必须报告并以后续队列运行取证，不手工改写 main。
