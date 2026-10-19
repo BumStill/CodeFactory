@@ -84,7 +84,7 @@ Release-Urgency: immediate
 
 | Value | Meaning | Effect |
 | --- | --- | --- |
-| `immediate` | Meets the rubric below | Requires the merge operator to dispatch right after merge, even when the ordinary delivery boundary would wait |
+| `immediate` | Meets the rubric below | The merge operator dispatches right after merge, even when the ordinary delivery boundary would wait. CodeFactory's merge queue is that operator: a drain that merges an `immediate` commit dispatches Auto Release once, at the final merged head (`scripts/merge-queue.mjs`) |
 | *(absent — the default)* | No urgency override | Follows the repository's configured boundary: an already-authorized on-demand `through_release` still dispatches; otherwise it rides the schedule |
 | `hold` | Must not ship alone (needs a companion change, docs, or an announcement first) | Blocks every cut until the whole batch is reviewed and deliberately released with `allow_guarded_batch=true` |
 
@@ -103,7 +103,9 @@ Commits' `!`; that already means "breaking change" and drives the version slot.
 
 The trailer is a **decision signal, not an event trigger**. Rule 1 still forbids
 release-on-merge, so `immediate` requires the already-authorized merge operator
-to dispatch Auto Release after the merge. It does not replace a deliberately
+to dispatch Auto Release after the merge. In CodeFactory the merge queue is that
+operator, so the dispatch is automatic but still an explicit `workflow_dispatch`
+bound to the merged head — never a push-triggered release. It does not replace a deliberately
 configured on-demand path: CodeFactory's `deliver_changes` with a
 `through_release` ceiling is itself an authorized dispatch request, even without
 an urgency override. For squash merges, the operator must preserve the trailer

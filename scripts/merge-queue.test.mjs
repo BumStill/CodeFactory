@@ -23,6 +23,7 @@ import {
   drainQueue,
   versionBumpHandoff,
   verifyRequiredChecks,
+  releaseMergedBatch,
 } from './merge-queue.mjs';
 
 // ---------------------------------------------------------------------------
@@ -83,6 +84,10 @@ function fakeAdapter(prs, opts = {}) {
     async refreshPr(number) {
       return structuredClone(state.get(number));
     },
+    // M120: default merged commits carry no urgency trailer.
+    async commitMessage() {
+      return 'fix: synthetic change';
+    },
     async updateBranch(number) {
       calls.update.push(number);
       const p = state.get(number);
@@ -115,6 +120,62 @@ function fakeAdapter(prs, opts = {}) {
     },
   };
 }
+
+// M120 — release decisions use the merged commit, never branch metadata.
+for (const [name, messages, plan, expected] of [
+  ['immediate', ['fix: one\n\nRelease-Urgency: immediate'], {}, 1],
+  ['no trailer', ['fix: one'], {}, 0],
+  ['hold batch', ['fix: one\n\nRelease-Urgency: immediate'], { hold: 1 }, 0],
+  ['two immediate', ['fix: one\n\nRelease-Urgency: immediate', 'fix: two\n\nRelease-Urgency: immediate'], {}, 1],
+  ['prose is not a trailer', ['fix: one\n\nRelease-Urgency: immediate\n\nNot a footer'], {}, 0],
+  ['invalid urgency guards batch', ['fix: one\n\nRelease-Urgency: immediate'], { invalid_urgency: 1 }, 0],
+]) {
+  test(`M120-R1: ${name}`, async () => {
+    const dispatches = [], comments = [];
+    const merged = messages.map((message, i) => ({ number: i + 1, sha: `merged-${i}`, message }));
+    const adapter = {
+      async commitMessage(sha) { return merged.find((m) => m.sha === sha).message; },
+      async releasePlan(sha) { assert.equal(sha, merged.at(-1).sha); return { hold: 0, invalid_urgency: 0, ...plan }; },
+      async dispatchRelease(sha) { dispatches.push(sha); },
+      async comment(number, body) { comments.push({ number, body }); },
+    };
+    await releaseMergedBatch(adapter, merged);
+    assert.equal(dispatches.length, expected);
+    if (expected) assert.equal(dispatches[0], merged.at(-1).sha);
+    if (plan.hold || plan.invalid_urgency) assert.match(comments[0].body, /hold|guard/i);
+  });
+}
+
+test('M120-R2: dispatch error comments on the PR and rejects the queue run', async () => {
+  const adapter = fakeAdapter([pr()]);
+  const comments = [];
+  adapter.commitMessage = async () => 'fix: one\n\nRelease-Urgency: immediate';
+  adapter.releasePlan = async () => ({ hold: 0, invalid_urgency: 0 });
+  adapter.dispatchRelease = async () => { throw Error('synthetic dispatch denied'); };
+  adapter.comment = async (number, body) => comments.push({ number, body });
+  await assert.rejects(runQueue(adapter), /synthetic dispatch denied/);
+  assert.equal(comments[0].number, 1);
+  assert.match(comments[0].body, /dispatch.*failed.*synthetic dispatch denied/is);
+});
+
+test('M120 adapter: fetch newly merged objects before scanning a head-relative tag range', async () => {
+  const calls = [];
+  const adapter = createGhAdapter({ repo: 'synthetic/queue', run(args) {
+    calls.push(args);
+    if (args[0] === 'git' && args[1] === 'fetch') return '';
+    if (args[0] === 'git' && args[1] === 'describe') {
+      assert.equal(args.at(-1), SHA_C);
+      return 'v1.0.0\n';
+    }
+    if (args[0] === 'python3') {
+      assert.equal(args.at(-1), `v1.0.0..${SHA_C}`);
+      return JSON.stringify({ hold: 1, invalid_urgency: 0 });
+    }
+    throw Error(`unexpected call ${args.join(' ')}`);
+  } });
+  assert.equal((await adapter.releasePlan(SHA_C)).hold, 1);
+  assert.deepEqual(calls[0], ['git', 'fetch', '--tags', 'origin', 'main']);
+});
 
 // ---------------------------------------------------------------------------
 // CF-MQ-R1 / R2 — eligibility and ordering
