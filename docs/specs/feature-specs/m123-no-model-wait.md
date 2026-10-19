@@ -21,5 +21,5 @@
 - 原任务未指定规格文件名，存放于本文件。需求逐字保留。
 - Harness：Spec、Compatibility、Observation、Release、AI Collaboration。仅后端消息与调度行为，不改布局。
 - 验收矩阵：R1/R4 有恢复时间的全不可用组合、时间到点可用；R2/R4 仅缺凭据；R3 连续多次无模型不耗失败计数、真实错误保留门禁；R4 混合可用；R5 原入口回归。
-- 补强（R1 调度边界）：`ModelUnavailable::decision` 在排期前把唤醒时间规整到未来（最少 `MIN_RESUME_LEAD_MS`=1s），`resume_at_with_lead` 负责该规整且不把 `None`（不可恢复原因）变成等待。理由：复用旧错误载荷、时钟回拨或休眠错过边界时，过去的唤醒时间会被 supervisor 立刻视为到期，表现为「等待中却持续发请求」。测试 `m123_past_resume_time_is_pushed_into_the_future` 覆盖过去时间被推后、未来时间原样保留、`None` 仍为 `None`。
+- 补强（R1 调度边界）：`DecisionRouter` 在 `CapabilityRestored` 落库前用 `scheduled_wait_not_in_the_past` 规整 no-model 等待时间：`at > 0 && reason == "no_model_available" && at < now` 时取 `now + MIN_RESUME_LEAD_MS`(1s)；`0`（不可恢复原因，如仅缺凭据）仍表示结束，其它 capability-restored 信号仍立即恢复。理由：复用旧错误载荷、时钟回拨或休眠错过边界时，过去的唤醒时间会被 supervisor 立刻视为到期，表现为「等待中却持续发请求」。测试 `m123_past_resume_time_is_scheduled_in_the_future` 覆盖该推送且只推最近的未来。
 - context scope：路由准入、Objective 决策与聊天收尾；assumptions：现有 Objective supervisor 的 next_observation_at 提供持久自动恢复；review point：legacy 不进入新分支；validation result：随测试和 PR 更新。

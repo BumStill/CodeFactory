@@ -1216,6 +1216,24 @@ pub enum RouteSignal {
     },
 }
 
+/// M123. The shortest distance a scheduled no-model wait may be placed in the
+/// future. A wait whose resume time already passed (a reused error payload, a
+/// clock jump, or a boundary that elapsed while the app slept) would otherwise
+/// be stored as a time already gone: the supervisor observes it as due at once
+/// and the "wait" becomes a request storm.
+pub(crate) const MIN_RESUME_LEAD_MS: i64 = 1_000;
+
+/// M123. Keep a scheduled no-model wait in the future. Only the waitable
+/// (non-zero) timestamp of the no-model cause is adjusted: `0` still means the
+/// run ends, and other capability-restored signals resume immediately.
+pub(crate) fn scheduled_wait_not_in_the_past(reason: &str, at: i64, now_ms: i64) -> i64 {
+    if at > 0 && reason == "no_model_available" && at < now_ms {
+        now_ms.saturating_add(MIN_RESUME_LEAD_MS)
+    } else {
+        at
+    }
+}
+
 pub struct DecisionRouter;
 
 impl DecisionRouter {
@@ -1266,6 +1284,11 @@ impl DecisionRouter {
                 resume_cursor,
             } => {
                 decision.domain = domain;
+                let next_observation_at = scheduled_wait_not_in_the_past(
+                    &reason,
+                    next_observation_at,
+                    Utc::now().timestamp_millis(),
+                );
                 // Keep the stable authorization identity while the restored
                 // capability is queued and claimed. Domain adapters bind their
                 // secret-free receipt to this key; clearing it here would split
@@ -13140,6 +13163,31 @@ CREATE TABLE objectives (
         assert_eq!(ended.failure_code.as_deref(), Some("no_model_available"));
         assert!(ended.next_observation_at.is_none());
         assert!(ended.remediation_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn m123_past_resume_time_is_scheduled_in_the_future() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let current = recovery_ceiling_objective(&pool, "synthetic-m123-past").await;
+        let before = Utc::now().timestamp_millis();
+        let decision = super::super::failover::ModelUnavailable {
+            resume_at_ms: Some(before - 60_000),
+            notice: "当前没有可用模型：DeepSeek 18:00 起可用；届时自动继续。".into(),
+        }
+        .decision(&current, "turn-synthetic-m123-past")
+        .unwrap();
+        let applied = store.apply_decision(current.revision, decision).await.unwrap();
+        assert_eq!(applied.status, ObjectiveStatus::WaitingSystem);
+        let at = applied.next_observation_at.expect("等待必须被排期");
+        assert!(
+            at > before,
+            "已在过去的唤醒时间必须推到未来，否则 supervisor 会立刻判定到期并形成重试风暴"
+        );
+        assert!(
+            at <= Utc::now().timestamp_millis() + 2_000,
+            "只应推到最近的未来，不得把等待拖长"
+        );
     }
 
     async fn recovery_ceiling_objective(pool: &SqlitePool, id: &str) -> ObjectiveSnapshot {

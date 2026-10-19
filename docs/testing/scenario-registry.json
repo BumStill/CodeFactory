@@ -114,7 +114,7 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/src/agent/model_transport.rs", "src-tauri/src/agent/provider_recovery.rs", "src-tauri/src/agent/tool_recovery.rs", "src-tauri/src/agent/failover.rs"],
+      "change_patterns": ["src-tauri/src/agent/objective.rs", "src-tauri/src/agent/objective_supervisor.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs", "src-tauri/src/agent/model_transport.rs", "src-tauri/src/agent/provider_recovery.rs", "src-tauri/src/agent/tool_recovery.rs"],
       "automated_by": ["rust:same_remediation_claim_defer_reclaim_hits_the_recovery_ceiling", "rust:repeated_failure_signature_parks_a_system_owned_incident", "rust:identical_failure_budget_counts_distinct_claim_epochs_not_callbacks", "binary:--delivery-recovery-smoke"],
       "required_evidence": ["L0", "L1", "L2"],
       "gates": ["pull_request", "nightly"]
