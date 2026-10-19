@@ -384,6 +384,8 @@ test('R6: a stop request halts the queue before the next merge', async () => {
 function ghFixture({
   failure,
   messages = ['fix: synthetic change'],
+  prBody = '',
+  mergedMessage,
   blockedNumbers = [],
   commentsFor = () => [],
   eventsFor = () => [],
@@ -425,7 +427,11 @@ function ghFixture({
       })));
     }
     if (args[1] === 'api' && /\/commits\/[0-9a-f]{40}$/.test(args[2])) {
-      return JSON.stringify({ commit: { committer: { date: headCommittedAt } } });
+      const merge = calls.findLast((a) => a[2] === 'merge');
+      const message = mergedMessage ?? (merge
+        ? `${merge[merge.indexOf('--subject') + 1]}\n\n${merge[merge.indexOf('--body') + 1]}`
+        : 'fix: synthetic change');
+      return JSON.stringify({ commit: { message, committer: { date: headCommittedAt } } });
     }
     if (args[1] === 'api' && args[2].includes('/commits')) {
       return JSON.stringify(messages.map((message) => ({ commit: { message } })));
@@ -440,14 +446,62 @@ function ghFixture({
       open.delete(number);
       return '';
     }
-    if (args[2] === 'view' && args.at(-1) === 'title') {
-      return JSON.stringify({ title: 'fix: synthetic change' });
+    if (args[2] === 'view' && /^(title|title,body)$/.test(args.at(-1))) {
+      return JSON.stringify({ title: 'fix: synthetic change', body: prBody });
     }
     if (args[2] === 'view') return JSON.stringify({ state: 'MERGED', mergeCommit: { oid: SHA_C } });
     throw Error(`Unexpected synthetic gh call: ${args.join(' ')}`);
   };
   return { calls, postedComments, adapter: createGhAdapter({ repo: 'synthetic/queue', run }) };
 }
+
+for (const [name, prBody, messages, expected] of [
+  ['body immediate', 'Release-Urgency: immediate', ['fix: synthetic change'], 'immediate'],
+  ['body hold', 'Release-Urgency: hold', ['fix: synthetic change\n\nRelease-Urgency: immediate'], 'hold'],
+  ['commit hold', 'Release-Urgency: immediate', ['fix: synthetic change\n\nRelease-Urgency: hold'], 'hold'],
+  ['body conflict wins', 'Release-Urgency: invalid', ['fix: synthetic change\n\nRelease-Urgency: immediate'], 'invalid'],
+  ['no urgency', '', ['fix: synthetic change'], null],
+]) {
+  test(`M122 R1/R4: ${name}`, async () => {
+    const { adapter, calls } = ghFixture({ prBody, messages });
+    await adapter.merge(1, { expectedHead: SHA_A, title: 'fix: synthetic change' });
+    const merge = calls.find((a) => a[2] === 'merge');
+    const body = merge[merge.indexOf('--body') + 1];
+    const footer = body.trim().split(/\n\s*\n/).at(-1);
+    if (expected) assert.match(footer, new RegExp(`^Release-Urgency: ${expected}$`, 'm'));
+    else assert.doesNotMatch(body, /Release-Urgency:/);
+    if (expected === 'immediate') {
+      const dispatched = [];
+      adapter.releasePlan = async () => ({ hold: 0, invalid_urgency: 0 });
+      adapter.dispatchRelease = async (sha) => dispatched.push(sha);
+      await releaseMergedBatch(adapter, [{ number: 1, sha: SHA_C }]);
+      assert.deepEqual(dispatched, [SHA_C]);
+    }
+  });
+}
+
+test('M122 R2/R3: clean prose and one final footer', async () => {
+  const { adapter, calls } = ghFixture({
+    prBody: 'Release-Urgency: immediate',
+    messages: ["fix: synthetic change\n\nfix: synthetic change\n\nMerge branch 'main' into synthetic\n\nUseful detail\n\nCo-Authored-By: Synthetic <synthetic@example.invalid>"],
+  });
+  await adapter.merge(1, { expectedHead: SHA_A });
+  const merge = calls.find((a) => a[2] === 'merge');
+  const body = merge[merge.indexOf('--body') + 1];
+  assert.doesNotMatch(body, /fix: synthetic change|Merge branch/);
+  assert.match(body, /Useful detail/);
+  const footer = body.trim().split(/\n\s*\n/).at(-1);
+  assert.match(footer, /^Release-Urgency: immediate$/m);
+  assert.match(footer, /^Co-Authored-By: Synthetic/m);
+});
+
+test('M122 R2: lost merged footer comments and fails the queue run', async () => {
+  const { adapter, postedComments } = ghFixture({
+    prBody: 'Release-Urgency: immediate', mergedMessage: 'fix: synthetic change',
+  });
+  await assert.rejects(runQueue(adapter), /trailer/i);
+  assert.ok(postedComments.some((body) => /trailer/i.test(body)));
+});
 
 for (const failure of ['label', 'merge', 'checks']) {
   test(`M94: synthetic gh ${failure} error on first PR does not stop second PR`, async () => {
@@ -737,7 +791,7 @@ test('M114-R8b: merging reuses the listed title instead of another gh pr view', 
       throw new Error(`unexpected call: ${args.join(' ')}`);
     },
   });
-  const result = await adapter.merge(2, { expectedHead: 's2', title: 'fix: synthetic merge' });
+  const result = await adapter.merge(2, { expectedHead: 's2', title: 'fix: synthetic merge', prBody: '' });
   assert.equal(result.merged, true);
   assert.ok(
     !calls.some((call) => call.includes('--json title')),
