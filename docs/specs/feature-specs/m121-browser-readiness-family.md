@@ -20,7 +20,14 @@
 | R2 | 统一修复 | `scripts/headless-acceptance-support.mjs` 提供 `gotoScenario` / `waitForAppBoot`：**boot 预算**（`APP_BOOT_BUDGET_MS`，默认 60s，可 `CF_HEADLESS_BOOT_BUDGET_MS` 覆盖）只覆盖"文档加载 + 应用外壳挂载"，**断言预算**（`ASSERTION_BUDGET_MS` = 10s）对启动后的每一次产品断言保持不变。boot 耗时会打印 `[acceptance] boot <ms>ms (budget <ms>ms)`，预算因此是被测量的，不是被猜的。超时会输出 DOM 轮廓、`document.body` 片段、console/pageerror/失败请求。 |
 | R3 | Managed 浏览器语义 | `open` 在返回前等待文档 committed + 完成加载：轮询 `document.readyState`，要求 href 已提交且（`complete` 或有非空可见文本的 `interactive`），上限 20s；超时错误带上最后一次观测到的 `readyState/href/文本`。 |
 | R4 | 重复验证 | `scenario-execution.yml` 新增 `execute-windows-soak`：带 `flake-soak` 标签的 PR 在同一 job 内把同一批 Windows 目标连续跑 5 次（第一次付冷启动，后四次复用同一构建缓存），任何一次失败即失败。默认 PR 不产生额外成本，也不改变任何必需检查。 |
-| R5 | 启动级预算的归属（本 PR 的 CI 发现） | 同一因果形状在 Rust 侧"创建页面"上也成立：`Target.createTarget` 属**启动级**动作，冷 runner 上实测 2 分钟仍未返回，沿用 30s 操作预算会直接超时。因此 `chromium.rs` 把预算分成两类：`PAGE_CREATE_TIMEOUT`（60s，启动级，只用于建页）与 `OP_TIMEOUT`（30s，操作级，用于 connect/evaluate/find_element）。该缺陷由本 PR 自身的 `check-rust`（Windows 冷 runner）在 `thin_browser_open_reaches_driver_without_receipt` 上暴露，属于"修好导航提交窗口后，把同类窗口的下一个受害者暴露出来"，而不是新的偶发。 |
+| R5 | 不削弱门禁 | 必需检查保持原状，不增加 `continue-on-error`，不绕过可信根；使用现有场景 `HLT-005, RTE-001, RTE-003`。 |
+
+### CI 后续发现与修正
+
+- run 39202990975 的 `thin_browser_open_reaches_driver_without_receipt` 再次返回空正文，证明只检查 URL 与 readyState 不能建立目标导航完成的因果保证。
+- 查阅实际使用的 chromiumoxide 0.9.1 源码：`Browser::new_page` 创建 target；`Page::goto` 提供完整导航语义。实现改为先建 `about:blank`，再仅导航一次到目标 URL，随后读取；失败仍回收会话，不盲目重放。
+- 之前“冷 runner 实测两分钟”和“本机 35–42ms 证明 10s 不够”的说法均无相应测量支撑，撤回。现有数据只能证明本机成功路径耗时，不能证明 Windows 冷启动根因或 60s 预算的充分性；需由 Windows CI 重复验收确认。
+
 ### 预算不是"调大超时"
 
 - 被替换的是**导航后的第一次等待**，语义是"进程启动完成"，不是产品断言。

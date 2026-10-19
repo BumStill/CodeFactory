@@ -670,7 +670,7 @@ impl BrowserDriver for ChromiumDriver {
             release_profile(&profile_dir, session_id);
             return Err(error);
         }
-        let page = match tokio::time::timeout(PAGE_CREATE_TIMEOUT, browser.new_page(url))
+        let page = match tokio::time::timeout(PAGE_CREATE_TIMEOUT, browser.new_page("about:blank"))
             .await
             .map_err(|_| {
                 AppError::Other(format!(
@@ -703,6 +703,21 @@ impl BrowserDriver for ChromiumDriver {
             _scratch: scratch,
             profile_dir: profile_dir.clone(),
         };
+
+        // Create the target before issuing navigation. Unlike CreateTarget's
+        // initial URL, goto tracks the navigation through the attached page's
+        // lifecycle, so the old document's `complete` cannot satisfy readiness.
+        let navigation = tokio::time::timeout(OP_TIMEOUT, live.page.goto(url)).await;
+        let navigation_error = match navigation {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(format!("Navigation to {url} failed: {error}")),
+            Err(_) => Some(format!("Navigation to {url} timed out after {}s", OP_TIMEOUT.as_secs())),
+        };
+        if let Some(error) = navigation_error {
+            let _ = authorizer.unknown().await;
+            let _ = teardown(&mut live, session_id).await;
+            return Err(AppError::Other(error));
+        }
 
         // `Target.createTarget` resolves when the page exists, not when the
         // requested document has committed and settled. Reading straight after
