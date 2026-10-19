@@ -28,4 +28,5 @@
 ## Implementation Notes
 - thin 的完成判定放在 objective 决策入口（`decision_for_thin_run_outcome`），由 chat 结算层根据 `sessions.delivery_mode='thin'` 选择；`decision_for_run_outcome_with_reason` 保持 legacy 语义不变。
 - thin 只对 `Informational` / `LocalMutation` 目标接受「最终回答」为完成证据（`EvidenceKind::InformationalAnswer`）；`Delivery` / `Live` 仍必须有交付回执，避免把「说了要发」当成已发。
-- thin 运行轮内的外部事项等待沿用阶段 1 R5：`external_wait_completion_hint` 缺唤醒源时把 `background_task_start` / `schedule_wakeup` 提示写给模型，循环继续（等待，不记失败）。
+- thin 结算前检查本会话后台任务/定时唤醒覆盖，有覆盖则持久化 `thin_waiting_for_wake`，不计失败；无覆盖时只读/本地任务最终回答即可完成。交付类缺回执回落既有可路由等待，不返回结算错误。
+- 集成验收：`commands::chat::tests::thin_settlement_persists_completed_or_nonfailure_wake_wait` 使用合成内存数据库调用生产结算入口并读取持久化 objective，覆盖 completed 与非失败等待两条路径。

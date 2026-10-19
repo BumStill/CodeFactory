@@ -1513,9 +1513,10 @@ pub fn decision_for_thin_run_outcome_with_reason(
             observed_at: Utc::now().timestamp_millis(),
             reached_acceptance: objective.requested_acceptance.clone(),
         };
-        let mut decision = CompletionArbiter::decide_thin(objective, std::slice::from_ref(&evidence))?;
-        decision.visible_final_message_id = outcome.final_message_id.clone();
-        return Ok(decision);
+        if let Ok(mut decision) = CompletionArbiter::decide_thin(objective, std::slice::from_ref(&evidence)) {
+            decision.visible_final_message_id = outcome.final_message_id.clone();
+            return Ok(decision);
+        }
     }
     decision_for_run_outcome_with_reason(objective, outcome, terminal_reason)
 }
@@ -12334,15 +12335,12 @@ CREATE TABLE objectives (
             RecoveryDomain::Delivery,
             "merged_pr",
         );
-        let refused = decision_for_thin_run_outcome(
+        let decision = decision_for_thin_run_outcome(
             &objective,
             &thin_outcome("已开 PR", StopReason::Finished),
-        )
-        .expect_err("thin delivery without a receipt must stay blocked");
-        assert!(
-            refused.to_string().contains("does not satisfy objective kind"),
-            "{refused}"
-        );
+        ).expect("thin delivery must return a routable decision, not a settlement error");
+        assert_eq!(decision.status, ObjectiveStatus::WaitingSystem);
+        assert_ne!(decision.decision_type, DecisionType::Complete);
     }
 
     #[test]

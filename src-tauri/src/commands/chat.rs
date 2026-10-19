@@ -1704,7 +1704,25 @@ async fn apply_chat_objective_outcome(
         Some(session_id) => crate::agent::thin::is_thin(db, session_id).await,
         None => false,
     };
-    let decision = if thin {
+    let thin_waiting = thin
+        && outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished
+        && crate::agent::background_tasks::wake_source_cover(
+            db, current.session_id.as_deref().unwrap_or_default(),
+        ).await.is_covered();
+    let decision = if thin_waiting {
+        crate::agent::objective::DecisionRouter::route(
+            &current,
+            crate::agent::objective::RouteSignal::TechnicalFailure {
+                domain: crate::agent::objective::RecoveryDomain::Chat,
+                failure_code: crate::agent::objective::COMPLETION_EVIDENCE_INCOMPLETE.into(),
+                failure_signature: "thin:external-wait".into(),
+                next_observation_at: chrono::Utc::now().timestamp_millis() + 5_000,
+                resume_cursor: current.root_turn_id.clone(),
+            },
+        )
+        // ObjectiveStore normalizes this to thin_waiting_for_wake before
+        // persistence: no failure signature, retry budget or remediation.
+    } else if thin {
         crate::agent::objective::decision_for_thin_run_outcome_with_reason(
             &current,
             outcome,
@@ -4212,6 +4230,42 @@ fn select_chat_mode(
 mod tests {
     use super::*;
     use crate::agent::failover::{ActiveRouteState, EndpointHealthRegistry};
+
+    #[tokio::test]
+    async fn thin_settlement_persists_completed_or_nonfailure_wake_wait() {
+        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain};
+        use codefactory_agent_loop::run::{RunOutcome, StopReason};
+        for waiting in [false, true] {
+            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+            sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('synthetic-settle','synthetic','/synthetic','model',1,1,'thin')")
+                .execute(&pool).await.unwrap();
+            let store = ObjectiveStore::new(pool.clone());
+            let current = store.create(CreateObjective {
+                id: "synthetic-settle-objective".into(), kind: ObjectiveKind::LocalMutation,
+                session_id: Some("synthetic-settle".into()), root_turn_id: Some("synthetic-root".into()),
+                domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
+            }).await.unwrap();
+            crate::agent::background_tasks::wake_source_cover(&pool, "synthetic-settle").await;
+            if waiting {
+                sqlx::query("INSERT INTO wakeup_schedules (id,session_id,prompt,source,every_sec,next_at,status,created_at) VALUES ('synthetic-watch','synthetic-settle','check PR','agent_decided',180,9999999999999,'pending',1)")
+                    .execute(&pool).await.unwrap();
+            }
+            let outcome = RunOutcome {
+                final_text: "读取浏览器标题后已关闭会话".into(), final_message_id: None,
+                completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0,
+                stop_reason: StopReason::Finished,
+            };
+            let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "synthetic-root", &outcome, None).await.unwrap();
+            assert_eq!(settled.status, if waiting { ObjectiveStatus::WaitingSystem } else { ObjectiveStatus::Completed });
+            if waiting {
+                assert_eq!(settled.failure_code.as_deref(), Some("thin_waiting_for_wake"));
+                assert!(settled.failure_signature.is_none());
+                assert!(settled.remediation_id.is_none());
+            }
+            assert_eq!(store.get(&current.id).await.unwrap().unwrap().status, settled.status);
+            pool.close().await;
+        }
+    }
 
     #[tokio::test]
     async fn m84_close_objective_is_guarded_audited_and_idempotent() {
