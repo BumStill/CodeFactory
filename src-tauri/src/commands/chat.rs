@@ -1894,12 +1894,20 @@ async fn settle_chat_objective_from_error(
             current.revision
         )));
     }
+    let unavailable = crate::agent::failover::ModelUnavailable::parse(error_text);
     let signal = if auth_expired {
         RouteSignal::AuthorizationRequired {
             domain: RecoveryDomain::Auth,
             request_key: format!("chatgpt-auth:{objective_id}"),
             action_signature: format!("oauth:chatgpt:resume:{objective_id}"),
             resume_cursor: Some(root_turn_id.to_string()),
+        }
+    } else if let Some(unavailable) = unavailable.as_ref() {
+        RouteSignal::CapabilityRestored {
+            domain: RecoveryDomain::Chat,
+            reason: "no_model_available".into(),
+            next_observation_at: unavailable.resume_at_ms.unwrap_or_default(),
+            resume_cursor: Some(root_turn_id.into()),
         }
     } else {
         // Separate "this endpoint is answering unavailable" from the generic
@@ -1950,8 +1958,11 @@ async fn settle_chat_objective_from_error(
             resume_cursor: Some(root_turn_id.to_string()),
         }
     };
-    let decision = DecisionRouter::route(&current, signal)
-        .map_err(|error| AppError::Other(error.to_string()))?;
+    let decision = if let Some(unavailable) = unavailable.as_ref().filter(|_| !auth_expired) {
+        unavailable.decision(&current, root_turn_id)
+    } else {
+        DecisionRouter::route(&current, signal)
+    }.map_err(|error| AppError::Other(error.to_string()))?;
     // R6 (U23): this write is what schedules the next recovery step. When it was
     // lost to the SQLite write lock, the Objective stayed `active` with nothing
     // scheduled and no owner — the limbo the 2026-10-08 sessions got stuck in,
@@ -1998,6 +2009,18 @@ async fn settle_chat_objective_from_error(
             }
         }
     };
+    if let Some(unavailable) = unavailable.as_ref().filter(|_| !auth_expired) {
+        if let Some(session) = revised.session_id.as_deref() {
+            sqlx::query("INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)")
+                .bind(format!("model-availability:{}:{}", revised.id, revised.revision))
+                .bind(session).bind(&unavailable.notice).bind(Utc::now().timestamp_millis())
+                .execute(db).await?;
+            app.emit(event_name, StreamEvent::TransportRetry {
+                label: if unavailable.resume_at_ms.is_some() { "等唤醒" } else { "已结束" }.into(),
+                attempt: 0, max_attempts: 0, delay_ms: 0, reason: unavailable.notice.clone(),
+            }).ok();
+        }
+    }
     project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
     Ok(revised)
 }

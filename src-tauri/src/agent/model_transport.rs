@@ -1955,7 +1955,12 @@ impl ModelTransport for RoutedDesktopModelTransport {
         let mut downgraded_options: Option<RoundOptions> = None;
         loop {
             let opts = downgraded_options.as_ref().unwrap_or(opts);
-            if let Some(change) = self.route_state.admit_usage_window(self.cancel.as_deref(), super::usage_windows::session_ignores_windows(&self.session_id), Some(self.events.as_ref())).await.map_err(classify_transport_error)? {
+            let admission = if super::thin::is_thin(&self.db, &self.session_id).await {
+                self.route_state.admit_model_availability(self.cancel.as_deref(), super::usage_windows::session_ignores_windows(&self.session_id), Some(self.events.as_ref())).await
+            } else {
+                self.route_state.admit_usage_window(self.cancel.as_deref(), super::usage_windows::session_ignores_windows(&self.session_id), Some(self.events.as_ref())).await
+            };
+            if let Some(change) = admission.map_err(classify_transport_error)? {
                 transitions.push(change);
             }
             let route = self.route_state.current();

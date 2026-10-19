@@ -5222,6 +5222,9 @@ impl ObjectiveStore {
         &self,
         mut decision: DecisionEnvelope,
     ) -> anyhow::Result<DecisionEnvelope> {
+        if decision.failure_code.as_deref() == Some("no_model_available") {
+            return Ok(decision);
+        }
         let session: Option<String> = sqlx::query_scalar("SELECT session_id FROM objectives WHERE id=?")
             .bind(&decision.objective_id).fetch_optional(&self.pool).await?.flatten();
         if let Some(session) = session {
@@ -7051,7 +7054,10 @@ impl ObjectiveStore {
             && !decision.is_parked_wake_wait()
             && !decision.transport_probe_wait
         {
-            let strategy = if decision.domain == RecoveryDomain::Update
+            let model_wait = decision.failure_code.as_deref() == Some("no_model_available");
+            let strategy = if model_wait {
+                "apply_recommended"
+            } else if decision.domain == RecoveryDomain::Update
                 && decision.failure_code.as_deref() == Some(UPDATE_SAFE_POINT_PENDING)
             {
                 "wait_for_restart_safe_point"
@@ -7062,10 +7068,10 @@ impl ObjectiveStore {
             // is scheduled at the caller's flat +5s, so five identical errors —
             // under a minute of a transient condition — exhaust the budget and
             // park the Objective for good.
-            let repeat_signature = decision
+            let repeat_signature = if model_wait { "model_availability" } else { decision
                 .failure_signature
                 .as_deref()
-                .ok_or_else(|| anyhow!("waiting_system failure signature missing"))?;
+                .ok_or_else(|| anyhow!("waiting_system failure signature missing"))? };
             let prior_attempts: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM objective_remediations
                  WHERE objective_id=? AND failure_signature=?
@@ -7088,7 +7094,9 @@ impl ObjectiveStore {
             // was and nothing that observes immediately is delayed. U33/R12: the
             // backoff ladder is clamped, so a parked session always gets an
             // attempt within MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS.
-            let scheduled_observation = if prior_attempts > 0 {
+            let scheduled_observation = if model_wait {
+                requested_observation
+            } else if prior_attempts > 0 {
                 bounded_next_observation_at(
                     now,
                     requested_observation.max(
@@ -7121,12 +7129,7 @@ impl ObjectiveStore {
                     .as_deref()
                     .ok_or_else(|| anyhow!("waiting_system failure code missing"))?,
             )
-            .bind(
-                decision
-                    .failure_signature
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("waiting_system failure signature missing"))?,
-            )
+            .bind(repeat_signature)
             .bind(strategy)
             .bind(&decision.objective_id)
             .bind(&decision.resume_cursor)
@@ -13110,6 +13113,36 @@ CREATE TABLE objectives (
         .await
         .unwrap();
         assert_eq!(workspace_terminal, ("cleanup_pending".into(), None, None));
+    }
+
+    #[tokio::test]
+    async fn m123_availability_wait_is_not_a_repeated_failure_and_keeps_exact_wake() {
+        let pool = pool().await;
+        let store = ObjectiveStore::new(pool.clone());
+        let mut current = recovery_ceiling_objective(&pool, "synthetic-m123").await;
+        let at = Utc::now().timestamp_millis() + 3_600_250;
+        for _ in 0..4 {
+            let decision = super::super::failover::ModelUnavailable {
+                resume_at_ms: Some(at),
+                notice: "当前没有可用模型：DeepSeek 18:00 起可用；届时自动继续。".into(),
+            }.decision(&current, "turn-synthetic-m123").unwrap();
+            current = store.apply_decision(current.revision, decision).await.unwrap();
+            assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
+            assert_eq!(current.next_observation_at, Some(at));
+            assert!(current.failure_signature.is_none());
+        }
+        let rows: Vec<(String, i64)> = sqlx::query_as("SELECT strategy, execution_attempt_index FROM objective_remediations WHERE objective_id=?")
+            .bind(&current.id).fetch_all(&pool).await.unwrap();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|(strategy, attempts)| strategy == "apply_recommended" && *attempts == 0));
+        let decision = super::super::failover::ModelUnavailable {
+            resume_at_ms: None, notice: "已结束：没有可用模型；请配置 OpenRouter 凭据。".into(),
+        }.decision(&current, "turn-synthetic-m123").unwrap();
+        let ended = store.apply_decision(current.revision, decision).await.unwrap();
+        assert_eq!(ended.status, ObjectiveStatus::Failed);
+        assert_eq!(ended.failure_code.as_deref(), Some("no_model_available"));
+        assert!(ended.next_observation_at.is_none());
+        assert!(ended.remediation_id.is_none());
     }
 
     async fn recovery_ceiling_objective(pool: &SqlitePool, id: &str) -> ObjectiveSnapshot {

@@ -418,6 +418,58 @@ pub struct ActiveRouteState {
     health: EndpointHealthRegistry,
 }
 
+/// M123: a preflight result, never a provider request failure.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ModelUnavailable {
+    pub resume_at_ms: Option<i64>,
+    pub notice: String,
+}
+
+impl ModelUnavailable {
+    const MARKER: &'static str = "MODEL_UNAVAILABLE:";
+
+    pub fn from_decision(decision: super::usage_windows::AvailabilityDecision) -> Self {
+        let reasons = decision.causes.iter().map(|cause| cause.sentence()).collect::<Vec<_>>().join("；");
+        Self {
+            resume_at_ms: decision.earliest_ms.map(|at| at.saturating_add(250)),
+            notice: if decision.waitable {
+                format!("当前没有可用模型：{reasons}；届时自动继续。")
+            } else {
+                format!("已结束：没有可用模型（{reasons}）；请在设置中配置凭据、调整使用时段或选择可用模型。")
+            },
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!("{}{}", Self::MARKER, serde_json::to_string(self).expect("availability serializes"))
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let (_, payload) = text.split_once(Self::MARKER)?;
+        serde_json::Deserializer::from_str(payload).into_iter::<Self>().next()?.ok()
+    }
+
+    pub fn decision(&self, current: &super::objective::ObjectiveSnapshot, root: &str) -> anyhow::Result<super::objective::DecisionEnvelope> {
+        use super::objective::{DecisionRouter, RouteSignal, RecoveryDomain, DecisionType, ObjectiveStatus};
+        let mut decision = DecisionRouter::route(current, RouteSignal::CapabilityRestored {
+            domain: RecoveryDomain::Chat,
+            reason: "no_model_available".into(),
+            next_observation_at: self.resume_at_ms.unwrap_or_default(),
+            resume_cursor: Some(root.into()),
+        })?;
+        decision.failure_signature = None;
+        if self.resume_at_ms.is_none() {
+            decision.status = ObjectiveStatus::Failed;
+            decision.decision_type = DecisionType::FailedInternal;
+            decision.remediation_id = None;
+            decision.next_observation_at = None;
+            decision.recovery_owner = None;
+            decision.next_action_authorized = false;
+        }
+        Ok(decision)
+    }
+}
+
 impl ActiveRouteState {
     pub fn from_plan(plan: RouteCandidatePlan) -> Self {
         Self::from_plan_with_health(plan, shared_endpoint_health().clone())
@@ -495,6 +547,14 @@ impl ActiveRouteState {
 
     /// Called before every POST, including retries; waits are not failures.
     pub async fn admit_usage_window(&self, cancel: Option<&AtomicBool>, ignore_windows: bool, events: Option<&dyn crate::agent::events::EventSink>) -> Result<Option<RouteChange>, String> {
+        self.admit_availability(cancel, ignore_windows, events, false).await
+    }
+
+    pub(crate) async fn admit_model_availability(&self, cancel: Option<&AtomicBool>, ignore_windows: bool, events: Option<&dyn crate::agent::events::EventSink>) -> Result<Option<RouteChange>, String> {
+        self.admit_availability(cancel, ignore_windows, events, true).await
+    }
+
+    async fn admit_availability(&self, cancel: Option<&AtomicBool>, ignore_windows: bool, events: Option<&dyn crate::agent::events::EventSink>, durable_wait: bool) -> Result<Option<RouteChange>, String> {
         let settings = self.inner.lock().expect("active route mutex poisoned").usage_settings.clone();
         let Some(settings) = settings else { return Ok(None); };
         let mut wait_notified = false;
@@ -502,7 +562,7 @@ impl ActiveRouteState {
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) { return Err("cancelled".into()); }
             let now = super::usage_windows::now_ms();
             let config = settings.read().await;
-            if config.model_usage_windows.is_empty() && config.endpoint_usage_windows.is_empty() { return Ok(None); }
+            if !durable_wait && config.model_usage_windows.is_empty() && config.endpoint_usage_windows.is_empty() { return Ok(None); }
             let delay = {
             let mut inner = self.inner.lock().expect("active route mutex poisoned");
             let from = inner.candidates[inner.current_index].clone();
@@ -588,6 +648,17 @@ impl ActiveRouteState {
             // CF-WINDOW-R5 / M86：判定"该等"还是"该报错"。时间会让时段到点、
             // 让额度重置；缺凭据不会自己好，所以它只作为原因出现，不构成等待。
             let decision = super::usage_windows::availability_decision(causes);
+            if durable_wait && !decision.causes.is_empty() {
+                let unavailable = ModelUnavailable::from_decision(decision);
+                if let Some(events) = events {
+                    events.emit(crate::openrouter::types::StreamEvent::TransportRetry {
+                        label: "等唤醒".into(), attempt: 0, max_attempts: 0,
+                        delay_ms: unavailable.resume_at_ms.map(|at| at.saturating_sub(now).max(0) as u64).unwrap_or(0),
+                        reason: unavailable.notice.clone(),
+                    });
+                }
+                return Err(unavailable.encode());
+            }
             if !decision.causes.is_empty() && decision.causes.iter().all(|cause| cause.kind == super::usage_windows::WaitCauseKind::MissingCredential) {
                 // 例如全部候选都没配凭据：等也不会变好，交给原有的传输层错误
                 // 与失败说明，不在这里空转。
@@ -1091,6 +1162,84 @@ mod tests {
             .unwrap();
         assert!(admitted.is_none(), "缺凭据需要用户动作，不能靠等");
         assert!(state.inner.lock().unwrap().failed_indices.is_empty(), "预过滤不是技术失败");
+    }
+
+    #[tokio::test]
+    async fn m123_missing_credentials_end_without_request_even_without_windows() {
+        let mut candidate = route("openrouter", "synthetic");
+        candidate.credential_ref = None;
+        candidate.legacy_inline_api_key = None;
+        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(candidate), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(Default::default())));
+        let error = state.admit_model_availability(None, false, None).await.unwrap_err();
+        let unavailable = ModelUnavailable::parse(&error).unwrap();
+        assert_eq!(unavailable.resume_at_ms, None);
+        assert!(unavailable.notice.contains("凭据"));
+        assert!(state.inner.lock().unwrap().failed_indices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn m123_waits_durably_then_admits_restored_route() {
+        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route("synthetic", "pro")), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut settings = crate::config::settings::Settings::default();
+        let key = super::super::usage_windows::model_key("synthetic", "pro");
+        let mut blocked = super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap();
+        blocked.mode = "custom".into();
+        blocked.weekdays.clear();
+        blocked.periods = vec![];
+        blocked.invert = false;
+        settings.model_usage_windows.insert(key.clone(), blocked);
+        let live = Arc::new(tokio::sync::RwLock::new(settings));
+        state.attach_usage_settings(live.clone());
+        let result = tokio::time::timeout(Duration::from_millis(100), state.admit_model_availability(None, false, None)).await.expect("must release runner, not sleep");
+        let unavailable = ModelUnavailable::parse(&result.unwrap_err()).unwrap();
+        assert!(unavailable.notice.contains("没有可用模型"));
+        live.write().await.model_usage_windows.get_mut(&key).unwrap().mode = "anytime".into();
+        assert!(state.admit_model_availability(None, false, None).await.unwrap().is_none());
+        assert!(state.inner.lock().unwrap().failures.is_empty());
+    }
+
+    #[test]
+    fn m123_earliest_recovery_across_window_quota_and_credentials() {
+        use super::super::usage_windows::{WaitCause, WaitCauseKind, availability_decision};
+        for (window, quota) in [(1800000000000, 1800001140000), (1900000000000, 1800000000000)] {
+            let decision = availability_decision(vec![
+                WaitCause::new("DeepSeek", WaitCauseKind::UsageWindow, Some(window)),
+                WaitCause::new("ChatGPT", WaitCauseKind::QuotaCap, Some(quota)),
+                WaitCause::new("OpenRouter", WaitCauseKind::MissingCredential, None),
+            ]);
+            let unavailable = ModelUnavailable::from_decision(decision);
+            assert_eq!(unavailable.resume_at_ms, Some(window.min(quota) + 250));
+            assert!(unavailable.notice.contains("DeepSeek") && unavailable.notice.contains("ChatGPT") && unavailable.notice.contains("OpenRouter"));
+            assert_eq!(ModelUnavailable::parse(&unavailable.encode()).unwrap().resume_at_ms, unavailable.resume_at_ms);
+        }
+    }
+
+    #[tokio::test]
+    async fn m123_boundary_wake_and_mixed_available_route() {
+        let _serial = super::super::usage_windows::clock_test_lock();
+        let clock = |time: &str| chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{time}:00+08:00")).unwrap().timestamp_millis();
+        let mut plan = RouteCandidatePlan::new(route("deepseek", "pro"));
+        let mut missing = route("openrouter", "synthetic");
+        missing.credential_ref = None;
+        missing.legacy_inline_api_key = None;
+        plan.push_fallback(missing);
+        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut settings = crate::config::settings::Settings::default();
+        settings.model_usage_windows.insert(super::super::usage_windows::model_key("deepseek", "pro"), super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap());
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
+        super::super::usage_windows::set_clock_override_ms(Some(clock("17:59")));
+        let error = state.admit_model_availability(None, false, None).await.unwrap_err();
+        assert_eq!(ModelUnavailable::parse(&error).unwrap().resume_at_ms, Some(clock("18:00") + 250));
+        super::super::usage_windows::set_clock_override_ms(Some(clock("18:00")));
+        assert!(state.admit_model_availability(None, false, None).await.unwrap().is_none());
+        assert_eq!(state.current().endpoint_name, "deepseek");
+        super::super::usage_windows::set_clock_override_ms(Some(clock("17:59")));
+        state.inner.lock().unwrap().candidates.push(route("available", "fallback"));
+        let change = state.admit_model_availability(None, false, None).await.unwrap().unwrap();
+        assert_eq!(change.to_endpoint, "available");
+        assert!(state.inner.lock().unwrap().failed_indices.is_empty());
+        super::super::usage_windows::set_clock_override_ms(None);
     }
 
     fn route(name: &str, model: &str) -> RouteCandidate {
