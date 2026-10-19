@@ -1001,6 +1001,7 @@ pub async fn run_agent_loop(
         gate_benchmark,
         &completion_instruction,
     );
+    let mut thin_final_evidence = None;
     let mut completion_sequence = 0_u64;
     let mut last_completion_nudge_sequence = None;
     let mut successful_local_verifications = BTreeSet::new();
@@ -1666,6 +1667,9 @@ pub async fn run_agent_loop(
                     evidence.blockers.clear();
                     evidence.blockers_structured.clear();
                     evidence.completed = true;
+                    // Preserve the same verdict at the loop/settlement boundary.
+                    // Re-reading gate.evidence() would resurrect legacy blockers.
+                    thin_final_evidence = Some(evidence.clone());
                 }
                 match crate::policy::completion_finalization(
                     &evidence,
@@ -3333,6 +3337,11 @@ pub async fn run_agent_loop(
         (total_input_tokens, total_output_tokens),
         &last_final_text,
     );
+    if outcome.stop_reason == StopReason::Finished {
+        if let Some(evidence) = thin_final_evidence {
+            outcome.completion_evidence = evidence;
+        }
+    }
     outcome.final_message_id = last_final_message_id;
     Ok(outcome)
 }
@@ -3594,6 +3603,50 @@ mod tests {
                 .push(row.request_id);
             Ok(true)
         }
+    }
+
+    struct ThinBrowserTools;
+
+    #[async_trait::async_trait]
+    impl ToolBackend for ThinBrowserTools {
+        async fn thin_mode(&self, _: &str) -> bool { true }
+        async fn list_schemas(&self) -> Vec<ToolDefinition> { vec![tool_definition()] }
+        async fn execute(&self, call: &ToolCall, args: &serde_json::Value, _: &ToolCtx)
+            -> Result<ToolInvocationResult, ToolError> {
+            let failed = args["action"] != "open";
+            Ok(ToolInvocationResult {
+                content: if failed { "browser command rejected" } else { "Example Domain" }.into(),
+                is_error: failed,
+                status: if failed { crate::tool::ToolExecutionStatus::Error } else { crate::tool::ToolExecutionStatus::Done },
+                command: format!("{} {}", call.function.name, args["action"]),
+                kind: ToolKind::Mutation, return_code: Some(if failed { 1 } else { 0 }),
+                stdout: String::new(), stderr: String::new(),
+                error: failed.then(|| "browser command rejected".into()), metadata: None,
+                next_working_directory: None, duration_ms: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn thin_browser_error_final_answer_is_accepted_once() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response("", vec![call("open", "browser_session", serde_json::json!({"action":"open","url":"https://example.com"}))], 0),
+            response("", vec![call("tabs", "browser_session", serde_json::json!({"action":"tabs"}))], 1),
+            response("Example Domain；后续命令报错，已说明。", vec![], 2),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let mut svc = services(transport.clone(), persistence.clone(), Arc::new(CollectingEventSink::new()));
+        svc.tools = Arc::new(ThinBrowserTools);
+        let mut cfg = config();
+        cfg.max_iterations = 8;
+        let outcome = run_agent_loop(inputs(), cfg, svc).await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Finished);
+        assert!(outcome.completion_evidence.completed, "{:?}", outcome.completion_evidence);
+        assert!(outcome.completion_evidence.blockers.is_empty());
+        assert_eq!(transport.requests().len(), 3, "no repeated final answer");
+        assert_eq!(persistence.messages.lock().unwrap().iter().filter(|(role, text, _)|
+            role == "assistant" && text.starts_with("Example Domain")).count(), 1);
+        assert!(!persistence.notices.lock().unwrap().iter().any(|(kind, _)| kind == "gate_recovery"));
     }
 
     struct ScriptedTools;

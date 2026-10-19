@@ -1697,9 +1697,8 @@ async fn apply_chat_objective_outcome(
     .bind(root_turn_id)
     .fetch_optional(db)
     .await?;
-    // Phase-1 P0-3: thin sessions answer read-only/local work and are done —
-    // the legacy evidence pack is an automation-mode contract. Delivery/Live
-    // still go through the legacy arbiter, which demands a receipt.
+    // Thin accepts final answers after the external-wait guard; legacy
+    // alone retains objective-kind evidence/receipt requirements.
     let thin = match current.session_id.as_deref() {
         Some(session_id) => crate::agent::thin::is_thin(db, session_id).await,
         None => false,
@@ -4235,13 +4234,16 @@ mod tests {
     async fn thin_settlement_persists_completed_or_nonfailure_wake_wait() {
         use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain};
         use codefactory_agent_loop::run::{RunOutcome, StopReason};
-        for waiting in [false, true] {
+        for (kind, waiting) in [
+            (ObjectiveKind::LocalMutation, false), (ObjectiveKind::LocalMutation, true),
+            (ObjectiveKind::Delivery, false), (ObjectiveKind::Live, false),
+        ] {
             let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
             sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('synthetic-settle','synthetic','/synthetic','model',1,1,'thin')")
                 .execute(&pool).await.unwrap();
             let store = ObjectiveStore::new(pool.clone());
             let current = store.create(CreateObjective {
-                id: "synthetic-settle-objective".into(), kind: ObjectiveKind::LocalMutation,
+                id: "synthetic-settle-objective".into(), kind,
                 session_id: Some("synthetic-settle".into()), root_turn_id: Some("synthetic-root".into()),
                 domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
             }).await.unwrap();
