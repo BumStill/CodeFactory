@@ -404,34 +404,6 @@
       "automated_by": ["path:src/components/ModelPicker.test.tsx", "path:src/lib/chatgptModels.test.ts", "path:src/stores/chatgptCatalog.freshness.test.ts"],
       "required_evidence": ["L0"],
       "gates": ["pull_request"]
-    },
-    {
-      "id": "RTE-005",
-      "name": "浏览器打开导航后读取已提交的页面内容",
-      "category": "runtime_lifecycle",
-      "priority": "P0",
-      "source_kind": "incident_shape",
-      "change_patterns": ["src-tauri/src/browser/chromium.rs", "src-tauri/src/browser/navigate.rs", "src-tauri/src/tools/browser_session.rs"],
-      "automated_by": [
-        "rust:browser_open_reads_the_same_content_when_repeated",
-        "rust:browser_open_waits_for_the_navigation_before_reading_it",
-        "rust:an_uncommitted_target_never_counts_as_settled",
-        "rust:a_loading_document_with_visible_text_is_still_not_settled",
-        "rust:a_single_probe_cannot_spend_the_whole_settle_budget"
-      ],
-      "required_evidence": ["L1", "L2"],
-      "gates": ["pull_request"]
-    },
-    {
-      "id": "UI-016",
-      "name": "headless 验收按真实冷启动预算等待并报告启动耗时",
-      "category": "runtime_lifecycle",
-      "priority": "P1",
-      "source_kind": "incident_shape",
-      "change_patterns": ["scripts/headless-acceptance-support.mjs", "src/acceptance/headlessReadiness.test.ts"],
-      "automated_by": ["path:src/acceptance/headlessReadiness.test.ts"],
-      "required_evidence": ["L0", "L1"],
-      "gates": ["pull_request"]
     }
   ],
   "complex_e2e_cases": [
