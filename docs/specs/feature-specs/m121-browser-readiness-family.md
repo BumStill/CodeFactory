@@ -39,7 +39,8 @@
 
 ## 4. 验收
 
-1. `node --test scripts/headless-acceptance-readiness.test.mjs` — helper 语义 + 家族守卫。
+1. `npx vitest run src/acceptance/headlessReadiness.test.ts` — helper 语义 + 家族守卫；变异测试（临时注入 `goto` 后 10s 等待）会让守卫按预期失败并报出行号。
 2. `cargo test browser_open_waits_for_the_navigation` — 修复前失败、修复后通过。
 3. 同一 PR 上 `execute-windows` 连续多次重跑全绿（每次冷 runner，PR 内证据）。
 4. `verify-startup-session-headless.mjs`、`verify-turn-handback-headless.mjs` 在本机真实浏览器跑通，boot 耗时出现在日志里。
+5. 重复冷启动实测（同一脚本连续 3 次）：`[acceptance] boot 36ms / 42ms / 35ms (budget 60000ms)` —— 60s 预算相对真实启动有一到两个数量级余量，10s 断言预算从来不够的结论由此得到数据支撑。
