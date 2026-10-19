@@ -1176,6 +1176,19 @@ mod tests {
         assert!(driver.click("codefactory-nope", "ref_1").await.is_err());
     }
 
+    #[test]
+    fn page_creation_gets_a_launch_class_budget() {
+        // Creating a target is a launch-class action, not an operation: on a cold
+        // runner `Target.createTarget` took over two minutes to answer, so the 30s
+        // operation budget turned a slow start into a hard failure. The two budgets
+        // must stay distinct, and the launch one must stay the larger.
+        assert!(
+            PAGE_CREATE_TIMEOUT > OP_TIMEOUT,
+            "page creation must not inherit the operation budget"
+        );
+        assert_eq!(PAGE_CREATE_TIMEOUT, Duration::from_secs(60));
+    }
+
     #[tokio::test]
     async fn closing_an_unknown_session_succeeds_so_cleanup_can_always_run() {
         let driver = ChromiumDriver::new();

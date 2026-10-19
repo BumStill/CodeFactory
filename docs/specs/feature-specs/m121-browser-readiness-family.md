@@ -20,7 +20,7 @@
 | R2 | 统一修复 | `scripts/headless-acceptance-support.mjs` 提供 `gotoScenario` / `waitForAppBoot`：**boot 预算**（`APP_BOOT_BUDGET_MS`，默认 60s，可 `CF_HEADLESS_BOOT_BUDGET_MS` 覆盖）只覆盖"文档加载 + 应用外壳挂载"，**断言预算**（`ASSERTION_BUDGET_MS` = 10s）对启动后的每一次产品断言保持不变。boot 耗时会打印 `[acceptance] boot <ms>ms (budget <ms>ms)`，预算因此是被测量的，不是被猜的。超时会输出 DOM 轮廓、`document.body` 片段、console/pageerror/失败请求。 |
 | R3 | Managed 浏览器语义 | `open` 在返回前等待文档 committed + 完成加载：轮询 `document.readyState`，要求 href 已提交且（`complete` 或有非空可见文本的 `interactive`），上限 20s；超时错误带上最后一次观测到的 `readyState/href/文本`。 |
 | R4 | 重复验证 | `scenario-execution.yml` 新增 `execute-windows-soak`：带 `flake-soak` 标签的 PR 在同一 job 内把同一批 Windows 目标连续跑 5 次（第一次付冷启动，后四次复用同一构建缓存），任何一次失败即失败。默认 PR 不产生额外成本，也不改变任何必需检查。 |
-
+| R5 | 启动级预算的归属（本 PR 的 CI 发现） | 同一因果形状在 Rust 侧"创建页面"上也成立：`Target.createTarget` 属**启动级**动作，冷 runner 上实测 2 分钟仍未返回，沿用 30s 操作预算会直接超时。因此 `chromium.rs` 把预算分成两类：`PAGE_CREATE_TIMEOUT`（60s，启动级，只用于建页）与 `OP_TIMEOUT`（30s，操作级，用于 connect/evaluate/find_element）。该缺陷由本 PR 自身的 `check-rust`（Windows 冷 runner）在 `thin_browser_open_reaches_driver_without_receipt` 上暴露，属于"修好导航提交窗口后，把同类窗口的下一个受害者暴露出来"，而不是新的偶发。 |
 ### 预算不是"调大超时"
 
 - 被替换的是**导航后的第一次等待**，语义是"进程启动完成"，不是产品断言。
@@ -33,6 +33,7 @@
 - `scripts/headless-acceptance-support.mjs`：新增 `observePage` / `describePageState` / `waitForAppBoot` / `gotoScenario` / `APP_BOOT_BUDGET_MS` / `ASSERTION_BUDGET_MS`。
 - `src/acceptance/headlessReadiness.test.ts`：预算归属、诊断输出、家族守卫（由 `pnpm test` 自动执行）。
 - 19 处 boot 等待改为共享 helper，涉及 15 个验收脚本（含本 family 点名的 startup-session、turn-handback）。
+- `src-tauri/src/browser/chromium.rs`：预算分两级——`PAGE_CREATE_TIMEOUT`（60s，启动级，只用于 `new_page`）与 `OP_TIMEOUT`（30s，操作级，用于 connect/evaluate/find_element/snapshot），并由 `page_creation_gets_a_launch_class_budget` 守卫两者不得合并回去。
 - `src-tauri/src/browser/chromium.rs`：`open` 读取前等待导航提交，等待分两段——先用 `Target.targetInfo`（不依赖执行上下文，不会被导航期间的上下文切换挂住）等提交，再用有界 JS 探针等文档就绪；任一探针超时 2s 就重试，因此失败信息是"最后看到的 url/readyState"而不是一个笼统的 30s 操作超时。
 - `src-tauri/src/tools/browser_session.rs`：延迟 body 的确定性复现测试。
 - 重复验证不放工作流改动：`.github/workflows/*` 属于受信 scenario gate 根，普通 PR 自改会被 `scenario-gate-pr` 拒绝（本次已验证该拒绝生效）。因此 R4 的重复证据通过在同一 PR 上多次重跑 `execute-windows`（每次都是全新冷 runner）取得，而不是新增 job。
@@ -44,3 +45,4 @@
 3. 同一 PR 上 `execute-windows` 连续多次重跑全绿（每次冷 runner，PR 内证据）。
 4. `verify-startup-session-headless.mjs`、`verify-turn-handback-headless.mjs` 在本机真实浏览器跑通，boot 耗时出现在日志里。
 5. 重复冷启动实测（同一脚本连续 3 次）：`[acceptance] boot 36ms / 42ms / 35ms (budget 60000ms)` —— 60s 预算相对真实启动有一到两个数量级余量，10s 断言预算从来不够的结论由此得到数据支撑。
+6. `cargo test --lib browser::chromium` — 13 项全绿，含新增的 `page_creation_gets_a_launch_class_budget`（断言建页预算严格大于操作预算且为 60s）；全量 `cargo test --lib` 在最终 head 上 1767 项全绿。
