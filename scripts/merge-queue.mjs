@@ -225,6 +225,41 @@ export function versionBumpHandoff(title) {
   return /\bbump version to\b/i.test(t) || /^chore:\s*bump version\b/i.test(t);
 }
 
+/** M120: one deliberate dispatch per drain, pinned to its final merged head. */
+export async function releaseMergedBatch(adapter, merged) {
+  if (!merged.length) return;
+  const immediate = [];
+  try {
+    for (const entry of merged) {
+      const message = (await adapter.commitMessage(entry.sha)).trimEnd();
+      const footer = message.split(/\r?\n\s*\r?\n/).at(-1);
+      if (footer.split(/\r?\n/).some((line) => {
+        const colon = line.indexOf(':');
+        return colon >= 0 && line.slice(0, colon).trim().toLowerCase() === 'release-urgency'
+          && line.slice(colon + 1).trim().toLowerCase() === 'immediate';
+      })) immediate.push(entry);
+    }
+    if (!immediate.length) return;
+    const head = merged.at(-1).sha;
+    const plan = await adapter.releasePlan(head);
+    if (plan.hold > 0 || plan.invalid_urgency > 0) {
+      for (const entry of immediate) await adapter.comment(entry.number,
+        `Merge queue did not dispatch Auto Release: guarded batch at ${head} ` +
+        `contains ${plan.hold} hold and ${plan.invalid_urgency} invalid urgency trailer(s). ` +
+        'Review the complete batch before explicitly using allow_guarded_batch=true.');
+      return;
+    }
+    await adapter.dispatchRelease(head);
+  } catch (error) {
+    // Also report scan failures: missing evidence must never silently release.
+    for (const entry of immediate.length ? immediate : merged) {
+      await adapter.comment(entry.number,
+        `Merge queue Auto Release dispatch/check failed: ${String(error.message ?? error)}`);
+    }
+    throw error; // CLI exits nonzero; never let the per-PR merge catch swallow it.
+  }
+}
+
 /**
  * Run the queue against an adapter, one merge at a time.
  *
@@ -235,6 +270,7 @@ export function versionBumpHandoff(title) {
  */
 export async function runQueue(adapter, { stopRequested, maxIterations = 100, initialPrs = null } = {}) {
   const outcomes = [];
+  const mergedEntries = [];
   const seen = new Set();
   let iterations = 0;
   // R8(b): the caller may hand over the snapshot it already fetched (the
@@ -311,6 +347,7 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100, in
     });
     if (result.merged) {
       outcomes.push({ number: target.number, status: 'merged', sha: result.sha });
+      mergedEntries.push({ number: target.number, sha: result.sha });
       seen.add(target.number);
       continue;
     }
@@ -322,6 +359,9 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100, in
       outcomes.push({ number: head.number, status: 'error', reason: String(error.message ?? error) });
     }
   }
+  // M120: merges that landed in THIS drain may authorize one release. This is
+  // outside the per-PR catch above, so a dispatch failure fails the queue run.
+  await releaseMergedBatch(adapter, mergedEntries);
   return outcomes;
 }
 
@@ -482,6 +522,25 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
     },
     async refreshPr(number) {
       return prView(number);
+    },
+    // M120(a): the merged commit on main is the release decision source.
+    async commitMessage(sha) {
+      const body = JSON.parse(run(['gh', 'api', `repos/${repo}/commits/${sha}`]));
+      return body?.commit?.message ?? '';
+    },
+    // M120(b): reuse the release planner so the queue and Auto Release can
+    // never disagree about hold/invalid guards.
+    async releasePlan(sha) {
+      const lastTag = run(['git', 'describe', '--tags', '--abbrev=0', '--match', 'v*']).trim();
+      const raw = run(['python3', 'tools/release/plan_release.py', '--range', `${lastTag}..${sha}`]);
+      return JSON.parse(raw);
+    },
+    async dispatchRelease(sha) {
+      run(['gh', 'workflow', 'run', 'auto-release.yml', '--repo', repo, '--ref', 'main',
+        '-f', `expected_head_sha=${sha}`]);
+    },
+    async comment(number, body) {
+      run(['gh', 'pr', 'comment', String(number), '--repo', repo, '--body', body]);
     },
     async updateBranch(number, expectedHead) {
       run([

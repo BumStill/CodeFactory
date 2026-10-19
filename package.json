@@ -8,6 +8,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "cargo:shared": "node scripts/cargo-shared.mjs",
+    "test:merge-queue": "node --test scripts/merge-queue.test.mjs",
     "test:cargo-shared": "node --test scripts/cargo-shared.test.mjs",
     "build-cache": "node scripts/build-cache-budget.mjs",
     "build-cache:enforce": "node scripts/build-cache-budget.mjs --enforce",
