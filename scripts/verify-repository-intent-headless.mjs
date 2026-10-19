@@ -9,6 +9,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario, waitForAppBoot } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -69,9 +70,11 @@ async function stopServer(child) {
 }
 
 async function assertWorkspace(page, tag) {
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   const conversation = page.getByRole("main", { name: "会话窗口" });
-  await conversation.waitFor({ timeout: 10_000 });
+  await gotoScenario(page, baseUrl, {
+    landmark: conversation,
+    label: `[${tag}] repository intent workspace shell`,
+  });
   const header = page.getByRole("banner", { name: "会话工具栏" });
   const sidebar = page.getByRole("complementary", { name: "会话列表" });
   await header.waitFor();
@@ -154,13 +157,17 @@ async function assertWorkspace(page, tag) {
   await page.screenshot({ path: path.join(artifactDir, `${tag}-collapsed.png`), fullPage: true });
 
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("main", { name: "会话窗口" }).waitFor({ timeout: 10_000 });
+  await waitForAppBoot(page, page.getByRole("main", { name: "会话窗口" }), {
+    label: `[${tag}] workspace shell after reload`,
+  });
   assert((await page.getByRole("complementary", { name: "会话列表" }).count()) === 0, `[${tag}] collapsed state did not persist across reload`);
   await page.getByRole("banner", { name: "会话工具栏" }).getByRole("button", { name: "展开会话侧栏" }).click();
   await page.getByRole("complementary", { name: "会话列表" }).waitFor();
   assert((await page.getByRole("button", { name: "新建会话", exact: true }).count()) === 1, `[${tag}] restored sidebar changed the single new-session entry contract`);
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("complementary", { name: "会话列表" }).waitFor({ timeout: 10_000 });
+  await waitForAppBoot(page, page.getByRole("complementary", { name: "会话列表" }), {
+    label: `[${tag}] restored sidebar after reload`,
+  });
   assert((await page.getByRole("complementary", { name: "会话列表" }).getByRole("button", { name: "收起会话侧栏" }).count()) === 1, `[${tag}] expanded state did not persist across reload`);
   await page.screenshot({ path: path.join(artifactDir, `${tag}.png`), fullPage: true });
 }

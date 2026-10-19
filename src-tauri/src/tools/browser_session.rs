@@ -1496,6 +1496,11 @@ async fn reclaim_expired(pool: Option<&sqlx::SqlitePool>) {
 mod tests {
     use super::*;
 
+    /// The real-browser tests all use the synthetic owner session, so they
+    /// must not run against each other: `close_all` from one test would close
+    /// a sibling's page and make cleanup counts depend on scheduler order.
+    static BROWSER_SESSION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn mode_ctx(mode: &str) -> ExecCtx {
         let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql("CREATE TABLE sessions (id TEXT PRIMARY KEY, kind TEXT, delivery_mode TEXT);")
@@ -1509,6 +1514,7 @@ mod tests {
 
     #[tokio::test]
     async fn thin_browser_open_reaches_driver_without_receipt() {
+        let _serial = BROWSER_SESSION_TEST_LOCK.lock().await;
         let ctx = mode_ctx("thin").await;
         // A real local fixture, not a remote site or a production session.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1520,6 +1526,10 @@ mod tests {
             use std::io::{Read, Write};
             while !server_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    // Windows may inherit the listener's nonblocking mode.
+                    // Read the request before replying, rather than treating
+                    // WouldBlock as an HTTP request and racing Chrome.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
                     let mut request = [0; 4096];
                     let _ = stream.read(&mut request);
@@ -1537,6 +1547,105 @@ mod tests {
         assert_eq!(output.status, super::super::ToolExecutionStatus::Done, "{output:?}");
         assert!(output.content.contains("Thin Browser Fixture"), "{output:?}");
         assert!(output.content.contains("Receipt-free navigation works"));
+        assert_eq!(cleanup, 1);
+    }
+
+    /// R3 repeatability: opening the same URL twice must read the same
+    /// settled document both times, not "first call settles, second call
+    /// returns whatever the page happens to be showing".
+    #[tokio::test]
+    async fn browser_open_reads_the_same_content_when_repeated() {
+        let _serial = BROWSER_SESSION_TEST_LOCK.lock().await;
+        let ctx = mode_ctx("thin").await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request);
+                let body = "<html><head><title>Repeat Fixture</title></head><body><h1>Same document twice</h1></body></html>";
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let first = execute(json!({"action":"open", "url":format!("http://{address}/repeat")}), &ctx)
+            .await
+            .unwrap();
+        let second = execute(json!({"action":"open", "url":format!("http://{address}/repeat")}), &ctx)
+            .await
+            .unwrap();
+        let cleanup = close_all_for_owner_session("synthetic-browser").await;
+        // Each `open` owns its own Managed session — the second open is a
+        // second session, not a re-use — so two are torn down here.
+        assert_eq!(cleanup, 2);
+        assert_eq!(first.status, super::super::ToolExecutionStatus::Done, "{first:?}");
+        assert_eq!(second.status, super::super::ToolExecutionStatus::Done, "{second:?}");
+        assert!(first.content.contains("Same document twice"), "{first:?}");
+        let body = |content: &str| content.splitn(2, "\n---\n").nth(1).unwrap_or_default().to_string();
+        assert_eq!(body(&first.content), body(&second.content), "repeated open must be stable");
+        drop(server);
+    }
+
+    /// Deterministic reproducer for the M121 family on a cold runner.
+    ///
+    /// The fixture commits its response headers, then stalls before the body.
+    /// `Target.createTarget` resolves while that navigation is still in
+    /// flight, so an `open` that reads the DOM straight after creating the
+    /// page sees about:blank — exactly the empty-content session a cold
+    /// `windows-latest` runner produced, which then passed on a warm rerun.
+    #[tokio::test]
+    async fn browser_open_waits_for_the_navigation_before_reading_it() {
+        let _serial = BROWSER_SESSION_TEST_LOCK.lock().await;
+        let ctx = mode_ctx("thin").await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !server_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    // One thread per connection: chromium opens a preconnect in
+                    // parallel with the request, and a serial accept loop would
+                    // leave that second socket unread for the whole body delay.
+                    std::thread::spawn(move || {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                        let mut request = [0; 4096];
+                        // A preconnect with no request is not an HTTP request.
+                        let count = match stream.read(&mut request) {
+                            Ok(count) if count > 0 => count,
+                            _ => return,
+                        };
+                        assert!(request[..count].starts_with(b"GET "));
+                        let body = "<html><head><title>Slow Fixture Committed</title></head><body><h1>Navigation settled before the read</h1></body></html>";
+                        // Headers first, body deliberately late.
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let _ = stream.flush();
+                        std::thread::sleep(Duration::from_millis(750));
+                        let _ = write!(stream, "{body}");
+                    });
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+        let output = execute(json!({"action":"open", "url":format!("http://{address}/slow")}), &ctx)
+            .await
+            .unwrap();
+        let cleanup = close_all_for_owner_session("synthetic-browser").await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(output.status, super::super::ToolExecutionStatus::Done, "{output:?}");
+        assert!(
+            output.content.contains("Slow Fixture Committed"),
+            "open must read the committed document, not about:blank: {output:?}"
+        );
+        assert!(output.content.contains("Navigation settled before the read"), "{output:?}");
         assert_eq!(cleanup, 1);
     }
 

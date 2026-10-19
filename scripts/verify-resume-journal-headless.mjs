@@ -12,6 +12,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -125,9 +126,11 @@ process.once("SIGINT", () => { void shutdownFromSignal("SIGINT"); });
 process.once("SIGTERM", () => { void shutdownFromSignal("SIGTERM"); });
 
 async function assertResumeSurface(page, viewport, tag) {
-  await page.goto(baseUrl, { waitUntil: "networkidle" });
   const banner = page.getByTestId("resume-banner");
-  await banner.waitFor({ timeout: 10_000 });
+  await gotoScenario(page, baseUrl, {
+    landmark: banner,
+    label: `[${tag}] resume journal shell`,
+  });
 
   const bannerText = (await banner.innerText()).replace(/\s+/g, "");
   assert(bannerText.includes("已从缓存恢复3个任务"), `[${tag}] restored count missing: ${bannerText}`);

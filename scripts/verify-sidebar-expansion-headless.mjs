@@ -9,6 +9,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -57,8 +58,10 @@ async function main() {
     await waitForServer(vite);
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox"] });
     const page = await browser.newPage({ viewport: { width: 420, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-    await page.getByRole("main", { name: "Sidebar expansion acceptance" }).waitFor({ timeout: 10_000 });
+    await gotoScenario(page, baseUrl, {
+      landmark: page.getByRole("main", { name: "Sidebar expansion acceptance" }),
+      label: "sidebar expansion acceptance shell",
+    });
 
     assert((await page.getByText("CodeFactory 主线", { exact: true }).count()) === 0, "project should start collapsed when quick session is active");
     await page.getByText("CodeFactory", { exact: true }).click();

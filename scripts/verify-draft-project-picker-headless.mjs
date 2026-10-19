@@ -9,6 +9,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -57,8 +58,10 @@ async function main() {
     await waitForServer(vite);
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true, args: ["--disable-gpu", "--no-sandbox", "--no-proxy-server"] });
     const page = await browser.newPage({ viewport: { width: 375, height: 812 } });
-    await page.goto(baseUrl, { waitUntil: "networkidle" });
-    await page.getByRole("main", { name: "Draft project picker acceptance" }).waitFor({ timeout: 10_000 });
+    await gotoScenario(page, baseUrl, {
+      landmark: page.getByRole("main", { name: "Draft project picker acceptance" }),
+      label: "draft project picker acceptance shell",
+    });
     const compactGeometry = await page.evaluate(() => {
       const control = document.querySelector('[data-testid="message-input-control-row"]');
       const toolbar = document.querySelector('[data-testid="composer-utility-toolbar"]');
