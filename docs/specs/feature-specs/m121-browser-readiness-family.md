@@ -33,7 +33,7 @@
 - `scripts/headless-acceptance-support.mjs`：新增 `observePage` / `describePageState` / `waitForAppBoot` / `gotoScenario` / `APP_BOOT_BUDGET_MS` / `ASSERTION_BUDGET_MS`。
 - `src/acceptance/headlessReadiness.test.ts`：预算归属、诊断输出、家族守卫（由 `pnpm test` 自动执行）。
 - 19 处 boot 等待改为共享 helper，涉及 15 个验收脚本（含本 family 点名的 startup-session、turn-handback）。
-- `src-tauri/src/browser/chromium.rs`：`open` 读取前等待导航提交。
+- `src-tauri/src/browser/chromium.rs`：`open` 读取前等待导航提交，等待分两段——先用 `Target.targetInfo`（不依赖执行上下文，不会被导航期间的上下文切换挂住）等提交，再用有界 JS 探针等文档就绪；任一探针超时 2s 就重试，因此失败信息是"最后看到的 url/readyState"而不是一个笼统的 30s 操作超时。
 - `src-tauri/src/tools/browser_session.rs`：延迟 body 的确定性复现测试。
 - 重复验证不放工作流改动：`.github/workflows/*` 属于受信 scenario gate 根，普通 PR 自改会被 `scenario-gate-pr` 拒绝（本次已验证该拒绝生效）。因此 R4 的重复证据通过在同一 PR 上多次重跑 `execute-windows`（每次都是全新冷 runner）取得，而不是新增 job。
 
