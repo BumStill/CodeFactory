@@ -209,8 +209,9 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     if let (Some(db), Some(session_id)) = (&ctx.db, &ctx.session_id) {
         if crate::agent::thin::is_thin(db, session_id).await {
-            let ceiling = requested_ceiling.map(|requested| settings.delivery_ceiling.clamp_request(requested))
-                .unwrap_or(settings.delivery_ceiling);
+            // Thin tasks finish the session-authorized delivery, even when a
+            // model accidentally asks to stop at an earlier checkpoint.
+            let ceiling = settings.delivery_ceiling;
             return super::delivery_thin::execute(&args, ctx, ceiling, &settings.delivery_exclude_globs).await;
         }
     }
