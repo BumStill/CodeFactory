@@ -52,6 +52,17 @@ const LAUNCH_WATCHDOG: Duration = Duration::from_secs(75);
 /// Any single page operation. Generous enough for a slow site, short enough
 /// that a wedged page surfaces as an error instead of hanging the turn.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a freshly created page gets to commit and finish its initial
+/// load before `open` reports what it last observed instead of returning an
+/// empty document.
+const PAGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Readiness probe; returns JSON so the caller can distinguish "committed but
+/// still loading" from about:blank.
+const PAGE_SETTLE_PROBE: &str = r#"(() => JSON.stringify({
+  state: document.readyState,
+  href: location.href,
+  text: (document.body ? document.body.innerText : "").slice(0, 120)
+}))()"#;
 
 /// The marker every "the browser would not start" message carries.
 ///
@@ -393,6 +404,39 @@ async fn timeout<T, E: std::fmt::Display>(
     }
 }
 
+/// Wait until `page` has committed `requested` and finished its initial load.
+///
+/// Polls `document.readyState` instead of listening for a navigation event:
+/// the event may already have fired by the time this runs, and a missed event
+/// must not hang the caller. `interactive` is accepted only when the body
+/// already has visible text, so an SPA that is still fetching modules is not
+/// reported as ready with an empty document.
+async fn wait_for_document_settled(page: &Page, requested: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + PAGE_SETTLE_TIMEOUT;
+    let mut last = String::from("no observation");
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(raw) = ChromiumDriver::eval_with_script(page, PAGE_SETTLE_PROBE.to_string()).await {
+            last = raw.clone();
+            if let Ok(observed) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let state = observed["state"].as_str().unwrap_or_default();
+                let href = observed["href"].as_str().unwrap_or_default();
+                let text = observed["text"].as_str().unwrap_or_default();
+                let committed = !href.is_empty() && href != "about:blank";
+                let settled =
+                    state == "complete" || (state == "interactive" && !text.trim().is_empty());
+                if committed && settled {
+                    return Ok(());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(AppError::Other(format!(
+        "The page did not settle on {requested} within {}s: {last}",
+        PAGE_SETTLE_TIMEOUT.as_secs()
+    )))
+}
+
 #[async_trait]
 impl BrowserDriver for ChromiumDriver {
     async fn open(&self, session_id: &str, url: &str, scope: &ProfileScope) -> Result<PageContent> {
@@ -586,6 +630,18 @@ impl BrowserDriver for ChromiumDriver {
             _scratch: scratch,
             profile_dir: profile_dir.clone(),
         };
+
+        // `Target.createTarget` resolves when the page exists, not when the
+        // requested document has committed and settled. Reading straight after
+        // it can observe a document that is still loading — wide enough on a
+        // cold windows-latest runner to surface as "session exists but no page
+        // content". `open` therefore returns only once the navigation it
+        // started has settled, and says what it last saw when it cannot.
+        if let Err(error) = wait_for_document_settled(&live.page, url).await {
+            let _ = authorizer.unknown().await;
+            let _ = teardown(&mut live, session_id).await;
+            return Err(error);
+        }
 
         let content = match Self::eval_with_script(&live.page, page_script::readable_expression())
             .await

@@ -118,6 +118,75 @@ jobs:
           path: runner-receipt.json
           if-no-files-found: error
 
+  # M121 flake soak: a cold-runner timeout is only disproved by repetition in
+  # ordinary conditions, so the same Windows targets run five times inside one
+  # job (the first pass pays the cold build, the next four reuse it). Opt-in
+  # with the `flake-soak` PR label so day-to-day PRs pay nothing, and never a
+  # substitute for execute-windows — it is extra evidence, not a gate change.
+  execute-windows-soak:
+    needs: plan
+    if: ${{ needs.plan.outputs.run_windows == 'true' && contains(github.event.pull_request.labels.*.name, 'flake-soak') }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout trusted base policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: policy
+          persist-credentials: false
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: affected-scenario-plan
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        if: ${{ needs.plan.outputs.windows_node == 'true' }}
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        if: ${{ needs.plan.outputs.windows_node == 'true' }}
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: candidate/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        if: ${{ needs.plan.outputs.windows_node == 'true' }}
+        working-directory: candidate
+        run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ needs.plan.outputs.windows_rust == 'true' }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ needs.plan.outputs.windows_rust == 'true' }}
+        with:
+          workspaces: candidate/src-tauri
+      - name: Execute affected Windows targets five times
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            echo "::group::flake soak attempt ${attempt}"
+            python policy/tools/governance/scenario_execution.py execute \
+              --plan scenario-plan.json \
+              --repo candidate \
+              --runner windows-latest \
+              --output "runner-receipt-soak-${attempt}.json"
+            echo "::endgroup::"
+          done
+      - name: Upload soak receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-soak-windows-attempt-${{ github.run_attempt }}
+          path: runner-receipt-soak-*.json
+          if-no-files-found: warn
+
   execute-macos:
     needs: plan
     if: ${{ needs.plan.outputs.run_macos == 'true' }}

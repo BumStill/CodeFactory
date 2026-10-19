@@ -9,7 +9,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
-import { allocateLoopbackPort, waitForAcceptanceDocument, waitForFocused } from "./headless-acceptance-support.mjs";
+import { allocateLoopbackPort, gotoScenario, waitForAcceptanceDocument, waitForFocused } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -80,8 +80,10 @@ async function main() {
     await waitForAcceptanceDocument(vite, baseUrl, "permission-mode.tsx");
     browser = await chromium.launch({ executablePath: await firstBrowser(), headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
-    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-    await page.getByRole("main", { name: "Permission mode acceptance" }).waitFor({ timeout: 10_000 });
+    await gotoScenario(page, baseUrl, {
+      landmark: page.getByRole("main", { name: "Permission mode acceptance" }),
+      label: "permission mode acceptance shell",
+    });
 
     const modeTrigger = page.getByRole("button", { name: /会话权限：标准/ });
     await modeTrigger.waitFor();

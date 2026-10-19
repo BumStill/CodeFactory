@@ -14,6 +14,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
+import { gotoScenario } from "./headless-acceptance-support.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const entry = path.join(root, "src", "acceptance", "session-background-tasks.tsx");
@@ -117,8 +118,10 @@ async function main() {
       args: ["--disable-gpu", "--no-sandbox", "--no-proxy-server", "--proxy-bypass-list=*"],
     });
     const page = await browser.newPage({ viewport: { width: 1366, height: 768 } });
-    await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "domcontentloaded" });
-    await page.getByRole("main", { name: "Session background tasks acceptance" }).waitFor({ timeout: 15_000 });
+    await gotoScenario(page, `http://127.0.0.1:${port}/`, {
+      landmark: page.getByRole("main", { name: "Session background tasks acceptance" }),
+      label: "background tasks acceptance shell",
+    });
 
     const screenshots = [];
     for (const theme of ["light", "dark"]) {
