@@ -1697,11 +1697,26 @@ async fn apply_chat_objective_outcome(
     .bind(root_turn_id)
     .fetch_optional(db)
     .await?;
-    let decision = crate::agent::objective::decision_for_run_outcome_with_reason(
-        &current,
-        outcome,
-        terminal_reason.as_deref(),
-    )
+    // Phase-1 P0-3: thin sessions answer read-only/local work and are done —
+    // the legacy evidence pack is an automation-mode contract. Delivery/Live
+    // still go through the legacy arbiter, which demands a receipt.
+    let thin = match current.session_id.as_deref() {
+        Some(session_id) => crate::agent::thin::is_thin(db, session_id).await,
+        None => false,
+    };
+    let decision = if thin {
+        crate::agent::objective::decision_for_thin_run_outcome_with_reason(
+            &current,
+            outcome,
+            terminal_reason.as_deref(),
+        )
+    } else {
+        crate::agent::objective::decision_for_run_outcome_with_reason(
+            &current,
+            outcome,
+            terminal_reason.as_deref(),
+        )
+    }
     .map_err(|error| AppError::Other(error.to_string()))?;
     // CF-TRUTH-R3/R4: an ownership handoff (or any other internal interruption)
     // must not be recorded as the user pressing stop. The run only counts as a

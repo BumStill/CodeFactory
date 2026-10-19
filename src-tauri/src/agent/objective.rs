@@ -1397,8 +1397,33 @@ impl CompletionArbiter {
         objective: &ObjectiveSnapshot,
         evidence: &[ObjectiveEvidence],
     ) -> anyhow::Result<DecisionEnvelope> {
+        Self::decide_accepting(objective, evidence, false)
+    }
+
+    /// Thin sessions (phase-1 P0-3) accept a plain answer as completion for
+    /// read-only and local work. Delivery/Live are untouched here: saying it
+    /// shipped is not shipping, so their receipts stay mandatory.
+    pub fn decide_thin(
+        objective: &ObjectiveSnapshot,
+        evidence: &[ObjectiveEvidence],
+    ) -> anyhow::Result<DecisionEnvelope> {
+        let thin_satisfied = matches!(
+            objective.kind,
+            ObjectiveKind::Informational | ObjectiveKind::LocalMutation
+        ) && evidence
+            .iter()
+            .any(|item| item.kind == EvidenceKind::InformationalAnswer);
+        Self::decide_accepting(objective, evidence, thin_satisfied)
+    }
+
+    fn decide_accepting(
+        objective: &ObjectiveSnapshot,
+        evidence: &[ObjectiveEvidence],
+        additionally_satisfied: bool,
+    ) -> anyhow::Result<DecisionEnvelope> {
         let has = |kind| evidence.iter().any(|item| item.kind == kind);
-        let satisfied = match objective.kind {
+        let satisfied = additionally_satisfied
+            || match objective.kind {
             ObjectiveKind::Informational => {
                 has(EvidenceKind::InformationalAnswer) || has(EvidenceKind::CurrentStateAcceptance)
             }
@@ -1442,6 +1467,57 @@ pub fn decision_for_run_outcome(
     outcome: &codefactory_agent_loop::run::RunOutcome,
 ) -> anyhow::Result<DecisionEnvelope> {
     decision_for_run_outcome_with_reason(objective, outcome, None)
+}
+
+/// Thin sessions (phase-1 P0-3): a read-only or local task is done once the
+/// model has answered and nothing external is still in flight.
+///
+/// Thin runs never reach settlement while a PR/CI/release/background job is
+/// still pending — the in-run R5 hint makes the model arm a wake source and
+/// keeps waiting — so a `Finished` outcome with final text here means the work
+/// is actually over. Requiring the legacy evidence pack at that point leaves
+/// the objective in `waiting_system` forever (7f531297, v1.89.7).
+pub fn decision_for_thin_run_outcome(
+    objective: &ObjectiveSnapshot,
+    outcome: &codefactory_agent_loop::run::RunOutcome,
+) -> anyhow::Result<DecisionEnvelope> {
+    decision_for_thin_run_outcome_with_reason(objective, outcome, None)
+}
+
+/// See [`decision_for_thin_run_outcome`]. Anything that is not a finished run
+/// with a final answer keeps the legacy semantics, so thin never fakes
+/// completion for an interrupted, cancelled or empty run.
+pub fn decision_for_thin_run_outcome_with_reason(
+    objective: &ObjectiveSnapshot,
+    outcome: &codefactory_agent_loop::run::RunOutcome,
+    terminal_reason: Option<&str>,
+) -> anyhow::Result<DecisionEnvelope> {
+    use codefactory_agent_loop::run::StopReason;
+
+    if outcome.stop_reason == StopReason::Finished && !outcome.final_text.trim().is_empty() {
+        let scope = objective
+            .root_turn_id
+            .as_deref()
+            .or(objective.task_id.as_deref())
+            .unwrap_or(&objective.id)
+            .to_string();
+        let evidence = ObjectiveEvidence {
+            id: Uuid::new_v4().to_string(),
+            kind: EvidenceKind::InformationalAnswer,
+            scope,
+            digest: format!("sha256:{:x}", Sha256::digest(outcome.final_text.as_bytes())),
+            evidence_ref: outcome
+                .final_message_id
+                .clone()
+                .unwrap_or_else(|| format!("objective-run:{}:{}", objective.id, objective.revision + 1)),
+            observed_at: Utc::now().timestamp_millis(),
+            reached_acceptance: objective.requested_acceptance.clone(),
+        };
+        let mut decision = CompletionArbiter::decide_thin(objective, std::slice::from_ref(&evidence))?;
+        decision.visible_final_message_id = outcome.final_message_id.clone();
+        return Ok(decision);
+    }
+    decision_for_run_outcome_with_reason(objective, outcome, terminal_reason)
 }
 
 /// CF-TRUTH-R4 (2026-10-10): the outcome of a run the *system* stopped.
@@ -12187,6 +12263,86 @@ CREATE TABLE objectives (
         assert!(!resumed.requires_user_action);
         assert_eq!(resumed.resume_cursor.as_deref(), Some("turn-auth"));
         assert!(resumed.next_observation_at.is_some());
+    }
+
+    fn thin_outcome(text: &str, stop_reason: StopReason) -> RunOutcome {
+        RunOutcome {
+            final_text: text.into(),
+            final_message_id: Some("assistant-thin".into()),
+            completion_evidence: CompletionEvidence {
+                completed: false,
+                blockers: vec!["requires machine-checked evidence".into()],
+                ..Default::default()
+            },
+            input_tokens: 12,
+            output_tokens: 6,
+            stop_reason,
+        }
+    }
+
+    /// R1/R3: thin 只读任务（问答、浏览器 open→read→close 后回答）在模型给出
+    /// 最终回答后即完成，不再要求 legacy 的「可核对依据」证据包。
+    #[test]
+    fn thin_read_only_answer_completes_without_a_legacy_evidence_pack() {
+        for (kind, acceptance) in [
+            (ObjectiveKind::Informational, "answer"),
+            (ObjectiveKind::LocalMutation, "browser_read_title"),
+        ] {
+            let objective = ObjectiveSnapshot::new(
+                "objective-thin-readonly",
+                kind,
+                RecoveryDomain::Chat,
+                acceptance,
+            );
+            let outcome = thin_outcome("页面标题是 Example Domain", StopReason::Finished);
+            let decision = decision_for_thin_run_outcome(&objective, &outcome).unwrap();
+            assert_eq!(decision.status, ObjectiveStatus::Completed, "{kind:?}");
+            assert_eq!(decision.decision_type, DecisionType::Complete, "{kind:?}");
+            let evidence = decision.evidence.clone().expect("typed completion evidence");
+            assert_eq!(evidence.kind, EvidenceKind::InformationalAnswer, "{kind:?}");
+            assert_eq!(evidence.reached_acceptance, acceptance);
+        }
+    }
+
+    /// R2: 没有最终回答就没有完成依据——thin 也不得伪造 completed，且不能
+    /// 把失败记成空 detail 的无限等待。
+    #[test]
+    fn thin_without_a_final_answer_never_fakes_completion() {
+        let objective = ObjectiveSnapshot::new(
+            "objective-thin-empty",
+            ObjectiveKind::LocalMutation,
+            RecoveryDomain::Chat,
+            "change",
+        );
+        let decision =
+            decision_for_thin_run_outcome(&objective, &thin_outcome("   ", StopReason::Finished))
+                .unwrap();
+        assert_ne!(decision.decision_type, DecisionType::Complete);
+        assert_ne!(decision.status, ObjectiveStatus::Completed);
+        assert_eq!(
+            decision.failure_code.as_deref(),
+            Some("completion_evidence_incomplete")
+        );
+    }
+
+    /// R1: 交付/上线目标仍然必须有交付回执——「说完成了」不等于已交付。
+    #[test]
+    fn thin_delivery_still_requires_a_delivery_receipt() {
+        let objective = ObjectiveSnapshot::new(
+            "objective-thin-delivery",
+            ObjectiveKind::Delivery,
+            RecoveryDomain::Delivery,
+            "merged_pr",
+        );
+        let refused = decision_for_thin_run_outcome(
+            &objective,
+            &thin_outcome("已开 PR", StopReason::Finished),
+        )
+        .expect_err("thin delivery without a receipt must stay blocked");
+        assert!(
+            refused.to_string().contains("does not satisfy objective kind"),
+            "{refused}"
+        );
     }
 
     #[test]
