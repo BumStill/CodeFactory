@@ -531,7 +531,10 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
     // M120(b): reuse the release planner so the queue and Auto Release can
     // never disagree about hold/invalid guards.
     async releasePlan(sha) {
-      const lastTag = run(['git', 'describe', '--tags', '--abbrev=0', '--match', 'v*']).trim();
+      // Checkout predates this drain's merges. Fetch their objects and tags
+      // before scanning, and resolve the previous tag relative to the final head.
+      run(['git', 'fetch', '--tags', 'origin', 'main']);
+      const lastTag = run(['git', 'describe', '--tags', '--abbrev=0', sha]).trim();
       const raw = run(['python3', 'tools/release/plan_release.py', '--range', `${lastTag}..${sha}`]);
       return JSON.parse(raw);
     },

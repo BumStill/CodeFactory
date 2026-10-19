@@ -158,6 +158,25 @@ test('M120-R2: dispatch error comments on the PR and rejects the queue run', asy
   assert.match(comments[0].body, /dispatch.*failed.*synthetic dispatch denied/is);
 });
 
+test('M120 adapter: fetch newly merged objects before scanning a head-relative tag range', async () => {
+  const calls = [];
+  const adapter = createGhAdapter({ repo: 'synthetic/queue', run(args) {
+    calls.push(args);
+    if (args[0] === 'git' && args[1] === 'fetch') return '';
+    if (args[0] === 'git' && args[1] === 'describe') {
+      assert.equal(args.at(-1), SHA_C);
+      return 'v1.0.0\n';
+    }
+    if (args[0] === 'python3') {
+      assert.equal(args.at(-1), `v1.0.0..${SHA_C}`);
+      return JSON.stringify({ hold: 1, invalid_urgency: 0 });
+    }
+    throw Error(`unexpected call ${args.join(' ')}`);
+  } });
+  assert.equal((await adapter.releasePlan(SHA_C)).hold, 1);
+  assert.deepEqual(calls[0], ['git', 'fetch', '--tags', 'origin', 'main']);
+});
+
 // ---------------------------------------------------------------------------
 // CF-MQ-R1 / R2 — eligibility and ordering
 // ---------------------------------------------------------------------------
