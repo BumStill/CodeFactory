@@ -579,8 +579,16 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         }
     };
 
-    let durable_authorizer = match (ctx.db.as_ref(), ctx.outer_receipt_id.as_deref()) {
-        (Some(pool), Some(receipt_id)) => {
+    // R1: thin sessions deliberately have no durable side-effect receipts.
+    // Only an explicit persisted thin mode bypasses this legacy contract;
+    // unknown sessions and database errors keep the existing fail-closed path.
+    let thin = match (ctx.db.as_ref(), ctx.session_id.as_deref()) {
+        (Some(db), Some(session_id)) => crate::agent::thin::is_thin(db, session_id).await,
+        _ => false,
+    };
+    let durable_authorizer = match (thin, ctx.db.as_ref(), ctx.outer_receipt_id.as_deref()) {
+        (true, _, _) => None,
+        (false, Some(pool), Some(receipt_id)) => {
             let store = crate::agent::browser_recovery::BrowserRecoveryStore::new(pool.clone());
             let operation = store.operation_permit(receipt_id).await.map_err(|error| {
                 AppError::Other(format!("load browser operation contract: {error}"))
@@ -594,8 +602,8 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 dispatch: tokio::sync::Mutex::new(None),
             })
         }
-        (None, None) => None,
-        (Some(_), None)
+        (false, None, None) => None,
+        (false, Some(_), None)
             if matches!(args.action.as_str(), "tabs" | "read" | "find" | "snapshot") =>
         {
             None
@@ -1487,6 +1495,69 @@ async fn reclaim_expired(pool: Option<&sqlx::SqlitePool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn mode_ctx(mode: &str) -> ExecCtx {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sessions (id TEXT PRIMARY KEY, kind TEXT, delivery_mode TEXT);")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO sessions VALUES ('synthetic-browser', 'anonymous', ?)")
+            .bind(mode).execute(&db).await.unwrap();
+        let mut ctx = ExecCtx::new(std::env::temp_dir(), Some(db));
+        ctx.session_id = Some("synthetic-browser".into());
+        ctx
+    }
+
+    #[tokio::test]
+    async fn thin_browser_open_reaches_driver_without_receipt() {
+        let ctx = mode_ctx("thin").await;
+        // A real local fixture, not a remote site or a production session.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !server_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                    let mut request = [0; 4096];
+                    let _ = stream.read(&mut request);
+                    let body = "<html><head><title>Thin Browser Fixture</title></head><body><h1>Receipt-free navigation works</h1></body></html>";
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+        let output = execute(json!({"action":"open", "url":format!("http://{address}/fixture")}), &ctx).await.unwrap();
+        let cleanup = close_all_for_owner_session("synthetic-browser").await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(output.status, super::super::ToolExecutionStatus::Done, "{output:?}");
+        assert!(output.content.contains("Thin Browser Fixture"), "{output:?}");
+        assert!(output.content.contains("Receipt-free navigation works"));
+        assert_eq!(cleanup, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_browser_missing_receipt_still_waits_and_reads_are_admitted() {
+        for mode in ["legacy", "thin"] {
+            let ctx = mode_ctx(mode).await;
+            if mode == "legacy" {
+                for action in ["open", "attach", "click", "fill", "press", "close"] {
+                    let output = execute(json!({"action":action}), &ctx).await.unwrap();
+                    assert_eq!(output.status, super::super::ToolExecutionStatus::Waiting);
+                    assert_eq!(output.metadata.unwrap()["code"], "browser_observation_contract_required");
+                }
+            }
+            for action in ["tabs", "read", "find", "snapshot"] {
+                let output = execute(json!({"action":action,"session_id":"codefactory-absent-fixture"}), &ctx).await.unwrap();
+                assert_eq!(output.status, super::super::ToolExecutionStatus::Error, "{output:?}");
+                assert!(output.content.contains("unknown or has already been reclaimed"));
+            }
+        }
+    }
 
     #[test]
     fn attach_failure_requests_only_the_required_pairing_authorization() {
