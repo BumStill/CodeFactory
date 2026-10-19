@@ -1605,15 +1605,20 @@ mod tests {
             use std::io::{Read, Write};
             while !server_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                    let mut request = [0; 4096];
-                    let _ = stream.read(&mut request);
-                    let body = "<html><head><title>Slow Fixture Committed</title></head><body><h1>Navigation settled before the read</h1></body></html>";
-                    // Headers first, body deliberately late.
-                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-                    let _ = stream.flush();
-                    std::thread::sleep(Duration::from_millis(750));
-                    let _ = write!(stream, "{body}");
+                    // One thread per connection: chromium opens a preconnect in
+                    // parallel with the request, and a serial accept loop would
+                    // leave that second socket unread for the whole body delay.
+                    std::thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = [0; 4096];
+                        let _ = stream.read(&mut request);
+                        let body = "<html><head><title>Slow Fixture Committed</title></head><body><h1>Navigation settled before the read</h1></body></html>";
+                        // Headers first, body deliberately late.
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let _ = stream.flush();
+                        std::thread::sleep(Duration::from_millis(750));
+                        let _ = write!(stream, "{body}");
+                    });
                 } else {
                     std::thread::sleep(Duration::from_millis(10));
                 }

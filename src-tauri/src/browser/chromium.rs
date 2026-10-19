@@ -56,6 +56,11 @@ const OP_TIMEOUT: Duration = Duration::from_secs(30);
 /// load before `open` reports what it last observed instead of returning an
 /// empty document.
 const PAGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Page creation is a launch-class step, not an operation-class one: it creates
+/// the target and attaches to the first navigation, which on a cold runner is
+/// bounded by the same realities as `LAUNCH_TIMEOUT`. Sharing `OP_TIMEOUT` made
+/// a real cold-runner wait surface as the opaque "browser operation timed out".
+const PAGE_CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 /// One settle probe. Bounded well under `OP_TIMEOUT` so a probe that blocks
 /// while the target swaps execution contexts still leaves room for the next
 /// probe instead of spending the whole operation budget in silence.
@@ -665,9 +670,19 @@ impl BrowserDriver for ChromiumDriver {
             release_profile(&profile_dir, session_id);
             return Err(error);
         }
-        let page = match timeout(browser.new_page(url)).await.map_err(|error| {
-            AppError::Other(format!("Creating a page for {url} failed: {error}"))
-        }) {
+        let page = match tokio::time::timeout(PAGE_CREATE_TIMEOUT, browser.new_page(url))
+            .await
+            .map_err(|_| {
+                AppError::Other(format!(
+                    "Creating a page for {url} timed out after {}s",
+                    PAGE_CREATE_TIMEOUT.as_secs()
+                ))
+            })
+            .and_then(|created| {
+                created.map_err(|error| {
+                    AppError::Other(format!("Creating a page for {url} failed: {error}"))
+                })
+            }) {
             Ok(page) => page,
             Err(error) => {
                 let _ = authorizer.unknown().await;
