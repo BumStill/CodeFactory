@@ -1526,6 +1526,10 @@ mod tests {
             use std::io::{Read, Write};
             while !server_stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    // Windows may inherit the listener's nonblocking mode.
+                    // Read the request before replying, rather than treating
+                    // WouldBlock as an HTTP request and racing Chrome.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
                     let mut request = [0; 4096];
                     let _ = stream.read(&mut request);
@@ -1609,9 +1613,15 @@ mod tests {
                     // parallel with the request, and a serial accept loop would
                     // leave that second socket unread for the whole body delay.
                     std::thread::spawn(move || {
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
                         let mut request = [0; 4096];
-                        let _ = stream.read(&mut request);
+                        // A preconnect with no request is not an HTTP request.
+                        let count = match stream.read(&mut request) {
+                            Ok(count) if count > 0 => count,
+                            _ => return,
+                        };
+                        assert!(request[..count].starts_with(b"GET "));
                         let body = "<html><head><title>Slow Fixture Committed</title></head><body><h1>Navigation settled before the read</h1></body></html>";
                         // Headers first, body deliberately late.
                         let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
