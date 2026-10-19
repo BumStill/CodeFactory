@@ -425,6 +425,19 @@ pub(crate) struct ModelUnavailable {
     pub notice: String,
 }
 
+/// M123. The shortest distance a scheduled wait may be placed in the future.
+/// A wait whose resume time already passed (a reused error payload, a clock
+/// jump, a boundary that was skipped while the app was asleep) would otherwise
+/// schedule an attempt at a time already gone, and the runner would observe it
+/// as due immediately — a request storm dressed up as "waiting".
+pub(crate) const MIN_RESUME_LEAD_MS: i64 = 1_000;
+
+/// M123. Place a waitable resume time in the future; keep an unresolvable
+/// cause (`None`) unresolvable. Never invents a wait that was not there.
+pub(crate) fn resume_at_with_lead(resume_at_ms: Option<i64>, now_ms: i64) -> Option<i64> {
+    resume_at_ms.map(|at| at.max(now_ms.saturating_add(MIN_RESUME_LEAD_MS)))
+}
+
 impl ModelUnavailable {
     const MARKER: &'static str = "MODEL_UNAVAILABLE:";
 
@@ -451,14 +464,15 @@ impl ModelUnavailable {
 
     pub fn decision(&self, current: &super::objective::ObjectiveSnapshot, root: &str) -> anyhow::Result<super::objective::DecisionEnvelope> {
         use super::objective::{DecisionRouter, RouteSignal, RecoveryDomain, DecisionType, ObjectiveStatus};
+        let resume_at_ms = resume_at_with_lead(self.resume_at_ms, chrono::Utc::now().timestamp_millis());
         let mut decision = DecisionRouter::route(current, RouteSignal::CapabilityRestored {
             domain: RecoveryDomain::Chat,
             reason: "no_model_available".into(),
-            next_observation_at: self.resume_at_ms.unwrap_or_default(),
+            next_observation_at: resume_at_ms.unwrap_or_default(),
             resume_cursor: Some(root.into()),
         })?;
         decision.failure_signature = None;
-        if self.resume_at_ms.is_none() {
+        if resume_at_ms.is_none() {
             decision.status = ObjectiveStatus::Failed;
             decision.decision_type = DecisionType::FailedInternal;
             decision.remediation_id = None;
@@ -1197,6 +1211,22 @@ mod tests {
         live.write().await.model_usage_windows.get_mut(&key).unwrap().mode = "anytime".into();
         assert!(state.admit_model_availability(None, false, None).await.unwrap().is_none());
         assert!(state.inner.lock().unwrap().failures.is_empty());
+    }
+
+    #[test]
+    fn m123_past_resume_time_is_pushed_into_the_future() {
+        let now = 1_800_000_000_000_i64;
+        assert_eq!(super::resume_at_with_lead(None, now), None, "不可恢复的原因不排期");
+        assert_eq!(
+            super::resume_at_with_lead(Some(now - 5_000), now),
+            Some(now + super::MIN_RESUME_LEAD_MS),
+            "已在过去的唤醒时间必须落到未来，否则会立刻重试风暴"
+        );
+        assert_eq!(
+            super::resume_at_with_lead(Some(now + 42_000), now),
+            Some(now + 42_000),
+            "未来时间原样保留"
+        );
     }
 
     #[test]
