@@ -25,6 +25,7 @@ passed the required checks on that exact combined state.
 | CF-MQ-R5 | Release flow compatibility: the version-bump PR opened by auto-release can also go through the queue, with no deadlock against "binding to the exact main head" (`expected_head_sha`) or `Release-Urgency` / hold judgements | Drill: one release while a PR is still in the queue |
 | CF-MQ-R6 | CodeFactory's delivery tool (`ceiling: merged`) uses the queue instead of looping on catch-up / rerun; a stopped task must not keep merging through the queue in the background (see M47: on 10-09 #584 was still merged by the delivery tool after its session was stopped) | Integration test |
 | CF-MQ-R7 | The documentation (`AGENTS.md` and `docs/principles/release-cadence.md` merge sections) matches the new flow | Doc diff |
+| CF-MQ-R8 | 队列在一次运行的合入批次里读到 `Release-Urgency: immediate`，就按发布节律切版；`hold`/非法 trailer 不切并留痕；dispatch 失败可见且队列运行非零退出；门禁（ruleset、strict、auto-release 输入语义）不被削弱 | 单元测试 + 队列运行日志 + 一次真实批量合入后的切版记录 |
 
 ## Applicable Harnesses
 
@@ -80,3 +81,28 @@ values and rollback.
 - A **queue arm marker** (`merge-queue: armed` label + recorded expected head)
   is what authorizes the queue to merge a PR. A stopped task clears the marker,
   so nothing merges in the background after the session ends (fixes M47).
+
+### immediate 切版（M120）
+
+`Release-Urgency: immediate` 是「合入后立刻切版」的信号。PR 改由本队列合并后，
+这个信号不能只停留在提交里，否则 immediate 实际失效（2026-10-19：M120 证据里
+#749、#751 带 immediate 合入，直到下一班次都没有发版）。
+
+一次队列运行（一次 drain）的规则：
+
+1. 每成功 squash 合并一个 PR，读取**落在 main 上的那个提交**的提交消息最后一段，
+   只认最后一段里的 `Release-Urgency:` trailer（与 `tools/release/plan_release.py`
+   的 footer 解析一致）。正文中间出现的同名行不算信号。
+2. 本批次出现 immediate 时，先按 `docs/principles/release-cadence.md` 扫描
+   `<上个 tag>..main`：若批次含 `Release-Urgency: hold` 或非法 urgency，则不切版，
+   在每个 immediate PR 上留明文评论说明被哪一类 trailer 拦住，并给出
+   `allow_guarded_batch=true` 的显式放行路径。
+3. 否则 `workflow_dispatch` `auto-release.yml`，`expected_head_sha` 固定为本批次
+   最后合入的 main head；同一轮多个 immediate 只 dispatch 一次，避免重复切版。
+4. dispatch 之前任何一步失败（读提交、扫描、dispatch）都在 PR 留明文评论，并让
+   队列运行以非零退出，不允许静默吞掉。
+5. 门禁不变：不碰 ruleset、不关 strict，`auto-release` 的 `hold` / `force` /
+   `allow_guarded_batch` 语义原样保留；队列只负责「按节律触发」，不替发布流程
+   做决定。
+
+回滚：删除队列运行末尾的这一步，即恢复「只保留 trailer、由人工 dispatch」的旧行为。
