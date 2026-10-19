@@ -1850,6 +1850,29 @@ mod tests {
         assert!(external_wait_completion_hint(&pool, "s1", true).await.is_some());
     }
 
+    /// 阶段 1 P0-3 / R3：thin 的外部事项等待必须给出两种挂监视的具体做法
+    /// （以及 ≥180s 的轮询下限），否则模型只能空转后停在 waiting_system。
+    #[tokio::test]
+    async fn thin_external_wait_asks_for_a_wake_source_and_waits_when_covered() {
+        let pool = memory_pool().await;
+        let hint = external_wait_completion_hint(&pool, "thin-session", true)
+            .await
+            .expect("uncovered external wait must produce a hint");
+        assert!(hint.contains("background_task_start"), "{hint}");
+        assert!(hint.contains("schedule_wakeup"), "{hint}");
+        assert!(hint.contains("180"), "{hint}");
+        schedule_wakeup_at(
+            &pool,
+            wakeup_request("thin-session", "check CI", Some(180)),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert!(external_wait_completion_hint(&pool, "thin-session", true)
+            .await
+            .is_none());
+    }
+
     fn wakeup_request(session: &str, prompt: &str, every_sec: Option<u64>) -> WakeupRequest {
         WakeupRequest {
             session_id: session.to_string(),
