@@ -2678,7 +2678,22 @@ impl ToolBackend for DesktopToolBackend {
             }
         };
 
-        let result = invocation_from_output(output, command, kind);
+        let mut result = invocation_from_output(output, command, kind);
+        if let Some(session) = ctx.session_id.as_deref() {
+            if super::thin::is_thin(&self.db, session).await && call.function.name == "deliver_changes" {
+                if let Some(hint) = super::thin::external_wait_hint(&self.db, session).await {
+                    super::thin::record_unwatched_wait(&self.db, session, "交付 PR / CI").await
+                        .map_err(|error| ToolError { message: error.to_string() })?;
+                    let hinted: Option<i64> = sqlx::query_scalar(
+                        "UPDATE thin_wait_notes SET hinted=1,root_turn_id=? WHERE session_id=? AND (hinted=0 OR root_turn_id IS NOT ?) RETURNING hinted")
+                        .bind(ctx.root_turn_id.as_deref()).bind(session).bind(ctx.root_turn_id.as_deref())
+                        .fetch_optional(&self.db).await.map_err(|error| ToolError { message: error.to_string() })?;
+                    if hinted.is_some() { result.content.push_str(&format!("\n{hint}")); }
+                } else {
+                    let _ = sqlx::query("DELETE FROM thin_wait_notes WHERE session_id=?").bind(session).execute(&self.db).await;
+                }
+            }
+        }
         if let Some(receipt_id) = receipt_id.as_deref() {
             self.settle_mutation_receipt(receipt_id, Some(&result), ctx)
                 .await?;

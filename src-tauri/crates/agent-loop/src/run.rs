@@ -1626,7 +1626,8 @@ pub async fn run_agent_loop(
                 // machine-verifiable obstacle (delivery blocked / command
                 // missing / waiting on a checkable condition) gets ONE live
                 // probe-backed correction — facts over stale memory.
-                if !summary_only_round && !fact_check_used {
+                let thin = tool_backend.thin_mode(&audit_session_id).await;
+                if !thin && !summary_only_round && !fact_check_used {
                     if let Some(correction) =
                         fact_checker.fact_check(&text, &fact_check_instruction)
                     {
@@ -1649,7 +1650,11 @@ pub async fn run_agent_loop(
                         continue;
                     }
                 }
-                if let Some(prompt) = tool_backend.external_wait_completion_hint(&audit_session_id).await {
+                // Thin settles the first final answer. Missing-monitor advice belongs
+                // in tool results, never in a request to generate another final answer.
+                if let Some(prompt) = if thin { None } else {
+                    tool_backend.external_wait_completion_hint(&audit_session_id).await
+                } {
                     events.round_ended().await;
                     require_tool_next = true;
                     messages.push(crate::types::ChatMessage {
@@ -3647,6 +3652,35 @@ mod tests {
         assert_eq!(persistence.messages.lock().unwrap().iter().filter(|(role, text, _)|
             role == "assistant" && text.starts_with("Example Domain")).count(), 1);
         assert!(!persistence.notices.lock().unwrap().iter().any(|(kind, _)| kind == "gate_recovery"));
+    }
+
+    struct ThinUnwatchedTools;
+
+    #[async_trait::async_trait]
+    impl ToolBackend for ThinUnwatchedTools {
+        async fn thin_mode(&self, _: &str) -> bool { true }
+        async fn external_wait_completion_hint(&self, _: &str) -> Option<String> {
+            Some("请挂监视；没有执行者时交由用户决定是否继续等待。".into())
+        }
+        async fn list_schemas(&self) -> Vec<ToolDefinition> { vec![tool_definition()] }
+        async fn execute(&self, _: &ToolCall, _: &serde_json::Value, _: &ToolCtx)
+            -> Result<ToolInvocationResult, ToolError> { unreachable!() }
+    }
+
+    #[tokio::test]
+    async fn thin_unwatched_final_answer_never_requests_a_second_answer() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response("等待 CI 完成，成果在 PR #42。", vec![], 0),
+        ]));
+        let persistence = Arc::new(RecordingPersistence::default());
+        let mut svc = services(transport.clone(), persistence.clone(), Arc::new(CollectingEventSink::new()));
+        svc.tools = Arc::new(ThinUnwatchedTools);
+        let outcome = run_agent_loop(inputs(), config(), svc).await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Finished);
+        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(persistence.messages.lock().unwrap().iter().filter(|(role, text, _)|
+            role == "assistant" && text.contains("PR #42")).count(), 1);
+        assert!(persistence.notices.lock().unwrap().is_empty());
     }
 
     struct ScriptedTools;
