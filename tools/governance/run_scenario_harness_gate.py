@@ -339,7 +339,16 @@ def main() -> int:
                 # accidental cleanup project.
                 errors.extend(
                     validate_impacted_execution(
-                        registry, impact_files, "pull_request", repo_root
+                        registry,
+                        impact_files,
+                        "pull_request",
+                        repo_root,
+                        # Same coverage rule as release: a blanket-expanded
+                        # impact must not hide a product file that no scenario
+                        # claims (#793 passed PR and failed release for the
+                        # same commit).
+                        expand_global_files=True,
+                        fail_on_unmapped=True,
                     )
                 )
 
