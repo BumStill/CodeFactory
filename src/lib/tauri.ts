@@ -206,6 +206,7 @@ export interface Session {
   kind?: "project" | "quick" | "anonymous";
   /** Per-session tool permission preset. Missing legacy rows behave as standard. */
   permission_mode?: PermissionMode;
+  delivery_authorized?: boolean;
   /** Per-session reasoning effort override; null/undefined → global default. */
   reasoning_effort?: ReasoningEffort | null;
   /** SQLite-authoritative activity used to restore sidebar state after reload. */

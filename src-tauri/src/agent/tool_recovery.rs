@@ -125,7 +125,14 @@ impl ToolRecoveryStore {
                     .unwrap_or_default();
                 let named_file =
                     exact_local_append_target(command).or_else(|| fetch_output_target(command));
-                if let Some(relative) = named_file {
+                if let Some(observer) = remote_delivery_observer(command) {
+                    Some(ToolRecoveryPlan {
+                        resource_kind: "workspace_git",
+                        replay_policy: "never_after_dispatch",
+                        safe_locator_json: serde_json::json!({"remote_observer": observer}).to_string(),
+                        precondition_digest: remote_delivery_digest(cwd, &observer).await?,
+                    })
+                } else if let Some(relative) = named_file {
                     file_plan(cwd, Some(&relative)).await?
                 } else if escapes_workspace_observation(command) {
                     None
@@ -1037,7 +1044,14 @@ pub(crate) async fn snapshot_digest_on(
             file_digest(&path).await?
         }
         "user_skills" => user_skills_digest()?,
-        "workspace_git" => workspace_git_digest(cwd).await?,
+        "workspace_git" => {
+            if let Some(observer) = locator.get("remote_observer") {
+                let observer: Vec<String> = serde_json::from_value(observer.clone())?;
+                remote_delivery_digest(cwd, &observer).await?
+            } else {
+                workspace_git_digest(cwd).await?
+            }
+        }
         "session_plan" => {
             let (Some(session), Some(root)) = (
                 locator.get("session_id").and_then(|v| v.as_str()),
@@ -1344,6 +1358,32 @@ fn fetch_output_target(command: &str) -> Option<String> {
     safe_relative(Path::new(&candidate)).then_some(candidate)
 }
 
+/// Only simple foreground delivery commands get a read-only remote observer.
+/// Compound shell programs remain opaque; never replay a remote mutation.
+fn remote_delivery_observer(command: &str) -> Option<Vec<String>> {
+    if command.contains(['\n', '\r', ';', '|', '&', '`', '$', '<', '>']) { return None; }
+    let words: Vec<_> = command.split_whitespace().collect();
+    let values: &[&str] = match words.as_slice() {
+        ["git", "push", rest @ ..] => {
+            let remote = rest.iter().find(|value| !value.starts_with('-')).copied().unwrap_or("origin");
+            return Some(vec!["git".into(), "ls-remote".into(), remote.into()]);
+        }
+        ["git", "tag", ..] => &["git", "show-ref", "--tags"],
+        ["gh", "pr", "create" | "merge", ..] => &["gh", "pr", "list", "--state", "all", "--json", "number,state,headRefName,headRefOid"],
+        ["glab", "mr", "create" | "merge", ..] => &["glab", "mr", "list", "--all", "--output", "json"],
+        _ => return None,
+    };
+    Some(values.iter().map(|value| (*value).to_owned()).collect())
+}
+
+async fn remote_delivery_digest(cwd: &Path, observer: &[String]) -> Result<String> {
+    let (program, args) = observer.split_first().ok_or_else(|| anyhow!("missing remote observer"))?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30),
+        tokio::process::Command::new(program).no_window().args(args).current_dir(cwd).kill_on_drop(true).output()).await??;
+    if !output.status.success() { bail!("remote delivery observation failed"); }
+    Ok(format!("{:x}", Sha256::digest(output.stdout)))
+}
+
 async fn workspace_git_digest(cwd: &Path) -> Result<String> {
     let cwd = cwd.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<String> {
@@ -1583,6 +1623,25 @@ async fn terminalize_linked_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m130_remote_observer_tracks_actual_git_refs() {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let init = std::process::Command::new("git").no_window().args(["init", "--bare"]).arg(&remote).output().unwrap();
+        assert!(init.status.success());
+        let observer = vec!["git".to_owned(), "ls-remote".to_owned(), remote.to_string_lossy().into_owned()];
+        let before = remote_delivery_digest(root.path(), &observer).await.unwrap();
+        let commit = std::process::Command::new("git").no_window().arg("-C").arg(&remote)
+            .args(["-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "hash-object", "-t", "blob", "-w", "--stdin"])
+            .output().unwrap();
+        assert!(commit.status.success());
+        assert_eq!(before, remote_delivery_digest(root.path(), &observer).await.unwrap(), "unreferenced object must not masquerade as a pushed ref");
+        for command in ["gh pr create", "glab mr create", "git push origin HEAD"] {
+            assert!(remote_delivery_observer(command).is_some());
+        }
+        assert!(remote_delivery_observer("git push origin HEAD; touch sentinel").is_none());
+    }
 
     #[test]
     fn m106_python_forge_writes_cannot_use_workspace_receipts() {

@@ -54,6 +54,11 @@ pub async fn queue_interjection(
     client_message_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<bool, AppError> {
+    if crate::agent::is_delivery_revocation(&message) {
+        let db = state.db.read().await.clone();
+        sqlx::query("UPDATE sessions SET delivery_authorized=0, delivery_ceiling=NULL WHERE id=?")
+            .bind(&session_id).execute(&db).await?;
+    }
     enqueue_interjection(&state.interjections, &session_id, &message, client_message_id.as_deref()).await
 }
 
@@ -210,7 +215,7 @@ mod tests {
         };
         assert_eq!(
             authorized.capability_override("继续"),
-            Some(codefactory_agent_loop::run::TurnCapability::Deliver),
+            None,
         );
         let unauthorized = SessionSteerInbox {
             queue: Arc::new(Mutex::new(HashMap::new())),
@@ -219,7 +224,7 @@ mod tests {
         };
         assert_eq!(
             unauthorized.capability_override("继续"),
-            Some(codefactory_agent_loop::run::TurnCapability::Implement),
+            None,
         );
     }
 }

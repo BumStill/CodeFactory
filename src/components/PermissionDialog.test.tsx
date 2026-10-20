@@ -19,6 +19,14 @@ function baseRequest(overrides: Partial<PendingPermission>): PendingPermission {
 const noop = { onAllow: vi.fn(), onDeny: vi.fn(), onAllowFullAccess: vi.fn() };
 
 describe("PermissionDialog tool-args preview", () => {
+  it("M130 asks once for session delivery without a trust shortcut", async () => {
+    const allow = vi.fn();
+    render(<PermissionDialog request={baseRequest({ toolName: "deliver_changes", args: { ceiling: "pr_only" } })} trusted={false} {...noop} onAllow={allow} />);
+    expect(screen.getByText(/允许向远端推送并创建 PR \/ MR 吗/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "信任本会话并允许" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "允许交付" }));
+    expect(allow).toHaveBeenCalledTimes(1);
+  });
   it("CF-TPP-R3 hides redundant trust and explains the boundary", () => {
     render(<PermissionDialog request={baseRequest({})} trusted={true} {...noop} />);
     expect(screen.queryByRole("button", { name: "信任本会话并允许" })).not.toBeInTheDocument();

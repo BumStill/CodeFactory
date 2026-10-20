@@ -214,6 +214,21 @@ pub(crate) enum PermissionPromptResponse {
     Deny,
 }
 
+async fn grant_remote_delivery_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, intent: &PermissionIntentSnapshot,
+) -> anyhow::Result<()> {
+    let remote = intent.tool_name == "deliver_changes"
+        || (intent.tool_name == "bash" && intent.prompt_args.get("command")
+            .and_then(Value::as_str).is_some_and(codefactory_agent_loop::policy::is_delivery_command));
+    if remote {
+        sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id=?")
+            .bind(&intent.session_id).execute(&mut **tx).await?;
+        sqlx::query("DELETE FROM delivery_stop_fences WHERE session_id=?")
+            .bind(&intent.session_id).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PendingPermissionRegistry {
     inner: Arc<Mutex<HashMap<PermissionPromptKey, oneshot::Sender<PermissionPromptResponse>>>>,
@@ -1008,6 +1023,9 @@ impl PermissionIntentStore {
             if update_pending_intent_response(&mut tx, &intent, status, failure, now).await? != 1 {
                 bail!("permission response lost its prompt CAS");
             }
+            if response == PermissionPromptResponse::Allow {
+                grant_remote_delivery_in_tx(&mut tx, &intent).await?;
+            }
             tx.commit().await?;
             return Ok(ProjectedPermissionSettlement {
                 objective_id: intent.scope.objective_id,
@@ -1110,6 +1128,7 @@ impl PermissionIntentStore {
                 if allowed != 1 {
                     bail!("permission response lost its prompt CAS");
                 }
+                grant_remote_delivery_in_tx(&mut tx, &intent).await?;
                 let consumed = sqlx::query(
                     "UPDATE permission_intents
                      SET status='consumed', consumed_at=?, updated_at=?
@@ -1418,6 +1437,11 @@ impl PermissionIntentStore {
         let snapshot = get_in_tx(&mut tx, &key.intent_id)
             .await?
             .ok_or_else(|| anyhow!("updated permission intent disappeared"))?;
+        // M130: commit the user's session grant together with the exact allow.
+        // A restart between decision and waiter consumption must not lose it.
+        if response == PermissionPromptResponse::Allow {
+            grant_remote_delivery_in_tx(&mut tx, &snapshot).await?;
+        }
         tx.commit().await?;
         Ok(snapshot)
     }
@@ -2189,6 +2213,8 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+            sqlx::query("CREATE TABLE delivery_stop_fences (session_id TEXT PRIMARY KEY)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 0)").execute(&pool).await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE objectives (
                id TEXT PRIMARY KEY, revision INTEGER NOT NULL, status TEXT NOT NULL
@@ -2402,6 +2428,22 @@ mod tests {
             expires_at: 2_000,
             created_process_instance: "process-a".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn m130_durable_allow_atomically_grants_delivery_only_for_remote_action() {
+        let pool = database().await;
+        sqlx::query("INSERT INTO sessions (id) VALUES ('session-a')").execute(&pool).await.unwrap();
+        let store = PermissionIntentStore::new(pool.clone());
+        let mut req = request(OBJECTIVE_ID, BINDING_ID, "synthetic-remote");
+        req.tool_name = "deliver_changes".into();
+        req.args = serde_json::json!({"ceiling":"pr_only"});
+        let intent = store.create_pending(&req, 1000).await.unwrap();
+        store.record_user_response(&intent.prompt_key(), PermissionPromptResponse::Allow, 1100).await.unwrap();
+        assert!(crate::agent::fetch_session_delivery_authorized(&pool, "session-a").await);
+        crate::agent::set_session_delivery_authorized(&pool, "session-a", false).await;
+        store.record_user_response(&intent.prompt_key(), PermissionPromptResponse::Allow, 1101).await.unwrap();
+        assert!(!crate::agent::fetch_session_delivery_authorized(&pool, "session-a").await, "replayed allow cannot undo revocation");
     }
 
     #[tokio::test]

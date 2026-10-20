@@ -11,12 +11,12 @@ import type { DispatchApproval } from "./desktopDispatch";
 export function useAppDispatchBridge(showWorkspace: () => void): void {
   useDesktopDispatchBridge({ handlers: {
     getUsageWindows, setUsageWindow, setSessionUsageWindowOverride, getQuota, setQuotaCap,
-    createAndSend: async ({ project, message, model, permissionMode }) => {
+    createAndSend: async ({ project, message, model, permissionMode, deliveryAuthorized }) => {
       const selected = model ? await dispatchSetModel({ model }) : null;
       const store = useChatStore.getState();
       const session = await store.createSession(project, selected?.model ?? store.activeModel);
       if (permissionMode) await dispatchSetPermission({ sessionId: session.id, mode: permissionMode });
-      const receipt = await dispatchSend({ sessionId: session.id, message, mode: "steer" });
+      const receipt = await dispatchSend({ sessionId: session.id, message, mode: "steer", deliveryAuthorized });
       return { ...receipt, model: session.model_id };
     },
     send: dispatchSend,

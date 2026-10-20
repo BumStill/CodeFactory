@@ -90,6 +90,8 @@ export function PermissionDialog({
   onDeny,
   onAllowFullAccess,
 }: Props) {
+  const remoteDelivery = request.toolName === "deliver_changes"
+    || (request.toolName === "bash" && /\b(git\s+(push|tag)|gh\s+(pr\s+(create|merge)|release)|glab\s+mr\s+(create|merge))\b/.test(formatToolArgs(request.args)));
   const dialogRef = useRef<HTMLDivElement>(null);
   const denyButtonRef = useRef<HTMLButtonElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
@@ -154,7 +156,7 @@ export function PermissionDialog({
           <div className="min-w-0">
             <h2 id="permission-dialog-title" className="text-body font-semibold text-gray-100">需要权限</h2>
             <p className="text-label text-gray-500">
-              工具 `{request.toolName}` 想要以项目访问权限运行。
+              {remoteDelivery ? "允许向远端推送并创建 PR / MR 吗？允许后将开启本会话的允许交付。" : <>工具 `{request.toolName}` 想要以项目访问权限运行。</>}
             </p>
           </div>
         </div>
@@ -165,7 +167,7 @@ export function PermissionDialog({
           <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
             等待你的批准；超时或无人应答不会记成你拒绝，请确认操作范围后再批准。
           </div>
-          {trusted && (
+          {trusted && !remoteDelivery && (
             <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
               当前会话已受信任，但无法确认此操作的影响仅限本会话工作区，因此仍需你确认。
             </div>
@@ -186,9 +188,9 @@ export function PermissionDialog({
             className="inline-flex min-h-11 items-center gap-1.5 rounded bg-accent px-3 text-label text-white hover:bg-accent-hover lg:min-h-9"
           >
             <Check size={14} />
-            仅允许一次
+            {remoteDelivery ? "允许交付" : "仅允许一次"}
           </button>
-          {!trusted && <button
+          {!trusted && !remoteDelivery && <button
             onClick={onAllowFullAccess}
             className="inline-flex min-h-11 items-center gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 px-3 text-label text-amber-900 dark:text-amber-100 hover:bg-amber-500/20 lg:min-h-9"
           >
