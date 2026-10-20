@@ -16,6 +16,8 @@ import {
   ARM_LABEL,
   HOLD_LABEL,
   BLOCKED_LABEL_PREFIX,
+  WAKE_LABELS,
+  resolveWake,
   evaluateEligibility,
   orderQueue,
   parseBlockedMarker,
@@ -524,8 +526,13 @@ test('M94: fixed blocked label is ensured and detailed reason is commented', asy
 
 test('M78: arming triggers only trusted default-branch queue tooling', () => {
   const workflow = readFileSync(new URL('../.github/workflows/merge-queue.yml', import.meta.url), 'utf8');
-  assert.match(workflow, /pull_request_target:\s*\n\s*types: \[labeled\]/);
-  assert.match(workflow, /if:.*github.event_name != 'pull_request_target'.*github.event.label.name == 'merge-queue: armed'/);
+  // M126: `unlabeled` is part of the trigger because lifting `merge-queue:
+  // blocked` is what makes a blocked, green PR mergeable again (2026-10-20 #768
+  // sat idle 20+ min on exactly that event). Which labels drain is decided by
+  // the unit-tested `wake` predicate below, not by an untested workflow `if:`.
+  assert.match(workflow, /pull_request_target:\s*\n\s*types: \[labeled, unlabeled\]/);
+  assert.match(workflow, /node scripts\/merge-queue\.mjs wake/);
+  assert.match(workflow, /if: steps\.wake\.outputs\.run == 'true'/);
   assert.match(workflow, /ref: \$\{\{ github.event.repository.default_branch \}\}/);
   assert.doesNotMatch(workflow, /ref:.*(?:head|pull_request)/);
   assert.match(workflow, /schedule:/);
@@ -797,4 +804,78 @@ test('M114-R8b: merging reuses the listed title instead of another gh pr view', 
     !calls.some((call) => call.includes('--json title')),
     'the title already came from the shared listing',
   );
+});
+
+// ---------------------------------------------------------------------------
+// M126 — every signal that can make an armed PR mergeable must wake the queue.
+// 2026-10-20 (#768): the queue's own `merge-queue: blocked` label was lifted on
+// a CLEAN, armed PR and nothing woke the queue for 20+ minutes, because the
+// only label trigger was `labeled` filtered to `merge-queue: armed`.
+// ---------------------------------------------------------------------------
+test('M126: arming wakes the queue', () => {
+  assert.deepEqual(resolveWake('pull_request_target', ARM_LABEL), {
+    run: true,
+    reason: `queue label "${ARM_LABEL}" changed`,
+  });
+});
+
+test('M126: clearing the queue block wakes the queue', () => {
+  assert.equal(resolveWake('pull_request_target', BLOCKED_LABEL_PREFIX).run, true);
+  assert.equal(resolveWake('pull_request_target', `${BLOCKED_LABEL_PREFIX} head=abc`).run, true);
+  // Removing the block is an `unlabeled` event, the case #768 missed.
+  assert.equal(WAKE_LABELS.includes(BLOCKED_LABEL_PREFIX), true);
+});
+
+test('M126: unrelated labels do not drain the queue', () => {
+  assert.equal(resolveWake('pull_request_target', 'type: chore').run, false);
+  assert.equal(resolveWake('pull_request_target', HOLD_LABEL).run, false);
+  assert.deepEqual(resolveWake('pull_request_target', ''), {
+    run: false,
+    reason: 'pull_request_target without a label name',
+  });
+});
+
+test('M126: scheduled and CI-completion sweeps always drain', () => {
+  for (const event of ['schedule', 'workflow_run', 'workflow_dispatch']) {
+    assert.equal(resolveWake(event, '').run, true, event);
+  }
+});
+
+test('M126: the workflow runs the tested predicate instead of its own label filter', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const workflow = await readFile(
+    new URL('../.github/workflows/merge-queue.yml', import.meta.url),
+    'utf8',
+  );
+  assert.match(workflow, /types: \[labeled, unlabeled\]/);
+  assert.match(workflow, /node scripts\/merge-queue\.mjs wake/);
+  assert.match(workflow, /if: steps\.wake\.outputs\.run == 'true'/);
+  const jobGuard = workflow.split('drain-queue:')[1].split('steps:')[0];
+  assert.ok(!/label\.name/.test(jobGuard), 'the job guard must not hardcode a label filter');
+  // Trust root unchanged: the queue runs default-branch tooling, never PR code.
+  assert.match(workflow, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+});
+
+test('M126: the wake CLI publishes the GITHUB_OUTPUT contract', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const dir = mkdtempSync(join(tmpdir(), 'm126-'));
+  const out = join(dir, 'github_output');
+  const repoRoot = new URL('..', import.meta.url);
+  const run = (label) =>
+    execFileSync(
+      process.execPath,
+      ['scripts/merge-queue.mjs', 'wake', '--event', 'pull_request_target', '--label', label],
+      { env: { ...process.env, GITHUB_OUTPUT: out }, cwd: repoRoot },
+    );
+  try {
+    run(`${BLOCKED_LABEL_PREFIX} head=abc`);
+    assert.match(readFileSync(out, 'utf8'), /^run=true$/m);
+    run('docs');
+    assert.match(readFileSync(out, 'utf8'), /^run=false$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

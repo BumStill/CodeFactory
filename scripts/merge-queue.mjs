@@ -19,7 +19,7 @@
 // See docs/specs/feature-specs/merge-queue.md.
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { appendFileSync, existsSync } from 'node:fs';
 
 // The exact required checks of ruleset `main-pr-and-ci-gate` (id 20222077).
 // Kept in sync with `.github/rulesets/main.json`; the queue refuses to run if
@@ -48,6 +48,48 @@ const BLOCKED_MARKER_RE =
 /** Render the machine-readable marker written at the top of a blocking comment. */
 export function blockedMarker(headSha, date = new Date()) {
   return `<!-- merge-queue:blocked head=${headSha} at=${date.toISOString()} -->`;
+}
+
+// ---------------------------------------------------------------------------
+// M126 — what wakes the queue
+// ---------------------------------------------------------------------------
+// 2026-10-20 (#768): the queue was driven by `schedule`, `workflow_run` and a
+// `pull_request_target: [labeled]` trigger filtered to `merge-queue: armed`.
+// Two real gaps let a green, armed PR (merge state CLEAN) sit for 20+ minutes:
+//
+//   (a) the queue's own `merge-queue: blocked` label was lifted after a green
+//       head, which emits `unlabeled` — no trigger listened to it, so the
+//       block removal woke nothing and the queue only ran when a human
+//       dispatched it by hand;
+//   (b) arming an already-armed PR produces no event at all (`gh pr edit
+//       --add-label` is a no-op on a present label), so "arm once CI went
+//       green" could stay asleep until the next cron tick.
+//
+// The decision lives HERE, not in the workflow's `if:`, so a unit test pins it
+// and the workflow cannot drift away from the tested behaviour.
+export const WAKE_LABELS = Object.freeze([ARM_LABEL, BLOCKED_LABEL_PREFIX]);
+
+/**
+ * Should this event drain the queue?
+ *
+ * Only `pull_request_target` events are filtered: they are the ones that fire
+ * per label change. Everything else (schedule / workflow_run / dispatch) is a
+ * deliberate queue sweep and always runs. The trigger stays
+ * `pull_request_target` — the workflow checks out the DEFAULT branch and never
+ * the PR head, so a candidate PR still cannot run its own queue logic.
+ */
+export function resolveWake(eventName, labelName = '') {
+  const event = typeof eventName === 'string' ? eventName.trim() : '';
+  if (event !== 'pull_request_target') {
+    return { run: true, reason: `${event || 'unspecified event'} always drains the queue` };
+  }
+  const label = typeof labelName === 'string' ? labelName.trim() : '';
+  if (!label) return { run: false, reason: 'pull_request_target without a label name' };
+  const hits = WAKE_LABELS.some(
+    (name) => label === name || (name === BLOCKED_LABEL_PREFIX && label.startsWith(BLOCKED_LABEL_PREFIX)),
+  );
+  if (!hits) return { run: false, reason: `label "${label}" is not a queue wake label` };
+  return { run: true, reason: `queue label "${label}" changed` };
 }
 
 /** Parse the marker back out of a PR comment body; null when absent. */
@@ -687,6 +729,21 @@ async function main(argv) {
   const [command = 'status', ...rest] = argv;
   const flags = parseFlags(rest);
   const repo = flags.repo ?? 'BumStill/CodeFactory';
+
+  if (command === 'wake') {
+    // M126: the workflow calls this instead of encoding the label filter in its
+    // `if:`, so the tested predicate is the one that actually runs.
+    const verdict = resolveWake(
+      flags.event ?? process.env.GITHUB_EVENT_NAME ?? '',
+      flags.label ?? '',
+    );
+    const outFile = process.env.GITHUB_OUTPUT;
+    if (outFile) {
+      appendFileSync(outFile, `run=${verdict.run ? 'true' : 'false'}\nreason=${verdict.reason}\n`);
+    }
+    process.stdout.write(`${JSON.stringify({ command, ...verdict }, null, 2)}\n`);
+    return 0;
+  }
 
   if (command === 'plan' || command === 'status') {
     const adapter = createGhAdapter({ repo });

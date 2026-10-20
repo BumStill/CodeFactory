@@ -24,8 +24,16 @@ env:
   PYTHONIOENCODING: utf-8
 
 on:
+  # M126: label changes are the wake signal. `labeled` arms a PR; `unlabeled`
+  # lifts the queue's own `merge-queue: blocked` (2026-10-20 #768 sat idle 20+
+  # min exactly on that event). Which labels actually drain is decided by
+  # `scripts/merge-queue.mjs wake` below, so the rule stays unit-tested.
+  #
+  # Safety: `pull_request_target` runs the DEFAULT-branch tooling and never
+  # checks out or executes PR code — the queue that merges a candidate is the
+  # one on the trusted branch. No new permissions are granted here.
   pull_request_target:
-    types: [labeled]
+    types: [labeled, unlabeled]
   schedule:
     - cron: "*/10 * * * *" # sweep the queue every 10 minutes
   workflow_dispatch:
@@ -53,7 +61,6 @@ permissions:
 
 jobs:
   drain-queue:
-    if: "${{ github.event_name != 'pull_request_target' || github.event.label.name == 'merge-queue: armed' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -69,7 +76,18 @@ jobs:
         with:
           node-version: "20"
 
+      # M126: one tested predicate decides whether this event drains the queue.
+      # A label change outside `merge-queue: *` stops here in seconds and never
+      # touches the merge path.
+      - name: Decide whether this event drains the queue
+        id: wake
+        run: |
+          node scripts/merge-queue.mjs wake \
+            --event "$GITHUB_EVENT_NAME" \
+            --label "${{ github.event.label.name }}"
+
       - name: Require a write token
+        if: steps.wake.outputs.run == 'true'
         env:
           MERGE_QUEUE_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
@@ -79,9 +97,11 @@ jobs:
           }
 
       - name: Verify the queue logic (unit tests)
+        if: steps.wake.outputs.run == 'true'
         run: node --test scripts/merge-queue.test.mjs
 
       - name: Drain the queue (plan + merge share one snapshot)
+        if: steps.wake.outputs.run == 'true'
         # M114/R8: `drain` first asks "is anything armed?" with ONE listing and
         # exits immediately when nothing is queued (most workflow_run sweeps),
         # then reads the ruleset once and reuses a single PR listing for both the
