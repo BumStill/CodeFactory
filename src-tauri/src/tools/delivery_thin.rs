@@ -107,6 +107,17 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
             log.gh(commands, &["pr", "edit", &number_arg, "--add-label", "merge-queue: armed"])?;
             log.step("queue", "armed");
         } else { log.step("queue", "already armed"); }
+        // M126: GitHub only emits the `labeled` webhook when a label is NEW, so
+        // re-arming an already-armed PR woke nothing — "arm once CI went green"
+        // left the queue asleep until its next cron tick (2026-10-20 #768 sat
+        // idle 20+ min on a CLEAN, armed PR). Dispatch the queue workflow so
+        // "armed" means "the queue runs now". Best effort: a token without
+        // actions:write keeps the scheduled sweep in charge, and the arm itself
+        // already succeeded, so a refused dispatch must not fail delivery.
+        match log.gh(commands, &["workflow", "run", "merge-queue.yml"]) {
+            Ok(_) => log.step("queue", "dispatched"),
+            Err(_) => log.step("queue", "dispatch unavailable"),
+        }
     }
     let ci = log.gh(commands, &["pr", "view", &number_arg, "--json", "state,statusCheckRollup"])?;
     let ci: Value = serde_json::from_str(&ci).map_err(|e| e.to_string())?;
@@ -146,7 +157,7 @@ mod tests {
     #[derive(Default)]
     struct Forge {
         pushed: bool, pr: bool, armed: bool, fail_label: bool, merged: bool,
-        pushes: usize, creates: usize, merges: usize,
+        pushes: usize, creates: usize, merges: usize, dispatched: bool,
         // CF-STAGE1-P1: proves the body contract runs between commit and push.
         fill_body: bool, reject_body: Option<String>,
         created_body: Option<String>, edited_body: Option<String>, events: Vec<&'static str>,
@@ -182,6 +193,7 @@ mod tests {
                     self.armed=true; Ok(String::new())
                 },
                 "edit" => { self.edited_body = recorded_body(a); Ok(String::new()) },
+                "run" => { self.dispatched = true; Ok(String::new()) },
                 "view" if a.contains(&"labels") => Ok(json!({"labels":if self.armed {vec![json!({"name":"merge-queue: armed"})]} else {vec![]}}).to_string()),
                 "view" if a.contains(&"number,url") => Ok(pr.to_string()),
                 "view" => Ok(json!({"state":"OPEN","statusCheckRollup":[{"status":"IN_PROGRESS"}]}).to_string()),
@@ -261,5 +273,13 @@ mod tests {
         let mut forge = Forge { fail_label:true, ..Default::default() };
         assert_eq!(deliver(&mut forge).unwrap_err(), "label denied");
         assert_eq!(forge.merges, 0);
+    }
+    #[test]
+    fn already_armed_rearm_still_wakes_the_queue() {
+        // M126: an already-armed PR emits no `labeled` webhook, so "arm once CI
+        // went green" must still dispatch the queue or the PR waits for cron.
+        let mut forge = Forge { pushed:true, pr:true, armed:true, ..Default::default() };
+        let _ = deliver(&mut forge).unwrap();
+        assert!(forge.dispatched, "re-arming an armed PR must dispatch the queue");
     }
 }
