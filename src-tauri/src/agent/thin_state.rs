@@ -325,6 +325,53 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     Ok(state)
 }
 
+/// 阶段 2 P0/R1：thin 回合**唯一**的结算判定。
+///
+/// 只要本轮已经产出了最终回答（`final_text` 非空），状态就必须结算为最终回答
+/// （→ `ended`/`waiting_*`）。`StopReason::Blocked` 是完成闸门在拿到最终文本后
+/// 收束回合的有界停止，把用户可见的最终回答当成技术失败会让行永久停在
+/// `running`（v1.91.1 会话 bee5d6b7 的现场），而且之后再也没有回合来改写它。
+pub fn outcome_settles_final(finished: bool, blocked: bool, final_text: &str) -> bool {
+    finished || (blocked && !final_text.trim().is_empty())
+}
+
+/// 阶段 2 P0/R1：最终回答只在这一处结算。
+///
+/// `stop_label` 只用于技术失败签名，调用方不得再自行判断「finished 才算最终」。
+#[allow(clippy::too_many_arguments)]
+pub async fn settle_outcome(
+    db: &SqlitePool,
+    session_id: &str,
+    root_turn_id: &str,
+    finished: bool,
+    blocked: bool,
+    final_text: &str,
+    stop_label: &str,
+    external_what: Option<String>,
+) -> sqlx::Result<ThinState> {
+    if outcome_settles_final(finished, blocked, final_text) {
+        settle_final(db, session_id, root_turn_id, external_what).await
+    } else {
+        settle_error(
+            db,
+            session_id,
+            root_turn_id,
+            &format!("agent loop stopped: {stop_label}"),
+        )
+        .await
+    }
+}
+
+/// 阶段 2 P0/R2：没有任何可续跑的回合时，thin 会话必须发问，不能留在 `running`。
+pub async fn ask_user(db: &SqlitePool, session_id: &str, question: &str) -> sqlx::Result<ThinState> {
+    let mut state = ThinState::running();
+    state.state = SessionState::WaitingUser;
+    state.question = Some(question.to_string());
+    state.updated_at = now();
+    save(db, session_id, &state).await?;
+    Ok(state)
+}
+
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("agent loop error").chars().take(160).collect()
 }

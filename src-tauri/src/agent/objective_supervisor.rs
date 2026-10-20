@@ -1439,6 +1439,23 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                 Ok(surfaced) => tracing::info!(surfaced, "thin waiting_wake heartbeat surfaced expired waits"),
                 Err(error) => tracing::warn!(%error, "thin waiting_wake heartbeat failed"),
             }
+            // 阶段 2 P0/R2: a `running` thin row whose executor died (crashed
+            // turn, restart race) is resumed from the heartbeat once it is past
+            // the grace window. Runs at most once a minute.
+            if polls_since_stall_sweep % 12 == 0 {
+                let resumed = super::thin_restart::resume_running_without_executor(
+                    app.clone(),
+                    &pool,
+                    super::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS,
+                )
+                .await;
+                if resumed > 0 {
+                    tracing::info!(
+                        count = resumed,
+                        "thin restart heartbeat resumed running sessions with no executor"
+                    );
+                }
+            }
             polls_since_stall_sweep += 1;
             if polls_since_stall_sweep >= STALL_SWEEP_EVERY_POLLS {
                 polls_since_stall_sweep = 0;

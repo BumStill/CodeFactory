@@ -1693,16 +1693,26 @@ async fn apply_chat_objective_outcome(
     // answer already exists once in the transcript.
     if let Some(session) = current.session_id.as_deref() {
         if crate::agent::thin::is_thin(db, session).await {
-            let thin = if outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished {
-                let external = if crate::agent::thin::external_wait_hint(db, session).await.is_some() {
-                    Some("外部交付（PR/CI）".to_string())
-                } else { None };
-                crate::agent::thin_state::settle_final(db, session, root_turn_id, external).await
-            } else {
-                crate::agent::thin_state::settle_error(
-                    db, session, root_turn_id, &format!("agent loop stopped: {:?}", outcome.stop_reason),
-                ).await
-            }.map_err(|error| AppError::Other(error.to_string()))?;
+            // 阶段 2 P0/R1: the settlement decision lives in exactly one place
+            // (`thin_state::settle_outcome`). A run that already produced a
+            // final answer — including a bounded `Blocked` stop — ends the
+            // session; only a run with no answer at all counts as a technical
+            // failure, so a final answer can never leave the row `running`.
+            let external = if crate::agent::thin::external_wait_hint(db, session).await.is_some() {
+                Some("外部交付（PR/CI）".to_string())
+            } else { None };
+            let thin = crate::agent::thin_state::settle_outcome(
+                db,
+                session,
+                root_turn_id,
+                outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished,
+                outcome.stop_reason == codefactory_agent_loop::run::StopReason::Blocked,
+                &outcome.final_text,
+                &format!("{:?}", outcome.stop_reason),
+                external,
+            )
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?;
             crate::agent::thin_state::close_objective(db, objective_id, &thin)
                 .await.map_err(|error| AppError::Other(error.to_string()))?;
             return Ok(current);
@@ -3730,6 +3740,309 @@ pub(crate) async fn resume_context_objective(
     resume_chat_objective_inner(app, objective, mutation_permit, Some(authorization)).await
 }
 
+/// 阶段 2 P0/R2：应用启动或心跳发现 thin 会话停在 `running` 且没有活着的回合
+/// 执行者时，从这里真正续跑。
+///
+/// 复用持久化的根回合（不插入合成的用户消息、不新建第二个根回合），并在历史里
+/// 追加阶段 1 R3 的中断提示，让模型先确认现场再继续。结算仍走 thin 唯一结算入口，
+/// 所以续跑后的回合可以把会话结到 `ended`/`waiting_*`。
+pub(crate) async fn resume_thin_running_session(
+    app: AppHandle,
+    session_id: String,
+) -> Result<(), AppError> {
+    let db = app.state::<AppState>().db.read().await.clone();
+    if !crate::agent::thin::is_thin(&db, &session_id).await {
+        return Ok(());
+    }
+    let Some(thin) = crate::agent::thin_state::load(&db, &session_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    if thin.state != crate::agent::thin_state::SessionState::Running {
+        return Ok(());
+    }
+    let resumable: Option<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT turn.root_turn_id, objective.id, objective.revision, turn.updated_at
+         FROM chat_turn_state turn
+         JOIN objectives objective ON objective.id=turn.objective_id
+         WHERE turn.session_id=? AND turn.completed_at IS NULL
+           AND objective.status IN ('active','waiting_system')
+         ORDER BY turn.updated_at DESC LIMIT 1",
+    )
+    .bind(&session_id)
+    .fetch_optional(&db)
+    .await?;
+    let Some((root_turn_id, objective_id, objective_revision, last_progress_at)) = resumable else {
+        // Nothing persisted to continue: a `running` row with no turn would sit
+        // there forever, so the session must ask instead.
+        crate::agent::thin_state::ask_user(
+            &db,
+            &session_id,
+            "应用重启后发现这个会话停在运行中，但找不到可续跑的回合。要我继续吗？",
+        )
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+        return Ok(());
+    };
+    let original_content: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM messages WHERE id=? AND session_id=? AND role='user'",
+    )
+    .bind(&root_turn_id)
+    .bind(&session_id)
+    .fetch_optional(&db)
+    .await?;
+    let original_content = original_content.unwrap_or_default();
+
+    let state = app.state::<AppState>();
+    let run_control = Arc::new(crate::ChatRunControl::pending());
+    let cancel_flag = run_control.cancel.clone();
+    if let Err(error) = admit_chat_run(
+        &state.chat_cancels,
+        &state.update_restart_reserved,
+        &session_id,
+        run_control.clone(),
+    )
+    .await
+    {
+        // Another live turn owns this session: nothing to resume.
+        tracing::info!(session = %session_id, %error, "thin restart: session already has a live executor");
+        return Ok(());
+    }
+    let mut running_guard = ChatRunningSetupGuard::new(
+        state.chat_cancels.clone(),
+        session_id.clone(),
+        run_control.clone(),
+    );
+    running_guard.attach_durable_db(db.clone());
+    #[cfg(not(test))]
+    running_guard.attach_event_app(app.clone());
+    register_chat_run_control(&db, &run_control, &session_id).await?;
+    bind_chat_run_root(
+        &db,
+        &run_control.run_instance_id,
+        &session_id,
+        &root_turn_id,
+    )
+    .await?;
+
+    let settings_snapshot = state.settings.read().await.clone();
+    let settings_state = state.settings.clone();
+    let pending_permissions = state.pending_permissions.clone();
+    let chat_cancels = state.chat_cancels.clone();
+    let interjections = state.interjections.clone();
+    let tracked_run_control = run_control.clone();
+    drop(state);
+    let mcp_manager = Arc::clone(&*app.state::<Arc<McpManager>>());
+
+    let session = sqlx::query_as::<_, crate::storage::Session>("SELECT * FROM sessions WHERE id=?")
+        .bind(&session_id)
+        .fetch_one(&db)
+        .await?;
+    let mut history = crate::storage::load_agent_history(&db, &session_id).await?;
+    let interrupt_at = if last_progress_at > 0 {
+        last_progress_at
+    } else {
+        thin.updated_at
+    };
+    push_thin_resume_prompt(
+        &db,
+        &session_id,
+        &format!("thin-restart:{session_id}:{interrupt_at}"),
+        interrupt_at,
+        &mut history,
+    )
+    .await?;
+
+    let turn_settings = settings_for_session_route(
+        &settings_snapshot,
+        session.endpoint_id.as_deref(),
+        &session.model_id,
+        &session.model_policy,
+    )?;
+    let requires_vision = history.iter().any(|message| {
+        !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
+    });
+    let (route_plan, _) = resolve_route_plan(
+        &turn_settings,
+        &session.model_id,
+        &session.model_policy,
+        requires_vision,
+    )
+    .await?;
+    let primary_route = route_plan
+        .candidates()
+        .first()
+        .ok_or_else(|| AppError::Other("thin restart has no model route".into()))?
+        .clone();
+    let structured_read_only = crate::storage::tasks::sub_session_read_only(&db, &session_id).await?;
+    let contract = crate::agent::decide_chat_contract_with_intent(
+        None,
+        &original_content,
+        crate::agent::TurnIntent {
+            structured_read_only,
+        },
+    );
+    let effective_cwd = resolve_chat_execution_cwd(
+        &app,
+        &db,
+        &objective_id,
+        &session_id,
+        &session.cwd,
+        contract.capability,
+    )
+    .await?;
+
+    let event_name = format!("stream:{session_id}");
+    let app_for_run = app.clone();
+    let db_for_run = db.clone();
+    let session_for_run = session_id.clone();
+    let session_for_error = session_id.clone();
+    let interjections_cleanup = interjections.clone();
+    let loop_result = supervise_chat_task(async move {
+        let mut agent = AgentLoop::new_with_mode(
+            app_for_run,
+            db_for_run,
+            session_for_run,
+            primary_route.endpoint_name,
+            primary_route.model_id,
+            primary_route.base_url,
+            String::new(),
+            primary_route.api_style,
+            effective_cwd,
+            settings_state,
+            pending_permissions,
+            mcp_manager,
+            Some(crate::agent::AgentExecutionContext {
+                parent_session_id: None,
+                task_id: None,
+                knowledge_library_ids: Vec::new(),
+                usage_surface: crate::agent::UsageSurface::Interactive,
+                // A restart resume carries no new authorization: it continues
+                // the persisted turn under exactly the authority it had.
+                mutation_permit: None,
+                force_context_compression: None,
+            }),
+            contract.mode,
+        )
+        .with_turn_capability(contract.capability)
+        .with_turn_grants(contract.grants)
+        .with_failover_plan(route_plan)
+        .with_cancel(cancel_flag)
+        .with_steer(interjections);
+        agent.run(history).await
+    })
+    .await;
+
+    let mut settled_objective = match loop_result {
+        Ok(outcome) => Some(
+            settle_chat_objective_from_outcome(
+                &db,
+                &app,
+                &event_name,
+                &objective_id,
+                objective_revision,
+                &root_turn_id,
+                &outcome,
+                None,
+            )
+            .await?,
+        ),
+        Err(error_text) => {
+            tracing::error!("thin restart agent loop error: {error_text}");
+            let settled = crate::agent::thin_state::settle_outcome(
+                &db,
+                &session_id,
+                &root_turn_id,
+                false,
+                false,
+                "",
+                "agent loop error",
+                None,
+            )
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?;
+            crate::agent::thin_state::close_objective(&db, &objective_id, &settled)
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))?;
+            sqlx::query(
+                "UPDATE chat_turn_state SET revision=revision+1, updated_at=? WHERE root_turn_id=?",
+            )
+            .bind(Utc::now().timestamp_millis())
+            .bind(&root_turn_id)
+            .execute(&db)
+            .await?;
+            None
+        }
+    };
+
+    if let Some(cancelled) =
+        settle_chat_run_control(&db, &tracked_run_control.run_instance_id).await?
+    {
+        settled_objective = Some(cancelled);
+    }
+    clear_chat_running_if_current(&chat_cancels, &session_id, &tracked_run_control).await;
+    if let Some(settled) = settled_objective.as_ref() {
+        emit_chat_turn_settled(
+            &app,
+            &event_name,
+            &tracked_run_control,
+            Some(&root_turn_id),
+            Some(&settled.id),
+            chat_settlement_status(settled),
+        );
+    }
+    crate::commands::interjections::drain_for_session(&interjections_cleanup, &session_for_error)
+        .await;
+    let reclaimed = crate::tools::browser_session::close_for_session(&session_for_error).await;
+    if reclaimed > 0 {
+        tracing::info!("thin restart reclaimed {reclaimed} browser session(s)");
+    }
+    running_guard.disarm();
+    Ok(())
+}
+
+/// 阶段 1 R3 的中断提示，追加为一条 system 历史（不是用户消息、不落第二个根回合）。
+/// 旧恢复路径与重启续跑共用这一份实现。
+async fn push_thin_resume_prompt(
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    key: &str,
+    interrupted_at: i64,
+    history: &mut Vec<crate::storage::Message>,
+) -> Result<(), AppError> {
+    let last: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT tool.tool_name, tool.arguments, tool.created_at FROM tool_calls tool JOIN messages message ON message.id=tool.message_id WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await?;
+    let (summary, at) = last
+        .map(|(name, arguments, at)| {
+            (
+                format!("{name}: {}", arguments.chars().take(500).collect::<String>()),
+                at,
+            )
+        })
+        .unwrap_or_else(|| ("模型请求（结果未知）".into(), interrupted_at));
+    history.push(crate::storage::Message {
+        id: format!("thin-resume:{key}"),
+        session_id: session_id.to_string(),
+        role: "system".into(),
+        content: crate::agent::thin::resume_prompt(at, &summary),
+        endpoint_id: None,
+        model_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        tool_calls: None,
+        reasoning_content: None,
+        completion_state: None,
+        created_at: Utc::now().timestamp_millis(),
+    });
+    Ok(())
+}
+
 async fn resume_chat_objective_inner(
     app: AppHandle,
     objective: crate::agent::objective::ObjectiveSnapshot,
@@ -3851,17 +4164,14 @@ async fn resume_chat_objective_inner(
     let thin_mode = crate::agent::thin::is_thin(&db, &session_id).await;
     let mut history = crate::storage::load_agent_history(&db, &session_id).await?;
     if thin_mode {
-        let last: Option<(String, String, i64)> = sqlx::query_as(
-            "SELECT tool.tool_name, tool.arguments, tool.created_at FROM tool_calls tool JOIN messages message ON message.id=tool.message_id WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1"
-        ).bind(&session_id).fetch_optional(&db).await?;
-        let (summary, interrupted_at) = last.map(|(name, arguments, at)| (format!("{name}: {}", arguments.chars().take(500).collect::<String>()), at))
-            .unwrap_or_else(|| ("模型请求（结果未知）".into(), objective.updated_at));
-        history.push(crate::storage::Message {
-            id: format!("thin-resume:{}:{}", objective.id, objective.revision), session_id: session_id.clone(), role: "system".into(),
-            content: crate::agent::thin::resume_prompt(interrupted_at, &summary),
-            endpoint_id: None, model_id: None, input_tokens: None, output_tokens: None, tool_calls: None, reasoning_content: None, completion_state: None,
-            created_at: Utc::now().timestamp_millis(),
-        });
+        push_thin_resume_prompt(
+            &db,
+            &session_id,
+            &format!("{}:{}", objective.id, objective.revision),
+            objective.updated_at,
+            &mut history,
+        )
+        .await?;
     }
     if let Some(continuation) = crate::agent::objective::incomplete_objective_continuation_prompt(
         objective.failure_code.as_deref(),

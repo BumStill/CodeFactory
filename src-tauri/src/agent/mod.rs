@@ -13,6 +13,7 @@ mod context_policy;
 pub(crate) mod context_recovery;
 pub mod delivery;
 pub(crate) mod thin;
+pub(crate) mod thin_restart;
 pub(crate) mod thin_state;
 #[cfg(not(test))]
 pub(crate) mod delivery_recovery_smoke;
