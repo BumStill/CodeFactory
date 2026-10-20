@@ -804,11 +804,70 @@ pub fn is_forge_query_segment(segment: &str) -> bool {
                     .is_some_and(|subsub| allowed.contains(subsub)),
             }
         }
-        "git" => rest
-            .first()
-            .is_some_and(|subcommand| GIT_QUERY_SUBCOMMANDS.contains(subcommand)),
+        "git" => match rest.split_first() {
+            // `git branch` is two tools in one: a bare listing only reads
+            // refs, while `-d/-m/-c/-f/-u` or a positional name writes them.
+            // A flat table entry would launder `git branch -D main` into a
+            // read-only probe.
+            Some((&"branch", tail)) => git_branch_listing_is_read_only(tail),
+            Some((subcommand, _)) => GIT_QUERY_SUBCOMMANDS.contains(subcommand),
+            None => false,
+        },
         _ => false,
     }
+}
+
+/// `git branch` lists refs when it is given only listing flags, and writes
+/// them as soon as a write flag or a positional branch name appears. Split by
+/// flag instead of adding `branch` to the flat query table, which would have
+/// turned `git branch -D main` into a read-only probe.
+fn git_branch_listing_is_read_only(words: &[&str]) -> bool {
+    const LISTING_FLAGS: &[&str] = &[
+        "-a",
+        "--all",
+        "-r",
+        "--remotes",
+        "-v",
+        "-vv",
+        "--verbose",
+        "-i",
+        "--ignore-case",
+        "--column",
+        "--no-column",
+        "--show-current",
+    ];
+    // These take one value and still only read refs: a revision filter
+    // (`--merged HEAD`) or a branch-name pattern (`--list 'feat/*'`). Anything
+    // else positional names a branch to create, so it stays a write.
+    const VALUE_TAKING_FLAGS: &[&str] = &[
+        "-l",
+        "--list",
+        "--merged",
+        "--no-merged",
+        "--contains",
+        "--no-contains",
+        "--points-at",
+    ];
+    let mut expects_value = false;
+    for word in words {
+        if LISTING_FLAGS.contains(word)
+            || word.starts_with("--format=")
+            || word.starts_with("--sort=")
+        {
+            expects_value = false;
+            continue;
+        }
+        if VALUE_TAKING_FLAGS.contains(word) {
+            expects_value = true;
+            continue;
+        }
+        if expects_value && !word.is_empty() {
+            expects_value = false;
+            continue;
+        }
+        return false;
+    }
+    true
 }
 
 /// The mirrored boundary: forge/git invocations that change remote or local
@@ -838,14 +897,18 @@ fn is_forge_mutation_segment(segment: &str) -> bool {
             // not, so require a following verb.
             tail.first().is_some()
         }
-        "git" => rest.first().is_some_and(|subcommand| {
-            matches!(
+        "git" => match rest.split_first() {
+            // M131b: `branch` is both a read and a write, and this mirror runs
+            // before the probe check — listing it wholesale is what turned the
+            // read-only field command `git branch --show-current` into a
+            // "变更动作". Delegate to the same split the query side uses.
+            Some((&"branch", tail)) => !git_branch_listing_is_read_only(tail),
+            Some((subcommand, _)) => matches!(
                 *subcommand,
                 "add"
                     | "am"
                     | "apply"
                     | "archive"
-                    | "branch"
                     | "checkout"
                     | "cherry-pick"
                     | "clean"
@@ -868,8 +931,9 @@ fn is_forge_mutation_segment(segment: &str) -> bool {
                     | "tag"
                     | "update-ref"
                     | "worktree"
-            )
-        }),
+            ),
+            None => false,
+        },
         _ => false,
     }
 }
@@ -7742,6 +7806,62 @@ mod tests {
 
         let completed = gate.evidence();
         assert!(completed.completed, "blockers: {:?}", completed.blockers);
+    }
+
+    /// M131b-R1 field evidence (session `357f833f`, 2026-10-21): a read-only
+    /// turn asked for `git branch --show-current` next to `git status` and
+    /// `git log`, and the whole compound command was denied as a mutation.
+    /// Listing refs is a query like `git status`; only the forms that write a
+    /// ref stay mutations.
+    #[test]
+    fn m131b_git_branch_listing_is_a_read_only_probe() {
+        let field_report = "git status --short --branch; echo '--- log ---'; \
+git log --oneline -1; echo '--- branches ---'; git branch --show-current; echo '--- pr ---'; \
+gh pr view --json number,state,title 2>&1 | head -5";
+        for command in [
+            "git branch",
+            "git branch --show-current",
+            "git branch -a",
+            "git branch -r -v",
+            "git branch -vv",
+            "git branch --list 'feat/*'",
+            "git branch --format='%(refname:short)'",
+            "git branch --merged",
+        ] {
+            assert_eq!(
+                classify_command(command, 30_000),
+                ToolKind::ReadOnly,
+                "a ref listing is a probe, not a mutation: {command}"
+            );
+        }
+        // The original compound also carried `gh pr view`, which is a remote
+        // read that the classifier deliberately labels Verification; what
+        // matters for the field report is that no segment turns the whole
+        // command into a workspace mutation the read-only turn must refuse.
+        assert_ne!(
+            classify_command(field_report, 30_000),
+            ToolKind::Mutation,
+            "the read-only field command must be allowed in a review-only turn"
+        );
+        for command in [
+            "git branch -D main",
+            "git branch -d stale",
+            "git branch -m main",
+            "git branch -M main",
+            "git branch -c copy",
+            "git branch -C copy",
+            "git branch -f main HEAD~1",
+            "git branch --set-upstream-to=origin/main",
+            "git branch --unset-upstream",
+            "git branch --edit-description",
+            "git branch new-feature",
+        ] {
+            assert_eq!(
+                classify_command(command, 30_000),
+                ToolKind::Mutation,
+                "a ref writer must never be laundered as a probe: {command}"
+            );
+        }
     }
 
     #[test]
