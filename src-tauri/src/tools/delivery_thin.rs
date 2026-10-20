@@ -47,6 +47,103 @@ impl Log {
     fn step(&mut self, step: &str, result: &str) { self.steps.push(json!({"step":step,"result":result})); }
 }
 
+/// M132: a title that only restates the branch says nothing about the change.
+/// The field defect was `fix: codefactory/objective-<hex>` reaching `main` and the
+/// release notes because nothing refused it.
+fn echoes_branch(title: &str, branch: &str) -> bool {
+    let claim = title
+        .split_once(':')
+        .map_or(title.trim(), |(_, rest)| rest.trim());
+    let branch = branch.trim();
+    let claim_lower = claim.to_ascii_lowercase();
+    claim.is_empty()
+        || (!branch.is_empty() && (claim == branch || claim.contains(branch)))
+        || claim.contains("codefactory/objective")
+        || claim_lower.starts_with("objective ")
+        || claim_lower.starts_with("objective-")
+}
+
+/// Conventional Commit subjects are what this repository releases from; a title
+/// without one gives the squash subject and the release note nothing to work with.
+fn conventional_subject(title: &str) -> bool {
+    let Some((head, rest)) = title.trim().split_once(':') else {
+        return false;
+    };
+    if rest.trim().is_empty() {
+        return false;
+    }
+    let head = head.trim();
+    let kind_end = head.find(['(', '!']).unwrap_or(head.len());
+    matches!(
+        &head[..kind_end],
+        "feat" | "fix" | "chore" | "docs" | "refactor" | "test" | "ci" | "build" | "perf" | "style"
+    )
+}
+
+fn usable_title(title: &str, branch: &str) -> bool {
+    let title = title.trim();
+    let claim = title
+        .split_once(':')
+        .map_or(title, |(_, rest)| rest.trim());
+    conventional_subject(title)
+        && !echoes_branch(title, branch)
+        && !delivery::is_managed_objective_placeholder_title(claim)
+}
+
+/// The branch's own commits, newest first — the fallback description of the work.
+fn recent_subjects(commands: &mut impl Commands) -> Vec<String> {
+    commands
+        .git(&["log", "--format=%s", "-n", "20"])
+        .map(|log| {
+            log.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// An already-open PR may carry a title a human already corrected; never lose it.
+fn open_pr_title(commands: &mut impl Commands, branch: &str) -> Option<String> {
+    let listed = commands
+        .gh(&["pr", "list", "--head", branch, "--state", "open", "--json", "number,title,state"])
+        .ok()?;
+    let prs: Vec<Value> = serde_json::from_str(&listed).ok()?;
+    prs.iter()
+        .find(|pr| pr["state"] == "OPEN")
+        .and_then(|pr| pr["title"].as_str())
+        .map(str::to_owned)
+}
+
+/// Resolve the PR title before anything is committed or pushed: the model's own
+/// title, then this branch's first meaningful commit subject, then a title a
+/// human already fixed on the open PR. Nothing usable means no delivery at all.
+fn resolve_title(commands: &mut impl Commands, args: &Value, branch: &str) -> Result<String, String> {
+    if let Some(title) = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| usable_title(title, branch))
+    {
+        return Ok(title.to_string());
+    }
+    if let Some(subject) = recent_subjects(commands)
+        .into_iter()
+        .find(|subject| usable_title(subject, branch))
+    {
+        return Ok(subject);
+    }
+    if let Some(title) = open_pr_title(commands, branch).filter(|title| usable_title(title, branch)) {
+        return Ok(title);
+    }
+    Err(format!(
+        "deliver_changes 缺少可用的 PR 标题：调用没有给 title，分支 {branch} 上也没有能用作标题的提交说明。\
+请用 title 传一句描述本次改动的 Conventional Commit 标题（如 fix: 修复标题回落成分支名），\
+本次未提交、未推送任何内容。"
+    ))
+}
+
 fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, excludes: &[String], log: &mut Log) -> Result<Value, String> {
     if ceiling == DeliveryCeiling::Off { return Ok(json!({"state":"noop"})); }
     let branch = commands.git(&["branch", "--show-current"])?;
@@ -55,9 +152,10 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
         return Err(format!("expected branch does not match {branch}"));
     }
     log.branch = branch.clone();
+    // M132: resolve the title first — a delivery that cannot describe itself must
+    // not write `fix: <branch>` into the commit history or onto the PR.
+    let title = resolve_title(commands, args, &branch)?;
     let paths = commands.stage(excludes)?;
-    let title = args.get("title").and_then(Value::as_str).map(str::to_owned)
-        .unwrap_or_else(|| format!("fix: {}", paths.first().map(String::as_str).unwrap_or(&branch)));
     if !paths.is_empty() {
         commands.git(&["commit", "-m", &title])?;
         log.step("commit", "created");
@@ -100,6 +198,15 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
     }
     let pr = if let Some(pr) = existing {
         let number = pr["number"].as_u64().ok_or("PR number missing")?.to_string();
+        // M132 R3: update only with a title that says something, so a re-delivery
+        // can never turn a usable PR title back into the branch name.
+        let keep_title = !usable_title(&title, &branch)
+            && pr["title"].as_str().is_some_and(|existing| usable_title(existing, &branch));
+        let title = if keep_title {
+            pr["title"].as_str().unwrap_or_default().to_string()
+        } else {
+            title
+        };
         if pr["title"].as_str() != Some(title.as_str()) || pr["body"].as_str() != Some(body.as_str()) {
             log.gh(commands, &["pr", "edit", &number, "--title", &title, "--body", &body])?;
         }
@@ -176,6 +283,10 @@ mod tests {
         governance_root: Option<std::path::PathBuf>, governance_error: Option<String>, governance_warnings: Vec<String>,
         fill_body: bool, reject_body: Option<String>,
         created_body: Option<String>, edited_body: Option<String>, events: Vec<&'static str>,
+        // M132: the title the forge actually received, and the commit subjects the
+        // branch carries (`git log --format=%s`, newest first).
+        subjects: Vec<String>, pr_title: Option<String>,
+        created_title: Option<String>, edited_title: Option<String>,
     }
     impl Commands for Forge {
         fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {
@@ -196,24 +307,32 @@ mod tests {
             Ok(match a[0] {
                 "branch" => "feature".into(), "rev-parse" => "abc123".into(),
                 "ls-remote" if self.pushed => "abc123\trefs/heads/feature".into(),
+                "log" => self.subjects.join("\n"),
                 "push" => { self.pushed = true; self.pushes += 1; self.events.push("push"); String::new() },
                 _ => String::new(),
             })
         }
         fn gh(&mut self, a: &[&str]) -> Result<String,String> {
-            let pr = json!({"number":42,"url":"https://forge.invalid/pr/42","title":"fix: thin","body":"synthetic","state":if self.merged {"MERGED"} else {"OPEN"},"headRefOid":"abc123"});
+            let pr = json!({"number":42,"url":"https://forge.invalid/pr/42",
+                "title":self.pr_title.clone().unwrap_or_else(|| "fix: thin".to_string()),
+                "body":"synthetic","state":if self.merged {"MERGED"} else {"OPEN"},"headRefOid":"abc123"});
             match a[1] {
                 "list" => Ok(if self.pr {json!([pr])} else {json!([])}.to_string()),
                 "create" => {
                     self.pr=true; self.creates+=1;
                     self.created_body = recorded_body(a);
+                    self.created_title = recorded_title(a);
                     Ok(String::new())
                 },
                 "edit" if a.contains(&"--add-label") => {
                     if self.fail_label {return Err("label denied".into());}
                     self.armed=true; Ok(String::new())
                 },
-                "edit" => { self.edited_body = recorded_body(a); Ok(String::new()) },
+                "edit" => {
+                    self.edited_body = recorded_body(a);
+                    if let Some(title) = recorded_title(a) { self.pr_title = Some(title.clone()); self.edited_title = Some(title); }
+                    Ok(String::new())
+                },
                 "run" => { self.dispatched = true; Ok(String::new()) },
                 "view" if a.contains(&"labels") => Ok(json!({"labels":if self.armed {vec![json!({"name":"merge-queue: armed"})]} else {vec![]}}).to_string()),
                 "view" if a.contains(&"number,url") => Ok(pr.to_string()),
@@ -227,6 +346,11 @@ mod tests {
         args.iter().position(|arg| *arg == "--body")
             .and_then(|index| args.get(index + 1))
             .map(|body| body.to_string())
+    }
+    fn recorded_title(args: &[&str]) -> Option<String> {
+        args.iter().position(|arg| *arg == "--title")
+            .and_then(|index| args.get(index + 1))
+            .map(|title| title.to_string())
     }
     fn deliver(f: &mut Forge) -> Result<Value,String> {
         run(f, &json!({"title":"fix: thin","body":"synthetic"}), DeliveryCeiling::ThroughMerge, &[], &mut Log::default())
@@ -355,5 +479,60 @@ mod tests {
         let mut forge = Forge { pushed:true, pr:true, armed:true, ..Default::default() };
         let _ = deliver(&mut forge).unwrap();
         assert!(forge.dispatched, "re-arming an armed PR must dispatch the queue");
+    }
+
+    // ---- M132: the PR title/body must describe the change, never the branch ----
+    const BRANCH_ECHO: &str = "fix: codefactory/objective-8af68c03794255ec2beef940d3d42524";
+
+    #[test]
+    fn missing_title_uses_first_meaningful_commit_subject() {
+        // R1: no `title` from the model, but the branch already carries a real
+        // Conventional Commit — that subject is the title, not the branch name.
+        let mut forge = Forge { subjects: vec![BRANCH_ECHO.to_string(),
+            "feat: keep the merge queue awake after a green run".to_string()], ..Default::default() };
+        let result = run(&mut forge, &json!({"body":"synthetic"}), DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+        assert_eq!(forge.created_title.as_deref(), Some("feat: keep the merge queue awake after a green run"));
+        assert_eq!(result["state"], "waiting");
+    }
+
+    #[test]
+    fn branch_echo_title_falls_back_to_the_commit_subject() {
+        // R1: an explicit title that only echoes the branch describes nothing.
+        let mut forge = Forge { subjects: vec!["fix: stop the queue waking on a stale head".to_string()],
+            ..Default::default() };
+        let result = run(&mut forge, &json!({"title": BRANCH_ECHO, "body":"synthetic"}),
+            DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+        assert_eq!(forge.created_title.as_deref(), Some("fix: stop the queue waking on a stale head"));
+        assert_ne!(result["state"], "delivered");
+    }
+
+    #[test]
+    fn no_title_and_no_meaningful_subject_errors_without_push() {
+        // R1: nothing usable to say → error before any commit or push.
+        let mut forge = Forge { subjects: vec![BRANCH_ECHO.to_string()], ..Default::default() };
+        let error = run(&mut forge, &json!({"body":"synthetic"}), DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap_err();
+        assert!(error.contains("title") || error.contains("标题"), "{error}");
+        assert_eq!((forge.pushes, forge.creates), (0, 0));
+        assert!(!forge.pushed);
+    }
+
+    #[test]
+    fn reused_pr_keeps_a_usable_title_instead_of_the_branch_name() {
+        // R3: an open PR that already carries a real title is not downgraded.
+        let mut forge = Forge { pr: true, pr_title: Some("fix: keep the merge queue awake".into()),
+            subjects: vec![BRANCH_ECHO.to_string()], ..Default::default() };
+        let result = run(&mut forge, &json!({"title": BRANCH_ECHO, "body":"synthetic"}),
+            DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+        assert_eq!(forge.edited_title, None);
+        assert_eq!(result["state"], "waiting");
+    }
+
+    #[test]
+    fn better_title_updates_the_existing_pr() {
+        // R3: when the candidate is a real subject, the open PR is updated.
+        let mut forge = Forge { pr: true, pr_title: Some(BRANCH_ECHO.into()),
+            subjects: vec!["feat: derive the PR title from the commit".to_string()], ..Default::default() };
+        run(&mut forge, &json!({"body":"synthetic"}), DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+        assert_eq!(forge.edited_title.as_deref(), Some("feat: derive the PR title from the commit"));
     }
 }
