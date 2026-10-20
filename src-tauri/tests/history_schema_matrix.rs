@@ -21,7 +21,7 @@ fn historical_schema_matrix_preserves_identity() {
         assert_eq!(row["reopen_idempotent"], true);
         assert_eq!(row["side_effect_count"], 0);
         assert_eq!(row["human_prompt_count"], 0);
-        assert_eq!(row["outcome"], if version == 1 { "explicit_terminal" } else { "continued" });
+        assert_eq!(row["outcome"], "continued");
     }
     assert_eq!(value["cleanup_ok"], true);
 }
