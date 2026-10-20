@@ -22,7 +22,7 @@ def check(root: Path, base: str, timeout: float = 10) -> dict:
             continue
         try:
             result = subprocess.run([sys.executable, str(script), *args], cwd=root,
-                                    capture_output=True, text=True, timeout=timeout)
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         except (OSError, subprocess.TimeoutExpired) as error:
             warnings.append(f'{name}: timeout or unavailable: {error}')
             continue
