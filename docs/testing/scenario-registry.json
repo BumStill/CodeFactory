@@ -126,7 +126,7 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
-      "automated_by": ["rust:arbitrary_real_user_message_links_the_unique_open_objective", "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident", "binary:--history-session-smoke"],
+      "automated_by": ["rust:arbitrary_real_user_message_links_the_unique_open_objective", "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident", "rust:ambiguous_objective_identity_never_refuses_the_message", "rust:contextual_approval_after_an_ended_turn_starts_a_new_turn", "binary:--history-session-smoke"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },

@@ -63,11 +63,19 @@ pub(super) async fn run(root: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
         let admission = crate::commands::chat::admit_headless_chat_turn(&pool, SESSION, "继续").await;
         let expected_id;
         if version == 1 {
-            let error = match admission { Ok(_) => bail!("identity-free history must not create a new task"), Err(e) => e.to_string() };
-            if !error.contains("这段历史记录缺少可续接的任务身份") || counts(&pool).await? != before {
-                bail!("identity-free history did not fail atomically with a readable terminal");
+            // M129 R5: identity-free history is no longer a refusal. The human's
+            // message starts a new turn atomically and keeps the history.
+            let admission = admission.map_err(|e| anyhow!(e.to_string()))?;
+            let state = counts(&pool).await?;
+            if admission.objective.session_id.as_deref() != Some(SESSION)
+                || admission.objective.id == OBJECTIVE
+                || state.0 != before.0 + 1
+                || state.1 != before.1 + 1
+                || state.3 != 0
+            {
+                bail!("identity-free history did not start a new turn with the human's message");
             }
-            expected_id = None;
+            expected_id = Some(admission.objective.id);
         } else {
             let admission = admission.map_err(|e| anyhow!(e.to_string()))?;
             if admission.objective.session_id.as_deref() != Some(SESSION)
@@ -85,17 +93,20 @@ pub(super) async fn run(root: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
         if counts(&reopened).await? != settled { bail!("schema {version} reopen duplicated state"); }
         if let Some(id) = expected_id {
             let binding: (String,String,String) = sqlx::query_as("SELECT id,session_id,root_turn_id FROM objectives").fetch_one(&reopened).await?;
-            if binding != (id, SESSION.into(), ROOT.into()) { bail!("schema {version} lost durable identity"); }
-        } else {
-            let error = crate::commands::chat::admit_headless_chat_turn(&reopened, SESSION, "继续").await;
-            if error.is_ok() || counts(&reopened).await? != settled { bail!("terminal retry was not idempotent"); }
+            if binding.0 != id || binding.1 != SESSION { bail!("schema {version} lost durable identity"); }
+            if version == 1 {
+                // No identity existed to preserve; the new turn must own a fresh root.
+                if binding.2.is_empty() || binding.2 == ROOT { bail!("schema 1 did not start an independent turn root"); }
+            } else if binding.2 != ROOT {
+                bail!("schema {version} lost durable identity");
+            }
         }
         let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE role='user'").fetch_one(&reopened).await?;
-        if user_count != if version == 1 { 1 } else { 2 } { bail!("matrix required extra human input"); }
+        if user_count != 2 { bail!("matrix required extra human input"); }
         crate::storage::db::close_and_release_files(reopened).await;
         rows.push(serde_json::json!({"source_version":version,"migrated":true,
             "identity_preserved":true,"reopen_idempotent":true,"side_effect_count":settled.3,
-            "human_prompt_count":0,"outcome":if version==1 {"explicit_terminal"} else {"continued"}}));
+            "human_prompt_count":0,"outcome":"continued"}));
     }
     Ok(rows)
 }
