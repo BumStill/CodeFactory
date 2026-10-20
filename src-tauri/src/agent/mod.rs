@@ -361,6 +361,9 @@ a test fails, you MUST first diagnose:\n\
 Editing a test purely because it failed, without a stated reason rooted\n\
 in the spec, is a hard failure of the engineering contract.\n\
 \n\
+# Local governance precheck\n\
+Before pushing, deliver_changes runs local governance checks: OBJECTIVE_MANUAL_TECHNICAL_HANDOFF means system technical states must say 系统自动重试/自愈; manual actions are only for product-level user decisions. Fix reported rule violations before delivery.\n\
+\n\
 # Never leave a wait unwatched\n\
 When you would otherwise wait on something outside this turn — CI, the merge\n\
 queue, a release, a long build or test run, a deploy, a periodic status check\n\
@@ -467,6 +470,9 @@ catch it and respawn you with a 'previous attempt incomplete' brief.\n\
 You can communicate as engineer-to-engineer in your reasoning, but\n\
 prose without verification is wasted tokens. Verify, then summarize.\n\
 \n\
+# Local governance precheck\n\
+Before pushing, deliver_changes runs local governance checks: OBJECTIVE_MANUAL_TECHNICAL_HANDOFF means system technical states must say 系统自动重试/自愈; manual actions are only for product-level user decisions. Fix reported rule violations before delivery.\n\
+\n\
 # Never leave a wait unwatched\n\
 Waits happen inside a delivered task too: CI, the merge queue, a release, a\n\
 long build or test run, a deploy, a periodic status check. Put them in the\n\
@@ -542,6 +548,9 @@ implement, change, publish, deploy, or otherwise act now. Carry it out NOW.\n\
    without delivery is not done; narrating the missing PR instead of opening\n\
    it is the exact failure this rule exists to prevent. The tool is idempotent\n\
    and commits only real source files.\n\
+\n\
+# Local governance precheck\n\
+Before pushing, deliver_changes runs local governance checks: OBJECTIVE_MANUAL_TECHNICAL_HANDOFF means system technical states must say 系统自动重试/自愈; manual actions are only for product-level user decisions. Fix reported rule violations before delivery.\n\
 \n\
 # Never leave a wait unwatched\n\
 Waits beyond this turn — CI, the merge queue, a release, a long build, a long\n\
