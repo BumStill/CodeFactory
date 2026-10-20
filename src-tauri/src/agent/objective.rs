@@ -2202,6 +2202,14 @@ impl ObjectiveStore {
             resource_generation,
         ) in candidates
         {
+            // Phase 2 P0 / R3: a thin session owns its own four-state verdict.
+            // The legacy capability rearm must not queue a remediation or a
+            // recovery decision for it.
+            if let Some(session) = session_id.as_deref() {
+                if super::thin::is_thin(&self.pool, session).await {
+                    continue;
+                }
+            }
             let domain = RecoveryDomain::parse(&domain_value)?;
             let now = Utc::now().timestamp_millis();
             let mut tx = self.pool.begin().await?;
@@ -3712,6 +3720,15 @@ impl ObjectiveStore {
         let mut reclassified = 0;
         for (objective_id, revision, session_id, terminal_root_turn_id, suspended_at) in candidates
         {
+            // Phase 2 P0 / R3: never reclassify a thin session's Objective into
+            // a synthetic technical handback. That path writes the incident
+            // notice into the transcript, which is the fabricated ending this
+            // phase removes.
+            if let Some(session) = session_id.as_deref() {
+                if super::thin::is_thin(&self.pool, session).await {
+                    continue;
+                }
+            }
             let now = Utc::now().timestamp_millis();
             let next_revision = revision + 1;
             let visible_final_message_id =
@@ -5288,23 +5305,12 @@ impl ObjectiveStore {
                     // A missing-monitor reminder is not a technical failure either.
                     return Ok(decision);
                 }
-                if decision.failure_signature.is_some() && decision.status == ObjectiveStatus::WaitingSystem {
-                    let previous: Vec<Option<String>> = sqlx::query_scalar("SELECT failure_signature FROM objective_decisions WHERE objective_id=? ORDER BY revision DESC LIMIT 2")
-                        .bind(&decision.objective_id).fetch_all(&self.pool).await?;
-                    if previous.len() == 2 && previous.iter().all(|signature| signature == &decision.failure_signature) {
-                        decision.status = ObjectiveStatus::Failed;
-                        decision.decision_type = DecisionType::FailedInternal;
-                        decision.failure_code = Some(TECHNICAL_RECOVERY_EXHAUSTED.into());
-                        decision.request_key = None;
-                        decision.remediation_id = None;
-                        decision.recovery_owner = Some(OBJECTIVE_INCIDENT_CONTROLLER.into());
-                        decision.next_observation_at = None;
-                        decision.next_action_authorized = false;
-                        decision.requires_user_action = false;
-                    } else {
-                        decision.domain = RecoveryDomain::Chat;
-                    }
-                }
+                // Phase 2 P0 / R1: the legacy recovery ladder and its
+                // incident-controller park are not thin-session authorities.
+                // Escalating a repeated failure signature here is exactly what
+                // parked a `waiting_wake` session as `technical_recovery_exhausted`
+                // and printed "已结束：连续三次遇到相同失败" in the transcript.
+                // A thin session keeps its own four-state verdict untouched.
                 return Ok(decision);
             }
         }
@@ -5651,6 +5657,61 @@ impl ObjectiveStore {
         .await;
     }
 
+    /// Phase 2 P0 / R1+R2: retire a legacy Objective that belongs to a thin
+    /// session instead of settling it.
+    ///
+    /// The retirement is the only write: no `objective_decisions` row, no
+    /// remediation, no transcript system message, and no change to
+    /// `thin_session_state`. That is what stops `objective-incident-controller`
+    /// from fabricating a user-visible "已结束：连续三次…" for a session whose
+    /// real state is `waiting_wake`.
+    async fn retire_legacy_objective_on_thin_session(
+        &self,
+        current: &ObjectiveSnapshot,
+    ) -> anyhow::Result<Option<ObjectiveSnapshot>> {
+        let Some(session) = current.session_id.as_deref() else {
+            return Ok(None);
+        };
+        if current.status.is_terminal() {
+            return Ok(None);
+        }
+        if !super::thin::is_thin(&self.pool, session).await {
+            return Ok(None);
+        }
+        let now = Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE objectives SET revision=revision+1, status='legacy_orphan',
+               decision_type='continue', failure_code=NULL, failure_signature=NULL,
+               remediation_id=NULL, next_observation_at=NULL,
+               requires_user_action=0, lease_owner=NULL, lease_expires_at=NULL,
+               completed_at=?, updated_at=?
+             WHERE id=? AND status NOT IN ('completed','cancelled','legacy_orphan')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(&current.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE objective_remediations SET status='superseded',
+               lease_owner=NULL, lease_expires_at=NULL, updated_at=?
+             WHERE objective_id=?
+               AND status NOT IN ('completed','cancelled','superseded')",
+        )
+        .bind(now)
+        .bind(&current.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!(
+            objective_id = %current.id,
+            session_id = session,
+            "legacy objective retired: thin session owns its own state"
+        );
+        self.get(&current.id).await
+    }
+
     async fn apply_decision_inner(
         &self,
         expected_revision: i64,
@@ -5670,6 +5731,16 @@ impl ObjectiveStore {
             );
         }
         decision.validate(&current)?;
+        // Phase 2 P0 / R1+R2: `thin_session_state` is the only authority for a
+        // thin session. A legacy decision (objective-incident-controller,
+        // recovery ladder, remediation budget, completion gate) aimed at a thin
+        // session must never be applied: it wrote the fabricated
+        // "已结束：连续三次…" into sessions whose real state was `waiting_wake`.
+        // Retire the legacy Objective as a read-only compat record and return
+        // without a decision row, a remediation or a transcript message.
+        if let Some(retired) = self.retire_legacy_objective_on_thin_session(&current).await? {
+            return Ok(retired);
+        }
         // Runs before the transaction opens: a deterministic pool may allow a
         // single connection, and asking for a second one mid-transaction
         // deadlocks recovery into a timeout.
@@ -5716,9 +5787,12 @@ impl ObjectiveStore {
                 super::thin::is_thin(&self.pool, session).await
             } else { false };
             if thin {
-                Some(format!("已结束：连续三次遇到相同失败。已尝试读取现场并重新执行；最后错误：{}。成果与命令记录保留在本会话及任务工作区 {}。",
-                    current.failure_code.as_deref().unwrap_or("执行失败"),
-                    "（见本会话项目目录与工具输出）"))
+                // Phase 2 P0 / R2: only `thin_session_state` may tell a thin
+                // session that the work ended. The fabricated
+                // "已结束：连续三次遇到相同失败" wording is gone; a thin session
+                // carries its own four-state verdict and this legacy path never
+                // reaches it (the Objective is retired before settlement).
+                None
             } else {
                 self.build_failure_summary(&current, &decision).await
             }
@@ -13334,6 +13408,154 @@ CREATE TABLE objectives (
             .unwrap()
     }
 
+    /// Phase 2 P0 / R4: the legacy incident controller must not settle a thin
+    /// session. Before this guard it parked a `waiting_wake` session as
+    /// `technical_recovery_exhausted` and wrote
+    /// "已结束：连续三次遇到相同失败" into the transcript. A legacy (`project`)
+    /// session keeps its old settlement, so the guard is scoped, not global.
+    #[tokio::test]
+    async fn legacy_incident_controller_never_settles_a_thin_session() {
+        fn parked_settlement(objective: &ObjectiveSnapshot) -> DecisionEnvelope {
+            DecisionEnvelope {
+                objective_id: objective.id.clone(),
+                revision: objective.revision + 1,
+                domain: RecoveryDomain::Chat,
+                decision_type: DecisionType::FailedInternal,
+                status: ObjectiveStatus::Failed,
+                failure_code: Some(TECHNICAL_RECOVERY_EXHAUSTED.into()),
+                failure_signature: Some("sha256:legacy-exhausted".into()),
+                recovery_owner: Some(OBJECTIVE_INCIDENT_CONTROLLER.into()),
+                remediation_id: None,
+                next_observation_at: None,
+                next_action_authorized: false,
+                requires_user_action: false,
+                request_key: None,
+                decision_key: None,
+                action_signature: None,
+                output_started: false,
+                side_effect_started: false,
+                resume_cursor: objective.root_turn_id.clone(),
+                reached_acceptance: None,
+                evidence: None,
+                visible_final_message_id: None,
+                cancellation_provenance: None,
+                attention_request: None,
+                settlement_origin: SettlementOrigin::default(),
+                transport_probe_wait: false,
+            }
+        }
+
+        let pool = pool().await;
+        settlement_tables(&pool).await;
+        crate::agent::thin_state::ensure(&pool).await.unwrap();
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        for (id, mode) in [
+            ("session-objective-thin-guard", "thin"),
+            ("session-objective-legacy-guard", "project"),
+        ] {
+            sqlx::query(
+                "INSERT INTO sessions
+                 (id, title, cwd, model_id, created_at, updated_at, delivery_mode)
+                 VALUES (?, ?, '/tmp/guard', 'test', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(now)
+            .bind(now)
+            .bind(mode)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let thin = seed_legacy_parked_chat_incident(&pool, "objective-thin-guard").await;
+        let legacy = seed_legacy_parked_chat_incident(&pool, "objective-legacy-guard").await;
+        sqlx::query(
+            "INSERT INTO thin_session_state
+             (session_id, state, waiting_for, wake_source, consecutive_failures, updated_at)
+             VALUES (?, 'waiting_wake', '后台任务', 'background_task', 0, ?)",
+        )
+        .bind("session-objective-thin-guard")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let messages_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // 1. Settling the thin Objective retires it and writes nothing else.
+        let retired = store
+            .apply_decision(thin.revision, parked_settlement(&thin))
+            .await
+            .unwrap();
+        let retired_status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+            .bind(&thin.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(retired_status, "legacy_orphan");
+        assert_eq!(retired.failure_code, None);
+        let thin_decisions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objective_decisions WHERE objective_id=?")
+                .bind(&thin.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(thin_decisions, 0, "a thin session takes no legacy decision");
+        let messages_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            messages_after, messages_before,
+            "no fabricated ending reaches a thin transcript"
+        );
+        let thin_state: String =
+            sqlx::query_scalar("SELECT state FROM thin_session_state WHERE session_id=?")
+                .bind("session-objective-thin-guard")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(thin_state, "waiting_wake");
+
+        // 2. The controller's own tick paths skip the thin Objective.
+        store.sync_recovery_capabilities().await.unwrap();
+        let reactivated = store.reactivate_eligible_incidents(8).await.unwrap();
+        assert!(
+            reactivated.iter().all(|objective| objective.id != thin.id),
+            "capability rearm must not resurrect a thin Objective"
+        );
+        store.reclassify_synthetic_technical_handbacks().await.unwrap();
+        let thin_after_ticks: String =
+            sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+                .bind(&thin.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(thin_after_ticks, "failed");
+
+        // 3. A legacy session keeps the historical settlement.
+        let legacy = store.get(&legacy.id).await.unwrap().unwrap();
+        let settled = store
+            .apply_decision(legacy.revision, parked_settlement(&legacy))
+            .await
+            .unwrap();
+        assert_eq!(settled.status, ObjectiveStatus::Failed);
+        let legacy_decisions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objective_decisions WHERE objective_id=?")
+                .bind(&legacy.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy_decisions, 1, "legacy sessions are unchanged");
+    }
+
     #[tokio::test]
     async fn capability_revision_reactivates_a_legacy_incident_without_user_reprompt() {
         let pool = pool().await;
@@ -16394,19 +16616,33 @@ CREATE TABLE objectives (
                         source: super::super::background_tasks::TaskSource::AgentDecided,
                     }, chrono::Utc::now().timestamp()).await.unwrap();
             }
-            for _ in 0..5 {
-                let decision = DecisionRouter::route(&current, RouteSignal::TechnicalFailure {
-                    domain: RecoveryDomain::Chat, failure_code: COMPLETION_EVIDENCE_INCOMPLETE.into(),
-                    failure_signature: "synthetic:wait".into(), next_observation_at: Utc::now().timestamp_millis() + 5_000,
-                    resume_cursor: current.root_turn_id.clone(),
-                }).unwrap();
-                current = store.apply_decision(current.revision, decision).await.unwrap();
-                assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
-                if covered {
-                    assert!(current.failure_signature.is_none(), "waiting is not a technical failure");
-                    assert!(current.next_observation_at.is_none(), "only the wake source should resume the wait");
-                    assert!(current.remediation_id.is_none(), "no system nudge while covered");
-                }
+            // Phase 2 P0: this used to apply five legacy
+            // `completion_evidence_incomplete` waits to a thin Objective. A thin
+            // session owns `thin_session_state`, so the first legacy decision
+            // retires the Objective instead — the legacy wait gate never runs
+            // and there is no attempt budget left to exhaust.
+            let decision = DecisionRouter::route(&current, RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat, failure_code: COMPLETION_EVIDENCE_INCOMPLETE.into(),
+                failure_signature: "synthetic:wait".into(), next_observation_at: Utc::now().timestamp_millis() + 5_000,
+                resume_cursor: current.root_turn_id.clone(),
+            }).unwrap();
+            let retired = store.apply_decision(current.revision, decision).await.unwrap();
+            assert_eq!(retired.status, ObjectiveStatus::LegacyOrphan);
+            assert!(retired.failure_signature.is_none(), "waiting is not a technical failure");
+            assert!(retired.next_observation_at.is_none(), "only the wake source should resume the wait");
+            assert!(retired.remediation_id.is_none(), "no system nudge while covered");
+            let legacy_decisions: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM objective_decisions WHERE objective_id=?")
+                    .bind(&retired.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(legacy_decisions, 0, "a thin session takes no legacy decision");
+            if covered {
+                assert!(
+                    super::super::background_tasks::wake_source_cover(&pool, &session).await.is_covered(),
+                    "retiring the legacy Objective must leave the thin wake source intact"
+                );
             }
             if coverage == "process" {
                 super::super::background_tasks::reclaim_session(&pool, &session).await;
@@ -16427,13 +16663,22 @@ CREATE TABLE objectives (
         sqlx::query("INSERT INTO chat_turn_state (root_turn_id,session_id,status,objective_id) VALUES (?,?,'working',?)")
             .bind(current.root_turn_id.as_deref().unwrap()).bind(current.session_id.as_deref().unwrap()).bind(&current.id)
             .execute(&pool).await.unwrap();
-        for round in 1..=3 {
-            current = route_technical_failure(&store, &current, "adapter_error", "sha256:same-thin-failure").await;
-            assert_eq!(current.status, if round == 3 { ObjectiveStatus::Failed } else { ObjectiveStatus::WaitingSystem });
-        }
+        // Phase 2 P0: a thin ending comes from the thin settlement
+        // (`thin_session_state` + projected `chat_turn_state`), never from three
+        // legacy `route_technical_failure` rounds. Those rounds wrote
+        // "已结束：连续三次遇到相同失败" into `messages` for sessions whose real
+        // state was still `waiting_wake`.
+        let messages_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=?")
+            .bind(current.session_id.as_deref().unwrap()).fetch_one(&pool).await.unwrap();
+        let retired = route_technical_failure(&store, &current, "adapter_error", "sha256:same-thin-failure").await;
+        assert_eq!(retired.status, ObjectiveStatus::LegacyOrphan);
+        assert!(retired.failure_code.is_none(), "no legacy failure_code reaches a thin Objective");
         let summary: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant'")
             .bind(current.session_id.as_deref().unwrap()).fetch_one(&pool).await.unwrap();
-        assert!(summary > 0, "thin terminal must explain attempts and artifact location");
+        assert_eq!(
+            summary, messages_before,
+            "the legacy path must not fabricate an ending for a thin session"
+        );
     }
 
     /// Synthetic chat Objective on the completion-gate route, already parked in
