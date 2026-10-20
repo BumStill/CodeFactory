@@ -4317,6 +4317,16 @@ fn reconcile_readme_contract_body(
     body: &str,
 ) -> Result<ReadmeBodyReconciliation, String> {
     let readme_changed = readme_changed_on_branch(root, remote, base)?;
+    apply_readme_declaration(body, readme_changed)
+}
+
+/// CF-STAGE1-P1: the README declaration half of the body contract, with the
+/// branch fact passed in instead of read from git. Thin delivery reuses this so
+/// "did this branch touch README.md" is the only thing it supplies itself.
+fn apply_readme_declaration(
+    body: &str,
+    readme_changed: bool,
+) -> Result<ReadmeBodyReconciliation, String> {
     let (decisions, reasons) = readme_contract_lines(body);
     let valid_decision =
         decisions.len() == 1 && matches!(decisions[0].as_str(), "required" | "reviewed");
@@ -4405,6 +4415,100 @@ fn reconcile_readme_contract_body(
         body: format!("{}\n", cleaned.join("\n")),
         changed: true,
     })
+}
+
+/// CF-STAGE1-P1: thin delivery (`tools::delivery_thin`) keeps no durable body, so
+/// it forwarded the caller's body verbatim and opened PRs the repository
+/// validators reject (`README-Update` / `Scenario-Test` missing). Everything the
+/// body must declare is derived here from the same sources the durable path
+/// uses — never a second copy of the rules.
+pub(crate) fn prepare_thin_pr_body(
+    root: &Path,
+    title: &str,
+    body: &str,
+    urgency: Option<ReleaseUrgency>,
+) -> Result<String, String> {
+    let remote = "origin";
+    let base = thin_base_branch(root, remote)?;
+    let mut steps = Vec::new();
+    let scenario_body =
+        reconcile_scenario_contract_body(root, remote, &base, body, &mut steps)?;
+    let readme_changed = readme_changed_on_branch(root, remote, &base)?;
+    let assembled = apply_readme_declaration(&scenario_body, readme_changed)?.body;
+    // `Release-Urgency` belongs in the final paragraph, so it is placed after the
+    // README block and is idempotent when the caller already declared it.
+    let assembled = append_release_urgency(assembled, urgency);
+    validate_pr_body_intent(&assembled)?;
+    precheck_thin_pr_body(root, title, &format!("{remote}/{base}"), &assembled)?;
+    Ok(assembled)
+}
+
+/// The base a thin delivery measures its diff against. A ref that is not there
+/// yet (fresh clone, shallow CI checkout) is fetched once; if it still cannot be
+/// resolved the delivery stops before any remote mutation instead of guessing.
+fn thin_base_branch(root: &Path, remote: &str) -> Result<String, String> {
+    let base = remote_default_branch(root, remote).unwrap_or_else(|| "main".to_string());
+    let existing = format!("{remote}/{base}");
+    if git(root, &["rev-parse", "--verify", "--quiet", &existing]).is_ok() {
+        return Ok(base);
+    }
+    let _ = git(root, &["fetch", remote, &base]);
+    git(root, &["rev-parse", "--verify", "--quiet", &existing]).map_err(|_| {
+        format!(
+            "无法解析基线分支 {existing}，未推送任何提交；请先 git fetch {remote} {base} 后重试交付"
+        )
+    })?;
+    Ok(base)
+}
+
+/// Run the exact scripts CI runs, against the body that is about to be pushed.
+/// A body that would fail `check-frontend` / `scenario-gate-pr` is refused here,
+/// with the validator's own message, before the first push.
+fn precheck_thin_pr_body(
+    root: &Path,
+    title: &str,
+    base_ref: &str,
+    body: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut input = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    input.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    let path = input.path().to_path_buf();
+    let checks = [
+        (
+            "README 契约 (validate_readme_contract.py)",
+            "tools/governance/validate_readme_contract.py",
+            false,
+        ),
+        (
+            "场景契约 (validate_scenario_test_governance.py --ci)",
+            "tools/governance/validate_scenario_test_governance.py",
+            true,
+        ),
+    ];
+    for (label, script, with_title) in checks {
+        let script_path = root.join(script);
+        // Repositories that do not opt into these contracts have nothing to check.
+        if !script_path.exists() {
+            continue;
+        }
+        let mut environment = dev_command("python3");
+        environment
+            .arg(&script_path)
+            .arg("--body-file")
+            .arg(&path)
+            .arg("--repo")
+            .arg(root)
+            .arg("--base-ref")
+            .arg(base_ref);
+        if with_title {
+            environment.arg("--title").arg(title).arg("--ci");
+        }
+        bounded_delivery_output(&mut environment).map_err(|detail| {
+            format!("PR 正文未通过 {label} 的 CI 校验，未推送任何提交：{detail}")
+        })?;
+    }
+    Ok(())
 }
 
 fn prepare_release_policy(
@@ -18655,6 +18759,81 @@ mod m115_queue_head_tests {
         assert_eq!(
             queue_sync_other_parent("", &parents(&[known, "main-head"])),
             None
+        );
+    }
+}
+
+/// CF-STAGE1-P1: the thin delivery body contract, tested without a network.
+/// The last case runs the repository's real `check-frontend` validator, so the
+/// generated body is judged by the same script CI uses.
+#[cfg(test)]
+mod thin_body_contract_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn repo_root() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repository root above src-tauri")
+    }
+
+    #[test]
+    fn assembly_adds_the_readme_declaration_once() {
+        let assembled =
+            apply_readme_declaration("## Summary\n\nsynthetic change", false).unwrap();
+        assert!(assembled.changed);
+        let body = append_release_urgency(assembled.body, None);
+        assert_eq!(body.matches("README-Update:").count(), 1, "{body}");
+        assert_eq!(body.matches("README-Update-Reason:").count(), 1, "{body}");
+    }
+
+    #[test]
+    fn assembly_preserves_an_existing_declaration_verbatim() {
+        let original =
+            "## Summary\n\nREADME-Update: reviewed\nREADME-Update-Reason: synthetic reason\n";
+        let assembled = apply_readme_declaration(original, false).unwrap();
+        assert!(!assembled.changed);
+        assert_eq!(assembled.body, original);
+    }
+
+    #[test]
+    fn release_urgency_lands_in_the_last_paragraph_without_duplication() {
+        let assembled = apply_readme_declaration("## Summary\n\nsynthetic", false)
+            .unwrap()
+            .body;
+        let body = append_release_urgency(assembled, Some(ReleaseUrgency::Immediate));
+        let last = body.trim_end().rsplit("\n\n").next().unwrap();
+        assert_eq!(last.trim(), "Release-Urgency: immediate");
+        let again = append_release_urgency(body, Some(ReleaseUrgency::Immediate));
+        assert_eq!(again.matches("Release-Urgency:").count(), 1, "{again}");
+    }
+
+    #[test]
+    fn generated_body_passes_the_ci_readme_contract_validator() {
+        let root = repo_root();
+        let body = append_release_urgency(
+            apply_readme_declaration("## Summary\n\nsynthetic change body", false)
+                .unwrap()
+                .body,
+            Some(ReleaseUrgency::Immediate),
+        );
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        let output = dev_command("python3")
+            .arg(root.join("tools/governance/validate_readme_contract.py"))
+            .arg("--body-file")
+            .arg(file.path())
+            .arg("--repo")
+            .arg(root)
+            .arg("--base-ref")
+            .arg("HEAD")
+            .output()
+            .expect("python3 must run the repository validator");
+        assert!(
+            output.status.success(),
+            "validator rejected the generated body\nstdout: {}\nstderr: {}\nbody:\n{body}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

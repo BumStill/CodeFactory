@@ -212,12 +212,17 @@ export function evaluateEligibility(pr, { requiredChecks = REQUIRED_CHECKS } = {
       if (recordedCheck) {
         const now = latestCheckOnHead(pr.checks, recordedCheck, pr.headSha);
         if (now && now.status === 'completed' && now.conclusion === 'success') {
-          return {
-            eligible: true,
-            clearedBlock: true,
-            reason: `blocked check ${recordedCheck} is green again on the same head (${shortSha(pr.headSha)}); re-evaluating`,
-            terminal: false,
-          };
+          return evaluateEligibility(
+            { ...pr, labels: labels.filter((label) => !label.startsWith(BLOCKED_LABEL_PREFIX)) },
+            { requiredChecks },
+          ).eligible
+            ? {
+                eligible: true,
+                clearedBlock: true,
+                reason: `blocked check ${recordedCheck} is green again on the same head (${shortSha(pr.headSha)}); all required checks re-evaluated`,
+                terminal: false,
+              }
+            : { eligible: false, terminal: false, reason: 'recovered check does not certify all required checks; keeping block' };
         }
       }
       return {

@@ -81,10 +81,12 @@ jobs:
       # touches the merge path.
       - name: Decide whether this event drains the queue
         id: wake
+        env:
+          QUEUE_WAKE_LABEL: ${{ github.event.label.name }}
         run: |
           node scripts/merge-queue.mjs wake \
             --event "$GITHUB_EVENT_NAME" \
-            --label "${{ github.event.label.name }}"
+            --label "$QUEUE_WAKE_LABEL"
 
       - name: Require a write token
         if: steps.wake.outputs.run == 'true'

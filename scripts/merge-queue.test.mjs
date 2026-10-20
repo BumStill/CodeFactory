@@ -534,6 +534,9 @@ test('M78: arming triggers only trusted default-branch queue tooling', () => {
   // the unit-tested `wake` predicate below, not by an untested workflow `if:`.
   assert.match(workflow, /pull_request_target:\s*\n\s*types: \[labeled, unlabeled\]/);
   assert.match(workflow, /node scripts\/merge-queue\.mjs wake/);
+  assert.match(workflow, /QUEUE_WAKE_LABEL: \$\{\{ github\.event\.label\.name \}\}/);
+  assert.match(workflow, /--label "\$QUEUE_WAKE_LABEL"/);
+  assert.doesNotMatch(workflow, /--label "\$\{\{ github\.event\.label\.name/);
   assert.match(workflow, /if: steps\.wake\.outputs\.run == 'true'/);
   assert.match(workflow, /ref: \$\{\{ github.event.repository.default_branch \}\}/);
   assert.doesNotMatch(workflow, /ref:.*(?:head|pull_request)/);
@@ -851,6 +854,9 @@ test('M126: the workflow runs the tested predicate instead of its own label filt
   );
   assert.match(workflow, /types: \[labeled, unlabeled\]/);
   assert.match(workflow, /node scripts\/merge-queue\.mjs wake/);
+  assert.match(workflow, /QUEUE_WAKE_LABEL: \$\{\{ github\.event\.label\.name \}\}/);
+  assert.match(workflow, /--label "\$QUEUE_WAKE_LABEL"/);
+  assert.doesNotMatch(workflow, /--label "\$\{\{ github\.event\.label\.name/);
   assert.match(workflow, /if: steps\.wake\.outputs\.run == 'true'/);
   const jobGuard = workflow.split('drain-queue:')[1].split('steps:')[0];
   assert.ok(!/label\.name/.test(jobGuard), 'the job guard must not hardcode a label filter');
@@ -956,6 +962,18 @@ test('M127 — the blocked marker round-trips the failing check name', () => {
   assert.equal(parsed.headSha, SHA_A);
   assert.equal(parsed.check, 'check-frontend');
   assert.equal(parseBlockedMarker(blockedMarker(SHA_A)).check, null);
+});
+
+test('M126 safety: recovered check cannot bypass another failed required check', () => {
+  const checks = greenChecks(SHA_A).map((check) =>
+    check.name === 'check-rust' ? { ...check, conclusion: 'failure' } : check,
+  );
+  const verdict = evaluateEligibility(pr({
+    checks,
+    labels: [ARM_LABEL, BLOCKED_LABEL_PREFIX],
+    blocked: { headSha: SHA_A, check: 'check-frontend' },
+  }));
+  assert.equal(verdict.eligible, false);
 });
 
 test('M127 — runQueue records the failing check so the block can self-heal', async () => {

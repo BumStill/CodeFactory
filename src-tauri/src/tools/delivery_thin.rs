@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 use crate::agent::delivery;
+use crate::agent::delivery::ReleaseUrgency;
 use super::{ExecCtx, ToolOutput};
 use crate::config::settings::DeliveryCeiling;
 
@@ -10,6 +11,12 @@ trait Commands {
     fn git(&mut self, args: &[&str]) -> Result<String, String>;
     fn gh(&mut self, args: &[&str]) -> Result<String, String>;
     fn stage(&mut self, excludes: &[String]) -> Result<Vec<String>, String>;
+    /// CF-STAGE1-P1: the repository PR-body contract. Applied after the local
+    /// commit and before the first push, so a body CI would reject is never
+    /// pushed. Default passthrough keeps synthetic forges in memory.
+    fn reconcile_body(&mut self, _title: &str, body: &str, _urgency: Option<ReleaseUrgency>) -> Result<String, String> {
+        Ok(body.to_string())
+    }
 }
 
 struct Local<'a>(&'a Path);
@@ -19,6 +26,9 @@ impl Commands for Local<'_> {
         delivery::bounded_delivery_output(delivery::dev_command("gh").current_dir(self.0).args(args))
     }
     fn stage(&mut self, excludes: &[String]) -> Result<Vec<String>, String> { delivery::stage_scoped(self.0, excludes) }
+    fn reconcile_body(&mut self, title: &str, body: &str, urgency: Option<ReleaseUrgency>) -> Result<String, String> {
+        delivery::prepare_thin_pr_body(self.0, title, body, urgency)
+    }
 }
 
 #[derive(Default)]
@@ -47,6 +57,12 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
         log.step("commit", "created");
     } else { log.step("commit", "unchanged"); }
     let sha = commands.git(&["rev-parse", "HEAD"])?;
+    // The committed tree is now the thing the body describes; derive the required
+    // declarations and refuse a body CI would reject before touching the remote.
+    let urgency = super::delivery::release_urgency_from_args(args)?;
+    let requested_body = args.get("body").and_then(Value::as_str).unwrap_or("");
+    let body = commands.reconcile_body(&title, requested_body, urgency)?;
+    log.step("pr_body", if body == requested_body { "unchanged" } else { "reconciled" });
     let remote_ref = format!("refs/heads/{branch}");
     let remote = commands.git(&["ls-remote", "--heads", "origin", &remote_ref])?;
     let remote_sha = remote.split_whitespace().next();
@@ -59,7 +75,6 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
         commands.git(&["push", "--set-upstream", "origin", &format!("HEAD:{remote_ref}")])?;
         log.step("push", "pushed");
     } else { log.step("push", "unchanged"); }
-    let body = args.get("body").and_then(Value::as_str).unwrap_or("");
     let listed = log.gh(commands, &["pr", "list", "--head", &branch, "--state", "all", "--json", "number,url,title,body,state,headRefOid"])?;
     let prs: Vec<Value> = serde_json::from_str(&listed).map_err(|e| e.to_string())?;
     let existing = prs.iter().find(|pr| pr["state"] == "OPEN")
@@ -71,13 +86,13 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
     }
     let pr = if let Some(pr) = existing {
         let number = pr["number"].as_u64().ok_or("PR number missing")?.to_string();
-        if pr["title"].as_str() != Some(title.as_str()) || pr["body"].as_str() != Some(body) {
-            log.gh(commands, &["pr", "edit", &number, "--title", &title, "--body", body])?;
+        if pr["title"].as_str() != Some(title.as_str()) || pr["body"].as_str() != Some(body.as_str()) {
+            log.gh(commands, &["pr", "edit", &number, "--title", &title, "--body", &body])?;
         }
         log.step("pr", "reused");
         pr.clone()
     } else {
-        log.gh(commands, &["pr", "create", "--head", &branch, "--title", &title, "--body", body])?;
+        log.gh(commands, &["pr", "create", "--head", &branch, "--title", &title, "--body", &body])?;
         let raw = log.gh(commands, &["pr", "view", &branch, "--json", "number,url"])?;
         log.step("pr", "created");
         serde_json::from_str(&raw).map_err(|e| e.to_string())?
@@ -140,14 +155,27 @@ pub(super) async fn execute(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeilin
 mod tests {
     use super::*;
     #[derive(Default)]
-    struct Forge { pushed: bool, pr: bool, armed: bool, fail_label: bool, merged: bool, pushes: usize, creates: usize, merges: usize, dispatched: bool }
+    struct Forge {
+        pushed: bool, pr: bool, armed: bool, fail_label: bool, merged: bool,
+        pushes: usize, creates: usize, merges: usize, dispatched: bool,
+        // CF-STAGE1-P1: proves the body contract runs between commit and push.
+        fill_body: bool, reject_body: Option<String>,
+        created_body: Option<String>, edited_body: Option<String>, events: Vec<&'static str>,
+    }
     impl Commands for Forge {
-        fn stage(&mut self, _: &[String]) -> Result<Vec<String>,String> { Ok(vec![]) }
+        fn stage(&mut self, _: &[String]) -> Result<Vec<String>,String> { self.events.push("stage"); Ok(vec![]) }
+        fn reconcile_body(&mut self, _title: &str, body: &str, _urgency: Option<ReleaseUrgency>) -> Result<String,String> {
+            self.events.push("pr_body");
+            if let Some(error) = self.reject_body.clone() { return Err(error); }
+            Ok(if self.fill_body {
+                format!("{body}\n\n## README contract\n\nREADME-Update: reviewed\nREADME-Update-Reason: thin delivery derives the required lines before pushing")
+            } else { body.to_string() })
+        }
         fn git(&mut self, a: &[&str]) -> Result<String,String> {
             Ok(match a[0] {
                 "branch" => "feature".into(), "rev-parse" => "abc123".into(),
                 "ls-remote" if self.pushed => "abc123\trefs/heads/feature".into(),
-                "push" => { self.pushed = true; self.pushes += 1; String::new() },
+                "push" => { self.pushed = true; self.pushes += 1; self.events.push("push"); String::new() },
                 _ => String::new(),
             })
         }
@@ -155,12 +183,16 @@ mod tests {
             let pr = json!({"number":42,"url":"https://forge.invalid/pr/42","title":"fix: thin","body":"synthetic","state":if self.merged {"MERGED"} else {"OPEN"},"headRefOid":"abc123"});
             match a[1] {
                 "list" => Ok(if self.pr {json!([pr])} else {json!([])}.to_string()),
-                "create" => {self.pr=true; self.creates+=1; Ok(String::new())},
+                "create" => {
+                    self.pr=true; self.creates+=1;
+                    self.created_body = recorded_body(a);
+                    Ok(String::new())
+                },
                 "edit" if a.contains(&"--add-label") => {
                     if self.fail_label {return Err("label denied".into());}
                     self.armed=true; Ok(String::new())
                 },
-                "edit" => Ok(String::new()),
+                "edit" => { self.edited_body = recorded_body(a); Ok(String::new()) },
                 "run" => { self.dispatched = true; Ok(String::new()) },
                 "view" if a.contains(&"labels") => Ok(json!({"labels":if self.armed {vec![json!({"name":"merge-queue: armed"})]} else {vec![]}}).to_string()),
                 "view" if a.contains(&"number,url") => Ok(pr.to_string()),
@@ -169,6 +201,11 @@ mod tests {
                 _ => Err(format!("unexpected {a:?}")),
             }
         }
+    }
+    fn recorded_body(args: &[&str]) -> Option<String> {
+        args.iter().position(|arg| *arg == "--body")
+            .and_then(|index| args.get(index + 1))
+            .map(|body| body.to_string())
     }
     fn deliver(f: &mut Forge) -> Result<Value,String> {
         run(f, &json!({"title":"fix: thin","body":"synthetic"}), DeliveryCeiling::ThroughMerge, &[], &mut Log::default())
@@ -208,6 +245,29 @@ mod tests {
         assert_eq!(result["state"], "delivered");
         assert_eq!((forge.pushes, forge.creates, forge.merges), (0,0,0));
     }
+    #[test]
+    fn thin_delivery_sends_the_reconciled_body_and_does_it_before_pushing() {
+        let mut forge = Forge { fill_body: true, ..Default::default() };
+        deliver(&mut forge).unwrap();
+        let body = forge.created_body.clone().expect("pr create must carry the body");
+        assert_eq!(body.matches("README-Update:").count(), 1, "{body}");
+        assert!(body.contains("README-Update-Reason: "), "{body}");
+        let reconcile = forge.events.iter().position(|event| *event == "pr_body").unwrap();
+        let push = forge.events.iter().position(|event| *event == "push").unwrap();
+        assert!(reconcile < push, "body contract must run before the first push: {:?}", forge.events);
+    }
+
+    #[test]
+    fn body_contract_failure_never_pushes_or_opens_a_pr() {
+        let mut forge = Forge {
+            reject_body: Some("PR 正文未通过 README 契约 的 CI 校验，未推送任何提交：missing README-Update:".into()),
+            ..Default::default()
+        };
+        let error = deliver(&mut forge).unwrap_err();
+        assert!(error.contains("README-Update"), "{error}");
+        assert_eq!((forge.pushes, forge.creates, forge.events.contains(&"push")), (0, 0, false));
+    }
+
     #[test]
     fn label_failure_returns_error_never_merges() {
         let mut forge = Forge { fail_label:true, ..Default::default() };
