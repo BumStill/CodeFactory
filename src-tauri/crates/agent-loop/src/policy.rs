@@ -801,6 +801,12 @@ fn is_review_safe_named_tool(tool_name: &str) -> bool {
             | "skill_list"
             | "skill_search"
             | "bash"
+            // M131b: reading a public page is the most common read-only
+            // request there is. Leaving the page reader out of this list left
+            // `browser_session` as the only visible reader, and on a machine
+            // without the extension that turn died on `browser_pairing_required`
+            // without ever fetching the page (session 357f833f, 2026-10-21).
+            | "web_fetch"
             | "browser_session"
             // Offered so a planning turn can persist its own document. The
             // per-call path check in `capability_denial` is what keeps them
@@ -1391,6 +1397,59 @@ mod tests {
         .expect("mutation must be denied");
         assert!(!denial.contains("请由用户明确要求"));
         assert!(denial.contains("不要要求用户重复确认"));
+    }
+
+    /// M131b-R2 field evidence (session `357f833f`, 2026-10-21): the user
+    /// asked a read-only turn to read a Wikipedia URL. `web_fetch` existed in
+    /// v1.91.0 but was filtered out of the ReviewOnly tool list, so the model
+    /// only saw `browser_session`, tried `attach`, and stopped on
+    /// `browser_pairing_required` without ever reading the page.
+    #[test]
+    fn m131b_review_turns_can_see_the_page_reader() {
+        assert!(
+            tool_visible_for_capability(TurnCapability::ReviewOnly, "web_fetch"),
+            "a read-only turn that says \"read this URL\" must be offered web_fetch, \
+             or the only visible reader is the browser and it needs pairing"
+        );
+        assert!(capability_denial(
+            TurnCapability::ReviewOnly,
+            "web_fetch",
+            "web_fetch https://en.wikipedia.org/wiki/Unix_philosophy",
+            &ToolKind::ReadOnly,
+            &serde_json::json!({"url": "https://en.wikipedia.org/wiki/Unix_philosophy"}),
+        )
+        .is_none());
+        // M131b-R1: the same field session lost a `git status` / `git branch
+        // --show-current` probe to the review-only gate. The classifier now
+        // reports it as a read, so the gate must let it through.
+        let status_probe = "git status --short --branch; git branch --show-current";
+        assert!(
+            capability_denial(
+                TurnCapability::ReviewOnly,
+                "bash",
+                status_probe,
+                &codefactory_agent_core::classify_command(status_probe, 30_000),
+                &serde_json::json!({ "command": status_probe }),
+            )
+            .is_none(),
+            "a ref-listing probe is not a review-only violation"
+        );
+
+        let defs = vec![
+            definition("web_fetch", "Read the text of a web page."),
+            definition("browser_session", "Read live web pages."),
+            definition("write_file", "Create or overwrite a file."),
+        ];
+        let review =
+            active_tool_definitions_for_capability(&defs, false, TurnCapability::ReviewOnly);
+        let names = review
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            names.contains(&"web_fetch"),
+            "the schema the model receives must carry web_fetch: {names:?}"
+        );
     }
 
     #[test]
