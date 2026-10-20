@@ -18,6 +18,8 @@ import {
   BLOCKED_LABEL_PREFIX,
   WAKE_LABELS,
   resolveWake,
+  blockedMarker,
+  latestCheckOnHead,
   evaluateEligibility,
   orderQueue,
   parseBlockedMarker,
@@ -116,8 +118,8 @@ function fakeAdapter(prs, opts = {}) {
       for (const other of state.values()) other.mergeStateStatus = 'BEHIND';
       return { merged: true, sha: `merge-${number}` };
     },
-    async markBlocked(number, reason) {
-      calls.blocked.push({ number, reason });
+    async markBlocked(number, reason, opts = {}) {
+      calls.blocked.push({ number, reason, ...opts });
       state.delete(number);
     },
   };
@@ -878,4 +880,90 @@ test('M126: the wake CLI publishes the GITHUB_OUTPUT contract', async () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// M127 — a re-run on the SAME head, and a block whose cause is gone
+// ---------------------------------------------------------------------------
+// 2026-10-20 (#769): `check-frontend` failed on the README-Update contract, the
+// PR body was fixed (no commit), the same job went green on the identical head
+// — and the queue still saw `failure` because it read the oldest run for that
+// name. The PR then carried `merge-queue: blocked` bound to a head that was
+// green, so nothing could ever clear it.
+
+test('M127 — the newest run for a head decides, not the oldest', () => {
+  const checks = [
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:12:00Z' },
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:16:00Z' },
+    { name: 'check-frontend', status: 'completed', conclusion: 'success', headSha: SHA_A, completedAt: '2026-10-20T05:33:00Z' },
+  ];
+  assert.equal(latestCheckOnHead(checks, 'check-frontend', SHA_A).conclusion, 'success');
+  // Listing order must not matter.
+  assert.equal(
+    latestCheckOnHead([...checks].reverse(), 'check-frontend', SHA_A).conclusion,
+    'success',
+  );
+  const verdict = evaluateEligibility(
+    pr({ checks: [...greenChecks(SHA_A).filter((c) => c.name !== 'check-frontend'), ...checks] }),
+  );
+  assert.equal(verdict.eligible, true, verdict.reason);
+});
+
+test('M127 — a later failure still wins over an earlier success (no wishful reading)', () => {
+  const checks = [
+    ...greenChecks(SHA_A).filter((c) => c.name !== 'check-frontend'),
+    { name: 'check-frontend', status: 'completed', conclusion: 'success', headSha: SHA_A, completedAt: '2026-10-20T05:10:00Z' },
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:40:00Z' },
+  ];
+  const verdict = evaluateEligibility(pr({ checks }));
+  assert.equal(verdict.eligible, false);
+  assert.equal(verdict.terminal, true);
+  assert.equal(verdict.failedCheck, 'check-frontend');
+});
+
+test('M127 — a block on the same head clears once its recorded check is green again', () => {
+  const checks = [
+    ...greenChecks(SHA_A).filter((c) => c.name !== 'check-frontend'),
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:16:00Z' },
+    { name: 'check-frontend', status: 'completed', conclusion: 'success', headSha: SHA_A, completedAt: '2026-10-20T05:33:00Z' },
+  ];
+  const verdict = evaluateEligibility(
+    pr({ checks, labels: [ARM_LABEL, BLOCKED_LABEL_PREFIX], blocked: { headSha: SHA_A, at: 1, check: 'check-frontend' } }),
+  );
+  assert.equal(verdict.eligible, true, verdict.reason);
+  assert.equal(verdict.clearedBlock, true);
+  assert.match(verdict.reason, /green again on the same head/);
+});
+
+test('M127 — the same-head block survives while its check is still red or unnamed', () => {
+  const checks = [
+    ...greenChecks(SHA_A).filter((c) => c.name !== 'check-frontend'),
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:40:00Z' },
+  ];
+  const stillRed = evaluateEligibility(
+    pr({ checks, labels: [ARM_LABEL, BLOCKED_LABEL_PREFIX], blocked: { headSha: SHA_A, at: 1, check: 'check-frontend' } }),
+  );
+  assert.equal(stillRed.eligible, false);
+  assert.equal(stillRed.terminal, false);
+  const legacy = evaluateEligibility(pr({ labels: [ARM_LABEL, BLOCKED_LABEL_PREFIX], blocked: { headSha: SHA_A, at: 1 } }));
+  assert.equal(legacy.eligible, false);
+  assert.match(legacy.reason, /already blocked by the queue on this head/);
+});
+
+test('M127 — the blocked marker round-trips the failing check name', () => {
+  const marker = blockedMarker(SHA_A, new Date('2026-10-20T05:16:47Z'), 'check-frontend');
+  const parsed = parseBlockedMarker(`Merge queue dropped this PR: x\n${marker}`);
+  assert.equal(parsed.headSha, SHA_A);
+  assert.equal(parsed.check, 'check-frontend');
+  assert.equal(parseBlockedMarker(blockedMarker(SHA_A)).check, null);
+});
+
+test('M127 — runQueue records the failing check so the block can self-heal', async () => {
+  const checks = greenChecks(SHA_A).map((c) =>
+    c.name === 'check-frontend' ? { ...c, conclusion: 'failure' } : c,
+  );
+  const adapter = fakeAdapter([pr({ checks })]);
+  await runQueue(adapter, {});
+  assert.equal(adapter.calls.blocked.length, 1);
+  assert.equal(adapter.calls.blocked[0].checkName, 'check-frontend');
 });

@@ -43,11 +43,20 @@ export const BLOCKED_LABEL_PREFIX = 'merge-queue: blocked';
 // description is repository-global and cannot hold a per-PR SHA, and the queue
 // is stateless between runs, so a local state file would not survive.
 const BLOCKED_MARKER_RE =
-  /<!--\s*merge-queue:blocked\s+head=([0-9a-f]{7,40})\s+at=([^\s]+)\s*-->/i;
+  /<!--\s*merge-queue:blocked\s+head=([0-9a-f]{7,40})\s+at=([^\s]+)(?:\s+check=([^\s]+))?\s*-->/i;
 
-/** Render the machine-readable marker written at the top of a blocking comment. */
-export function blockedMarker(headSha, date = new Date()) {
-  return `<!-- merge-queue:blocked head=${headSha} at=${date.toISOString()} -->`;
+/**
+ * Render the machine-readable marker written at the top of a blocking comment.
+ *
+ * M127: the marker also records WHICH required check failed, because that is
+ * the only thing that can distinguish "this head failed for a reason a later
+ * run can fix" (a re-run, or a PR-body contract that needs no commit) from
+ * "this head is genuinely broken".
+ */
+export function blockedMarker(headSha, date = new Date(), checkName = '') {
+  const name = typeof checkName === 'string' ? checkName.trim() : '';
+  const check = name ? ` check=${encodeURIComponent(name)}` : '';
+  return `<!-- merge-queue:blocked head=${headSha} at=${date.toISOString()}${check} -->`;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +107,15 @@ export function parseBlockedMarker(body) {
   const match = BLOCKED_MARKER_RE.exec(body);
   if (!match) return null;
   const at = Date.parse(match[2]);
-  return { headSha: match[1].toLowerCase(), at: Number.isNaN(at) ? null : at };
+  let check = null;
+  if (match[3]) {
+    try {
+      check = decodeURIComponent(match[3]);
+    } catch {
+      check = match[3];
+    }
+  }
+  return { headSha: match[1].toLowerCase(), at: Number.isNaN(at) ? null : at, check };
 }
 
 function shortSha(sha) {
@@ -134,6 +151,27 @@ function readyAtOf(pr) {
  * draft, held, unarmed) and should be reconsidered on a later pass.
  * @returns {{eligible: boolean, reason: string, terminal: boolean}}
  */
+// ---------------------------------------------------------------------------
+// M127 — a re-run on the SAME head supersedes its earlier conclusion
+// ---------------------------------------------------------------------------
+// 2026-10-20 (#769): `check-frontend` failed because the PR body lacked the
+// README-Update contract lines. Fixing the body needs no commit, so the head
+// stayed identical while a later run of the same job went green — and the queue
+// kept reading the oldest run for that name, saw `failure`, and refused the PR
+// forever. GitHub keeps every run for a head, so "which conclusion counts" has
+// to be answered explicitly: the newest one.
+export function latestCheckOnHead(checks, name, headSha) {
+  const onHead = (checks ?? []).filter(
+    (check) => check && check.name === name && check.headSha === headSha,
+  );
+  if (onHead.length === 0) return null;
+  const stamp = (check) => {
+    const value = toMillis(check?.completedAt) ?? toMillis(check?.startedAt);
+    return value === null ? -Infinity : value;
+  };
+  return onHead.reduce((latest, check) => (stamp(check) >= stamp(latest) ? check : latest));
+}
+
 export function evaluateEligibility(pr, { requiredChecks = REQUIRED_CHECKS } = {}) {
   if (pr.isDraft) {
     return { eligible: false, reason: 'still a draft', terminal: false };
@@ -164,6 +202,23 @@ export function evaluateEligibility(pr, { requiredChecks = REQUIRED_CHECKS } = {
           reason: `blocked head ${shortSha(recordedHead)} was superseded by ${shortSha(pr.headSha)}; re-evaluating`,
           terminal: false,
         };
+      }
+      // M127: the block names the check that dropped the PR. If that check is
+      // green again on the SAME head, the block is stale — the recovery never
+      // needed a commit. A legacy record without a check name keeps the
+      // conservative M101 behaviour rather than retrying an unknown failure.
+      const recordedCheck =
+        typeof record?.check === 'string' && record.check.trim() ? record.check.trim() : null;
+      if (recordedCheck) {
+        const now = latestCheckOnHead(pr.checks, recordedCheck, pr.headSha);
+        if (now && now.status === 'completed' && now.conclusion === 'success') {
+          return {
+            eligible: true,
+            clearedBlock: true,
+            reason: `blocked check ${recordedCheck} is green again on the same head (${shortSha(pr.headSha)}); re-evaluating`,
+            terminal: false,
+          };
+        }
       }
       return {
         eligible: false,
@@ -209,7 +264,9 @@ export function evaluateEligibility(pr, { requiredChecks = REQUIRED_CHECKS } = {
         terminal: false,
       };
     }
-    const current = onHead.find((check) => check.headSha === pr.headSha);
+    // M127: the NEWEST run for this head decides, not whichever run the API
+    // happened to list first.
+    const current = latestCheckOnHead(checks, name, pr.headSha);
     if (current.status !== 'completed') {
       return { eligible: false, reason: `required check ${name} is still running`, terminal: false };
     }
@@ -217,6 +274,7 @@ export function evaluateEligibility(pr, { requiredChecks = REQUIRED_CHECKS } = {
       // A failed check on the exact head is a definite failure: drop it (R4).
       return {
         eligible: false,
+        failedCheck: name,
         reason: `required check ${name} failed on the current head (${current.conclusion})`,
         terminal: true,
       };
@@ -375,7 +433,10 @@ export async function runQueue(adapter, { stopRequested, maxIterations = 100, in
           // A definite failure (hard conflict, or a check failed on this exact
           // head) leaves the queue with a plain-language reason (R4) and the PRs
           // behind it keep going.
-          await adapter.markBlocked(pr.number, verdict.reason, { headSha: pr.headSha });
+          await adapter.markBlocked(pr.number, verdict.reason, {
+            headSha: pr.headSha,
+            checkName: verdict.failedCheck,
+          });
           outcomes.push({ number: pr.number, status: 'dropped', reason: verdict.reason });
         } else {
           outcomes.push({ number: pr.number, status: 'not-eligible', reason: verdict.reason });
@@ -489,6 +550,8 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       status: check.status,
       conclusion: check.conclusion,
       headSha: check.head_sha,
+      startedAt: check.started_at,
+      completedAt: check.completed_at,
     }));
   }
 
@@ -666,7 +729,7 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
       }
       return { merged: false, reason: `PR #${number} is still ${after.state}` };
     },
-    async markBlocked(number, reason, { headSha } = {}) {
+    async markBlocked(number, reason, { headSha, checkName } = {}) {
       // --force is idempotent when the fixed label already exists.
       run(['gh', 'label', 'create', BLOCKED_LABEL_PREFIX, '--repo', repo,
         '--description', 'Blocked by merge queue; see PR comment for details', '--force']);
@@ -674,7 +737,7 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
         BLOCKED_LABEL_PREFIX]);
       // M101-R1: record WHICH head was blocked so a later push is re-evaluated
       // instead of being refused forever. The marker is hidden when rendered.
-      const marker = headSha ? `${blockedMarker(headSha)}\n` : '';
+      const marker = headSha ? `${blockedMarker(headSha, new Date(), checkName)}\n` : '';
       run(['gh', 'pr', 'comment', String(number), '--repo', repo, '--body',
         `${marker}Merge queue dropped this PR: ${reason}`]);
     },
