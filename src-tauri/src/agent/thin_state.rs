@@ -113,10 +113,14 @@ pub fn after_final(need: WaitNeed, outcome_location: &str) -> ThinState {
             ..ThinState::running()
         },
         WaitNeed::External { what, covered: false } => ThinState {
-            state: SessionState::WaitingUser,
+            state: SessionState::WaitingWake,
             waiting_for: Some(what.clone()),
-            question: Some(format!(
-                "需要你决定是否继续等待 {what}；目前没有唤醒源。你可以让我挂监视继续等，或结束这个等待。"
+            // R5：外部事项（PR/CI/发版）是模型自己能监视的对象。没有唤醒源时，
+            // 工具结果层面已经提示挂监视（background_task_start / schedule_wakeup），
+            // 这里不再把它升级成「需要用户决定」的问题；R4 的失效守卫仍在 30 分钟
+            // 后兜底，避免真的无人看管。
+            reason: Some(format!(
+                "外部事项未挂监视：等 {what}，可用 background_task_start 或 schedule_wakeup 监视"
             )),
             ..ThinState::running()
         },
@@ -304,6 +308,12 @@ pub async fn settle_final(
             covered: true,
         },
         None => match super::thin::unwatched_wait(db, session_id).await {
+            // R5：名字里是外部事项（PR/CI/发版/部署/流水线）的等待，是模型能自己
+            // 监视的对象，不能被 R3 当成「等一个人」而升级成给用户的问题。
+            Some(what) if super::thin::is_external_object(&what) => WaitNeed::External {
+                what,
+                covered: false,
+            },
             Some(what) => WaitNeed::Unwatched { what },
             None => WaitNeed::None,
         },
@@ -322,6 +332,53 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     };
     save(db, session_id, &state).await?;
     project_turn(db, root_turn_id, &state).await?;
+    Ok(state)
+}
+
+/// 阶段 2 P0/R1：thin 回合**唯一**的结算判定。
+///
+/// 只要本轮已经产出了最终回答（`final_text` 非空），状态就必须结算为最终回答
+/// （→ `ended`/`waiting_*`）。`StopReason::Blocked` 是完成闸门在拿到最终文本后
+/// 收束回合的有界停止，把用户可见的最终回答当成技术失败会让行永久停在
+/// `running`（v1.91.1 会话 bee5d6b7 的现场），而且之后再也没有回合来改写它。
+pub fn outcome_settles_final(finished: bool, blocked: bool, final_text: &str) -> bool {
+    finished || (blocked && !final_text.trim().is_empty())
+}
+
+/// 阶段 2 P0/R1：最终回答只在这一处结算。
+///
+/// `stop_label` 只用于技术失败签名，调用方不得再自行判断「finished 才算最终」。
+#[allow(clippy::too_many_arguments)]
+pub async fn settle_outcome(
+    db: &SqlitePool,
+    session_id: &str,
+    root_turn_id: &str,
+    finished: bool,
+    blocked: bool,
+    final_text: &str,
+    stop_label: &str,
+    external_what: Option<String>,
+) -> sqlx::Result<ThinState> {
+    if outcome_settles_final(finished, blocked, final_text) {
+        settle_final(db, session_id, root_turn_id, external_what).await
+    } else {
+        settle_error(
+            db,
+            session_id,
+            root_turn_id,
+            &format!("agent loop stopped: {stop_label}"),
+        )
+        .await
+    }
+}
+
+/// 阶段 2 P0/R2：没有任何可续跑的回合时，thin 会话必须发问，不能留在 `running`。
+pub async fn ask_user(db: &SqlitePool, session_id: &str, question: &str) -> sqlx::Result<ThinState> {
+    let mut state = ThinState::running();
+    state.state = SessionState::WaitingUser;
+    state.question = Some(question.to_string());
+    state.updated_at = now();
+    save(db, session_id, &state).await?;
     Ok(state)
 }
 

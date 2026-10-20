@@ -1693,16 +1693,26 @@ async fn apply_chat_objective_outcome(
     // answer already exists once in the transcript.
     if let Some(session) = current.session_id.as_deref() {
         if crate::agent::thin::is_thin(db, session).await {
-            let thin = if outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished {
-                let external = if crate::agent::thin::external_wait_hint(db, session).await.is_some() {
-                    Some("外部交付（PR/CI）".to_string())
-                } else { None };
-                crate::agent::thin_state::settle_final(db, session, root_turn_id, external).await
-            } else {
-                crate::agent::thin_state::settle_error(
-                    db, session, root_turn_id, &format!("agent loop stopped: {:?}", outcome.stop_reason),
-                ).await
-            }.map_err(|error| AppError::Other(error.to_string()))?;
+            // 阶段 2 P0/R1: the settlement decision lives in exactly one place
+            // (`thin_state::settle_outcome`). A run that already produced a
+            // final answer — including a bounded `Blocked` stop — ends the
+            // session; only a run with no answer at all counts as a technical
+            // failure, so a final answer can never leave the row `running`.
+            let external = if crate::agent::thin::external_wait_hint(db, session).await.is_some() {
+                Some("外部交付（PR/CI）".to_string())
+            } else { None };
+            let thin = crate::agent::thin_state::settle_outcome(
+                db,
+                session,
+                root_turn_id,
+                outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished,
+                outcome.stop_reason == codefactory_agent_loop::run::StopReason::Blocked,
+                &outcome.final_text,
+                &format!("{:?}", outcome.stop_reason),
+                external,
+            )
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?;
             crate::agent::thin_state::close_objective(db, objective_id, &thin)
                 .await.map_err(|error| AppError::Other(error.to_string()))?;
             return Ok(current);
@@ -1732,7 +1742,11 @@ async fn apply_chat_objective_outcome(
             db, current.session_id.as_deref().unwrap_or_default(),
         ).await.is_covered();
     let unwatched = if thin && !thin_waiting {
-        crate::agent::thin::unwatched_wait(db, current.session_id.as_deref().unwrap_or_default()).await
+        crate::agent::thin::unwatched_wait(db, current.session_id.as_deref().unwrap_or_default())
+            .await
+            // R5：外部事项（PR/CI/发版/部署）是模型自己能监视的对象，挂监视的提示
+            // 发生在工具结果层面；不能再用一条「需要你决定」的决策行去问用户。
+            .filter(|what| !crate::agent::thin::is_external_object(what))
     } else { None };
     let decision = if let Some(waiting_for) = unwatched.filter(|_| outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished) {
         let prompt = format!("需要你决定是否继续等待 {waiting_for}；目前没有唤醒源。请决定继续等待并挂监视，或结束等待。");
@@ -3730,6 +3744,309 @@ pub(crate) async fn resume_context_objective(
     resume_chat_objective_inner(app, objective, mutation_permit, Some(authorization)).await
 }
 
+/// 阶段 2 P0/R2：应用启动或心跳发现 thin 会话停在 `running` 且没有活着的回合
+/// 执行者时，从这里真正续跑。
+///
+/// 复用持久化的根回合（不插入合成的用户消息、不新建第二个根回合），并在历史里
+/// 追加阶段 1 R3 的中断提示，让模型先确认现场再继续。结算仍走 thin 唯一结算入口，
+/// 所以续跑后的回合可以把会话结到 `ended`/`waiting_*`。
+pub(crate) async fn resume_thin_running_session(
+    app: AppHandle,
+    session_id: String,
+) -> Result<(), AppError> {
+    let db = app.state::<AppState>().db.read().await.clone();
+    if !crate::agent::thin::is_thin(&db, &session_id).await {
+        return Ok(());
+    }
+    let Some(thin) = crate::agent::thin_state::load(&db, &session_id)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    if thin.state != crate::agent::thin_state::SessionState::Running {
+        return Ok(());
+    }
+    let resumable: Option<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT turn.root_turn_id, objective.id, objective.revision, turn.updated_at
+         FROM chat_turn_state turn
+         JOIN objectives objective ON objective.id=turn.objective_id
+         WHERE turn.session_id=? AND turn.completed_at IS NULL
+           AND objective.status IN ('active','waiting_system')
+         ORDER BY turn.updated_at DESC LIMIT 1",
+    )
+    .bind(&session_id)
+    .fetch_optional(&db)
+    .await?;
+    let Some((root_turn_id, objective_id, objective_revision, last_progress_at)) = resumable else {
+        // Nothing persisted to continue: a `running` row with no turn would sit
+        // there forever, so the session must ask instead.
+        crate::agent::thin_state::ask_user(
+            &db,
+            &session_id,
+            "应用重启后发现这个会话停在运行中，但找不到可续跑的回合。要我继续吗？",
+        )
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+        return Ok(());
+    };
+    let original_content: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM messages WHERE id=? AND session_id=? AND role='user'",
+    )
+    .bind(&root_turn_id)
+    .bind(&session_id)
+    .fetch_optional(&db)
+    .await?;
+    let original_content = original_content.unwrap_or_default();
+
+    let state = app.state::<AppState>();
+    let run_control = Arc::new(crate::ChatRunControl::pending());
+    let cancel_flag = run_control.cancel.clone();
+    if let Err(error) = admit_chat_run(
+        &state.chat_cancels,
+        &state.update_restart_reserved,
+        &session_id,
+        run_control.clone(),
+    )
+    .await
+    {
+        // Another live turn owns this session: nothing to resume.
+        tracing::info!(session = %session_id, %error, "thin restart: session already has a live executor");
+        return Ok(());
+    }
+    let mut running_guard = ChatRunningSetupGuard::new(
+        state.chat_cancels.clone(),
+        session_id.clone(),
+        run_control.clone(),
+    );
+    running_guard.attach_durable_db(db.clone());
+    #[cfg(not(test))]
+    running_guard.attach_event_app(app.clone());
+    register_chat_run_control(&db, &run_control, &session_id).await?;
+    bind_chat_run_root(
+        &db,
+        &run_control.run_instance_id,
+        &session_id,
+        &root_turn_id,
+    )
+    .await?;
+
+    let settings_snapshot = state.settings.read().await.clone();
+    let settings_state = state.settings.clone();
+    let pending_permissions = state.pending_permissions.clone();
+    let chat_cancels = state.chat_cancels.clone();
+    let interjections = state.interjections.clone();
+    let tracked_run_control = run_control.clone();
+    drop(state);
+    let mcp_manager = Arc::clone(&*app.state::<Arc<McpManager>>());
+
+    let session = sqlx::query_as::<_, crate::storage::Session>("SELECT * FROM sessions WHERE id=?")
+        .bind(&session_id)
+        .fetch_one(&db)
+        .await?;
+    let mut history = crate::storage::load_agent_history(&db, &session_id).await?;
+    let interrupt_at = if last_progress_at > 0 {
+        last_progress_at
+    } else {
+        thin.updated_at
+    };
+    push_thin_resume_prompt(
+        &db,
+        &session_id,
+        &format!("thin-restart:{session_id}:{interrupt_at}"),
+        interrupt_at,
+        &mut history,
+    )
+    .await?;
+
+    let turn_settings = settings_for_session_route(
+        &settings_snapshot,
+        session.endpoint_id.as_deref(),
+        &session.model_id,
+        &session.model_policy,
+    )?;
+    let requires_vision = history.iter().any(|message| {
+        !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
+    });
+    let (route_plan, _) = resolve_route_plan(
+        &turn_settings,
+        &session.model_id,
+        &session.model_policy,
+        requires_vision,
+    )
+    .await?;
+    let primary_route = route_plan
+        .candidates()
+        .first()
+        .ok_or_else(|| AppError::Other("thin restart has no model route".into()))?
+        .clone();
+    let structured_read_only = crate::storage::tasks::sub_session_read_only(&db, &session_id).await?;
+    let contract = crate::agent::decide_chat_contract_with_intent(
+        None,
+        &original_content,
+        crate::agent::TurnIntent {
+            structured_read_only,
+        },
+    );
+    let effective_cwd = resolve_chat_execution_cwd(
+        &app,
+        &db,
+        &objective_id,
+        &session_id,
+        &session.cwd,
+        contract.capability,
+    )
+    .await?;
+
+    let event_name = format!("stream:{session_id}");
+    let app_for_run = app.clone();
+    let db_for_run = db.clone();
+    let session_for_run = session_id.clone();
+    let session_for_error = session_id.clone();
+    let interjections_cleanup = interjections.clone();
+    let loop_result = supervise_chat_task(async move {
+        let mut agent = AgentLoop::new_with_mode(
+            app_for_run,
+            db_for_run,
+            session_for_run,
+            primary_route.endpoint_name,
+            primary_route.model_id,
+            primary_route.base_url,
+            String::new(),
+            primary_route.api_style,
+            effective_cwd,
+            settings_state,
+            pending_permissions,
+            mcp_manager,
+            Some(crate::agent::AgentExecutionContext {
+                parent_session_id: None,
+                task_id: None,
+                knowledge_library_ids: Vec::new(),
+                usage_surface: crate::agent::UsageSurface::Interactive,
+                // A restart resume carries no new authorization: it continues
+                // the persisted turn under exactly the authority it had.
+                mutation_permit: None,
+                force_context_compression: None,
+            }),
+            contract.mode,
+        )
+        .with_turn_capability(contract.capability)
+        .with_turn_grants(contract.grants)
+        .with_failover_plan(route_plan)
+        .with_cancel(cancel_flag)
+        .with_steer(interjections);
+        agent.run(history).await
+    })
+    .await;
+
+    let mut settled_objective = match loop_result {
+        Ok(outcome) => Some(
+            settle_chat_objective_from_outcome(
+                &db,
+                &app,
+                &event_name,
+                &objective_id,
+                objective_revision,
+                &root_turn_id,
+                &outcome,
+                None,
+            )
+            .await?,
+        ),
+        Err(error_text) => {
+            tracing::error!("thin restart agent loop error: {error_text}");
+            let settled = crate::agent::thin_state::settle_outcome(
+                &db,
+                &session_id,
+                &root_turn_id,
+                false,
+                false,
+                "",
+                "agent loop error",
+                None,
+            )
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))?;
+            crate::agent::thin_state::close_objective(&db, &objective_id, &settled)
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))?;
+            sqlx::query(
+                "UPDATE chat_turn_state SET revision=revision+1, updated_at=? WHERE root_turn_id=?",
+            )
+            .bind(Utc::now().timestamp_millis())
+            .bind(&root_turn_id)
+            .execute(&db)
+            .await?;
+            None
+        }
+    };
+
+    if let Some(cancelled) =
+        settle_chat_run_control(&db, &tracked_run_control.run_instance_id).await?
+    {
+        settled_objective = Some(cancelled);
+    }
+    clear_chat_running_if_current(&chat_cancels, &session_id, &tracked_run_control).await;
+    if let Some(settled) = settled_objective.as_ref() {
+        emit_chat_turn_settled(
+            &app,
+            &event_name,
+            &tracked_run_control,
+            Some(&root_turn_id),
+            Some(&settled.id),
+            chat_settlement_status(settled),
+        );
+    }
+    crate::commands::interjections::drain_for_session(&interjections_cleanup, &session_for_error)
+        .await;
+    let reclaimed = crate::tools::browser_session::close_for_session(&session_for_error).await;
+    if reclaimed > 0 {
+        tracing::info!("thin restart reclaimed {reclaimed} browser session(s)");
+    }
+    running_guard.disarm();
+    Ok(())
+}
+
+/// 阶段 1 R3 的中断提示，追加为一条 system 历史（不是用户消息、不落第二个根回合）。
+/// 旧恢复路径与重启续跑共用这一份实现。
+async fn push_thin_resume_prompt(
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    key: &str,
+    interrupted_at: i64,
+    history: &mut Vec<crate::storage::Message>,
+) -> Result<(), AppError> {
+    let last: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT tool.tool_name, tool.arguments, tool.created_at FROM tool_calls tool JOIN messages message ON message.id=tool.message_id WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await?;
+    let (summary, at) = last
+        .map(|(name, arguments, at)| {
+            (
+                format!("{name}: {}", arguments.chars().take(500).collect::<String>()),
+                at,
+            )
+        })
+        .unwrap_or_else(|| ("模型请求（结果未知）".into(), interrupted_at));
+    history.push(crate::storage::Message {
+        id: format!("thin-resume:{key}"),
+        session_id: session_id.to_string(),
+        role: "system".into(),
+        content: crate::agent::thin::resume_prompt(at, &summary),
+        endpoint_id: None,
+        model_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        tool_calls: None,
+        reasoning_content: None,
+        completion_state: None,
+        created_at: Utc::now().timestamp_millis(),
+    });
+    Ok(())
+}
+
 async fn resume_chat_objective_inner(
     app: AppHandle,
     objective: crate::agent::objective::ObjectiveSnapshot,
@@ -3851,17 +4168,14 @@ async fn resume_chat_objective_inner(
     let thin_mode = crate::agent::thin::is_thin(&db, &session_id).await;
     let mut history = crate::storage::load_agent_history(&db, &session_id).await?;
     if thin_mode {
-        let last: Option<(String, String, i64)> = sqlx::query_as(
-            "SELECT tool.tool_name, tool.arguments, tool.created_at FROM tool_calls tool JOIN messages message ON message.id=tool.message_id WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1"
-        ).bind(&session_id).fetch_optional(&db).await?;
-        let (summary, interrupted_at) = last.map(|(name, arguments, at)| (format!("{name}: {}", arguments.chars().take(500).collect::<String>()), at))
-            .unwrap_or_else(|| ("模型请求（结果未知）".into(), objective.updated_at));
-        history.push(crate::storage::Message {
-            id: format!("thin-resume:{}:{}", objective.id, objective.revision), session_id: session_id.clone(), role: "system".into(),
-            content: crate::agent::thin::resume_prompt(interrupted_at, &summary),
-            endpoint_id: None, model_id: None, input_tokens: None, output_tokens: None, tool_calls: None, reasoning_content: None, completion_state: None,
-            created_at: Utc::now().timestamp_millis(),
-        });
+        push_thin_resume_prompt(
+            &db,
+            &session_id,
+            &format!("{}:{}", objective.id, objective.revision),
+            objective.updated_at,
+            &mut history,
+        )
+        .await?;
     }
     if let Some(continuation) = crate::agent::objective::incomplete_objective_continuation_prompt(
         objective.failure_code.as_deref(),
@@ -4336,11 +4650,13 @@ mod tests {
         }
     }
 
-    /// R2: external work without a watcher asks the user once, not the model
-    /// for a rewritten final answer. Legacy waits retain their old protocol.
+    /// R5: 外部事项（PR/CI/发版）是模型自己能挂监视的对象。没有唤醒源时，
+    /// 提示发生在工具结果层面，结算停在 `waiting_wake`——绝不升级成给用户的
+    /// 问题（v1.91.1 会话 6f5e87a2：03:33 停在 waiting_user，问「我在等交付
+    /// PR / CI，但这不是我能自己确认的对象」）。
     #[tokio::test]
-    async fn thin_unwatched_settlement_requires_visible_user_question() {
-        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain};
+    async fn thin_external_wait_settles_waiting_wake_instead_of_asking_the_user() {
+        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
         use codefactory_agent_loop::run::{RunOutcome, StopReason};
         let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('unwatched','synthetic','/synthetic','model',1,1,'thin')")
@@ -4351,15 +4667,52 @@ mod tests {
             session_id: Some("unwatched".into()), root_turn_id: Some("unwatched-root".into()),
             domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
         }).await.unwrap();
-        crate::agent::thin::record_unwatched_wait(&pool, "unwatched", "PR #42 的 CI").await.unwrap();
+        crate::agent::thin::record_unwatched_wait(&pool, "unwatched", "交付 PR / CI").await.unwrap();
         let outcome = RunOutcome {
-            final_text: "等待 PR #42 的 CI".into(), final_message_id: None,
+            final_text: "PR 已开，等 CI".into(), final_message_id: None,
             completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0, stop_reason: StopReason::Finished,
         };
         let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "unwatched-root", &outcome, None).await.unwrap();
         let thin = crate::agent::thin_state::load(&pool, "unwatched").await.unwrap().unwrap();
+        assert_eq!(
+            thin.state,
+            crate::agent::thin_state::SessionState::WaitingWake,
+            "等 PR/CI 是模型能自己监视的外部事项，不能变成等用户"
+        );
+        assert!(thin.question.is_none(), "不得向用户发问：{:?}", thin.question);
+        assert_eq!(thin.waiting_for.as_deref(), Some("交付 PR / CI"));
+        assert!(
+            thin.reason.as_deref().unwrap_or_default().contains("background_task_start"),
+            "外部事项无唤醒源时必须指明挂监视的做法：{:?}",
+            thin.reason
+        );
+        assert!(settled.failure_code.is_none());
+        assert!(settled.remediation_id.is_none());
+    }
+
+    /// R5 的另一半：真正「等一个人/一次确认」的等待仍然必须让用户看见。
+    #[tokio::test]
+    async fn thin_person_wait_still_requires_a_visible_user_question() {
+        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
+        use codefactory_agent_loop::run::{RunOutcome, StopReason};
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('person','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let current = store.create(CreateObjective {
+            id: "person-objective".into(), kind: ObjectiveKind::Delivery,
+            session_id: Some("person".into()), root_turn_id: Some("person-root".into()),
+            domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
+        }).await.unwrap();
+        crate::agent::thin::record_unwatched_wait(&pool, "person", "等你确认用哪个文件夹").await.unwrap();
+        let outcome = RunOutcome {
+            final_text: "需要你选一个目录".into(), final_message_id: None,
+            completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0, stop_reason: StopReason::Finished,
+        };
+        let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "person-root", &outcome, None).await.unwrap();
+        let thin = crate::agent::thin_state::load(&pool, "person").await.unwrap().unwrap();
         assert_eq!(thin.state, crate::agent::thin_state::SessionState::WaitingUser);
-        assert!(thin.question.unwrap().contains("PR #42 的 CI"));
+        assert!(thin.question.unwrap().contains("等你确认用哪个文件夹"));
         assert!(settled.failure_code.is_none());
         assert!(settled.remediation_id.is_none());
     }

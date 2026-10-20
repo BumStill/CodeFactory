@@ -1705,6 +1705,24 @@ pub fn run() {
                     "startup: retired prior-process chat transports before objective recovery"
                 );
             }
+            // 阶段 2 P0/R2: thin sessions are heartbeat-only, so a row left
+            // `running` by a prior process (install restart) has no executor
+            // and no other owner. Resume it now instead of leaving it running
+            // forever; each resume continues the persisted root turn with the
+            // phase-1 R3 "you were interrupted" prompt.
+            let resumed_thin_sessions = tauri::async_runtime::block_on(
+                agent::thin_restart::resume_running_without_executor(
+                    app.handle().clone(),
+                    &objective_pool,
+                    0,
+                ),
+            );
+            if resumed_thin_sessions > 0 {
+                tracing::info!(
+                    count = resumed_thin_sessions,
+                    "startup: thin sessions left running without an executor are resumed"
+                );
+            }
             let recovered_exhausted_reprompts = tauri::async_runtime::block_on(
                 objective_store.reconcile_unconsumed_exhausted_chat_reprompts(),
             )?;

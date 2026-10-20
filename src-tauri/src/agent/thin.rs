@@ -31,6 +31,26 @@ pub(crate) async fn external_wait_hint(db: &sqlx::SqlitePool, session: &str) -> 
     super::background_tasks::external_wait_completion_hint(db, session, pending).await
 }
 
+/// R5：外部事项（PR/CI/发版/部署/流水线）是**模型自己能监视**的对象
+/// （`gh pr view`、`gh run watch`、`background_task_start`、`schedule_wakeup`）。
+/// 它们绝不能走 R3 的「等一个人」分类——那会把「等 CI」升级成给用户的问题
+/// （v1.91.1 会话 6f5e87a2 的现场：03:33 停在 waiting_user，
+/// 问题写着「我在等「交付 PR / CI」，但这不是我能自己确认的对象」）。
+pub(crate) fn is_external_object(what: &str) -> bool {
+    let lower = what.to_lowercase();
+    const CJK: [&str; 8] = ["交付", "发版", "发布", "部署", "流水线", "工作流", "合并", "上线"];
+    if CJK.iter().any(|token| lower.contains(token)) {
+        return true;
+    }
+    const ASCII: [&str; 10] = [
+        "pr", "prs", "ci", "mr", "release", "deploy", "merge", "pipeline", "workflow", "actions",
+    ];
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '#')
+        .map(|token| token.trim_matches('#'))
+        .any(|token| ASCII.contains(&token))
+}
+
 /// Pending work observed by a tool, not inferred from a legacy failure code.
 pub(crate) async fn record_unwatched_wait(db: &sqlx::SqlitePool, session: &str, waiting_for: &str) -> sqlx::Result<()> {
     sqlx::raw_sql(include_str!("../../migrations/0023_thin_wait_notes.sql")).execute(db).await?;
@@ -51,6 +71,31 @@ pub(crate) fn resume_prompt(at: i64, summary: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// R5：外部事项（模型自己能监视）与「等一个人/一次确认」必须可判定，
+    /// 否则 R3 会把「等 CI」误判成给用户的问题。
+    #[test]
+    fn external_objects_are_not_person_waits() {
+        for what in [
+            "交付 PR / CI",
+            "PR #42 的 CI",
+            "等 GitHub Actions",
+            "release 构建",
+            "等发版",
+            "部署流水线",
+            "等合并结果",
+        ] {
+            assert!(super::is_external_object(what), "should be external: {what}");
+        }
+        for what in [
+            "等你确认用哪个文件夹",
+            "等客户回复",
+            "等你确认是否删除",
+            "等你提供 API key",
+        ] {
+            assert!(!super::is_external_object(what), "should be a person wait: {what}");
+        }
+    }
+
     #[test]
     fn resumed_bash_always_has_system_prompt_for_success_failure_unknown() {
         for status in ["done", "error", "pending"] {
@@ -94,9 +139,14 @@ mod phase2_state_tests {
         assert_eq!(ended.state, SessionState::Ended);
         let watched = thin_state::after_final(WaitNeed::External { what: "PR #774 合并".into(), covered: true }, "");
         assert_eq!(watched.state, SessionState::WaitingWake);
+        // R5（v1.91.1 会话 6f5e87a2 现场）：外部事项没有唤醒源时不再向用户发问，
+        // 而是停在 `waiting_wake` 并写明该挂什么监视——工具结果层面已经提示过
+        // background_task_start / schedule_wakeup；R4 的 30 分钟失效守卫兜底。
         let unwatched = thin_state::after_final(WaitNeed::External { what: "浏览器只读任务".into(), covered: false }, "");
-        assert_eq!(unwatched.state, SessionState::WaitingUser);
-        assert!(unwatched.question.as_deref().unwrap_or_default().contains("PR #774") || unwatched.question.as_deref().unwrap_or_default().contains("浏览器只读任务"));
+        assert_eq!(unwatched.state, SessionState::WaitingWake);
+        assert!(unwatched.question.is_none(), "外部事项不得升级成用户问题：{:?}", unwatched.question);
+        assert!(unwatched.reason.as_deref().unwrap_or_default().contains("schedule_wakeup"));
+        assert_eq!(unwatched.waiting_for.as_deref(), Some("浏览器只读任务"));
         let self_invented = thin_state::after_final(WaitNeed::Unwatched { what: "确认范围".into() }, "");
         assert_eq!(self_invented.state, SessionState::WaitingUser);
         assert!(self_invented.question.is_some());
