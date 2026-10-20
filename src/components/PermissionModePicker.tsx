@@ -3,7 +3,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from
 import { createPortal } from "react-dom";
 import { Check, ShieldCheck } from "lucide-react";
 import { useChatStore } from "../stores/chat";
-import type { PermissionMode } from "../lib/tauri";
+import { invoke, type PermissionMode } from "../lib/tauri";
 
 const OPTIONS: Array<{ id: PermissionMode; label: string; description: string }> = [
   { id: "safe", label: "安全", description: "读取自动允许，写入和命令先确认" },
@@ -35,7 +35,7 @@ export function PermissionModePicker({
     if (!rect || typeof window === "undefined") return;
     const gutter = 8;
     const menuWidth = Math.min(288, window.innerWidth - gutter * 2);
-    const menuHeight = 184;
+    const menuHeight = 244;
     setMenuPosition({
       left: Math.max(gutter, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - gutter)),
       top: Math.max(gutter, rect.top - menuHeight - 4),
@@ -185,6 +185,24 @@ export function PermissionModePicker({
               </span>
             </button>
           ))}
+          <button
+            type="button"
+            role="menuitemcheckbox"
+            aria-checked={activeSession.delivery_authorized === true}
+            onClick={async () => {
+              const authorized = activeSession.delivery_authorized !== true;
+              await invoke("update_session_delivery_authorized", { sessionId: activeSession.id, authorized });
+              useChatStore.setState(state => ({
+                sessions: state.sessions.map(session => session.id === activeSession.id ? { ...session, delivery_authorized: authorized } : session),
+                activeSession: state.activeSession?.id === activeSession.id ? { ...state.activeSession, delivery_authorized: authorized } : state.activeSession,
+              }));
+              closeAndRestoreFocus();
+            }}
+            className="flex min-h-[44px] w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-label text-gray-200 hover:bg-surface-3"
+          >
+            <span aria-hidden="true">{activeSession.delivery_authorized ? "✓" : "○"}</span>
+            允许交付（推送、PR / MR、合并与发布）
+          </button>
         </div>,
         document.body,
       )}

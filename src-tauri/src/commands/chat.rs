@@ -5164,9 +5164,9 @@ mod tests {
         crate::agent::stop_fence::record_stop(&pool, "m47-session", "user_stop", None).await.unwrap();
         let receipt = admit_persisted_chat_turn(&pool, &crate::ChatRunControl::pending(), "m47-session", None,
             "开始实施修复，授权交付（ceiling: merged）").await.unwrap();
-        assert_eq!(receipt.contract.capability, crate::agent::TurnCapability::Deliver);
-        assert!(crate::agent::stop_fence::stop_fence(&pool, "m47-session").await.unwrap().is_none(),
-            "R4: a new explicit delivery authorization must not remain permanently stopped");
+        assert_eq!(receipt.contract.capability, crate::agent::TurnCapability::Implement);
+        assert!(crate::agent::stop_fence::stop_fence(&pool, "m47-session").await.unwrap().is_some(),
+            "R1: wording cannot clear a delivery stop or grant remote authority");
         pool.close().await;
     }
 

@@ -1978,6 +1978,7 @@ pub fn run() {
             commands::session::create_session,
             commands::session::materialize_draft_session,
             commands::session::update_session_permission_mode,
+            commands::session::update_session_delivery_authorized,
             commands::session::update_session_reasoning_effort,
             commands::session::get_session,
             commands::session::delete_session,

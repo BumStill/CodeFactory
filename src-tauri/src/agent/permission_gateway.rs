@@ -99,13 +99,74 @@ impl PermissionGateway for DesktopPermissionGateway {
         args: &serde_json::Value,
         bash_command: Option<&str>,
     ) -> PermissionOutcome {
+        // M130: never infer remote authority from model/user wording or the
+        // loop's cached capability. Shell and structured delivery share this gate.
+        let remote = tool_call.function.name == "deliver_changes"
+            || bash_command.is_some_and(codefactory_agent_loop::policy::is_delivery_command);
         if let Some(outcome) = self
             .authorize_permission_recovery(tool_call, args, bash_command)
             .await
         {
+            if remote && matches!(outcome, PermissionOutcome::Allow)
+                && !super::fetch_session_delivery_authorized(&self.db, &self.session_id).await {
+                return permission_recovery_rejected();
+            }
             return outcome;
         }
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
+        if remote {
+            // The session switch never overrides an explicit per-tool deny.
+            if let PermissionDecision::Deny(reason) = decide_permission_for_call(
+                &policy, &tool_call.function.name, args, bash_command,
+                self.browser_read_granted, None,
+            ) {
+                return PermissionOutcome::Deny(PermissionDenial {
+                    content: format!("此操作被会话权限策略禁止：{reason}"),
+                    reason: PermissionDenialReason::PolicyDenied,
+                    duration_ms: 0,
+                });
+            }
+            if super::fetch_session_delivery_authorized(&self.db, &self.session_id).await {
+                return PermissionOutcome::Allow;
+            }
+            let waiting = super::thin_state::ThinState {
+                state: super::thin_state::SessionState::WaitingUser,
+                question: Some("允许向远端推送并创建 PR / MR 吗？".into()),
+                ..super::thin_state::ThinState::running()
+            };
+            if super::thin_state::save(&self.db, &self.session_id, &waiting).await.is_err() {
+                return permission_recovery_rejected();
+            }
+            let outcome = self.request_permission(tool_call, args.clone(), bash_command).await;
+            if super::thin_state::save(&self.db, &self.session_id, &super::thin_state::ThinState::running()).await.is_err() {
+                return permission_recovery_rejected();
+            }
+            return match outcome {
+                PermissionOutcome::Allow if self.anonymous => {
+                    let saved = sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id=?")
+                        .bind(&self.session_id).execute(&self.db).await;
+                    if matches!(saved, Ok(ref result) if result.rows_affected() == 1) {
+                        PermissionOutcome::Allow
+                    } else {
+                        permission_recovery_rejected()
+                    }
+                }
+                PermissionOutcome::Allow => {
+                    // Durable decision already stored the grant atomically.
+                    // Never reopen it here after a concurrent user revocation.
+                    if super::fetch_session_delivery_authorized(&self.db, &self.session_id).await {
+                        PermissionOutcome::Allow
+                    } else { permission_recovery_rejected() }
+                }
+                PermissionOutcome::Deny(mut denial) => {
+                    if denial.reason == PermissionDenialReason::DeniedByUser {
+                        denial.content = "用户不允许推送，请在本地完成并说明".into();
+                    }
+                    PermissionOutcome::Deny(denial)
+                }
+                other => other,
+            };
+        }
         // CF-TPP-R1 only ever widens the shell gate for `full_access` (trusted)
         // sessions, and only for actions the workspace-local proof accepts.
         // Anything else — including "we could not resolve the workspace root" —
@@ -680,6 +741,78 @@ mod tests {
             PermissionOutcome::Deny(denial) => assert_eq!(denial.reason, expected),
             other => panic!("expected {expected:?} denial, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn m130_real_local_commit_then_approved_push_updates_synthetic_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        fn git(cwd: &std::path::Path, args: &[&str]) -> String {
+            use crate::util::no_window::NoWindow;
+            let output = std::process::Command::new("git").no_window().current_dir(cwd).args(args).output().unwrap();
+            assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8(output.stdout).unwrap()
+        }
+        git(dir.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(dir.path(), &["init", repo.to_str().unwrap()]);
+        git(&repo, &["config", "user.email", "synthetic@example.invalid"]);
+        git(&repo, &["config", "user.name", "Synthetic"]);
+        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        let contract = super::super::resolve_turn_delivery_authorization(None, "实施", super::super::TurnIntent::default(), false).0;
+        assert!(codefactory_agent_loop::policy::capability_denial(contract.capability, "bash", "git commit -m synthetic", &codefactory_agent_core::ToolKind::Mutation, &serde_json::json!({})).is_none());
+        git(&repo, &["commit", "--allow-empty", "-m", "synthetic"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        assert!(git(&repo, &["ls-remote", "origin"]).is_empty());
+        let gateway = test_gateway("trusted").await;
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0").execute(&gateway.db).await.unwrap();
+        let args = serde_json::json!({"command":"git push origin HEAD:refs/heads/synthetic"});
+        let call = ToolCall { id: "synthetic-push-real".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let cloned = gateway.clone();
+        let handle = tokio::spawn(async move { cloned.authorize(&call, &args, Some("git push origin HEAD:refs/heads/synthetic")).await });
+        let sender = take_pending_sender(&gateway).await;
+        let waiting = super::super::thin_state::load(&gateway.db, "permission-test").await.unwrap().unwrap();
+        assert_eq!(waiting.state, super::super::thin_state::SessionState::WaitingUser);
+        assert!(waiting.question.unwrap().contains("允许"));
+        assert!(git(&repo, &["ls-remote", "origin"]).is_empty(), "no remote mutation before approval");
+        sender.send(true).unwrap();
+        assert_eq!(handle.await.unwrap(), PermissionOutcome::Allow);
+        git(&repo, &["push", "origin", "HEAD:refs/heads/synthetic"]);
+        assert_eq!(git(&repo, &["ls-remote", "origin", "refs/heads/synthetic"]).split_whitespace().next(), Some(head.trim()));
+    }
+
+    #[tokio::test]
+    async fn m130_remote_approval_persists_and_resumes_same_call() {
+        let gateway = test_gateway("trusted").await;
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0")
+            .execute(&gateway.db).await.unwrap();
+        let args = serde_json::json!({"command":"git push origin synthetic"});
+        let call = ToolCall { id: "synthetic-push".into(), r#type: "function".into(),
+            function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let cloned = gateway.clone();
+        let handle = tokio::spawn(async move { cloned.authorize(&call, &args, Some("git push origin synthetic")).await });
+        assert!(!super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await);
+        take_pending_sender(&gateway).await.send(true).unwrap();
+        assert_eq!(handle.await.unwrap(), PermissionOutcome::Allow);
+        assert!(super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await);
+    }
+
+    #[tokio::test]
+    async fn m130_remote_denial_keeps_grant_off_and_names_user_decision() {
+        let gateway = test_gateway("trusted").await;
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0")
+            .execute(&gateway.db).await.unwrap();
+        let args = serde_json::json!({"ceiling":"pr_only"});
+        let call = ToolCall { id: "synthetic-deliver".into(), r#type: "function".into(),
+            function: FunctionCall { name: "deliver_changes".into(), arguments: args.to_string() } };
+        let cloned = gateway.clone();
+        let handle = tokio::spawn(async move { cloned.authorize(&call, &args, None).await });
+        take_pending_sender(&gateway).await.send(false).unwrap();
+        match handle.await.unwrap() {
+            PermissionOutcome::Deny(denial) => assert_eq!(denial.content, "用户不允许推送，请在本地完成并说明"),
+            other => panic!("expected denial, got {other:?}"),
+        }
+        assert!(!super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await);
     }
 
     #[tokio::test]

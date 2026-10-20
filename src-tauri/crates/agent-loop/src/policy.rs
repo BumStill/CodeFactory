@@ -631,28 +631,63 @@ pub fn completion_command_and_kind(
     (command, kind)
 }
 
-fn is_delivery_command(command: &str) -> bool {
+#[cfg(test)]
+mod m130_tests {
+    use super::*;
+
+    #[test]
+    fn m130_remote_classification_handles_flags_and_keeps_queries_local() {
+        for command in ["git -C repo push origin HEAD", "git.exe push", "glab mr create", "gh api repos/example/project/pulls -X POST", "git\tpush origin HEAD"] {
+            assert!(is_delivery_command(command), "{command}");
+            assert!(capability_denial(TurnCapability::ReviewOnly, "bash", command,
+                &ToolKind::ReadOnly, &serde_json::json!({})).is_some(), "read-only must reject remote writes even if backend classification is stale: {command}");
+        }
+        for command in ["git commit -m synthetic", "git switch -c synthetic", "git stash", "git status --short", "gh pr view 7 --json state", "grep -n 'git push' README.md"] {
+            assert!(!is_delivery_command(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn m130_local_git_writes_follow_write_permission() {
+        for command in ["git commit -m synthetic", "git switch -c synthetic", "git stash"] {
+            assert!(capability_denial(TurnCapability::Implement, "bash", command,
+                &ToolKind::Mutation, &serde_json::json!({"command": command})).is_none(), "{command}");
+            assert!(capability_denial(TurnCapability::ReviewOnly, "bash", command,
+                &ToolKind::Mutation, &serde_json::json!({"command": command})).is_some());
+        }
+    }
+
+    #[test]
+    fn m130_remote_actions_reach_shared_permission_gateway() {
+        for capability in [TurnCapability::Implement, TurnCapability::Deliver] {
+            assert!(tool_visible_for_capability(capability, "deliver_changes"));
+            for command in ["git push origin HEAD", "gh pr create", "glab mr create", "git tag v-test"] {
+                assert!(capability_denial(capability, "bash", command,
+                    &ToolKind::Mutation, &serde_json::json!({"command": command})).is_none(), "{capability:?}: {command}");
+            }
+        }
+    }
+}
+
+pub fn is_delivery_command(command: &str) -> bool {
+    // Read-only searches may quote delivery commands as data, not execute them.
+    if codefactory_agent_core::command_is_read_only_probe(command) { return false; }
     let lower = command.to_ascii_lowercase();
+    let normalized = lower.replace(['\'', '"', '\t', '\n', ';', '|', '&', ',', '[', ']', '(', ')'], " ");
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    for (index, word) in words.iter().enumerate() {
+        let binary = word.rsplit(['/', '\\']).next().unwrap_or(word).trim_end_matches(".exe");
+        let rest = &words[index + 1..];
+        if binary == "git" && rest.iter().any(|word| matches!(*word, "push" | "tag")) { return true; }
+        if matches!(binary, "gh" | "glab") && rest.iter().any(|word| matches!(*word, "pr" | "mr" | "release" | "workflow" | "api")) {
+            // Unknown forge writes fail closed; query-only calls were excluded above.
+            return true;
+        }
+    }
     [
-        "git commit",
-        "git push",
-        "git tag",
-        "gh pr create",
-        "gh pr merge",
-        "gh workflow run",
-        "gh release create",
-        "glab mr create",
-        "glab mr merge",
-        "npm publish",
-        "pnpm publish",
-        "cargo publish",
-        "kubectl apply",
-        "helm upgrade",
-        "vercel --prod",
-        "netlify deploy",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+        "npm publish", "pnpm publish", "cargo publish", "docker push", "podman push",
+        "kubectl apply", "helm upgrade", "vercel --prod", "netlify deploy",
+    ].iter().any(|needle| lower.contains(needle))
 }
 
 /// Directories whose text documents are planning artifacts rather than product
@@ -779,8 +814,7 @@ fn is_review_safe_named_tool(tool_name: &str) -> bool {
 pub fn tool_visible_for_capability(capability: TurnCapability, tool_name: &str) -> bool {
     match capability {
         TurnCapability::ReviewOnly => is_review_safe_named_tool(tool_name),
-        TurnCapability::Implement => tool_name != "deliver_changes",
-        TurnCapability::Deliver => true,
+        TurnCapability::Implement | TurnCapability::Deliver => true,
     }
 }
 
@@ -794,7 +828,7 @@ pub fn tool_visible_for_capability(capability: TurnCapability, tool_name: &str) 
 pub fn capability_denial(
     capability: TurnCapability,
     tool_name: &str,
-    command: &str,
+    _command: &str,
     kind: &ToolKind,
     args: &serde_json::Value,
 ) -> Option<String> {
@@ -805,33 +839,18 @@ pub fn capability_denial(
             if is_planning_document_write(tool_name, args) {
                 return None;
             }
-            let mutating = matches!(kind, ToolKind::Mutation | ToolKind::BackgroundServiceStart);
+            let mutating = matches!(kind, ToolKind::Mutation | ToolKind::BackgroundServiceStart)
+                || (tool_name == "bash" && is_delivery_command(_command));
             if mutating || !is_review_safe_named_tool(tool_name) {
                 Some(review_only_denial(tool_name))
             } else {
                 None
             }
         }
-        TurnCapability::Implement => {
-            if tool_name == "deliver_changes" || is_delivery_command(command) {
-                Some(
-                    "当前意图只授权本地实施，已跳过提交、推送、PR、合并或发布动作；需要交付时必须获得对应意图并调用受控交付工具。"
-                        .into(),
-                )
-            } else {
-                None
-            }
-        }
-        TurnCapability::Deliver => {
-            if tool_name == "bash" && is_delivery_command(command) {
-                Some(
-                    "已跳过裸 shell 交付命令；提交、推送、PR、合并和发布必须调用 `deliver_changes`，由它记录 CI 门禁、head SHA 与恢复回执。这不是账号或命令权限分类问题；不要重试同一条 gh/git 命令。"
-                        .into(),
-                )
-            } else {
-                None
-            }
-        }
+        // M130: local writes follow write permission. Remote mutations use
+        // the live session grant in PermissionGateway, which can ask once and
+        // resume the exact call rather than returning a wording-level denial.
+        TurnCapability::Implement | TurnCapability::Deliver => None,
     }
 }
 
@@ -1073,7 +1092,7 @@ mod tests {
             &ToolKind::Mutation,
             &no_args(),
         )
-        .is_some());
+        .is_none());
         assert!(capability_denial(
             TurnCapability::Implement,
             "bash",
@@ -1081,7 +1100,7 @@ mod tests {
             &ToolKind::Mutation,
             &no_args(),
         )
-        .is_some());
+        .is_none());
         assert!(capability_denial(
             TurnCapability::Deliver,
             "deliver_changes",
@@ -1523,18 +1542,14 @@ mod tests {
     }
 
     #[test]
-    fn deliver_intent_routes_raw_delivery_commands_to_the_governed_tool() {
-        let denial = capability_denial(
+    fn deliver_intent_routes_raw_delivery_commands_to_permission_gateway() {
+        assert!(capability_denial(
             TurnCapability::Deliver,
             "bash",
             "gh pr merge 281 --squash --auto",
             &ToolKind::Mutation,
             &serde_json::json!({"command": "gh pr merge 281 --squash --auto"}),
-        )
-        .expect("raw delivery mutation must stay behind deliver_changes");
-        assert!(denial.contains("deliver_changes"));
-        assert!(!denial.contains("本回合"));
-        assert!(!denial.contains("高风险"));
+        ).is_none());
     }
 
     #[test]

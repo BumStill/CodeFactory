@@ -3423,15 +3423,11 @@ mod tests {
         let message = "开始实施：按任务文件修复。授权交付，ceiling: merged。\
                        先核实个人账户仓库能否用 merge queue，再分析一下风险。";
         let capability = m48_apply_gui_turn(&db, session, message).await;
-        assert_eq!(
-            capability,
-            TurnCapability::Deliver,
-            "the authorization sentence must win over the question in the same message"
-        );
-        assert!(
-            m48_delivery_row(&db, session).await,
-            "sessions.delivery_authorized must be 1 after the authorization turn"
-        );
+        assert_eq!(capability, TurnCapability::Implement,
+            "wording must not turn on session delivery");
+        assert!(!m48_delivery_row(&db, session).await);
+        // The session switch, not a phrase, enables delivery.
+        set_session_delivery_authorized(&db, session, true).await;
 
         // A follow-up with no delivery wording keeps the grant.
         assert_eq!(

@@ -40,10 +40,8 @@ pub struct ChatContract {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnGrants {
     pub browser_read: bool,
-    /// The turn is hard read-only because a STRUCTURED source said so — an
-    /// explicit field supplied by the caller (for example `delegate_tasks`
-    /// marking a review-only subagent, or an acceptance scenario declaration).
-    /// Wording never sets this.
+    /// M130: structured read-only or an explicit current read-only directive.
+    /// Wording may lower authority, never grant remote delivery.
     pub explicit_read_only: bool,
 }
 
@@ -428,6 +426,7 @@ const HARD_READ_ONLY_CJK: &[&str] = &[
     "别执行",
     "不要实现",
     "别实现",
+    "先别动代码",
     "不要动代码",
     "别动代码",
 ];
@@ -466,6 +465,17 @@ fn without_scoped_file_limits(lowercased: &str) -> String {
         .fold(lowercased.to_string(), |text, scope| {
             text.replace(scope, "")
         })
+}
+
+fn has_hard_read_only_directive(user_msg: &str) -> bool {
+    let text = without_scoped_file_limits(&user_msg.to_ascii_lowercase());
+    // Conditional constraints govern their branch, not the entire turn.
+    let text = text.split([ '。', '；', ';' ]).filter(|clause| {
+        let clause = clause.trim_start();
+        !clause.starts_with("如果") && !clause.starts_with("若") && !clause.starts_with("if ")
+    }).collect::<Vec<_>>().join("。");
+    HARD_READ_ONLY_CJK.iter().chain(HARD_READ_ONLY_EN_PHRASES.iter())
+        .any(|cue| text.contains(cue) && !text.contains(&format!("别{cue}")))
 }
 
 fn ceiling_declaration(lowercased: &str) -> bool {
@@ -866,6 +876,12 @@ pub fn is_contextual_approval(user_msg: &str) -> bool {
 pub fn is_delivery_revocation(user_msg: &str) -> bool {
     let text = user_msg.to_ascii_lowercase();
     [
+        "别推了",
+        "先不要提交到远端",
+        "不要推送",
+        "别推送",
+        "don't push",
+        "do not push",
         "取消交付",
         "取消发布",
         "先不发布",
@@ -953,37 +969,23 @@ pub fn resolve_turn_delivery_authorization(
     persisted: bool,
 ) -> (ChatContract, DeliveryAuthorizationUpdate) {
     let mut contract = decide_chat_contract_with_intent(prev_assistant, user_msg, intent);
-    if is_delivery_revocation(user_msg) {
-        (contract, DeliveryAuthorizationUpdate::Revoked)
-    } else if contract.capability == TurnCapability::Deliver {
-        (contract, DeliveryAuthorizationUpdate::Granted)
-    } else if persisted {
-        contract = with_persisted_delivery_authorization(contract, true);
-        (contract, DeliveryAuthorizationUpdate::Unchanged)
+    // R1: text can lower authority, never enable session delivery.
+    let revoked = is_delivery_revocation(user_msg);
+    contract.capability = if contract.grants.explicit_read_only {
+        TurnCapability::ReviewOnly
+    } else if persisted && !revoked {
+        TurnCapability::Deliver
     } else {
-        (contract, DeliveryAuthorizationUpdate::Unchanged)
-    }
+        TurnCapability::Implement
+    };
+    (contract, if revoked { DeliveryAuthorizationUpdate::Revoked } else { DeliveryAuthorizationUpdate::Unchanged })
 }
 
 /// A mid-run user steer can change the current action intent at the next safe
 /// round boundary. This is separate from normal permission approval: it
 /// changes the user's objective and therefore must reach policy evaluation.
 pub fn steer_capability_override(user_msg: &str) -> Option<TurnCapability> {
-    // β (2026-09-28): a wording-level planning cue used to return `ReviewOnly`
-    // here, i.e. a mid-run sentence could revoke the turn's write capability.
-    // Wording no longer votes on capability; a hard read-only steer comes from
-    // the structured intent the caller supplies at turn entry.
-    if is_delivery_request(user_msg) {
-        return Some(TurnCapability::Deliver);
-    }
-    if is_direct_execution_request(user_msg)
-        || is_change_request(user_msg)
-        || is_explicit_continuation_request(user_msg)
-        || is_strong_approval(user_msg)
-    {
-        return Some(TurnCapability::Implement);
-    }
-    None
+    has_hard_read_only_directive(user_msg).then_some(TurnCapability::ReviewOnly)
 }
 
 /// The same steer, read against what the session already holds.
@@ -1003,11 +1005,12 @@ pub fn steer_capability_override(user_msg: &str) -> Option<TurnCapability> {
 /// [`with_persisted_delivery_authorization`] already applies at turn entry.
 pub fn steer_capability_override_with_authorization(
     user_msg: &str,
-    delivery_authorized: bool,
+    _delivery_authorized: bool,
 ) -> Option<TurnCapability> {
-    match steer_capability_override(user_msg)? {
-        TurnCapability::Implement if delivery_authorized => Some(TurnCapability::Deliver),
-        capability => Some(capability),
+    if is_delivery_revocation(user_msg) {
+        Some(TurnCapability::Implement)
+    } else {
+        steer_capability_override(user_msg)
     }
 }
 
@@ -1122,11 +1125,12 @@ pub fn decide_chat_contract_with_intent(
     user_msg: &str,
     intent: TurnIntent,
 ) -> ChatContract {
+    let read_only = intent.structured_read_only || has_hard_read_only_directive(user_msg);
     let grants = TurnGrants {
         browser_read: grants_browser_read(user_msg),
-        explicit_read_only: intent.structured_read_only,
+        explicit_read_only: read_only,
     };
-    if intent.structured_read_only {
+    if read_only {
         return ChatContract {
             mode: AgentMode::Interactive,
             capability: TurnCapability::ReviewOnly,
@@ -1136,7 +1140,7 @@ pub fn decide_chat_contract_with_intent(
     if is_delivery_request(user_msg) {
         return ChatContract {
             mode: AgentMode::Execute,
-            capability: TurnCapability::Deliver,
+            capability: TurnCapability::Implement,
             grants,
         };
     }
@@ -1150,9 +1154,7 @@ pub fn decide_chat_contract_with_intent(
     if is_explicit_continuation_request(user_msg) {
         return ChatContract {
             mode: AgentMode::Execute,
-            capability: prev_assistant
-                .and_then(proposal_capability)
-                .unwrap_or(TurnCapability::Implement),
+            capability: TurnCapability::Implement,
             grants,
         };
     }
@@ -1163,9 +1165,7 @@ pub fn decide_chat_contract_with_intent(
     if approval {
         return ChatContract {
             mode: AgentMode::Execute,
-            capability: approved_proposal
-                .or_else(|| prev_assistant.and_then(proposal_capability))
-                .unwrap_or(TurnCapability::Implement),
+            capability: TurnCapability::Implement,
             grants,
         };
     }
@@ -1387,7 +1387,7 @@ mod tests {
         // β: wording alone never selects ReviewOnly…
         assert_eq!(
             decide_chat_contract(None, "先系统分析，不要修改代码").capability,
-            TurnCapability::Implement
+            TurnCapability::ReviewOnly
         );
         // …a hard read-only turn comes from a structured intent instead.
         assert_eq!(
@@ -1407,7 +1407,7 @@ mod tests {
         );
         assert_eq!(
             decide_chat_contract(None, "修复完成后提交 PR、合并并发布上线").capability,
-            TurnCapability::Deliver
+            TurnCapability::Implement
         );
     }
 
@@ -1415,7 +1415,7 @@ mod tests {
     fn short_approval_inherits_delivery_only_from_the_approved_proposal() {
         assert_eq!(
             decide_chat_contract(Some("我会修复、开 PR 并发布。可以开始吗？"), "做吧").capability,
-            TurnCapability::Deliver
+            TurnCapability::Implement
         );
         assert_eq!(
             decide_chat_contract(Some("我会在本地修复并验证。可以开始吗？"), "做吧").capability,
@@ -1449,10 +1449,10 @@ mod tests {
         // β: a wording cue no longer revokes anything, so a standing grant still
         // applies to it.
         let wording_only = decide_chat_contract(None, "先系统分析，不要修改代码");
-        assert_eq!(wording_only.capability, TurnCapability::Implement);
+        assert_eq!(wording_only.capability, TurnCapability::ReviewOnly);
         assert_eq!(
             with_persisted_delivery_authorization(wording_only, true).capability,
-            TurnCapability::Deliver
+            TurnCapability::ReviewOnly
         );
         // A STRUCTURED read-only turn stays review-only whatever the session
         // holds.
@@ -1520,7 +1520,7 @@ mod tests {
         }
         assert_eq!(
             decide_chat_contract(Some("我会修复、开 PR、合并并发布。"), "可以，继续",).capability,
-            TurnCapability::Deliver,
+            TurnCapability::Implement,
         );
     }
 
@@ -1597,11 +1597,8 @@ mod tests {
         // records that the constraint had no capability effect.
         for message in ["先分析一下，不要改代码", "只评估风险，别执行"] {
             let contract = decide_chat_contract(None, message);
-            assert!(
-                !contract.grants.explicit_read_only,
-                "{message:?} is wording, not a structured grant"
-            );
-            assert_eq!(contract.capability, TurnCapability::Implement, "{message:?}");
+            assert!(contract.grants.explicit_read_only, "{message:?}");
+            assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
             assert_eq!(contract.mode, AgentMode::Interactive, "{message:?}");
             let block = constraint_instruction_block(message).expect("instruction block");
             assert!(block.contains("turn-constraint"), "{message:?}");
@@ -1670,8 +1667,8 @@ mod tests {
             // β: the constraint becomes an instruction; the change request
             // keeps its write capability.
             let contract = decide_chat_contract(None, message);
-            assert_ne!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
-            assert!(!contract.grants.explicit_read_only, "{message:?}");
+            assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+            assert!(contract.grants.explicit_read_only, "{message:?}");
             assert!(
                 constraint_instruction_block(message).is_some(),
                 "{message:?} should still be handed to the model as a constraint"
@@ -1767,35 +1764,16 @@ mod tests {
     fn a_mid_turn_change_request_reaches_implementation() {
         assert_eq!(
             steer_capability_override("等下，这个间距也太挤了，应该跟上面对齐"),
-            Some(TurnCapability::Implement),
+            None,
         );
     }
 
     #[test]
     fn explicit_mid_turn_correction_can_change_the_active_capability() {
-        assert_eq!(
-            steer_capability_override("先把之前批准的执行了，再回来分析原因"),
-            Some(TurnCapability::Implement),
-        );
-        assert_eq!(
-            steer_capability_override("别只审视了，继续实施，把刚才这个方案执行完。"),
-            Some(TurnCapability::Implement),
-        );
-        assert_eq!(
-            steer_capability_override("不要只分析了，继续执行"),
-            Some(TurnCapability::Implement),
-        );
-        assert_eq!(
-            steer_capability_override("继续"),
-            Some(TurnCapability::Implement),
-        );
-        assert_eq!(
-            steer_capability_override("继续发布上线"),
-            Some(TurnCapability::Deliver),
-        );
-        // β (2026-09-28): a wording cue no longer steers the capability at all;
-        // it is an instruction, not a permission.
-        assert_eq!(steer_capability_override("先别修改，继续分析"), None);
+        for message in ["先把之前批准的执行了，再回来分析原因", "别只审视了，继续实施，把刚才这个方案执行完。", "继续", "继续发布上线"] {
+            assert_eq!(steer_capability_override(message), None);
+        }
+        assert_eq!(steer_capability_override("先别修改，继续分析"), Some(TurnCapability::ReviewOnly));
     }
 
     /// 2026-09-08 field report. Seven sessions were resumed with the single
@@ -1819,7 +1797,7 @@ mod tests {
         // Without a grant nothing is inherited: the steer still means Implement.
         assert_eq!(
             steer_capability_override_with_authorization("继续", false),
-            Some(TurnCapability::Implement),
+            None,
         );
         // An explicit read-only steer still wins over a standing grant, and an
         // explicit revocation is handled by `is_delivery_revocation` upstream.
@@ -1827,7 +1805,7 @@ mod tests {
         // alone instead of dropping the turn to ReviewOnly.
         assert_eq!(
             steer_capability_override_with_authorization("先别修改，继续分析", true),
-            None,
+            Some(TurnCapability::ReviewOnly),
         );
         assert!(is_delivery_revocation("先别发布"));
         // A message that steers nothing still steers nothing.
@@ -1857,8 +1835,8 @@ mod tests {
         let message = "先分析一下这个布局，不要改代码";
         let contract = decide_chat_contract(None, message);
         assert_eq!(contract.mode, AgentMode::Interactive, "{message:?}");
-        assert_eq!(contract.capability, TurnCapability::Implement, "{message:?}");
-        assert!(!contract.grants.explicit_read_only, "{message:?}");
+        assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+        assert!(contract.grants.explicit_read_only, "{message:?}");
         assert!(constraint_instruction_block(message).is_some(), "{message:?}");
     }
 
@@ -1917,8 +1895,8 @@ mod tests {
     fn a_delegated_brief_with_only_read_only_wording_keeps_write_capability() {
         let message = "只读审查当前分支的实现，不要修改文件。";
         let contract = decide_chat_contract(None, message);
-        assert!(!contract.grants.explicit_read_only, "{message:?}");
-        assert_ne!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+        assert!(contract.grants.explicit_read_only, "{message:?}");
+        assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
     }
 
     /// β fixture 5 — a structured read-only turn must still hand back evidence:
@@ -1980,8 +1958,8 @@ mod tests {
             );
             assert_eq!(
                 decide_chat_contract(None, message).capability,
-                TurnCapability::Deliver,
-                "{message} must authorize delivery"
+                TurnCapability::Implement,
+                "{message} must not authorize delivery by wording"
             );
         }
     }
@@ -1998,8 +1976,8 @@ mod tests {
         ] {
             assert_eq!(
                 decide_chat_contract(None, message).capability,
-                TurnCapability::Deliver,
-                "{message} must authorize delivery"
+                TurnCapability::Implement,
+                "{message} must not authorize delivery by wording"
             );
         }
     }

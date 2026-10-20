@@ -22,6 +22,26 @@ pub struct SessionListItem {
     is_running: bool,
 }
 
+/// M130: structured session switch, never inferred from message text.
+#[tauri::command]
+pub async fn update_session_delivery_authorized(
+    state: State<'_, AppState>, session_id: String, authorized: bool,
+) -> Result<(), AppError> {
+    let db = state.db.read().await.clone();
+    let mut tx = db.begin().await?;
+    let result = sqlx::query("UPDATE sessions SET delivery_authorized=?, delivery_ceiling=CASE WHEN ? THEN delivery_ceiling ELSE NULL END WHERE id=?")
+        .bind(authorized as i64).bind(authorized).bind(&session_id).execute(&mut *tx).await?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::Other("Unknown session".into()));
+    }
+    if authorized {
+        sqlx::query("DELETE FROM delivery_stop_fences WHERE session_id=?")
+            .bind(&session_id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 fn validate_model_policy(policy: &str) -> Result<(), AppError> {
     if matches!(policy, "fixed" | "prefer" | "auto") {
         Ok(())

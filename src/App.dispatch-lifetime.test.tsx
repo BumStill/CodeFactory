@@ -43,7 +43,7 @@ vi.mock("./components/UpdaterBanner", () => ({ UpdaterBanner: () => null }));
     mocks.listener!({ payload: { request_id: "quota", operation: "get_quota", request: {} } });
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("dispatch_reply", expect.objectContaining({ requestId: "quota", ok: true, result: [{ endpoint: "synthetic", five_hour_cap_percent: 80 }] })));
     mocks.listener!({ payload: { request_id: "create", operation: "create_and_send", request: { project: "/synthetic/project", message: "synthetic message", delivery_authorized: false } } });
-    await waitFor(() => expect(mocks.dispatchSend).toHaveBeenCalledWith({ sessionId: "synthetic-new", message: "synthetic message", mode: "steer" }));
+    await waitFor(() => expect(mocks.dispatchSend).toHaveBeenCalledWith({ sessionId: "synthetic-new", message: "synthetic message", mode: "steer", deliveryAuthorized: false }));
     await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("dispatch_reply", expect.objectContaining({ requestId: "create", ok: true })));
     expect(screen.getByText("synthetic settings")).toBeInTheDocument();
     mocks.listener!({ payload: { request_id: "switch", operation: "switch_session", request: { session_id: "synthetic-existing" } } });
