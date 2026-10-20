@@ -14,6 +14,9 @@ trait Commands {
     /// CF-STAGE1-P1: the repository PR-body contract. Applied after the local
     /// commit and before the first push, so a body CI would reject is never
     /// pushed. Default passthrough keeps synthetic forges in memory.
+    fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {
+        Ok((Vec::new(), 0))
+    }
     fn reconcile_body(&mut self, _title: &str, body: &str, _urgency: Option<ReleaseUrgency>) -> Result<String, String> {
         Ok(body.to_string())
     }
@@ -26,6 +29,9 @@ impl Commands for Local<'_> {
         delivery::bounded_delivery_output(delivery::dev_command("gh").current_dir(self.0).args(args))
     }
     fn stage(&mut self, excludes: &[String]) -> Result<Vec<String>, String> { delivery::stage_scoped(self.0, excludes) }
+    fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {
+        delivery::precheck_thin_governance(self.0)
+    }
     fn reconcile_body(&mut self, title: &str, body: &str, urgency: Option<ReleaseUrgency>) -> Result<String, String> {
         delivery::prepare_thin_pr_body(self.0, title, body, urgency)
     }
@@ -61,7 +67,15 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
     // declarations and refuse a body CI would reject before touching the remote.
     let urgency = super::delivery::release_urgency_from_args(args)?;
     let requested_body = args.get("body").and_then(Value::as_str).unwrap_or("");
-    let body = commands.reconcile_body(&title, requested_body, urgency)?;
+    let (warnings, elapsed_ms) = commands.precheck_governance()?;
+    log.step("governance_precheck", &format!("{elapsed_ms} ms"));
+    let mut checked_body = requested_body.to_string();
+    if !warnings.is_empty() {
+        let warning = format!("治理预检警告（校验器不可用，未执行部分校验）：\n{}", warnings.join("\n"));
+        log.step("governance_warning", &warning);
+        checked_body.push_str(&format!("\n\n{warning}\n"));
+    }
+    let body = commands.reconcile_body(&title, &checked_body, urgency)?;
     log.step("pr_body", if body == requested_body { "unchanged" } else { "reconciled" });
     let remote_ref = format!("refs/heads/{branch}");
     let remote = commands.git(&["ls-remote", "--heads", "origin", &remote_ref])?;
@@ -159,10 +173,17 @@ mod tests {
         pushed: bool, pr: bool, armed: bool, fail_label: bool, merged: bool,
         pushes: usize, creates: usize, merges: usize, dispatched: bool,
         // CF-STAGE1-P1: proves the body contract runs between commit and push.
+        governance_root: Option<std::path::PathBuf>, governance_error: Option<String>, governance_warnings: Vec<String>,
         fill_body: bool, reject_body: Option<String>,
         created_body: Option<String>, edited_body: Option<String>, events: Vec<&'static str>,
     }
     impl Commands for Forge {
+        fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {
+            self.events.push("governance");
+            if let Some(root) = &self.governance_root { return delivery::precheck_thin_governance(root); }
+            if let Some(error) = &self.governance_error { return Err(error.clone()); }
+            Ok((self.governance_warnings.clone(), 12))
+        }
         fn stage(&mut self, _: &[String]) -> Result<Vec<String>,String> { self.events.push("stage"); Ok(vec![]) }
         fn reconcile_body(&mut self, _title: &str, body: &str, _urgency: Option<ReleaseUrgency>) -> Result<String,String> {
             self.events.push("pr_body");
@@ -266,6 +287,59 @@ mod tests {
         let error = deliver(&mut forge).unwrap_err();
         assert!(error.contains("README-Update"), "{error}");
         assert_eq!((forge.pushes, forge.creates, forge.events.contains(&"push")), (0, 0, false));
+    }
+
+    #[test]
+    fn governance_failure_never_pushes_then_corrected_delivery_pushes() {
+        let mut forge = Forge { governance_error: Some("OBJECTIVE_MANUAL_TECHNICAL_HANDOFF synthetic.md:2 system-owned technical state".into()), ..Default::default() };
+        assert!(deliver(&mut forge).unwrap_err().contains("synthetic.md:2"));
+        assert_eq!((forge.pushes, forge.creates), (0, 0));
+        forge.governance_error = None;
+        deliver(&mut forge).unwrap();
+        assert_eq!((forge.pushes, forge.creates), (1, 1));
+    }
+
+    #[test]
+    fn unavailable_governance_warns_in_body_and_tool_steps_without_blocking() {
+        let mut forge = Forge { governance_warnings: vec!["synthetic validator unavailable".into()], ..Default::default() };
+        let mut log = Log::default();
+        run(&mut forge, &json!({"title":"fix: synthetic"}), DeliveryCeiling::ThroughMerge, &[], &mut log).unwrap();
+        assert_eq!(forge.pushes, 1);
+        assert!(forge.created_body.unwrap().contains("治理预检警告"));
+        assert!(log.steps.iter().any(|step| step["step"] == "governance_warning"));
+    }
+
+    #[test]
+    fn real_governance_rule_blocks_thin_push_then_fixed_spec_pushes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let tools = root.join("tools/governance");
+        std::fs::create_dir_all(&tools).unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        std::fs::copy(repo.join("tools/governance/validate_objective_non_interruption_contract.py"), tools.join("validate_objective_non_interruption_contract.py")).unwrap();
+        delivery::git(root, &["init"]).unwrap();
+        delivery::git(root, &["config", "user.name", "Synthetic"]).unwrap();
+        delivery::git(root, &["config", "user.email", "synthetic@example.invalid"]).unwrap();
+        let specs = root.join("docs/specs");
+        std::fs::create_dir_all(&specs).unwrap();
+        let spec = specs.join("synthetic.md");
+        std::fs::write(&spec, "# Synthetic\n").unwrap();
+        delivery::git(root, &["add", "."]).unwrap();
+        delivery::git(root, &["commit", "-m", "fixture"]).unwrap();
+        delivery::git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        std::fs::write(&spec, "# Requirements\n技术失败时用户必须点击重试按钮。\n").unwrap();
+        delivery::git(root, &["add", "."]).unwrap();
+        delivery::git(root, &["commit", "-m", "synthetic bad spec"]).unwrap();
+        let mut forge = Forge { governance_root: Some(root.to_path_buf()), ..Default::default() };
+        let error = deliver(&mut forge).unwrap_err();
+        assert!(error.contains("OBJECTIVE_MANUAL_TECHNICAL_HANDOFF"), "{error}");
+        assert!(error.contains("synthetic.md:2"), "{error}");
+        assert_eq!((forge.pushes, forge.creates), (0, 0));
+        std::fs::write(&spec, "# Requirements\n技术失败时系统自动重试并自愈。\n").unwrap();
+        delivery::git(root, &["add", "."]).unwrap();
+        delivery::git(root, &["commit", "-m", "synthetic fixed spec"]).unwrap();
+        deliver(&mut forge).unwrap();
+        assert_eq!((forge.pushes, forge.creates), (1, 1));
     }
 
     #[test]

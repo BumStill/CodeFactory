@@ -4422,6 +4422,35 @@ fn apply_readme_declaration(
 /// validators reject (`README-Update` / `Scenario-Test` missing). Everything the
 /// body must declare is derived here from the same sources the durable path
 /// uses — never a second copy of the rules.
+/// M128: execute the repository's existing rules with bounded subprocesses.
+/// Infrastructure failures warn; recognized governance violations block pushing.
+pub(crate) fn precheck_thin_governance(root: &Path) -> Result<(Vec<String>, u64), String> {
+    if !root.join("tools/governance").exists() {
+        return Ok((Vec::new(), 0));
+    }
+    let base = thin_base_branch(root, "origin")?;
+    let started = std::time::Instant::now();
+    let output = bounded_delivery_output(
+        dev_command("python3").current_dir(root)
+            .arg("-c").arg(include_str!("../../../scripts/delivery-governance-precheck.py"))
+            .arg(root).arg(format!("origin/{base}")),
+    );
+    let unavailable = |detail: String| Ok((vec![format!("governance validator unavailable: {detail}")], started.elapsed().as_millis() as u64));
+    let output = match output { Ok(output) => output, Err(detail) => return unavailable(detail) };
+    let result: serde_json::Value = match serde_json::from_str(&output) {
+        Ok(result) => result,
+        Err(error) => return unavailable(error.to_string()),
+    };
+    if result["ok"] == false {
+        return Err(format!("本地治理预检失败，未推送任何提交：{}", result["error"].as_str().unwrap_or(&output)));
+    }
+    if result["ok"] != true {
+        return unavailable("invalid validator envelope".into());
+    }
+    let warnings = result["warnings"].as_array().map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+    Ok((warnings, result["elapsed_ms"].as_u64().unwrap_or(0)))
+}
+
 pub(crate) fn prepare_thin_pr_body(
     root: &Path,
     title: &str,
