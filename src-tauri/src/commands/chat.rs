@@ -2622,12 +2622,14 @@ async fn admit_persisted_chat_turn(
     let resolution =
         resolve_open_chat_objective_continuation_in_tx(&mut tx, session_id, &root_turn_id, ordinal)
             .await?;
-    if matches!(resolution, ChatContinuationResolution::Ambiguous) {
-        return Err(AppError::Other(
-            "CHAT_OBJECTIVE_IDENTITY_AMBIGUOUS: system reconciliation required".into(),
-        ));
-    }
-    let legacy_continuation = if matches!(resolution, ChatContinuationResolution::None)
+    // M129 R3: an ambiguous identity is a system-side bookkeeping condition, not
+    // a reason to refuse the human's message. It falls through to a new turn that
+    // still carries the full session history, and the reconciliation vocabulary
+    // never reaches the transcript.
+    let legacy_continuation = if matches!(
+        resolution,
+        ChatContinuationResolution::None | ChatContinuationResolution::Ambiguous
+    )
         && crate::agent::is_contextual_approval(content)
     {
         sqlx::query_as::<_, (String, String)>(
@@ -2646,23 +2648,10 @@ async fn admit_persisted_chat_turn(
     } else {
         None
     };
-    if matches!(resolution, ChatContinuationResolution::None)
-        && legacy_continuation.is_none()
-        && crate::agent::is_contextual_approval(content)
-    {
-        let historical_user_messages: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user' AND id<>?",
-        )
-        .bind(session_id)
-        .bind(&root_turn_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if historical_user_messages > 0 {
-            return Err(AppError::Other(
-                "这段历史记录缺少可续接的任务身份，无法安全继续；本次未启动新任务。".into(),
-            ));
-        }
-    }
+    // M129 R1/R2: an ended prior turn with an identity-free (or fully settled)
+    // history is an ordinary "approve what you just proposed" follow-up. It must
+    // never be refused and must never be a dead end: the message is admitted as a
+    // new turn that still sees the whole conversation.
     let setup = match resolution {
         ChatContinuationResolution::AlreadyBound { objective_id } => ChatContinuationSetup {
             continuation_root_turn_id: None,
@@ -2683,14 +2672,15 @@ async fn admit_persisted_chat_turn(
             driver: Some(driver),
             ambiguous: false,
         },
-        ChatContinuationResolution::None => ChatContinuationSetup {
-            continuation_root_turn_id: legacy_continuation.as_ref().map(|(_, root)| root.clone()),
-            previous_segment_id: legacy_continuation.map(|(segment, _)| segment),
-            expected_objective_id: None,
-            driver: None,
-            ambiguous: false,
-        },
-        ChatContinuationResolution::Ambiguous => unreachable!(),
+        ChatContinuationResolution::None | ChatContinuationResolution::Ambiguous => {
+            ChatContinuationSetup {
+                continuation_root_turn_id: legacy_continuation.as_ref().map(|(_, root)| root.clone()),
+                previous_segment_id: legacy_continuation.map(|(segment, _)| segment),
+                expected_objective_id: None,
+                driver: None,
+                ambiguous: false,
+            }
+        }
     };
 
     let assistant_candidates = sqlx::query_scalar::<_, String>(
@@ -4839,6 +4829,181 @@ mod tests {
         ));
         assert_eq!(projection.activity_kind, "core_input_required");
         assert_eq!(projection.terminal_reason, None);
+    }
+
+    /// M129 (P0, user-reported): 「全部都执行」 sent right after the previous
+    /// turn ended used to be refused with an identity error the user could never
+    /// get past. The contextual approval must start a new turn and keep history.
+    #[tokio::test]
+    async fn contextual_approval_after_an_ended_turn_starts_a_new_turn() {
+        let dir = std::env::temp_dir().join(format!("cf-chat-m129-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::storage::db::connect(dir.join("chat.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('m129-session', 'title', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('m129-prior-root', 'm129-session', 'user', '实现上面这 5 项', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_task_segments
+             (id, session_id, ordinal, title, status, goal_root_turn_id, created_at, updated_at)
+             VALUES ('m129-prior-segment', 'm129-session', 1, '上一轮', 'completed',
+                     'm129-prior-root', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives
+             (id, kind, session_id, root_turn_id, status, decision_type, domain,
+              requested_acceptance, reached_acceptance, evidence_ref, created_at, updated_at,
+              completed_at)
+             VALUES ('m129-prior-objective', 'local_mutation', 'm129-session',
+                     'm129-prior-root', 'completed', 'complete', 'code', '测试通过',
+                     '测试通过', 'evidence:m129', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, task_segment_id, objective_id, phase, status,
+              started_at, updated_at)
+             VALUES ('m129-prior-root', 'm129-session', 'm129-prior-segment',
+                     'm129-prior-objective', 'delivery', 'completed', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let control = crate::ChatRunControl::pending();
+        let receipt = admit_persisted_chat_turn(
+            &pool,
+            &control,
+            "m129-session",
+            None,
+            "把上面 5 项都执行了",
+        )
+        .await
+        .expect("a contextual approval after an ended turn must be admitted");
+
+        assert_ne!(
+            receipt.objective.id, "m129-prior-objective",
+            "the approval must own a new objective instead of reopening the settled one"
+        );
+        assert_eq!(receipt.objective.session_id.as_deref(), Some("m129-session"));
+        let (status, decision): (String, String) =
+            sqlx::query_as("SELECT status, decision_type FROM objectives WHERE id='m129-prior-objective'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (status.as_str(), decision.as_str()),
+            ("completed", "complete"),
+            "the settled prior objective must stay untouched"
+        );
+        let history: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE session_id='m129-session' AND role='user'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(history, 2, "the new turn must carry the earlier user message");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M129 R3: two open candidates is a bookkeeping ambiguity, not a refusal.
+    /// The message still starts a turn and both prior objectives stay intact.
+    #[tokio::test]
+    async fn ambiguous_objective_identity_never_refuses_the_message() {
+        let dir = std::env::temp_dir().join(format!("cf-chat-m129-amb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::storage::db::connect(dir.join("chat.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('m129-amb', 'title', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (index, objective) in ["m129-amb-a", "m129-amb-b"].iter().enumerate() {
+            let ordinal = (index + 1) as i64;
+            sqlx::query(
+                "INSERT INTO messages (id, session_id, role, content, created_at)
+                 VALUES (?, 'm129-amb', 'user', '实现一项', 1)",
+            )
+            .bind(objective)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO chat_task_segments
+                 (id, session_id, ordinal, title, status, goal_root_turn_id, created_at, updated_at)
+                 VALUES (?, 'm129-amb', ?, '一轮', 'active', ?, 1, 1)",
+            )
+            .bind(format!("{objective}-segment"))
+            .bind(ordinal)
+            .bind(objective)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO objectives
+                 (id, kind, session_id, root_turn_id, status, decision_type, domain,
+                  requested_acceptance, created_at, updated_at)
+                 VALUES (?, 'local_mutation', 'm129-amb', ?, 'active', 'continue',
+                         'code', '测试通过', 1, 1)",
+            )
+            .bind(objective)
+            .bind(objective)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO chat_turn_state
+                 (root_turn_id, session_id, task_segment_id, objective_id, phase, status,
+                  started_at, updated_at)
+                 VALUES (?, 'm129-amb', ?, ?, 'planning', 'active', 1, 1)",
+            )
+            .bind(objective)
+            .bind(format!("{objective}-segment"))
+            .bind(objective)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let control = crate::ChatRunControl::pending();
+        let receipt = admit_persisted_chat_turn(&pool, &control, "m129-amb", None, "继续")
+            .await
+            .expect("ambiguity must not refuse the user's message");
+        assert!(
+            receipt.objective.id != "m129-amb-a" && receipt.objective.id != "m129-amb-b",
+            "the new turn must not silently overwrite either open objective"
+        );
+        let still_open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objectives WHERE status='active' AND id IN ('m129-amb-a','m129-amb-b')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still_open, 2, "both candidates must stay for system reconciliation");
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// β fixture 7 — the wording-constraint audit must survive the REAL
