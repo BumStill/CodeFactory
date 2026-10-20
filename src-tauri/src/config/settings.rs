@@ -678,6 +678,7 @@ impl Default for Settings {
                     "write_docx".into(),
                     "read_xlsx".into(),
                     "edit_xlsx".into(),
+                    "web_fetch".into(),
                 ],
                 ask: vec!["bash".into()],
                 deny: vec![],

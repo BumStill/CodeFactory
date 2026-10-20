@@ -569,6 +569,7 @@ dependencies = [
  "codefactory-agent-loop",
  "dashmap",
  "dirs 5.0.1",
+ "encoding_rs",
  "futures",
  "futures-util",
  "getrandom 0.2.17",

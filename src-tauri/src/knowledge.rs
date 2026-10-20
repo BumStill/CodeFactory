@@ -736,9 +736,16 @@ fn extract_pptx(path: &Path) -> crate::errors::Result<Vec<ExtractedChunk>> {
 
 fn extract_pdf(path: &Path) -> crate::errors::Result<Vec<ExtractedChunk>> {
     let bytes = std::fs::read(path)?;
-    let raw = String::from_utf8_lossy(&bytes);
-    let text = normalize_text(&extract_pdf_literal_strings(&raw));
+    let text = pdf_text_from_bytes(&bytes);
     Ok(split_text_chunks(&text, Some(1), None, "page"))
+}
+
+/// Best-effort PDF text for bytes that never touch the disk — the same
+/// literal-string pass `extract_pdf` uses, shared with `web_fetch` so a URL
+/// that serves a PDF reads the same way a local one does.
+pub(crate) fn pdf_text_from_bytes(bytes: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(bytes);
+    normalize_text(&extract_pdf_literal_strings(&raw))
 }
 
 fn split_text_chunks(

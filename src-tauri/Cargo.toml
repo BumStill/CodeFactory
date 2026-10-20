@@ -66,6 +66,7 @@ chrono   = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 iana-time-zone = "0.1"
 base64   = "0.22"
+encoding_rs = "0.8"         # web_fetch decodes GBK / non-UTF-8 pages (also a dep of reqwest)
 sha2     = "0.10"          # PKCE S256 challenge for Codex/ChatGPT OAuth
 cap-std = "4.0.2"          # handle-relative Skill filesystem access
 cap-primitives = "4.0.2"   # no-follow directory opens below the Skill root handle
