@@ -3295,7 +3295,10 @@ impl ObjectiveStore {
     /// Objective. Re-requesting a settled stop starts a new intent; no later
     /// chat admission may pass while this row remains `requested`.
     pub async fn request_chat_session_cancel(&self, session_id: &str) -> anyhow::Result<()> {
+        let thin = super::thin::is_thin(&self.pool, session_id).await;
+        if thin { super::thin_state::ensure(&self.pool).await?; }
         let now = Utc::now().timestamp_millis();
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO chat_session_cancel_intents
              (session_id, status, requested_at, settled_at, updated_at)
@@ -3307,8 +3310,22 @@ impl ObjectiveStore {
         .bind(session_id)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // R6: UI and dispatch stop share this durable entry. End the thin
+        // authority atomically with the stop fence, even without a live turn.
+        if thin {
+        sqlx::query(
+            "INSERT INTO thin_session_state (session_id,state,reason,outcome_location,consecutive_failures,updated_at)
+             SELECT id,'ended','cancelled：用户已停止会话','本会话记录',0,?
+             FROM sessions WHERE id=? AND delivery_mode='thin'
+             ON CONFLICT(session_id) DO UPDATE SET state='ended',
+               reason=excluded.reason, outcome_location=excluded.outcome_location,
+               waiting_for=NULL,wake_source=NULL,question=NULL,failure_signature=NULL,
+               consecutive_failures=0,updated_at=excluded.updated_at",
+        ).bind(now).bind(session_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5738,8 +5755,10 @@ impl ObjectiveStore {
         // "已结束：连续三次…" into sessions whose real state was `waiting_wake`.
         // Retire the legacy Objective as a read-only compat record and return
         // without a decision row, a remediation or a transcript message.
-        if let Some(retired) = self.retire_legacy_objective_on_thin_session(&current).await? {
-            return Ok(retired);
+        if decision.status != ObjectiveStatus::Cancelled {
+            if let Some(retired) = self.retire_legacy_objective_on_thin_session(&current).await? {
+                return Ok(retired);
+            }
         }
         // Runs before the transaction opens: a deterministic pool may allow a
         // single connection, and asking for a second one mid-transaction
@@ -5800,6 +5819,13 @@ impl ObjectiveStore {
             None
         }
         .unwrap_or_else(|| resume_after_failure_hint(&current));
+        let cancelled_thin = if decision.status == ObjectiveStatus::Cancelled {
+            match current.session_id.as_deref() {
+                Some(session) => super::thin::is_thin(&self.pool, session).await,
+                None => false,
+            }
+        } else { false };
+        if cancelled_thin { super::thin_state::ensure(&self.pool).await?; }
         let mut tx = self.pool.begin().await?;
         // The decision transaction may be the only SQLite connection in a
         // deterministic test or embedded deployment. Inspect schema through
@@ -6606,6 +6632,15 @@ impl ObjectiveStore {
         }
 
         if decision.status == ObjectiveStatus::Cancelled {
+            if cancelled_thin {
+                sqlx::query(
+                    "INSERT INTO thin_session_state (session_id,state,reason,outcome_location,consecutive_failures,updated_at)
+                     VALUES (?,'ended','cancelled：回合已取消','本会话记录',0,?)
+                     ON CONFLICT(session_id) DO UPDATE SET state='ended',reason=excluded.reason,
+                       outcome_location=excluded.outcome_location,waiting_for=NULL,wake_source=NULL,
+                       question=NULL,failure_signature=NULL,consecutive_failures=0,updated_at=excluded.updated_at",
+                ).bind(current.session_id.as_deref()).bind(now).execute(&mut *tx).await?;
+            }
             let turn_projection_columns: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM pragma_table_info('chat_turn_state')
                  WHERE name IN ('revision','phase','status','recent_activity_kind',

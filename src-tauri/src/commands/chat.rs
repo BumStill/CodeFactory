@@ -1218,6 +1218,10 @@ pub async fn is_chat_running(
         return Ok(true);
     }
     let pool = state.db.read().await.clone();
+    if crate::agent::thin::is_thin(&pool, &session_id).await {
+        return Ok(crate::agent::thin_derive::refresh(&pool, &session_id).await?.state
+            == crate::agent::thin_state::SessionState::Running);
+    }
     has_progressing_system_chat_run(&pool, &session_id).await
 }
 
@@ -2913,6 +2917,15 @@ async fn admit_persisted_chat_turn(
     let already_settled = existing_turn
         .as_ref()
         .is_some_and(|(_, _, status)| matches!(status.as_str(), "completed" | "cancelled"));
+    // R6: only a newly admitted user turn may reopen a stopped thin session.
+    // Background recovery and late writes cannot clear the cancellation.
+    let has_thin_state: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_session_state'",
+    ).fetch_one(&mut *tx).await?;
+    if fresh_user_message && control_status != "cancel_requested" && has_thin_state == 1 {
+        sqlx::query("DELETE FROM thin_session_state WHERE session_id=? AND state='ended' AND reason LIKE 'cancelled%'")
+            .bind(session_id).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
     Ok(ChatAdmissionReceipt {
         root_turn_id,
@@ -3758,15 +3771,9 @@ pub(crate) async fn resume_thin_running_session(
     if !crate::agent::thin::is_thin(&db, &session_id).await {
         return Ok(());
     }
-    let Some(thin) = crate::agent::thin_state::load(&db, &session_id)
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?
-    else {
-        return Ok(());
-    };
-    if thin.state != crate::agent::thin_state::SessionState::Running {
-        return Ok(());
-    }
+    let thin = crate::agent::thin_state::load(&db, &session_id)
+        .await.map_err(|error| AppError::Other(error.to_string()))?
+        .unwrap_or_else(crate::agent::thin_state::ThinState::running);
     let resumable: Option<(String, String, i64, i64)> = sqlx::query_as(
         "SELECT turn.root_turn_id, objective.id, objective.revision, turn.updated_at
          FROM chat_turn_state turn

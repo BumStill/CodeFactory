@@ -1434,10 +1434,15 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             // R4: thin sessions are heartbeat-only. A waiting_wake row is
             // woken while its wake source exists, and an expired source turns
             // into an explicit question for the user instead of silence.
-            match super::thin_state::sweep(&pool, chrono::Utc::now().timestamp_millis()).await {
-                Ok(0) => {}
-                Ok(surfaced) => tracing::info!(surfaced, "thin waiting_wake heartbeat surfaced expired waits"),
-                Err(error) => tracing::warn!(%error, "thin waiting_wake heartbeat failed"),
+            let thin_sessions: Result<Vec<String>, _> = sqlx::query_scalar(
+                "SELECT id FROM sessions WHERE delivery_mode='thin'",
+            ).fetch_all(&pool).await;
+            if let Ok(sessions) = thin_sessions {
+                for session in sessions {
+                    if let Err(error) = super::thin_derive::refresh(&pool, &session).await {
+                        tracing::warn!(%error, session, "thin fact-derived heartbeat failed");
+                    }
+                }
             }
             // 阶段 2 P0/R2: a `running` thin row whose executor died (crashed
             // turn, restart race) is resumed from the heartbeat once it is past

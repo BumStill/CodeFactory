@@ -188,7 +188,9 @@ pub async fn save(db: &SqlitePool, session_id: &str, state: &ThinState) -> sqlx:
            reason=excluded.reason, outcome_location=excluded.outcome_location,
            failure_signature=excluded.failure_signature,
            consecutive_failures=excluded.consecutive_failures,
-           updated_at=excluded.updated_at",
+           updated_at=excluded.updated_at
+         WHERE NOT (thin_session_state.state='ended'
+                    AND thin_session_state.reason LIKE 'cancelled%')",
     )
     .bind(session_id)
     .bind(state.state.as_str())
@@ -297,6 +299,12 @@ pub async fn settle_final(
     root_turn_id: &str,
     external_what: Option<String>,
 ) -> sqlx::Result<ThinState> {
+    if let Some(state) = load(db, session_id).await?.filter(|state| {
+        state.state == SessionState::Ended
+            && state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled"))
+    }) {
+        return Ok(state);
+    }
     let cover = super::background_tasks::wake_source_cover(db, session_id).await;
     let need = match external_what {
         Some(what) => WaitNeed::External {
@@ -325,7 +333,15 @@ pub async fn settle_final(
 }
 
 pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str, error_text: &str) -> sqlx::Result<ThinState> {
-    let state = if error_text.contains("no_model_available") || super::failover::ModelUnavailable::parse(error_text).is_some() {
+    if let Some(state) = load(db, session_id).await?.filter(|state| {
+        state.state == SessionState::Ended
+            && state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled"))
+    }) {
+        return Ok(state);
+    }
+    let state = if error_text == "agent loop stopped: Cancelled" {
+        ThinState::ended("cancelled：回合已取消", "本会话记录")
+    } else if error_text.contains("no_model_available") || super::failover::ModelUnavailable::parse(error_text).is_some() {
         after_no_model(60 * 1_000)
     } else {
         record_technical_failure(db, session_id, &first_line(error_text)).await?
@@ -445,6 +461,63 @@ mod settle_tests {
              INSERT INTO objectives (id,status) VALUES ('o-1','active');",
         ).execute(&db).await.unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn r6_stop_ends_thin_sessions_and_late_errors_cannot_reopen_them() {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let store = crate::agent::objective::ObjectiveStore::new(db.clone());
+        for mode in ["thin", "legacy"] {
+            sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?, 'synthetic', '/synthetic', 'model', 1, 1, ?)")
+                .bind(mode).bind(mode).execute(&db).await.unwrap();
+            if mode == "thin" { save(&db, mode, &ThinState::running()).await.unwrap(); }
+            store.request_chat_session_cancel(mode).await.unwrap();
+            if mode == "thin" {
+                let stopped = load(&db, mode).await.unwrap().unwrap();
+                assert_eq!(stopped.state, SessionState::Ended);
+                assert_eq!(stopped.reason.as_deref(), Some("cancelled：用户已停止会话"));
+                let late = settle_error(&db, mode, "missing-root", "late transport error").await.unwrap();
+                assert_eq!(late.state, SessionState::Ended);
+                assert_eq!(late.reason, stopped.reason);
+                let late_final = settle_final(&db, mode, "missing-root", None).await.unwrap();
+                assert_eq!(late_final.reason, stopped.reason);
+                save(&db, mode, &ThinState::running()).await.unwrap();
+                assert_eq!(load(&db, mode).await.unwrap().unwrap().reason, stopped.reason);
+            } else {
+                assert!(load(&db, mode).await.unwrap().is_none());
+            }
+            store.consume_chat_session_cancel(mode).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn r6_exact_objective_cancel_ends_thin_state() {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('exact','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
+        let store = ObjectiveStore::new(db.clone());
+        store.create(CreateObjective {
+            id: "exact-objective".into(), kind: ObjectiveKind::Informational,
+            session_id: Some("exact".into()), root_turn_id: Some("exact-root".into()),
+            domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic".into(),
+        }).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state (root_turn_id,session_id,objective_id,phase,status,started_at,updated_at) VALUES ('exact-root','exact','exact-objective','working','active',1,1)")
+            .execute(&db).await.unwrap();
+        save(&db, "exact", &ThinState::running()).await.unwrap();
+        store.cancel_chat_exact("exact", "exact-root", "exact-objective").await.unwrap();
+        let ended = load(&db, "exact").await.unwrap().unwrap();
+        assert_eq!(ended.state, SessionState::Ended);
+        assert!(ended.reason.unwrap().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn r6_cancelled_outcome_is_terminal_not_a_technical_failure() {
+        let db = db().await;
+        let state = settle_outcome(&db, "s-1", "root-1", false, false, "", "Cancelled", None).await.unwrap();
+        assert_eq!(state.state, SessionState::Ended);
+        assert!(state.reason.as_deref().unwrap().contains("cancelled"));
+        assert_eq!(state.consecutive_failures, 0);
     }
 
     #[tokio::test]
