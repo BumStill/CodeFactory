@@ -40,6 +40,9 @@ reconciliation required`。两者都把系统侧的身份记账问题写进了�
 `CXD-001`、`RTE-004`；复杂 E2E：`E2E-001/002/003/004/007/009`。
 其中 HLT-003 的语义在本改动后是「新回合 + 完整历史」（不再是拒绝），本 spec 即其权威说明。
 
+`docs/testing/scenario-registry.json` 属于信任根（trust-root），普通 PR 不得自改；本次新增的两个
+测试登记在该文件的 `automated_by` 需要外部 governance bootstrap 单独落地，本 PR 只保留 spec 说明。
+
 ## 证据
 
 - 单测：`commands::chat::tests::contextual_approval_after_an_ended_turn_starts_a_new_turn`、
