@@ -150,6 +150,12 @@ pub fn request_chat_run_stop(run_instance_id: &str) -> bool {
     raise_chat_run_stop_flag(run_instance_id)
 }
 
+pub(crate) fn chat_run_executor_alive(run_instance_id: &str) -> bool {
+    lock_chat_run_stop_flags().get(run_instance_id)
+        .and_then(std::sync::Weak::upgrade)
+        .is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 fn raise_chat_run_stop_flag(run_instance_id: &str) -> bool {
     let flags = lock_chat_run_stop_flags();
     let Some(weak) = flags.get(run_instance_id) else {

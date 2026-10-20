@@ -24,6 +24,23 @@ pub(crate) async fn running_without_executor(
     grace_ms: i64,
     mut has_live_executor: impl FnMut(&str) -> bool,
 ) -> sqlx::Result<Vec<String>> {
+    let has_controls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_run_controls'")
+        .fetch_one(db).await?;
+    if has_controls == 1 {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT session.id FROM sessions session
+             WHERE session.delivery_mode='thin'
+               AND EXISTS (SELECT 1 FROM chat_turn_state turn
+                 JOIN chat_run_controls control ON control.root_turn_id=turn.root_turn_id
+                 WHERE turn.session_id=session.id AND turn.completed_at IS NULL
+                   AND turn.terminal_reason IS NULL AND control.status<>'cancelled'
+                   AND control.updated_at<=?)
+               AND NOT EXISTS (SELECT 1 FROM chat_session_cancel_intents stop
+                 WHERE stop.session_id=session.id AND stop.status='requested')
+             ORDER BY session.id",
+        ).bind(now_ms.saturating_sub(grace_ms)).fetch_all(db).await?;
+        return Ok(rows.into_iter().filter(|session| !has_live_executor(session)).collect());
+    }
     crate::agent::thin_state::ensure(db).await?;
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT state.session_id FROM thin_session_state state

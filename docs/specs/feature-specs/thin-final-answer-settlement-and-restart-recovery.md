@@ -53,6 +53,42 @@ v1.91.1 安装重启（10-21 03:16）后两个 thin 会话的权威状态 `thin_
 - `agent::thin`（含 `thin_state`）既有用例全绿，证明 R1 的调用点改写没有回退
   四状态语义。
 
+## R6：所有终止路径落入 ended(reason)
+
+用户补充现场：bee5d6b7 在 03:45 被 stop，04:18 thin 状态仍为 running。
+界面停止与 dispatch stop 必须在持久化停止入口同步结束 thin 状态；取消回合不能算作
+一次技术失败。最终回答、连续三次失败、stop、取消都必须留下 ended 与明确 reason。
+
+实现约束：停止意图与 thin ended 在同一事务提交；清除等待字段；迟到错误、最终回答
+和普通 save 不得覆盖 cancelled 终态；只有成功接纳的新用户回合可以清理上一轮取消状态。
+legacy 不新增 thin 行。合成回归先观察到两条 Running != Ended，再修复并原样重跑。
+
+## R7 与编排方设计修订：从事实推导四态
+
+此前“唯一权威表”和依赖 state=running 的描述由本节替代。唯一判定入口是
+`thin_derive::derive_state(db, session)`，优先级固定为：
+1. 当前进程 run-control 对应的真实存活执行者 → running；残留 active 行不算。
+2. 运行中的 background_task 或未来 pending wakeup → waiting_wake。
+3. 未回答的用户问题（权限请求或绑定根回合的问题记录）→ waiting_user；
+   后续用户回答或 stop 解除问题，assistant 提问文本不能充当用户回答。
+4. 否则 ended；原因取最后的终止事实（回合终止、最终回答或 stop）。
+
+`thin_session_state` 仅作可重算投影。心跳、会话列表、运行状态查询和当前回合水合
+共用 derive_state/refresh，旧写入点保留为兼容缓存刷新。恢复动作与状态显示分离，
+重启/心跳续跑根据未终止根回合和 run-control 事实选择，不以缓存 running 为前提。
+
+新增回归先观察缓存 Running != Ended 与 assistant 提问被误判结束，再修复并原样复验；
+覆盖污染缓存、执行者释放、真实 refresh、未来/过期唤醒、问题回复和停止原因。
+R6 最终全量曾通过 1840 测试；推导接入后相关 thin 21 与 session 18 测试已通过，
+后续以最后修改后的全量回归为准。未运行安装版主路径，不声明 live。
+
+交付边界：原 PR #789 已合并（2c0ddf573960d2bdb8c72604c1122dfa91ba2f73），
+R6/R7 及推导修订作为后续 PR 交付，持续授权上限为 merged，不触发发版。
+此前再次询问授权是执行者把“同一 PR”约束误读为“原 PR 合并即授权失效”，不是工具
+消费了授权。已核对 resolve_turn_delivery_authorization：会话持久 grant 保持有效，
+普通后续消息不会清除，仅明确撤销或只读约束降权；无需改动正确的授权实现。
+本任务按模板单执行流，未使用 sub-agent。
+
 ## 已知限制
 
 真机「重启后自动续跑」需要安装包重启才能观察；本地以合成 fixture 覆盖选择与

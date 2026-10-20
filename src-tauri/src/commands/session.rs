@@ -257,7 +257,10 @@ pub async fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionList
     .fetch_all(&*pool)
     .await?;
     for session in &mut sessions {
-        if foreground_running.contains(&session.session.id) {
+        if crate::agent::thin::is_thin(&pool, &session.session.id).await {
+            let derived = crate::agent::thin_derive::refresh(&pool, &session.session.id).await?;
+            session.is_running = derived.state == crate::agent::thin_state::SessionState::Running;
+        } else if foreground_running.contains(&session.session.id) {
             session.is_running = true;
         }
     }
@@ -913,7 +916,26 @@ async fn load_turn_activity_states(
         .fetch_all(pool)
         .await
     {
-        Ok(states) => Ok(states),
+        Ok(mut states) => {
+            if crate::agent::thin::is_thin(pool, session_id).await {
+                let derived = crate::agent::thin_derive::refresh(pool, session_id).await?;
+                if let Some(turn) = states.iter_mut().filter(|turn| turn.is_current_objective_turn).max_by_key(|turn| turn.updated_at) {
+                    use crate::agent::thin_state::SessionState;
+                    let (phase, status) = match derived.state {
+                        SessionState::Running => ("working", "active"),
+                        SessionState::WaitingWake | SessionState::WaitingUser => ("waiting", "waiting"),
+                        SessionState::Ended => ("finalizing", "completed"),
+                    };
+                    turn.phase = phase.into();
+                    turn.status = status.into();
+                    turn.recent_activity_kind = format!("thin_{}", derived.state.as_str());
+                    turn.recent_activity_label = derived.question.clone().or(derived.reason.clone()).unwrap_or_else(|| derived.state.as_str().into());
+                    turn.waiting_reason = derived.question.or(derived.waiting_for);
+                    turn.terminal_reason = if derived.state == SessionState::Ended { derived.reason } else { None };
+                }
+            }
+            Ok(states)
+        },
         Err(error) if error.to_string().contains("no such table: chat_turn_state") => {
             // Read-only compatibility for legacy/minimal databases. Normal app
             // startup creates the additive table before serving commands, but
