@@ -384,7 +384,7 @@ fn desktop_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (Strin
         // defaults to Mutation until it receives an audited typed classifier.
         "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" | "read_pptx"
         | "skill_list" | "skill_search" | "read_xlsx" | "background_task_list"
-        | "background_task_output" | "wakeup_list" => ToolKind::ReadOnly,
+        | "background_task_output" | "wakeup_list" | "web_fetch" => ToolKind::ReadOnly,
         _ => ToolKind::Mutation,
     };
     (command, kind)
@@ -3765,6 +3765,11 @@ mod tests {
             // `schedule_wakeup` / `wakeup_cancel` create/cancel a timer, so they
             // stay Mutation and keep going through approval.
             "wakeup_list",
+            // CF-WEB: fetching one URL is a network read — no local file, no
+            // spawn, no session row. Private/loopback targets are refused unless
+            // the operator opts in, and the body is returned labelled untrusted.
+            // Same class as a `browser_session` read probe.
+            "web_fetch",
         ];
         for definition in crate::tools::all_definitions() {
             let name = definition.function.name;

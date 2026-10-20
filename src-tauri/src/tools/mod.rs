@@ -3,6 +3,7 @@ pub mod bash;
 pub mod background_task;
 pub mod wakeup;
 pub mod browser_session;
+pub mod web_fetch;
 pub mod delegate_tasks;
 pub mod delivery;
 mod delivery_thin;
@@ -193,6 +194,7 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         wakeup::list_definition(),
         wakeup::cancel_definition(),
         browser_session::definition(),
+        web_fetch::definition(),
         pptx::definition(),
         pptx_edit::read_definition(),
         pptx_edit::edit_definition(),
@@ -231,6 +233,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "wakeup_list" => wakeup::execute_list(args, ctx).await,
         "wakeup_cancel" => wakeup::execute_cancel(args, ctx).await,
         "browser_session" => browser_session::execute(args, ctx).await,
+        "web_fetch" => web_fetch::execute(args, ctx).await,
         "write_pptx" => pptx::execute(args, ctx).await,
         "read_pptx" => pptx_edit::execute_read(args, ctx).await,
         "edit_pptx" => pptx_edit::execute_edit(args, ctx).await,
