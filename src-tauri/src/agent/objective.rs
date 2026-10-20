@@ -2520,11 +2520,20 @@ impl ObjectiveStore {
         } else {
             "COALESCE(objectives.last_progress_at, objectives.updated_at)"
         };
+        // R7: thin waiting is owned by the four-state row and heartbeat, so
+        // the legacy stall reaper must not consume it. Older-schema tests may
+        // not have the sessions table at all.
+        let thin_guard = if table_exists(&self.pool, "sessions").await? {
+            "AND NOT EXISTS (SELECT 1 FROM sessions thin WHERE thin.id=objectives.session_id AND thin.delivery_mode='thin')"
+        } else {
+            ""
+        };
         let ids: Vec<String> = sqlx::query_scalar(&format!(
             "SELECT id FROM objectives
              WHERE status='active'
                AND lease_owner IS NULL
                AND next_observation_at IS NULL
+               {thin_guard}
                AND {heartbeat} < ?
                AND NOT EXISTS (
                      SELECT 1 FROM objective_remediations remediation

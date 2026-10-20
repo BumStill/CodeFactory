@@ -32,3 +32,27 @@
 - Applicable Harnesses：Spec、Compatibility、Observation、Release（合并交接）、AI Collaboration；UI 片追加 Viewport。
 - AI Collaboration：上下文限于阶段 0–2、任务模板和相关生产接缝；仅使用合成 fixture。并行只读审查不修改文件，实施者执行测试并复核结论。
 - 真机连续 10 单由编排方发版安装后验收，本地通过不声明 live。
+
+
+## Implementation Notes（阶段2剩余分片，2026-10-20）
+
+- **R1/R7 四态权威表**：`thin_session_state`（migration 0024）是 thin 会话唯一状态源：
+  `running / waiting_wake / waiting_user / ended`，带 `waiting_for`、`wake_source`、
+  `question`、`outcome_location`、`failure_signature`、`consecutive_failures`。
+  thin 结算在 `apply_chat_objective_outcome` 分叉，直接写这张表并投影
+  `chat_turn_state`（`thin_running|thin_waiting_wake|thin_waiting_user|thin_ended`），
+  不再写 `objective_decisions` / `objective_remediations` / recovery 行，也不把
+  legacy `failure_code` 投给 thin 会话。Objective 行仅在 `ended` 时以
+  `legacy_orphan` 收口（该状态不声明任何 legacy 完成证据，避免伪造 completed）。
+- **R4 心跳**：supervisor 每轮调用 `thin_state::sweep`；`waiting_wake` 有唤醒源就保持，
+  唤醒源消失且超过 30 分钟则转 `waiting_user` 并提出「你等的 X 已失效」的问题。
+  另外 stalled-active reaper 排除 `sessions.delivery_mode='thin'`，不再把 thin 等待当
+  legacy 停滞处理。
+- **R5 连续失败/模型恢复**：同一技术失败签名累计 3 次 → `ended`，reason 写明签名与次数；
+  不同失败重置计数；`no_model_available` → `waiting_wake`，唤醒源是模型恢复时间，
+  既不判技术失败也不追问用户。
+- **R6 界面投影**：`src/lib/thinState.ts` 只从 activity kind 判四态并给一句人话；
+  `MessageList` 显示四态标签，并把四态映射到结果卡既有的完成/等待语义。
+- **R8 回放**：`thin.rs phase2_state_tests`（四态结算 + 3 次失败 + 模型恢复）、
+  `thin_state::settle_tests`（权威表落库、legacy 失败码不出现）、
+  `src/lib/thinState.test.ts`（界面投影与 legacy 不误标）。
