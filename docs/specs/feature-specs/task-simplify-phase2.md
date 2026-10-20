@@ -78,6 +78,12 @@
   不写任何转写消息，也不改 `thin_session_state`。
 - 直接写库的 legacy 入口同样跳过 thin：`reactivate_eligible_incidents`（能力重排）、
   `reclassify_synthetic_technical_handbacks`（合成技术交接）。
+- `reap_active_objectives_whose_run_control_settled`（supervisor 的 orphan 回收）
+  补上与 R7 同语义的 thin 过滤：run control 结算后不得把 thin 会话判成
+  `objective_progress_stalled`（v1.90.1 真机：会话已回答结束后 34 秒被写入该决策）。
+- `drive_adapter` 的 thin 分支不再调用 legacy `resume_chat_objective`：thin 的等待
+  归 `thin_session_state` 心跳，遗留闭环不得唤醒它（v1.90.1 真机：同一会话被连唤醒
+  两次，模型重复回答「没有需要继续的东西」，同一答案共 3 次）。
 - `bound_system_recovery` 删除 thin 分支上的「同签名 3 次 → Failed」升级；
   `failure_summary_message` 删除写死的「连续三次失败」文案，thin 的结束语只由
   `apply_chat_objective_outcome` + `thin_session_state` 产生。
