@@ -16,6 +16,6 @@ Spec：逐字规格与 Req 映射；Compatibility：固定计划、既有副作�
 - 后台可操作性：后端路由及 supervisor 自动工作，无需 GUI 点击。
 - 无 Spec Amendment；历史证据中的实际忙闲时状态无法从合成数据核实。
 
-Scenario-Test: HLT-001
+Scenario-Test: HLT-001, HLT-002, HLT-005
 README-Update: reviewed
 README-Update-Reason: 仅修复现有模型路由恢复，不改变公开功能、安装、隐私或平台承诺。
