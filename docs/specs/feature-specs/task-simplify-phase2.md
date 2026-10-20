@@ -67,3 +67,28 @@
   只记录内部告警，不向用户暴露身份决策。
 - 与 M129（会话 3dbfe52c 在入口删除拒绝分支止血）同向：M129 先合入后，本项在其基础上
   保留「自愈 + 收敛」，不恢复任何拒绝分支。
+
+## P0 落地：legacy 决策不再结算 thin 会话（2026-10-21）
+
+- 现象：`waiting_wake` 的 thin 会话被 `objective-incident-controller` 停成
+  `technical_recovery_exhausted`，转写里出现「已结束：连续三次遇到相同失败」。
+- 裁决闸门：`ObjectiveStore::apply_decision_inner` 对 thin 会话不再应用任何 legacy
+  决策，只把 Objective 行以 `legacy_orphan` 收口（清空 failure_code / signature、
+  remediation、next_observation_at），不写 `objective_decisions`、不排 remediation、
+  不写任何转写消息，也不改 `thin_session_state`。
+- 直接写库的 legacy 入口同样跳过 thin：`reactivate_eligible_incidents`（能力重排）、
+  `reclassify_synthetic_technical_handbacks`（合成技术交接）。
+- `reap_active_objectives_whose_run_control_settled`（supervisor 的 orphan 回收）
+  补上与 R7 同语义的 thin 过滤：run control 结算后不得把 thin 会话判成
+  `objective_progress_stalled`（v1.90.1 真机：会话已回答结束后 34 秒被写入该决策）。
+- `drive_adapter` 的 thin 分支不再调用 legacy `resume_chat_objective`：thin 的等待
+  归 `thin_session_state` 心跳，遗留闭环不得唤醒它（v1.90.1 真机：同一会话被连唤醒
+  两次，模型重复回答「没有需要继续的东西」，同一答案共 3 次）。
+- `bound_system_recovery` 删除 thin 分支上的「同签名 3 次 → Failed」升级；
+  `failure_summary_message` 删除写死的「连续三次失败」文案，thin 的结束语只由
+  `apply_chat_objective_outcome` + `thin_session_state` 产生。
+- 回放：`legacy_incident_controller_never_settles_a_thin_session`（thin 收口 + 零决策 /
+  零消息 / 状态不变 + legacy 会话仍按旧规则结算）、
+  `thin_wait_gate_five_rounds_never_exhausts_technical_failures`、
+  `thin_three_identical_failures_end_with_summary_without_legacy_budget` 改为断言
+  legacy 路径零决策零文案。

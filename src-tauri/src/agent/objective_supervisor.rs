@@ -697,9 +697,20 @@ async fn process_claim(
                     &claim,
                     &permit,
                     move |executor| async move {
+                        // R1/R3: a thin session's wait is owned by
+                        // `thin_session_state` and its heartbeat. Waking it
+                        // through the legacy chat-resume path is what produced
+                        // two identical "没有需要继续的东西" replies after the
+                        // session had already answered. There is nothing for the
+                        // legacy supervisor to do here.
                         if let Some(session) = objective.session_id.as_deref() {
                             if super::thin::is_thin(&pool, session).await {
-                                return crate::commands::chat::resume_chat_objective(app, objective, execution_permit).await;
+                                tracing::debug!(
+                                    objective_id = %objective.id,
+                                    session_id = session,
+                                    "thin session owns its own wait; legacy supervisor will not wake it"
+                                );
+                                return Ok(());
                             }
                         }
                         match executor {
@@ -1191,12 +1202,30 @@ async fn reap_active_objectives_whose_run_control_settled(
     store: &ObjectiveStore,
     settled_before_ms: i64,
 ) -> anyhow::Result<Vec<ObjectiveSnapshot>> {
-    let ids: Vec<String> = sqlx::query_scalar(
+    // R1/R3: thin sessions are heartbeat-only. This legacy backstop has no
+    // thin authority, so it must never decide for one — it was the sweep that
+    // parked a `waiting_wake` session as `objective_progress_stalled` five
+    // seconds after its run control settled. Schema-tolerant because older
+    // fixtures have no `sessions` table at all.
+    let has_sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sessions'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let thin_guard = if has_sessions > 0 {
+        "AND NOT EXISTS (SELECT 1 FROM sessions thin
+                          WHERE thin.id = objective.session_id
+                            AND thin.delivery_mode = 'thin')"
+    } else {
+        ""
+    };
+    let ids: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT objective.id
            FROM objectives objective
           WHERE objective.status = 'active'
             AND objective.lease_owner IS NULL
             AND objective.next_observation_at IS NULL
+            {thin_guard}
             AND NOT EXISTS (
                   SELECT 1 FROM objective_remediations remediation
                   WHERE remediation.objective_id = objective.id
@@ -1219,7 +1248,7 @@ async fn reap_active_objectives_whose_run_control_settled(
                              AND live.session_id = objective.session_id)))
           ORDER BY objective.created_at
           LIMIT 8",
-    )
+    ))
     .bind(settled_before_ms)
     .fetch_all(pool)
     .await?;
@@ -1648,6 +1677,52 @@ mod tests {
         .await
         .unwrap();
 
+        // R1/R3: a thin session owns its own wait, so the legacy backstop must
+        // not decide for it even when its run control has already settled.
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at, delivery_mode)
+             VALUES ('session-thin', 'thin', '/tmp', 'model', 1, 1, 'thin')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let thin = store
+            .create(CreateObjective {
+                id: "objective-thin".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-thin".into()),
+                root_turn_id: Some("turn-thin".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE objectives
+             SET lease_owner=NULL, next_observation_at=NULL, recovery_owner=NULL
+             WHERE id=?",
+        )
+        .bind(&thin.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_run_controls
+             (run_instance_id, session_id, root_turn_id, objective_id, objective_revision,
+              status, created_process_instance, settled_at, created_at, updated_at)
+             VALUES ('run-thin', 'session-thin', 'turn-thin', ?, ?, 'completed',
+                     'test-process', ?, ?, ?)",
+        )
+        .bind(&thin.id)
+        .bind(thin.revision)
+        .bind(now - 60_000)
+        .bind(now - 300_000)
+        .bind(now - 60_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let reaped = reap_active_objectives_whose_run_control_settled(
             &pool,
             &store,
@@ -1679,6 +1754,27 @@ mod tests {
         assert!(
             healthy_after.next_observation_at.is_none() && healthy_after.recovery_owner.is_none(),
             "the healthy session is untouched by the backstop"
+        );
+
+        let thin_after = store.get(&thin.id).await.unwrap().unwrap();
+        assert_eq!(
+            thin_after.status,
+            ObjectiveStatus::Active,
+            "a thin session is never reaped by the legacy backstop"
+        );
+        assert!(
+            thin_after.next_observation_at.is_none() && thin_after.failure_code.is_none(),
+            "a thin session keeps its own four-state verdict"
+        );
+        let thin_decisions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM objective_decisions WHERE objective_id=?")
+                .bind(&thin.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            thin_decisions, 0,
+            "no legacy stall decision may be written for a thin session"
         );
 
         pool.close().await;
