@@ -4460,6 +4460,9 @@ pub(crate) fn prepare_thin_pr_body(
     let remote = "origin";
     let base = thin_base_branch(root, remote)?;
     let mut steps = Vec::new();
+    // M132: the body opens with what changed and why; every declaration the
+    // validators need comes after that sentence run.
+    let body = &ensure_pr_summary(root, title, body);
     let scenario_body =
         reconcile_scenario_contract_body(root, remote, &base, body, &mut steps)?;
     let readme_changed = readme_changed_on_branch(root, remote, &base)?;
@@ -4470,6 +4473,164 @@ pub(crate) fn prepare_thin_pr_body(
     validate_pr_body_intent(&assembled)?;
     precheck_thin_pr_body(root, title, &format!("{remote}/{base}"), &assembled)?;
     Ok(assembled)
+}
+
+#[cfg(test)]
+mod m132_summary_tests {
+    use super::*;
+
+    /// R2: a body that opens with contract bookkeeping gets a real summary first.
+    #[test]
+    fn thin_body_gets_leading_summary_from_the_commit_body() {
+        let dir = std::env::temp_dir().join(format!("cf-m132-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        std::fs::write(dir.join("note.txt"), "synthetic\n").unwrap();
+        git(&dir, &["add", "."]).unwrap();
+        git(&dir, &["-c", "user.name=QA", "-c", "user.email=qa@example.invalid",
+            "commit", "-q", "-m", "feat: keep the thin PR title honest",
+            "-m", "The queue woke on a stale head while the title said nothing about the change."]).unwrap();
+        let body = ensure_pr_summary(&dir, "feat: keep the thin PR title honest",
+            "Scenario-Test: HLT-001\nREADME-Update: reviewed");
+        assert!(body.starts_with("The queue woke on a stale head"), "{body}");
+        assert!(body.contains("Scenario-Test: HLT-001"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2: a real summary is never duplicated; the title claim is the last resort.
+    #[test]
+    fn existing_summary_is_kept_and_title_claim_is_the_last_resort() {
+        assert!(body_starts_with_summary("This fixes the title the queue copied."));
+        let kept = ensure_pr_summary(Path::new("/nonexistent"), "feat: x", "Already a summary.");
+        assert_eq!(kept, "Already a summary.");
+        let fallback = ensure_pr_summary(Path::new("/nonexistent"), "feat: keep the title honest",
+            "Scenario-Test: HLT-001");
+        assert!(fallback.starts_with("keep the title honest"), "{fallback}");
+        assert!(fallback.ends_with("Scenario-Test: HLT-001"), "{fallback}");
+    }
+
+    /// R2: the declaration lines a body must carry are not a summary.
+    #[test]
+    fn contract_lines_are_not_a_summary() {
+        assert!(!body_starts_with_summary("Scenario-Test: HLT-001"));
+        assert!(!body_starts_with_summary("## 变更\n\nsome prose"));
+        assert!(!body_starts_with_summary(""));
+        assert!(body_starts_with_summary("  \nThis is the summary.\n"));
+    }
+}
+
+/// M132: what a PR body may open with. A body that starts with a heading, a
+/// list, a comment or a machine-read declaration (`Scenario-Test:`, ...) is
+/// bookkeeping — the reviewer still cannot tell what the change does.
+fn body_starts_with_summary(body: &str) -> bool {
+    let Some(line) = body.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return false;
+    };
+    if line.starts_with('#')
+        || line.starts_with("<!--")
+        || line.starts_with('>')
+        || line.starts_with('|')
+        || line.starts_with("- ")
+        || line.starts_with("* ")
+    {
+        return false;
+    }
+    let key = line.split_once(':').map(|(key, _)| key.trim()).unwrap_or("");
+    let declaration = !key.is_empty()
+        && key.len() <= 40
+        && !key.contains(' ')
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && key.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    !declaration
+}
+
+/// The first paragraph of a commit body, as one line.
+fn first_paragraph(text: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            if lines.is_empty() {
+                continue;
+            }
+            break;
+        }
+        lines.push(line);
+    }
+    lines.join(" ")
+}
+
+/// At most three sentences — a summary, not a second body.
+fn first_sentences(text: &str) -> String {
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        current.push(ch);
+        let ends = match ch {
+            '。' | '！' | '？' => true,
+            '.' | '!' | '?' => chars.peek().map_or(true, |next| next.is_whitespace()),
+            _ => false,
+        };
+        if ends {
+            sentences.push(current.trim().to_string());
+            current.clear();
+            if sentences.len() == 3 {
+                return sentences.join(" ");
+            }
+        }
+    }
+    if !current.trim().is_empty() {
+        sentences.push(current.trim().to_string());
+    }
+    sentences.retain(|sentence| !sentence.is_empty());
+    sentences.join(" ")
+}
+
+/// The title's own claim, used when the commit body says nothing.
+fn title_summary(title: &str) -> String {
+    let claim = title
+        .split_once(':')
+        .map_or(title.trim(), |(_, rest)| rest.trim());
+    if claim.is_empty() {
+        return String::new();
+    }
+    let cjk = claim.chars().any(|c| c as u32 >= 0x4e00);
+    if claim
+        .chars()
+        .last()
+        .is_some_and(|c| matches!(c, '.' | '。' | '!' | '!' | '?' | '？'))
+    {
+        claim.to_string()
+    } else {
+        format!("{claim}{}", if cjk { "。" } else { "." })
+    }
+}
+
+/// M132: prepend the missing summary. The caller's prose always wins; the commit
+/// body's first paragraph is the fallback, the title's claim the last resort.
+fn ensure_pr_summary(root: &Path, title: &str, body: &str) -> String {
+    if body_starts_with_summary(body) {
+        return body.to_string();
+    }
+    let commit_body = git(root, &["log", "-1", "--format=%b"]).unwrap_or_default();
+    let paragraph = first_sentences(&first_paragraph(&commit_body));
+    let summary = if paragraph.is_empty() {
+        title_summary(title)
+    } else {
+        paragraph
+    };
+    if summary.is_empty() {
+        return body.to_string();
+    }
+    if body.trim().is_empty() {
+        format!("{summary}\n")
+    } else {
+        format!("{summary}\n\n{body}")
+    }
 }
 
 /// The base a thin delivery measures its diff against. A ref that is not there
@@ -8176,7 +8337,7 @@ fn branch_commit_slot(root: &Path, base: &str, branch: &str) -> u8 {
 /// degenerate `<branch tail>` title such as
 /// `objective 9477e76a…`. U19 reported exactly that title reaching a real PR;
 /// it carries no description of the change and must never become a PR title.
-fn is_managed_objective_placeholder_title(title: &str) -> bool {
+pub(crate) fn is_managed_objective_placeholder_title(title: &str) -> bool {
     let trimmed = title.trim();
     let rest = trimmed
         .strip_prefix("objective ")
