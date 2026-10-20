@@ -1127,7 +1127,17 @@ async fn dispatch(
                 .await
                 .map_err(to_message)
         }
-        (BrowserSessionKind::Managed, "tabs" | "select_tab") => Err(
+        (BrowserSessionKind::Managed, "tabs") => {
+            // Only the page owned by this session is exposed, never the user's profile.
+            let content = LOCAL.read(session_id).await.map_err(to_message)?;
+            Ok(format_tabs(&[crate::browser::extension::Tab {
+                tab_id: 0,
+                title: content.title,
+                url: content.url,
+                active: true,
+            }]))
+        }
+        (BrowserSessionKind::Managed, "select_tab") => Err(
             "This managed session owns one page. Use browser_session.snapshot or \
              browser_session.read with this session_id; select_tab is unnecessary. \
              To inspect the user's own tabs, create a separate session with attach."
@@ -1171,10 +1181,11 @@ fn format_tabs(tabs: &[crate::browser::extension::Tab]) -> String {
     tabs.iter()
         .map(|tab| {
             format!(
-                "{} | {}{}",
+                "{} | {}{} | {}",
                 tab.tab_id,
                 tab.title,
-                if tab.active { " (active)" } else { "" }
+                if tab.active { " (active)" } else { "" },
+                tab.url
             )
         })
         .collect::<Vec<_>>()
@@ -1567,7 +1578,9 @@ mod tests {
         assert_eq!(output.status, super::super::ToolExecutionStatus::Done, "{output:?}");
         assert!(output.content.contains("Thin Browser Fixture"), "{output:?}");
         assert!(output.content.contains("Receipt-free navigation works"));
-        assert!(tabs.content.contains("snapshot"), "{tabs:?}");
+        assert_eq!(tabs.status, super::super::ToolExecutionStatus::Done, "{tabs:?}");
+        assert!(tabs.content.contains("0 | Thin Browser Fixture (active)"), "{tabs:?}");
+        assert!(tabs.content.contains(&format!("http://{address}/fixture")), "{tabs:?}");
         assert_eq!(invalid.status, super::super::ToolExecutionStatus::Error);
         assert_eq!(snapshot.status, super::super::ToolExecutionStatus::Done, "{snapshot:?}");
         assert_eq!(read.status, super::super::ToolExecutionStatus::Done, "{read:?}");
@@ -1898,13 +1911,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tab_listing_preserves_extension_fields_and_includes_urls() {
+        let tabs = vec![
+            crate::browser::extension::Tab {
+                tab_id: 7,
+                title: "Synthetic page".into(),
+                url: "https://example.test/first".into(),
+                active: true,
+            },
+            crate::browser::extension::Tab {
+                tab_id: 19,
+                title: "Other synthetic page".into(),
+                url: "https://example.test/second".into(),
+                active: false,
+            },
+        ];
+        assert_eq!(
+            format_tabs(&tabs),
+            "7 | Synthetic page (active) | https://example.test/first\n19 | Other synthetic page | https://example.test/second"
+        );
+        assert_eq!(format_tabs(&[]), "No readable tabs are open.");
+    }
+
     #[tokio::test]
-    async fn tab_actions_do_not_apply_to_the_managed_browser() {
-        // A managed session drives one page it opened, so a tab list would be
-        // meaningless — say so instead of returning something empty.
+    async fn tab_selection_does_not_apply_to_the_managed_browser() {
+        // Listing the owned page is read-only; selecting arbitrary pages is not offered.
         let ctx = ExecCtx::new(std::env::temp_dir(), None);
         let authorizer = AllowBrowserMutation;
-        for action in ["tabs", "select_tab"] {
+        for action in ["select_tab"] {
             let error = dispatch(
                 &args_for(action),
                 &ctx,
