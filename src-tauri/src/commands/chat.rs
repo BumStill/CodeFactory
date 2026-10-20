@@ -1548,6 +1548,9 @@ async fn project_chat_objective(
                 _ => ("finalizing", "thin_ended", "已结束；原因与成果见本会话记录"),
             };
             (phase, activity_kind, activity_label) = projected;
+            if let Some(attention) = objective.attention_request.as_ref() {
+                activity_label = &attention.prompt;
+            }
         }
     }
     let waiting_reason = objective
@@ -1708,7 +1711,24 @@ async fn apply_chat_objective_outcome(
         && crate::agent::background_tasks::wake_source_cover(
             db, current.session_id.as_deref().unwrap_or_default(),
         ).await.is_covered();
-    let decision = if thin_waiting {
+    let unwatched = if thin && !thin_waiting {
+        crate::agent::thin::unwatched_wait(db, current.session_id.as_deref().unwrap_or_default()).await
+    } else { None };
+    let decision = if let Some(waiting_for) = unwatched.filter(|_| outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished) {
+        let prompt = format!("需要你决定是否继续等待 {waiting_for}；目前没有唤醒源。请决定继续等待并挂监视，或结束等待。");
+        let mut decision = crate::agent::objective::DecisionRouter::route(
+            &current,
+            crate::agent::objective::RouteSignal::CoreInputRequired {
+                domain: crate::agent::objective::RecoveryDomain::Chat,
+                request_key: format!("thin-wait:{root_turn_id}"),
+                missing_inputs: vec![prompt.clone()],
+                attempted_routes: vec!["已提示挂监视，但尚无可用唤醒源".into()],
+                resume_cursor: current.root_turn_id.clone(),
+            },
+        ).map_err(|error| AppError::Other(error.to_string()))?;
+        if let Some(attention) = decision.attention_request.as_mut() { attention.prompt = prompt; }
+        Ok(decision)
+    } else if thin_waiting {
         crate::agent::objective::DecisionRouter::route(
             &current,
             crate::agent::objective::RouteSignal::TechnicalFailure {
@@ -4290,6 +4310,33 @@ mod tests {
             assert_eq!(store.get(&current.id).await.unwrap().unwrap().status, settled.status);
             pool.close().await;
         }
+    }
+
+    /// R2: external work without a watcher asks the user once, not the model
+    /// for a rewritten final answer. Legacy waits retain their old protocol.
+    #[tokio::test]
+    async fn thin_unwatched_settlement_requires_visible_user_question() {
+        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain};
+        use codefactory_agent_loop::run::{RunOutcome, StopReason};
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('unwatched','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let current = store.create(CreateObjective {
+            id: "unwatched-objective".into(), kind: ObjectiveKind::Delivery,
+            session_id: Some("unwatched".into()), root_turn_id: Some("unwatched-root".into()),
+            domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
+        }).await.unwrap();
+        crate::agent::thin::record_unwatched_wait(&pool, "unwatched", "PR #42 的 CI").await.unwrap();
+        let outcome = RunOutcome {
+            final_text: "等待 PR #42 的 CI".into(), final_message_id: None,
+            completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0, stop_reason: StopReason::Finished,
+        };
+        let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "unwatched-root", &outcome, None).await.unwrap();
+        assert_eq!(settled.status, ObjectiveStatus::WaitingCoreInput);
+        assert!(settled.attention_request.unwrap().prompt.contains("需要你决定是否继续等待 PR #42 的 CI"));
+        assert!(settled.failure_code.is_none());
+        assert!(settled.remediation_id.is_none());
     }
 
     #[tokio::test]

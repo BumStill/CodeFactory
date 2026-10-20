@@ -31,6 +31,19 @@ pub(crate) async fn external_wait_hint(db: &sqlx::SqlitePool, session: &str) -> 
     super::background_tasks::external_wait_completion_hint(db, session, pending).await
 }
 
+/// Pending work observed by a tool, not inferred from a legacy failure code.
+pub(crate) async fn record_unwatched_wait(db: &sqlx::SqlitePool, session: &str, waiting_for: &str) -> sqlx::Result<()> {
+    sqlx::raw_sql(include_str!("../../migrations/0023_thin_wait_notes.sql")).execute(db).await?;
+    sqlx::query("INSERT INTO thin_wait_notes(session_id,waiting_for) VALUES (?,?) ON CONFLICT(session_id) DO UPDATE SET waiting_for=excluded.waiting_for")
+        .bind(session).bind(waiting_for).execute(db).await?;
+    Ok(())
+}
+
+pub(crate) async fn unwatched_wait(db: &sqlx::SqlitePool, session: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT waiting_for FROM thin_wait_notes WHERE session_id=?")
+        .bind(session).fetch_optional(db).await.ok().flatten()
+}
+
 pub(crate) fn resume_prompt(at: i64, summary: &str) -> String {
     let time = chrono::DateTime::from_timestamp_millis(at).map(|time| time.with_timezone(&chrono::Local).to_rfc3339()).unwrap_or_else(|| at.to_string());
     format!("你在 {time} 被中断，最后一步是 {summary}，可能已执行也可能未执行。先用 git status、git log、gh pr view 等确认现状，再决定下一步。")
