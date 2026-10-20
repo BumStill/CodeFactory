@@ -410,6 +410,7 @@ struct ActiveRouteInner {
     initial_route_change: Option<RouteChange>,
     usage_skips: Vec<RouteAttemptSnapshot>,
     usage_settings: Option<Arc<tokio::sync::RwLock<crate::config::settings::Settings>>>,
+    overload_streak: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -536,6 +537,7 @@ impl ActiveRouteState {
                 initial_route_change,
                 usage_skips: Vec::new(),
                 usage_settings: None,
+                overload_streak: 0,
             })),
             health,
         }
@@ -707,15 +709,50 @@ impl ActiveRouteState {
     /// so "a fallback is available" can never disagree with what advancing
     /// would actually do. A `fixed` plan holds exactly the model the user
     /// pinned, so this is `false` there and a pinned model is never swapped out.
+    fn candidate_available(&self, inner: &ActiveRouteInner, index: usize) -> bool {
+        let route = &inner.candidates[index];
+        if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name)
+            || !route.has_usable_credential() { return false; }
+        let Some(settings) = &inner.usage_settings else { return true; };
+        // Fail closed while settings are being edited; admission rechecks before POST.
+        let Ok(config) = settings.try_read() else { return false; };
+        let now = super::usage_windows::now_ms();
+        if super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id)
+            .is_some_and(|rule| !rule.evaluate(now).available) { return false; }
+        if config.endpoint_is_subscription(&route.endpoint_name) {
+            let ledger = super::quota_cap::shared_quota_ledger();
+            let cap = config.quota_cap_for(&route.endpoint_name);
+            let budget = super::quota_cap::SubscriptionBudget::default();
+            if ledger.evaluate(&route.endpoint_name, cap, budget, now)
+                .or_else(|| ledger.evaluate(&route.base_url, cap, budget, now)).is_some() { return false; }
+        }
+        true
+    }
+
     pub fn has_available_fallback(&self) -> bool {
         let inner = self.inner.lock().expect("active route mutex poisoned");
-        let current_index = inner.current_index;
-        ((current_index + 1)..inner.candidates.len()).any(|index| {
-            !inner.failed_indices.contains(&index)
-                && self
-                    .health
-                    .is_available(&inner.candidates[index].endpoint_name)
-        })
+        ((inner.current_index + 1)..inner.candidates.len())
+            .any(|index| self.candidate_available(&inner, index))
+    }
+
+    /// Count only consecutive overloads on the current route, across complete calls.
+    pub fn is_overload(reason: &str) -> bool {
+        let lower = reason.to_ascii_lowercase();
+        !super::model_transport::is_quota_exhausted(reason)
+            && !lower.contains("circuit_open")
+            && (lower.contains("overloaded") || lower.contains("http 529")
+                || lower.contains("http 503"))
+    }
+
+    pub fn overload_switch_due(&self, reason: &str) -> bool {
+        let mut inner = self.inner.lock().expect("active route mutex poisoned");
+        if Self::is_overload(reason) {
+            inner.overload_streak = inner.overload_streak.saturating_add(1);
+            inner.overload_streak >= 2
+        } else {
+            inner.overload_streak = 0;
+            true
+        }
     }
 
     pub fn take_initial_route_change(&self) -> Option<RouteChange> {
@@ -744,12 +781,9 @@ impl ActiveRouteState {
             self.health.mark_unavailable(&from.endpoint_name);
         }
 
-        let next_index = ((from_index + 1)..inner.candidates.len()).find(|index| {
-            !inner.failed_indices.contains(index)
-                && self
-                    .health
-                    .is_available(&inner.candidates[*index].endpoint_name)
-        })?;
+        let next_index = ((from_index + 1)..inner.candidates.len())
+            .find(|index| self.candidate_available(&inner, *index))?;
+        inner.overload_streak = 0;
         let to = inner.candidates[next_index].clone();
         inner.current_index = next_index;
         Some(RouteChange {
@@ -763,6 +797,9 @@ impl ActiveRouteState {
     }
 
     pub fn record_current_failure(&self, reason: &str) {
+        // A recoverable saturation is not an exhausted candidate. The durable
+        // provider episode already owns the retry time; keep preflight eligible.
+        if Self::is_overload(reason) { return; }
         let mut inner = self.inner.lock().expect("active route mutex poisoned");
         let current_index = inner.current_index;
         let current = inner.candidates[current_index].clone();
@@ -784,6 +821,7 @@ impl ActiveRouteState {
     }
 
     pub fn mark_current_success(&self) {
+        self.inner.lock().expect("active route mutex poisoned").overload_streak = 0;
         let current = self.current();
         self.health.mark_success(&current.endpoint_name);
     }
@@ -1652,6 +1690,31 @@ mod tests {
             EndpointHealthRegistry::new(Duration::from_secs(0)),
         );
         assert!(recovered.has_available_fallback());
+    }
+
+    #[tokio::test]
+    async fn m125_overloaded_route_remains_eligible_for_scheduled_retry() {
+        let state = ActiveRouteState::from_plan_with_health(
+            RouteCandidatePlan::new(route("pinned", "pro")),
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(Default::default())));
+        state.record_current_failure("HTTP 529 overloaded");
+        assert!(state.inner.lock().unwrap().failed_indices.is_empty(), "M125: overload waiting is not an exhausted route");
+        assert!(state.admit_model_availability(None, false, None).await.unwrap().is_none());
+        assert_eq!(state.current().endpoint_name, "pinned");
+    }
+
+    #[tokio::test]
+    async fn m125_unconfigured_fallback_is_not_available() {
+        let mut plan = RouteCandidatePlan::new(route("primary", "pro"));
+        let mut missing = route("backup", "pro");
+        missing.credential_ref = None;
+        missing.legacy_inline_api_key = None;
+        plan.push_fallback(missing);
+        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(Default::default())));
+        assert!(!state.has_available_fallback(), "M125: credentials are required for a usable fallback");
     }
 
     /// CF-PFB-R6. Fixed mode is a pin: one candidate, no fallback, ever.
