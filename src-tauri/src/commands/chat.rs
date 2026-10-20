@@ -1742,7 +1742,11 @@ async fn apply_chat_objective_outcome(
             db, current.session_id.as_deref().unwrap_or_default(),
         ).await.is_covered();
     let unwatched = if thin && !thin_waiting {
-        crate::agent::thin::unwatched_wait(db, current.session_id.as_deref().unwrap_or_default()).await
+        crate::agent::thin::unwatched_wait(db, current.session_id.as_deref().unwrap_or_default())
+            .await
+            // R5：外部事项（PR/CI/发版/部署）是模型自己能监视的对象，挂监视的提示
+            // 发生在工具结果层面；不能再用一条「需要你决定」的决策行去问用户。
+            .filter(|what| !crate::agent::thin::is_external_object(what))
     } else { None };
     let decision = if let Some(waiting_for) = unwatched.filter(|_| outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished) {
         let prompt = format!("需要你决定是否继续等待 {waiting_for}；目前没有唤醒源。请决定继续等待并挂监视，或结束等待。");
@@ -4646,11 +4650,13 @@ mod tests {
         }
     }
 
-    /// R2: external work without a watcher asks the user once, not the model
-    /// for a rewritten final answer. Legacy waits retain their old protocol.
+    /// R5: 外部事项（PR/CI/发版）是模型自己能挂监视的对象。没有唤醒源时，
+    /// 提示发生在工具结果层面，结算停在 `waiting_wake`——绝不升级成给用户的
+    /// 问题（v1.91.1 会话 6f5e87a2：03:33 停在 waiting_user，问「我在等交付
+    /// PR / CI，但这不是我能自己确认的对象」）。
     #[tokio::test]
-    async fn thin_unwatched_settlement_requires_visible_user_question() {
-        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain};
+    async fn thin_external_wait_settles_waiting_wake_instead_of_asking_the_user() {
+        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
         use codefactory_agent_loop::run::{RunOutcome, StopReason};
         let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('unwatched','synthetic','/synthetic','model',1,1,'thin')")
@@ -4661,15 +4667,52 @@ mod tests {
             session_id: Some("unwatched".into()), root_turn_id: Some("unwatched-root".into()),
             domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
         }).await.unwrap();
-        crate::agent::thin::record_unwatched_wait(&pool, "unwatched", "PR #42 的 CI").await.unwrap();
+        crate::agent::thin::record_unwatched_wait(&pool, "unwatched", "交付 PR / CI").await.unwrap();
         let outcome = RunOutcome {
-            final_text: "等待 PR #42 的 CI".into(), final_message_id: None,
+            final_text: "PR 已开，等 CI".into(), final_message_id: None,
             completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0, stop_reason: StopReason::Finished,
         };
         let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "unwatched-root", &outcome, None).await.unwrap();
         let thin = crate::agent::thin_state::load(&pool, "unwatched").await.unwrap().unwrap();
+        assert_eq!(
+            thin.state,
+            crate::agent::thin_state::SessionState::WaitingWake,
+            "等 PR/CI 是模型能自己监视的外部事项，不能变成等用户"
+        );
+        assert!(thin.question.is_none(), "不得向用户发问：{:?}", thin.question);
+        assert_eq!(thin.waiting_for.as_deref(), Some("交付 PR / CI"));
+        assert!(
+            thin.reason.as_deref().unwrap_or_default().contains("background_task_start"),
+            "外部事项无唤醒源时必须指明挂监视的做法：{:?}",
+            thin.reason
+        );
+        assert!(settled.failure_code.is_none());
+        assert!(settled.remediation_id.is_none());
+    }
+
+    /// R5 的另一半：真正「等一个人/一次确认」的等待仍然必须让用户看见。
+    #[tokio::test]
+    async fn thin_person_wait_still_requires_a_visible_user_question() {
+        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
+        use codefactory_agent_loop::run::{RunOutcome, StopReason};
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('person','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let current = store.create(CreateObjective {
+            id: "person-objective".into(), kind: ObjectiveKind::Delivery,
+            session_id: Some("person".into()), root_turn_id: Some("person-root".into()),
+            domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
+        }).await.unwrap();
+        crate::agent::thin::record_unwatched_wait(&pool, "person", "等你确认用哪个文件夹").await.unwrap();
+        let outcome = RunOutcome {
+            final_text: "需要你选一个目录".into(), final_message_id: None,
+            completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0, stop_reason: StopReason::Finished,
+        };
+        let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "person-root", &outcome, None).await.unwrap();
+        let thin = crate::agent::thin_state::load(&pool, "person").await.unwrap().unwrap();
         assert_eq!(thin.state, crate::agent::thin_state::SessionState::WaitingUser);
-        assert!(thin.question.unwrap().contains("PR #42 的 CI"));
+        assert!(thin.question.unwrap().contains("等你确认用哪个文件夹"));
         assert!(settled.failure_code.is_none());
         assert!(settled.remediation_id.is_none());
     }

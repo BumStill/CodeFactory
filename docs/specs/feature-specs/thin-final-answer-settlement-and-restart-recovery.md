@@ -27,6 +27,15 @@ v1.91.1 安装重启（10-21 03:16）后两个 thin 会话的权威状态 `thin_
 - **R1 最终回答只在一处结算**：`thin_state::settle_outcome` 是唯一判定，
   规则是「已产出最终回答（`final_text` 非空）即结算为最终回答」，包含
   `Blocked` 这种有界停止；没有最终回答才记技术失败。调用方不得再自行判断。
+- **R5 外部事项不算「等一个人」**：PR/CI/发版/部署/流水线是模型自己能监视的对象
+  （`gh pr view`、`background_task_start`、`schedule_wakeup`），
+  `thin::is_external_object` 负责分类：
+  - 结算时命名外部事项的等待 → `WaitNeed::External{covered:false}`，
+    停在 `waiting_wake` 并写明该挂什么监视，**不再**升级成给用户的问题；
+  - 只有真正「等某个人/一次确认」的等待仍走 `WaitNeed::Unwatched` → `waiting_user`；
+  - 也不再为外部事项生成「需要你决定是否继续等待」的决策行。
+  现场依据：会话 6f5e87a2 03:33 进 `waiting_user`，问题是
+  「我在等「交付 PR / CI」，但这不是我能自己确认的对象」。
 - **R2 `running` 不允许无人看管**：新增 `agent::thin_restart`，
   以权威表为依据挑选 `state='running'` 且**当前进程没有活执行者**
   （`chat_cancels` 内无该会话）的会话：

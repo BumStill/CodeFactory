@@ -113,10 +113,14 @@ pub fn after_final(need: WaitNeed, outcome_location: &str) -> ThinState {
             ..ThinState::running()
         },
         WaitNeed::External { what, covered: false } => ThinState {
-            state: SessionState::WaitingUser,
+            state: SessionState::WaitingWake,
             waiting_for: Some(what.clone()),
-            question: Some(format!(
-                "需要你决定是否继续等待 {what}；目前没有唤醒源。你可以让我挂监视继续等，或结束这个等待。"
+            // R5：外部事项（PR/CI/发版）是模型自己能监视的对象。没有唤醒源时，
+            // 工具结果层面已经提示挂监视（background_task_start / schedule_wakeup），
+            // 这里不再把它升级成「需要用户决定」的问题；R4 的失效守卫仍在 30 分钟
+            // 后兜底，避免真的无人看管。
+            reason: Some(format!(
+                "外部事项未挂监视：等 {what}，可用 background_task_start 或 schedule_wakeup 监视"
             )),
             ..ThinState::running()
         },
@@ -304,6 +308,12 @@ pub async fn settle_final(
             covered: true,
         },
         None => match super::thin::unwatched_wait(db, session_id).await {
+            // R5：名字里是外部事项（PR/CI/发版/部署/流水线）的等待，是模型能自己
+            // 监视的对象，不能被 R3 当成「等一个人」而升级成给用户的问题。
+            Some(what) if super::thin::is_external_object(&what) => WaitNeed::External {
+                what,
+                covered: false,
+            },
             Some(what) => WaitNeed::Unwatched { what },
             None => WaitNeed::None,
         },
