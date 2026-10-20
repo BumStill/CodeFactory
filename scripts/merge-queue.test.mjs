@@ -16,6 +16,10 @@ import {
   ARM_LABEL,
   HOLD_LABEL,
   BLOCKED_LABEL_PREFIX,
+  WAKE_LABELS,
+  resolveWake,
+  blockedMarker,
+  latestCheckOnHead,
   evaluateEligibility,
   orderQueue,
   parseBlockedMarker,
@@ -114,8 +118,8 @@ function fakeAdapter(prs, opts = {}) {
       for (const other of state.values()) other.mergeStateStatus = 'BEHIND';
       return { merged: true, sha: `merge-${number}` };
     },
-    async markBlocked(number, reason) {
-      calls.blocked.push({ number, reason });
+    async markBlocked(number, reason, opts = {}) {
+      calls.blocked.push({ number, reason, ...opts });
       state.delete(number);
     },
   };
@@ -524,8 +528,16 @@ test('M94: fixed blocked label is ensured and detailed reason is commented', asy
 
 test('M78: arming triggers only trusted default-branch queue tooling', () => {
   const workflow = readFileSync(new URL('../.github/workflows/merge-queue.yml', import.meta.url), 'utf8');
-  assert.match(workflow, /pull_request_target:\s*\n\s*types: \[labeled\]/);
-  assert.match(workflow, /if:.*github.event_name != 'pull_request_target'.*github.event.label.name == 'merge-queue: armed'/);
+  // M126: `unlabeled` is part of the trigger because lifting `merge-queue:
+  // blocked` is what makes a blocked, green PR mergeable again (2026-10-20 #768
+  // sat idle 20+ min on exactly that event). Which labels drain is decided by
+  // the unit-tested `wake` predicate below, not by an untested workflow `if:`.
+  assert.match(workflow, /pull_request_target:\s*\n\s*types: \[labeled, unlabeled\]/);
+  assert.match(workflow, /node scripts\/merge-queue\.mjs wake/);
+  assert.match(workflow, /QUEUE_WAKE_LABEL: \$\{\{ github\.event\.label\.name \}\}/);
+  assert.match(workflow, /--label "\$QUEUE_WAKE_LABEL"/);
+  assert.doesNotMatch(workflow, /--label "\$\{\{ github\.event\.label\.name/);
+  assert.match(workflow, /if: steps\.wake\.outputs\.run == 'true'/);
   assert.match(workflow, /ref: \$\{\{ github.event.repository.default_branch \}\}/);
   assert.doesNotMatch(workflow, /ref:.*(?:head|pull_request)/);
   assert.match(workflow, /schedule:/);
@@ -797,4 +809,179 @@ test('M114-R8b: merging reuses the listed title instead of another gh pr view', 
     !calls.some((call) => call.includes('--json title')),
     'the title already came from the shared listing',
   );
+});
+
+// ---------------------------------------------------------------------------
+// M126 — every signal that can make an armed PR mergeable must wake the queue.
+// 2026-10-20 (#768): the queue's own `merge-queue: blocked` label was lifted on
+// a CLEAN, armed PR and nothing woke the queue for 20+ minutes, because the
+// only label trigger was `labeled` filtered to `merge-queue: armed`.
+// ---------------------------------------------------------------------------
+test('M126: arming wakes the queue', () => {
+  assert.deepEqual(resolveWake('pull_request_target', ARM_LABEL), {
+    run: true,
+    reason: `queue label "${ARM_LABEL}" changed`,
+  });
+});
+
+test('M126: clearing the queue block wakes the queue', () => {
+  assert.equal(resolveWake('pull_request_target', BLOCKED_LABEL_PREFIX).run, true);
+  assert.equal(resolveWake('pull_request_target', `${BLOCKED_LABEL_PREFIX} head=abc`).run, true);
+  // Removing the block is an `unlabeled` event, the case #768 missed.
+  assert.equal(WAKE_LABELS.includes(BLOCKED_LABEL_PREFIX), true);
+});
+
+test('M126: unrelated labels do not drain the queue', () => {
+  assert.equal(resolveWake('pull_request_target', 'type: chore').run, false);
+  assert.equal(resolveWake('pull_request_target', HOLD_LABEL).run, false);
+  assert.deepEqual(resolveWake('pull_request_target', ''), {
+    run: false,
+    reason: 'pull_request_target without a label name',
+  });
+});
+
+test('M126: scheduled and CI-completion sweeps always drain', () => {
+  for (const event of ['schedule', 'workflow_run', 'workflow_dispatch']) {
+    assert.equal(resolveWake(event, '').run, true, event);
+  }
+});
+
+test('M126: the workflow runs the tested predicate instead of its own label filter', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const workflow = await readFile(
+    new URL('../.github/workflows/merge-queue.yml', import.meta.url),
+    'utf8',
+  );
+  assert.match(workflow, /types: \[labeled, unlabeled\]/);
+  assert.match(workflow, /node scripts\/merge-queue\.mjs wake/);
+  assert.match(workflow, /QUEUE_WAKE_LABEL: \$\{\{ github\.event\.label\.name \}\}/);
+  assert.match(workflow, /--label "\$QUEUE_WAKE_LABEL"/);
+  assert.doesNotMatch(workflow, /--label "\$\{\{ github\.event\.label\.name/);
+  assert.match(workflow, /if: steps\.wake\.outputs\.run == 'true'/);
+  const jobGuard = workflow.split('drain-queue:')[1].split('steps:')[0];
+  assert.ok(!/label\.name/.test(jobGuard), 'the job guard must not hardcode a label filter');
+  // Trust root unchanged: the queue runs default-branch tooling, never PR code.
+  assert.match(workflow, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+});
+
+test('M126: the wake CLI publishes the GITHUB_OUTPUT contract', async () => {
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const dir = mkdtempSync(join(tmpdir(), 'm126-'));
+  const out = join(dir, 'github_output');
+  const repoRoot = new URL('..', import.meta.url);
+  const run = (label) =>
+    execFileSync(
+      process.execPath,
+      ['scripts/merge-queue.mjs', 'wake', '--event', 'pull_request_target', '--label', label],
+      { env: { ...process.env, GITHUB_OUTPUT: out }, cwd: repoRoot },
+    );
+  try {
+    run(`${BLOCKED_LABEL_PREFIX} head=abc`);
+    assert.match(readFileSync(out, 'utf8'), /^run=true$/m);
+    run('docs');
+    assert.match(readFileSync(out, 'utf8'), /^run=false$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// M127 — a re-run on the SAME head, and a block whose cause is gone
+// ---------------------------------------------------------------------------
+// 2026-10-20 (#769): `check-frontend` failed on the README-Update contract, the
+// PR body was fixed (no commit), the same job went green on the identical head
+// — and the queue still saw `failure` because it read the oldest run for that
+// name. The PR then carried `merge-queue: blocked` bound to a head that was
+// green, so nothing could ever clear it.
+
+test('M127 — the newest run for a head decides, not the oldest', () => {
+  const checks = [
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:12:00Z' },
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:16:00Z' },
+    { name: 'check-frontend', status: 'completed', conclusion: 'success', headSha: SHA_A, completedAt: '2026-10-20T05:33:00Z' },
+  ];
+  assert.equal(latestCheckOnHead(checks, 'check-frontend', SHA_A).conclusion, 'success');
+  // Listing order must not matter.
+  assert.equal(
+    latestCheckOnHead([...checks].reverse(), 'check-frontend', SHA_A).conclusion,
+    'success',
+  );
+  const verdict = evaluateEligibility(
+    pr({ checks: [...greenChecks(SHA_A).filter((c) => c.name !== 'check-frontend'), ...checks] }),
+  );
+  assert.equal(verdict.eligible, true, verdict.reason);
+});
+
+test('M127 — a later failure still wins over an earlier success (no wishful reading)', () => {
+  const checks = [
+    ...greenChecks(SHA_A).filter((c) => c.name !== 'check-frontend'),
+    { name: 'check-frontend', status: 'completed', conclusion: 'success', headSha: SHA_A, completedAt: '2026-10-20T05:10:00Z' },
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:40:00Z' },
+  ];
+  const verdict = evaluateEligibility(pr({ checks }));
+  assert.equal(verdict.eligible, false);
+  assert.equal(verdict.terminal, true);
+  assert.equal(verdict.failedCheck, 'check-frontend');
+});
+
+test('M127 — a block on the same head clears once its recorded check is green again', () => {
+  const checks = [
+    ...greenChecks(SHA_A).filter((c) => c.name !== 'check-frontend'),
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:16:00Z' },
+    { name: 'check-frontend', status: 'completed', conclusion: 'success', headSha: SHA_A, completedAt: '2026-10-20T05:33:00Z' },
+  ];
+  const verdict = evaluateEligibility(
+    pr({ checks, labels: [ARM_LABEL, BLOCKED_LABEL_PREFIX], blocked: { headSha: SHA_A, at: 1, check: 'check-frontend' } }),
+  );
+  assert.equal(verdict.eligible, true, verdict.reason);
+  assert.equal(verdict.clearedBlock, true);
+  assert.match(verdict.reason, /green again on the same head/);
+});
+
+test('M127 — the same-head block survives while its check is still red or unnamed', () => {
+  const checks = [
+    ...greenChecks(SHA_A).filter((c) => c.name !== 'check-frontend'),
+    { name: 'check-frontend', status: 'completed', conclusion: 'failure', headSha: SHA_A, completedAt: '2026-10-20T05:40:00Z' },
+  ];
+  const stillRed = evaluateEligibility(
+    pr({ checks, labels: [ARM_LABEL, BLOCKED_LABEL_PREFIX], blocked: { headSha: SHA_A, at: 1, check: 'check-frontend' } }),
+  );
+  assert.equal(stillRed.eligible, false);
+  assert.equal(stillRed.terminal, false);
+  const legacy = evaluateEligibility(pr({ labels: [ARM_LABEL, BLOCKED_LABEL_PREFIX], blocked: { headSha: SHA_A, at: 1 } }));
+  assert.equal(legacy.eligible, false);
+  assert.match(legacy.reason, /already blocked by the queue on this head/);
+});
+
+test('M127 — the blocked marker round-trips the failing check name', () => {
+  const marker = blockedMarker(SHA_A, new Date('2026-10-20T05:16:47Z'), 'check-frontend');
+  const parsed = parseBlockedMarker(`Merge queue dropped this PR: x\n${marker}`);
+  assert.equal(parsed.headSha, SHA_A);
+  assert.equal(parsed.check, 'check-frontend');
+  assert.equal(parseBlockedMarker(blockedMarker(SHA_A)).check, null);
+});
+
+test('M126 safety: recovered check cannot bypass another failed required check', () => {
+  const checks = greenChecks(SHA_A).map((check) =>
+    check.name === 'check-rust' ? { ...check, conclusion: 'failure' } : check,
+  );
+  const verdict = evaluateEligibility(pr({
+    checks,
+    labels: [ARM_LABEL, BLOCKED_LABEL_PREFIX],
+    blocked: { headSha: SHA_A, check: 'check-frontend' },
+  }));
+  assert.equal(verdict.eligible, false);
+});
+
+test('M127 — runQueue records the failing check so the block can self-heal', async () => {
+  const checks = greenChecks(SHA_A).map((c) =>
+    c.name === 'check-frontend' ? { ...c, conclusion: 'failure' } : c,
+  );
+  const adapter = fakeAdapter([pr({ checks })]);
+  await runQueue(adapter, {});
+  assert.equal(adapter.calls.blocked.length, 1);
+  assert.equal(adapter.calls.blocked[0].checkName, 'check-frontend');
 });

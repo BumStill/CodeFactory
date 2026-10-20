@@ -8328,6 +8328,17 @@ fn gh_arm_merge_queue_args(number: u64) -> Vec<String> {
     ]
 }
 
+/// M126: `gh` args that wake the merge queue right after arming.
+///
+/// Arming an already-armed PR is a no-op for GitHub, and a no-op emits no
+/// `labeled` webhook, so "arm once CI went green" used to leave the queue
+/// asleep until its next cron tick (2026-10-20 #768 sat idle 20+ min on a
+/// CLEAN, armed PR). Dispatching the queue workflow makes arming mean "the
+/// queue runs now" instead of "the queue runs on the next sweep".
+fn gh_dispatch_merge_queue_args() -> Vec<String> {
+    vec!["workflow".into(), "run".into(), "merge-queue.yml".into()]
+}
+
 /// `gh` args that clear a PR's merge-queue arm (used when a task stops).
 fn gh_clear_merge_queue_arm_args(number: u64) -> Vec<String> {
     vec![
@@ -8882,7 +8893,13 @@ impl DeliveryRemote for GhCliRemote {
     /// best-effort — arming must never fail a delivery that is otherwise ready.
     async fn arm_merge_queue(&self, number: u64, _expected_head: &str) -> Result<(), String> {
         let _ = self.gh(&gh_ensure_merge_queue_label_args());
-        self.gh(&gh_arm_merge_queue_args(number)).map(|_| ())
+        self.gh(&gh_arm_merge_queue_args(number))?;
+        // M126: re-arming an already-armed PR emits no `labeled` webhook, so the
+        // queue would wait for its next cron tick. Best effort — the arm already
+        // succeeded and the scheduled sweep still covers a token without
+        // `actions: write`.
+        let _ = self.gh(&gh_dispatch_merge_queue_args());
+        Ok(())
     }
 
     /// U31: clear the arm so a stopped task cannot keep merging (M47).
@@ -10703,6 +10720,20 @@ impl DeliveryRemote for GithubRemote {
                 json!({ "labels": [MERGE_QUEUE_ARM_LABEL] }),
             )
             .await?;
+        // M126: adding a label that is already present is a no-op, and a no-op
+        // emits no `labeled` webhook — so re-arming woke nothing and the queue
+        // waited for its next sweep. Dispatch it explicitly. Best effort: a
+        // token without `actions: write` keeps the scheduled sweep in charge.
+        let _ = self
+            .client
+            .post(
+                &format!(
+                    "/repos/{}/actions/workflows/merge-queue.yml/dispatches",
+                    self.repo
+                ),
+                json!({ "ref": self.default_branch }),
+            )
+            .await;
         Ok(())
     }
 
