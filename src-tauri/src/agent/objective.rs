@@ -2726,6 +2726,11 @@ impl ObjectiveStore {
             bail!("chat admission fenced by durable session cancellation");
         }
 
+        // R10: the message entry is not an identity court. A missing root row,
+        // a dangling objective binding or an ambiguous continuation hint must
+        // converge to one usable objective instead of rejecting the user's
+        // message. Identity is repaired here; the user never sees a recovery
+        // decision for it.
         let current_binding = sqlx::query_scalar::<_, Option<String>>(
             "SELECT objective_id FROM chat_turn_state WHERE root_turn_id=? AND session_id=?",
         )
@@ -2733,7 +2738,7 @@ impl ObjectiveStore {
         .bind(session_id)
         .fetch_optional(&mut **tx)
         .await?
-        .ok_or_else(|| anyhow!("chat root turn missing while ensuring objective"))?
+        .flatten()
         .filter(|value| !value.is_empty());
 
         let mut candidates = Vec::new();
@@ -2742,10 +2747,11 @@ impl ObjectiveStore {
                 .bind(objective_id)
                 .fetch_one(&mut **tx)
                 .await?;
-            if exists != 1 {
-                bail!("chat objective binding points to missing objective");
+            if exists == 1 {
+                candidates.push(objective_id.clone());
+            } else {
+                tracing::warn!(%objective_id, %root_turn_id, "thin/chat entry ignored a dangling objective binding instead of rejecting the message");
             }
-            candidates.push(objective_id.clone());
         }
 
         if let Some(continuation_root_turn_id) = continuation_root_turn_id {
@@ -2757,31 +2763,43 @@ impl ObjectiveStore {
             .bind(session_id)
             .fetch_optional(&mut **tx)
             .await?
-            .ok_or_else(|| anyhow!("contextual continuation root turn is missing"))?
+            .flatten()
             .filter(|value| !value.is_empty());
             if let Some(continuation_binding) = continuation_binding {
                 let status =
                     sqlx::query_scalar::<_, String>("SELECT status FROM objectives WHERE id=?")
                         .bind(&continuation_binding)
                         .fetch_optional(&mut **tx)
-                        .await?
-                        .ok_or_else(|| anyhow!("contextual continuation objective is missing"))?;
-                if !matches!(status.as_str(), "completed" | "cancelled" | "legacy_orphan") {
-                    candidates.push(continuation_binding);
+                        .await?;
+                match status.as_deref() {
+                    None => tracing::warn!(%continuation_binding, "chat entry ignored a missing continuation objective"),
+                    Some(status) if !matches!(status, "completed" | "cancelled" | "legacy_orphan") => {
+                        candidates.push(continuation_binding);
+                    }
+                    Some(_) => {}
                 }
             } else {
-                // A pre-0006 root is still an authoritative continuation
-                // anchor, but it has no safe synthesized identity. Reconcile
-                // that exact root inside this transaction so both transport
-                // projections receive one opaque Objective id.
+                // A pre-0006 root is still a useful continuation anchor, but
+                // it has no safe synthesized identity. Reconcile that exact
+                // root inside this transaction so both transport projections
+                // receive one opaque Objective id.
                 legacy_root_to_reconcile = Some(continuation_root_turn_id.to_string());
             }
         }
 
         candidates.sort();
         candidates.dedup();
+        // Ambiguity resolves to the binding the current turn already owns;
+        // only if it has none do we take the deterministic (lowest) candidate.
+        // This mirrors "continue what I was doing" without a user-visible
+        // identity decision.
         if candidates.len() > 1 {
-            bail!("multiple open objectives match contextual chat continuation");
+            if let Some(bound) = current_binding.as_ref().filter(|id| candidates.contains(id)) {
+                candidates = vec![bound.clone()];
+            } else {
+                candidates.truncate(1);
+            }
+            tracing::warn!(%root_turn_id, "chat entry converged ambiguous objective identities instead of rejecting the message");
         }
 
         if let Some(objective_id) = candidates.pop() {
@@ -11364,6 +11382,43 @@ CREATE TABLE objectives (
     }
 
     #[tokio::test]
+    async fn message_admission_never_rejects_a_missing_or_ambiguous_task_identity() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+               status TEXT NOT NULL, objective_id TEXT)",
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, status, objective_id)
+             VALUES ('turn-dangling', 'session-r10', 'active', 'objective-that-was-deleted')",
+        ).execute(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let admitted = store.ensure_chat_objective(
+            "session-r10", "turn-dangling", ObjectiveKind::LocalMutation, "validated_change",
+        ).await.expect("R10: a missing bound objective must not reject the user's message");
+        assert_ne!(admitted.id, "objective-that-was-deleted");
+
+        // 歧义：两个打开的任务，其中一个绑定当前轮，另一个来自续接提示。
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, status)
+             VALUES ('turn-other', 'session-r10', 'active')",
+        ).execute(&pool).await.unwrap();
+        let other = store.ensure_chat_objective(
+            "session-r10", "turn-other", ObjectiveKind::LocalMutation, "validated_change",
+        ).await.unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, status)
+             VALUES ('turn-new', 'session-r10', 'active')",
+        ).execute(&pool).await.unwrap();
+        let continued = store.ensure_or_continue_chat_objective(
+            "session-r10", "turn-new", Some("turn-other"),
+            ObjectiveKind::LocalMutation, "validated_change",
+        ).await.expect("R10: ambiguous identities must converge, not reject");
+        assert_eq!(continued.id, other.id);
+    }
+
+    #[tokio::test]
     async fn chat_objective_is_created_once_and_linked_to_the_transport_projection() {
         let pool = pool().await;
         sqlx::query(
@@ -11737,7 +11792,7 @@ CREATE TABLE objectives (
     }
 
     #[tokio::test]
-    async fn contextual_root_fails_closed_when_two_open_objectives_are_present() {
+    async fn contextual_root_converges_when_two_open_objectives_are_present() {
         let pool = pool().await;
         sqlx::query(
             "CREATE TABLE chat_turn_state (
@@ -11768,7 +11823,7 @@ CREATE TABLE objectives (
             )
             .await
             .unwrap();
-        store
+        let current = store
             .ensure_chat_objective(
                 "session-ambiguous",
                 "turn-current",
@@ -11778,7 +11833,10 @@ CREATE TABLE objectives (
             .await
             .unwrap();
 
-        let error = store
+        // R10: an ambiguous continuation hint converges onto the objective the
+        // current turn already owns. The user's message is never rejected and
+        // no identity question is surfaced.
+        let continued = store
             .ensure_or_continue_chat_objective(
                 "session-ambiguous",
                 "turn-current",
@@ -11787,8 +11845,9 @@ CREATE TABLE objectives (
                 "delivery_receipt",
             )
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("multiple open objectives"));
+            .expect("R10: ambiguous identities converge instead of rejecting the message");
+        assert_eq!(continued.id, current.id);
+        assert_eq!(continued.status, ObjectiveStatus::Active);
     }
 
     #[tokio::test]
