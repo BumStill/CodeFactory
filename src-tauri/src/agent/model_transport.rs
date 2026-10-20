@@ -422,6 +422,18 @@ impl ProviderAttemptRuntime {
 }
 
 impl RoutedDesktopModelTransport {
+    fn overload_wait(&self, route: &RouteCandidate) -> String {
+        let unavailable = super::failover::ModelUnavailable {
+            resume_at_ms: Some(chrono::Utc::now().timestamp_millis().saturating_add(60_000)),
+            notice: format!("模型 {} 服务过载；当前没有可用备用路由（固定模型不会切换），约 60 秒后自动观测，等待服务恢复，无需回复继续。", route.model_id),
+        };
+        self.events.emit(StreamEvent::TransportRetry {
+            label: "等唤醒".into(), attempt: 0, max_attempts: 0,
+            delay_ms: 60_000, reason: unavailable.notice.clone(),
+        });
+        unavailable.encode()
+    }
+
     /// U27 / CF-WSC-R6: a queued remediation whose binding row no longer exists
     /// cannot be replayed. When the objective's session still has one live turn,
     /// that turn owns the work now (the user continued the session, possibly
@@ -2016,7 +2028,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     };
                     if action == ProviderFailureAction::DurableWaiting {
                         let error = TransportError::Retryable(
-                            "PROVIDER_RECOVERY_WAITING: provider overloaded".into(),
+                            format!("PROVIDER_RECOVERY_WAITING: provider overloaded；{}", self.overload_wait(&route)),
                         );
                         if !self.turn_uncommitted_side_effect.load(Ordering::SeqCst) {
                             self.route_state.record_current_failure(&reason);
@@ -2029,6 +2041,15 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
+                    }
+                    if self.durable_provider_required && ActiveRouteState::is_overload(&reason)
+                        && (!self.route_state.overload_switch_due(&reason)
+                            || !self.route_state.has_available_fallback())
+                    {
+                        return Err(TransportError::Retryable(format!(
+                            "{reason}；等待 {} 服务恢复，约 20–60 秒后自动观测；当前无可用备用路由或尚未达到两次过载（固定模型不会切换）。",
+                            route.model_id,
+                        )));
                     }
                     let Some(change) = self.route_state.advance_after_failure(&reason) else {
                         return Err(TransportError::Retryable(
@@ -2136,7 +2157,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     };
                     if action == ProviderFailureAction::DurableWaiting {
                         let error = TransportError::Retryable(
-                            "PROVIDER_RECOVERY_WAITING: provider overloaded".into(),
+                            format!("PROVIDER_RECOVERY_WAITING: provider overloaded；{}", self.overload_wait(&route)),
                         );
                         if !self.turn_uncommitted_side_effect.load(Ordering::SeqCst) {
                             self.route_state.record_current_failure(&reason);
@@ -2170,6 +2191,15 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     if round_side_effect_started.load(Ordering::SeqCst) || side_effect_before_round {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
+                    }
+                    if self.durable_provider_required && ActiveRouteState::is_overload(&reason)
+                        && (!self.route_state.overload_switch_due(&reason)
+                            || !self.route_state.has_available_fallback())
+                    {
+                        return Err(TransportError::Retryable(format!(
+                            "{reason}；等待 {} 服务恢复，约 20–60 秒后自动观测；当前无可用备用路由或尚未达到两次过载（固定模型不会切换）。",
+                            route.model_id,
+                        )));
                     }
                     let Some(change) = self.route_state.advance_after_failure(&reason) else {
                         return Err(TransportError::Retryable(
@@ -4237,7 +4267,13 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                 .complete(&[], &[], &RoundOptions::default())
                 .await
                 .expect_err("overload must remain system-owned");
+            assert!(error.to_string().contains("等待"), "M125: fixed/no-backup explains its wait: {error}");
+            assert_eq!(transport.route_state.current().endpoint_name, "durable-overload-provider");
             if attempt == 3 {
+                let unavailable = super::super::failover::ModelUnavailable::parse(&error.to_string())
+                    .expect("M125: durable wait uses M123 non-failure signal");
+                assert!(unavailable.resume_at_ms.unwrap() > chrono::Utc::now().timestamp_millis());
+                assert!(unavailable.notice.contains("固定模型不会切换"));
                 assert!(error.to_string().contains("PROVIDER_RECOVERY_WAITING"));
                 assert!(
                     codefactory_agent_loop::context::is_provider_overloaded(&error.to_string()),
@@ -4880,14 +4916,19 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             durable_provider_required: true,
         };
 
+        let first = transport.complete(&[], &[], &RoundOptions::default()).await;
+        assert!(first.is_err(), "M125: first overload retains the preferred route");
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
         let response = transport
             .complete(&[], &[], &RoundOptions::default())
             .await
             .expect("an overloaded preferred endpoint must not park a fallback-enabled task");
 
-        assert!(primary_hits.load(Ordering::SeqCst) >= 1);
-        assert!(
-            fallback_hits.load(Ordering::SeqCst) >= 1,
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 2, "M125: third POST uses fallback");
+        assert_eq!(
+            fallback_hits.load(Ordering::SeqCst),
+            1,
             "the overloaded preferred endpoint must hand the turn to deepseek"
         );
         assert_eq!(
