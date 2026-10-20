@@ -104,6 +104,7 @@ pub(crate) async fn execute_with(args: Value, fetch: FetchContext) -> Result<Too
 
     let response = match client
         .get(url.clone())
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
         .header(
             reqwest::header::ACCEPT,
             "text/html,application/xhtml+xml,text/plain;q=0.9,application/json;q=0.8,application/pdf;q=0.8,*/*;q=0.5",
@@ -376,7 +377,13 @@ fn strip_blocks(html: &str, tags: &[&str]) -> String {
         let close = format!("</{tag}>");
         loop {
             let lower = current.to_ascii_lowercase();
-            let Some(start) = lower.find(&open) else {
+            // Match the complete tag name: `<head` must not consume `<header>`
+            // (or `<nav` a custom `<navigation-note>` element).
+            let Some(start) = lower.match_indices(&open).find_map(|(index, _)| {
+                lower.as_bytes().get(index + open.len())
+                    .filter(|next| next.is_ascii_whitespace() || **next == b'>' || **next == b'/')
+                    .map(|_| index)
+            }) else {
                 break;
             };
             match lower[start..].find(&close) {
@@ -701,8 +708,24 @@ fn looks_js_only(html: &str, text: &str) -> bool {
         "id=\"react-root\"",
         "data-reactroot",
     ];
-    PLACEHOLDERS.iter().any(|marker| lower.contains(marker))
-        || (characters < 40 && lower.contains("<script"))
+    // Hydration markers are common on server-rendered docs and blogs too.
+    // A real paragraph/list/code block is evidence of readable server content,
+    // even when the whole article is shorter than 400 characters.
+    let has_content = ["p", "li", "pre", "article"].iter().any(|tag| {
+        let open = format!("<{tag}");
+        lower.match_indices(&open).any(|(index, _)| {
+            let boundary = lower.as_bytes().get(index + open.len())
+                .is_some_and(|next| next.is_ascii_whitespace() || *next == b'>');
+            boundary && lower[index..].find('>').is_some_and(|end| {
+                let rest = &html[index + end + 1..];
+                rest.find(&format!("</{tag}>")).is_some_and(|close| {
+                    rest[..close].chars().any(|c| c.is_alphanumeric())
+                })
+            })
+        })
+    });
+    !has_content && (PLACEHOLDERS.iter().any(|marker| lower.contains(marker))
+        || (characters < 40 && lower.contains("<script")))
 }
 
 fn page_slice(text: &str, start: usize, max_chars: usize) -> (String, usize) {
@@ -788,6 +811,7 @@ fn validate_target(raw: &str) -> std::result::Result<Url, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::no_window::NoWindow;
     use serde_json::Value;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -909,6 +933,137 @@ mod tests {
   </article>
   <footer>© Example</footer>
 </body></html>"#;
+
+    // M131c: synthetic structural reproduction of the supplied Wikipedia page.
+    // Keep the real page out of versioned fixtures (task-template synthetic-only rule).
+    const WIKI: &str = include_str!("fixtures/web-fetch-wiki.html");
+
+    #[tokio::test]
+    async fn m131c_wiki_headers_do_not_erase_main_content() {
+        let (_, client) = fixture(vec![("/wiki", html(WIKI))]).await;
+        let out = fetch(&client, "http://fixture.test/wiki", json!({})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("Title: Unix philosophy - Wikipedia"));
+        assert!(out.content.contains("Write programs that do one thing"), "{}", out.content);
+        assert!(!out.content.contains("Site navigation"));
+    }
+
+    #[tokio::test]
+    async fn m131c_compressed_wiki_is_decoded() {
+        // Python's standard library supplies deterministic gzip/zlib fixture bytes;
+        // no production dependency and no network access are needed.
+        for encoding in ["gzip", "deflate"] {
+            let script = format!(
+                "import gzip,zlib,sys; b=sys.stdin.buffer.read(); sys.stdout.buffer.write({}.compress(b))",
+                if encoding == "gzip" { "gzip" } else { "zlib" }
+            );
+            let mut child = std::process::Command::new("python3")
+                .no_window()
+                .args(["-c", &script])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn().expect("python3 fixture encoder");
+            std::io::Write::write_all(child.stdin.take().as_mut().unwrap(), WIKI.as_bytes()).unwrap();
+            let compressed = child.wait_with_output().unwrap();
+            assert!(compressed.status.success());
+            let response = http_response("200 OK", &[("Content-Type", "text/html; charset=UTF-8"), ("Content-Encoding", encoding)], &compressed.stdout);
+            let (_, client) = fixture(vec![("/compressed", response)]).await;
+            let out = fetch(&client, "http://fixture.test/compressed", json!({})).await;
+            assert!(!out.is_error, "{encoding}: {}", out.content);
+            assert!(out.content.contains("Title: Unix philosophy - Wikipedia"));
+            assert!(out.content.contains("Write programs that do one thing"), "{encoding}: {}", out.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn m131c_short_ssr_docs_and_gbk_are_not_js_shells() {
+        let docs = r#"<html><head><title>Docs</title><script src="hydrate.js"></script></head><body><main id="__next"><header><h1>Quick start</h1></header><p>Install the package.</p><pre><code>cargo add example</code></pre></main></body></html>"#;
+        let chinese = r#"<html><head><meta charset="gbk"><title>中文文档</title></head><body><main id="app"><p>组合小工具，完成复杂工作。</p></main><script src="app.js"></script></body></html>"#;
+        let (gbk, _, _) = encoding_rs::GBK.encode(chinese);
+        let (_, client) = fixture(vec![
+            ("/docs", html(docs)),
+            ("/chinese", http_response("200 OK", &[("Content-Type", "text/html")], &gbk)),
+        ]).await;
+        for (path, title, text) in [("docs", "Docs", "cargo add example"), ("chinese", "中文文档", "组合小工具，完成复杂工作。")] {
+            let out = fetch(&client, &format!("http://fixture.test/{path}"), json!({})).await;
+            assert!(!out.is_error, "{}", out.content);
+            assert!(out.content.contains(&format!("Title: {title}")));
+            assert!(out.content.contains(text), "{}", out.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn m131c_request_uses_browser_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            socket.write_all(&html("<p>Headers accepted.</p>")).await.unwrap();
+            request
+        });
+        let client = reqwest::Client::builder().no_proxy().resolve("fixture.test", addr).build().unwrap();
+        let out = fetch(&client, "http://fixture.test/headers", json!({})).await;
+        assert!(!out.is_error, "{}", out.content);
+        let request = server.await.unwrap();
+        assert!(request.contains("user-agent: mozilla/5.0"), "{request}");
+        assert!(request.contains("accept: text/html,application/xhtml+xml"), "{request}");
+        assert!(request.contains("accept-encoding:") && request.contains("gzip") && request.contains("br") && request.contains("deflate"), "{request}");
+    }
+
+    #[test]
+    fn m131c_tag_prefixes_do_not_consume_unrelated_elements() {
+        let base = Url::parse("https://example.com/readme").unwrap();
+        let (_, body) = html_to_markdown("<main><header><h1>README</h1></header><article><p>Use pipes.</p><aside-note>Keep this note.</aside-note><form-example>Keep this example.</form-example></article></main>", &base);
+        assert!(body.contains("Use pipes."), "{body}");
+        assert!(body.contains("Keep this note."), "{body}");
+        assert!(body.contains("Keep this example."), "{body}");
+    }
+
+    #[tokio::test]
+    async fn m131c_brotli_document_is_decoded() {
+        // node:zlib.brotliCompressSync of a synthetic HTML documentation page.
+        let bytes = [27,113,0,200,68,231,150,42,33,65,40,236,65,83,114,98,112,211,157,161,224,132,3,151,70,18,120,94,166,7,161,187,141,189,39,14,245,185,163,21,196,7,13,61,8,248,180,226,63,91,130,243,157,6,154,151,240,68,231,157,92,235,193,26,226,90,35,36,14,117,75,36,3];
+        let response = http_response("200 OK", &[("Content-Type", "text/html"), ("Content-Encoding", "br")], &bytes);
+        let (_, client) = fixture(vec![("/br", response)]).await;
+        let out = fetch(&client, "http://fixture.test/br", json!({})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("Title: Brotli docs"), "{}", out.content);
+        assert!(out.content.contains("Compressed documentation remains readable."));
+    }
+
+    #[tokio::test]
+    #[ignore = "local-only original page probe; CI fixtures remain synthetic"]
+    async fn m131c_original_wikipedia_gzip_probe() {
+        let path = std::env::var("WEB_FETCH_WIKI_FIXTURE").expect("local HTML fixture path");
+        let raw = std::fs::read(&path).unwrap();
+        let compressed = std::process::Command::new("python3")
+                .no_window()
+            .args(["-c", "import gzip,sys; sys.stdout.buffer.write(gzip.compress(open(sys.argv[1],'rb').read()))", &path])
+            .output().unwrap();
+        assert!(compressed.status.success());
+        assert!(raw.len() > 100_000);
+        let response = http_response("200 OK", &[("Content-Type", "text/html; charset=UTF-8"), ("Content-Encoding", "gzip")], &compressed.stdout);
+        let (_, client) = fixture(vec![("/original", response)]).await;
+        let out = fetch(&client, "http://fixture.test/original", json!({"max_chars": 40000})).await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("Title: Unix philosophy"));
+        assert!(out.content.contains("Write programs that do one thing"), "{}", out.content);
+        println!("original Wikipedia gzip: title and Unix philosophy paragraph verified via web_fetch only");
+    }
+
+    #[tokio::test]
+    #[ignore = "local-only live web_fetch probe; CI never accesses external sites"]
+    async fn m131c_live_wikipedia_web_fetch_only() {
+        let ctx = ExecCtx::new(std::env::temp_dir(), None);
+        let out = execute(json!({"url": "https://en.wikipedia.org/wiki/Unix_philosophy", "max_chars": 40000}), &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("Title: Unix philosophy"), "{}", out.content);
+        assert!(out.content.contains("Write programs that do one thing"), "{}", out.content);
+        println!("live web_fetch only: title and principle verified; no browser_session");
+    }
 
     // ------------------------------------------------------------- R7: HTML
 
