@@ -1402,6 +1402,14 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                 }
                 Err(error) => tracing::warn!(%error, "orphaned-Objective sweep failed"),
             }
+            // R4: thin sessions are heartbeat-only. A waiting_wake row is
+            // woken while its wake source exists, and an expired source turns
+            // into an explicit question for the user instead of silence.
+            match super::thin_state::sweep(&pool, chrono::Utc::now().timestamp_millis()).await {
+                Ok(0) => {}
+                Ok(surfaced) => tracing::info!(surfaced, "thin waiting_wake heartbeat surfaced expired waits"),
+                Err(error) => tracing::warn!(%error, "thin waiting_wake heartbeat failed"),
+            }
             polls_since_stall_sweep += 1;
             if polls_since_stall_sweep >= STALL_SWEEP_EVERY_POLLS {
                 polls_since_stall_sweep = 0;

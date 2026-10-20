@@ -81,3 +81,50 @@ mod tests {
         assert!(sqlx::query("INSERT INTO sessions (id,delivery_mode) VALUES ('bad','other')").execute(&db).await.is_err());
     }
 }
+
+#[cfg(test)]
+mod phase2_state_tests {
+    use crate::agent::thin_state::{self, SessionState, WaitNeed};
+
+    // R8 replay: the final answer exists once and every real-machine case
+    // settles into one of the four durable states.
+    #[test]
+    fn final_answer_replay_cases_settle_four_states() {
+        let ended = thin_state::after_final(WaitNeed::None, "本会话记录");
+        assert_eq!(ended.state, SessionState::Ended);
+        let watched = thin_state::after_final(WaitNeed::External { what: "PR #774 合并".into(), covered: true }, "");
+        assert_eq!(watched.state, SessionState::WaitingWake);
+        let unwatched = thin_state::after_final(WaitNeed::External { what: "浏览器只读任务".into(), covered: false }, "");
+        assert_eq!(unwatched.state, SessionState::WaitingUser);
+        assert!(unwatched.question.as_deref().unwrap_or_default().contains("PR #774") || unwatched.question.as_deref().unwrap_or_default().contains("浏览器只读任务"));
+        let self_invented = thin_state::after_final(WaitNeed::Unwatched { what: "确认范围".into() }, "");
+        assert_eq!(self_invented.state, SessionState::WaitingUser);
+        assert!(self_invented.question.is_some());
+    }
+
+    #[test]
+    fn three_identical_technical_failures_end_and_model_outage_waits_for_its_wake() {
+        assert_eq!(thin_state::after_failure(1, "bash exited 1").state, SessionState::Running);
+        assert_eq!(thin_state::after_failure(2, "bash exited 1").state, SessionState::Running);
+        let ended = thin_state::after_failure(3, "bash exited 1");
+        assert_eq!(ended.state, SessionState::Ended);
+        assert!(ended.reason.as_deref().unwrap_or_default().contains("bash exited 1"));
+        let no_model = thin_state::after_no_model(0);
+        assert_eq!(no_model.state, SessionState::WaitingWake);
+        assert!(no_model.wake_source.is_some());
+    }
+
+    #[tokio::test]
+    async fn thin_state_round_trips_and_expired_wake_becomes_a_user_question() {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        thin_state::ensure(&db).await.unwrap();
+        thin_state::save(&db, "synthetic-session", &thin_state::after_final(WaitNeed::External { what: "CI 结束".into(), covered: true }, "")).await.unwrap();
+        let loaded = thin_state::load(&db, "synthetic-session").await.unwrap().unwrap();
+        assert_eq!(loaded.state, SessionState::WaitingWake);
+        let swept = thin_state::sweep(&db, i64::MAX / 4).await.unwrap();
+        assert_eq!(swept, 1);
+        let expired = thin_state::load(&db, "synthetic-session").await.unwrap().unwrap();
+        assert_eq!(expired.state, SessionState::WaitingUser);
+        assert!(expired.question.as_deref().unwrap_or_default().contains("已失效"));
+    }
+}

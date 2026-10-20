@@ -1688,6 +1688,26 @@ async fn apply_chat_objective_outcome(
     if current.status.is_terminal() {
         return Ok(current);
     }
+    // R1/R2/R7: a thin final answer settles the four-state authority directly.
+    // No legacy decision, remediation or recovery row is written, and the
+    // answer already exists once in the transcript.
+    if let Some(session) = current.session_id.as_deref() {
+        if crate::agent::thin::is_thin(db, session).await {
+            let thin = if outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished {
+                let external = if crate::agent::thin::external_wait_hint(db, session).await.is_some() {
+                    Some("外部交付（PR/CI）".to_string())
+                } else { None };
+                crate::agent::thin_state::settle_final(db, session, root_turn_id, external).await
+            } else {
+                crate::agent::thin_state::settle_error(
+                    db, session, root_turn_id, &format!("agent loop stopped: {:?}", outcome.stop_reason),
+                ).await
+            }.map_err(|error| AppError::Other(error.to_string()))?;
+            crate::agent::thin_state::close_objective(db, objective_id, &thin)
+                .await.map_err(|error| AppError::Other(error.to_string()))?;
+            return Ok(current);
+        }
+    }
     if current.revision != expected_revision {
         return Err(AppError::Other(format!(
             "stale chat runner revision: expected {expected_revision}, actual {}",
@@ -1881,6 +1901,18 @@ async fn settle_chat_objective_from_error(
     if current.status.is_terminal() {
         project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
         return Ok(current);
+    }
+    // R5: three identical real failures end a thin task with a human reason;
+    // no model is a wait for the model's own recovery, not a failure.
+    if let Some(session) = current.session_id.as_deref() {
+        if crate::agent::thin::is_thin(db, session).await {
+            let thin = crate::agent::thin_state::settle_error(db, session, root_turn_id, error_text)
+                .await.map_err(|error| AppError::Other(error.to_string()))?;
+            crate::agent::thin_state::close_objective(db, objective_id, &thin)
+                .await.map_err(|error| AppError::Other(error.to_string()))?;
+            project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
+            return Ok(current);
+        }
     }
     if error_text.contains("PROVIDER_DURABLE_IDENTITY_SUPERSEDED") {
         // M79: settle only this obsolete claim, never the new turn's recovery.
@@ -4291,13 +4323,15 @@ mod tests {
                 stop_reason: StopReason::Finished,
             };
             let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "synthetic-root", &outcome, None).await.unwrap();
-            assert_eq!(settled.status, if waiting { ObjectiveStatus::WaitingSystem } else { ObjectiveStatus::Completed });
+            let thin = crate::agent::thin_state::load(&pool, "synthetic-settle").await.unwrap().unwrap();
             if waiting {
-                assert_eq!(settled.failure_code.as_deref(), Some("thin_waiting_for_wake"));
-                assert!(settled.failure_signature.is_none());
-                assert!(settled.remediation_id.is_none());
+                assert_eq!(thin.state, crate::agent::thin_state::SessionState::WaitingWake);
+                assert_eq!(settled.status, ObjectiveStatus::Active);
+            } else {
+                assert_eq!(thin.state, crate::agent::thin_state::SessionState::Ended);
+                assert_eq!(store.get(&current.id).await.unwrap().unwrap().status, ObjectiveStatus::LegacyOrphan);
             }
-            assert_eq!(store.get(&current.id).await.unwrap().unwrap().status, settled.status);
+            assert!(settled.failure_code.is_none());
             pool.close().await;
         }
     }
@@ -4323,8 +4357,9 @@ mod tests {
             completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0, stop_reason: StopReason::Finished,
         };
         let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "unwatched-root", &outcome, None).await.unwrap();
-        assert_eq!(settled.status, ObjectiveStatus::WaitingCoreInput);
-        assert!(settled.attention_request.unwrap().prompt.contains("需要你决定是否继续等待 PR #42 的 CI"));
+        let thin = crate::agent::thin_state::load(&pool, "unwatched").await.unwrap().unwrap();
+        assert_eq!(thin.state, crate::agent::thin_state::SessionState::WaitingUser);
+        assert!(thin.question.unwrap().contains("PR #42 的 CI"));
         assert!(settled.failure_code.is_none());
         assert!(settled.remediation_id.is_none());
     }

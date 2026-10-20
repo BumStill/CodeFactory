@@ -3,6 +3,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { UrlTransform } from "react-markdown";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { projectThinState, thinStateCopy } from "../lib/thinState";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
 import { createHighlighter, type Highlighter } from "shiki";
@@ -1358,6 +1359,27 @@ const MessageRow = memo(function MessageRow({
           </div>
         </details>
       )}
+      {(() => {
+        const thin = projectThinState({
+          kind: msg.turnActivity?.kind,
+          label: msg.turnActivity?.label,
+          waitingReason: msg.turnActivity?.waitingReason,
+        });
+        const copy = thinStateCopy(thin);
+        if (!copy || thin.state === "ended") return null;
+        return (
+          <div
+            data-testid="thin-state"
+            data-thin-state={thin.state}
+            className="mt-1 inline-flex max-w-[72ch] items-start gap-1.5 text-caption text-gray-400"
+          >
+            <span className="select-none">
+              {thin.state === "waiting_user" ? "需要你决定" : thin.state === "waiting_wake" ? "等唤醒" : "正在做"}
+            </span>
+            <span className="break-words text-gray-500">{copy.replace(/^(需要你决定|等唤醒|正在做)[：:]?/, "")}</span>
+          </div>
+        );
+      })()}
       {settledDuration && (
         <div
           data-testid="settled-turn-status"
@@ -1374,7 +1396,14 @@ const MessageRow = memo(function MessageRow({
           <TurnResultSnapshot
             plan={msg.plan}
             evidence={evidence}
-            objectiveStatus={msg.turnActivity?.objectiveStatus ?? null}
+            objectiveStatus={(() => {
+              const kind = msg.turnActivity?.kind;
+              if (kind === "thin_ended") return "completed";
+              if (kind === "thin_waiting_wake") return "waiting_system";
+              if (kind === "thin_waiting_user") return "waiting_core_input";
+              if (kind === "thin_running") return "active";
+              return msg.turnActivity?.objectiveStatus ?? null;
+            })()}
             turnBoundaryFailure={turnBoundaryFailure}
             durationMs={msg.durationMs ?? null}
             onOpenEvidence={
