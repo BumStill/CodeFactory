@@ -3810,7 +3810,7 @@ fn parse_release_urgency(s: &str) -> Option<ReleaseUrgency> {
 /// call would replace a self-inflicted release block with a self-inflicted
 /// delivery block. Delivery proceeds on the ordinary cadence and the report
 /// says the signal was ignored.
-fn release_urgency_from_args(args: &Value) -> std::result::Result<Option<ReleaseUrgency>, String> {
+pub(super) fn release_urgency_from_args(args: &Value) -> std::result::Result<Option<ReleaseUrgency>, String> {
     let Some(raw) = args.get("release_urgency") else {
         return Ok(None);
     };
