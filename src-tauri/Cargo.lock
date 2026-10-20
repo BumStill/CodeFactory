@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "codefactory"
-version = "1.90.1"
+version = "1.91.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -569,6 +569,7 @@ dependencies = [
  "codefactory-agent-loop",
  "dashmap",
  "dirs 5.0.1",
+ "encoding_rs",
  "futures",
  "futures-util",
  "getrandom 0.2.17",

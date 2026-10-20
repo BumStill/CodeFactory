@@ -79,6 +79,7 @@ pub const SUBAGENT_ALLOWED_TOOLS: &[&str] = &[
     "edit_file",
     "bash",
     "browser_session",
+    "web_fetch",
 ];
 
 /// The EFFECTIVE dispatch inputs for this session, resolved the same way at
