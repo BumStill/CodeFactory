@@ -3297,7 +3297,6 @@ mod tests {
             holding.send(()).unwrap();
             tokio::time::sleep(Duration::from_millis(300)).await;
             tx.commit().await.unwrap();
-            std::time::Instant::now()
         });
 
         // Never guess how quickly the spawned holder gets scheduled: wait until
@@ -3311,15 +3310,22 @@ mod tests {
         let mut tx = begin_write(&pool)
             .await
             .expect("a busy-but-live writer must not surface as an error");
-        let acquired = std::time::Instant::now();
-        let released = holder.await.expect("the holder must not panic");
-
-        // Lock ordering, not a guessed millisecond window: the second writer can
-        // only acquire once the holder's commit released the lock, never before.
-        assert!(
-            acquired >= released,
-            "the second writer acquired the write lock while the holder still held it"
+        // Lock ordering is observed in the *database* timeline, not by comparing
+        // two `Instant`s captured on two different threads: at the moment commit
+        // releases the lock the OS may wake this task before the holder thread
+        // runs its next instruction, so `acquired < released` even though the
+        // ordering was correct (this was the Windows-CI flake). The committed
+        // value is race-free evidence — the second writer can only read `n = 1`
+        // because `BEGIN IMMEDIATE` kept it out until the holder committed.
+        let visible: i64 = sqlx::query_scalar("SELECT n FROM u23_counter WHERE id = 1")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            visible, 1,
+            "the second writer acquired the write lock before the holder committed"
         );
+        holder.await.expect("the holder must not panic");
         sqlx::query("UPDATE u23_counter SET n = n + 1 WHERE id = 1")
             .execute(&mut *tx)
             .await
