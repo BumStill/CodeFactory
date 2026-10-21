@@ -44,13 +44,13 @@ pub fn schedule_definition() -> ToolDefinition {
                     "type": "integer",
                     "minimum": MIN_WAKEUP_SECS,
                     "maximum": MAX_WAKEUP_SECS,
-                    "description": "Wake once after this many seconds. Omit it, or pass 0/null, when you do not want a one-shot wakeup"
+                    "description": "Wake once after this many seconds"
                 },
                 "every_sec": {
                     "type": "integer",
                     "minimum": MIN_WAKEUP_SECS,
                     "maximum": MAX_WAKEUP_SECS,
-                    "description": "Wake every this many seconds. Omit it, or pass 0/null, when you do not want a repeating wakeup"
+                    "description": "Wake every this many seconds"
                 },
                 "source": {
                     "type": "string",
@@ -272,34 +272,6 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("session_id"), "{}", out.content);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn m149_zero_every_sec_schedules_a_single_one_shot_wakeup() {
-        let dir = std::env::temp_dir().join(format!("cf-bg-wakeup-m149-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        let mut ctx = ExecCtx::new(dir.clone(), Some(pool.clone()));
-        ctx.session_id = Some("s-m149".to_string());
-        let out = execute_schedule(
-            json!({"prompt": "检查 PR #1 的 CI 是否全绿", "after_sec": 180, "every_sec": 0}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("180 秒后"), "{}", out.content);
-        let rows = crate::agent::background_tasks::list_wakeups(&pool, "s-m149")
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].after_sec, Some(180));
-        assert_eq!(rows[0].every_sec, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

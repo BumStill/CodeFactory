@@ -30,7 +30,12 @@ pub fn start_definition() -> ToolDefinition {
         "background_task_start",
         format!("Start a shell command in this session's working directory as a background task and return a task_id immediately. \
          When the command ends (success, failure or timeout) the system wakes this session with the exit code and the output tail. \
-         Use it for anything you would otherwise wait on: CI, long builds, deploys, long test runs, periodic status checks. {}",
+         Use it for anything you would otherwise wait on: CI, long builds, deploys, long test runs, periodic status checks. \
+         A delivered PR is already watched by the system: CI failure, a merge conflict, a queue rejection and the merge \
+         itself all wake this session, so no watcher of your own is needed. If you still need a bounded watch, run it \
+         here with at least 180 seconds between checks, e.g. \
+         `for i in $(seq 1 40); do sleep 180; gh pr checks <PR> --json bucket; done` — tight polling and `gh --watch` \
+         are refused because they burn the shared API quota. {}",
             crate::util::command_env::shell_description()).as_str(),
         json!({
             "type": "object",
@@ -314,6 +319,17 @@ mod tests {
             assert!(definition.function.name.starts_with("background_task_"));
             assert_eq!(definition.function.parameters["type"], "object");
         }
+    }
+
+    #[test]
+    fn m149_start_definition_teaches_the_bounded_watch_shape() {
+        // M149 R2：只说不允许，模型就没有下一步。可执行的形态必须出现在模型一定看得到的
+        // 地方（工具描述），并说明已交付 PR 由系统监视，不必自己轮询。
+        let description = start_definition().function.description;
+        assert!(description.contains("already watched by the system"), "{description}");
+        assert!(description.contains("sleep 180"), "{description}");
+        assert!(description.contains("180 seconds"), "{description}");
+        assert!(description.contains("gh --watch"), "{description}");
     }
 
     #[tokio::test]
