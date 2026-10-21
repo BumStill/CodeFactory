@@ -71,3 +71,10 @@
 - `objective`：终态目标下的 thin 活跃回合不被启动收敛关闭；运行中 thin 会话的 legacy
   决策不写目标终态。
 - 真机（R4）：`sleep 60` → 重启 → 会话保持 running → 续跑输出 `LIVENESS-DONE`。
+
+## 治理登记
+
+`docs/testing/scenario-registry.json` 属于逐字节 trust root，普通候选 PR 不得修改
+（`validate_trust_root_immutability`）。因此本 PR 只按 `Scenario-Test:` 声明已有场景，
+新增的行为测试由 `check-rust` 全量执行；把这些测试补进该场景的 `automated_by`
+需要独立的 external governance bootstrap，和 m129 的处理方式一致。
