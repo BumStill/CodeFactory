@@ -63,6 +63,10 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// `delivery_authorized` intentionally has **no** serde default. A request that
 /// does not state it explicitly does not deserialize at all.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchReleaseUrgency { Immediate, Default, Hold }
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     /// CF-HDE-R1: create a session in a named project and send the first message.
@@ -74,6 +78,8 @@ pub enum Request {
         #[serde(default)]
         permission_mode: Option<String>,
         delivery_authorized: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_urgency: Option<DispatchReleaseUrgency>,
     },
     /// CF-HDE-R1: send a message to an existing session.
     ///
@@ -87,6 +93,8 @@ pub enum Request {
         #[serde(default)]
         mode: Option<String>,
         delivery_authorized: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        release_urgency: Option<DispatchReleaseUrgency>,
     },
     /// CF-HDE-R1: set the session's permission mode.
     SetPermission {

@@ -7,6 +7,7 @@ import { useSettingsStore } from "../stores/settings";
 import { refreshChatGptCatalogIfStale } from "../stores/chatgptCatalog";
 import { evaluateWindow, modelWindowKey } from "../lib/usageWindows";
 import { invoke } from "../lib/tauri";
+import { ReleaseUrgencyPicker } from "./ReleaseUrgencyPicker";
 import { ReasoningEffortPicker } from "./ReasoningEffortPicker";
 import { UsageWindowDialog } from "./UsageWindowDialog";
 
@@ -231,6 +232,7 @@ export function ModelPicker({ portal = false, prominent = false }: ModelPickerPr
               会话策略更改只从下一轮开始生效；当前运行中的回合不会改路。
             </p>
             <ReasoningEffortPicker embedded />
+            <ReleaseUrgencyPicker />
           </>
         )}
         {endpointKeys.length > 1 && (

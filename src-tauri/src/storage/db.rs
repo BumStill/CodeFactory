@@ -1374,6 +1374,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
+    ensure_column(pool, "sessions", "release_urgency", "TEXT NOT NULL DEFAULT 'default'").await?;
     ensure_column(pool, "sessions", "delivery_ceiling", "TEXT").await?;
     // Per-session permission preset. Existing sessions get standard so old
     // global allow/ask/deny details no longer leak into the primary UX.
@@ -1751,6 +1752,35 @@ fn sidecar_path(db: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn m137_dispatch_policy_survives_database_reopen_and_omitted_followup() {
+        use crate::headless_dispatch::parse_request;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.sqlite");
+        let url = format!("sqlite://{}", path.display());
+        let pool = super::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic','Synthetic','/synthetic','model',1,1)").execute(&pool).await.unwrap();
+        let initial: String = sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id='synthetic'").fetch_one(&pool).await.unwrap();
+        assert_eq!(initial, "default");
+        for policy in ["immediate", "default", "hold"] {
+            for operation in ["send", "create_and_send"] {
+                let mut payload = serde_json::json!({"operation":operation,"message":"Synthetic message","delivery_authorized":true,"release_urgency":policy});
+                if operation == "send" { payload["session_id"] = "synthetic".into(); }
+                else { payload["project"] = "/synthetic".into(); }
+                let request = parse_request(&payload.to_string()).unwrap();
+                assert_eq!(serde_json::to_value(request).unwrap()["release_urgency"], policy);
+                sqlx::query("UPDATE sessions SET release_urgency=? WHERE id='synthetic'").bind(policy).execute(&pool).await.unwrap();
+            }
+        }
+        pool.close().await;
+        let pool = super::connect(&url).await.unwrap();
+        let followup = parse_request(r#"{"operation":"send","session_id":"synthetic","message":"next","delivery_authorized":true}"#).unwrap();
+        assert!(serde_json::to_value(followup).unwrap().get("release_urgency").is_none());
+        let persisted: String = sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id='synthetic'").fetch_one(&pool).await.unwrap();
+        assert_eq!(persisted, "hold");
+        pool.close().await;
+    }
+
     use super::*;
 
     #[tokio::test]

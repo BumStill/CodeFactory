@@ -79,12 +79,14 @@ export interface DispatchHandlers {
     model?: string;
     permissionMode?: DispatchPermissionMode;
     deliveryAuthorized: boolean;
+    releaseUrgency?: "immediate" | "default" | "hold";
   }) => Promise<unknown>;
   send: (input: {
     sessionId: string;
     message: string;
     mode: DispatchSendMode;
     deliveryAuthorized: boolean;
+    releaseUrgency?: "immediate" | "default" | "hold";
   }) => Promise<unknown>;
   setPermission: (input: { sessionId: string; mode: DispatchPermissionMode }) => Promise<unknown>;
   closeObjective?: (input: {
@@ -131,6 +133,11 @@ function optionalString(value: unknown, field: string): string | undefined {
  * 与原生侧同一条规则：字段缺失就不是一个合法请求。消息里写着"merge the PR"
  * 但没带这个字段，一样拒绝。
  */
+function requiredReleaseUrgency(value: unknown): "immediate" | "default" | "hold" {
+  if (value === "immediate" || value === "default" || value === "hold") return value;
+  throw new Error("release_urgency must be immediate, default or hold");
+}
+
 function requiredDeliveryAuthorization(value: unknown): boolean {
   if (typeof value !== "boolean") {
     throw new Error("delivery_authorized must be an explicit boolean");
@@ -181,6 +188,7 @@ export async function applyDispatchRequest(
             body.permission_mode === undefined
               ? undefined
               : requiredPermissionMode(body.permission_mode),
+          ...(body.release_urgency === undefined ? {} : { releaseUrgency: requiredReleaseUrgency(body.release_urgency) }),
           deliveryAuthorized: requiredDeliveryAuthorization(body.delivery_authorized),
         });
         break;
@@ -192,6 +200,7 @@ export async function applyDispatchRequest(
             body.mode === undefined
               ? DEFAULT_DISPATCH_SEND_MODE
               : requiredSendMode(body.mode),
+          ...(body.release_urgency === undefined ? {} : { releaseUrgency: requiredReleaseUrgency(body.release_urgency) }),
           deliveryAuthorized: requiredDeliveryAuthorization(body.delivery_authorized),
         });
         break;

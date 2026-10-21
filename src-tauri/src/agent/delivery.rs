@@ -3961,7 +3961,7 @@ fn missing_release_metadata(expected_message: &str, actual_message: &str) -> Vec
     missing
 }
 
-fn append_release_urgency(message: String, urgency: Option<ReleaseUrgency>) -> String {
+pub(crate) fn append_release_urgency(message: String, urgency: Option<ReleaseUrgency>) -> String {
     let Some(urgency) = urgency else {
         return message;
     };
@@ -3973,7 +3973,8 @@ fn append_release_urgency(message: String, urgency: Option<ReleaseUrgency>) -> S
         return message;
     }
     let footer_started = !release_urgency_trailers(&message).is_empty()
-        || !breaking_change_trailers(&message).is_empty();
+        || !breaking_change_trailers(&message).is_empty()
+        || message.rsplit("\n\n").next().is_some_and(|footer| footer.lines().any(|line| line.starts_with("Co-Authored-By:")));
     format!(
         "{}{}Release-Urgency: {value}",
         message.trim_end(),

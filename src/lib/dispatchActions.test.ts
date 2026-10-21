@@ -57,6 +57,18 @@ function mkSession(id: string, extra: Partial<Session> = {}): Session {
 }
 
 /** 会话 A 是要被操作的会话，B 是界面里当前显示的那个（M56 的现场）。 */
+describe("M137 session urgency persistence", () => {
+  it("persists explicit urgency before queueing and leaves it unchanged on later omitted turns", async () => {
+    seed({ a: { streaming: true } });
+    invokeMock.mockResolvedValue(true);
+    await dispatchSend({ sessionId: "A", message: "synthetic first", mode: "queue", releaseUrgency: "immediate" });
+    expect(invokeMock).toHaveBeenCalledWith("update_session_release_urgency", { sessionId: "A", urgency: "immediate" });
+    invokeMock.mockClear();
+    await dispatchSend({ sessionId: "A", message: "synthetic next", mode: "queue" });
+    expect(invokeMock.mock.calls.some(([command]) => command === "update_session_release_urgency")).toBe(false);
+  });
+});
+
 const sessionA = mkSession("A");
 const sessionB = mkSession("B");
 
