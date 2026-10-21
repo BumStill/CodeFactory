@@ -426,6 +426,17 @@
       "automated_by": ["rust:begin_write_waits_for_a_contended_writer_instead_of_failing"],
       "required_evidence": ["L1"],
       "gates": ["pull_request"]
+    },
+    {
+      "id": "HLT-006",
+      "name": "模型请求有界等待与首字节可见",
+      "category": "long_task_continuity",
+      "priority": "P0",
+      "source_kind": "anonymized_history_shape",
+      "change_patterns": ["src-tauri/src/http_util.rs", "src-tauri/src/agent/model_transport.rs", "src-tauri/src/agent/internal_text.rs", "src-tauri/src/openrouter/client.rs", "src-tauri/src/agent/mod.rs", "src/components/MessageList.tsx"],
+      "automated_by": ["rust:model_request_without_first_byte_times_out_instead_of_hanging", "rust:model_request_budgets_are_finite", "rust:first_byte_timeout_classifies_as_transport_failure", "path:src/components/MessageList.turnStatus.test.tsx"],
+      "required_evidence": ["L0", "L1", "L2"],
+      "gates": ["pull_request"]
     }
   ],
   "complex_e2e_cases": [
