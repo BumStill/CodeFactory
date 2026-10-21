@@ -613,6 +613,17 @@ mod pr_body_guard {
     /// instead of re-serialising the whole command (which would mangle unrelated
     /// quoting).
     fn tokenize(command: &str) -> Vec<Token> {
+        // Windows shells (PowerShell) use `\` as a path separator, not an escape
+        // character — popping it would turn `C:\Users\b.md` into `C:Usersb.md`.
+        // Its double-quote escape character is the backtick instead.
+        let windows = cfg!(windows);
+        let escape_in_quotes = |active: char, current: char| {
+            if windows {
+                active == '"' && current == '`'
+            } else {
+                active == '"' && current == '\\'
+            }
+        };
         let mut tokens = Vec::new();
         let mut iter = command.char_indices().peekable();
         while let Some(&(start, ch)) = iter.peek() {
@@ -631,7 +642,7 @@ mod pr_body_guard {
                         end = index + current.len_utf8();
                         continue;
                     }
-                    if active == '"' && current == '\\' {
+                    if escape_in_quotes(active, current) {
                         // POSIX: inside double quotes only `$ ` " \` and newline are
                         // escaped; a `\n` in a PR body must stay a literal backslash-n,
                         // otherwise the body text we read back differs from what `gh`
@@ -648,8 +659,8 @@ mod pr_body_guard {
                                 end = escape_index + 1;
                             }
                             _ => {
-                                text.push('\\');
-                                end = index + 1;
+                                text.push(current);
+                                end = index + current.len_utf8();
                             }
                         }
                         continue;
@@ -668,7 +679,7 @@ mod pr_body_guard {
                     end = index + current.len_utf8();
                     continue;
                 }
-                if current == '\\' {
+                if current == '\\' && !windows {
                     iter.next();
                     if let Some(&(_, escaped)) = iter.peek() {
                         text.push(escaped);
@@ -855,6 +866,33 @@ mod guard_tests {
         assert!(written.contains("Release-Urgency: immediate"), "{written}");
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "plain body");
     }
+
+    #[test]
+    fn m147b_quoted_body_file_path_with_spaces_is_handled() {
+        // Quoting is what a real shell needs for a path with spaces; on Windows the
+        // quoted text also carries backslashes, which must reach the guard intact.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pr body.md");
+        std::fs::write(&source, "plain body").unwrap();
+        let guarded = guard_command(
+            &format!("gh pr edit 818 --body-file '{}'", source.display()),
+            dir.path(),
+            immediate(),
+        )
+        .expect("the command must still be recognised");
+        assert!(!guarded.command.contains(&source.display().to_string()), "{}", guarded.command);
+        assert!(guarded.command.contains("--body-file "), "{}", guarded.command);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "plain body");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn m147b_unquoted_windows_path_is_not_treated_as_an_escape() {
+        use super::pr_body_guard::tokenize;
+        let tokens = tokenize(r"gh pr edit 818 --body-file C:\Users\dev\body.md");
+        assert_eq!(tokens.last().unwrap().text, r"C:\Users\dev\body.md");
+    }
+
 
     #[test]
     fn m147b_unrelated_commands_are_never_rewritten() {
