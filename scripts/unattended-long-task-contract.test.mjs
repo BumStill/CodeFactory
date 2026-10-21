@@ -232,10 +232,15 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
     ),
     "every scenario must name an executable automation target",
   );
-  const implementation = `${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${thinDerive}\n${thinRestart}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}`;
+  const thinDelivery = await source("src-tauri/src/tools/delivery_thin.rs");
+  const implementation = `${thinDelivery}\n${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${thinDerive}\n${thinRestart}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}`;
   for (const scenario of parsed.scenarios.filter((item) => legacy.scenario_ids.includes(item.id))) {
     for (const automation of scenario.automated_by) {
       const target = automation.slice(automation.indexOf(":") + 1);
+      if (automation.startsWith("path:")) {
+        assert.ok((await source(target)).trim().length > 0, `${scenario.id} points at empty automation ${automation}`);
+        continue;
+      }
       assert.ok(
         implementation.includes(target),
         `${scenario.id} points at missing automation ${automation}`,
