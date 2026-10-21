@@ -433,7 +433,7 @@
       "category": "runtime_lifecycle",
       "priority": "P0",
       "source_kind": "product_contract",
-      "change_patterns": ["src-tauri/src/agent/background_tasks.rs", "src-tauri/src/tools/background_task.rs", "src-tauri/src/commands/background.rs", "src-tauri/src/commands/control_plane.rs", "src-tauri/src/util/process_tree.rs", "src-tauri/src/util/command_activity.rs", "src-tauri/src/util/command_env.rs", "src-tauri/src/config/settings.rs", "src/components/SessionBackgroundTasks.tsx", "src/lib/backgroundTasks.ts"],
+      "change_patterns": ["src-tauri/src/agent/background_tasks.rs", "src-tauri/src/tools/background_task.rs", "src-tauri/src/commands/background.rs", "src-tauri/src/commands/control_plane.rs", "src-tauri/src/util/process_tree.rs", "src-tauri/src/util/command_activity.rs", "src-tauri/src/util/mod.rs", "src-tauri/src/util/command_env.rs", "src-tauri/src/config/settings.rs", "src/components/SessionBackgroundTasks.tsx", "src/lib/backgroundTasks.ts"],
       "automated_by": ["pnpm:test:background-tasks:headless"],
       "required_evidence": ["L1", "L3"],
       "gates": ["pull_request"]
