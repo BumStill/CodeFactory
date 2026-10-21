@@ -561,6 +561,39 @@ pub async fn delivery_channel_status(
     Ok(DeliveryChannelStatus { gh_cli, rest_token })
 }
 
+/// M145-R3: one stop notice per stopped turn.
+///
+/// `cancel_chat` is called for every stop, including a second stop of the same
+/// turn; the user reported two consecutive "已停止…" lines for one stop. A notice
+/// is the assistant's answer to the *current* user message, so it is inserted
+/// only when the turn has no stop notice yet. Returns the inserted row count.
+pub(crate) async fn insert_stop_notice_once(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    content: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, created_at)
+         SELECT ?, ?, 'assistant', ?, ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM messages earlier
+           WHERE earlier.session_id=? AND earlier.role='assistant'
+             AND earlier.content LIKE '已停止%'
+             AND earlier.created_at >= COALESCE(
+               (SELECT MAX(user_message.created_at) FROM messages user_message
+                WHERE user_message.session_id=? AND user_message.role='user'), 0))",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(session_id)
+    .bind(content)
+    .bind(Utc::now().timestamp_millis())
+    .bind(session_id)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 #[tauri::command]
 pub async fn cancel_chat(
     app: AppHandle,
@@ -609,9 +642,13 @@ pub async fn cancel_chat(
     {
         Ok(report) => {
             let content = format!("{}\n{}", report.notice, report.notes.join("\n"));
-            sqlx::query("INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)")
-                .bind(Uuid::new_v4().to_string()).bind(&session_id).bind(&content)
-                .bind(Utc::now().timestamp_millis()).execute(&pool).await?;
+            // M145-R3: the notice belongs to the turn the user stopped, so a
+            // second stop of the same turn must not add a second line, and a
+            // session that never had a delivery must not be told about PRs.
+            let inserted = insert_stop_notice_once(&pool, &session_id, &content).await?;
+            if inserted == 0 {
+                tracing::info!(session_id, "cancel_chat: 该回合已有停止通知，跳过重复插入");
+            }
             tracing::info!(session_id, pr_number = ?report.pr_number,
                 complete = report.is_complete(), notes = ?report.notes,
                 "cancel_chat: 停止栅栏及 PR 撤回结果已写入会话");
@@ -622,7 +659,7 @@ pub async fn cancel_chat(
             "cancel_chat: 停止栅栏写入失败；交付可能仍认为自己可以继续"
         ),
     }
-    let stopped = cancel_system_owned_chat(&app, &pool, &session_id).await?;
+    let stopped = settle_chat_stop_with_retry(&app, &pool, &session_id).await?;
     if let Some(control) = control.as_ref() {
         clear_chat_running_if_current(&state.chat_cancels, &session_id, control).await;
     }
@@ -670,6 +707,40 @@ async fn live_chat_objectives(
 /// message stuck behind it. An explicit user stop is also the only authority
 /// that may abandon an Objective whose external side effect stayed uncertain —
 /// `explicit_cancel` provenance is exactly what the durable store requires.
+/// M145-R2: settling a stop writes through the same SQLite writer as everything
+/// else, so on Windows it can lose the `database is locked` race. A failed
+/// settlement must not park the intent at `requested` forever: retry with a
+/// short bounded backoff, and when every attempt fails say so instead of
+/// pretending the stop reached the database. (M145-R1 additionally lets the
+/// user's next message finish the same intent.)
+async fn settle_chat_stop_with_retry(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+) -> Result<usize, AppError> {
+    const BACKOFF_MS: [u64; 3] = [0, 150, 400];
+    let mut last_error = None;
+    for (attempt, delay_ms) in BACKOFF_MS.iter().enumerate() {
+        if *delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+        }
+        match cancel_system_owned_chat(app, pool, session_id).await {
+            Ok(stopped) => return Ok(stopped),
+            Err(error) => {
+                tracing::warn!(session_id, attempt = attempt + 1, %error,
+                    "M145: 停止结算失败，按退避重试");
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+    tracing::warn!(
+        session_id,
+        error = ?last_error,
+        "M145: 停止结算重试耗尽；意图保持 requested，用户的下一条消息会完成结算"
+    );
+    Ok(0)
+}
+
 async fn cancel_system_owned_chat(
     app: &AppHandle,
     pool: &sqlx::SqlitePool,
@@ -2663,6 +2734,24 @@ async fn admit_persisted_chat_turn(
         .map(str::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = Utc::now().timestamp_millis();
+    // M145-R1: the user's new message is itself the "continue" intent. A stop
+    // whose settlement failed (Windows `database is locked`) used to leave a
+    // `requested` intent behind, and every later admission was refused by the
+    // durable fence below — the session stayed unusable until a restart. Finish
+    // any stop that predates this message (cancelling what it left live) before
+    // the new turn is admitted; a stop that arrives *during* admission still
+    // fences, which is why the in-transaction check stays.
+    let settled_stops = crate::agent::objective::ObjectiveStore::new(pool.clone())
+        .settle_stale_chat_session_cancel(session_id, now)
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?;
+    if settled_stops > 0 {
+        tracing::info!(
+            session_id,
+            cancelled_objectives = settled_stops,
+            "M145: 新消息结算了遗留的会话停止意图"
+        );
+    }
     let mut tx = pool.begin().await?;
     let session_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id=?")
         .bind(session_id)
