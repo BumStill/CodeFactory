@@ -30,7 +30,8 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$HOME/**/.codefactory/attachments/**"
+          "$HOME/**/.codefactory/attachments/**",
+          "$APPDATA/attachments/**"
         ]
       }
     }

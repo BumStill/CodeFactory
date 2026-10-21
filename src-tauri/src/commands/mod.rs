@@ -13,6 +13,7 @@ pub mod dispatch;
 pub mod document;
 pub mod evidence;
 pub mod evolution;
+pub mod file_links;
 pub mod files;
 pub mod git;
 pub mod git_remote;

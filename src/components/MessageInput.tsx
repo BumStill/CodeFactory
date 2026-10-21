@@ -76,6 +76,7 @@ interface Props {
   /** cwd of the active session — required for attachment saves to land
    *  in the right project's .codefactory/attachments dir. Without it,
    *  paste/drop are silently ignored. */
+  sessionId?: string | null;
   cwd?: string | null;
   /** Seed ↑/↓ recall with this session's already-sent user messages (oldest
    *  first). Combined with a per-session `key`, recall is scoped per session. */
@@ -117,7 +118,7 @@ export function readComposerText(
   return stateValue.trim();
 }
 
-export const MessageInput = forwardRef<MessageInputHandle, Props>(function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, steeringActive = guidanceActive, hasPendingSteer = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, initialHistory, toolbar }: Props, handleRef) {
+export const MessageInput = forwardRef<MessageInputHandle, Props>(function MessageInput({ onSend, onGuide, onCommand, onCancel, streaming, guidanceActive = false, steeringActive = guidanceActive, hasPendingSteer = false, disabled, pendingInsert, onInsertConsumed, skillSlashCommands = [], cwd, sessionId, initialHistory, toolbar }: Props, handleRef) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
   const [attachments, setAttachments] = useState<AttachmentChip[]>([]);
@@ -151,10 +152,6 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
   // is appended at SEND time, not now, so chips can be removed without
   // hunting through the textarea content.
   const saveAttachmentFile = async (file: File): Promise<void> => {
-    if (!cwd) {
-      setAttachError("打开一个项目后才能附加文件");
-      return;
-    }
     setUploading(true);
     setAttachError(null);
     try {
@@ -169,7 +166,7 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
       const b64 = btoa(binary);
       const saved = await invoke<AttachmentChip & { size_bytes: number }>(
         "save_chat_attachment",
-        { cwd, filename: file.name || "pasted.png", dataBase64: b64 },
+        { cwd: cwd ?? null, sessionId: sessionId ?? null, filename: file.name || "pasted.png", dataBase64: b64 },
       );
       // Display the original filename (the on-disk name is a uuid); the
       // original name's extension is what tells images from documents.
@@ -525,10 +522,10 @@ export const MessageInput = forwardRef<MessageInputHandle, Props>(function Messa
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
-          disabled={!cwd || uploading}
+          disabled={uploading}
           aria-label="附加文件"
           className="flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-lg text-gray-500 transition-colors enabled:hover:bg-surface-4 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:opacity-30 lg:h-[36px] lg:w-[36px]"
-          title={cwd ? "附加文件（图片 / pptx / docx / pdf / xlsx）" : "打开项目后可附加文件"}
+          title="附加文件（图片 / pptx / docx / pdf / xlsx）"
         >
           <Paperclip size={16} />
         </button>

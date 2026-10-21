@@ -84,18 +84,16 @@ describe("MessageInput attachments", () => {
     );
   });
 
-  it("paste with no cwd shows an error and does NOT invoke save", () => {
-    setup({ cwd: null });
-    const textarea = screen.getByRole("textbox");
-    fireEvent.paste(textarea, {
-      clipboardData: {
-        items: [
-          { kind: "file", type: "image/png", getAsFile: () => makeImageFile() },
-        ],
-      },
+  it("paste with no cwd saves an attachment and sends its absolute path (R1)", async () => {
+    invokeMock.mockResolvedValue({ path: "/app/attachments/session/x.png", name: "x.png", size_bytes: 4 });
+    const { onSend } = setup({ cwd: null });
+    fireEvent.paste(screen.getByRole("textbox"), {
+      clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => makeImageFile() }] },
     });
-    expect(invokeMock).not.toHaveBeenCalled();
-    expect(screen.getByText(/打开一个项目/)).toBeInTheDocument();
+    await screen.findByRole("img", { name: "screenshot.png" });
+    expect(invokeMock).toHaveBeenCalledWith("save_chat_attachment", expect.objectContaining({ cwd: null }));
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("![screenshot.png](file:///app/attachments/session/x.png)");
   });
 
   it("paste of plain text doesn't trigger save (only images)", () => {

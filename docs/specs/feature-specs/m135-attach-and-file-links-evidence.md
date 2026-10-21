@@ -1,0 +1,25 @@
+## 摘要
+修复无项目聊天附件上传，以及消息与工具产物本地链接静默失败。使用受控原生命令，保持 scheme scope 不变。
+
+Release-Urgency: immediate
+Scenario-Test: SC-001
+README-Update: reviewed
+README-Update-Reason: 修复既有附件与文件打开承诺，不改变公开安装或隐私承诺。
+
+## Req ↔ 验收
+- R1：MessageInput.attachments.test.tsx 无 cwd 上传预览与发送，先失败后通过；项目目录行为回归通过。
+- R2：fileLinks.test.ts 路由回归先失败后通过；ToolCallCard.test.tsx 验证会话 cwd 与原始路径；真实浏览器本地/相对链接、打开按钮、缺失文件 toast 通过。
+- R3：Rust file_links::tests 覆盖 scheme 拒绝、脚本/可执行/未知类型显示；不扩大 shell scope。全量 Rust 主库 1,852 项通过（12 项忽略），M135 三项回归通过；前端 155 个文件、1,035 项测试通过，pnpm build 通过。
+- R4：fileLinks.test.ts 及 Rust 路径矩阵覆盖 Windows 盘符、UNC、长路径前缀与 URL 解码，作为 macOS 主机上的 Windows 替代证据。
+- R5：headless 四组 light/dark × 1366/480，上传图片并发送、点击文件链接和打开、错误提示、无横向溢出均通过。截图在系统临时目录 codefactory-m135-headless/{light,dark}-{1366,480}.png。
+
+## Applicable Harnesses
+Spec：仓库 M135 原文规格；Compatibility：跨平台路径矩阵；Payload：附件 IPC 字节与路径断言；Viewport：真实 Chrome 明暗宽窄截图；Observation：可见失败 toast；Release：授权仅到合并，not live，真机验收由编排方发版后完成；AI Collaboration：单执行流，未调用 delegate_tasks，遵循任务模板。
+
+## AI Collaboration
+context scope：仅附件上传与本地文件链接；assumptions：无 cwd 使用 app data 附件目录；review point：scheme、执行权限、session 路径隔离；validation result：定向单测、浏览器验收和前端构建通过，全量验证记录随交付更新。
+
+## 真机与后台操作
+真机验收由编排方发版后完成：安装后分别在 Mac/Windows 无项目会话上传图片发送，打开生成的 PDF/目录，点击脚本只显示，缺失文件显示错误。已有 dispatchSend 可发送绝对附件路径；本次原生命令可通过 IPC 调用，不依赖坐标交互。
+
+Spec Amendment: 无。

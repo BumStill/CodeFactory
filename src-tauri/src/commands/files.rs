@@ -143,14 +143,18 @@ pub struct SavedAttachment {
 /// is a follow-up PR.
 #[tauri::command]
 pub async fn save_chat_attachment(
-    cwd: String,
+    app: tauri::AppHandle,
+    cwd: Option<String>,
+    session_id: Option<String>,
     filename: String,
     data_base64: String,
 ) -> Result<SavedAttachment, String> {
     use base64::{engine::general_purpose, Engine as _};
     use std::path::PathBuf;
 
-    let dir = PathBuf::from(&cwd).join(".codefactory").join("attachments");
+    use tauri::Manager;
+    let data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let dir = super::file_links::attachment_dir(&data, cwd.as_deref(), session_id.as_deref())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
 
     // Decode + sanitize filename. We keep only the extension from the

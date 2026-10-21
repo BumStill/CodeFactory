@@ -4,6 +4,7 @@ import { Copy, ExternalLink, FileText, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { invoke } from "../lib/tauri";
+import { openFileLinkVisible } from "../lib/fileLinks";
 import { FileArtifactCard } from "./FileArtifactCard";
 
 interface DocumentPreviewData {
@@ -54,7 +55,7 @@ export function DocumentPreview({ tab, cwd, onClose }: Props) {
         <button type="button" className={headerActionClass} onClick={() => void navigator.clipboard?.writeText(preview?.path ?? tab.path)} aria-label={`复制路径 ${tab.title}`}>
           <Copy size={14} />
         </button>
-        <button type="button" className={headerActionClass} onClick={() => void invoke("plugin:shell|open", { path: preview?.path ?? tab.path }).catch(() => {})} aria-label={`系统打开 ${tab.title}`}>
+        <button type="button" className={headerActionClass} onClick={() => openFileLinkVisible(preview?.path ?? tab.path, cwd)} aria-label={`系统打开 ${tab.title}`}>
           <ExternalLink size={14} />
         </button>
         <button type="button" className={headerActionClass} onClick={onClose} aria-label={`关闭文档 ${tab.title}`}>

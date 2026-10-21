@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Copy, ExternalLink, FileText, Eye } from "lucide-react";
-import { invoke } from "../lib/tauri";
+import { useContext } from "react";
+import { FileLinkScope, openFileLinkVisible, resolveLocalPath } from "../lib/fileLinks";
 
 const TEXT_EXTENSIONS = new Set([
   "md", "markdown", "txt", "json", "yaml", "yml", "toml", "csv",
@@ -9,10 +10,7 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 export function resolveFilePath(cwd: string | null | undefined, path: string): string {
-  const raw = path.startsWith("file://") ? path.slice("file://".length) : path;
-  if (/^(\/|\\\\|[A-Za-z]:[\\/])/.test(raw) || !cwd) return raw;
-  const separator = cwd.includes("\\") ? "\\" : "/";
-  return `${cwd.replace(/[\\/]+$/, "")}${separator}${raw.replace(/^[\\/]+/, "")}`;
+  return resolveLocalPath(cwd, path);
 }
 
 export function isDocumentPath(value: string): boolean {
@@ -41,10 +39,12 @@ interface Props {
 }
 
 export function FileArtifactCard({ path, cwd, onPreview, compact = false }: Props) {
+  const scope = useContext(FileLinkScope);
+  cwd = cwd ?? scope.cwd;
   const resolved = resolveFilePath(cwd, path);
   const name = basename(path);
   const handleOpen = () => {
-    void invoke("plugin:shell|open", { path: resolved }).catch(() => {});
+    openFileLinkVisible(path, cwd, scope.sessionId);
   };
   const handleCopy = () => {
     void navigator.clipboard?.writeText(resolved);
