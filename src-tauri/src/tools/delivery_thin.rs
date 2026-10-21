@@ -155,15 +155,20 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
     // M132: resolve the title first — a delivery that cannot describe itself must
     // not write `fix: <branch>` into the commit history or onto the PR.
     let title = resolve_title(commands, args, &branch)?;
+    // M147b: the urgency has to exist before the commit is written. The PR body
+    // is rewritable (nobody can stop a later `gh pr edit --body`), the commit
+    // message is not — so the trailer is persisted here as the durable copy the
+    // merge queue falls back to when the body carries none.
+    let urgency = super::delivery::release_urgency_from_args(args)?;
+    let commit_message = delivery::append_release_urgency(title.clone(), urgency);
     let paths = commands.stage(excludes)?;
     if !paths.is_empty() {
-        commands.git(&["commit", "-m", &title])?;
+        commands.git(&["commit", "-m", &commit_message])?;
         log.step("commit", "created");
     } else { log.step("commit", "unchanged"); }
     let sha = commands.git(&["rev-parse", "HEAD"])?;
     // The committed tree is now the thing the body describes; derive the required
     // declarations and refuse a body CI would reject before touching the remote.
-    let urgency = super::delivery::release_urgency_from_args(args)?;
     let requested_body = args.get("body").and_then(Value::as_str).unwrap_or("");
     let (warnings, elapsed_ms) = commands.precheck_governance()?;
     log.step("governance_precheck", &format!("{elapsed_ms} ms"));
@@ -331,6 +336,8 @@ mod tests {
         // branch carries (`git log --format=%s`, newest first).
         subjects: Vec<String>, pr_title: Option<String>,
         created_title: Option<String>, edited_title: Option<String>,
+        // M147b: the commit message the local commit actually carried.
+        commit_message: Option<String>,
     }
     impl Commands for Forge {
         fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {
@@ -339,7 +346,7 @@ mod tests {
             if let Some(error) = &self.governance_error { return Err(error.clone()); }
             Ok((self.governance_warnings.clone(), 12))
         }
-        fn stage(&mut self, _: &[String]) -> Result<Vec<String>,String> { self.events.push("stage"); Ok(vec![]) }
+        fn stage(&mut self, _: &[String]) -> Result<Vec<String>,String> { self.events.push("stage"); Ok(vec!["synthetic.rs".into()]) }
         fn reconcile_body(&mut self, _title: &str, body: &str, urgency: Option<ReleaseUrgency>) -> Result<String,String> {
             self.events.push("pr_body");
             let body = delivery::append_release_urgency(body.to_string(), urgency);
@@ -353,6 +360,12 @@ mod tests {
                 "branch" => "feature".into(), "rev-parse" => "abc123".into(),
                 "ls-remote" if self.pushed => "abc123\trefs/heads/feature".into(),
                 "log" => self.subjects.join("\n"),
+                "commit" => {
+                    self.events.push("commit");
+                    self.commit_message = a.iter().position(|arg| *arg == "-m")
+                        .and_then(|index| a.get(index + 1)).map(|message| message.to_string());
+                    String::new()
+                },
                 "push" => { self.pushed = true; self.pushes += 1; self.events.push("push"); String::new() },
                 _ => String::new(),
             })
@@ -579,5 +592,41 @@ mod tests {
             subjects: vec!["feat: derive the PR title from the commit".to_string()], ..Default::default() };
         run(&mut forge, &json!({"body":"synthetic"}), DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
         assert_eq!(forge.edited_title.as_deref(), Some("feat: derive the PR title from the commit"));
+    }
+
+    // ---- M147b: the urgency trailer must survive a later PR-body rewrite ------
+    // #818 carried `release_urgency=immediate` in its session row yet the merged
+    // PR body had no `Release-Urgency:` trailer, so the batch was never cut. The
+    // body was the only carrier; the commit message is the durable one.
+
+    #[test]
+    fn m147b_thin_commit_carries_the_release_urgency_trailer() {
+        let mut forge = Forge::default();
+        run(&mut forge, &json!({"title":"fix: thin","body":"synthetic","release_urgency":"immediate"}),
+            DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+        let message = forge.commit_message.clone().expect("the delivery must create a commit");
+        assert_eq!(message.lines().next(), Some("fix: thin"), "{message}");
+        assert!(message.trim_end().ends_with("Release-Urgency: immediate"), "{message}");
+        let body = forge.created_body.clone().expect("pr create must carry the body");
+        assert!(body.contains("Release-Urgency: immediate"), "{body}");
+    }
+
+    #[test]
+    fn m147b_thin_commit_without_urgency_carries_no_trailer() {
+        let mut forge = Forge::default();
+        run(&mut forge, &json!({"title":"fix: thin","body":"synthetic"}),
+            DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+        let message = forge.commit_message.clone().expect("the delivery must create a commit");
+        assert!(!message.contains("Release-Urgency"), "{message}");
+    }
+
+    #[test]
+    fn m147b_hold_mandate_reaches_the_commit_trailer() {
+        let mut forge = Forge::default();
+        run(&mut forge, &json!({"title":"fix: thin","body":"synthetic","release_urgency":"hold",
+                "hold_requested_by_user":"user asked to hold the batch"}),
+            DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+        let message = forge.commit_message.clone().expect("the delivery must create a commit");
+        assert!(message.trim_end().ends_with("Release-Urgency: hold"), "{message}");
     }
 }

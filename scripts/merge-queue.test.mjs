@@ -1,3 +1,28 @@
+// M147b: the PR body is rewritable, so the merge queue falls back to the commit
+// message trailer. #818 merged with `release_urgency=immediate` and a body that
+// carried no `Release-Urgency:` -> no release was cut.
+import { squashMessage as m147bSquash } from './merge-queue.mjs';
+
+test('m147b: a body without the trailer still yields the commit trailer', () => {
+  const { body, trailers } = m147bSquash(
+    'fix: keep the urgency',
+    '## Summary\n\nRewritten prose with no trailer.',
+    ['fix: keep the urgency\n\nRelease-Urgency: immediate'],
+  );
+  assert.ok(trailers.includes('Release-Urgency: immediate'), JSON.stringify(trailers));
+  assert.match(body, /Release-Urgency: immediate/);
+});
+
+test('m147b: a body that kept the trailer still wins over the commit', () => {
+  const { body } = m147bSquash(
+    'fix: keep the urgency',
+    'Prose.\n\nRelease-Urgency: hold',
+    ['fix: keep the urgency\n\nRelease-Urgency: immediate'],
+  );
+  assert.match(body, /Release-Urgency: hold/);
+  assert.doesNotMatch(body, /Release-Urgency: immediate/);
+});
+
 // M141: a CI completion must not require another webhook to be observed.
 for (const pendingKind of ['running', 'missing', 'stale']) {
   test(`M141-R2: ${pendingKind} checks turn green without a new event`, async () => {
