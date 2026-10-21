@@ -902,9 +902,15 @@ pub fn validate_wakeup_delay(
     after_sec: Option<u64>,
     every_sec: Option<u64>,
 ) -> Result<(Option<u64>, Option<u64>), String> {
+    // M149 R1：模型习惯一次把两个字段都写上，不用的那个填 0 表示「没有」。
+    // 0 与缺失、null 同义；否则一次性的等待会被判成二选一冲突，本回合就没有唤醒源。
+    let after_sec = after_sec.filter(|value| *value > 0);
+    let every_sec = every_sec.filter(|value| *value > 0);
     if after_sec.is_some() && every_sec.is_some() {
         return Err(
-            "after_sec 与 every_sec 只能二选一：要一次性唤醒用 after_sec，要周期性唤醒用 every_sec。"
+            "after_sec 与 every_sec 只能二选一：要一次性唤醒用 after_sec，要周期性唤醒用 every_sec；\
+             不想用的那个字段省略或传 0/null。例：\
+             {\"prompt\":\"检查 PR #123 的 CI 是否全绿\",\"after_sec\":180}"
                 .to_string(),
         );
     }
@@ -916,7 +922,8 @@ pub fn validate_wakeup_delay(
         (None, None) => {
             return Err(format!(
                 "必须给出唤醒时间：after_sec（{MIN_WAKEUP_SECS} 秒后唤醒一次）或 every_sec\
-                 （每 N 秒唤醒一次），范围 {MIN_WAKEUP_SECS}–{MAX_WAKEUP_SECS} 秒。"
+                 （每 N 秒唤醒一次），范围 {MIN_WAKEUP_SECS}–{MAX_WAKEUP_SECS} 秒。例：\
+                 {{\"prompt\":\"检查 PR #123 的 CI 是否全绿\",\"after_sec\":180}}"
             ))
         }
     };
@@ -2106,6 +2113,26 @@ mod tests {
         assert!(validate_wakeup_delay(None, Some(0)).is_err());
         assert!(validate_wakeup_delay(None, None).is_err());
         assert!(validate_wakeup_delay(Some(600), Some(600)).is_err());
+    }
+
+    #[test]
+    fn m149_zero_valued_wakeup_field_counts_as_not_provided() {
+        // M149 R1：模型习惯一次把两个字段都写上，不用的那个写 0。0 必须等同于「没传」，
+        // 否则一次性的等待会被判成「二选一」冲突，本回合就没有任何唤醒源。
+        assert_eq!(
+            validate_wakeup_delay(Some(180), Some(0)).unwrap(),
+            (Some(180), None)
+        );
+        assert_eq!(
+            validate_wakeup_delay(Some(0), Some(600)).unwrap(),
+            (None, Some(600))
+        );
+        let nothing_usable = validate_wakeup_delay(None, Some(0)).unwrap_err();
+        assert!(nothing_usable.contains("after_sec"), "{nothing_usable}");
+        assert!(nothing_usable.contains("180"), "{nothing_usable}");
+        let conflict = validate_wakeup_delay(Some(180), Some(600)).unwrap_err();
+        assert!(conflict.contains("\"after_sec\":180"), "{conflict}");
+        assert!(conflict.contains("0"), "{conflict}");
     }
 
     #[tokio::test]
