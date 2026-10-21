@@ -2716,12 +2716,32 @@ async fn resolve_open_chat_objective_continuation_in_tx(
 /// durable run ownership as one receipt before any route, credential,
 /// checkpoint, or provider work can fail. A retry may read the same identity;
 /// it never guesses the latest unfinished message or reopens a terminal turn.
+/// 人发起的回合：来源固定为 [`crate::agent::objective::TurnOrigin::User`]。
 async fn admit_persisted_chat_turn(
     pool: &sqlx::SqlitePool,
     control: &crate::ChatRunControl,
     session_id: &str,
     requested_root_turn_id: Option<&str>,
     content: &str,
+) -> Result<ChatAdmissionReceipt, AppError> {
+    admit_persisted_chat_turn_with_origin(
+        pool,
+        control,
+        session_id,
+        requested_root_turn_id,
+        content,
+        crate::agent::objective::TurnOrigin::User,
+    )
+    .await
+}
+
+async fn admit_persisted_chat_turn_with_origin(
+    pool: &sqlx::SqlitePool,
+    control: &crate::ChatRunControl,
+    session_id: &str,
+    requested_root_turn_id: Option<&str>,
+    content: &str,
+    origin: crate::agent::objective::TurnOrigin,
 ) -> Result<ChatAdmissionReceipt, AppError> {
     if content.trim().is_empty() {
         return Err(AppError::Other("chat input cannot be empty".into()));
@@ -3047,13 +3067,14 @@ async fn admit_persisted_chat_turn(
     let objective_kind = chat_objective_kind(contract.capability, content);
     let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
     let objective = store
-        .ensure_or_continue_chat_objective_in_tx(
+        .ensure_or_continue_chat_objective_in_tx_with_origin(
             &mut tx,
             session_id,
             &root_turn_id,
             setup.continuation_root_turn_id.as_deref(),
             objective_kind,
             chat_requested_acceptance(objective_kind, content),
+            origin,
         )
         .await
         .map_err(|error| AppError::Other(error.to_string()))?;
@@ -3388,6 +3409,49 @@ pub async fn send_message(
     state: State<'_, AppState>,
     mcp: State<'_, Arc<McpManager>>,
 ) -> Result<(), AppError> {
+    send_message_with_origin(
+        app.clone(),
+        session_id,
+        content,
+        root_turn_id,
+        crate::agent::objective::TurnOrigin::User,
+        state,
+        mcp,
+    )
+    .await
+}
+
+/// M148：系统接续（后台任务结束通知、定时唤醒、PR 监视心跳）走同一条入队通道，
+/// 但以 `SystemWake` 来源准入：接续当前任务，不把上一回合结算为「被用户重新发起」。
+pub async fn send_system_wake(
+    app: AppHandle,
+    session_id: String,
+    content: String,
+) -> Result<(), AppError> {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let mcp = app.state::<Arc<McpManager>>();
+    send_message_with_origin(
+        app.clone(),
+        session_id,
+        content,
+        None,
+        crate::agent::objective::TurnOrigin::SystemWake,
+        state,
+        mcp,
+    )
+    .await
+}
+
+async fn send_message_with_origin(
+    app: AppHandle,
+    session_id: String,
+    content: String,
+    root_turn_id: Option<String>,
+    origin: crate::agent::objective::TurnOrigin,
+    state: State<'_, AppState>,
+    mcp: State<'_, Arc<McpManager>>,
+) -> Result<(), AppError> {
     let preparation_started = std::time::Instant::now();
     // Register cancellation before any database, model, or credential work so
     // a stop click cannot race the command's setup phase.
@@ -3407,12 +3471,13 @@ pub async fn send_message(
     );
     let db = state.db.read().await.clone();
     running_setup_guard.attach_durable_db(db.clone());
-    let admission = admit_persisted_chat_turn(
+    let admission = admit_persisted_chat_turn_with_origin(
         &db,
         &run_control,
         &session_id,
         root_turn_id.as_deref(),
         &content,
+        origin,
     )
     .await?;
     tracing::debug!(stage = "admission", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "first request preparation");

@@ -337,6 +337,29 @@ async fn touch_session_in_settlement(
         .await;
 }
 
+/// M148：回合来源。后台任务结束通知、定时唤醒、PR 监视心跳与用户消息共用同一条
+/// 准入路径，但它们不是「用户重新发起」。只有人发起的回合可以取代当前回合。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TurnOrigin {
+    /// 人发起的消息。
+    User,
+    /// 系统接续：只继续当前任务，不产生取代结算。
+    SystemWake,
+}
+
+impl TurnOrigin {
+    pub fn is_user(self) -> bool {
+        matches!(self, TurnOrigin::User)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnOrigin::User => "user",
+            TurnOrigin::SystemWake => "system_wake",
+        }
+    }
+}
+
 /// U18/R2: an Objective owns exactly ONE live chat turn at a time. Every path
 /// that closes the objective's own turn must also close the turns it left
 /// behind — otherwise a user reprompt (or a steer during system recovery) leaves
@@ -2694,13 +2717,14 @@ impl ObjectiveStore {
     ) -> anyhow::Result<ObjectiveSnapshot> {
         let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         let objective = self
-            .ensure_or_continue_chat_objective_in_tx(
+            .ensure_or_continue_chat_objective_in_tx_with_origin(
                 &mut tx,
                 session_id,
                 root_turn_id,
                 continuation_root_turn_id,
                 kind,
                 requested_acceptance,
+                TurnOrigin::User,
             )
             .await?;
         tx.commit().await?;
@@ -2710,6 +2734,7 @@ impl ObjectiveStore {
     /// Transaction-scoped form of chat Objective admission. Callers may bind
     /// the transport root, durable run control, and Objective identity in one
     /// commit; this helper never commits or reads through the pool.
+    /// 人发起的回合：来源固定为 [`TurnOrigin::User`]。
     pub(crate) async fn ensure_or_continue_chat_objective_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -2718,6 +2743,28 @@ impl ObjectiveStore {
         continuation_root_turn_id: Option<&str>,
         kind: ObjectiveKind,
         requested_acceptance: &str,
+    ) -> anyhow::Result<ObjectiveSnapshot> {
+        self.ensure_or_continue_chat_objective_in_tx_with_origin(
+            tx,
+            session_id,
+            root_turn_id,
+            continuation_root_turn_id,
+            kind,
+            requested_acceptance,
+            TurnOrigin::User,
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_or_continue_chat_objective_in_tx_with_origin(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+        root_turn_id: &str,
+        continuation_root_turn_id: Option<&str>,
+        kind: ObjectiveKind,
+        requested_acceptance: &str,
+        origin: TurnOrigin,
     ) -> anyhow::Result<ObjectiveSnapshot> {
         let now = Utc::now().timestamp_millis();
         let process_instance = current_process_instance();
@@ -2910,15 +2957,53 @@ impl ObjectiveStore {
             // "当前执行结束后发送". The new turn is user-driven, so no
             // remediation is created here and the system recovery budget is
             // untouched.
-            let superseded_turns = settle_superseded_chat_turns_in_tx(
-                tx,
-                &objective_id,
-                Some(root_turn_id),
-                "superseded_by_user_reprompt",
-                now,
-            )
-            .await?;
-            if superseded_turns > 0 || prior_status == ObjectiveStatus::WaitingSystem {
+            // M148/R2: only a human-sent message may take the turn over. Background
+            // task completion notices, scheduled wakeups and the PR watcher share
+            // this admission path but they *continue* the current task — settling
+            // them as "superseded by a user reprompt" is what turned a session
+            // waiting on PR/CI into `ended/superseded_by_user_reprompt`, after
+            // which the M142 PR monitor never woke it again and a failing PR went
+            // unhandled.
+            let superseded_turns = if origin.is_user() {
+                settle_superseded_chat_turns_in_tx(
+                    tx,
+                    &objective_id,
+                    Some(root_turn_id),
+                    "superseded_by_user_reprompt",
+                    now,
+                )
+                .await?
+            } else {
+                0
+            };
+            if !origin.is_user() {
+                sqlx::query(
+                    "INSERT INTO objective_events
+                     (id, objective_id, revision, event_type, status, decision_type,
+                      domain, recovery_owner, detail_json, created_at)
+                     VALUES (?, ?, ?, 'system_wake_continued', 'active',
+                             'continue', 'chat', 'chat-foreground', ?, ?)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(&objective_id)
+                .bind(next_revision)
+                .bind(
+                    serde_json::json!({
+                        "root_turn_id": root_turn_id,
+                        "prior_status": prior_status.as_str(),
+                        "origin": origin.as_str(),
+                        "settled_turns": 0,
+                        "budget": "system_continuation",
+                    })
+                    .to_string(),
+                )
+                .bind(now)
+                .execute(&mut **tx)
+                .await?;
+            }
+            if origin.is_user()
+                && (superseded_turns > 0 || prior_status == ObjectiveStatus::WaitingSystem)
+            {
                 sqlx::query(
                     "INSERT INTO objective_events
                      (id, objective_id, revision, event_type, status, decision_type,

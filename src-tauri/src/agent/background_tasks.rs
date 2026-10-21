@@ -1389,13 +1389,10 @@ impl WakeSink for ChatWakeSink {
     fn enqueue(&self, session_id: String, text: String) -> WakeFuture {
         let app = self.app.clone();
         Box::pin(async move {
-            use tauri::Manager;
-            let state = app.state::<crate::AppState>();
-            let mcp = app.state::<std::sync::Arc<crate::mcp::McpManager>>();
-            // 与用户输入同一条入队通道：会话正在跑回合时 send_message 会拒绝，
-            // 该 wake 保持 pending，下一轮循环重试（不会丢）。
-            match crate::commands::chat::send_message(app.clone(), session_id, text, None, state, mcp)
-                .await
+            // M148/R2：系统接续走同一条入队通道，但来源是 SystemWake——只接续当前
+            // 任务，不把上一回合结算成「被用户重新发起」（那会让等 PR/CI 的会话
+            // 被判 ended，之后 PR 监视再也不唤醒它）。
+            match crate::commands::chat::send_system_wake(app.clone(), session_id, text).await
             {
                 Ok(()) => true,
                 Err(error) => {
