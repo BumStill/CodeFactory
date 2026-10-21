@@ -589,6 +589,44 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn m139_readonly_compositions_skip_approval() {
+        let command = "git status --short; git log -1 --oneline; gh pr view --json number,state,title; ps -eo pid,etime,args | grep '[s]leep 60'";
+        for mode in ["trusted", "standard"] {
+            let gateway = test_gateway(mode).await;
+            let args = serde_json::json!({"command": command});
+            let call = ToolCall { id: "m139-read".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            assert!(matches!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow), "{mode}: readonly command must not prompt");
+            assert!(gateway.pending_permissions.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn m139_standard_write_waits_then_approval_continues() {
+        let gateway = durable_test_gateway().await;
+        let control = crate::ChatRunControl::pending();
+        crate::register_session_executor(&gateway.session_id, &control);
+        let command = "rm -rf generated";
+        let args = serde_json::json!({"command": command});
+        let call = ToolCall { id: "m139-write".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let task_gateway = gateway.clone();
+        let authorization = tokio::spawn(async move { task_gateway.authorize(&call, &args, Some(command)).await });
+        let intent = wait_for_durable_intent(&gateway).await;
+        let state = super::super::thin_derive::refresh(&gateway.db, &gateway.session_id).await.unwrap();
+        assert_eq!(state.state, super::super::thin_state::SessionState::WaitingUser);
+        assert_eq!(state.question.as_deref(), Some("需要你批准执行：rm -rf generated"));
+        assert!(!authorization.is_finished());
+        PermissionIntentStore::new(gateway.db.clone()).record_user_response(
+            &intent.prompt_key(), PermissionPromptResponse::Allow, chrono::Utc::now().timestamp_millis(),
+        ).await.unwrap();
+        take_pending_sender(&gateway).await.send(true).unwrap();
+        assert_eq!(authorization.await.unwrap(), PermissionOutcome::Allow);
+        let state = super::super::thin_derive::refresh(&gateway.db, &gateway.session_id).await.unwrap();
+        assert_eq!(state.state, super::super::thin_state::SessionState::Running);
+        assert!(state.question.is_none());
+        crate::unregister_session_executor(&gateway.session_id, &control);
+    }
+
     async fn test_gateway(mode: &str) -> Arc<DesktopPermissionGateway> {
         let db = SqlitePoolOptions::new()
             .max_connections(1)
