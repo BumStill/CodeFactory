@@ -9,7 +9,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { useChatStore } from "../stores/chat";
 import type { ToolCallState } from "../stores/chat";
-import { invoke } from "../lib/tauri";
+import { openFileLinkVisible } from "./MessageFileLinks";
 import { DiffViewer, parseUnifiedDiffResult } from "./DiffViewer";
 import { ToolLineStatsBadge } from "./LineChangeStats";
 import { toolCallLineStats, toolLineStatsLabel } from "../lib/editLineStats";
@@ -281,15 +281,6 @@ const FILE_WRITE_TOOLS = new Set([
   "write_pptx", "edit_pptx", "format_pptx", "write_docx", "edit_xlsx",
 ]);
 
-// A tool's `path` is usually relative to the session cwd; the OS opener needs
-// an absolute path. Resolve it, handling both unix and Windows separators.
-function resolveAgainstCwd(cwd: string | undefined, p: string): string {
-  const isAbsolute = /^(\/|\\\\|[A-Za-z]:[\\/])/.test(p);
-  if (isAbsolute || !cwd) return p;
-  const sep = cwd.includes("\\") ? "\\" : "/";
-  return `${cwd.replace(/[\\/]+$/, "")}${sep}${p.replace(/^[\\/]+/, "")}`;
-}
-
 // The file path to offer "open" for, or null if this isn't a successful
 // file-writing call.
 function generatedFilePath(tc: ToolCallState): string | null {
@@ -491,9 +482,7 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
       {filePath && (
         <button
           onClick={() =>
-            void invoke("plugin:shell|open", {
-              path: resolveAgainstCwd(cwd, filePath),
-            }).catch(() => {})
+            openFileLinkVisible(filePath, cwd, activeSessionId)
           }
           title={`打开 ${filePath}`}
           className="ml-7 flex max-w-[calc(100%-1.75rem)] items-center gap-1.5 rounded px-1.5 py-0.5 text-left text-label text-accent transition-colors hover:bg-surface-3"
