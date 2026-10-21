@@ -205,7 +205,7 @@ jobs:
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:reconnect-banner:headless
 
-      - name: Session background activity headless gate
+      - name: Background task panel headless gate
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: pnpm test:background-tasks:headless
 

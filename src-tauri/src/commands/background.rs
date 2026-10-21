@@ -16,7 +16,7 @@ use crate::AppState;
 pub struct SessionBackgroundActivity {
     pub tasks: Vec<BackgroundTask>,
     pub wakeups: Vec<WakeupSchedule>,
-    pub commands: Vec<crate::util::process_tree::CommandActivity>,
+    pub commands: Vec<crate::util::command_activity::CommandActivity>,
 }
 
 /// 本会话的后台任务与待触发唤醒。界面只显示，不把唤醒回路写进消息流。
@@ -33,7 +33,7 @@ pub async fn list_session_background_activity(
         .await
         .map_err(AppError::Other)?;
     wakeups.retain(|wakeup| wakeup.is_pending());
-    let commands = crate::util::process_tree::command_activity(&session_id);
+    let commands = crate::util::command_activity::command_activity(&session_id);
     Ok(SessionBackgroundActivity { tasks, wakeups, commands })
 }
 
@@ -43,7 +43,7 @@ pub async fn stop_session_background_task(
     session_id: String,
     task_id: String,
 ) -> Result<(), AppError> {
-    if crate::util::process_tree::stop_command(&session_id, &task_id) {
+    if crate::util::command_activity::stop_command(&session_id, &task_id) {
         return Ok(());
     }
     let pool = state.db.read().await.clone();

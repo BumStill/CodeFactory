@@ -12,7 +12,7 @@ import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { chromium } from "playwright-core";
 import { gotoScenario } from "./headless-acceptance-support.mjs";
 
@@ -38,21 +38,48 @@ async function exists(candidate) {
   }
 }
 
-async function findEsbuildBinary() {
-  const direct = path.join(root, "node_modules", ".bin", "esbuild");
+// Windows ships the launcher as a .cmd/.ps1 shim on PATH, while the real
+// executable is named esbuild.exe and lives at the platform package root.
+export function esbuildExecutableName(platform = process.platform) {
+  return platform === "win32" ? "esbuild.exe" : "esbuild";
+}
+
+// 平台包布局因平台而异：Windows 把可执行文件放在包根目录，unix 放在 bin/ 下。
+// 两种都探测，但把当前平台的真实布局排在前面。
+export function esbuildBinaryLayouts(platform = process.platform) {
+  const executable = esbuildExecutableName(platform);
+  return platform === "win32"
+    ? [executable, path.join("bin", executable)]
+    : [path.join("bin", executable), executable];
+}
+
+// 直接找平台包里的可执行文件，而不是依赖 node_modules/.bin 的 shim：
+// Windows 上 shim 是 .cmd/.ps1，无法被 spawnSync 直接执行。
+export async function findEsbuildBinary({ searchRoot = root, platform = process.platform } = {}) {
+  const executable = esbuildExecutableName(platform);
+  const direct = path.join(searchRoot, "node_modules", ".bin", executable);
   if (await exists(direct)) return direct;
   const { readdir } = await import("node:fs/promises");
-  const pnpmDir = path.join(root, "node_modules", ".pnpm");
+  const pnpmDir = path.join(searchRoot, "node_modules", ".pnpm");
+  const found = [];
   for (const entryName of await readdir(pnpmDir)) {
     if (!entryName.startsWith("@esbuild+")) continue;
     const platformDir = path.join(pnpmDir, entryName, "node_modules", "@esbuild");
     if (!(await exists(platformDir))) continue;
-    for (const platform of await readdir(platformDir)) {
-      const binary = path.join(platformDir, platform, "bin", "esbuild");
-      if (await exists(binary)) return binary;
+    for (const target of await readdir(platformDir)) {
+      for (const layout of esbuildBinaryLayouts(platform)) {
+        const binary = path.join(platformDir, target, layout);
+        if (await exists(binary)) found.push({ platform: target, binary });
+      }
     }
   }
-  throw new Error("no esbuild binary found under node_modules/.pnpm/@esbuild+*");
+  // 依赖里可能并存多个平台的包（交叉安装/缓存残留），优先当前平台那一份。
+  const native = found.find((item) => item.platform.startsWith(platform));
+  if (native) return native.binary;
+  if (found.length === 1) return found[0].binary;
+  throw new Error(
+    `no ${executable} binary found under node_modules for ${platform}; ` +
+    `candidates: ${JSON.stringify(found)}`);
 }
 
 function run(command, args, label) {
@@ -174,7 +201,13 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+// 只有直接执行时才跑真实浏览器门禁；被测试文件 import 时只暴露查找逻辑。
+const invokedDirectly = process.argv[1] !== undefined
+  && pathToFileURL(process.argv[1]).href === import.meta.url;
+
+if (invokedDirectly) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

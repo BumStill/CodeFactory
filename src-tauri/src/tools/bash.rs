@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 use crate::util::command_env;
 use crate::util::no_window::NoWindow;
-use crate::util::process_tree::{self, ProcessOutputError};
+use crate::util::command_activity::{self, CommandActivityFailure};
 
 // `emit`/`path` are trait methods: without these in scope the non-test build
 // fails with E0599 on every platform that compiles the branch below (the
@@ -421,16 +421,16 @@ async fn execute_inner(
         .unwrap_or(configured_timeout_secs);
     let timeout_duration = timeout_override.unwrap_or(Duration::from_secs(timeout_secs));
     let started = std::time::Instant::now();
-    let activity = ctx.session_id.as_deref().map(|session| process_tree::track_command(session, &a.command));
-    let result = process_tree::output_with_activity(cmd, timeout_duration, activity.as_ref()).await;
+    let activity = ctx.session_id.as_deref().map(|session| command_activity::track_command(session, &a.command));
+    let result = command_activity::output_with_activity(cmd, timeout_duration, activity.as_ref()).await;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     match result {
-        Err(reason @ (ProcessOutputError::InputRequired | ProcessOutputError::Stopped)) => {
-            let message = if reason == ProcessOutputError::InputRequired { command_env::INPUT_REQUIRED_MESSAGE } else { "命令已被停止，进程树已清理；可以继续当前回合。" };
+        Err(reason @ (CommandActivityFailure::InputRequired | CommandActivityFailure::Stopped)) => {
+            let message = if reason == CommandActivityFailure::InputRequired { command_env::INPUT_REQUIRED_MESSAGE } else { "命令已被停止，进程树已清理；可以继续当前回合。" };
             Ok(ToolOutput::err(message).with_process_outcome(None, String::new(), message.into(), Some(message.into()), duration_ms))
         }
-        Err(ProcessOutputError::Timeout) => {
+        Err(CommandActivityFailure::Timeout) => {
             let message = format!("Command timed out after {timeout_secs}s");
             Ok(ToolOutput::err(&message)
                 .with_metadata(command_failure_metadata(
@@ -441,7 +441,7 @@ async fn execute_inner(
                 ))
                 .with_process_outcome(None, String::new(), message.clone(), Some(message), duration_ms))
         }
-        Err(ProcessOutputError::Unavailable | ProcessOutputError::Failed) => {
+        Err(CommandActivityFailure::Unavailable | CommandActivityFailure::Failed) => {
             let message = format!(
                 "Failed to execute shell '{}'. PATH={}",
                 launched_program,

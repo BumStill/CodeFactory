@@ -5274,21 +5274,64 @@ mod tests {
     /// classify → admit → run the real shell → observe the file → commit the
     /// receipt.
     ///
-    /// `file://` keeps it hermetic. The point under test is the receipt path,
-    /// not HTTP, and a network fetch would make the case flaky for a reason
-    /// that has nothing to do with what broke.
+    /// A loopback-only server keeps it hermetic — no external network, no DNS —
+    /// while still exercising the transport the tool really uses. The point
+    /// under test is the receipt path, not HTTP.
+    ///
+    /// It has to be a socket rather than `file://`: PowerShell's
+    /// `Invoke-WebRequest` rejects the `file` scheme ("The 'file' scheme is not
+    /// supported"), so the old fixture only ever worked on the curl side and
+    /// failed on Windows for a reason unrelated to the receipt contract.
+    async fn serve_download_once(path: &'static str, body: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind download fixture");
+        let addr = listener.local_addr().expect("download fixture addr");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let requested = request.split_whitespace().nth(1).unwrap_or("/");
+                    let (status, payload): (&str, &[u8]) = if requested.starts_with(path) {
+                        ("200 OK", body)
+                    } else {
+                        ("404 Not Found", b"no such fixture route")
+                    };
+                    let mut response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(payload);
+                    let _ = socket.write_all(&response).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        format!("http://{addr}{path}")
+    }
+
     #[tokio::test]
     async fn a_download_actually_lands_its_file_and_commits_the_receipt() {
         let backend = objective_backend(false).await;
+        // Production builds the receipt schema at backend construction; the
+        // shared fixture only lays 0007, so without this the assertion below
+        // would read a table that was never provisioned.
+        backend.ensure_observation_schema().await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("payload.txt");
-        std::fs::write(&source, b"agentcenter installer").unwrap();
-        // A `file://` URL wants forward slashes on every platform.
-        let url = format!("file:///{}", source.display().to_string().replace('\\', "/").trim_start_matches('/'));
+        // A real socket, not a `file://` URL: PowerShell's `Invoke-WebRequest`
+        // refuses the `file` scheme outright, and a download that never
+        // crossed the network was not evidence of the download path anyway.
+        let url = serve_download_once("/payload.txt", b"agentcenter installer").await;
         // Windows runs commands through PowerShell, where `curl` is an alias
         // for `Invoke-WebRequest` and would reject curl's own flags.
         let command = if cfg!(windows) {
-            format!("Invoke-WebRequest -Uri {url} -OutFile fetched.txt")
+            format!("Invoke-WebRequest -UseBasicParsing -Uri {url} -OutFile fetched.txt")
         } else {
             format!("curl -fsSL {url} -o fetched.txt")
         };
@@ -5296,10 +5339,32 @@ mod tests {
         let args = serde_json::json!({"command": command});
         let call = call_with_args("bash-download-e2e", "bash", &args);
         register_tool_call(&backend, &call, &args).await;
+
+        // The durable fence is opened by the caller, not by `execute`: a test
+        // that only calls `execute` never enters the receipt path, so it would
+        // be asserting a contract nobody was asked to create.
+        let ctx = objective_ctx(dir.path());
+        let (classified, kind) = backend.classify(&call, &args);
+        let receipt_id = match backend
+            .mutation_preflight(&call, &args, &ctx, &classified, kind, false)
+            .await
+            .expect("the download fence must persist")
+        {
+            MutationAdmission::Dispatch {
+                receipt_id: Some(receipt_id),
+                ..
+            } => receipt_id,
+            _ => panic!("a download into the workspace must dispatch under a started receipt"),
+        };
+
         let out = backend
-            .execute(&call, &args, &objective_ctx(dir.path()))
+            .execute(&call, &args, &ctx)
             .await
             .expect("a download must not be fatal");
+        backend
+            .settle_mutation_receipt(&receipt_id, Some(&out), &ctx)
+            .await
+            .expect("settling the download receipt must persist");
 
         assert_eq!(
             out.status,
@@ -5315,8 +5380,9 @@ mod tests {
         );
 
         let (kind, state): (String, String) = sqlx::query_as(
-            "SELECT resource_kind, state FROM tool_recovery_contracts LIMIT 1",
+            "SELECT resource_kind, state FROM tool_recovery_contracts WHERE receipt_id=?",
         )
+        .bind(&receipt_id)
         .fetch_one(&backend.db)
         .await
         .unwrap();

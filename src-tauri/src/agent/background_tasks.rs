@@ -579,7 +579,7 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
     };
     let pid = child.id();
     #[cfg(windows)]
-    let job = match crate::util::process_tree::StdProcessTree::attach_async(&child) {
+    let job = match crate::util::command_activity::attach_job(&child) {
         Ok(job) => job,
         Err(error) => {
             let mut child = child;
@@ -623,7 +623,7 @@ async fn monitor_child(
     pid: Option<u32>,
     timeout: Duration,
     output_path: PathBuf,
-    #[cfg(windows)] job: crate::util::process_tree::StdProcessTree,
+    #[cfg(windows)] job: crate::util::command_activity::JobGuard,
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut tick = tokio::time::interval(Duration::from_millis(200));

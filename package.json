@@ -32,6 +32,7 @@
     "test:attachments:asset-scope": "node scripts/verify-attachment-asset-scope.mjs",
     "test:reconnect-banner:headless": "node scripts/verify-reconnect-banner-headless.mjs",
     "test:background-tasks:headless": "node scripts/verify-background-tasks-headless.mjs",
+    "test:background-tasks:esbuild-discovery": "node --test scripts/verify-background-tasks-headless.test.mjs",
     "test:turn-handback:headless": "node scripts/verify-turn-handback-headless.mjs",
     "test:enter-steer:headless": "node scripts/verify-enter-steer-headless.mjs",
     "test:turn-result-card:headless": "node scripts/verify-turn-result-card-headless.mjs",
