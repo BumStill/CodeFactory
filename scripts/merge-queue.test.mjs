@@ -1,3 +1,60 @@
+// M141: a CI completion must not require another webhook to be observed.
+for (const pendingKind of ['running', 'missing', 'stale']) {
+  test(`M141-R2: ${pendingKind} checks turn green without a new event`, async () => {
+    const adapter = fakeAdapter([pr()]);
+    adapter.rulesetGuard = async () => ({ ok: true });
+    const candidate = adapter._state.get(1);
+    candidate.checks = pendingKind === 'missing' ? [] : greenChecks(pendingKind === 'stale' ? SHA_B : SHA_A);
+    if (pendingKind === 'running') candidate.checks[0].status = 'in_progress';
+    const sleeps = [], passes = [];
+    const result = await watchQueue(adapter, {
+      sleep: async (ms) => { sleeps.push(ms); candidate.checks = greenChecks(SHA_A); },
+      onPass: (pass) => passes.push(pass),
+    });
+    assert.equal(result.passes, 2);
+    assert.deepEqual(sleeps, [180000]);
+    assert.equal(passes.length, 2);
+    assert.equal(adapter.calls.merge.length, 1);
+  });
+}
+
+test('M141-R2: pending checks have a bounded budget', async () => {
+  const adapter = fakeAdapter([pr({ checks: [] })]);
+  adapter.rulesetGuard = async () => ({ ok: true });
+  let sleeps = 0;
+  const result = await watchQueue(adapter, { maxPasses: 3, sleep: async () => { sleeps++; } });
+  assert.equal(result.passes, 3);
+  assert.equal(result.exhausted, true);
+  assert.equal(sleeps, 2);
+  assert.equal(adapter.calls.merge.length, 0);
+});
+
+for (const mode of ['hold', 'unarmed', 'failed', 'dry-run', 'stop', 'withdraw']) {
+  test(`M141-R2: ${mode} never bypasses the merge gates`, async () => {
+    const candidate = pr();
+    if (mode === 'hold') candidate.labels.push(HOLD_LABEL);
+    if (mode === 'unarmed') candidate.labels = [];
+    if (mode === 'failed') candidate.checks[0].conclusion = 'failure';
+    if (mode === 'withdraw') candidate.checks = [];
+    const adapter = fakeAdapter([candidate]);
+    adapter.rulesetGuard = async () => ({ ok: true });
+    let sleeps = 0;
+    await watchQueue(adapter, {
+      dryRun: mode === 'dry-run', stopRequested: () => mode === 'stop',
+      sleep: async () => { sleeps++; adapter._state.get(1).labels = []; },
+    });
+    assert.equal(sleeps, mode === 'withdraw' ? 1 : 0);
+    assert.equal(adapter.calls.merge.length, 0);
+  });
+}
+
+test('M141-R2: trusted workflow enables bounded watch only for non-dry drains', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/merge-queue.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /drain --repo "\$GITHUB_REPOSITORY" --watch/);
+  assert.match(workflow, /cancel-in-progress: false/);
+  assert.match(workflow, /ref: \$\{\{ github.event.repository.default_branch \}\}/);
+});
+
 // U31 merge queue — requirement tests (CF-MQ-R1 … R7).
 //
 // These are pure-logic tests over synthetic PR fixtures with an injected fake
@@ -25,6 +82,7 @@ import {
   parseBlockedMarker,
   runQueue,
   drainQueue,
+  watchQueue,
   versionBumpHandoff,
   verifyRequiredChecks,
   releaseMergedBatch,

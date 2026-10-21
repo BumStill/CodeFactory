@@ -532,6 +532,30 @@ export async function drainQueue(adapter, { stopRequested, maxIterations = 100, 
   return { guard, plan, outcomes };
 }
 
+/** M141: retain a bounded observer when an early wake sees unfinished checks.
+ * Every pass re-enters drainQueue, including its live ruleset/head guards.
+ * The 180s interval protects the shared GitHub API budget (M114).
+ */
+export async function watchQueue(adapter, {
+  maxPasses = 11,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  onPass = () => {},
+  ...options
+} = {}) {
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    if (options.stopRequested?.()) return { passes: pass - 1, stopped: true };
+    const result = await drainQueue(adapter, options);
+    await onPass({ pass, ...result });
+    const pending = !options.dryRun && result.outcomes.some((outcome) =>
+      outcome.status === 'not-eligible' &&
+      /^required check .+ (?:has not run|is stale;|is still running)/.test(outcome.reason),
+    );
+    if (!pending || options.stopRequested?.()) return { ...result, passes: pass };
+    if (pass === maxPasses) return { ...result, passes: pass, exhausted: true };
+    await sleep(180000);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Networked GitHub adapter (not exercised by unit tests)
 // ---------------------------------------------------------------------------
@@ -832,7 +856,9 @@ async function main(argv) {
     // R8: the single entry point — one armed-probe, one ruleset read, one PR
     // listing shared by the plan and the merge loop.
     const adapter = createGhAdapter({ repo });
-    const result = await drainQueue(adapter, {
+    const drain = flags.watch === true ? watchQueue : drainQueue;
+    const result = await drain(adapter, {
+      onPass: (pass) => process.stdout.write(`${JSON.stringify({ repo, watch: true, ...pass })}\n`),
       stopRequested: flags.stopFile
         ? () => existsSync(flags.stopFile)
         : undefined,

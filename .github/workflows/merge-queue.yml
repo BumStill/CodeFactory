@@ -117,5 +117,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
             node scripts/merge-queue.mjs drain --repo "$GITHUB_REPOSITORY" --dry-run
           else
-            node scripts/merge-queue.mjs drain --repo "$GITHUB_REPOSITORY"
+            # M141: retain the trusted observer across early CI-completion wakes.
+            # Recheck every 180s for at most 30 minutes; no extra webhook needed.
+            node scripts/merge-queue.mjs drain --repo "$GITHUB_REPOSITORY" --watch
           fi
