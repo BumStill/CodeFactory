@@ -274,6 +274,32 @@ async fn completed_external(db: &SqlitePool, session: &str) -> sqlx::Result<Opti
 }
 
 /// 唯一四态判定。缓存中的 state/question/reason 不参与事实选择。
+/// M148/R3：未完成的已交付 PR —— 有引用、且没有被成功关闭（closeout 未入队或
+/// 观测结果是故障）—— 就是「外部进行中事项」。只要它还在，会话就不能被判 ended，
+/// 否则 M142 的系统 PR 监视随 waiting 一起停摆，PR 失败无人处理。
+async fn unfinished_delivery(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
+    if !has_table(db, "thin_delivery_refs").await? {
+        return Ok(None);
+    }
+    let number: Option<i64> = sqlx::query_scalar("SELECT pr_number FROM thin_delivery_refs WHERE session_id=?")
+        .bind(session).fetch_optional(db).await?;
+    let Some(number) = number else { return Ok(None) };
+    if !has_table(db, "thin_external_observations").await? {
+        return Ok(Some(number));
+    }
+    let row: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT completed_reason, COALESCE(closeout_queued,0) FROM thin_external_observations WHERE session_id=? AND pr_number=?",
+    ).bind(session).bind(number).fetch_optional(db).await?;
+    Ok(match row {
+        None => Some(number),
+        Some((reason, queued)) => {
+            let finished = queued == 1
+                && reason.as_deref().is_some_and(|reason| !is_external_failure(reason));
+            (!finished).then_some(number)
+        }
+    })
+}
+
 pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> {
     let at = chrono::Utc::now().timestamp_millis();
     if has_table(db, "chat_session_cancel_intents").await? {
@@ -360,6 +386,21 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         let repaired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules wake JOIN messages answer ON answer.session_id=wake.session_id AND answer.role='assistant' AND answer.created_at>=wake.last_fired_at*1000 AND TRIM(answer.content)<>'' AND (answer.tool_calls IS NULL OR answer.tool_calls='' OR answer.tool_calls='[]') AND (answer.completion_state IS NULL OR answer.completion_state='' OR answer.completion_state='final') WHERE wake.session_id=? AND wake.id LIKE 'thin-repair-%' AND wake.status='done' AND wake.prompt LIKE (SELECT completed_reason || '%' FROM thin_external_observations WHERE session_id=?)")
             .bind(session).bind(session).fetch_one(db).await?;
         if repaired == 0 && pending_question_at == 0 { return Ok(ThinState::running()); }
+    }
+    // M148/R3：未完成的已交付 PR 是外部进行中事项——只要它还在，下面的终态推导
+    // 不得结束会话。v1.91.x 的现场：等待 PR 的会话被写成
+    // `ended/superseded_by_user_reprompt`，M142 的系统 PR 监视随之停摆，PR 失败
+    // 无人处理。真实提问（pending_question_at）仍然优先，停止/审批已在最前面处理。
+    if pending_question_at == 0 {
+        if let Some(number) = unfinished_delivery(db, session).await? {
+            return Ok(ThinState {
+                state: SessionState::WaitingWake,
+                waiting_for: Some(format!("等 PR #{number} 合并/CI")),
+                wake_source: Some("系统 PR 监视（心跳，间隔不少于 180 秒）".into()),
+                reason: Some("PR 未合并前不结束会话".into()),
+                ..ThinState::running()
+            });
+        }
     }
     if pending_question_at == 0 && (completed.is_none() || completed.as_deref().is_some_and(is_external_failure))
         && has_table(db, "thin_delivery_refs").await? {
@@ -689,6 +730,56 @@ mod tests {
                 derived.reason
             );
         }
+    }
+
+    /// M148/R3：等 PR 的会话不得因为「回合被取代 / 最终回答已完成」而结束——那会让
+    /// M142 的系统 PR 监视停摆，PR 失败无人处理。这里用「已合并但 closeout 未入队」
+    /// 的观测：前面的 M142 分支不覆盖它，只有 unfinished_delivery 守卫能拦住。
+    #[tokio::test]
+    async fn unfinished_delivery_keeps_a_delivered_session_waiting() {
+        let db = fixture().await;
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS thin_external_observations(session_id TEXT PRIMARY KEY,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL,observed_at INTEGER NOT NULL DEFAULT 0,completed_reason TEXT,closeout_queued INTEGER NOT NULL DEFAULT 0,merged_at INTEGER);
+             CREATE TABLE IF NOT EXISTS wakeup_schedules(id TEXT PRIMARY KEY,session_id TEXT,status TEXT,next_at INTEGER,last_fired_at INTEGER,prompt TEXT);
+             DELETE FROM chat_turn_state",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at,completed_at,terminal_reason) VALUES ('turn','derive','settled','completed',1000,2000,2000,'superseded_by_user_reprompt')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs(session_id,branch,pr_number,ceiling) VALUES ('derive','feat/m148',305,'merged')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued) VALUES ('derive',305,'merged',2500,'merged',0)")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let derived = derive_state(&db, "derive").await.unwrap();
+        assert_eq!(
+            derived.state,
+            SessionState::WaitingWake,
+            "未关闭的 PR 必须让会话保持等待（reason={:?}）",
+            derived.reason
+        );
+        assert_eq!(
+            derived.wake_source.as_deref(),
+            Some("系统 PR 监视（心跳，间隔不少于 180 秒）")
+        );
+
+        // 边界：closeout 已入队（PR 真正收口）后，同一个终态事实照旧结束会话。
+        sqlx::query("UPDATE thin_external_observations SET closeout_queued=1")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            derive_state(&db, "derive").await.unwrap().state,
+            SessionState::Ended
+        );
     }
 
     /// R1 的另一半：真实终止事实仍然结束会话（停止意图 + 三次真实失败）。
