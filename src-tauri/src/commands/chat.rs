@@ -2640,7 +2640,11 @@ pub(crate) async fn admit_headless_chat_turn(
     content: &str,
 ) -> Result<HeadlessChatAdmission, AppError> {
     let control = crate::ChatRunControl::pending();
-    let admission = admit_persisted_chat_turn(pool, &control, session_id, None, content).await?;
+    // Boxed: this entry runs on a spawned worker's 1 MB Windows main thread
+    // where the whole admission state machine would otherwise be embedded in
+    // the caller's future.
+    let admission =
+        Box::pin(admit_persisted_chat_turn(pool, &control, session_id, None, content)).await?;
     Ok(HeadlessChatAdmission {
         root_turn_id: admission.root_turn_id,
         objective: admission.objective,
@@ -2758,10 +2762,17 @@ async fn admit_persisted_chat_turn(
     // any stop that predates this message (cancelling what it left live) before
     // the new turn is admitted; a stop that arrives *during* admission still
     // fences, which is why the in-transaction check stays.
-    let settled_stops = crate::agent::objective::ObjectiveStore::new(pool.clone())
-        .settle_stale_chat_session_cancel(session_id, now)
-        .await
-        .map_err(|error| AppError::Other(error.to_string()))?;
+    // Windows runs this admission on a 1 MB main-thread stack. The settlement
+    // future reaches into the cancel path and used to be inlined into the
+    // admission state machine, which then sat inside the unattended worker's
+    // future as well (`0xc00000fd`, check-rust 2026-10-21). Boxing keeps the
+    // child state on the heap and leaves a pointer in this frame.
+    let settled_stops = Box::pin(
+        crate::agent::objective::ObjectiveStore::new(pool.clone())
+            .settle_stale_chat_session_cancel(session_id, now),
+    )
+    .await
+    .map_err(|error| AppError::Other(error.to_string()))?;
     if settled_stops > 0 {
         tracing::info!(
             session_id,
@@ -7969,5 +7980,25 @@ pub mod chat_links {
             }
             assert!(must_reveal(dir.path(), &std::fs::metadata(dir.path()).unwrap()));
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_probe {
+    #[tokio::test]
+    async fn admission_future_stays_inside_the_windows_stack_budget() {
+        let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let control = crate::ChatRunControl::pending();
+        let fut = super::admit_persisted_chat_turn(&pool, &control, "probe", None, "hi");
+        let bytes = std::mem::size_of_val(&fut);
+        drop(fut);
+        // Windows executes admission on a 1 MB main-thread stack, so a future
+        // that grows by accident (`error[E0277]`-free inlining is silent) turns
+        // into 0xc00000fd in CI instead of a compile error. 11.6 KB measured on
+        // 2026-10-21; the budget leaves room for small additions only.
+        assert!(
+            bytes <= 16 * 1024,
+            "admission future grew to {bytes} bytes; box heavy awaits (budget 16384)"
+        );
     }
 }
