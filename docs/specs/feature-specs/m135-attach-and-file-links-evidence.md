@@ -2,7 +2,8 @@
 修复无项目聊天附件上传，以及消息与工具产物本地链接静默失败。使用受控原生命令，保持 scheme scope 不变。
 
 Release-Urgency: immediate
-Scenario-Test: SC-001
+Scenario-Test: CAP-001, CXD-001, CXD-002, DAT-001, HLT-001, HLT-002, HLT-003, HLT-004, HLT-005, RTE-001, RTE-002, RTE-003, RTE-004, SKL-002, SKL-003, UI-001, UI-002, UI-003, UI-004, UI-005, UI-006, UI-007, UI-008, UI-009, UI-010, UI-011, UI-012, UI-013, UI-014, UI-015
+Scenario-Test-Reason: src-tauri/tauri.conf.json 为全局运行时配置，门禁按设计将影响面展开到全部场景；应用代码改动仅涉及附件上传与文件打开。
 README-Update: reviewed
 README-Update-Reason: 修复既有附件与文件打开承诺，不改变公开安装或隐私承诺。
 
