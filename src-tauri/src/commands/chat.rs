@@ -608,10 +608,7 @@ pub async fn cancel_chat(
     .await
     {
         Ok(report) => {
-            let content = format!("{}\n{}", report.notice, report.notes.join("\n"));
-            sqlx::query("INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)")
-                .bind(Uuid::new_v4().to_string()).bind(&session_id).bind(&content)
-                .bind(Utc::now().timestamp_millis()).execute(&pool).await?;
+            crate::agent::stop_fence::persist_stop_notice(&pool, &session_id, &report.notice).await?;
             tracing::info!(session_id, pr_number = ?report.pr_number,
                 complete = report.is_complete(), notes = ?report.notes,
                 "cancel_chat: 停止栅栏及 PR 撤回结果已写入会话");
@@ -728,7 +725,7 @@ async fn request_chat_run_cancel(
         .request_chat_session_cancel(session_id).await
         .map_err(|error| AppError::Other(error.to_string()))?;
     let now = Utc::now().timestamp_millis();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     sqlx::query(
         "INSERT INTO chat_run_controls
          (run_instance_id, session_id, status, created_process_instance,
@@ -1102,7 +1099,7 @@ async fn close_objective_in_pool_with_live_run(
     live_chat_run: bool,
 ) -> anyhow::Result<crate::agent::objective::ObjectiveSnapshot> {
     anyhow::ensure!(outcome == "accepted", "outcome must be accepted");
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let id = match objective_id {
         Some(requested) => {
             let found: Option<(String, Option<String>)> = sqlx::query_as(
@@ -2663,7 +2660,7 @@ async fn admit_persisted_chat_turn(
         .map(str::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = Utc::now().timestamp_millis();
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let session_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id=?")
         .bind(session_id)
         .fetch_one(&mut *tx)
@@ -5592,6 +5589,36 @@ mod tests {
         assert_eq!(still_open, 2, "both candidates must stay for system reconciliation");
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn m144_admission_retries_a_real_concurrent_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.sqlite");
+        let initialized = crate::storage::db::connect(path.to_str().unwrap()).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('m144','synthetic','/tmp','model',1,1)")
+            .execute(&initialized).await.unwrap();
+        initialized.close().await;
+        let pool = SqlitePoolOptions::new().min_connections(3).max_connections(3)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::ZERO)).await.unwrap();
+        let mut held = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("UPDATE sessions SET updated_at=2 WHERE id='m144'").execute(&mut *held).await.unwrap();
+        let contender = pool.clone();
+        let admission = tokio::spawn(async move {
+            admit_persisted_chat_turn(&contender, &crate::ChatRunControl::pending(), "m144", Some("m144-root"), "继续 synthetic").await
+        });
+        // The old deferred transaction fails immediately while this lock is held;
+        // the shared bounded retry survives until the lock is released.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        held.commit().await.unwrap();
+        let receipt = admission.await.unwrap().expect("send must recover lock contention in place");
+        assert_eq!(receipt.root_turn_id, "m144-root");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m144-root' AND content='继续 synthetic'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 1);
+        pool.close().await;
     }
 
     /// β fixture 7 — the wording-constraint audit must survive the REAL
