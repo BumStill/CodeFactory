@@ -167,6 +167,9 @@ export function presentChatInvocationError(error: unknown): Pick<
   "content" | "failureEvidence"
 > {
   const message = String(error).replace(/^Error:\s*/i, "");
+  if (/database(?: table)? is locked|sqlite[_ ]?busy/i.test(message)) {
+    return { content: "本地数据暂时无法保存，本次操作未完成；已有内容已保留。" };
+  }
   if (isModelRouteExhaustedError(message)) {
     return {
       content: credentialFailureGuidance(message) ?? MODEL_ROUTE_EXHAUSTED_GUIDANCE,
@@ -503,7 +506,7 @@ export function reduceChatStreamEvent(
           }
           return {
             ...m,
-            content: m.content + `\n\nError: ${event.message}`,
+            content: m.content + `\n\n${presentChatInvocationError(event.message).content}`,
           };
         }),
       };

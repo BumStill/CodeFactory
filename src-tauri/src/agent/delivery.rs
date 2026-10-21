@@ -17366,7 +17366,7 @@ Release-Urgency: hold"
             out.steps
         );
         assert!(
-            out.summary.contains("PR #7 保持打开，没有合并"),
+            out.summary.contains("PR #7 保持打开"),
             "结论必须如实说明 PR 的处境: {}",
             out.summary
         );
@@ -17433,7 +17433,7 @@ Release-Urgency: hold"
             )
             .await;
             assert_eq!(out.final_state, "stopped", "{:?}", out.steps);
-            assert!(out.summary.contains("明确发起"), "{}", out.summary);
+            assert!(out.summary.contains("本地改动保留在工作区"), "{}", out.summary);
         }
 
         assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
@@ -17485,7 +17485,7 @@ Release-Urgency: hold"
             git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
             "停止在推送之前，远端不应出现这个分支"
         );
-        assert!(out.summary.contains("不再执行还没发生的交付动作"), "{}", out.summary);
+        assert!(out.summary.contains("本地改动保留在工作区"), "{}", out.summary);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 

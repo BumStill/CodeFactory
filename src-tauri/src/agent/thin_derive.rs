@@ -198,7 +198,7 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
     {
         super::background_tasks::wake_source_cover(db, session).await;
         // 同一事务写唤醒与去重事实，不留下“标记成功但没排唤醒”的崩溃窗口。
-        let mut tx = db.begin().await?;
+        let mut tx = crate::storage::db::begin_write(db).await?;
         let queued = sqlx::query("UPDATE thin_external_observations SET closeout_queued=1 WHERE session_id=? AND closeout_queued=0")
             .bind(session).execute(&mut *tx).await?.rows_affected() == 1;
         if queued {
