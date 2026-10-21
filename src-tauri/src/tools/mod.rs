@@ -7,7 +7,6 @@ pub mod web_fetch;
 pub mod delegate_tasks;
 pub mod delivery;
 mod delivery_thin;
-mod pr_body_guard;
 pub mod docx;
 pub mod edit;
 pub mod file_lock;
