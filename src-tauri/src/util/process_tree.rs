@@ -21,21 +21,6 @@ pub(crate) fn isolate_std_process_tree(command: &mut std::process::Command) {
 #[cfg(not(unix))]
 pub(crate) fn isolate_std_process_tree(_command: &mut std::process::Command) {}
 
-/// tokio 子进程同样被隔离成独立进程组（pgid == pid）。超时或停止时必须整组
-/// 终止，否则 `sleep 30 & wait` 这类后代进程会活过超时，继续占着管道。
-#[cfg(unix)]
-pub(crate) fn kill_isolated_process_group(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn kill_isolated_process_group(_pid: u32) {}
-
 pub(crate) struct StdProcessTree {
     #[cfg(unix)]
     process_group_id: i32,

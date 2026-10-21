@@ -187,6 +187,22 @@ async fn capture_stream<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// 复核 `output_with_activity` 的收尾路径：tokio 子进程同样被隔离成独立进程组
+/// （pgid == pid）。超时或停止时必须整组终止，否则 `sleep 30 & wait` 这类后代
+/// 进程会活过截止时间，继续占着输出管道。
+#[cfg(unix)]
+fn kill_isolated_process_group(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_isolated_process_group(_pid: u32) {}
+
 /// 执行命令并持续观察输出：识别等待输入的提示符、响应会话级停止请求、
 /// 超时或异常时清理整棵进程树。
 pub async fn output_with_activity(
@@ -261,7 +277,7 @@ pub async fn output_with_activity(
                     // 才能连 `sleep 30 &` 这类后代一起终止。
                     #[cfg(unix)]
                     if let Some(pid) = child_pid {
-                        crate::util::process_tree::kill_isolated_process_group(pid);
+                        kill_isolated_process_group(pid);
                     }
                     let _ = child.start_kill();
                     let _ = child.wait().await;
