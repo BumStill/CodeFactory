@@ -725,6 +725,12 @@ mod pr_body_guard {
         Ok(path)
     }
 
+    /// Test-facing view of the tokenizer: the unquoted text of every word.
+    /// Lets tests assert word boundaries without exposing `Token` internals.
+    pub(super) fn token_words(command: &str) -> Vec<String> {
+        tokenize(command).into_iter().map(|token| token.text).collect()
+    }
+
     /// Rewrite `gh pr edit` so the body it writes still carries the session trailer.
     pub(super) fn guard_command(command: &str, cwd: &Path, urgency: ReleaseUrgency) -> Option<Guarded> {
         let tokens = tokenize(command);
@@ -885,12 +891,28 @@ mod guard_tests {
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "plain body");
     }
 
-    #[cfg(windows)]
     #[test]
-    fn m147b_unquoted_windows_path_is_not_treated_as_an_escape() {
-        use super::pr_body_guard::tokenize;
-        let tokens = tokenize(r"gh pr edit 818 --body-file C:\Users\dev\body.md");
-        assert_eq!(tokens.last().unwrap().text, r"C:\Users\dev\body.md");
+    fn m147b_unquoted_body_file_path_matches_platform_quoting() {
+        use super::pr_body_guard::token_words;
+        let words = token_words(r"gh pr edit 818 --body-file C:\Users\dev\body.md");
+        if cfg!(windows) {
+            // PowerShell: `\` is a path separator, not an escape, so the path must
+            // reach the guard intact or its canonicalize step silently gives up.
+            assert_eq!(words.last().map(String::as_str), Some(r"C:\Users\dev\body.md"));
+        } else {
+            // POSIX shells strip the backslashes — which is exactly why a real
+            // command has to quote the path (covered by the case above).
+            assert_eq!(words.last().map(String::as_str), Some("C:Usersdevbody.md"));
+        }
+    }
+
+    #[test]
+    fn m147b_tokenizer_keeps_single_quoted_text_verbatim() {
+        // Reaches `tokenize` exactly like the Windows-only case, so its visibility
+        // is proven on every platform instead of only on Windows CI.
+        use super::pr_body_guard::token_words;
+        let words = token_words("gh pr edit 818 --body-file 'a b/c.md'");
+        assert_eq!(words.last().map(String::as_str), Some("a b/c.md"));
     }
 
 
