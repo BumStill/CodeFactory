@@ -33,6 +33,15 @@ pub fn definition() -> ToolDefinition {
 }
 
 pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
+    // Validate required strings before deserialisation so null and absent
+    // fields identify the exact repair, without echoing potentially private content.
+    for field in ["path", "content"] {
+        if args.get(field).and_then(Value::as_str).is_none() {
+            return Ok(ToolOutput::err(format!(
+                "Invalid arguments for write_file: field `{field}` expected string (not null or missing). Re-issue write_file with both path and content as JSON strings."
+            )));
+        }
+    }
     let a: Args = match serde_json::from_value(args.clone()) {
         Ok(v) => v,
         Err(e) => {
@@ -117,6 +126,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("codefactory-write-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[tokio::test]
+    async fn m144_write_file_invalid_fields_are_actionable_tool_results() {
+        let cwd = temp_dir();
+        for args in [json!({"path":"a.txt", "content":null}), json!({"path":"a.txt"}), json!({"path":null,"content":"ok"}), json!(null)] {
+            let output = execute(args, &ExecCtx::new(cwd.clone(), None)).await.unwrap();
+            assert!(output.is_error);
+            assert!(output.content.contains("expected string"), "{}", output.content);
+            assert!(output.content.contains("path") || output.content.contains("content"));
+            assert!(!output.content.contains("Received:"), "must not echo payload");
+        }
+        assert!(!cwd.join("a.txt").exists());
+        std::fs::remove_dir_all(cwd).unwrap();
     }
 
     #[tokio::test]

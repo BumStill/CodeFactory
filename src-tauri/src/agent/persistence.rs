@@ -45,7 +45,7 @@ pub async fn persist_model_route_attempts(
         return Ok(());
     }
     let now = Utc::now().to_rfc3339();
-    let mut tx = db.begin().await.map_err(perr)?;
+    let mut tx = crate::storage::db::begin_write(db).await.map_err(perr)?;
     for attempt in attempts {
         sqlx::query(
             "INSERT INTO model_route_attempts
@@ -168,7 +168,7 @@ impl Persistence for SqlitePersistence {
             crate::storage::db::current_process_start_token()
                 .unwrap_or_else(|| "unknown-start".into())
         );
-        let mut tx = self.db.begin().await.map_err(perr)?;
+        let mut tx = crate::storage::db::begin_write(&self.db).await.map_err(perr)?;
         sqlx::query(
             "UPDATE chat_turn_state
              SET recovery_attempt=recovery_attempt+1, updated_at=?
@@ -430,7 +430,7 @@ impl Persistence for SqlitePersistence {
             return Ok(false);
         }
         let marker_id = format!("notice-marker:{}:{marker}", self.session_id);
-        let mut tx = self.db.begin().await.map_err(perr)?;
+        let mut tx = crate::storage::db::begin_write(&self.db).await.map_err(perr)?;
         let inserted = if is_gate_control_state(state) {
             sqlx::query(
                 "INSERT OR IGNORE INTO gate_events \

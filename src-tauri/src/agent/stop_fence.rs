@@ -65,6 +65,7 @@ pub async fn record_stop(
     pr_number: Option<i64>,
 ) -> Result<StopFence, sqlx::Error> {
     let now = chrono::Utc::now().timestamp_millis();
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     sqlx::query(&format!(
         "INSERT INTO {STOP_FENCE_TABLE} (session_id, reason, pr_number, stopped_at_ms)
          VALUES (?, ?, ?, ?)
@@ -77,8 +78,9 @@ pub async fn record_stop(
     .bind(reason)
     .bind(pr_number)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(StopFence {
         session_id: session_id.to_string(),
         reason: reason.to_string(),
@@ -198,13 +200,8 @@ impl DeliveryStopGate for FlagStopGate {
 /// R1 的文案：停止之后会话里必须说清"停在哪、什么没发生、已经发生的怎么办"。
 pub fn stopped_delivery_notice(pr_number: Option<u64>) -> String {
     match pr_number {
-        Some(number) => format!(
-            "已停止：PR #{number} 保持打开，没有合并。停止之后不再执行还没发生的交付动作\
-（推送、开 PR、合并、发版）；已经发生的动作不回滚。要接着交付，需要你或编排方明确发起。"
-        ),
-        None => "已停止：远端还没有本次交付的 PR，停止之后不再执行还没发生的交付动作\
-（推送、开 PR、合并、发版）；已经发生的本地提交不回滚。要接着交付，需要你或编排方明确发起。"
-            .to_string(),
+        Some(number) => format!("已停止。PR #{number} 保持打开；本地改动保留在工作区。"),
+        None => "已停止。未创建 PR；本地改动保留在工作区。".to_string(),
     }
 }
 
@@ -285,10 +282,10 @@ pub fn stop_pending_pr_actions(
             false
         }
     };
-    let notice = if cleared_merge_queue_arm {
-        format!("已撤回合并排队；PR 保留未合并。{}", stopped_delivery_notice(Some(number)))
+    let notice = if cleared_merge_queue_arm && disabled_auto_merge {
+        format!("已停止。已撤回 PR #{number} 的自动合并；本地改动保留在工作区。")
     } else {
-        format!("已停止本地交付，但合并排队撤回失败，PR #{number} 仍可能被远端队列处理；请核对远端状态。")
+        format!("已停止本地执行，但未能完全撤回 PR #{number} 的自动合并，远端仍可能继续合并。")
     };
     StopDisarmReport {
         pr_number: Some(number),
@@ -297,6 +294,20 @@ pub fn stop_pending_pr_actions(
         notes,
         notice,
     }
+}
+
+/// Persist one user-facing notice per input turn, even when stop is invoked
+/// concurrently through the menu and dispatch entry. Audit notes stay in logs.
+pub async fn persist_stop_notice(pool: &SqlitePool, session_id: &str, notice: &str) -> sqlx::Result<()> {
+    let mut tx = crate::storage::db::begin_write(pool).await?;
+    let root: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM messages WHERE session_id=? AND role='user' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    ).bind(session_id).fetch_optional(&mut *tx).await?;
+    let id = format!("stop-notice:{session_id}:{}", root.as_deref().unwrap_or("before-input"));
+    sqlx::query("INSERT INTO messages (id,session_id,role,content,created_at) VALUES (?,?,'assistant',?,?) ON CONFLICT(id) DO UPDATE SET content=excluded.content WHERE messages.session_id=excluded.session_id")
+        .bind(id).bind(session_id).bind(notice).bind(chrono::Utc::now().timestamp_millis())
+        .execute(&mut *tx).await?;
+    tx.commit().await
 }
 
 /// The PR this session most recently delivered, if any.
@@ -392,6 +403,8 @@ pub async fn stop_session_delivery(
     workspace_hint: Option<&std::path::Path>,
 ) -> Result<StopDisarmReport, sqlx::Error> {
     let pr_number = latest_session_pr(pool, session_id).await;
+    let has_delivery: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_runs WHERE session_id=?")
+        .bind(session_id).fetch_one(pool).await?;
     record_stop(
         pool,
         session_id,
@@ -399,6 +412,7 @@ pub async fn stop_session_delivery(
         pr_number.map(|number| number as i64),
     )
     .await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     sqlx::query(
         "UPDATE delivery_runs SET status='cancelled', next_action_authorized=0,
          lease_owner=NULL, lease_expires_at=NULL, updated_at=?
@@ -406,8 +420,9 @@ pub async fn stop_session_delivery(
     )
     .bind(chrono::Utc::now().timestamp_millis())
     .bind(session_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     let workspace = match workspace_hint {
         Some(path) => path.to_path_buf(),
         None => latest_session_workspace(pool, session_id)
@@ -415,12 +430,48 @@ pub async fn stop_session_delivery(
             .unwrap_or_else(|| std::path::PathBuf::from(".")),
     };
     let mut remote = GhPrStopDisarm { cwd: workspace };
-    Ok(stop_pending_pr_actions(&mut remote, pr_number))
+    let mut report = stop_pending_pr_actions(&mut remote, pr_number);
+    if pr_number.is_none() && has_delivery == 0 {
+        report.notice = "已停止。已有内容和本地改动已保留。".into();
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m144_stop_without_delivery_is_plain_and_idempotent_per_turn() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at) VALUES ('m144-stop','synthetic','/tmp','model',1,1)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('root-a','m144-stop','user','synthetic',1)").execute(&pool).await.unwrap();
+        let report = stop_session_delivery(&pool, "m144-stop", "user_stop", None).await.unwrap();
+        assert!(!report.notice.contains("PR"));
+        assert!(!report.notice.contains("编排方"));
+        let (first, second) = tokio::join!(
+            persist_stop_notice(&pool, "m144-stop", &report.notice),
+            persist_stop_notice(&pool, "m144-stop", &report.notice)
+        );
+        first.unwrap(); second.unwrap();
+        let rows: Vec<String> = sqlx::query_scalar("SELECT content FROM messages WHERE session_id='m144-stop' AND role='assistant'").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec![report.notice]);
+        assert!(stop_fence(&pool, "m144-stop").await.unwrap().is_some());
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('root-b','m144-stop','user','synthetic again',2)").execute(&pool).await.unwrap();
+        persist_stop_notice(&pool, "m144-stop", "已停止。").await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id='m144-stop' AND role='assistant'").fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 2, "a new user turn must get its own stop receipt");
+        pool.close().await;
+    }
+
+    #[test]
+    fn m144_stop_notice_is_plain_and_delivery_specific() {
+        let notice = stopped_delivery_notice(Some(144));
+        assert!(notice.contains("PR #144"));
+        assert!(!notice.contains("编排方"));
+        assert_eq!(notice.matches("已停止").count(), 1);
+        assert!(!notice.contains("不再执行还没发生"));
+    }
 
     /// A synthetic PR-side client: records what a stop asked of the provider.
     #[derive(Debug, Default)]
@@ -460,8 +511,8 @@ mod tests {
         );
         assert!(report.cleared_merge_queue_arm && report.disabled_auto_merge);
         assert!(report.is_complete());
-        assert!(report.notice.contains("PR #584 保持打开，没有合并"));
-        assert!(report.notice.contains("已撤回合并排队；PR 保留未合并"), "{}", report.notice);
+        assert!(report.notice.contains("已撤回 PR #584 的自动合并"));
+        assert_eq!(report.notice.matches("已停止").count(), 1);
     }
 
     /// 停止是幂等的：重复停止不会变成另一种动作，也不会漏掉任何一次关闭。
@@ -505,15 +556,15 @@ mod tests {
         let report = stop_pending_pr_actions(&mut remote, None);
         assert!(remote.calls.is_empty());
         assert!(report.is_complete());
-        assert!(report.notice.contains("不再执行还没发生的交付动作"));
+        assert!(report.notice.contains("未创建 PR"));
     }
 
     #[test]
     fn r1_notice_names_the_pr_and_says_it_was_not_merged() {
         let notice = stopped_delivery_notice(Some(584));
-        assert!(notice.contains("PR #584 保持打开，没有合并"), "{notice}");
-        assert!(notice.contains("已经发生的动作不回滚"), "{notice}");
-        assert!(notice.contains("明确发起"), "{notice}");
+        assert!(notice.contains("PR #584 保持打开"), "{notice}");
+        assert!(notice.contains("本地改动保留在工作区"), "{notice}");
+        assert!(!notice.contains("编排方"), "{notice}");
     }
 
     #[test]

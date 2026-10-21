@@ -3,7 +3,7 @@ use chrono::Utc;
 use sqlx::{
     migrate::MigrateDatabase,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
-    Row, Sqlite, SqlitePool, Transaction,
+    Row, SqlitePool,
 };
 use std::str::FromStr;
 use std::time::Duration;
@@ -150,9 +150,10 @@ pub(crate) fn process_identity_is_live(pid: u32, expected_start_token: Option<&s
 // include production modules via `#[path]` reuse the *same* implementation the
 // app ships instead of a weaker test double. Re-exported here because
 // `storage::db` is the path every caller already uses.
+#[allow(unused_imports)]
 pub use super::write_lock::{
     begin_write, contention_backoff, is_lock_contention, is_lock_contention_message, retry_write,
-    BUSY_TIMEOUT, CONTENTION_ATTEMPTS, LOCAL_STORE_CONTENDED,
+    rollback_idle_transactions, BUSY_TIMEOUT, CONTENTION_ATTEMPTS, LOCAL_STORE_CONTENDED,
 };
 
 /// Contention test for callers whose write goes through a store API that wraps
@@ -198,6 +199,53 @@ fn pool_connect_options(
         .busy_timeout(BUSY_TIMEOUT))
 }
 
+fn pool_builder() -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(5)
+        // Bounded wait for a pooled connection. Without it, every connection
+        // being held (e.g. by a leaked transaction before the release cleanup
+        // existed) turned "send a message" into an unbounded hang.
+        .acquire_timeout(Duration::from_secs(30))
+        // A bare `BEGIN IMMEDIATE` executed with `execute()` is invisible to
+        // sqlx's transaction bookkeeping. If its owner returns early or is
+        // cancelled, the connection comes back to the pool still holding the
+        // database write lock, and every later send fails with code 5 until the
+        // app restarts (Windows field report, 2026-10-21). SQLite's autocommit
+        // flag is checked on return, and only a leaked transaction is rolled
+        // back, so a resumed background write is no longer a permanent outage.
+        .after_release(|connection, _metadata| {
+            Box::pin(async move {
+                if connection_open_transaction(connection).await {
+                    tracing::warn!(
+                        "rolling back a SQLite transaction leaked into the connection pool"
+                    );
+                    sqlx::query("ROLLBACK").execute(&mut *connection).await?;
+                }
+                Ok(true)
+            })
+        })
+}
+
+/// True when the connection is inside a transaction. Reads the same autocommit
+/// flag sqlx's own executor uses, without needing a second statement (a
+/// statement would itself be part of the leak we are cleaning).
+async fn connection_open_transaction(connection: &mut sqlx::SqliteConnection) -> bool {
+    // `libsqlite3-sys` is already linked by the sqlx SQLite driver, so this
+    // symbol resolves without adding a second SQLite build dependency.
+    extern "C" {
+        fn sqlite3_get_autocommit(db: *mut std::ffi::c_void) -> i32;
+    }
+    let mut handle = match connection.lock_handle().await {
+        Ok(handle) => handle,
+        Err(_) => return false,
+    };
+    let raw = handle.as_raw_handle().as_ptr().cast();
+    // SAFETY: `lock_handle` guarantees the driver's background thread is not
+    // touching this handle, and sqlite3_get_autocommit only reads connection
+    // state on the current thread.
+    unsafe { sqlite3_get_autocommit(raw) == 0 }
+}
+
 pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     if !sqlx::Sqlite::database_exists(db_path)
         .await
@@ -210,8 +258,7 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     // connection: sqlx runs these pragmas as part of each connection's
     // handshake, and a failure to apply them fails the connect instead of
     // being swallowed.
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+    let pool = pool_builder()
         .connect_with(pool_connect_options(db_path)?)
         .await?;
 
@@ -3070,6 +3117,165 @@ mod tests {
         assert_eq!(counter(&pool).await, ROUNDS);
         pool.close().await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn m144_returned_raw_transaction_cannot_poison_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poison.sqlite");
+        let pool = pool_builder()
+            .max_connections(1)
+            .connect_with(pool_connect_options(path.to_str().unwrap()).unwrap())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE synthetic_lock_test (n INTEGER)").execute(&pool).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await.unwrap();
+        sqlx::query("INSERT INTO synthetic_lock_test VALUES (99)").execute(&mut *connection).await.unwrap();
+        // Simulate a failed COMMIT / cancelled bare-SQL transaction owner.
+        // sqlx cannot track BEGIN issued as a query, unlike Transaction RAII.
+        drop(connection);
+        let attempt = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut tx = begin_write(&pool).await?;
+            sqlx::query("INSERT INTO synthetic_lock_test VALUES (1)").execute(&mut *tx).await?;
+            tx.commit().await
+        }).await.expect("a returned connection must not retain a permanent write lock");
+        attempt.expect("later writes must recover without restarting the app");
+        let values: Vec<i64> = sqlx::query_scalar("SELECT n FROM synthetic_lock_test").fetch_all(&pool).await.unwrap();
+        assert_eq!(values, vec![1], "uncommitted abandoned write must be rolled back");
+        pool.close().await;
+    }
+
+    /// Negative control for the release cleanup: the same sequence against a
+    /// pool *without* `after_release` keeps returning code 5 forever. If this
+    /// test starts failing, the positive recovery test above is no longer
+    /// proving anything about the cleanup.
+    #[tokio::test]
+    async fn m144_without_release_cleanup_the_lock_would_stay_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poison-control.sqlite");
+        let bare = SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(
+                pool_connect_options(path.to_str().unwrap())
+                    .unwrap()
+                    .busy_timeout(Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE control (n INTEGER)").execute(&bare).await.unwrap();
+        let mut connection = bare.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await.unwrap();
+        drop(connection);
+        let second = bare.begin_with("BEGIN IMMEDIATE").await;
+        assert!(
+            second.is_err(),
+            "without release cleanup a leaked transaction must still own the write lock"
+        );
+        // The production self-recovery path: releasing idle leaked transactions
+        // restores writes without rebuilding the pool or restarting the app.
+        assert_eq!(rollback_idle_transactions(&bare).await, 1);
+        let mut tx = begin_write(&bare)
+            .await
+            .expect("recovery must restore writes after one failed attempt");
+        sqlx::query("INSERT INTO control VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        bare.close().await;
+    }
+
+    /// Every writer that lost a lock race must still be able to write once the
+    /// holder releases — a failed attempt may never leave the pool unusable.
+    /// This is the Windows field symptom ("after one database is locked, every
+    /// later send fails until restart") expressed as executable evidence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn m144_failed_contended_write_does_not_disable_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contended.sqlite");
+        let options = pool_connect_options(path.to_str().unwrap())
+            .unwrap()
+            .busy_timeout(Duration::ZERO);
+        let pool = pool_builder()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE synthetic_send_test (n INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut holder = pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *holder).await.unwrap();
+        sqlx::query("INSERT INTO synthetic_send_test VALUES (0)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let failed = begin_write(&pool).await.expect_err("a zero-timeout contender must see code 5");
+        assert!(
+            is_lock_contention(&failed),
+            "the first attempt must fail as documented contention: {failed}"
+        );
+        // The simulated lock holder goes away; the very next send must work
+        // without restarting anything.
+        sqlx::query("ROLLBACK").execute(&mut *holder).await.unwrap();
+        drop(holder);
+        let mut tx = begin_write(&pool).await.expect("later sends must recover");
+        sqlx::query("INSERT INTO synthetic_send_test VALUES (1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let values: Vec<i64> = sqlx::query_scalar("SELECT n FROM synthetic_send_test ORDER BY n")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(values, vec![1]);
+        pool.close().await;
+    }
+
+    /// Windows CI runs this on a real NTFS-backed database. Concurrent sends
+    /// must serialize through SQLite and all land; any code-5 leak fails here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn m144_parallel_writers_all_commit_on_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parallel.sqlite");
+        let pool = pool_builder()
+            .connect_with(pool_connect_options(path.to_str().unwrap()).unwrap())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE synthetic_parallel (writer INTEGER, round INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut writers = Vec::new();
+        for writer in 0..8_i64 {
+            let pool = pool.clone();
+            writers.push(tokio::spawn(async move {
+                for round in 0..5_i64 {
+                    let mut tx = begin_write(&pool).await?;
+                    sqlx::query("INSERT INTO synthetic_parallel VALUES (?, ?)")
+                        .bind(writer)
+                        .bind(round)
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
+                }
+                Ok::<(), sqlx::Error>(())
+            }));
+        }
+        for writer in writers {
+            writer.await.unwrap().expect("every concurrent writer must commit");
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM synthetic_parallel")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 40);
+        pool.close().await;
     }
 
     /// A writer that holds the write lock briefly must make a parallel session

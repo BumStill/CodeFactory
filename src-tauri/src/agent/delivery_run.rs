@@ -355,7 +355,7 @@ pub async fn next_delivery_failure_attempt(
     signature: &str,
     now: i64,
 ) -> Result<i64> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let row = sqlx::query(
         "SELECT failure_signature, stage_attempt, lease_expires_at
          FROM delivery_runs WHERE id=? AND lease_owner=? AND claim_epoch=?",
@@ -674,7 +674,7 @@ async fn rebind_stale_workspace_identity(
     process: &ProcessIdentity,
     now: i64,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let existing = sqlx::query(
         "SELECT objective_id, run_kind, session_id, task_id, workspace_path,
                 worktree_identity, repo_identity, base_branch, head_branch,
@@ -876,7 +876,7 @@ pub async fn create_delivery_run(
     // record the previous attempt left behind instead of refusing forever.
     rebind_stale_workspace_identity(pool, run, process, now).await?;
 
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let inserted = sqlx::query(
         "INSERT OR IGNORE INTO delivery_runs (
             id, objective_id, run_kind, session_id, root_turn_id, task_segment_id, task_id, workspace_path,
@@ -1275,7 +1275,7 @@ pub async fn reconcile_delivery_run_identity(
     now: i64,
     revision: &DeliveryIdentityRevision,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let existing = sqlx::query(
         "SELECT objective_id, run_kind, session_id, task_id, workspace_path,
                 worktree_identity, repo_identity, base_branch, head_branch,
@@ -1457,7 +1457,7 @@ pub async fn release_delivery_lease(
     pool: &SqlitePool, run_id: &str, process: &ProcessIdentity,
     claim_epoch: i64, now: i64, reason: &str,
 ) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let changed = sqlx::query("UPDATE delivery_runs SET lease_owner=NULL, lease_expires_at=NULL WHERE id=? AND lease_owner=? AND claim_epoch=?")
         .bind(run_id).bind(&process.instance_id).bind(claim_epoch)
         .execute(&mut *tx).await?.rows_affected() == 1;
@@ -1714,7 +1714,7 @@ pub async fn begin_delivery_mutation_intent(
         return Ok(false);
     }
     let evidence_json = normalized_mutation_evidence(evidence_json, false)?;
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let inserted = sqlx::query(
         "INSERT OR IGNORE INTO delivery_mutation_intents
          (intent_id, run_id, claim_epoch, rung, operation_key, status,
@@ -1897,7 +1897,7 @@ async fn settle_original_delivery_mutation_intent(
     } else {
         "status IN ('started', 'unknown')"
     };
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let updated = sqlx::query(&format!(
         "UPDATE delivery_mutation_intents
          SET status=?, evidence_json=COALESCE(?, evidence_json), updated_at=?
@@ -1973,7 +1973,7 @@ pub async fn mark_delivery_mutation_intent_reconciled_committed(
     if intent_id.trim().is_empty() || claim_epoch <= 0 {
         return Ok(false);
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let Some(existing_intent) = sqlx::query_as::<_, DeliveryMutationIntent>(
         "SELECT intent_id, run_id, claim_epoch, rung, operation_key, status,
                 process_instance, evidence_json, started_at, updated_at
@@ -2126,7 +2126,7 @@ pub async fn with_receipted_local_commit_cas<T, F>(
 where
     F: FnOnce() -> std::result::Result<T, String>,
 {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let commit_boundary_now = if now >= 1_000_000_000_000 {
         chrono::Utc::now().timestamp_millis()
     } else {
@@ -2240,7 +2240,7 @@ pub async fn with_receipted_branch_update_cas<T, F>(
 where
     F: FnOnce() -> std::result::Result<T, String>,
 {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let commit_boundary_now = if now >= 1_000_000_000_000 {
         chrono::Utc::now().timestamp_millis()
     } else {
@@ -2464,7 +2464,7 @@ pub async fn mark_delivery_claim_reconciled(
     if claim_epoch <= 0 {
         return Ok(false);
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let changed = sqlx::query(
         "UPDATE delivery_runs
          SET reconciled_claim_epoch=claim_epoch, last_observed_at=?, updated_at=?,
@@ -2551,7 +2551,7 @@ pub async fn record_delivery_observation(
             "delivery observation requires a positive claimed epoch".into(),
         ));
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     let previous = sqlx::query(
         "SELECT objective_id, repo_identity, worktree_identity, head_branch,
                 change_set_digest, stage, status, reached_ceiling, expected_head_sha,
@@ -3013,7 +3013,7 @@ pub async fn plan_startup_recovery(
     now: i64,
     lease_ttl: i64,
 ) -> Result<StartupRecoveryPlan> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::storage::db::begin_write(pool).await?;
     park_delivery_runs_linked_to_exhausted_objectives(&mut tx, process, now).await?;
     // CF-STOP-R3：用户/编排方停掉的会话，它的交付不再由后台恢复回路接手。
     park_delivery_runs_for_stopped_sessions(&mut tx, now).await?;
