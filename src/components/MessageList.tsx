@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { FileLinkScope, openFileLinkVisible } from "./MessageFileLinks";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { UrlTransform } from "react-markdown";
@@ -20,7 +21,7 @@ import {
 } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { ImagePreview } from "./ImagePreview";
-import { FileArtifactCard, isDocumentPath } from "./FileArtifactCard";
+import { MessageFileArtifactCard, isDocumentPath } from "./MessageFileArtifactCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
 import { ChatGptAuthRecovery } from "./ChatGptAuthRecovery";
@@ -160,6 +161,10 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
 }
 
 const allowedLocalImageUrl: UrlTransform = (value, key, node): string => {
+  if (node.tagName === "a" && key === "href") {
+    if (/^(?:https?:|file:)/i.test(value) || !/^[A-Za-z][A-Za-z\d+.-]*:/.test(value) || /^[A-Za-z]:[\\/]/.test(value)) return value;
+    return "";
+  }
   if (node.tagName === "img" && key === "src" && value.startsWith("file://")) return value;
   return defaultUrlTransform(value);
 };
@@ -204,7 +209,7 @@ function MarkdownContent({ content, onOpenDocument }: { content: string; onOpenD
           const code = String(children).replace(/\n$/, "");
           const match = /language-(\w+)/.exec(className || "");
           if (!match && isDocumentPath(code)) {
-            return <FileArtifactCard path={code} compact onPreview={onOpenDocument} {...props} />;
+            return <MessageFileArtifactCard path={code} compact onPreview={onOpenDocument} {...props} />;
           }
           if (match) return <CodeBlock lang={match[1]} code={code} />;
           return <code className="rounded bg-accent/10 px-1 py-0.5 font-mono text-note text-gray-300" {...props}>{children}</code>;
@@ -254,7 +259,7 @@ const markdownComponents: Components = {
     const isBlock = !!match;
     const code = String(children).replace(/\n$/, "");
     if (!isBlock && isDocumentPath(code)) {
-      return <FileArtifactCard path={code} compact {...props} />;
+      return <MessageFileArtifactCard path={code} compact {...props} />;
     }
     if (isBlock) {
       return <CodeBlock lang={match![1]} code={code} />;
@@ -344,6 +349,7 @@ const TimelineMarkdownSegment = memo(function TimelineMarkdownSegment({
 
 // ── Main component ───────────────────────────────────────────────────────────
 export function MessageList({
+  cwd,
   messages,
   streaming,
   turnActive = streaming,
@@ -435,6 +441,7 @@ export function MessageList({
 
   if (showingStartPage) {
     return (
+      <FileLinkScope.Provider value={{ cwd, sessionId: conversationKey }}>
       <div className="relative flex-1 min-h-0">
         {/* Same containment as the message branch below: the wrapper owns the
             height and an `absolute inset-0` child scrolls inside it. A plain
@@ -466,6 +473,7 @@ export function MessageList({
           </div>
         )}
       </div>
+      </FileLinkScope.Provider>
     );
   }
 
@@ -583,7 +591,14 @@ export function MessageList({
   const lastAssistantIdsByUserTurn = new Set(lastAssistantIdByRootTurn.values());
 
   return (
-    <div className="relative flex-1 min-h-0">
+    <FileLinkScope.Provider value={{ cwd, sessionId: conversationKey }}>
+    <div className="relative flex-1 min-h-0" onClickCapture={(event) => {
+      const target = (event.target as Element).closest?.("a")?.getAttribute("href");
+      if (!target) return;
+      event.preventDefault();
+      event.stopPropagation();
+      openFileLinkVisible(target, cwd, conversationKey);
+    }}>
       <div
         ref={scrollerRef}
         className="absolute inset-0 overflow-y-auto px-4 py-4"
@@ -700,6 +715,7 @@ export function MessageList({
         </button>
       )}
     </div>
+    </FileLinkScope.Provider>
   );
 }
 
