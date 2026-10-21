@@ -22,6 +22,23 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             }
         }
     }
+    // M139: permission waits are facts even while the executor is alive.
+    // Cancellation above remains authoritative; resolved/expired prompts do not wait.
+    if has_table(db, "permission_intents").await? {
+        let pending: Option<(String, String)> = sqlx::query_as(
+            "SELECT tool_name,prompt_args_json FROM permission_intents WHERE session_id=? AND status='pending' AND expires_at>? ORDER BY created_at DESC LIMIT 1",
+        ).bind(session).bind(at).fetch_optional(db).await?;
+        if let Some((tool, args)) = pending {
+            let args = serde_json::from_str::<serde_json::Value>(&args).unwrap_or_default();
+            let summary = args.get("command").and_then(serde_json::Value::as_str).unwrap_or(&tool);
+            let summary: String = summary.chars().take(240).collect();
+            return Ok(ThinState {
+                state: SessionState::WaitingUser,
+                question: Some(format!("需要你批准执行：{summary}")),
+                ..ThinState::running()
+            });
+        }
+    }
     match crate::session_executor_alive(session) {
         Some(true) => return Ok(ThinState::running()),
         None => return Ok(super::thin_state::load(db, session).await?.unwrap_or_else(ThinState::running)),
@@ -86,11 +103,6 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             what: "后台任务或未来定时唤醒".into(), covered: true,
         }, "本会话记录"));
     }
-    if has_table(db, "permission_intents").await? {
-        let question: Option<String> = sqlx::query_scalar("SELECT tool_name FROM permission_intents WHERE session_id=? AND status='pending' AND expires_at>? AND created_at>? ORDER BY created_at DESC LIMIT 1")
-            .bind(session).bind(at).bind(cutoff).fetch_optional(db).await?;
-        if let Some(tool) = question { return Ok(ThinState { state: SessionState::WaitingUser, question: Some(format!("是否允许 {tool}？")), ..ThinState::running() }); }
-    }
     if has_table(db, "thin_wait_notes").await? {
         // A note names an observed question; a subsequent user answer consumes it.
         let note: Option<(String, Option<String>)> = sqlx::query_as("SELECT waiting_for,root_turn_id FROM thin_wait_notes WHERE session_id=?")
@@ -135,6 +147,24 @@ mod tests {
             .execute(&db).await.unwrap();
         db
     }
+    #[tokio::test]
+    async fn m139_pending_approval_overrides_live_executor_and_resumes() {
+        let db = fixture().await;
+        let control = crate::ChatRunControl::pending();
+        crate::register_session_executor("derive", &control);
+        sqlx::raw_sql("DROP TABLE permission_intents; CREATE TABLE permission_intents(session_id TEXT, status TEXT, expires_at INTEGER, created_at INTEGER, tool_name TEXT, prompt_args_json TEXT);
+            INSERT INTO permission_intents VALUES ('derive','pending',9223372036854775807,100,'bash','{\"command\":\"rm -rf generated\"}');")
+            .execute(&db).await.unwrap();
+        let waiting = refresh(&db, "derive").await.unwrap();
+        assert_eq!(waiting.state, SessionState::WaitingUser);
+        assert_eq!(waiting.question.as_deref(), Some("需要你批准执行：rm -rf generated"));
+        sqlx::query("UPDATE permission_intents SET status='allowed'").execute(&db).await.unwrap();
+        let resumed = refresh(&db, "derive").await.unwrap();
+        assert_eq!(resumed.state, SessionState::Running);
+        assert!(resumed.question.is_none());
+        crate::unregister_session_executor("derive", &control);
+    }
+
     #[tokio::test]
     async fn facts_override_poisoned_cache_and_dead_process_controls() {
         let db = fixture().await;

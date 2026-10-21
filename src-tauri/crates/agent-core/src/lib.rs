@@ -682,7 +682,7 @@ pub fn effective_command_timeout_sec(command: &str, requested: u64, maximum: u64
 const READ_ONLY_PROBE_VERBS: &[&str] = &[
     "awk", "basename", "cat", "cd", "cut", "df", "dirname", "du", "echo", "file", "find",
     "grep", "head", "jq", "ls", "printf", "pwd", "readlink", "realpath", "rg", "sed", "sort",
-    "stat", "tail", "tr", "tree", "type", "uniq", "wc", "which",
+    "stat", "tail", "tr", "tree", "type", "uniq", "wc", "which", "ps",
 ];
 
 /// M52b-R1: forge query vocabulary, expressed as structure — binary, then
@@ -7904,6 +7904,19 @@ mod tests {
     /// `git log`, and the whole compound command was denied as a mutation.
     /// Listing refs is a query like `git status`; only the forms that write a
     /// ref stay mutations.
+    #[test]
+    fn m139_process_queries_do_not_become_remote_writes() {
+        for command in [
+            "git status --short; gh pr view --json number,state; ps -eo pid,etime,args | grep '[s]leep 60'",
+            "ps aux | head -5; gh issue list",
+        ] {
+            assert!(command_is_read_only_probe(command), "{command}");
+        }
+        for command in ["ps aux; gh pr create", "ps aux > out", "ps aux; git push", "ps aux; rm file"] {
+            assert!(!command_is_read_only_probe(command) || review_command_mutation(command).is_some(), "{command}");
+        }
+    }
+
     #[test]
     fn m131b_git_branch_listing_is_a_read_only_probe() {
         let field_report = "git status --short --branch; echo '--- log ---'; \
