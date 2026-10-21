@@ -268,8 +268,8 @@
       "category": "permission_safety",
       "priority": "P1",
       "source_kind": "product_contract",
-      "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs"],
-      "automated_by": ["pnpm:test:permission-mode:headless"],
+      "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs", "src-tauri/src/agent/permission_gateway.rs"],
+      "automated_by": ["pnpm:test:permission-mode:headless", "rust:m139_readonly_compositions_skip_approval", "rust:m139_standard_write_waits_then_approval_continues"],
       "required_evidence": ["L1", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
