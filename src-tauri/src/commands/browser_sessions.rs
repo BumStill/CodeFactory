@@ -142,9 +142,16 @@ pub async fn browser_bridge_pairing(
         "port": pairing.port,
         "token": pairing.token,
         "connected": connected,
+        "diagnostics": bridge.diagnostics().await,
         "extension_dir": crate::browser::extension_package::existing_dir()
             .map(|dir| dir.display().to_string()),
     }))
+}
+
+#[tauri::command]
+pub async fn browser_bridge_reconnect() -> Result<(), AppError> {
+    crate::tools::browser_session::BRIDGE.reconnect().await;
+    Ok(())
 }
 
 /// Write the extension out, ready to load, with pairing already filled in.
@@ -176,6 +183,7 @@ pub async fn browser_extension_prepare(
         "port": pairing.port,
         "token": pairing.token,
         "connected": connected,
+        "diagnostics": bridge.diagnostics().await,
         "chrome_available": crate::browser::chromium::system_chrome().is_some(),
     }))
 }

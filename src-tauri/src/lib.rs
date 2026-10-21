@@ -1992,6 +1992,7 @@ pub fn run() {
             commands::build_cache::build_cache_cleanup,
             commands::browser_sessions::close_browser_session,
             commands::browser_sessions::browser_bridge_pairing,
+            commands::browser_sessions::browser_bridge_reconnect,
             commands::browser_sessions::browser_extension_prepare,
             commands::browser_sessions::browser_extension_reveal,
             commands::browser_sessions::browser_open_extensions_page,
