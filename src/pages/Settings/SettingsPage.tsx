@@ -1874,13 +1874,14 @@ function AppearanceTab() {
 // force-install policy, a registry key) need administrator rights. So the panel
 // aims to make it the *only* step — open the folder, open the extensions page,
 // nothing to type.
-function BrowserBridgePanel() {
+export function BrowserBridgePanel() {
   const [state, setState] = useState<{
     dir: string;
     port: number;
     token: string;
     connected: boolean;
     chrome_available: boolean;
+    diagnostics?: { events: Array<{ at: number; side: string; event: string; port?: number; code?: number; reason?: string }> };
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -1981,6 +1982,30 @@ function BrowserBridgePanel() {
 
       {error && <p className="text-label leading-5 text-rose-500">{error}</p>}
 
+      {state && <div className="space-y-2 text-label text-gray-500">
+        <div className="flex flex-wrap gap-2">
+          <button type="button" className="rounded border border-border px-2 py-1 text-gray-300" onClick={() => void (async () => {
+            try {
+              await navigator.clipboard.writeText(JSON.stringify({ port: state.port, connected: state.connected, events: state.diagnostics?.events ?? [] }, null, 2));
+              setNotice("诊断信息已复制（不含配对码）");
+            } catch (copyError) { setNotice(`复制失败：${copyError}`); }
+          })()}>复制诊断信息</button>
+          <button type="button" className="rounded border border-border px-2 py-1 text-gray-300" onClick={() => void (async () => {
+            await run("browser_bridge_reconnect", "重连失败：");
+            await load();
+          })()}>重新连接</button>
+        </div>
+        {notice && <p role="status">{notice}</p>}
+        <details>
+          <summary className="cursor-pointer">最近 50 条连接事件</summary>
+          <ol className="mt-2 max-h-52 overflow-auto break-words font-mono text-caption">
+            {(state.diagnostics?.events ?? []).slice(-50).map((event, index) => <li key={index}>
+              {new Date(event.at).toLocaleTimeString()} {event.side} {event.event} {event.port ?? ""} {event.code ?? ""} {event.reason ?? ""}
+            </li>)}
+          </ol>
+        </details>
+      </div>}
+
       {reconnecting ? (
         <p className="text-label leading-5 text-amber-600 dark:text-amber-400">
           扩展连接短暂中断，正在自动恢复；当前会话和已选标签页会继续保留。
@@ -2026,8 +2051,6 @@ function BrowserBridgePanel() {
                 打开扩展文件夹
               </button>
             </div>
-
-            {notice && <p className="text-label leading-5 text-amber-500">{notice}</p>}
 
             <details className="text-label text-gray-500">
               <summary className="cursor-pointer">手动配对(一般不需要)</summary>

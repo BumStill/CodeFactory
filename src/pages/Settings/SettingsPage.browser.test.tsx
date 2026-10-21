@@ -140,6 +140,17 @@ beforeEach(() => {
 });
 
 describe("browser bridge pairing panel", () => {
+  it("copies diagnostics without the pairing token and offers reconnect", async () => {
+    renderBrowserTab();
+    await userEvent.click(await screen.findByRole("button", { name: "复制诊断信息" }));
+    expect(mocks.writeText).toHaveBeenCalled();
+    const copied = mocks.writeText.mock.calls[0][0];
+    expect(copied).not.toContain("0123456789abcdef0123456789abcdef");
+    expect(JSON.parse(copied)).toMatchObject({ port: 47615, connected: false });
+    await userEvent.click(screen.getByRole("button", { name: "重新连接" }));
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_bridge_reconnect");
+  });
+
   it("prepares the extension itself instead of asking for a build command", async () => {
     // The regression this guards: setup used to start with `pnpm ext:build`,
     // which an installed app's user has no way to run.

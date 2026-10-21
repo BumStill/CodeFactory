@@ -166,6 +166,44 @@ describe("service worker command dispatch", () => {
     return { api, storage, executeScript, sockets, fetchStub, chromeStub, alarmListeners };
   }
 
+  it("records bounded redacted diagnostics including close code and retry port", async () => {
+    vi.useFakeTimers();
+    try {
+      const token = "a".repeat(32);
+      const { sockets, storage } = await loadWorker([], { packaged: { port: 54321, token } });
+      await vi.advanceTimersByTimeAsync(0);
+      sockets[0].emit("open");
+      sockets[0].emit("message", { data: JSON.stringify({ ready: true }) });
+      sockets[0].close(1006, "network lost");
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(sockets[1].url).toBe("ws://127.0.0.1:47615");
+      const events = storage.bridgeEvents as Array<Record<string, unknown>>;
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ event: "disconnected", code: 1006, reason: "network lost" }),
+        expect.objectContaining({ event: "connecting", port: 47615, source: "packaged" }),
+      ]));
+      expect(JSON.stringify(events)).not.toContain(token);
+      expect(events.length).toBeLessThanOrEqual(50);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("re-reads a changed token and port on reconnect", async () => {
+    vi.useFakeTimers();
+    try {
+      const packaged = { port: 54321, token: "a".repeat(32) };
+      const { sockets } = await loadWorker([], { packaged });
+      await vi.advanceTimersByTimeAsync(0);
+      sockets[0].emit("open");
+      sockets[0].close();
+      packaged.port = 47615;
+      packaged.token = "b".repeat(32);
+      await vi.advanceTimersByTimeAsync(2000);
+      sockets[1].emit("open");
+      expect(JSON.parse(sockets[1].sent[0]).token).toBe(packaged.token);
+      expect(sockets[1].url).toBe("ws://127.0.0.1:47615");
+    } finally { vi.useRealTimers(); }
+  });
+
   it("pairs from the file the app writes, with nothing typed in", async () => {
     // The manual step this removes: the user copying a port and a token out of
     // Settings, and doing it again after every restart.
@@ -370,6 +408,21 @@ describe("service worker command dispatch", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps the keepalive alarm inside Chrome's 30s idle window", async () => {
+    const { chromeStub } = await loadWorker([], {
+      packaged: { port: 47615, token: "a".repeat(32) },
+    });
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    const calls = chromeStub.alarms.create.mock.calls as Array<[string, { periodInMinutes: number }]>;
+    expect(calls.length).toBeGreaterThan(0);
+    const [name, options] = calls[calls.length - 1];
+    expect(name).toBe("codefactory-bridge-keepalive");
+    // Chrome suspends an idle MV3 worker at 30s. A one-minute alarm leaves a
+    // full-minute blind spot where a dead socket is never noticed — exactly the
+    // intermittent disconnect the user reported.
+    expect(options.periodInMinutes).toBeLessThanOrEqual(0.5);
   });
 
   it("backs a superseded browser profile off to standby probes without fast reconnect", async () => {
