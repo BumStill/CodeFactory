@@ -44,8 +44,12 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         terminal = stop.map(|time| (time, "cancelled：用户已停止会话".into()));
     }
     if has_table(db, "chat_turn_state").await? {
+        // 阶段 2 P0/R1：只有真实终止事实才算数。`objective_already_terminal` 与
+        // `superseded_at_startup` 是 legacy 目标收敛在重启时写给回合投影的，
+        // 不代表 thin 会话结束——v1.91.7 就是这样把还在跑 `sleep 60` 的会话判成
+        // “已结束（目标已终态）”。已写坏的投影在这里被忽略。
         let end: Option<(i64, String)> = sqlx::query_as(
-            "SELECT COALESCE(completed_at,updated_at),terminal_reason FROM chat_turn_state WHERE session_id=? AND terminal_reason IS NOT NULL ORDER BY COALESCE(completed_at,updated_at) DESC LIMIT 1",
+            "SELECT COALESCE(completed_at,updated_at),terminal_reason FROM chat_turn_state WHERE session_id=? AND terminal_reason IS NOT NULL AND terminal_reason NOT IN ('objective_already_terminal','superseded_at_startup') ORDER BY COALESCE(completed_at,updated_at) DESC LIMIT 1",
         ).bind(session).fetch_optional(db).await?;
         if let Some(end) = end { if terminal.as_ref().is_none_or(|old| end.0 > old.0) { terminal = Some(end); } }
     }
@@ -171,6 +175,53 @@ mod tests {
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('final','derive','assistant','完成',300)")
             .execute(&db).await.unwrap();
         assert_eq!(derive_state(&db, "derive").await.unwrap().reason.as_deref(), Some("最终回答已完成"));
+    }
+
+    /// 阶段 2 P0/R1：legacy 目标收敛在重启时写进回合投影的原因不是 thin 的终止
+    /// 事实。v1.91.7 现场（会话 `0dcf23e1`）就是这样把还在跑 `sleep 60` 的会话
+    /// 判成 `ended / objective_already_terminal`。
+    #[tokio::test]
+    async fn legacy_convergence_reasons_never_end_a_running_thin_session() {
+        let db = fixture().await;
+        super::super::thin_state::save(&db, "derive", &ThinState::running())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('mid-turn','derive','user','只读演练：用 bash 执行 sleep 60',1000)")
+            .execute(&db)
+            .await
+            .unwrap();
+        for reason in ["objective_already_terminal", "superseded_at_startup"] {
+            sqlx::raw_sql("DELETE FROM chat_turn_state")
+                .execute(&db)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at,completed_at,terminal_reason) VALUES ('turn','derive','settled','completed',1000,2000,2000,?)")
+                .bind(reason)
+                .execute(&db)
+                .await
+                .unwrap();
+            let derived = derive_state(&db, "derive").await.unwrap();
+            assert_eq!(
+                derived.state,
+                SessionState::Running,
+                "{reason} 不得结束 thin 会话（reason={:?}）",
+                derived.reason
+            );
+        }
+    }
+
+    /// R1 的另一半：真实终止事实仍然结束会话（停止意图 + 三次真实失败）。
+    #[tokio::test]
+    async fn real_termination_still_ends_a_thin_session() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO chat_session_cancel_intents(session_id,status,requested_at,updated_at) VALUES ('derive','requested',50,50)")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            derive_state(&db, "derive").await.unwrap().state,
+            SessionState::Ended
+        );
     }
 
     #[tokio::test]

@@ -3901,6 +3901,7 @@ pub(crate) async fn resume_context_objective(
 pub(crate) async fn resume_thin_running_session(
     app: AppHandle,
     session_id: String,
+    origin: crate::agent::thin_restart::ResumeOrigin,
 ) -> Result<(), AppError> {
     let db = app.state::<AppState>().db.read().await.clone();
     if !crate::agent::thin::is_thin(&db, &session_id).await {
@@ -3912,11 +3913,11 @@ pub(crate) async fn resume_thin_running_session(
     if thin.state != crate::agent::thin_state::SessionState::Running {
         return Ok(());
     }
-    let eligible = crate::agent::thin_restart::running_without_executor(
-        &db, Utc::now().timestamp_millis(),
-        crate::agent::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS,
-        |id| crate::session_executor_alive(id) != Some(false),
-    ).await?;
+    let eligible = origin
+        .candidates(&db, Utc::now().timestamp_millis(), |id| {
+            crate::session_executor_alive(id) != Some(false)
+        })
+        .await?;
     if !eligible.contains(&session_id) {
         return Ok(());
     }
@@ -4169,20 +4170,31 @@ async fn push_thin_resume_prompt(
     interrupted_at: i64,
     history: &mut Vec<crate::storage::Message>,
 ) -> Result<(), AppError> {
-    let last: Option<(String, String, i64)> = sqlx::query_as(
-        "SELECT tool.tool_name, tool.arguments, tool.created_at FROM tool_calls tool JOIN messages message ON message.id=tool.message_id WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1",
+    let last: Option<(String, String, i64, String)> = sqlx::query_as(
+        "SELECT tool.tool_name, tool.arguments, tool.created_at, tool.status FROM tool_calls tool JOIN messages message ON message.id=tool.message_id WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1",
     )
     .bind(session_id)
     .fetch_optional(db)
     .await?;
     let (summary, at) = last
-        .map(|(name, arguments, at)| {
-            (
-                format!("{name}: {}", arguments.chars().take(500).collect::<String>()),
-                at,
-            )
+        .map(|(name, arguments, at, status)| {
+            let arguments = arguments.chars().take(500).collect::<String>();
+            if matches!(status.as_str(), "pending" | "approved") {
+                (
+                    format!("{name}: {arguments}（中断，结果未知）"),
+                    at,
+                )
+            } else {
+                (format!("{name}: {arguments}"), at)
+            }
         })
         .unwrap_or_else(|| ("模型请求（结果未知）".into(), interrupted_at));
+    // 阶段 2 P0/R2：重启后不可能再拿到真实结果的工具调用必须显式标成中断，
+    // 而不是继续挂在 pending 上让界面显示“正在执行”。
+    if let Err(error) = crate::agent::thin_restart::mark_interrupted_tool_calls(db, session_id).await
+    {
+        tracing::warn!(%error, session = %session_id, "thin restart: failed to mark interrupted tool calls");
+    }
     history.push(crate::storage::Message {
         id: format!("thin-resume:{key}"),
         session_id: session_id.to_string(),
