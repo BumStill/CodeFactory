@@ -137,7 +137,7 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/agent/thin_derive.rs", "src-tauri/src/agent/thin_restart.rs", "src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx", ".github/workflows/release.yml", ".github/workflows/auto-release.yml"],
-      "automated_by": ["rust:terminal_facts_invalidate_old_questions_and_background_work", "rust:recovery_never_reopens_ended_even_with_stale_unfinished_controls", "rust:a_user_stop_reaches_every_live_objective_the_session_still_owns", "rust:crash_left_session_stop_fences_claim_and_is_consumed_on_restart", "rust:durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled", "rust:m146_historical_closed_out_session_is_marked_without_a_turn", "rust:m146_waiting_session_gets_closeout_wake_when_answer_predates_merge", "rust:m146_wake_message_without_a_turn_is_not_running", "rust:m146_conflicting_and_queue_blocked_prs_wake_with_reason", "rust:m146_closeout_turns_are_throttled_to_two", "binary:--history-session-smoke"],
+      "automated_by": ["rust:terminal_facts_invalidate_old_questions_and_background_work", "rust:recovery_never_reopens_ended_even_with_stale_unfinished_controls", "rust:a_user_stop_reaches_every_live_objective_the_session_still_owns", "rust:crash_left_session_stop_fences_claim_and_is_consumed_on_restart", "rust:durable_cancel_prevents_restart_claim_before_runtime_flag_is_polled", "binary:--history-session-smoke"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
