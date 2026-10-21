@@ -32,7 +32,7 @@ const messages: UIMessage[] = [
   invoke: async (_cmd: string, args?: { message?: { cmd?: string; payload?: Record<string, unknown> } }) => {
     const cmd = args?.message?.cmd ?? _cmd;
     switch (cmd) {
-      case "save_chat_attachment":
+      case "save_session_attachment":
         return { path: "/Users/leo/Projects/AI foundation/.codefactory/attachments/input preview.png", name: "input preview.png", size_bytes: pngBytes.length };
       case "plugin:event|listen": return 1;
       case "plugin:event|unlisten": return null;

@@ -5,7 +5,7 @@
 // Per AGENTS.md "UX 行为变更必须实地验证" — these are NOT a substitute
 // for live-app verification (jsdom doesn't have a real clipboard or
 // drag layer), but they exercise the wire-up that exists today:
-//   - paste with a clipboard item triggers save_chat_attachment
+//   - paste with a clipboard item triggers save_session_attachment
 //   - missing cwd surfaces an error instead of silently swallowing the paste
 //   - chip removal clears state
 //   - submit attaches the markdown link to outgoing text
@@ -52,7 +52,7 @@ describe("MessageInput attachments", () => {
     convertFileSrcMock.mockClear();
   });
 
-  it("paste of an image file invokes save_chat_attachment and shows an image preview", async () => {
+  it("paste of an image file invokes save_session_attachment and shows an image preview", async () => {
     invokeMock.mockResolvedValue({ path: "/proj/.codefactory/attachments/x.png", name: "x.png", size_bytes: 4 });
     setup();
     const textarea = screen.getByRole("textbox");
@@ -68,7 +68,7 @@ describe("MessageInput attachments", () => {
     });
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
-      "save_chat_attachment",
+      "save_session_attachment",
       expect.objectContaining({ cwd: "/proj", filename: "screenshot.png" }),
     ));
     // The attachment tray shows a real preview, not just a filename chip.
@@ -84,18 +84,16 @@ describe("MessageInput attachments", () => {
     );
   });
 
-  it("paste with no cwd shows an error and does NOT invoke save", () => {
-    setup({ cwd: null });
-    const textarea = screen.getByRole("textbox");
-    fireEvent.paste(textarea, {
-      clipboardData: {
-        items: [
-          { kind: "file", type: "image/png", getAsFile: () => makeImageFile() },
-        ],
-      },
+  it("paste with no cwd saves an attachment and sends its absolute path (R1)", async () => {
+    invokeMock.mockResolvedValue({ path: "/app/attachments/session/x.png", name: "x.png", size_bytes: 4 });
+    const { onSend } = setup({ cwd: null });
+    fireEvent.paste(screen.getByRole("textbox"), {
+      clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => makeImageFile() }] },
     });
-    expect(invokeMock).not.toHaveBeenCalled();
-    expect(screen.getByText(/打开一个项目/)).toBeInTheDocument();
+    await screen.findByRole("img", { name: "screenshot.png" });
+    expect(invokeMock).toHaveBeenCalledWith("save_session_attachment", expect.objectContaining({ cwd: null }));
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("![screenshot.png](file:///app/attachments/session/x.png)");
   });
 
   it("paste of plain text doesn't trigger save (only images)", () => {

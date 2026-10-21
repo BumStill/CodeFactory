@@ -1009,6 +1009,7 @@ export function WorkspacePage({
                 pendingInsert={pendingInsert}
                 onInsertConsumed={() => setPendingInsert(undefined)}
                 cwd={activeCwd}
+                sessionId={activeSession?.id ?? activeDraft?.id ?? sessionId}
                 toolbar={activeDraft ? (
                   <DraftScopeBar
                     cwd={activeDraft.cwd}
