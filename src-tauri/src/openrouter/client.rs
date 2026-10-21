@@ -15,7 +15,7 @@ pub struct OpenRouterClient {
 impl OpenRouterClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            http: crate::http_util::model_http_client(),
+            http: Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
         }

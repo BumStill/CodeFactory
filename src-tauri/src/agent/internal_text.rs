@@ -73,7 +73,7 @@ pub(crate) async fn generate_bounded_text(
     let response = tokio::time::timeout(deadline, async move {
         let api_key = credential_for_route(&route_for_request).await?;
         let transport = DesktopModelTransport {
-            http: crate::http_util::model_http_client(),
+            http: Client::new(),
             events: Arc::new(CollectingEventSink::new()),
             model_id: route_for_request.model_id.clone(),
             session_id,

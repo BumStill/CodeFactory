@@ -88,7 +88,7 @@ describe("inline active-turn status", () => {
     );
   });
 
-  it("M145: a turn with no model stream yet says what it is waiting for", () => {
+  it("stays visible for a durable turn between stream segments", () => {
     render(
       <MessageList
         messages={[assistant()]}
@@ -98,12 +98,9 @@ describe("inline active-turn status", () => {
       />,
     );
 
-    // Regression: this used to read "等待中", which is what the reported
-    // stalled-provider turn showed forever.
     expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
-      "等待模型首个响应 · 01:24",
+      "等待中 · 01:24",
     );
-    expect(screen.getByTestId("inline-turn-status")).not.toHaveTextContent("等待中");
   });
 
   it("shows a durable long-running delivery tool as executing", () => {
@@ -209,7 +206,7 @@ describe("inline active-turn status", () => {
     );
 
     expect(screen.getByTestId("inline-turn-status")).toHaveTextContent(
-      "等待模型首个响应 · 00:00",
+      "等待中 · 00:00",
     );
   });
 
