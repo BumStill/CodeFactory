@@ -217,7 +217,7 @@ async fn process_output_with_timeout(
         .map_err(|error| match error {
             ProcessOutputError::Timeout => GitCommandFailureKind::Timeout,
             ProcessOutputError::Unavailable => GitCommandFailureKind::Unavailable,
-            ProcessOutputError::Failed => GitCommandFailureKind::Failed,
+            ProcessOutputError::Failed | ProcessOutputError::InputRequired | ProcessOutputError::Stopped => GitCommandFailureKind::Failed,
         })
 }
 

@@ -122,9 +122,9 @@ fn emit_build_status(ctx: &ExecCtx, state: &str, message: &str) {
 }
 
 fn bounded_stream(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
+    let text = command_env::decode_output(bytes);
     if text.len() <= OUTPUT_LIMIT {
-        return text.into_owned();
+        return text;
     }
     let mut end = OUTPUT_LIMIT;
     while !text.is_char_boundary(end) {
@@ -151,8 +151,7 @@ pub fn definition() -> ToolDefinition {
         function: FunctionDefinition {
             name: "bash".into(),
             description:
-                "Run a shell command in the project directory. Returns stdout+stderr. Default timeout 300s; long-running builds, installs, CI watches, and release polling may run up to 1800s."
-                    .into(),
+                format!("Run a shell command in the project directory. Returns stdout+stderr. Default timeout 300s; long-running builds, installs, CI watches, and release polling may run up to 1800s. {}", command_env::shell_description()),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -422,10 +421,15 @@ async fn execute_inner(
         .unwrap_or(configured_timeout_secs);
     let timeout_duration = timeout_override.unwrap_or(Duration::from_secs(timeout_secs));
     let started = std::time::Instant::now();
-    let result = process_tree::output_with_timeout(cmd, timeout_duration).await;
+    let activity = ctx.session_id.as_deref().map(|session| process_tree::track_command(session, &a.command));
+    let result = process_tree::output_with_activity(cmd, timeout_duration, activity.as_ref()).await;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     match result {
+        Err(reason @ (ProcessOutputError::InputRequired | ProcessOutputError::Stopped)) => {
+            let message = if reason == ProcessOutputError::InputRequired { command_env::INPUT_REQUIRED_MESSAGE } else { "命令已被停止，进程树已清理；可以继续当前回合。" };
+            Ok(ToolOutput::err(message).with_process_outcome(None, String::new(), message.into(), Some(message.into()), duration_ms))
+        }
         Err(ProcessOutputError::Timeout) => {
             let message = format!("Command timed out after {timeout_secs}s");
             Ok(ToolOutput::err(&message)
@@ -489,6 +493,9 @@ async fn execute_inner(
                 }
                 combined.truncate(end);
                 combined.push_str("\n[output truncated]");
+            }
+            if !output.status.success() {
+                combined.push_str(command_env::shell_failure_hint(&launched_program, &combined));
             }
             append_audit(
                 &mut combined,
@@ -555,6 +562,24 @@ fn read_github_quota() -> Option<shell_policy::GithubQuota> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn m143_windows_foreground_outputs_chinese_and_chains() {
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = crate::tools::ExecCtx::new(cwd.path().to_path_buf(), None);
+        let out = super::execute(serde_json::json!({"command": "echo 中文"}), &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.stdout.trim(), "中文");
+        let out = super::execute(serde_json::json!({"command": "echo first && echo second"}), &ctx).await.unwrap();
+        if crate::util::command_env::shell_invocation("").program == "pwsh.exe" {
+            assert!(!out.is_error, "{}", out.content);
+            assert!(out.content.contains("first") && out.content.contains("second"));
+        } else {
+            assert!(out.is_error);
+            assert!(out.content.contains("5.1") && out.content.contains("if ($?)"));
+        }
+    }
+
     #[test]
     fn bash_definition_exposes_bounded_timeout_control() {
         let definition = super::definition();

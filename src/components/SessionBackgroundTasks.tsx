@@ -10,12 +10,21 @@ import {
   backgroundSourceLabel,
   cancelSessionWakeup,
   listSessionBackgroundActivity,
+  SILENT_COMMAND_SEC,
   stopSessionBackgroundTask,
   wakeupCadence,
   type SessionBackgroundActivity,
 } from "../lib/backgroundTasks";
 
 const POLL_MS = 5_000;
+
+function silentSeconds(lastOutputAt: number): number {
+  return Math.max(0, Math.floor(Date.now() / 1000) - lastOutputAt);
+}
+
+function silentMinutes(lastOutputAt: number): number {
+  return Math.max(1, Math.round(silentSeconds(lastOutputAt) / 60));
+}
 
 interface Props {
   sessionId: string | null;
@@ -34,6 +43,7 @@ export function SessionBackgroundTasks({
   const [activity, setActivity] = useState<SessionBackgroundActivity>({
     tasks: [],
     wakeups: [],
+    commands: [],
   });
   const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,7 +51,7 @@ export function SessionBackgroundTasks({
 
   const refresh = useCallback(async () => {
     if (!sessionId) {
-      if (mounted.current) setActivity({ tasks: [], wakeups: [] });
+      if (mounted.current) setActivity({ tasks: [], wakeups: [], commands: [] });
       return;
     }
     try {
@@ -67,6 +77,20 @@ export function SessionBackgroundTasks({
   }, [refresh]);
 
   const running = activity.tasks.filter((task) => task.status === "running");
+  // 只把真的超过阈值没有输出的前台命令算进来：仍在持续输出的慢命令不打扰用户。
+  const silent = activity.commands.filter(
+    (command) => silentSeconds(command.last_output_at) >= SILENT_COMMAND_SEC,
+  );
+
+  const stopCommand = async (commandId: string) => {
+    if (!sessionId) return;
+    try {
+      await stopTaskCommand(sessionId, commandId);
+      await refresh();
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
 
   const stopTask = async (taskId: string) => {
     if (!sessionId) return;
@@ -90,12 +114,14 @@ export function SessionBackgroundTasks({
 
   if (!sessionId) return null;
   // 没有进行中的任务/唤醒时不占位置：这个标记只在真有后台工作时出现。
-  if (running.length === 0 && activity.wakeups.length === 0) return null;
+  if (running.length === 0 && activity.wakeups.length === 0 && silent.length === 0) return null;
 
   const liveCount = running.length;
   const label = liveCount > 0
     ? `${liveCount} 个后台任务进行中`
-    : `${activity.wakeups.length} 个定时唤醒待触发`;
+    : silent.length > 0
+      ? `${silent.length} 个命令长时间无输出`
+      : `${activity.wakeups.length} 个定时唤醒待触发`;
 
   return (
     <div className="relative">
@@ -107,7 +133,10 @@ export function SessionBackgroundTasks({
         onClick={() => setExpanded((open) => !open)}
         className="flex min-h-11 items-center gap-1 rounded-lg border border-border bg-surface px-2 text-note text-text-secondary transition-colors hover:bg-surface-hover lg:min-h-9"
       >
-        <Loader2 size={14} className={liveCount > 0 ? "animate-spin" : undefined} />
+        <Loader2
+          size={14}
+          className={liveCount > 0 || silent.length > 0 ? "animate-spin" : undefined}
+        />
         <span className="max-w-[10rem] truncate">{label}</span>
       </button>
 
@@ -117,8 +146,40 @@ export function SessionBackgroundTasks({
           aria-label="后台任务详情"
           className="absolute right-0 top-full z-30 mt-1 w-[min(22rem,calc(100vw-2rem))] rounded-xl border border-border bg-surface p-2 shadow-lg"
         >
+          {silent.length > 0 && (
+            <ul className="space-y-1">
+              {silent.map((command) => (
+                <li key={command.id} className="rounded-lg px-2 py-1.5 hover:bg-surface-hover">
+                  <div className="flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <p
+                        className="truncate font-mono text-note text-text-primary"
+                        title={command.command}
+                      >
+                        {command.command}
+                      </p>
+                      <p className="mt-0.5 text-caption text-text-tertiary">
+                        卡在 {command.command} 已 {silentMinutes(command.last_output_at)} 分钟，无输出
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      aria-label={`停止命令 ${command.command}`}
+                      onClick={() => void stopCommand(command.id)}
+                      className="flex min-h-9 items-center gap-1 rounded-lg border border-border px-1.5 text-caption text-text-secondary hover:bg-surface"
+                    >
+                      <Square size={14} /> 停止
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+
           {activity.tasks.length === 0 ? (
-            <p className="px-2 py-1 text-note text-text-tertiary">没有后台任务记录</p>
+            silent.length === 0 && (
+              <p className="px-2 py-1 text-note text-text-tertiary">没有后台任务记录</p>
+            )
           ) : (
             <ul className="space-y-1">
               {activity.tasks.map((task) => (

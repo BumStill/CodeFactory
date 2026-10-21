@@ -1,0 +1,22 @@
+## 修复范围
+M143 R1–R4：Windows 前台/后台优先 PowerShell 7；5.1 语法失败给出提示；执行前初始化 UTF-8；读取时回退系统代码页。
+
+Scenario-Test: HLT-001
+README-Update: reviewed
+README-Update-Reason: 仅修复现有 Windows shell 兼容性与输出编码，不改变公开产品承诺。
+
+## Requirements 与测试
+- R1: m143_windows_shell_prefers_pwsh_and_initializes_utf8
+- R2: m143_decodes_utf8_and_legacy_chinese_without_replacement、m143_background_log_decodes_chinese_at_character_boundaries
+- R3: m143_legacy_parser_failure_has_actionable_advice
+- R4: m143_windows_foreground_outputs_chinese_and_chains、m143_windows_background_chinese_and_legacy_parser_failure（execute-windows 真实进程）
+- 先失败：同一 cargo test --lib m143 命令首次因所需函数不存在而失败，修复后重跑。
+
+## Applicable Harnesses
+Spec：版本化原文；Compatibility/Payload：shell 与 UTF-8/CP936/CP1252 测试；Observation：语法失败建议；Release：授权上限为合并，不执行发版；AI Collaboration：单执行流，模板禁止 delegate_tasks。
+
+## AI Collaboration
+context scope：前台 bash、后台进程和输出日志、默认 shell；assumptions：Windows 标准 PowerShell 5/7；review point：保留原始命令、退出码和后台直接文件输出以支持重启；validation result：本地 M143 4 项通过；pnpm test 与 pnpm build 全部通过；scenario harness、scenario governance、README contract、governance baseline 均通过。Rust workspace 全量测试和 Windows CI 结果待补入。
+
+## 验收
+待本地测试及 Windows CI 完成后补齐结果。not live：本任务不发版；真实安装版验收由编排方发版后执行 echo 中文、条件链与后台日志中文核对。

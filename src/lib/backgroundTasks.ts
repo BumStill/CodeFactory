@@ -41,10 +41,22 @@ export interface WakeupRow {
   fire_count: number;
 }
 
+export interface ForegroundCommandRow {
+  id: string;
+  session_id: string;
+  command: string;
+  /** 最近一次真实输出的秒级时间戳；没有输出时停在启动时间。 */
+  last_output_at: number;
+}
+
 export interface SessionBackgroundActivity {
   tasks: BackgroundTaskRow[];
   wakeups: WakeupRow[];
+  commands: ForegroundCommandRow[];
 }
+
+/** 超过这个时长没有任何新输出，才在界面上说“卡住了”。 */
+export const SILENT_COMMAND_SEC = 300;
 
 export const BACKGROUND_STATUS_LABEL: Record<BackgroundTaskStatus, string> = {
   running: "运行中",
@@ -75,6 +87,7 @@ export async function listSessionBackgroundActivity(
   return {
     tasks: activity?.tasks ?? [],
     wakeups: activity?.wakeups ?? [],
+    commands: activity?.commands ?? [],
   };
 }
 

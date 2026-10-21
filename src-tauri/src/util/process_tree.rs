@@ -9,6 +9,57 @@ pub enum ProcessOutputError {
     Timeout,
     Unavailable,
     Failed,
+    InputRequired,
+    Stopped,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CommandActivity {
+    pub id: String,
+    pub session_id: String,
+    pub command: String,
+    pub last_output_at: u64,
+}
+
+fn activities() -> &'static std::sync::Mutex<std::collections::HashMap<String, (CommandActivity, std::sync::Arc<std::sync::atomic::AtomicBool>)>> {
+    static ITEMS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (CommandActivity, std::sync::Arc<std::sync::atomic::AtomicBool>)>>> = std::sync::OnceLock::new();
+    ITEMS.get_or_init(Default::default)
+}
+fn now_sec() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+pub struct ActivityGuard {
+    pub id: String,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for ActivityGuard {
+    fn drop(&mut self) { activities().lock().unwrap().remove(&self.id); }
+}
+pub fn track_command(session_id: &str, command: &str) -> ActivityGuard {
+    let id = uuid::Uuid::new_v4().to_string();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    activities().lock().unwrap().insert(id.clone(), (CommandActivity {
+        id: id.clone(), session_id: session_id.into(), command: command.into(), last_output_at: now_sec(),
+    }, cancelled.clone()));
+    ActivityGuard { id, cancelled }
+}
+pub fn command_activity(session_id: &str) -> Vec<CommandActivity> {
+    activities().lock().unwrap().values().filter(|(a,_)| a.session_id == session_id).map(|(a,_)| a.clone()).collect()
+}
+pub fn stop_command(session_id: &str, id: &str) -> bool {
+    let items = activities().lock().unwrap();
+    if let Some((activity, stop)) = items.get(id) {
+        if activity.session_id == session_id {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+    }
+    false
+}
+fn mark_output(id: Option<&str>) {
+    if let Some(id) = id {
+        if let Some((item,_)) = activities().lock().unwrap().get_mut(id) { item.last_output_at = now_sec(); }
+    }
 }
 
 #[cfg(unix)]
@@ -41,6 +92,16 @@ impl StdProcessTree {
     #[cfg(windows)]
     pub(crate) fn attach(child: &std::process::Child) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
+        Self::attach_handle(child.as_raw_handle() as _)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn attach_async(child: &Child) -> std::io::Result<Self> {
+        Self::attach_handle(child.raw_handle().ok_or_else(|| std::io::Error::other("missing process handle"))? as _)
+    }
+
+    #[cfg(windows)]
+    fn attach_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<Self> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -63,7 +124,7 @@ impl StdProcessTree {
             )
         };
         let assigned = configured != 0
-            && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) } != 0;
+            && unsafe { AssignProcessToJobObject(job, handle) } != 0;
         if !assigned {
             let error = std::io::Error::last_os_error();
             unsafe {
@@ -162,6 +223,10 @@ impl StdProcessTree {
         Ok(u32::from(child.try_wait()?.is_none()))
     }
 }
+
+// Windows handles are kernel references, safe to transfer to the monitor task.
+#[cfg(windows)]
+unsafe impl Send for StdProcessTree {}
 
 #[cfg(windows)]
 impl Drop for StdProcessTree {
@@ -278,51 +343,80 @@ async fn terminate_and_reap(
 }
 
 pub async fn output_with_timeout(
-    mut command: Command,
+    command: Command,
     timeout_duration: Duration,
 ) -> Result<Output, ProcessOutputError> {
-    command
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    output_with_activity(command, timeout_duration, None).await
+}
+
+async fn capture_stream<R: tokio::io::AsyncRead + Unpin>(mut reader: R, id: Option<String>, prompt: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 { return Ok(bytes); }
+        bytes.extend_from_slice(&chunk[..count]);
+        mark_output(id.as_deref());
+        let start = bytes.len().saturating_sub(4096);
+        if super::command_env::waiting_for_input(&super::command_env::decode_output(&bytes[start..])) {
+            prompt.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+pub async fn output_with_activity(
+    mut command: Command,
+    timeout_duration: Duration,
+    activity: Option<&ActivityGuard>,
+) -> Result<Output, ProcessOutputError> {
+    super::command_env::apply_noninteractive(&mut command);
+    command.kill_on_drop(true).stdout(Stdio::piped()).stderr(Stdio::piped());
     isolate(&mut command);
     let mut child = match command.spawn() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ProcessOutputError::Unavailable)
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(ProcessOutputError::Unavailable),
         Err(_) => return Err(ProcessOutputError::Failed),
         Ok(child) => child,
     };
-    let mut stdout = child.stdout.take().ok_or(ProcessOutputError::Failed)?;
-    let mut stderr = child.stderr.take().ok_or(ProcessOutputError::Failed)?;
-    let mut stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-    let mut stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-
-    let status = match tokio::time::timeout(timeout_duration, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(_)) => {
-            terminate_and_reap(&mut child, &mut stdout_task, &mut stderr_task).await;
-            return Err(ProcessOutputError::Failed);
-        }
-        Err(_) => {
-            terminate_and_reap(&mut child, &mut stdout_task, &mut stderr_task).await;
-            return Err(ProcessOutputError::Timeout);
+    #[cfg(windows)]
+    let _job = match StdProcessTree::attach_async(&child) {
+        Ok(job) => job,
+        Err(_) => { let _ = child.kill().await; return Err(ProcessOutputError::Failed); }
+    };
+    let stdout = child.stdout.take().ok_or(ProcessOutputError::Failed)?;
+    let stderr = child.stderr.take().ok_or(ProcessOutputError::Failed)?;
+    let prompt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let id = activity.map(|a| a.id.clone());
+    let mut stdout_task = tokio::spawn(capture_stream(stdout, id.clone(), prompt.clone()));
+    let mut stderr_task = tokio::spawn(capture_stream(stderr, id, prompt.clone()));
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let status = loop {
+        tokio::select! {
+            result = child.wait() => match result {
+                Ok(status) => break status,
+                Err(_) => {
+                    terminate_and_reap(&mut child, &mut stdout_task, &mut stderr_task).await;
+                    return Err(ProcessOutputError::Failed);
+                }
+            },
+            _ = tick.tick() => {
+                let reason = if prompt.load(std::sync::atomic::Ordering::Relaxed) { Some(ProcessOutputError::InputRequired) }
+                    else if activity.is_some_and(|a| a.cancelled.load(std::sync::atomic::Ordering::Relaxed)) { Some(ProcessOutputError::Stopped) }
+                    else if tokio::time::Instant::now() >= deadline { Some(ProcessOutputError::Timeout) } else { None };
+                if let Some(reason) = reason {
+                    // Closing the Windows job kills descendants even if their parent exited.
+                    #[cfg(windows)]
+                    drop(_job);
+                    terminate_and_reap(&mut child, &mut stdout_task, &mut stderr_task).await;
+                    return Err(reason);
+                }
+            }
         }
     };
-
     let (stdout, stderr) = collect_readers(&mut stdout_task, &mut stderr_task).await?;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    Ok(Output { status, stdout, stderr })
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -330,6 +424,37 @@ mod tests {
     use crate::util::no_window::NoWindow;
     use std::io::Write;
     use std::time::Instant;
+
+    #[tokio::test]
+    async fn m143_interactive_prompt_ends_early_and_next_command_runs() {
+        let shell = crate::util::command_env::shell_invocation(if cfg!(windows) {
+            "Write-Output 'Continue? (y/N)'; Start-Sleep -Seconds 30"
+        } else { "printf 'Continue? (y/N)'; sleep 30" });
+        let mut command = Command::new(shell.program);
+        command.args(shell.args);
+        let started = Instant::now();
+        assert_eq!(output_with_timeout(command, Duration::from_secs(20)).await.unwrap_err(), ProcessOutputError::InputRequired);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let shell = crate::util::command_env::shell_invocation("echo continued");
+        let mut command = Command::new(shell.program);
+        command.args(shell.args);
+        let output = output_with_timeout(command, Duration::from_secs(10)).await.unwrap();
+        assert!(output.status.success());
+        assert!(crate::util::command_env::decode_output(&output.stdout).contains("continued"));
+    }
+
+    #[tokio::test]
+    async fn m143_activity_tracks_output_and_session_scoped_stop() {
+        let activity = track_command("synthetic-session", "synthetic command");
+        let id = activity.id.clone();
+        assert_eq!(command_activity("other-session").len(), 0);
+        assert!(command_activity("synthetic-session").iter().any(|item| item.id == id));
+        assert!(!stop_command("other-session", &id));
+        assert!(stop_command("synthetic-session", &id));
+        assert!(activity.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        drop(activity);
+        assert!(command_activity("synthetic-session").is_empty());
+    }
 
     fn wait_for_parent(child: &mut std::process::Child, timeout: Duration) {
         let deadline = Instant::now() + timeout;

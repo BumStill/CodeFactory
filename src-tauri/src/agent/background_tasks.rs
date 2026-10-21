@@ -299,18 +299,19 @@ pub fn output_tail(path: &Path, limit: usize) -> String {
     let Ok(bytes) = std::fs::read(path) else {
         return String::new();
     };
-    if bytes.len() <= limit {
-        return String::from_utf8_lossy(&bytes).into_owned();
-    }
-    let mut start = bytes.len().saturating_sub(limit);
-    while start < bytes.len() && !is_char_boundary(&bytes, start) {
+    // Decode before truncating: a raw byte offset may split CP936 characters.
+    let text = crate::util::command_env::decode_output(&bytes);
+    let mut start = text.len().saturating_sub(limit);
+    while !text.is_char_boundary(start) {
         start += 1;
     }
-    String::from_utf8_lossy(&bytes[start..]).into_owned()
-}
-
-fn is_char_boundary(bytes: &[u8], index: usize) -> bool {
-    index == bytes.len() || (bytes[index] & 0xC0) != 0x80
+    let mut tail = text[start..].to_owned();
+    #[cfg(windows)]
+    {
+        let shell = crate::util::command_env::shell_invocation("");
+        tail.push_str(crate::util::command_env::shell_failure_hint(shell.program, &text));
+    }
+    tail
 }
 
 fn status_sentence(task: &BackgroundTask) -> String {
@@ -372,16 +373,8 @@ fn shell_invocation(command: &str) -> (String, Vec<String>) {
 
 #[cfg(windows)]
 fn shell_invocation(command: &str) -> (String, Vec<String>) {
-    (
-        "powershell".to_string(),
-        vec![
-            "-NoProfile".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-Command".to_string(),
-            command.to_string(),
-        ],
-    )
+    let shell = crate::util::command_env::shell_invocation(command);
+    (shell.program.to_string(), shell.args)
 }
 
 /// 进程启动时间的可比对标记；取不到时返回 None（对账必须落到 lost，不猜 running）。
@@ -568,6 +561,8 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
         ))
         .stderr(std::process::Stdio::from(output_file))
         .kill_on_drop(false);
+    crate::util::command_env::apply_noninteractive(&mut command);
+    crate::util::command_env::apply_developer_path(&mut command);
     // D5：独立进程组，停止/超时才能杀整棵树。
     #[cfg(unix)]
     {
@@ -583,6 +578,16 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
         }
     };
     let pid = child.id();
+    #[cfg(windows)]
+    let job = match crate::util::process_tree::StdProcessTree::attach_async(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let mut child = child;
+            let _ = child.kill().await;
+            settle(pool, &id, TaskStatus::Failed, None, true).await;
+            return Err(format!("后台命令无法加入 Job Object，已停止：{error}"));
+        }
+    };
     let marker = pid.and_then(process_start_marker);
     if let Some(pid) = pid {
         let _ = sqlx::query("UPDATE background_tasks SET pid = ?, process_started_at = ? WHERE id = ?")
@@ -599,6 +604,9 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
         child,
         pid,
         Duration::from_secs(timeout_sec),
+        output_path.clone(),
+        #[cfg(windows)]
+        job,
     ));
 
     Ok(Started {
@@ -614,28 +622,46 @@ async fn monitor_child(
     mut child: tokio::process::Child,
     pid: Option<u32>,
     timeout: Duration,
+    output_path: PathBuf,
+    #[cfg(windows)] job: crate::util::process_tree::StdProcessTree,
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
-    match tokio::time::timeout_at(deadline, child.wait()).await {
-        Ok(Ok(status)) => {
-            let code = status.code();
-            let terminal = if code == Some(0) {
-                TaskStatus::Exited
-            } else {
-                TaskStatus::Failed
-            };
-            settle(&pool, &id, terminal, code, true).await;
-        }
-        Ok(Err(_)) => {
-            settle(&pool, &id, TaskStatus::Failed, None, true).await;
-        }
-        Err(_) => {
-            if let Some(pid) = pid {
-                terminate_tree(pid).await;
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
+    loop {
+        tokio::select! {
+            result = child.wait() => {
+                let code = result.ok().and_then(|status| status.code());
+                let tail = output_tail(&output_path, 4096);
+                if crate::util::command_env::waiting_for_input(&tail) {
+                    append_input_notice(&output_path);
+                    settle(&pool, &id, TaskStatus::Failed, code, true).await;
+                } else {
+                    settle(&pool, &id, if code == Some(0) { TaskStatus::Exited } else { TaskStatus::Failed }, code, true).await;
+                }
+                return;
             }
-            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-            settle(&pool, &id, TaskStatus::TimedOut, None, true).await;
+            _ = tick.tick() => {
+                let stopped = get(&pool, &id).await.ok().flatten().is_some_and(|task| task.status == TaskStatus::Stopped);
+                let input = crate::util::command_env::waiting_for_input(&output_tail(&output_path, 4096));
+                let timed_out = tokio::time::Instant::now() >= deadline;
+                if !stopped && !input && !timed_out { continue; }
+                #[cfg(windows)]
+                drop(job);
+                if let Some(pid) = pid { terminate_tree(pid).await; }
+                let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+                if input { append_input_notice(&output_path); }
+                let status = if stopped { TaskStatus::Stopped } else if input { TaskStatus::Failed } else { TaskStatus::TimedOut };
+                settle(&pool, &id, status, None, true).await;
+                return;
+            }
         }
+    }
+}
+
+fn append_input_notice(path: &Path) {
+    use std::io::Write;
+    if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = writeln!(log, "\n{}", crate::util::command_env::INPUT_REQUIRED_MESSAGE);
     }
 }
 
@@ -1383,6 +1409,37 @@ impl WakeSink for ChatWakeSink {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    #[test]
+    fn m143_background_log_decodes_chinese_at_character_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.log");
+        std::fs::write(&path, "prefix中文🙂").unwrap();
+        assert_eq!(output_tail(&path, 4), "🙂");
+        #[cfg(windows)]
+        {
+            std::fs::write(&path, [0xd6, 0xd0, 0xce, 0xc4]).unwrap();
+            // Legacy bytes are tested deterministically independent of CI's ACP.
+            assert_eq!(crate::util::command_env::decode_output_for_code_page(&std::fs::read(&path).unwrap(), 936), "中文");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn m143_windows_background_chinese_and_legacy_parser_failure() {
+        let pool = memory_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let started = start(&pool, request("m143", dir.path(), "echo 中文", Some(30))).await.unwrap();
+        let task = wait_terminal(&pool, &started.id, 40).await;
+        assert_eq!(task.exit_code, Some(0));
+        assert_eq!(output_tail(Path::new(&task.output_path), 1000).trim(), "中文");
+        let inv = crate::util::command_env::windows_shell_invocation("echo first && echo second", false, true);
+        let output = std::process::Command::new(inv.program).args(inv.args).output().unwrap();
+        assert!(!output.status.success());
+        let text = crate::util::command_env::decode_output(&output.stderr);
+        assert!(!text.contains('\u{fffd}'), "{text}");
+        assert!(crate::util::command_env::shell_failure_hint("powershell.exe", &text).contains("5.1"));
+    }
 
     async fn memory_pool() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
