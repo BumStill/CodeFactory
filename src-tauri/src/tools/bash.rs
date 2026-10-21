@@ -350,6 +350,19 @@ async fn execute_inner(
     }
     let risk = policy.risk();
 
+    // M147b: delivery writes `Release-Urgency:` into the PR body, and the body is
+    // rewritable — a single `gh pr edit --body` used to erase it (#818 merged with
+    // `release_urgency=immediate` and no trailer, so no release was cut). The
+    // session policy is the user decision; the tool layer keeps it on the body.
+    let mut a = a;
+    let mut pr_body_guard: Option<super::pr_body_guard::Guarded> = None;
+    if let Some(urgency) = super::pr_body_guard::session_urgency(ctx).await {
+        if let Some(guarded) = super::pr_body_guard::guard_command(&a.command, &ctx.cwd, urgency) {
+            a.command = guarded.command.clone();
+            pr_body_guard = Some(guarded);
+        }
+    }
+
     // ── CF-BLD-R7 + CF-BLD-R3 in the real build path ─────────────────────────
     // A heavy build takes one of the machine's build slots — queueing, visibly,
     // when none is free — and may only start when there is room on disk. Both
@@ -506,6 +519,9 @@ async fn execute_inner(
                     .then(read_github_quota)
                     .flatten(),
             );
+            if let Some(guarded) = &pr_body_guard {
+                combined.push_str(&format!("\n[m147b] {}\n", guarded.note));
+            }
 
             let is_error = !output.status.success();
             if is_error {
