@@ -124,8 +124,8 @@ impl Drop for JobGuard {
 }
 
 #[cfg(windows)]
-pub(crate) fn attach_job<T: std::os::windows::io::AsRawHandle>(
-    child: &T,
+pub(crate) fn attach_job(
+    child: std::os::windows::io::RawHandle,
 ) -> std::io::Result<JobGuard> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
@@ -149,7 +149,7 @@ pub(crate) fn attach_job<T: std::os::windows::io::AsRawHandle>(
         )
     };
     let assigned = configured != 0
-        && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) } != 0;
+        && unsafe { AssignProcessToJobObject(job, child as _) } != 0;
     if !assigned {
         let error = std::io::Error::last_os_error();
         unsafe { CloseHandle(job) };
@@ -224,9 +224,9 @@ pub async fn output_with_activity(
         Ok(child) => child,
     };
     #[cfg(windows)]
-    let job = match attach_job(&child) {
-        Ok(job) => job,
-        Err(_) => {
+    let job = match child.raw_handle().map(attach_job) {
+        Some(Ok(job)) => job,
+        _ => {
             let _ = child.kill().await;
             return Err(CommandActivityFailure::Failed);
         }
