@@ -133,13 +133,16 @@ async function main() {
       const panel = section.getByRole("region", { name: "后台任务详情" });
       await panel.waitFor();
       for (const needle of ["gh pr checks 742 --watch", "由 agent 启动", "运行中", "pnpm test",
-        "按你的要求", "退出码 0", "盯着 PR #742，合并了告诉我", "每 180 秒"]) {
+        "按你的要求", "退出码 0", "盯着 PR #742，合并了告诉我", "每 180 秒",
+        "卡在 npm install 已 6 分钟，无输出"]) {
         assert((await panel.textContent()).includes(needle), `${theme}: panel missing ${needle}`);
       }
       assert(await section.getByRole("button", { name: /停止后台任务 gh pr checks 742 --watch/ }).isVisible(),
         `${theme}: stop control missing`);
       assert(await section.getByRole("button", { name: /取消定时唤醒/ }).isVisible(),
         `${theme}: cancel control missing`);
+      assert(await section.getByRole("button", { name: /停止命令 npm install/ }).isVisible(),
+        `${theme}: silent command stop control missing`);
       const box = await panel.boundingBox();
       assert(box && box.x >= 0 && box.y >= 0 && box.x + box.width <= 1366 && box.y + box.height <= 768,
         `${theme}: panel escapes the viewport: ${JSON.stringify(box)}`);

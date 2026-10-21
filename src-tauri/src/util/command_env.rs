@@ -44,7 +44,7 @@ pub fn waiting_for_input(output: &str) -> bool {
         || (line.starts_with("read-host") && line.ends_with(':'))
 }
 
-pub const INPUT_REQUIRED_MESSAGE: &str = "命令正在等待输入，已结束并清理进程树。请使用非交互参数（如 --yes、--no-input），不要使用 Read-Host 或交互确认后重试。";
+pub const INPUT_REQUIRED_MESSAGE: &str = "命令正在等待输入，已结束并清理进程树；系统会自动改用非交互参数（如 --yes、--no-input）恢复，不要使用 Read-Host 或交互确认。";
 
 pub fn apply_developer_path(cmd: &mut Command) {
     if let Some(path) = developer_path() {
@@ -211,8 +211,8 @@ pub fn shell_failure_hint(program: &str, output: &str) -> &'static str {
         return "";
     }
     match program {
-        "powershell.exe" => "\n当前是 Windows PowerShell 5.1，不支持 &&/||；用 ; 与 if ($?) { … }（失败用 if (-not $?) { … }）修正后重试。路径用双引号，环境变量用 $env:NAME。\n",
-        "pwsh.exe" => "\n当前是 PowerShell 7；请检查引号、括号和 PowerShell 语法后重试。\n",
+        "powershell.exe" => "\n当前是 Windows PowerShell 5.1，不支持 &&/||；用 ; 与 if ($?) { … }（失败用 if (-not $?) { … }）；系统会自动用修正后的命令重新尝试。路径用双引号，环境变量用 $env:NAME。\n",
+        "pwsh.exe" => "\n当前是 PowerShell 7；请检查引号、括号和 PowerShell 语法，系统会自动重新尝试。\n",
         _ => "",
     }
 }

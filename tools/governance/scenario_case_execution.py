@@ -11,7 +11,10 @@ import json
 import platform
 import re
 import subprocess
-import tomllib
+try:  # Python 3.11+
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9/3.10 compatibility
+    import tomli as tomllib
 from pathlib import Path
 from typing import Any
 
