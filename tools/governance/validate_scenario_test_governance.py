@@ -828,6 +828,13 @@ def validate_impacted_execution(
     product_files = [path for path in files if _is_product_file(path)]
     if not product_files:
         return []
+    unmapped = _unmapped_product_files(product_files, registry) if fail_on_unmapped else []
+    if unmapped:
+        # Report the concrete gap even when a global manifest expanded the
+        # impacted set, so both stages agree on the same batch of files.
+        return [
+            "scenario registry coverage gap for product files: " + ", ".join(unmapped)
+        ]
     impacted = _impacted_scenarios(
         product_files,
         registry,
@@ -922,6 +929,33 @@ def _is_product_file(path: str) -> bool:
     return path.startswith(PRODUCT_PREFIXES) and not _is_test_harness_file(path)
 
 
+def _unmapped_product_files(files: list[str], registry: dict[str, Any]) -> list[str]:
+    """Product files that no scenario claims explicitly.
+
+    Global manifests are excluded on purpose: their declared impact is "every
+    scenario", which ``expand_global_files`` already expresses. Every other
+    product file must be named by a scenario's ``change_patterns``. Judging this
+    on expansion instead is what let a real ``web_fetch`` change pass
+    ``pull_request`` (a blanket-expanded impact hid the gap) and fail
+    ``release_artifact`` for the same commit, with the version manifests mixed
+    into the gap message.
+    """
+
+    patterns = [
+        pattern
+        for scenario in registry.get("scenarios", [])
+        for pattern in scenario.get("change_patterns", [])
+    ]
+    return sorted(
+        {
+            path
+            for path in files
+            if path not in GLOBAL_PRODUCT_FILES
+            and not any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+        }
+    )
+
+
 def _impacted_scenarios(
     files: list[str],
     registry: dict[str, Any],
@@ -950,7 +984,12 @@ def validate_change_contract(
     errors: list[str] = []
     match = DECLARATION.search(FENCED.sub("", body))
     impacted = _impacted_scenarios(product_files, registry)
-    if not impacted:
+    unmapped = _unmapped_product_files(product_files, registry)
+    if unmapped:
+        errors.append(
+            "scenario registry coverage gap for product files: " + ", ".join(unmapped)
+        )
+    elif not impacted:
         errors.append(
             "scenario registry coverage gap for product files: "
             + ", ".join(sorted(product_files))

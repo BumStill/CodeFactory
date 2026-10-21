@@ -406,6 +406,17 @@
       "gates": ["pull_request"]
     },
     {
+      "id": "CAP-001",
+      "name": "网页抓取：压缩解码、HTML 抽取与本地/私网目标拒绝",
+      "category": "capability_usage",
+      "priority": "P1",
+      "source_kind": "incident_shape",
+      "change_patterns": ["src-tauri/src/tools/web_fetch.rs", "src-tauri/src/tools/fixtures/web-fetch*.html"],
+      "automated_by": ["rust:m131c_tag_prefixes_do_not_consume_unrelated_elements", "rust:literal_local_hosts_are_rejected_without_any_dns_lookup", "rust:ordinary_domains_are_not_ruled_out_by_address_guessing"],
+      "required_evidence": ["L0", "L1"],
+      "gates": ["pull_request"]
+    },
+    {
       "id": "DAT-001",
       "name": "SQLite 写锁争用：第二个写者等待而非失败，且不早于释放取得锁",
       "category": "runtime_lifecycle",
