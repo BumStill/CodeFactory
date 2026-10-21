@@ -1060,8 +1060,9 @@ impl DesktopModelTransport {
         );
 
         self.admit_provider_post().await?;
-        let mut response = crate::http_util::send_with_attempt_budget_and_notify_policy(
+        let mut response = crate::http_util::send_model_request_bounded_with_policy(
             "ChatGPT Responses stream request",
+            &self.model_id,
             || {
                 let mut request = self
                     .http
@@ -1091,8 +1092,9 @@ impl DesktopModelTransport {
         }
         if response.status().as_u16() == 401 {
             (access_token, account_id) = crate::codex_auth::force_refresh_access_token().await?;
-            response = crate::http_util::send_with_attempt_budget_and_notify_policy(
+            response = crate::http_util::send_model_request_bounded_with_policy(
                 "ChatGPT Responses stream request after forced token refresh",
+                &self.model_id,
                 || {
                     let mut request = self
                         .http
@@ -1375,8 +1377,9 @@ impl DesktopModelTransport {
         }
 
         self.admit_provider_post().await?;
-        let mut response = crate::http_util::send_with_attempt_budget_and_notify_policy(
+        let mut response = crate::http_util::send_model_request_bounded_with_policy(
             "OpenAI-compatible chat stream request",
+            &self.model_id,
             || {
                 self.http
                     .post(&url)
@@ -1431,8 +1434,9 @@ impl DesktopModelTransport {
                     &mut body,
                     self.max_output_tokens.map(u64::from).unwrap_or(8192),
                 );
-                response = crate::http_util::send_with_attempt_budget_and_notify_policy(
+                response = crate::http_util::send_model_request_bounded_with_policy(
                     "OpenAI-compatible chat stream request after max_tokens adaptation",
+                    &self.model_id,
                     || {
                         self.http
                             .post(&url)

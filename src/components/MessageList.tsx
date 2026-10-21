@@ -719,7 +719,12 @@ export function MessageList({
   );
 }
 
-type InlineTurnPhase = "thinking" | "executing" | "waiting" | "finalizing";
+type InlineTurnPhase =
+  | "thinking"
+  | "executing"
+  | "waiting"
+  | "connecting"
+  | "finalizing";
 
 function inlineTurnPhase(
   message: UIMessage | undefined,
@@ -749,12 +754,11 @@ function inlineTurnPhase(
   ) {
     return "executing";
   }
-  if (
-    activity?.objectiveStatus === "waiting_system" ||
-    !streaming
-  ) {
-    return "waiting";
-  }
+  // M145 R1: objective-level waiting is a real wait ("等待中"); a turn that has
+  // no stream yet is waiting on the provider's first response, and saying
+  // "等待中" there hid a stalled model request (user report: forever 等待中).
+  if (activity?.objectiveStatus === "waiting_system") return "waiting";
+  if (!streaming) return "connecting";
   return "thinking";
 }
 
@@ -762,6 +766,7 @@ const INLINE_TURN_PHASE = {
   thinking: { label: "Thinking", Icon: LoaderCircle },
   executing: { label: "执行中", Icon: SquareTerminal },
   waiting: { label: "等待中", Icon: Clock3 },
+  connecting: { label: "等待模型首个响应", Icon: LoaderCircle },
   finalizing: { label: "整理结果", Icon: Sparkles },
 } satisfies Record<InlineTurnPhase, { label: string; Icon: typeof LoaderCircle }>;
 
@@ -781,7 +786,7 @@ function InlineTurnStatus({
   const nowMs = useNowTick(true);
   const phase = inlineTurnPhase(message, streaming, turnExecutionActive, activity);
   const { label, Icon } = INLINE_TURN_PHASE[phase];
-  const animated = phase === "thinking" || phase === "finalizing";
+  const animated = phase === "thinking" || phase === "finalizing" || phase === "connecting";
 
   return (
     <div
