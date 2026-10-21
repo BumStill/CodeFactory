@@ -4443,9 +4443,16 @@ impl ObjectiveStore {
         let mut settled = 0usize;
 
         // Shape 2: terminal Objectives own no live turn.
+        // 阶段 2 P0/R1：thin 会话的终态由 `thin_session_state` 拥有，legacy 目标
+        // 是否是终态与它的回合无关。这里跳过 thin —— 否则重启时把还在跑
+        // `sleep 60` 的回合写成 `objective_already_terminal`（v1.91.7 现场）。
         let terminal_objectives = sqlx::query_scalar::<_, String>(
             "SELECT objective.id FROM objectives objective
              WHERE objective.status IN ('completed','cancelled','failed','legacy_orphan')
+               AND NOT EXISTS (
+                 SELECT 1 FROM sessions session
+                 WHERE session.id=objective.session_id
+                   AND session.delivery_mode='thin')
                AND EXISTS (
                  SELECT 1 FROM chat_turn_state turn
                  WHERE turn.objective_id=objective.id
@@ -5674,6 +5681,19 @@ impl ObjectiveStore {
         .await;
     }
 
+    /// 阶段 2 P0/R1：thin 会话是否还停在 `running`。读不出来时按“仍在运行”处理
+    /// （fail closed）——读不到状态就绝不结束任何东西。
+    async fn thin_session_still_running(&self, session: &str) -> bool {
+        match super::thin_state::load(&self.pool, session).await {
+            Ok(Some(state)) => state.state == super::thin_state::SessionState::Running,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(%error, session_id = session, "thin state unreadable; withholding legacy decision");
+                true
+            }
+        }
+    }
+
     /// Phase 2 P0 / R1+R2: retire a legacy Objective that belongs to a thin
     /// session instead of settling it.
     ///
@@ -5681,10 +5701,12 @@ impl ObjectiveStore {
     /// remediation, no transcript system message, and no change to
     /// `thin_session_state`. That is what stops `objective-incident-controller`
     /// from fabricating a user-visible "已结束：连续三次…" for a session whose
-    /// real state is `waiting_wake`.
+    /// real state is `waiting_wake`. A `running` thin session is not retirable at
+    /// all: the live turn belongs to its executor or to the restart resume.
     async fn retire_legacy_objective_on_thin_session(
         &self,
         current: &ObjectiveSnapshot,
+        loop_owned: bool,
     ) -> anyhow::Result<Option<ObjectiveSnapshot>> {
         let Some(session) = current.session_id.as_deref() else {
             return Ok(None);
@@ -5694,6 +5716,19 @@ impl ObjectiveStore {
         }
         if !super::thin::is_thin(&self.pool, session).await {
             return Ok(None);
+        }
+        // 阶段 2 P0/R1：`running` 的 thin 会话正在跑的那个回合只能由执行者
+        // （`loop_owned`）或重启续跑推进。legacy 决策（incident controller、
+        // 启动收敛）既不退休目标、也不写任何终态——什么都不做。
+        // v1.91.7：正是这里的退休把正在跑 `sleep 60` 的目标变成 `legacy_orphan`，
+        // 随后启动收敛把回合写成 `objective_already_terminal`。
+        if !loop_owned && self.thin_session_still_running(session).await {
+            tracing::info!(
+                objective_id = %current.id,
+                session_id = session,
+                "legacy decision withheld: thin session still running"
+            );
+            return self.get(&current.id).await;
         }
         let now = Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
@@ -5756,7 +5791,10 @@ impl ObjectiveStore {
         // Retire the legacy Objective as a read-only compat record and return
         // without a decision row, a remediation or a transcript message.
         if decision.status != ObjectiveStatus::Cancelled {
-            if let Some(retired) = self.retire_legacy_objective_on_thin_session(&current).await? {
+            if let Some(retired) = self
+                .retire_legacy_objective_on_thin_session(&current, permit.is_some())
+                .await?
+            {
                 return Ok(retired);
             }
         }
@@ -16310,6 +16348,12 @@ CREATE TABLE objectives (
     async fn startup_turn_convergence_closes_ghost_turns_exactly_once() {
         let pool = pool().await;
         settlement_tables(&pool).await;
+        // Shape 2 skips thin sessions (阶段 2 P0/R1), so the convergence query
+        // reads `sessions.delivery_mode` like the production schema does.
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'chat'")
+            .execute(&pool)
+            .await
+            .unwrap();
         let store = ObjectiveStore::new(pool.clone());
 
         let live = store

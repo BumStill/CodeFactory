@@ -1451,7 +1451,7 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                 let resumed = super::thin_restart::resume_running_without_executor(
                     app.clone(),
                     &pool,
-                    super::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS,
+                    super::thin_restart::ResumeOrigin::Heartbeat,
                 )
                 .await;
                 if resumed > 0 {

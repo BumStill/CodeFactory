@@ -1761,7 +1761,7 @@ pub fn run() {
                 agent::thin_restart::resume_running_without_executor(
                     app.handle().clone(),
                     &objective_pool,
-                    0,
+                    agent::thin_restart::ResumeOrigin::Startup,
                 ),
             );
             if resumed_thin_sessions > 0 {
