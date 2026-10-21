@@ -5779,15 +5779,38 @@ mod tests {
                 .busy_timeout(std::time::Duration::from_secs(5))).await.unwrap();
         let mut held = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         sqlx::query("UPDATE sessions SET updated_at=2 WHERE id='m144'").execute(&mut *held).await.unwrap();
+        // Establish the precondition without relying on wall time: this
+        // transaction really does own SQLite's write lock, and a second
+        // connection cannot write through it (zero busy_timeout => code 5).
+        let blocked = sqlx::query("UPDATE sessions SET updated_at=3 WHERE id='m144'")
+            .execute(&pool)
+            .await
+            .expect_err("the held write lock must block an independent writer");
+        assert_eq!(
+            blocked.as_database_error().and_then(|error| error.code()).as_deref(),
+            Some("5"),
+            "the precondition must be SQLITE_BUSY, not an unrelated database error"
+        );
         let contender = pool.clone();
+        let admission_started = std::time::Instant::now();
         let admission = tokio::spawn(async move {
             admit_persisted_chat_turn(&contender, &crate::ChatRunControl::pending(), "m144", Some("m144-root"), "继续 synthetic").await
         });
         // The old deferred transaction fails immediately while this lock is held;
-        // the shared bounded retry survives until the lock is released.
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        held.commit().await.unwrap();
+        // the shared bounded retry survives until the lock is released. Release
+        // after a few milliseconds, and with ROLLBACK rather than COMMIT: the
+        // retry budget is only CONTENTION_ATTEMPTS (50ms + 100ms backoff), so a
+        // WAL fsync on commit plus a descheduled test thread could outlast it on
+        // Windows and surface code 5 through the retry instead of after it.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        held.rollback().await.unwrap();
         let receipt = admission.await.unwrap().expect("send must recover lock contention in place");
+        // Guard against a vacuous pass: a run that never met the held lock would
+        // finish before the retry's first 50ms backoff could elapse.
+        assert!(
+            admission_started.elapsed() >= std::time::Duration::from_millis(45),
+            "admission must have met the held write lock and retried instead of sailing through"
+        );
         assert_eq!(receipt.root_turn_id, "m144-root");
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m144-root' AND content='继续 synthetic'")
             .fetch_one(&pool).await.unwrap();
