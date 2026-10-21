@@ -74,15 +74,15 @@ describe("ToolCallCard — open generated file", () => {
     expect(screen.getByText("q3.pptx")).toBeInTheDocument();
     const open = screen.getByTitle("打开 decks/q3.pptx");
     fireEvent.click(open);
-    expect(mocks.invoke).toHaveBeenCalledWith("plugin:shell|open", {
-      path: "/proj/decks/q3.pptx",
+    expect(mocks.invoke).toHaveBeenCalledWith("open_chat_link", {
+      target: "decks/q3.pptx", cwd: "/proj", sessionId: "session-1",
     });
   });
 
   it("passes an already-absolute path through unchanged", () => {
     render(<ToolCallCard tc={tc({ args: JSON.stringify({ path: "/tmp/out.docx" }), name: "write_docx" })} />);
     fireEvent.click(screen.getByTitle("打开 /tmp/out.docx"));
-    expect(mocks.invoke).toHaveBeenCalledWith("plugin:shell|open", { path: "/tmp/out.docx" });
+    expect(mocks.invoke).toHaveBeenCalledWith("open_chat_link", { target: "/tmp/out.docx", cwd: "/proj", sessionId: "session-1" });
   });
 
   it("does not offer open for a non-writing tool", () => {
