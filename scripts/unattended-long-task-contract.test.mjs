@@ -183,7 +183,7 @@ test("the exact Windows release executable repeats the same contract", async () 
 });
 
 test("history-derived scenarios use the unified synthetic registry", async () => {
-  const [catalog, redirect, agent, delivery, deliveryRun, deliveryTool, objective, toolBackend, chat, trajectory, skills, loop, ci, nightly, release] = await Promise.all([
+  const [catalog, redirect, agent, delivery, deliveryRun, deliveryTool, objective, toolBackend, chat, thinDerive, thinRestart, trajectory, skills, loop, ci, nightly, release] = await Promise.all([
     source("docs/testing/scenario-registry.json"),
     source("docs/testing/history-derived-long-task-scenarios.json"),
     source("src-tauri/src/agent/mod.rs"),
@@ -193,6 +193,8 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
     source("src-tauri/src/agent/objective.rs"),
     source("src-tauri/src/agent/tool_backend.rs"),
     source("src-tauri/src/commands/chat.rs"),
+    source("src-tauri/src/agent/thin_derive.rs"),
+    source("src-tauri/src/agent/thin_restart.rs"),
     source("src-tauri/src/trajectory.rs"),
     source("src-tauri/src/commands/skills.rs"),
     source("src-tauri/crates/agent-loop/src/run.rs"),
@@ -230,7 +232,7 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
     ),
     "every scenario must name an executable automation target",
   );
-  const implementation = `${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}`;
+  const implementation = `${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${thinDerive}\n${thinRestart}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}`;
   for (const scenario of parsed.scenarios.filter((item) => legacy.scenario_ids.includes(item.id))) {
     for (const automation of scenario.automated_by) {
       const target = automation.slice(automation.indexOf(":") + 1);
