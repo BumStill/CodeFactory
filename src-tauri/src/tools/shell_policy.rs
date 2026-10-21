@@ -53,9 +53,14 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
         return deny(
             "continuous GitHub polling is not allowed: `--watch` refreshes every 10s until CI ends, \
              so one command can spend hundreds of API requests and exhaust the shared quota \
-             (which then breaks releases). Wait for CI through `deliver_changes` with \
-             ceiling=through_ci_green — it backs off 10s→60s — or poll once per call, or loop with \
-             `sleep 60` or longer",
+             (which then breaks releases). 已交付的 PR 由系统监视：CI 失败、合并冲突、队列退回和合并\
+             都会唤醒本会话，不必自己轮询。A delivered PR is already watched by the system: CI \
+             failure, a merge conflict, a queue rejection and the merge itself all wake this \
+             session, so you do not need your own watcher. If you still need a bounded watch, run \
+             it as a background task with at least 180s between checks — background_task_start \
+             with command `for i in $(seq 1 40); do sleep 180; gh pr checks <PR> --json bucket; \
+             done`. Otherwise poll once per call, or wait through `deliver_changes` with \
+             ceiling=through_ci_green (it backs off 10s→60s).",
         );
     }
 
@@ -316,6 +321,19 @@ mod tests {
                 "the denial must name the managed alternative: {reason}"
             );
         }
+    }
+
+    #[test]
+    fn m149_watch_denial_carries_a_copy_pasteable_alternative() {
+        // M149 R2：只说不允许，模型就没有下一步。拒绝必须给出可直接执行的形态，
+        // 并说明已交付 PR 由系统监视，不必自己轮询。
+        let policy = classify_command("gh pr checks 291 --watch");
+        let ShellCommandPolicy::Deny { reason } = policy else {
+            panic!("--watch must be denied, got {policy:?}");
+        };
+        assert!(reason.contains("background_task_start"), "{reason}");
+        assert!(reason.contains("sleep 180"), "{reason}");
+        assert!(reason.contains("系统"), "{reason}");
     }
 
     #[test]

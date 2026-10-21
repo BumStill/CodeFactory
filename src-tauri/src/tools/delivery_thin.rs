@@ -249,7 +249,17 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
         .map(|_| format!("按本会话授权继续交付至 {}，不在较低的请求 ceiling 停止。", ceiling.label()));
     Ok(json!({"state":"waiting", "pr_url":pr["url"], "pr_number":number,
         "effective_ceiling":ceiling.label(), "ceiling_note":ceiling_note,
-        "branch":branch,"commit_sha":sha,"ci":ci,"next_action":"请用后台任务监视 CI；由合并队列合并，不要直接合并。"}))
+        "branch":branch,"commit_sha":sha,"ci":ci,
+        // M149 R3：M142 起系统对已交付 PR 低频心跳监视（≥180 秒）。结果必须说出来，
+        // 否则模型会去自建监视源（`gh --watch` 被拒后本回合就没有唤醒源）。
+        "session_state":"waiting_wake",
+        "system_watch":{"source":"system","pr_number":number,"min_interval_secs":180},
+        "next_action":format!(
+            "系统已在监视 PR #{number}（心跳间隔 ≥180 秒）：CI 失败、合并冲突、被合并队列退回或\
+             合并成功时都会自动唤醒本会话，你可以结束本回合等待唤醒。不要自己轮询\
+             （`gh --watch` 会被拒绝，也不需要 schedule_wakeup）；合并由合并队列完成，\
+             不要直接合并。被唤醒后需要动作时再调用 deliver_changes。"
+        )}))
 }
 
 fn session_release_args(args: &Value, session_urgency: &str) -> Value {
@@ -427,6 +437,21 @@ mod tests {
         assert_eq!(result["state"], "waiting");
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!((forge.pushes,forge.creates,forge.merges), (0,0,0));
+    }
+    #[test]
+    fn m149_waiting_result_says_the_system_already_watches_the_pr() {
+        // M149 R3：M142 起系统对已交付 PR 低频心跳监视。结果文案必须说出来，
+        // 否则模型又会自己去造监视源（`gh --watch`→被拒→没有唤醒源→回合结束）。
+        let mut forge = Forge { pushed:true, pr:true, armed:true, ..Default::default() };
+        let result = deliver(&mut forge).unwrap();
+        assert_eq!(result["state"], "waiting");
+        let next = result["next_action"].as_str().unwrap();
+        assert!(next.contains("系统已在监视 PR #"), "{next}");
+        assert!(next.contains("唤醒"), "{next}");
+        assert!(next.contains("结束本回合"), "{next}");
+        assert!(!next.contains("请用后台任务监视"), "{next}");
+        assert_eq!(result["session_state"], "waiting_wake");
+        assert_eq!(result["system_watch"]["source"], "system");
     }
     #[test]
     fn merged_same_head_is_delivered_without_new_pr_or_label() {

@@ -170,7 +170,7 @@
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
       "change_patterns": ["src-tauri/src/tools/delivery_thin.rs", "src-tauri/src/headless_dispatch.rs", "src/lib/desktopDispatch.ts", "src/lib/dispatchActions.ts", "src/lib/useAppDispatchBridge.ts", "src-tauri/src/agent/objective.rs", "src-tauri/src/agent/delivery.rs", "src-tauri/src/agent/delivery_run.rs", "src-tauri/src/tools/delivery.rs", ".github/workflows/release.yml", "src-tauri/src/agent/delivery_scenario_tests.rs", "scripts/merge-queue.mjs", ".github/workflows/merge-queue.yml"],
-      "automated_by": ["rust:m137_session_policy_reaches_created_and_updated_pr_bodies", "path:src/lib/desktopDispatch.test.ts", "rust:receipt_backed_delivery_completion_atomically_completes_run_and_objective", "rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "binary:--delivery-recovery-smoke", "workflow:Verify Windows release executable DeliveryRun recovery"],
+      "automated_by": ["rust:m137_session_policy_reaches_created_and_updated_pr_bodies", "rust:m149_waiting_result_says_the_system_already_watches_the_pr", "path:src/lib/desktopDispatch.test.ts", "rust:receipt_backed_delivery_completion_atomically_completes_run_and_objective", "rust:post_commit_pre_persist_crash_reconciles_the_exact_receipted_head_once", "rust:receipted_child_takeover_accepts_the_canonical_pr_still_at_its_parent", "binary:--delivery-recovery-smoke", "workflow:Verify Windows release executable DeliveryRun recovery"],
       "required_evidence": ["L1", "L2", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
     },
@@ -434,7 +434,7 @@
       "priority": "P0",
       "source_kind": "product_contract",
       "change_patterns": ["src-tauri/src/agent/background_tasks.rs", "src-tauri/src/tools/background_task.rs", "src-tauri/src/commands/background.rs", "src-tauri/src/commands/control_plane.rs", "src-tauri/src/util/process_tree.rs", "src-tauri/src/util/command_activity.rs", "src-tauri/src/util/mod.rs", "src-tauri/src/util/command_env.rs", "src-tauri/src/config/settings.rs", "src/components/SessionBackgroundTasks.tsx", "src/lib/backgroundTasks.ts"],
-      "automated_by": ["pnpm:test:background-tasks:headless"],
+      "automated_by": ["pnpm:test:background-tasks:headless", "rust:m149_zero_valued_wakeup_field_counts_as_not_provided", "rust:m149_zero_every_sec_schedules_a_single_one_shot_wakeup"],
       "required_evidence": ["L1", "L3"],
       "gates": ["pull_request"]
     }
