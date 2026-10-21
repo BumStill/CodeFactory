@@ -36,7 +36,7 @@
         {
           "sessionId": "synthetic-created-1",
           "content": "合成派单消息",
-          "rootTurnId": "048ae26a-9109-48b4-b800-c4d41281f7c2"
+          "rootTurnId": "f86605f2-9841-431b-8f7d-bcd5371c7c8b"
         }
       ],
       "switch_session": "pass"
@@ -75,7 +75,7 @@
         {
           "sessionId": "synthetic-created-1",
           "content": "合成派单消息",
-          "rootTurnId": "b7b82c6a-0fc9-4d08-9240-925172a84fd7"
+          "rootTurnId": "b672d948-6cef-402e-925b-6f3c17369a7a"
         }
       ],
       "switch_session": "pass"

@@ -8,7 +8,7 @@
 //!
 //! 选择条件是**权威表** `thin_session_state`，不是回合投影：
 //! - `state='running'`；
-//! - 已经超过宽限期（启动时为 0，心跳为 [`RUNNING_WITHOUT_EXECUTOR_GRACE_MS`]）；
+//! - 启动与心跳均至少超过 [`RUNNING_WITHOUT_EXECUTOR_GRACE_MS`] 宽限；
 //! - 当前进程没有该会话的活执行者（`chat_cancels` 里的在跑回合）。
 
 use sqlx::SqlitePool;
@@ -24,6 +24,8 @@ pub(crate) async fn running_without_executor(
     grace_ms: i64,
     mut has_live_executor: impl FnMut(&str) -> bool,
 ) -> sqlx::Result<Vec<String>> {
+    let grace_ms = grace_ms.max(RUNNING_WITHOUT_EXECUTOR_GRACE_MS);
+    crate::agent::thin_state::ensure(db).await?;
     let has_controls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_run_controls'")
         .fetch_one(db).await?;
     if has_controls == 1 {
@@ -34,11 +36,24 @@ pub(crate) async fn running_without_executor(
                  JOIN chat_run_controls control ON control.root_turn_id=turn.root_turn_id
                  WHERE turn.session_id=session.id AND turn.completed_at IS NULL
                    AND turn.terminal_reason IS NULL AND control.status<>'cancelled'
-                   AND control.updated_at<=?)
+                   AND control.updated_at<=? AND turn.updated_at<=?)
+               AND EXISTS (SELECT 1 FROM thin_session_state state
+                 WHERE state.session_id=session.id AND state.state='running' AND state.updated_at<=?)
+               AND NOT EXISTS (SELECT 1 FROM messages message
+                 WHERE message.session_id=session.id AND message.created_at>?)
+               AND NOT EXISTS (SELECT 1 FROM chat_turn_state recent
+                 WHERE recent.session_id=session.id AND recent.updated_at>?)
+               AND NOT EXISTS (SELECT 1 FROM chat_run_controls recent
+                 WHERE recent.session_id=session.id AND recent.updated_at>?)
                AND NOT EXISTS (SELECT 1 FROM chat_session_cancel_intents stop
                  WHERE stop.session_id=session.id AND stop.status='requested')
              ORDER BY session.id",
-        ).bind(now_ms.saturating_sub(grace_ms)).fetch_all(db).await?;
+        ).bind(now_ms.saturating_sub(grace_ms))
+            .bind(now_ms.saturating_sub(grace_ms))
+            .bind(now_ms.saturating_sub(grace_ms))
+            .bind(now_ms.saturating_sub(grace_ms))
+            .bind(now_ms.saturating_sub(grace_ms))
+            .bind(now_ms.saturating_sub(grace_ms)).fetch_all(db).await?;
         return Ok(rows.into_iter().filter(|session| !has_live_executor(session)).collect());
     }
     crate::agent::thin_state::ensure(db).await?;
@@ -76,7 +91,7 @@ pub(crate) async fn resume_running_without_executor(
         pool,
         chrono::Utc::now().timestamp_millis(),
         grace_ms,
-        |session| live.contains(session),
+        |session| live.contains(session) || crate::session_executor_alive(session) != Some(false),
     )
     .await
     {
@@ -155,12 +170,8 @@ mod tests {
         let selected = running_without_executor(&db, now, 0, |session| session == "live-running")
             .await
             .unwrap();
-        // Startup has no grace window: every running row with no executor is
-        // ours, including one updated a second before the crash.
-        assert_eq!(
-            selected,
-            vec!["stale-running".to_string(), "fresh-running".to_string()]
-        );
+        // R2: startup and heartbeat both protect newly started turns.
+        assert_eq!(selected, vec!["stale-running".to_string()]);
 
         // The heartbeat grace keeps a freshly-updated `running` row alone, but a
         // dead executor past the grace window is still picked up.
@@ -172,6 +183,44 @@ mod tests {
             heartbeat,
             vec!["stale-running".to_string(), "live-running".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_never_reopens_ended_even_with_stale_unfinished_controls() {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('ended-recovery','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        crate::agent::thin_state::save(&db, "ended-recovery", &crate::agent::thin_state::ThinState::ended("cancelled", "synthetic")).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('old-root','ended-recovery','running','running',1,1)")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO chat_run_controls(run_instance_id,session_id,root_turn_id,status,created_process_instance,created_at,updated_at) VALUES ('old-run','ended-recovery','old-root','active','old-process',1,1)")
+            .execute(&db).await.unwrap();
+        for grace in [0, RUNNING_WITHOUT_EXECUTOR_GRACE_MS] {
+            assert!(running_without_executor(&db, 10_000_000, grace, |_| false).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_uses_latest_user_activity_not_an_old_control() {
+        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('recent-user','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        let mut state = crate::agent::thin_state::ThinState::running();
+        state.updated_at = 1;
+        crate::agent::thin_state::save(&db, "recent-user", &state).await.unwrap();
+        sqlx::raw_sql("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('recent-root','recent-user','running','running',1,1);
+            INSERT INTO chat_run_controls(run_instance_id,session_id,root_turn_id,status,created_process_instance,created_at,updated_at) VALUES ('recent-run','recent-user','recent-root','active','old-process',1,1);
+            INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('recent-message','recent-user','user','synthetic new task',9999000);")
+            .execute(&db).await.unwrap();
+        assert!(running_without_executor(&db, 10_000_000, 0, |_| false).await.unwrap().is_empty());
+        assert_eq!(running_without_executor(&db, 10_600_001, 0, |_| false).await.unwrap(), vec!["recent-user"]);
+    }
+
+    #[tokio::test]
+    async fn recovery_protects_fresh_session_even_when_startup_passes_zero_grace() {
+        let db = fixture().await;
+        session(&db, "fresh", "running", 9_999_000).await;
+        assert!(running_without_executor(&db, 10_000_000, 0, |_| false).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -150,6 +150,33 @@ pub fn request_chat_run_stop(run_instance_id: &str) -> bool {
     raise_chat_run_stop_flag(run_instance_id)
 }
 
+static CHAT_SESSION_EXECUTORS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, (String, std::sync::Weak<AtomicBool>)>>,
+> = std::sync::OnceLock::new();
+
+fn session_executors() -> &'static std::sync::Mutex<HashMap<String, (String, std::sync::Weak<AtomicBool>)>> {
+    CHAT_SESSION_EXECUTORS.get_or_init(Default::default)
+}
+
+pub(crate) fn register_session_executor(session: &str, control: &ChatRunControl) {
+    let mut live = session_executors().lock().unwrap_or_else(|error| error.into_inner());
+    live.retain(|_, (_, flag)| flag.strong_count() > 0);
+    live.insert(session.into(), (control.run_instance_id.clone(), Arc::downgrade(&control.cancel)));
+}
+
+pub(crate) fn unregister_session_executor(session: &str, control: &ChatRunControl) {
+    let mut live = session_executors().lock().unwrap_or_else(|error| error.into_inner());
+    if live.get(session).is_some_and(|(id, _)| id == &control.run_instance_id) {
+        live.remove(session);
+    }
+}
+
+/// None means the registry cannot be observed reliably: recovery must not act.
+pub(crate) fn session_executor_alive(session: &str) -> Option<bool> {
+    let live = session_executors().lock().ok()?;
+    Some(live.get(session).is_some_and(|(_, flag)| flag.upgrade().is_some()))
+}
+
 pub(crate) fn chat_run_executor_alive(run_instance_id: &str) -> bool {
     lock_chat_run_stop_flags().get(run_instance_id)
         .and_then(std::sync::Weak::upgrade)
@@ -1502,7 +1529,7 @@ pub fn run_headless_smoke_cli() -> bool {
     let Some(flag) = args.next() else {
         return false;
     };
-    if flag != "--headless-smoke" {
+    if flag != "--headless-smoke" && flag != "--thin-executor-liveness-smoke" {
         return false;
     }
     desktop_context::reject_world_request_for_cli();
@@ -1521,6 +1548,20 @@ pub fn run_headless_smoke_cli() -> bool {
             eprintln!("Headless smoke could not start: {error}");
             std::process::exit(1);
         });
+    if flag == "--thin-executor-liveness-smoke" {
+        match runtime.block_on(commands::chat::thin_executor_liveness_smoke()) {
+            Ok(receipt) => {
+                std::fs::write(&output, serde_json::to_vec_pretty(&receipt).expect("receipt JSON"))
+                    .expect("write liveness receipt");
+                println!("{receipt}");
+                return true;
+            }
+            Err(error) => {
+                eprintln!("Thin executor liveness smoke failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     match runtime.block_on(agent::AgentLoop::run_headless_smoke(std::path::Path::new(
         &output,
     ))) {
