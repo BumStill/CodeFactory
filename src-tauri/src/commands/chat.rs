@@ -641,7 +641,24 @@ pub async fn cancel_chat(
     .await
     {
         Ok(report) => {
-            let content = format!("{}\n{}", report.notice, report.notes.join("\n"));
+            // M145-R3: a session that never had a delivery must not be told that
+            // a PR exists. `stop_pending_pr_actions(None)` still describes the
+            // absent PR in its notes, so those notes are dropped here and the
+            // plain "this step stops" wording is used instead.
+            let mut notes = report.notes.clone();
+            let head = if report.pr_number.is_none() {
+                notes.retain(|note| !note.contains("PR"));
+                "已停止：这一步不再继续，停止之后不再执行还没发生的交付动作\
+（推送、开 PR、合并、发版）；已经发生的本地提交不回滚。要接着做，需要你或编排方明确发起。"
+                    .to_string()
+            } else {
+                report.notice.clone()
+            };
+            let content = if notes.is_empty() {
+                head
+            } else {
+                format!("{}\n{}", head, notes.join("\n"))
+            };
             // M145-R3: the notice belongs to the turn the user stopped, so a
             // second stop of the same turn must not add a second line, and a
             // session that never had a delivery must not be told about PRs.

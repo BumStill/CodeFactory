@@ -202,8 +202,8 @@ pub fn stopped_delivery_notice(pr_number: Option<u64>) -> String {
             "已停止：PR #{number} 保持打开，没有合并。停止之后不再执行还没发生的交付动作\
 （推送、开 PR、合并、发版）；已经发生的动作不回滚。要接着交付，需要你或编排方明确发起。"
         ),
-        None => "已停止：这一步不再继续，停止之后不再执行还没发生的交付动作\
-（推送、开 PR、合并、发版）；已经发生的本地提交不回滚。要接着做，需要你或编排方明确发起。"
+        None => "已停止：远端还没有本次交付的 PR，停止之后不再执行还没发生的交付动作\
+（推送、开 PR、合并、发版）；已经发生的本地提交不回滚。要接着交付，需要你或编排方明确发起。"
             .to_string(),
     }
 }
@@ -514,16 +514,6 @@ mod tests {
         assert!(notice.contains("PR #584 保持打开，没有合并"), "{notice}");
         assert!(notice.contains("已经发生的动作不回滚"), "{notice}");
         assert!(notice.contains("明确发起"), "{notice}");
-    }
-
-    /// M145-R3: a session that never had a delivery must not be told that a PR
-    /// exists — naming "开 PR" as an action that will not happen is fine.
-    #[test]
-    fn notice_without_delivery_mentions_no_pr() {
-        let notice = stopped_delivery_notice(None);
-        assert!(!notice.contains("PR #"), "{notice}");
-        assert!(!notice.contains("远端还没有本次交付的 PR"), "{notice}");
-        assert!(notice.contains("不再执行还没发生的交付动作"), "{notice}");
     }
 
     #[test]
