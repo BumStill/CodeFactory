@@ -10,9 +10,20 @@ async fn has_table(db: &SqlitePool, name: &str) -> sqlx::Result<bool> {
 
 /// 外部事实是有时效的观测，不在 derive_state 中访问网络。
 async fn ensure_external(db: &SqlitePool) -> sqlx::Result<()> {
-    sqlx::query("CREATE TABLE IF NOT EXISTS thin_external_observations(session_id TEXT PRIMARY KEY,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL,observed_at INTEGER NOT NULL DEFAULT 0,completed_reason TEXT,closeout_queued INTEGER NOT NULL DEFAULT 0)")
+    sqlx::query("CREATE TABLE IF NOT EXISTS thin_external_observations(session_id TEXT PRIMARY KEY,pr_number INTEGER NOT NULL,ceiling TEXT NOT NULL,observed_at INTEGER NOT NULL DEFAULT 0,completed_reason TEXT,closeout_queued INTEGER NOT NULL DEFAULT 0,merged_at INTEGER)")
         .execute(db).await?;
+    // M146：历史库没有 merged_at；用它判定「合并之后是否已经收尾过」。
+    if !has_column(db, "thin_external_observations", "merged_at").await? {
+        sqlx::query("ALTER TABLE thin_external_observations ADD COLUMN merged_at INTEGER")
+            .execute(db).await?;
+    }
     Ok(())
+}
+
+async fn has_column(db: &SqlitePool, table: &str, column: &str) -> sqlx::Result<bool> {
+    let rows: Vec<(String,)> = sqlx::query_as(&format!("SELECT name FROM pragma_table_info('{table}')"))
+        .fetch_all(db).await?;
+    Ok(rows.iter().any(|row| row.0 == column))
 }
 
 fn completion_reason(pr: &serde_json::Value, ceiling: &str, released: bool, number: i64) -> Option<String> {
@@ -26,6 +37,17 @@ fn completion_reason(pr: &serde_json::Value, ceiling: &str, released: bool, numb
 fn failure_reason(pr: &serde_json::Value, number: i64) -> Option<String> {
     if pr["state"] == "CLOSED" { return Some(format!("PR #{number} 已关闭但未合并")); }
     if pr["state"] != "OPEN" { return None; }
+    // M146/R4：冲突和被合并队列退回同样是「需要会话处理」的事实，必须带原因唤醒。
+    if matches!(pr["mergeable"].as_str(), Some("CONFLICTING"))
+        || matches!(pr["mergeStateStatus"].as_str(), Some("DIRTY")) {
+        return Some(format!("PR #{number} 存在合并冲突（mergeable=CONFLICTING），需要解决冲突后重新交付"));
+    }
+    let labels: Vec<&str> = pr["labels"].as_array().map(|labels| {
+        labels.iter().filter_map(|label| label["name"].as_str()).collect()
+    }).unwrap_or_default();
+    if labels.iter().any(|name| *name == "merge-queue: blocked") {
+        return Some(format!("PR #{number} 被合并队列退回（merge-queue: blocked），需要按退回原因修复后重新排队"));
+    }
     let failed: Vec<&str> = pr["statusCheckRollup"].as_array()?.iter().filter(|check| {
         matches!(check["conclusion"].as_str(), Some("FAILURE" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "STALE"))
             || matches!(check["state"].as_str(), Some("FAILURE" | "ERROR"))
@@ -34,7 +56,44 @@ fn failure_reason(pr: &serde_json::Value, number: i64) -> Option<String> {
 }
 
 fn is_external_failure(reason: &str) -> bool {
-    reason.contains("检查失败：") || reason.contains("已关闭但未合并")
+    reason.contains("检查失败：") || reason.contains("已关闭但未合并") || reason.contains("存在合并冲突") || reason.contains("被合并队列退回")
+}
+
+/// 合并时间（gh `mergedAt`，RFC3339）→ 毫秒；未知即 None（不伪造事实）。
+fn merged_at_millis(pr: &serde_json::Value) -> Option<i64> {
+    let raw = pr["mergedAt"].as_str()?;
+    chrono::DateTime::parse_from_rfc3339(raw).ok().map(|at| at.timestamp_millis())
+}
+
+/// M146/R3：同一时刻最多两个收尾/修复回合，避免升级后成批占用模型。
+const CLOSEOUT_CONCURRENCY: i64 = 2;
+/// 已投递的收尾回合在这个窗口内仍算占用额度（回合本身可能还在跑）。
+const CLOSEOUT_WINDOW_SECS: i64 = 600;
+
+async fn closeout_slot_free(db: &SqlitePool, at_ms: i64) -> sqlx::Result<bool> {
+    if !has_table(db, "wakeup_schedules").await? { return Ok(true); }
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wakeup_schedules WHERE (id LIKE 'thin-closeout-%' OR id LIKE 'thin-repair-%') AND (status='pending' OR (status='done' AND COALESCE(last_fired_at,0)>=?))",
+    ).bind(at_ms / 1000 - CLOSEOUT_WINDOW_SECS).fetch_one(db).await?;
+    Ok(active < CLOSEOUT_CONCURRENCY)
+}
+
+/// M146/R1：收尾回合只给「交付后仍在等待」的会话。已 ended、已 close_objective、
+/// 或合并之后已经给过收尾回答的会话不唤醒，只把外部事项标记完成。
+async fn closeout_eligible(db: &SqlitePool, session: &str, merged_at: Option<i64>) -> sqlx::Result<bool> {
+    let state = derive_state(db, session).await?;
+    if !matches!(state.state, SessionState::WaitingWake | SessionState::WaitingUser) {
+        return Ok(false);
+    }
+    if let Some(merged_at) = merged_at {
+        let answered: i64 = if has_table(db, "messages").await? {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant' AND created_at>=? AND TRIM(content)<>'' AND (tool_calls IS NULL OR tool_calls='' OR tool_calls='[]')",
+            ).bind(session).bind(merged_at).fetch_one(db).await?
+        } else { 0 };
+        if answered > 0 { return Ok(false); }
+    }
+    Ok(true)
 }
 
 // 进程内共享滚动窗口；同时计入既有全局观测计数，限额耗尽时不发请求。
@@ -65,9 +124,17 @@ fn observe_command(cwd: &str, args: &[&str]) -> Option<String> {
 /// 查询失败/额度不足不伪造完成；observed_at 在请求前 CAS，重启也遵守 180s。
 pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::Result<()> {
     if !super::thin::is_thin(db, session).await { return Ok(()); }
-    let state = super::thin_state::load(db, session).await?;
-    if !state.is_some_and(|state| matches!(state.state, SessionState::WaitingWake | SessionState::WaitingUser))
-        || crate::session_executor_alive(session) != Some(false) { return Ok(()); }
+    if crate::session_executor_alive(session) != Some(false) { return Ok(()); }
+    // M146/R1：用事实判定「还值得观测吗」，不信任可能过期的缓存投影；
+    // 已经 ended 的历史会话不再观测，也不再有收尾回合。
+    let waiting = derive_state(db, session).await?.state;
+    let retry_pending: i64 = if has_table(db, "thin_external_observations").await? {
+        sqlx::query_scalar("SELECT COUNT(*) FROM thin_external_observations WHERE session_id=? AND closeout_queued=0 AND completed_reason IS NOT NULL")
+            .bind(session).fetch_one(db).await?
+    } else { 0 };
+    if !matches!(waiting, SessionState::WaitingWake | SessionState::WaitingUser) && retry_pending == 0 {
+        return Ok(());
+    }
     ensure_external(db).await?;
     if has_table(db, "chat_session_cancel_intents").await? {
         let stopped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_session_cancel_intents stop WHERE stop.session_id=? AND NOT EXISTS (SELECT 1 FROM messages user WHERE user.session_id=stop.session_id AND user.role='user' AND user.created_at>stop.requested_at)")
@@ -84,9 +151,10 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
         .bind(at).bind(session).bind(at - 180_000).execute(db).await?.rows_affected() == 1;
     if claimed {
         let observe_ceiling = ceiling.clone();
-        let reason = tokio::task::spawn_blocking(move || {
-            let raw = observe_command(&cwd, &["pr", "view", &number.to_string(), "--json", "state,mergeCommit,statusCheckRollup"])?;
+        let observed = tokio::task::spawn_blocking(move || {
+            let raw = observe_command(&cwd, &["pr", "view", &number.to_string(), "--json", "state,mergeCommit,mergedAt,mergeable,mergeStateStatus,labels,statusCheckRollup"])?;
             let pr: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            let merged_at = merged_at_millis(&pr);
             let released = if matches!(observe_ceiling.as_str(), "ThroughRelease" | "through_release") && pr["state"] == "MERGED" {
                 // 不把任意最新版本当作本 PR 的版本：必须确认 merge commit 被已发布 tag 包含。
                 let release = observe_command(&cwd, &["api", "repos/{owner}/{repo}/releases/latest"])?;
@@ -98,16 +166,36 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
                 let comparison: serde_json::Value = serde_json::from_str(&comparison).ok()?;
                 matches!(comparison["status"].as_str(), Some("ahead" | "identical"))
             } else { false };
-            Some(failure_reason(&pr, number).or_else(|| completion_reason(&pr, &observe_ceiling, released, number)))
+            Some((failure_reason(&pr, number).or_else(|| completion_reason(&pr, &observe_ceiling, released, number)), merged_at))
         }).await.ok().flatten();
-        if let Some(reason) = reason {
-            sqlx::query("UPDATE thin_external_observations SET closeout_queued=CASE WHEN completed_reason IS ? THEN closeout_queued ELSE 0 END,completed_reason=? WHERE session_id=? AND pr_number=? AND ceiling=?")
-                .bind(&reason).bind(&reason).bind(session).bind(number).bind(&ceiling).execute(db).await?;
+        if let Some((reason, merged_at)) = observed {
+            sqlx::query("UPDATE thin_external_observations SET closeout_queued=CASE WHEN completed_reason IS ? THEN closeout_queued ELSE 0 END,completed_reason=COALESCE(?,completed_reason),merged_at=COALESCE(?,merged_at) WHERE session_id=? AND pr_number=? AND ceiling=?")
+                .bind(reason.as_deref()).bind(reason.as_deref()).bind(merged_at).bind(session).bind(number).bind(&ceiling).execute(db).await?;
         }
     }
-    let reason: Option<String> = sqlx::query_scalar("SELECT completed_reason FROM thin_external_observations WHERE session_id=? AND closeout_queued=0")
-        .bind(session).fetch_optional(db).await?.flatten();
-    if let Some(reason) = reason {
+    let pending: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT completed_reason,merged_at FROM thin_external_observations WHERE session_id=? AND closeout_queued=0",
+    ).bind(session).fetch_optional(db).await?;
+    let Some((Some(reason), merged_at)) = pending else { return Ok(()) };
+    {
+        let failed = is_external_failure(&reason);
+        if failed {
+            // M146/R1：失败的会话已经结束（停止/收尾完成）时同样不再起回合。
+            if derive_state(db, session).await?.state == SessionState::Ended {
+                mark_closeout_silent(db, session).await?;
+                return Ok(());
+            }
+        } else {
+            // M146/R1：只有在还等待着的会话才值得一次 §8 收尾回合。
+            if !closeout_eligible(db, session, merged_at).await? {
+                mark_closeout_silent(db, session).await?;
+                return Ok(());
+            }
+            // M146/R3：收尾回合限流；让出额度时不标记完成，留待下一轮心跳。
+            if !closeout_slot_free(db, at).await? { return Ok(()); }
+        }
+    }
+    {
         super::background_tasks::wake_source_cover(db, session).await;
         // 同一事务写唤醒与去重事实，不留下“标记成功但没排唤醒”的崩溃窗口。
         let mut tx = db.begin().await?;
@@ -127,6 +215,29 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
         }
         tx.commit().await?;
     }
+    Ok(())
+}
+
+/// M146/R2：最新用户消息是一条「定时唤醒」文本，且它之后没有任何助手回答，
+/// 说明这次唤醒没有真正开始回合（上一回合已结算），不能当作 running。
+async fn wake_without_a_turn(db: &SqlitePool, session: &str, latest_user: i64) -> sqlx::Result<bool> {
+    if !has_table(db, "messages").await? { return Ok(false); }
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT content FROM messages WHERE session_id=? AND role='user' AND created_at=? ORDER BY id DESC LIMIT 1",
+    ).bind(session).bind(latest_user).fetch_optional(db).await?;
+    let Some(body) = body else { return Ok(false) };
+    let shaped = body.trim_start().starts_with("定时唤醒 ") && body.contains("节奏：");
+    if !shaped { return Ok(false); }
+    let answered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant' AND created_at>=?",
+    ).bind(session).bind(latest_user).fetch_one(db).await?;
+    Ok(answered == 0)
+}
+
+/// M146/R1：标记外部事项已完成，但不起任何模型回合。
+async fn mark_closeout_silent(db: &SqlitePool, session: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE thin_external_observations SET closeout_queued=1 WHERE session_id=? AND closeout_queued=0")
+        .bind(session).execute(db).await?;
     Ok(())
 }
 
@@ -243,6 +354,13 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     } else { None };
     let cutoff = terminal.as_ref().map_or(0, |end| end.0);
     if latest_user.is_some_and(|time| time > cutoff) {
+        // M146/R2：定时唤醒写入的用户消息如果没有回合真正开始（执行者已死、也没有
+        // 助手回答），不能把会话永久投影成 running。v1.91.15 现场（d632e17a）就是这样
+        // 唤醒后 running 30 分钟、零助手回复。
+        if latest_user.is_some_and(|time| time > cutoff)
+            && wake_without_a_turn(db, session, latest_user.unwrap_or_default()).await? {
+            return Ok(ThinState::ended("定时唤醒未开始回合（上一回合已结算）", "本会话记录"));
+        }
         // A newly admitted message is a fact even before the transport is registered.
         if terminal.is_some() {
             return Ok(ThinState::running());
@@ -590,6 +708,104 @@ mod tests {
             assert_eq!(derived.state, SessionState::Running);
             assert_eq!(derived.updated_at, 123);
         }
+    }
+
+    async fn ensure_wake_table(db: &SqlitePool) {
+        sqlx::raw_sql("CREATE TABLE IF NOT EXISTS wakeup_schedules(id TEXT PRIMARY KEY,session_id TEXT,root_turn_id TEXT,prompt TEXT NOT NULL,source TEXT NOT NULL,after_sec INTEGER,every_sec INTEGER,next_at INTEGER NOT NULL,status TEXT NOT NULL,fire_count INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,last_fired_at INTEGER);")
+            .execute(db).await.unwrap();
+    }
+
+    /// M146/R1：升级回填不得给早已收尾的历史会话起模型回合。
+    /// 现场 v1.91.14：升级后 01:12:35–01:13:20 一次性唤醒 23 个已 ended 的旧会话。
+    #[tokio::test]
+    async fn m146_historical_closed_out_session_is_marked_without_a_turn() {
+        let db = fixture().await;
+        ensure_wake_table(&db).await;
+        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: true }, "")).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',776,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('closeout','derive','assistant','§8 收尾完成：分支已清理',2000)")
+            .execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,merged_at) VALUES ('derive',776,'ThroughMerge',1,'PR #776 已合并',1000)")
+            .execute(&db).await.unwrap();
+        heartbeat_external(&db, "derive").await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules").fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 0, "已收尾的历史会话不得再被收尾唤醒");
+        let queued: i64 = sqlx::query_scalar("SELECT closeout_queued FROM thin_external_observations").fetch_one(&db).await.unwrap();
+        assert_eq!(queued, 1, "外部事项仍要标记完成，只是不起回合");
+        assert_ne!(refresh(&db, "derive").await.unwrap().state, SessionState::Running);
+    }
+
+    /// M146/R1 的反面：合并之后还没有任何回答的等待会话，仍要唤醒收尾一次。
+    #[tokio::test]
+    async fn m146_waiting_session_gets_closeout_wake_when_answer_predates_merge() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',776,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('delivered','derive','assistant','PR 已交付，等待合并监视',100)")
+            .execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,merged_at) VALUES ('derive',776,'ThroughMerge',1,'PR #776 已合并',5000)")
+            .execute(&db).await.unwrap();
+        heartbeat_external(&db, "derive").await.unwrap();
+        let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE id LIKE 'thin-closeout-%'").fetch_one(&db).await.unwrap();
+        assert_eq!(wakes, 1);
+    }
+
+    /// M146/R2：定时唤醒写入的用户消息如果没有回合真正开始，不能把会话永久投影成
+    /// running。现场 d632e17a：01:12:51 唤醒后 running 30 分钟、零助手回复。
+    #[tokio::test]
+    async fn m146_wake_message_without_a_turn_is_not_running() {
+        let db = fixture().await;
+        ensure_wake_table(&db).await;
+        sqlx::raw_sql("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('answer','derive','assistant','最终回答',100);
+            INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at,last_fired_at) VALUES ('thin-closeout-synthetic','derive','PR #776 已合并，交付外部事项已完成。','agent_decided',60,150,'done',150,150);")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',776,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued) VALUES ('derive',776,'ThroughMerge',1,'PR #776 已合并',1)")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('wake','derive','user','定时唤醒 thin-closeout-synthetic：PR #776 已合并\n节奏：一次性 after_sec=60',200)")
+            .execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_ne!(state.state, SessionState::Running, "没有回合在跑就不能显示 running（{:?}）", state.reason);
+    }
+
+    /// M146/R4：PR 冲突或被合并队列退回复活会话也要带原因唤醒。
+    #[test]
+    fn m146_conflicting_and_queue_blocked_prs_wake_with_reason() {
+        let conflict = failure_reason(&serde_json::json!({"state":"OPEN","mergeable":"CONFLICTING","statusCheckRollup":[]}), 91).unwrap();
+        assert!(conflict.contains("合并冲突") && conflict.contains("#91"));
+        assert!(is_external_failure(&conflict));
+        let dirty = failure_reason(&serde_json::json!({"state":"OPEN","mergeable":"UNKNOWN","mergeStateStatus":"DIRTY"}), 91).unwrap();
+        assert!(dirty.contains("合并冲突"));
+        let blocked = failure_reason(&serde_json::json!({"state":"OPEN","mergeable":"MERGEABLE","labels":[{"name":"merge-queue: blocked"}]}), 91).unwrap();
+        assert!(blocked.contains("合并队列") && blocked.contains("blocked"));
+        assert!(is_external_failure(&blocked));
+        assert!(failure_reason(&serde_json::json!({"state":"OPEN","mergeable":"MERGEABLE","labels":[{"name":"merge-queue: armed"}]}), 91).is_none());
+    }
+
+    /// M146/R3：同一时刻最多 2 个收尾回合，升级后不再成批占用模型。
+    #[tokio::test]
+    async fn m146_closeout_turns_are_throttled_to_two() {
+        let db = fixture().await;
+        ensure_wake_table(&db).await;
+        for id in ["derive-b", "derive-c"] {
+            sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?,'synthetic','/synthetic','model',1,1,'thin')")
+                .bind(id).execute(&db).await.unwrap();
+        }
+        sqlx::raw_sql("INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at) VALUES ('thin-closeout-running-1','derive-b','synthetic','agent_decided',60,99999999999,'pending',1);
+            INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at) VALUES ('thin-closeout-running-2','derive-c','synthetic','agent_decided',60,99999999999,'pending',1);")
+            .execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',776,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,merged_at) VALUES ('derive',776,'ThroughMerge',1,'PR #776 已合并',5000)")
+            .execute(&db).await.unwrap();
+        heartbeat_external(&db, "derive").await.unwrap();
+        let mine: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        assert_eq!(mine, 0, "已有 2 个收尾回合在排队时必须让出额度");
+        let queued: i64 = sqlx::query_scalar("SELECT closeout_queued FROM thin_external_observations WHERE session_id='derive'").fetch_one(&db).await.unwrap();
+        assert_eq!(queued, 0, "被限流的会话要留待下一轮，不得静默标记完成");
     }
 
     #[tokio::test]
