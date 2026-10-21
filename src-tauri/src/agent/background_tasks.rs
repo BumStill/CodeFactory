@@ -579,7 +579,9 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
     };
     let pid = child.id();
     #[cfg(windows)]
-    let job = match crate::util::command_activity::attach_job(&child) {
+    let job = match child.raw_handle()
+        .ok_or_else(|| std::io::Error::other("missing child process handle"))
+        .and_then(crate::util::command_activity::attach_job) {
         Ok(job) => job,
         Err(error) => {
             let mut child = child;

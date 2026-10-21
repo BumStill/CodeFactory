@@ -113,15 +113,9 @@ fn mark_output(id: Option<&str>) {
 }
 
 /// Job Object 守卫：Windows 上关闭句柄即杀掉整棵进程树，即使父进程已退出。
+/// OwnedHandle 提供 Send/Sync 与单次 CloseHandle；Job Object 不绑定创建线程。
 #[cfg(windows)]
-pub(crate) struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl Drop for JobGuard {
-    fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
-    }
-}
+pub(crate) struct JobGuard(std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
 pub(crate) fn attach_job(
@@ -155,7 +149,10 @@ pub(crate) fn attach_job(
         unsafe { CloseHandle(job) };
         return Err(error);
     }
-    Ok(JobGuard(job))
+    // SAFETY: CreateJobObjectW returned a valid owned handle. No other owner
+    // closes it on this success path; OwnedHandle closes it exactly once.
+    use std::os::windows::io::FromRawHandle;
+    Ok(JobGuard(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job as _) }))
 }
 
 async fn capture_stream<R: tokio::io::AsyncRead + Unpin>(
@@ -330,10 +327,11 @@ async fn collect_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::no_window::NoWindow;
 
     fn shell(command: &str) -> tokio::process::Command {
         let invocation = crate::util::command_env::shell_invocation(command);
-        let mut child = tokio::process::Command::new(invocation.program);
+        let mut child = tokio::process::Command::new(invocation.program).no_window();
         child.args(invocation.args);
         child
     }
