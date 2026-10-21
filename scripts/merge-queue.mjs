@@ -330,6 +330,27 @@ export function versionBumpHandoff(title) {
   return /\bbump version to\b/i.test(t) || /^chore:\s*bump version\b/i.test(t);
 }
 
+/**
+ * M147: a PR title that merely repeats a subject already merged into the base
+ * branch must not become the squash subject. That silently relabels the whole
+ * release batch (a fix landing as `chore: bump version …` means the cadence
+ * gate sees no feat/fix and never cuts a version). The PR's own newest commit
+ * subject is the honest fallback; with nothing better the candidate is kept so
+ * the queue never invents a subject of its own.
+ */
+export function resolveSquashSubject(title, messages, baseSubjects = []) {
+  const normalise = (text) => (text ?? '').trim().toLowerCase().replace(/\s+/g, ' ')
+    .replace(/\s*\(#\d+\)$/, '');
+  const candidate = (title ?? '').trim();
+  const base = new Set((baseSubjects ?? []).map(normalise).filter(Boolean));
+  const own = (messages ?? []).map((message) => (message ?? '').split(/\r?\n/)[0].trim())
+    .filter(Boolean);
+  if (!candidate) return own.at(-1) ?? 'fix: synthetic change';
+  if (!base.has(normalise(candidate))) return candidate;
+  const fresh = [...own].reverse().find((subject) => !base.has(normalise(subject)));
+  return fresh ?? candidate;
+}
+
 /** M122: PR intent wins conflicts, except a hold from any source is sticky. */
 export function squashMessage(title, prBody, messages) {
   const readTrailers = (text) => text.split(/\r?\n/).map((line) => line.trim())
@@ -725,9 +746,26 @@ export function createGhAdapter({ repo, run = defaultRun } = {}) {
         : JSON.parse(run([
           'gh', 'pr', 'view', String(number), '--repo', repo, '--json', 'title,body',
         ]));
-      const subject = title ?? metadata.title ?? 'fix: synthetic change';
-      const { body, trailers } = squashMessage(subject, prBody ?? metadata.body ?? '',
-        commits.map((commit) => commit.commit.message));
+      // M147: never relabel the batch with a subject that is already on main.
+      const baseSubjects = (() => {
+        try {
+          return run(['git', 'log', '-5', '--format=%s', 'origin/main']).split(/\r?\n/).filter(Boolean);
+        } catch {
+          return [];
+        }
+      })();
+      const messages = commits.map((commit) => commit.commit.message);
+      const requested = title ?? metadata.title ?? 'fix: synthetic change';
+      const subject = resolveSquashSubject(requested, messages, baseSubjects);
+      if (subject !== requested) {
+        try {
+          run(['gh', 'pr', 'comment', String(number), '--repo', repo, '--body',
+            `Merge queue replaced a stale squash subject: the PR title ${JSON.stringify(requested)} ` +
+            `already exists on main, so the batch entry uses the PR's own commit subject ` +
+            `${JSON.stringify(subject)}. A stale title would hide this change's release cadence type.`]);
+        } catch { /* an audit comment must not block the merge */ }
+      }
+      const { body, trailers } = squashMessage(subject, prBody ?? metadata.body ?? '', messages);
       run([
         'gh', 'pr', 'merge', String(number), '--repo', repo, '--squash',
         '--match-head-commit', expectedHead,
