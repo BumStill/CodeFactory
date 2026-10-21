@@ -46,6 +46,25 @@
 - 占满负载的全量 `--lib`（1762 passed / 10 ignored）连续两轮通过，用时 94.94s、99.15s——
   与出现 318µs 抖动时相同的负载条件。
 
+## 2026-10-22 追加：跨线程 `Instant` 比较仍有残余竞态
+
+Req 2 的初版实现比较的是**两个线程各自取的 `Instant`**：持锁方在 `commit()` 返回后取
+`released`，第二个写者在 `begin_write()` 返回后取 `acquired`。这不是锁序，而是
+「两个线程谁先执行下一条指令」——`commit()` 一释放锁，OS 可能先唤醒等待方并让它取到
+`acquired`，而持锁方线程还没被调度到取 `released`，于是 `acquired < released`。
+Windows CI 上正是这样红的（PR #828 两次 `check-rust`）。
+
+**修复**：锁序改在**数据库时间线**上观测。持锁方在自己的事务里已 `UPDATE u23_counter`；
+第二个写者拿到写锁后，在自己的事务里读 `SELECT n FROM u23_counter WHERE id = 1`，
+必须读到 `1`。只有 `BEGIN IMMEDIATE` 把持锁方挡在外面直到 `commit`，这个值才可能是 1。
+断言不再含任何时钟。
+
+| Req | 补充实现 | 补充验证 |
+|---|---|---|
+| Req 2（改） | 第二个写者读 `n` 并断言 `== 1` | 正向：用例通过；负向：把 `begin_write` 临时换成延迟 `BEGIN` → `left: 0, right: 1`，失败信息为 `the second writer acquired the write lock before the holder committed` |
+
+负向对照实测：`test ... FAILED`、`exit 101`；随后恢复 `write_lock.rs` 并 `grep -c "BEGIN IMMEDIATE"` 确认 4 处还原。
+
 ## 不做什么
 
 - 不放宽 `waited` 的下限，也不把该用例加入 `docs/testing/flaky-quarantine.json`：
