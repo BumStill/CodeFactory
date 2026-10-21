@@ -824,6 +824,7 @@ mod pr_body_guard {
 #[cfg(test)]
 mod guard_tests {
     use super::pr_body_guard::*;
+    use crate::util::no_window::NoWindow;
     use crate::agent::delivery::ReleaseUrgency;
 
     fn immediate() -> ReleaseUrgency {
@@ -945,6 +946,7 @@ mod guard_tests {
         let guarded = guard_command("gh pr edit 818 --body 'plain body'", dir.path(), immediate())
             .expect("the command must be rewritten");
         let status = std::process::Command::new("/bin/sh")
+            .no_window()
             .arg("-c")
             .arg(&guarded.command)
             .env(
