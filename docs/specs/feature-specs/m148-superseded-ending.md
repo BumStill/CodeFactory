@@ -39,6 +39,8 @@
 | R3 | 终止事实只限：最终回答且无外部进行中事项、用户/编排方 stop、连续 3 次真实失败；有未完成交付 PR 时任何路径不得判 ended | `unfinished_delivery` 守卫 + 用例 `unfinished_delivery_keeps_a_delivered_session_waiting` |
 | R4 | 已被误判 ended 但仍有未完成交付 PR 的会话，系统 PR 监视仍应唤醒它 | 守卫使 `derive_state` 回到 `waiting_wake`（`wake_source`＝系统 PR 监视），M142 心跳恢复观测 |
 | R5 | 先失败的测试覆盖四个场景 | `cargo test --lib -- agent::thin_derive agent::objective`（192 项）与全量 lib 套件 1905 项 |
+| R6 | 系统接续不得消费系统恢复预算：`SystemWake` 不得把排队中的 remediation 标成 `superseded` | 用例 `m148_system_wake_continues_a_waiting_session_instead_of_superseding_it` 断言 remediation 仍为 `queued`；该断言在修复前失败（`left: "superseded"`） |
+| R7 | 「真人重新发起仍要取代」不能因 R2 退化 | 用例 `m148_user_reprompt_still_settles_the_leftover_turn` 断言 `status='completed'`、`terminal_reason='superseded_by_user_reprompt'`、remediation `superseded`、无 `system_wake_continued` |
 
 ## 决策
 
@@ -50,7 +52,11 @@
 2. **未完成的已交付 PR 是外部进行中事项**：`derive_state` 在终态推导前检查
    `unfinished_delivery`——存在 `thin_delivery_refs` 引用、且观测结果不是
    「已合并且 `closeout_queued=1`」时，返回 `waiting_wake` 而不是 `ended`。
-3. **边界不放松**：
+3. **「接管」是两个动作，都要按来源门禁**：把上一回合结算为取代、以及把排队中的
+   remediation 标成 `superseded`，都属于「人把目标接管」。系统接续两者都不做，
+   否则它一边被唤醒处理技术失败，一边又把唯一负责重试的 remediation 取消掉——
+   系统技术态退化成需要人工推动。
+4. **边界不放松**：
    - 真实的用户提问（`pending_question_at`）仍优先于监视；
    - 用户停止（`chat_session_cancel_intents`）与待审批仍在最前面处理；
    - PR 真正收口后，同一个终态事实照旧结束会话——守卫不是「永不结束」；
@@ -75,6 +81,8 @@
 | 2 | 同一终态事实 + `closeout_queued=1` | `ended`（守卫有边界） | R3 |
 | 3 | 用户停止 / 待审批 | 仍优先结束或等待用户 | R3 |
 | 4 | 既有 M139/M140/M142/M146 场景 | 全绿，无回归 | R5 |
+| 5 | 系统接续（`SystemWake`）一条等 PR 的会话 | 旧回合仍 `interrupted`、无 `terminal_reason`、remediation 仍 `queued`、写 `system_wake_continued` | R2/R6 |
+| 6 | 用户重新发起同一条会话 | 旧回合 `completed` + `superseded_by_user_reprompt`、remediation `superseded`、无 `system_wake_continued` | R7 |
 
 ## 影响面
 

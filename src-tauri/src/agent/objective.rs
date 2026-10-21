@@ -2937,18 +2937,26 @@ impl ObjectiveStore {
             if updated.rows_affected() != 1 {
                 bail!("objective changed while binding contextual continuation");
             }
-            sqlx::query(
-                "UPDATE objective_remediations SET status='superseded',
-                   lease_owner=NULL, lease_expires_at=NULL,
-                   last_progress_at=?, updated_at=?
-                 WHERE objective_id=?
-                   AND status NOT IN ('completed','cancelled','superseded')",
-            )
-            .bind(now)
-            .bind(now)
-            .bind(&objective_id)
-            .execute(&mut **tx)
-            .await?;
+            // M148/R3: cancelling the queued remediation is part of *taking the
+            // objective over*, and only a human may do that. A system wake that
+            // runs this unconditionally silently consumes the system recovery
+            // budget it was woken for: the remediation is marked superseded,
+            // nothing owns the retry any more, and the session waits forever on
+            // a technical failure that now needs a manual nudge.
+            if origin.is_user() {
+                sqlx::query(
+                    "UPDATE objective_remediations SET status='superseded',
+                       lease_owner=NULL, lease_expires_at=NULL,
+                       last_progress_at=?, updated_at=?
+                     WHERE objective_id=?
+                       AND status NOT IN ('completed','cancelled','superseded')",
+                )
+                .bind(now)
+                .bind(now)
+                .bind(&objective_id)
+                .execute(&mut **tx)
+                .await?;
+            }
             // U18/R1+R2: the user's message takes the Objective over. Settle
             // every turn this Objective leaves behind in the SAME transaction
             // that moves `resume_cursor` onto the new turn — otherwise the
@@ -12068,6 +12076,228 @@ CREATE TABLE objectives (
             .await
             .unwrap(),
             baseline_event_count
+        );
+    }
+
+    /// M148 夹具：一个处于 `WaitingSystem` 的目标，加上一条被它留在后面的回合。
+    /// 这条回合的 `terminal_reason` 就是会话被判「已结束」的唯一写入点。
+    async fn m148_waiting_session_with_leftover_turn(
+        session: &str,
+    ) -> (sqlx::SqlitePool, ObjectiveStore, String, String) {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               status TEXT NOT NULL,
+               terminal_reason TEXT,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let leftover = format!("turn-{session}-leftover");
+        let wake = format!("turn-{session}-wake");
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, status) VALUES (?, ?, 'interrupted'), (?, ?, 'active')",
+        )
+        .bind(&leftover)
+        .bind(session)
+        .bind(&wake)
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let original = store
+            .ensure_chat_objective(
+                session,
+                &leftover,
+                ObjectiveKind::Delivery,
+                "delivery_receipt",
+            )
+            .await
+            .unwrap();
+        let waiting = DecisionRouter::route(
+            &original,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "provider_timeout".into(),
+                failure_signature: format!("sha256:m148-{session}"),
+                next_observation_at: Utc::now().timestamp_millis() + 60_000,
+                resume_cursor: Some(leftover.clone()),
+            },
+        )
+        .unwrap();
+        let waiting = store
+            .apply_decision(original.revision, waiting)
+            .await
+            .unwrap();
+        let remediation_id = waiting.remediation_id.clone().unwrap();
+        (pool, store, waiting.id, remediation_id)
+    }
+
+    /// M148：后台任务结束通知、定时唤醒、PR 监视心跳都走这条准入路径。它们只是
+    /// 接续当前任务，绝不能把留在后面的回合结算成 `superseded_by_user_reprompt`
+    /// ——那正是会话在等 PR/CI 时被判 `ended`、之后 M142 监视器不再唤醒它的原因。
+    #[tokio::test]
+    async fn m148_system_wake_continues_a_waiting_session_instead_of_superseding_it() {
+        let session = "session-m148-system-wake";
+        let (pool, store, objective_id, remediation_id) =
+            m148_waiting_session_with_leftover_turn(session).await;
+        let leftover = format!("turn-{session}-leftover");
+
+        let mut tx = pool.begin().await.unwrap();
+        let admitted = store
+            .ensure_or_continue_chat_objective_in_tx_with_origin(
+                &mut tx,
+                session,
+                &format!("turn-{session}-wake"),
+                Some(&leftover),
+                ObjectiveKind::Delivery,
+                "delivery_receipt",
+                TurnOrigin::SystemWake,
+            )
+            .await
+            .expect("a system wake must continue the waiting objective");
+        tx.commit().await.unwrap();
+
+        assert_eq!(admitted.id, objective_id, "the wake continues the same objective");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM chat_turn_state WHERE root_turn_id=?",
+            )
+            .bind(&leftover)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "interrupted",
+            "a system wake must not close the turn it continues from"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id=?",
+            )
+            .bind(&leftover)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None,
+            "a system wake must not write a terminal reason on the prior turn"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM chat_turn_state WHERE terminal_reason='superseded_by_user_reprompt'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "no turn may be settled as superseded by a system wake"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM objective_remediations WHERE id=?",
+            )
+            .bind(&remediation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "queued",
+            "a system wake must not cancel the system recovery budget"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objective_events
+                 WHERE objective_id=? AND event_type='system_wake_continued'",
+            )
+            .bind(&objective_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "the continuation must be auditable"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objective_events
+                 WHERE objective_id=? AND event_type='user_steer_superseded_remediation'",
+            )
+            .bind(&objective_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "a system wake is not a user reprompt"
+        );
+    }
+
+    /// M148 反向守卫：真人重新发起仍然要结算留在后面的回合，否则 U18/R1+R2
+    /// 的「一条目标只有一个活回合」会退化成永远运行中。
+    #[tokio::test]
+    async fn m148_user_reprompt_still_settles_the_leftover_turn() {
+        let session = "session-m148-user-reprompt";
+        let (pool, store, objective_id, remediation_id) =
+            m148_waiting_session_with_leftover_turn(session).await;
+        let leftover = format!("turn-{session}-leftover");
+
+        let mut tx = pool.begin().await.unwrap();
+        store
+            .ensure_or_continue_chat_objective_in_tx_with_origin(
+                &mut tx,
+                session,
+                &format!("turn-{session}-wake"),
+                Some(&leftover),
+                ObjectiveKind::Delivery,
+                "delivery_receipt",
+                TurnOrigin::User,
+            )
+            .await
+            .expect("a user reprompt takes the objective over");
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM chat_turn_state WHERE root_turn_id=?",
+            )
+            .bind(&leftover)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "completed",
+            "a user reprompt must close the turn it leaves behind"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id=?",
+            )
+            .bind(&leftover)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            Some("superseded_by_user_reprompt".to_string())
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM objective_remediations WHERE id=?",
+            )
+            .bind(&remediation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objective_events
+                 WHERE objective_id=? AND event_type='system_wake_continued'",
+            )
+            .bind(&objective_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
         );
     }
 
