@@ -1434,7 +1434,7 @@ mod tests {
         assert_eq!(task.exit_code, Some(0));
         assert_eq!(output_tail(Path::new(&task.output_path), 1000).trim(), "中文");
         let inv = crate::util::command_env::windows_shell_invocation("echo first && echo second", false, true);
-        let output = std::process::Command::new(inv.program).args(inv.args).output().unwrap();
+        let output = std::process::Command::new(inv.program).args(inv.args).no_window().output().unwrap();
         assert!(!output.status.success());
         let text = crate::util::command_env::decode_output(&output.stderr);
         assert!(!text.contains('\u{fffd}'), "{text}");

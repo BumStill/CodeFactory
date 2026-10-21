@@ -358,7 +358,7 @@ async fn capture_stream<R: tokio::io::AsyncRead + Unpin>(mut reader: R, id: Opti
         bytes.extend_from_slice(&chunk[..count]);
         mark_output(id.as_deref());
         let start = bytes.len().saturating_sub(4096);
-        if super::command_env::waiting_for_input(&super::command_env::decode_output(&bytes[start..])) {
+        if crate::util::command_env::waiting_for_input(&crate::util::command_env::decode_output(&bytes[start..])) {
             prompt.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -369,7 +369,7 @@ pub async fn output_with_activity(
     timeout_duration: Duration,
     activity: Option<&ActivityGuard>,
 ) -> Result<Output, ProcessOutputError> {
-    super::command_env::apply_noninteractive(&mut command);
+    crate::util::command_env::apply_noninteractive(&mut command);
     command.kill_on_drop(true).stdout(Stdio::piped()).stderr(Stdio::piped());
     isolate(&mut command);
     let mut child = match command.spawn() {
@@ -430,13 +430,13 @@ mod tests {
         let shell = crate::util::command_env::shell_invocation(if cfg!(windows) {
             "Write-Output 'Continue? (y/N)'; Start-Sleep -Seconds 30"
         } else { "printf 'Continue? (y/N)'; sleep 30" });
-        let mut command = Command::new(shell.program);
+        let mut command = Command::new(shell.program).no_window();
         command.args(shell.args);
         let started = Instant::now();
         assert_eq!(output_with_timeout(command, Duration::from_secs(20)).await.unwrap_err(), ProcessOutputError::InputRequired);
         assert!(started.elapsed() < Duration::from_secs(5));
         let shell = crate::util::command_env::shell_invocation("echo continued");
-        let mut command = Command::new(shell.program);
+        let mut command = Command::new(shell.program).no_window();
         command.args(shell.args);
         let output = output_with_timeout(command, Duration::from_secs(10)).await.unwrap();
         assert!(output.status.success());

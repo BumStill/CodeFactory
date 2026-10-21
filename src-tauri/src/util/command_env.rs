@@ -265,7 +265,7 @@ mod m143_tests {
 
     #[test]
     fn m143_noninteractive_environment_and_prompt_detection() {
-        let mut cmd = Command::new("unused");
+        let mut cmd = Command::new("unused").no_window();
         apply_noninteractive(&mut cmd);
         let env: std::collections::HashMap<_, _> = cmd.as_std().get_envs().map(|(k,v)| (k.to_string_lossy().to_string(), v.unwrap().to_string_lossy().to_string())).collect();
         assert_eq!(env["CI"], "1");
