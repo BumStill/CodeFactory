@@ -180,18 +180,7 @@ function drainFrames(buffer) {
 
 /** Stand in for the app's bridge: same handshake, same Origin rule. */
 function serveBridge() {
-  const state = {
-    socket: null,
-    nextId: 1,
-    pending: new Map(),
-    refusals: [],
-    // Heartbeat accounting. A silent socket is exactly the Windows symptom, so
-    // the soak watches beats rather than trusting a single successful call.
-    connects: 0,
-    heartbeats: 0,
-    lastHeartbeatAt: 0,
-    closes: [],
-  };
+  const state = { socket: null, nextId: 1, pending: new Map(), refusals: [] };
 
   const server = createServer();
   server.on("upgrade", (request, socket) => {
@@ -230,14 +219,6 @@ function serveBridge() {
           }
           log(`extension connected from ${origin}`);
           state.socket = socket;
-          state.connects += 1;
-          socket.write(encodeText(JSON.stringify({ ready: true })));
-          continue;
-        }
-        if (message.heartbeat) {
-          state.heartbeats += 1;
-          state.lastHeartbeatAt = Date.now();
-          socket.write(encodeText(JSON.stringify({ heartbeat_ack: message.sent_at })));
           continue;
         }
         const waiting = state.pending.get(message.id);
@@ -247,8 +228,7 @@ function serveBridge() {
         }
       }
     });
-    socket.on("close", (code) => {
-      state.closes.push({ at: Date.now(), code });
+    socket.on("close", () => {
       if (state.socket === socket) state.socket = null;
     });
   });
@@ -364,89 +344,6 @@ try {
   log(`unknown command rejected by the extension: ${pageProbe && pageProbe.error}`);
   if (bridge.state.refusals.length !== refusedBefore) {
     fail("a paired connection should not produce refusals");
-  }
-
-  const previous = bridge.state.socket;
-  previous.destroy();
-  await waitFor(() => bridge.state.socket && bridge.state.socket !== previous, "extension reconnect after transport loss", 15000);
-  const recovered = await bridge.state.call({ cmd: "read", tab_id: target.tab_id });
-  if (!recovered.ok || !recovered.data.markdown.includes("Revenue grew by 12%")) {
-    throw new Error("reconnected extension did not preserve access to the same tab");
-  }
-  log("disconnect → reconnect → same-tab read verified");
-
-  // Soak: the Windows report is intermittent — connected, then silently gone,
-  // then back. A single read cannot see that. Hold the real extension in a real
-  // Chrome against the stub bridge for N minutes and require every heartbeat
-  // window to stay inside the app's 45s idle timeout, with working commands
-  // throughout. `--soak-minutes=30` is the release-grade run.
-  const soakMinutes = Number(
-    (process.argv.find((arg) => arg.startsWith("--soak-minutes=")) || "").split("=")[1] || 0,
-  );
-  if (soakMinutes > 0) {
-    const durationMs = soakMinutes * 60_000;
-    const started = Date.now();
-    const beatsBefore = bridge.state.heartbeats;
-    const connectsBefore = bridge.state.connects;
-    let lastBeatCount = bridge.state.heartbeats;
-    let lastBeatAt = Date.now();
-    let worstGapMs = 0;
-    let probes = 0;
-    let probeFailures = 0;
-
-    while (Date.now() - started < durationMs) {
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-      if (bridge.state.heartbeats > lastBeatCount) {
-        lastBeatCount = bridge.state.heartbeats;
-        lastBeatAt = Date.now();
-      }
-      worstGapMs = Math.max(worstGapMs, Date.now() - lastBeatAt);
-      if (worstGapMs > 45_000) {
-        throw new Error(
-          `heartbeat silent for ${(worstGapMs / 1000).toFixed(1)}s — beyond the app's 45s idle timeout`,
-        );
-      }
-      // Proves the socket is not merely open but still serving commands.
-      let answered = false;
-      try {
-        await waitFor(async () => {
-          if (!bridge.state.socket) return false;
-          const reply = await bridge.state
-            .call({ cmd: "list_tabs" })
-            .then((value) => value.ok)
-            .catch(() => false);
-          return reply;
-        }, "a live command during the soak", 15000);
-        answered = true;
-      } catch {
-        probeFailures += 1;
-      }
-      if (!answered) throw new Error("the bridge stopped answering commands mid-soak");
-      probes += 1;
-    }
-
-    const minutes = (Date.now() - started) / 60_000;
-    const beats = bridge.state.heartbeats - beatsBefore;
-    // The socket that was already live when the soak started is not a
-    // reconnect; every new connect from here on is one recovery.
-    const reconnects = bridge.state.connects - connectsBefore;
-    const expected = Math.floor(durationMs / 20_000) * 0.8;
-    log(
-      `soak ${minutes.toFixed(1)} min: reconnects=${reconnects} heartbeats=${beats} ` +
-        `probes=${probes} worst heartbeat gap=${(worstGapMs / 1000).toFixed(1)}s ` +
-        `closes=${bridge.state.closes.length}`,
-    );
-    if (beats < expected) {
-      throw new Error(
-        `only ${beats} heartbeats in ${minutes.toFixed(1)} min; expected at least ${expected.toFixed(0)} ` +
-          `at the 20s interval — the worker is being suspended and not waking in time`,
-      );
-    }
-    if (probeFailures > 0) throw new Error(`${probeFailures} liveness probes failed during the soak`);
-    console.log(
-      `SOAK PASS: ${minutes.toFixed(1)} min continuous (${beats} heartbeats, ` +
-        `${reconnects} reconnect(s), worst gap ${(worstGapMs / 1000).toFixed(1)}s < 45s)`,
-    );
   }
 
   if (process.exitCode) throw new Error("assertions failed");

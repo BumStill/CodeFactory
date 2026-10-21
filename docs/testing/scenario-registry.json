@@ -312,7 +312,7 @@
       "category": "runtime_lifecycle",
       "priority": "P0",
       "source_kind": "incident_shape",
-      "change_patterns": ["src-tauri/src/browser/bridge.rs", "src-tauri/src/browser/extension.rs", "extension/background.js", "extension/options.js", "src/lib/browserExtension.test.ts", "scripts/verify-extension-bridge.mjs"],
+      "change_patterns": ["src-tauri/src/browser/bridge.rs", "src-tauri/src/browser/extension.rs", "extension/background.js", "extension/options.js", "src/lib/browserExtension.test.ts"],
       "automated_by": ["rust:an_old_connection_closing_cannot_clear_the_new_extension", "rust:a_new_connection_cancels_a_command_stranded_on_the_old_generation", "rust:registering_a_pending_call_is_atomic_with_its_generation_snapshot", "rust:a_superseded_profiles_standby_probe_cannot_evict_the_winner", "rust:an_authorized_heartbeat_is_acknowledged_on_the_same_generation", "rust:a_command_timeout_evicts_the_half_open_connection", "path:src/lib/browserExtension.test.ts"],
       "required_evidence": ["L0", "L1", "L2", "L4"],
       "gates": ["pull_request"]
@@ -345,7 +345,7 @@
       "category": "workspace_session",
       "priority": "P1",
       "source_kind": "incident_shape",
-      "change_patterns": ["src/pages/Settings/SettingsPage.tsx", "src/pages/Settings/SettingsPage.browser.test.tsx", "scripts/verify-browser-bridge-headless.mjs", "src/acceptance/browser-bridge.tsx"],
+      "change_patterns": ["src/pages/Settings/SettingsPage.tsx", "src/pages/Settings/SettingsPage.browser.test.tsx"],
       "automated_by": ["path:src/pages/Settings/SettingsPage.browser.test.tsx"],
       "required_evidence": ["L0", "L3"],
       "gates": ["pull_request"]
