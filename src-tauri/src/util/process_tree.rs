@@ -405,13 +405,8 @@ mod tests {
             .write_all(b"start\n")
             .expect("release fixture start gate");
 
-        // Fixture readiness, not the behaviour under test: a cold PowerShell on a
-        // loaded Windows runner can take many seconds to read the gate, start the
-        // detached descendant and write its pid, so 5s turned a slow spawn into a
-        // spurious "fixture parent did not exit". The sweep deadline below is the
-        // product assertion and stays unchanged.
-        wait_for_parent(&mut child, Duration::from_secs(60));
-        let descendant_pid = wait_for_pid(&pid_path, Duration::from_secs(60));
+        wait_for_parent(&mut child, Duration::from_secs(5));
+        let descendant_pid = wait_for_pid(&pid_path, Duration::from_secs(5));
         assert_ne!(descendant_pid, child.id());
         assert!(
             tree.active_process_count(&mut child).expect("count tree") > 0,
