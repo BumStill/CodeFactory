@@ -37,6 +37,14 @@ const activity: SessionBackgroundActivity = {
       timeout_sec: 600,
     },
   ],
+  commands: [
+    {
+      id: "cmd-1",
+      session_id: "session-273a55b2",
+      command: "npm install",
+      last_output_at: Math.floor(Date.now() / 1000) - 360,
+    },
+  ],
   wakeups: [
     {
       id: "wk-1",

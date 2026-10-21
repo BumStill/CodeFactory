@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+pub mod command_activity;
 pub mod command_env;
 pub mod fs_cleanup;
 pub mod github_cli;

@@ -5695,10 +5695,23 @@ mod tests {
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('m144','synthetic','/tmp','model',1,1)")
             .execute(&initialized).await.unwrap();
         initialized.close().await;
+        // Contention belongs to the statements this test drives, not to the
+        // connections' own handshake. Three connections opening at once with a
+        // zero busy timeout lose the race to switch the file into WAL and fail
+        // with code 5 on Windows before the admission retry under test ever
+        // runs. Connection setup therefore keeps a real timeout, and every
+        // established connection drops it back to zero so a contended
+        // `BEGIN IMMEDIATE` still fails fast exactly as production would.
         let pool = SqlitePoolOptions::new().min_connections(3).max_connections(3)
+            .after_connect(|connection: &mut sqlx::SqliteConnection, _meta: sqlx::pool::PoolConnectionMetadata| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA busy_timeout = 0").execute(&mut *connection).await?;
+                    Ok(())
+                })
+            })
             .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                .busy_timeout(std::time::Duration::ZERO)).await.unwrap();
+                .busy_timeout(std::time::Duration::from_secs(5))).await.unwrap();
         let mut held = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         sqlx::query("UPDATE sessions SET updated_at=2 WHERE id='m144'").execute(&mut *held).await.unwrap();
         let contender = pool.clone();

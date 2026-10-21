@@ -183,7 +183,7 @@ test("the exact Windows release executable repeats the same contract", async () 
 });
 
 test("history-derived scenarios use the unified synthetic registry", async () => {
-  const [catalog, redirect, agent, delivery, deliveryRun, deliveryTool, objective, toolBackend, chat, thinDerive, thinRestart, trajectory, skills, loop, ci, nightly, release] = await Promise.all([
+  const [catalog, redirect, agent, delivery, deliveryRun, deliveryTool, objective, toolBackend, chat, thinDerive, thinRestart, trajectory, skills, loop, ci, nightly, release, commandEnv, processTree, backgroundTasks, bashTool] = await Promise.all([
     source("docs/testing/scenario-registry.json"),
     source("docs/testing/history-derived-long-task-scenarios.json"),
     source("src-tauri/src/agent/mod.rs"),
@@ -201,6 +201,10 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
     source(".github/workflows/ci.yml"),
     source(".github/workflows/unattended-long-task-nightly.yml"),
     source(".github/workflows/release.yml"),
+    source("src-tauri/src/util/command_env.rs"),
+    source("src-tauri/src/util/process_tree.rs"),
+    source("src-tauri/src/agent/background_tasks.rs"),
+    source("src-tauri/src/tools/bash.rs"),
   ]);
   const parsed = JSON.parse(catalog);
   const legacy = JSON.parse(redirect);
@@ -233,7 +237,7 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
     "every scenario must name an executable automation target",
   );
   const thinDelivery = await source("src-tauri/src/tools/delivery_thin.rs");
-  const implementation = `${thinDelivery}\n${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${thinDerive}\n${thinRestart}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}`;
+  const implementation = `${thinDelivery}\n${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${thinDerive}\n${thinRestart}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}\n${commandEnv}\n${processTree}\n${backgroundTasks}\n${bashTool}`;
   for (const scenario of parsed.scenarios.filter((item) => legacy.scenario_ids.includes(item.id))) {
     for (const automation of scenario.automated_by) {
       const target = automation.slice(automation.indexOf(":") + 1);

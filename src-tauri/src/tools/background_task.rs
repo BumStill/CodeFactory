@@ -28,9 +28,10 @@ fn definition(name: &str, description: &str, parameters: Value) -> ToolDefinitio
 pub fn start_definition() -> ToolDefinition {
     definition(
         "background_task_start",
-        "Start a shell command in this session's working directory as a background task and return a task_id immediately. \
+        format!("Start a shell command in this session's working directory as a background task and return a task_id immediately. \
          When the command ends (success, failure or timeout) the system wakes this session with the exit code and the output tail. \
-         Use it for anything you would otherwise wait on: CI, long builds, deploys, long test runs, periodic status checks.",
+         Use it for anything you would otherwise wait on: CI, long builds, deploys, long test runs, periodic status checks. {}",
+            crate::util::command_env::shell_description()).as_str(),
         json!({
             "type": "object",
             "properties": {

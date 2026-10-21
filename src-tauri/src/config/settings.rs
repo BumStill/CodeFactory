@@ -629,7 +629,7 @@ pub struct ShellConfig {
 fn default_shell_name() -> &'static str {
     #[cfg(windows)]
     {
-        "powershell"
+        crate::util::command_env::shell_invocation("").program.trim_end_matches(".exe")
     }
     #[cfg(target_os = "macos")]
     {

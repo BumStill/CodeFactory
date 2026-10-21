@@ -36,6 +36,7 @@ const activity: SessionBackgroundActivity = {
       timeout_sec: 600,
     },
   ],
+  commands: [],
   wakeups: [
     {
       id: "wk-1",
@@ -86,6 +87,18 @@ describe("SessionBackgroundTasks", () => {
       sessionId: "s1",
       wakeupId: "wk-1",
     });
+  });
+
+  it("shows silent foreground commands and stops the exact command without cancelling the turn", async () => {
+    const commands = [{ id: "cmd-1", session_id: "s1", command: "npm install", last_output_at: Math.floor(Date.now() / 1000) - 360 }];
+    invokeMock.mockResolvedValue({ tasks: [], wakeups: [], commands });
+    render(<SessionBackgroundTasks sessionId="s1" />);
+    const marker = await screen.findByRole("button", { name: /后台活动/ });
+    expect(marker).toHaveTextContent("无输出");
+    await userEvent.click(marker);
+    expect(screen.getByText(/卡在 npm install 已 6 分钟，无输出/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "停止命令 npm install" }));
+    expect(invokeMock).toHaveBeenCalledWith("stop_session_background_task", { sessionId: "s1", taskId: "cmd-1" });
   });
 
   it("stays out of the way when this session has no live background work", async () => {

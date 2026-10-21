@@ -12,7 +12,7 @@ use std::time::Duration;
 use tauri::{AppHandle, State};
 
 use crate::util::no_window::NoWindow;
-use crate::util::process_tree::{self, ProcessOutputError};
+use crate::util::command_activity::{self, CommandActivityFailure};
 use crate::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -212,12 +212,14 @@ async fn process_output_with_timeout(
     command: tokio::process::Command,
     timeout_duration: Duration,
 ) -> Result<std::process::Output, GitCommandFailureKind> {
-    process_tree::output_with_timeout(command, timeout_duration)
+    command_activity::output_with_activity(command, timeout_duration, None)
         .await
         .map_err(|error| match error {
-            ProcessOutputError::Timeout => GitCommandFailureKind::Timeout,
-            ProcessOutputError::Unavailable => GitCommandFailureKind::Unavailable,
-            ProcessOutputError::Failed => GitCommandFailureKind::Failed,
+            CommandActivityFailure::Timeout => GitCommandFailureKind::Timeout,
+            CommandActivityFailure::Unavailable => GitCommandFailureKind::Unavailable,
+            CommandActivityFailure::InputRequired
+            | CommandActivityFailure::Stopped
+            | CommandActivityFailure::Failed => GitCommandFailureKind::Failed,
         })
 }
 
