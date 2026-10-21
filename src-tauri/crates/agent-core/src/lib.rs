@@ -2712,7 +2712,21 @@ fn is_functional_probe(command: &str) -> bool {
         command.contains("localhost") || command.contains("127.0.0.1") || command.contains("[::1]");
     let known_client = contains_any(
         command,
-        &["curl ", "wget ", "grpcurl ", "nc ", "netcat ", "redis-cli "],
+        &[
+            "curl ",
+            "wget ",
+            "grpcurl ",
+            "nc ",
+            "netcat ",
+            "redis-cli ",
+            // Windows reaches the same loopback endpoint through PowerShell, and
+            // the cmdlet must count as the same client: `Invoke-WebRequest` with
+            // `-OutFile` is `curl -o`. Treating it as a plain shell word left it
+            // ReadOnly, which demanded a side-effect receipt for a read-shaped
+            // fetch and then fenced that receipt against its own re-admission.
+            "invoke-webrequest ",
+            "iwr ",
+        ],
     );
     let inline_protocol_client = contains_any(command, &["python -c ", "python3 -c "])
         && contains_any(

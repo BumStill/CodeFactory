@@ -1867,6 +1867,28 @@ mod tests {
     }
 
     #[test]
+    fn a_powershell_download_is_the_same_client_as_curl() {
+        let kind_of = |command: &str| {
+            completion_command_and_kind("bash", &serde_json::json!({ "command": command })).1
+        };
+        let curl = kind_of("curl -fsSL http://127.0.0.1:9/payload.txt -o fetched.txt");
+        assert!(
+            matches!(curl, ToolKind::FunctionalProbe { .. }),
+            "a loopback download is a functional probe, got {curl:?}"
+        );
+        for command in [
+            "Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:9/payload.txt -OutFile fetched.txt",
+            "iwr -Uri http://127.0.0.1:9/payload.txt -OutFile fetched.txt",
+        ] {
+            assert_eq!(
+                kind_of(command),
+                curl,
+                "a PowerShell fetch writing a local file must classify exactly like curl: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn only_deterministic_local_checks_receive_reuse_keys() {
         let cwd = Path::new("/workspace");
         let cargo = reusable_local_verification_key(
