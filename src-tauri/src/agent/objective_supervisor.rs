@@ -1439,6 +1439,9 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             ).fetch_all(&pool).await;
             if let Ok(sessions) = thin_sessions {
                 for session in sessions {
+                    if let Err(error) = super::thin_derive::heartbeat_external(&pool, &session).await {
+                        tracing::warn!(%error, session, "thin external observation heartbeat failed");
+                    }
                     if let Err(error) = super::thin_derive::refresh(&pool, &session).await {
                         tracing::warn!(%error, session, "thin fact-derived heartbeat failed");
                     }
