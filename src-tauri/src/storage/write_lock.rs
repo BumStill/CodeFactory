@@ -125,9 +125,60 @@ pub async fn begin_write(pool: &SqlitePool) -> sqlx::Result<Transaction<'static,
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // Self-recovery: a leaked transaction on an idle pooled
+                // connection keeps code 5 forever. Release it and give the
+                // caller one final chance instead of requiring a restart.
+                let recovered = rollback_idle_transactions(pool).await;
+                if recovered > 0 {
+                    tracing::warn!(
+                        recovered,
+                        "released leaked SQLite write transactions; retrying the write once"
+                    );
+                    return pool.begin_with("BEGIN IMMEDIATE").await;
+                }
+                return Err(error);
+            }
         }
     }
+}
+
+/// Roll back any transaction still open on an *idle* pooled connection.
+///
+/// [`begin_write`] calls this only after bounded contention retries are
+/// exhausted. A connection that was returned with a bare, untracked
+/// `BEGIN IMMEDIATE` still owns the database write lock; releasing it here is
+/// what turns "restart the app" into "retry the same send". Connections that
+/// are currently in use are left alone, so an ordinary long write is never
+/// interrupted by another caller's recovery attempt.
+pub async fn rollback_idle_transactions(pool: &SqlitePool) -> usize {
+    extern "C" {
+        fn sqlite3_get_autocommit(db: *mut std::ffi::c_void) -> i32;
+    }
+    let mut recovered = 0;
+    for _ in 0..8 {
+        let Ok(Ok(mut connection)) =
+            tokio::time::timeout(Duration::from_millis(100), pool.acquire()).await
+        else {
+            break;
+        };
+        let open = {
+            let Ok(mut handle) = connection.lock_handle().await else {
+                continue;
+            };
+            let raw = handle.as_raw_handle().as_ptr().cast();
+            // SAFETY: the pool connection is exclusively ours and the driver
+            // thread is paused for the lifetime of the locked handle.
+            unsafe { sqlite3_get_autocommit(raw) == 0 }
+        };
+        if open {
+            tracing::warn!("rolling back a transaction leaked on an idle pooled connection");
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            recovered += 1;
+        }
+        drop(connection);
+    }
+    recovered
 }
 
 /// Re-run a whole write operation when it fails on lock contention.

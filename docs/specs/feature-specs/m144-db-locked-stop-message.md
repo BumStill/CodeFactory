@@ -19,3 +19,20 @@
 - Harness：Spec、Compatibility、Observation、Release（仅合并，不发版）、Payload、AI Collaboration；若前端展示路径发生变更追加 Viewport。
 - R1/R4：合成 SQLite 竞争与发送准入回归；R2/R4：无交付、有交付、重复停止及重新执行再停止；R3/R4：null、缺字段、错误类型、合法空文本。
 - 真机验收由发版安装后的编排方完成：Windows 中并发命令期间发送“继续”，停止无交付/有 PR 会话，检查提示计数及 write_file 错误仅进入工具结果。
+
+## P0 追加（用户 2026-10-21 补充）：一次 code 5 后永久不可继续
+
+Windows 现场：一旦出现 `database is locked`，之后每次发送/继续都失败，只能重启应用。根因不是瞬时争用，而是写锁被长期持有。
+
+### 需求
+- **R5 无泄漏事务**：禁止用 `execute("BEGIN IMMEDIATE")` 开启事务（sqlx 无法追踪，提前返回/取消会把未结束事务随连接还池）。全部改为 RAII `Transaction`（`begin_write` / `Connection::begin_with`）。
+- **R6 归还即清理**：连接池 `after_release` 检查 SQLite autocommit；发现未结束事务立即 `ROLLBACK` 并告警，单次故障不得演变为永久 outage。
+- **R7 有界等待**：`acquire_timeout` 限制取连接等待；`busy_timeout` + 有限重试仍保留。连接全部被占时必须报错而不是无限挂起。
+- **R8 事务不跨外部 I/O**：模型请求、子进程、网络期间不得持有写事务；`scripts/validate-write-transaction-scope.mjs` 作为可执行门禁。
+- **R9 回归**：模拟泄漏事务归还后，后续写入必须成功且脏写被回滚；零超时制造一次真实 code 5，随后同一池的写入必须成功；8 写者 × 5 轮并发在 Windows CI 上全部提交。
+
+### 实现
+- `pool_builder()` 统一生产/测试连接池：`after_release` 清理 + `acquire_timeout(30s)`；`pool_connect_options` 保持 WAL/FULL/FK/10s busy timeout。
+- `ensure_objective_failed_status` 的 schema 重建改用 `conn.begin_with`，失败或取消自动回滚。
+- `ObjectiveStore`、`delivery_run`、`persistence`、`thin_derive` 的 31 处写事务统一改走 `begin_write`（BEGIN IMMEDIATE + 重试）。
+- 多池/多进程核查：生产侧写主库均通过 `storage::db::connect`，同一套 pragmas；`--dispatch` 不另开主库池。

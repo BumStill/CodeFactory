@@ -2212,7 +2212,7 @@ impl ObjectiveStore {
             }
             let domain = RecoveryDomain::parse(&domain_value)?;
             let now = Utc::now().timestamp_millis();
-            let mut tx = self.pool.begin().await?;
+            let mut tx = crate::storage::db::begin_write(&self.pool).await?;
             let unsafe_side_effects: i64 = sqlx::query_scalar(
                 "SELECT
                    (SELECT COUNT(*) FROM side_effect_receipts receipt
@@ -2692,7 +2692,7 @@ impl ObjectiveStore {
         kind: ObjectiveKind,
         requested_acceptance: &str,
     ) -> anyhow::Result<ObjectiveSnapshot> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         let objective = self
             .ensure_or_continue_chat_objective_in_tx(
                 &mut tx,
@@ -3133,7 +3133,7 @@ impl ObjectiveStore {
         let now = Utc::now().timestamp_millis();
         let process_instance = current_process_instance();
         let candidate_id = Uuid::new_v4().to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         sqlx::query(
             "INSERT OR IGNORE INTO objectives
              (id, revision, kind, session_id, task_id, status, decision_type,
@@ -3298,7 +3298,7 @@ impl ObjectiveStore {
         let thin = super::thin::is_thin(&self.pool, session_id).await;
         if thin { super::thin_state::ensure(&self.pool).await?; }
         let now = Utc::now().timestamp_millis();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         sqlx::query(
             "INSERT INTO chat_session_cancel_intents
              (session_id, status, requested_at, settled_at, updated_at)
@@ -3367,7 +3367,7 @@ impl ObjectiveStore {
         }
 
         let now = Utc::now().timestamp_millis();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         let remaining: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objectives objective
              WHERE objective.session_id=?
@@ -3602,7 +3602,7 @@ impl ObjectiveStore {
             let remediation_id = Uuid::new_v4().to_string();
             let failure_code = "exhausted_user_reprompt_unconsumed";
             let failure_signature = format!("{objective_id}:{root_turn_id}:{failure_code}");
-            let mut tx = self.pool.begin().await?;
+            let mut tx = crate::storage::db::begin_write(&self.pool).await?;
             let updated = sqlx::query(
                 "UPDATE objectives SET revision=revision+1,
                    recovery_generation=1, status='waiting_system',
@@ -3750,7 +3750,7 @@ impl ObjectiveStore {
             let next_revision = revision + 1;
             let visible_final_message_id =
                 format!("system-incident-{}-{}", objective_id, next_revision);
-            let mut tx = self.pool.begin().await?;
+            let mut tx = crate::storage::db::begin_write(&self.pool).await?;
             let updated = sqlx::query(
                 "UPDATE objectives SET revision=?, status='failed',
                    decision_type='failed_internal', requires_user_action=0,
@@ -3951,7 +3951,7 @@ impl ObjectiveStore {
             let session: Option<String> = sqlx::query_scalar("SELECT session_id FROM objectives WHERE id=?")
                 .bind(&objective_id).fetch_optional(&self.pool).await?.flatten();
             let thin = if let Some(session) = session { super::thin::is_thin(&self.pool, &session).await } else { false };
-            let mut tx = self.pool.begin().await?;
+            let mut tx = crate::storage::db::begin_write(&self.pool).await?;
             if strategy == "reconcile_then_resume" && !thin {
                 let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
                     "SELECT
@@ -4126,7 +4126,7 @@ impl ObjectiveStore {
     ) -> anyhow::Result<()> {
         let now = Utc::now().timestamp_millis();
         let next = now + delay_ms.max(1_000);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         let remediation = sqlx::query(
             "UPDATE objective_remediations
              SET status='waiting',
@@ -4219,7 +4219,7 @@ impl ObjectiveStore {
         claim_epoch: i64, lease_ms: i64, now: i64,
     ) -> anyhow::Result<ClaimRenewal> {
         let lease_expires_at = now + lease_ms.max(1);
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         // Read the claim's committed identity before touching it. When an update
         // below cannot match, this is what says whether the claim was closed by
         // its own owner (an adapter settling its own work, which leaves the row
@@ -4462,7 +4462,7 @@ impl ObjectiveStore {
         .await?;
         for objective_id in terminal_objectives {
             let now = Utc::now().timestamp_millis();
-            let mut tx = self.pool.begin().await?;
+            let mut tx = crate::storage::db::begin_write(&self.pool).await?;
             let closed = settle_superseded_chat_turns_in_tx(
                 &mut tx,
                 &objective_id,
@@ -4493,7 +4493,7 @@ impl ObjectiveStore {
         .await?;
         for (objective_id, active_root) in live_objectives {
             let now = Utc::now().timestamp_millis();
-            let mut tx = self.pool.begin().await?;
+            let mut tx = crate::storage::db::begin_write(&self.pool).await?;
             let closed = settle_superseded_chat_turns_in_tx(
                 &mut tx,
                 &objective_id,
@@ -5731,7 +5731,7 @@ impl ObjectiveStore {
             return self.get(&current.id).await;
         }
         let now = Utc::now().timestamp_millis();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         sqlx::query(
             "UPDATE objectives SET revision=revision+1, status='legacy_orphan',
                decision_type='continue', failure_code=NULL, failure_signature=NULL,
@@ -5864,7 +5864,7 @@ impl ObjectiveStore {
             }
         } else { false };
         if cancelled_thin { super::thin_state::ensure(&self.pool).await?; }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         // The decision transaction may be the only SQLite connection in a
         // deterministic test or embedded deployment. Inspect schema through
         // that same transaction; asking the pool for a second connection here
@@ -8364,21 +8364,24 @@ pub async fn ensure_objective_failed_status(pool: &SqlitePool) -> crate::errors:
     // table and the next start silently created an empty `objectives`, losing
     // every task the user had.
     let rebuilt_result = async {
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        // RAII: unlike a bare `BEGIN IMMEDIATE` statement, this transaction is
+        // rolled back by sqlx if any step fails or the future is cancelled.
+        use sqlx::Connection as _;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let step = async {
-            sqlx::query(&rebuilt).execute(&mut *conn).await?;
+            sqlx::query(&rebuilt).execute(&mut *tx).await?;
             sqlx::query("INSERT INTO objectives_failed_rebuild SELECT * FROM objectives")
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await?;
-            sqlx::query("DROP TABLE objectives").execute(&mut *conn).await?;
+            sqlx::query("DROP TABLE objectives").execute(&mut *tx).await?;
             sqlx::query("ALTER TABLE objectives_failed_rebuild RENAME TO objectives")
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await?;
             for index in &indexes {
-                sqlx::query(index).execute(&mut *conn).await?;
+                sqlx::query(index).execute(&mut *tx).await?;
             }
             let violations = sqlx::query("PRAGMA foreign_key_check")
-                .fetch_all(&mut *conn)
+                .fetch_all(&mut *tx)
                 .await?;
             if !violations.is_empty() {
                 return Err(sqlx::Error::Protocol(
@@ -8389,12 +8392,9 @@ pub async fn ensure_objective_failed_status(pool: &SqlitePool) -> crate::errors:
         }
         .await;
         match step {
-            Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(())
-            }
+            Ok(()) => tx.commit().await,
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                tx.rollback().await?;
                 Err(error)
             }
         }

@@ -20,6 +20,19 @@
 - node scripts/verify-m144-storage-headless.mjs：通过。真实 Chromium 生产 MessageList 与错误呈现函数，light/dark 断言提示正文、停止计数、无内部诊断及无横向溢出。截图目录为系统临时目录 codefactory-m144-evidence，文件 m144-light.png、m144-dark.png。
 - 场景 --ci、README contract、统一 local harness、baseline 均通过；同一场景校验函数额外检查真实未提交文件集通过。
 
+## P0 追加验证（永久 database is locked）
+|需求|结果与证据|
+|---|---|
+|R5/R6/R9|m144_returned_raw_transaction_cannot_poison_later_writes：在 1 连接池上用裸 BEGIN IMMEDIATE 写入后丢弃连接，模拟 COMMIT 失败/取消；连接归还清理回滚脏写，后续 begin_write 成功，表中只剩新写入。|
+|R6/R9 负向对照|m144_without_release_cleanup_the_lock_would_stay_poisoned：无 after_release 的裸池上同一泄漏使裸 BEGIN IMMEDIATE 持续失败；rollback_idle_transactions 返回 1 后 begin_write 恢复并成功提交。若清理或自愈失效，该用例失败。|
+|R7/R9|m144_failed_contended_write_does_not_disable_later_writes：busy_timeout=0 制造一次真实 code 5，释放持有者后同一连接池的下一笔写入成功，无需重启。|
+|R9 Windows|m144_parallel_writers_all_commit_on_every_platform：8 写者 × 5 轮并发事务全部提交（40 行），运行于 check-rust 的 windows-latest。|
+|R8|node scripts/validate-write-transaction-scope.mjs：扫描生产 Rust 源码，事务作用域内出现 Command::new、reqwest、model_transport、provider 流或子进程即非零退出；当前通过。|
+|R5 覆盖|ensure_objective_failed_status 的 schema 重建由裸 BEGIN/COMMIT 改为 conn.begin_with RAII；ObjectiveStore 14 处、delivery_run 13 处、persistence 3 处、thin_derive 1 处写事务统一走 begin_write。|
+|R7 有界等待|pool_builder 增加 acquire_timeout(30s)；busy_timeout 10s × 3 次重试后进入自愈回收。|
+
+多池核查：生产主库写路径均经 storage::db::connect（同一 WAL/FULL/FK/busy_timeout）；独立库路径 delivery-recovery smoke 也使用 connect；`--dispatch` 不另建主库池。Windows 上 WAL 仍走 SQLite 统一锁语义，差异由 acquire/busy 超时与归还清理覆盖。
+
 ## Harness 与协作
 Spec：原任务规格位于 docs/specs/feature-specs/m144-db-locked-stop-message.md。
 Compatibility/Observation：合成 WAL 多连接竞争与真实准入、持久状态断言，保留驱动日志。
@@ -34,4 +47,4 @@ Spec Amendment：无。
 
 README-Update: reviewed
 README-Update-Reason: 修复既有持久化及停止提示，不改变公开功能和安装承诺。
-Scenario-Test: CXD-001, CXD-002, HLT-001, HLT-002, HLT-003, HLT-004, HLT-005, RTE-004
+Scenario-Test: CXD-001, CXD-002, DAT-001, HLT-001, HLT-002, HLT-003, HLT-004, HLT-005, RTE-003, RTE-004
