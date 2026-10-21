@@ -48,6 +48,25 @@ let socket = null;
 let heartbeatTimer = null;
 let reconnectDelayMs = 1000;
 let addressAttempt = 0;
+let eventQueue = Promise.resolve();
+let activeToken = "";
+
+// Serialize storage updates: open/ready/close may arrive in the same tick.
+function recordEvent(event, fields = {}) {
+  eventQueue = eventQueue.catch(() => {}).then(async () => {
+    const { bridgeEvents = [] } = await chrome.storage.local.get(["bridgeEvents"]);
+    const entry = { at: Date.now(), side: "extension", event, ...fields };
+    const events = [...bridgeEvents, entry].slice(-50);
+    await chrome.storage.local.set({ bridgeEvents: events });
+  });
+  return eventQueue;
+}
+
+async function tokenFingerprint(token) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return Array.from(new Uint8Array(digest)).slice(0, 6).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 
 function stopHeartbeat() {
   if (heartbeatTimer !== null) clearInterval(heartbeatTimer);
@@ -59,7 +78,8 @@ function startHeartbeat(candidate, lastAckAt, ackRequired) {
   heartbeatTimer = setInterval(() => {
     if (socket === candidate && candidate.readyState === WebSocket.OPEN) {
       if (ackRequired() && Date.now() - lastAckAt() >= HEARTBEAT_STALE_MS) {
-        candidate.close();
+        void recordEvent("heartbeat_timeout");
+        candidate.close(4002, "heartbeat timeout");
         return;
       }
       candidate.send(JSON.stringify({ heartbeat: true, sent_at: Date.now() }));
@@ -143,6 +163,9 @@ function connect() {
     // Recorded so the options page can say "paired automatically" instead of
     // showing an empty form that looks like nothing has been set up.
     setStatus("connecting", { pairingSource: paired.source, activePort: port });
+    activeToken = paired.token;
+    void tokenFingerprint(paired.token).then((fingerprint) => recordEvent("pairing", { fingerprint, source: paired.source }));
+    void recordEvent("connecting", { port, source: paired.source, retry_ms: reconnectDelayMs });
 
     // Loopback only. The app refuses any origin that is not this extension, so
     // a page cannot stand in for us even though it could open the same socket.
@@ -200,6 +223,11 @@ function connect() {
         heartbeatAckRequired = true;
         lastHeartbeatAckAt = Date.now();
         setStatus("connected", { connectionMode: "authenticated", bridgeStandby: false });
+        await recordEvent("connected", { port });
+        const { bridgeEvents = [] } = await chrome.storage.local.get(["bridgeEvents"]);
+        if (socket === candidate && candidate.readyState === WebSocket.OPEN) {
+          candidate.send(JSON.stringify({ diagnostics: bridgeEvents }));
+        }
         return;
       }
       if (request.heartbeat_ack !== undefined) {
@@ -217,6 +245,7 @@ function connect() {
       // connection or overwrite its status.
       if (socket !== candidate) return;
       socket = null;
+      void recordEvent("disconnected", { code: event.code, reason: String(event.reason || "").replaceAll(activeToken, "[redacted]").slice(0, 120), port });
       stopHeartbeat();
       if (event.code === 4001 && event.reason === "superseded") {
         // Another authenticated browser profile owns the bridge. Fast retrying
@@ -319,7 +348,17 @@ async function inPage(tabId, fn, args = []) {
  */
 async function ensureKeepalive() {
   const existing = await chrome.alarms.get(KEEPALIVE_ALARM);
-  if (!existing) chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+  // A one-minute alarm was itself a disconnect cause: Chrome suspends an idle
+  // MV3 worker after 30s, so a socket lost while the worker was asleep stayed
+  // unnoticed for up to a minute — the user sees "it drops and comes back on
+  // its own". Ask for the shortest period Chrome allows (30s). Chrome before
+  // 120 rejects sub-minute periods, so fall back instead of losing the alarm.
+  if (existing && (existing.periodInMinutes ?? 1) <= 0.5) return;
+  try {
+    await chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+  } catch {
+    await chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
+  }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -336,8 +375,13 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === KEEPALIVE_ALARM) connect();
 });
 chrome.storage.onChanged.addListener((changes) => {
-  if (changes.port || changes.token) connect();
+  if (changes.port || changes.token) {
+    if (socket) socket.close(4003, "pairing changed");
+    connect();
+  }
 });
+chrome.runtime.onSuspend?.addListener(() => { void recordEvent("worker_suspend"); });
+void recordEvent("worker_wake");
 
 // Every cold start of the worker, however it was triggered.
 void ensureKeepalive();

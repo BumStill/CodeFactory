@@ -104,6 +104,8 @@ pub struct ExtensionBridge {
     pending: Pending,
     outbound: Outbound,
     connection_changed: Notify,
+    events: Mutex<Vec<serde_json::Value>>,
+    extension_events: Mutex<Vec<serde_json::Value>>,
 }
 
 impl ExtensionBridge {
@@ -116,6 +118,8 @@ impl ExtensionBridge {
             pending: Arc::new(Mutex::new(HashMap::new())),
             outbound: Arc::new(Mutex::new(None)),
             connection_changed: Notify::new(),
+            events: Mutex::new(Vec::new()),
+            extension_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -134,6 +138,7 @@ impl ExtensionBridge {
             .map_err(|error| AppError::Other(format!("Could not read the bridge port: {error}")))?
             .port();
         *self.port.lock().await = Some(port);
+        self.event("listening", serde_json::json!({"port": port, "preferred_port": PREFERRED_PORT})).await;
         let holds_stable_port = port == PREFERRED_PORT;
 
         let bridge = Arc::clone(self);
@@ -164,6 +169,35 @@ impl ExtensionBridge {
         #[cfg(test)]
         let _ = holds_stable_port;
         Ok(pairing)
+    }
+
+    async fn event(&self, event: &str, fields: serde_json::Value) {
+        let mut entry = fields;
+        entry["at"] = serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
+        entry["side"] = serde_json::json!("app");
+        entry["event"] = serde_json::json!(event);
+        tracing::info!(event, "browser bridge lifecycle");
+        let mut events = self.events.lock().await;
+        events.push(entry);
+        if events.len() > 50 { events.remove(0); }
+    }
+
+    pub async fn diagnostics(&self) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let mut events = self.events.lock().await.clone();
+        events.extend(self.extension_events.lock().await.clone());
+        events.sort_by_key(|e| e["at"].as_u64().unwrap_or_default());
+        if events.len() > 50 { events.drain(..events.len() - 50); }
+        serde_json::json!({ "connected": self.connected().await, "port": *self.port.lock().await,
+            "fingerprint": format!("{:x}", Sha256::digest(self.token.as_bytes()))[..12], "events": events })
+    }
+
+    pub async fn reconnect(&self) {
+        let active = self.outbound.lock().await.clone();
+        if let Some(active) = active {
+            self.clear_connection(active.id).await;
+        }
+        self.event("reconnect_requested", serde_json::json!({})).await;
     }
 
     /// Whether an extension is currently connected.
@@ -220,8 +254,8 @@ impl ExtensionBridge {
         let (mut writer, mut reader) = websocket.split();
 
         // First frame must be the handshake.
-        let hello = match reader.next().await {
-            Some(Ok(Message::Text(text))) => serde_json::from_str::<Hello>(&text).ok(),
+        let hello = match tokio::time::timeout(Duration::from_secs(5), reader.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<Hello>(&text).ok(),
             _ => None,
         };
         let origin = origin.lock().await.clone();
@@ -278,6 +312,7 @@ impl ExtensionBridge {
             self.clear_pending(superseded.id).await;
         }
         self.connection_changed.notify_waiters();
+        self.event("connected", serde_json::json!({})).await;
 
         // `open` only proves TCP/WebSocket establishment. This acknowledgment is
         // sent after origin/token/protocol authorization so the extension does not
@@ -301,14 +336,57 @@ impl ExtensionBridge {
             }
         });
 
-        while let Some(Ok(message)) = reader.next().await {
-            let Message::Text(text) = message else {
-                continue;
+        let idle_deadline = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(45) };
+        let idle = tokio::time::sleep(idle_deadline);
+        tokio::pin!(idle);
+        loop {
+            let message = tokio::select! {
+                message = reader.next() => message,
+                _ = &mut idle => {
+                    self.event("heartbeat_timeout", serde_json::json!({"code": 4002, "reason": "heartbeat timeout"})).await;
+                    let current = self.outbound.lock().await.clone();
+                    if let Some(active) = current.filter(|a| a.id == connection_id) {
+                        let _ = active.sender.unbounded_send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Library(4002), reason: "heartbeat timeout".into(),
+                        })));
+                    }
+                    // Let the writer send the close before it is aborted below.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    break;
+                }
             };
+            let Some(Ok(message)) = message else { break };
+            if let Message::Close(frame) = &message {
+                self.event("disconnected", serde_json::json!({
+                    "code": frame.as_ref().map(|f| u16::from(f.code)),
+                    "reason": frame.as_ref().map(|f| f.reason.replace(&self.token, "[redacted]").chars().take(120).collect::<String>())
+                })).await;
+                break;
+            }
+            let Message::Text(text) = message else { continue };
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };
+            if let Some(events) = value.get("diagnostics").and_then(|v| v.as_array()) {
+                // Never retain arbitrary frames or caller-supplied fields.
+                let allowed = ["worker_wake", "worker_suspend", "pairing", "connecting", "connected", "disconnected", "heartbeat_timeout"];
+                let sanitized = events.iter().rev().take(50).filter(|e| allowed.contains(&e["event"].as_str().unwrap_or(""))).map(|e| {
+                    let mut entry = serde_json::json!({"side": "extension", "at": e["at"].as_u64().unwrap_or_default(), "event": e["event"]});
+                    for key in ["port", "code", "retry_ms"] {
+                        if let Some(number) = e[key].as_u64() { entry[key] = serde_json::json!(number); }
+                    }
+                    for key in ["reason", "source", "fingerprint"] {
+                        if let Some(text) = e[key].as_str() {
+                            entry[key] = serde_json::json!(text.replace(&self.token, "[redacted]").chars().take(120).collect::<String>());
+                        }
+                    }
+                    entry
+                }).collect::<Vec<_>>();
+                *self.extension_events.lock().await = sanitized;
+                continue;
+            }
             if value.get("heartbeat").and_then(serde_json::Value::as_bool) == Some(true) {
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
                 let current = self.outbound.lock().await.clone();
                 if let Some(current) = current.filter(|active| active.id == connection_id) {
                     if current
@@ -1062,6 +1140,24 @@ mod tests {
 
         first.close(None).await.expect("close old extension");
         current.close(None).await.expect("close current extension");
+    }
+
+    #[tokio::test]
+    async fn m136_silent_peer_is_closed_and_diagnostics_are_redacted() {
+        let bridge = Arc::new(ExtensionBridge::new());
+        let pairing = bridge.start().await.expect("start");
+        let mut socket = connect_test_extension(&bridge, &pairing).await;
+        let close = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Ok(Message::Close(frame))) = socket.next().await { break frame; }
+            }
+        }).await.expect("silent peer must be evicted");
+        assert_eq!(close.expect("reasoned close").reason, "heartbeat timeout");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!bridge.connected().await);
+        let diagnostics = bridge.diagnostics().await;
+        assert!(!diagnostics.to_string().contains(&pairing.token));
+        assert!(diagnostics["events"].as_array().unwrap().iter().any(|e| e["event"] == "heartbeat_timeout"));
     }
 
     #[tokio::test]

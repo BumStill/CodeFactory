@@ -51,6 +51,7 @@ async fn probe() -> anyhow::Result<Value> {
         token: bridge::new_token(), port: Mutex::new(None), next_id: AtomicU64::new(1),
         next_connection_id: AtomicU64::new(1), pending: Arc::new(Mutex::new(HashMap::new())),
         outbound: Arc::new(Mutex::new(None)), connection_changed: Notify::new(),
+        events: Mutex::new(Vec::new()), extension_events: Mutex::new(Vec::new()),
     });
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
