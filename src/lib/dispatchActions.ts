@@ -203,10 +203,13 @@ async function waitForSteerApplied(
  * 空闲会话下两种都是"立即开始新的一轮"。
  */
 export async function dispatchSend(
-  input: { sessionId: string; message: string; mode: DispatchSendMode; deliveryAuthorized?: boolean },
+  input: { sessionId: string; message: string; mode: DispatchSendMode; deliveryAuthorized?: boolean; releaseUrgency?: "default" | "immediate" | "hold" },
   options: { timeoutMs?: number; steerAppliedTimeoutMs?: number } = {},
 ): Promise<DispatchSendResult> {
   const session = requireSession(input.sessionId);
+  if (input.releaseUrgency !== undefined) {
+    await invoke("update_session_release_urgency", { sessionId: session.id, urgency: input.releaseUrgency });
+  }
   if (input.deliveryAuthorized !== undefined) {
     await invoke("update_session_delivery_authorized", {
       sessionId: session.id, authorized: input.deliveryAuthorized,

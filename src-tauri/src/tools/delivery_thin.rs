@@ -17,8 +17,8 @@ trait Commands {
     fn precheck_governance(&mut self) -> Result<(Vec<String>, u64), String> {
         Ok((Vec::new(), 0))
     }
-    fn reconcile_body(&mut self, _title: &str, body: &str, _urgency: Option<ReleaseUrgency>) -> Result<String, String> {
-        Ok(body.to_string())
+    fn reconcile_body(&mut self, _title: &str, body: &str, urgency: Option<ReleaseUrgency>) -> Result<String, String> {
+        Ok(delivery::append_release_urgency(body.to_string(), urgency))
     }
 }
 
@@ -252,9 +252,31 @@ fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, exc
         "branch":branch,"commit_sha":sha,"ci":ci,"next_action":"请用后台任务监视 CI；由合并队列合并，不要直接合并。"}))
 }
 
+fn session_release_args(args: &Value, session_urgency: &str) -> Value {
+    let mut effective = args.clone();
+    // Missing/null cannot erase the persisted immediate policy. Invalid explicit
+    // strings remain errors in the governed argument parser.
+    if effective.get("release_urgency").is_none_or(Value::is_null) {
+        if matches!(session_urgency, "immediate" | "hold") {
+            effective["release_urgency"] = json!(session_urgency);
+        } else { effective.as_object_mut().map(|args| args.remove("release_urgency")); }
+    }
+    // A persisted hold is a structured user decision, not an agent-created gate.
+    if session_urgency == "hold" && effective["release_urgency"] == "hold" {
+        effective["hold_requested_by_user"] = json!("release_urgency: hold (session setting)");
+    }
+    effective
+}
+
 pub(super) async fn execute(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeiling, excludes: &[String]) -> crate::errors::Result<ToolOutput> {
     let mut log = Log::default();
-    let result = run(&mut Local(&ctx.cwd), args, ceiling, excludes, &mut log);
+    let mut effective_args = args.clone();
+    if let (Some(db), Some(session)) = (&ctx.db, &ctx.session_id) {
+        let urgency: String = sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id=?")
+            .bind(session).fetch_one(db).await?;
+        effective_args = session_release_args(args, &urgency);
+    }
+    let result = run(&mut Local(&ctx.cwd), &effective_args, ceiling, excludes, &mut log);
     if let (Some(db), Some(session), Some(number)) = (&ctx.db, &ctx.session_id, log.pr_number) {
         sqlx::query("INSERT INTO thin_delivery_refs (session_id,branch,pr_number,ceiling) VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET branch=excluded.branch,pr_number=excluded.pr_number,ceiling=excluded.ceiling")
             .bind(session).bind(&log.branch).bind(number as i64).bind(format!("{ceiling:?}")).execute(db).await?;
@@ -275,6 +297,28 @@ pub(super) async fn execute(args: &Value, ctx: &ExecCtx, ceiling: DeliveryCeilin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn m137_session_policy_reaches_created_and_updated_pr_bodies() {
+        for policy in ["immediate", "default", "hold"] {
+            for existing in [false, true] {
+                let args = session_release_args(&json!({"title":"fix: persist release policy", "body":"Synthetic summary"}), policy);
+                let mut forge = Forge { pr: existing, ..Default::default() };
+                let mut log = Log::default();
+                run(&mut forge, &args, DeliveryCeiling::ThroughMerge, &[], &mut log).unwrap();
+                let actual = if existing { forge.edited_body.unwrap() } else { forge.created_body.unwrap() };
+                if policy == "default" { assert!(!actual.contains("Release-Urgency:")); }
+                else { assert!(actual.ends_with(&format!("Release-Urgency: {policy}")), "{actual}"); }
+            }
+        }
+        let coauthored = delivery::append_release_urgency("Summary\n\nCo-Authored-By: Synthetic <synthetic@example.invalid>".into(), Some(ReleaseUrgency::Immediate));
+        assert_eq!(coauthored.rsplit("\n\n").next().unwrap(), "Co-Authored-By: Synthetic <synthetic@example.invalid>\nRelease-Urgency: immediate");
+        let args = session_release_args(&json!({"release_urgency":null}), "immediate");
+        assert_eq!(args["release_urgency"], "immediate");
+        let args = session_release_args(&json!({"release_urgency":"immediate"}), "hold");
+        assert_eq!(args["release_urgency"], "immediate");
+        assert!(super::super::delivery::release_urgency_from_args(&session_release_args(&json!({"release_urgency":"hold"}), "default")).unwrap().is_none());
+    }
+
     #[derive(Default)]
     struct Forge {
         pushed: bool, pr: bool, armed: bool, fail_label: bool, merged: bool,
@@ -296,8 +340,9 @@ mod tests {
             Ok((self.governance_warnings.clone(), 12))
         }
         fn stage(&mut self, _: &[String]) -> Result<Vec<String>,String> { self.events.push("stage"); Ok(vec![]) }
-        fn reconcile_body(&mut self, _title: &str, body: &str, _urgency: Option<ReleaseUrgency>) -> Result<String,String> {
+        fn reconcile_body(&mut self, _title: &str, body: &str, urgency: Option<ReleaseUrgency>) -> Result<String,String> {
             self.events.push("pr_body");
+            let body = delivery::append_release_urgency(body.to_string(), urgency);
             if let Some(error) = self.reject_body.clone() { return Err(error); }
             Ok(if self.fill_body {
                 format!("{body}\n\n## README contract\n\nREADME-Update: reviewed\nREADME-Update-Reason: thin delivery derives the required lines before pushing")

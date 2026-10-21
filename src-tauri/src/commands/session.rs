@@ -42,6 +42,28 @@ pub async fn update_session_delivery_authorized(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn get_session_release_urgency(state: State<'_, AppState>, session_id: String) -> Result<String, AppError> {
+    let db = state.db.read().await.clone();
+    Ok(sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id=?")
+        .bind(session_id).fetch_one(&db).await?)
+}
+
+/// Persist the user-owned session release policy (shared GUI/dispatch entry).
+#[tauri::command]
+pub async fn update_session_release_urgency(
+    state: State<'_, AppState>, session_id: String, urgency: String,
+) -> Result<(), AppError> {
+    if !matches!(urgency.as_str(), "default" | "immediate" | "hold") {
+        return Err(AppError::Other("Unsupported release urgency".into()));
+    }
+    let db = state.db.read().await.clone();
+    let changed = sqlx::query("UPDATE sessions SET release_urgency=? WHERE id=?")
+        .bind(&urgency).bind(&session_id).execute(&db).await?;
+    if changed.rows_affected() != 1 { return Err(AppError::Other("Unknown session".into())); }
+    Ok(())
+}
+
 fn validate_model_policy(policy: &str) -> Result<(), AppError> {
     if matches!(policy, "fixed" | "prefer" | "auto") {
         Ok(())

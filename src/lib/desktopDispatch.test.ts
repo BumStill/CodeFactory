@@ -47,6 +47,24 @@ function stubHandlers(): DispatchHandlers & { calls: string[] } {
   };
 }
 
+describe("M137 release urgency", () => {
+  it.each(["create_and_send", "send"])("%s forwards every supported urgency and rejects invalid values", async (operation) => {
+    for (const release_urgency of ["immediate", "default", "hold"]) {
+      const handler = vi.fn(async () => null);
+      const handlers = { ...stubHandlers(), createAndSend: handler, send: handler };
+      const result = await applyDispatchRequest(request(operation, { project: "/synthetic/project", session_id: "synthetic-session", message: "go", delivery_authorized: true, release_urgency }), handlers);
+      expect(result.ok).toBe(true);
+      expect(handler).toHaveBeenCalledWith(expect.objectContaining({ releaseUrgency: release_urgency }));
+    }
+    for (const release_urgency of ["soon", "", null, 42]) {
+      const handler = vi.fn(async () => null);
+      const result = await applyDispatchRequest(request(operation, { project: "/synthetic/project", session_id: "synthetic-session", message: "go", delivery_authorized: true, release_urgency }), { ...stubHandlers(), createAndSend: handler, send: handler });
+      expect(result.ok).toBe(false);
+      expect(handler).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe("本地派单入口的前端路由", () => {
   it("每条 CF-HDE-R6 能力都能在后台被调到（不需要菜单、坐标点击或解锁）", async () => {
     const handlers = stubHandlers();

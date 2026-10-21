@@ -1,0 +1,50 @@
+{
+  "status": "pass",
+  "environment": "real Chromium, production picker and synthetic IPC; installed app acceptance deferred to orchestrator",
+  "results": [
+    {
+      "theme": "light",
+      "width": 1366,
+      "selected": "hold",
+      "box": {
+        "x": 25,
+        "y": 75,
+        "width": 366,
+        "height": 44
+      }
+    },
+    {
+      "theme": "light",
+      "width": 390,
+      "selected": "hold",
+      "box": {
+        "x": 25,
+        "y": 75,
+        "width": 340,
+        "height": 44
+      }
+    },
+    {
+      "theme": "dark",
+      "width": 1366,
+      "selected": "hold",
+      "box": {
+        "x": 25,
+        "y": 75,
+        "width": 366,
+        "height": 44
+      }
+    },
+    {
+      "theme": "dark",
+      "width": 390,
+      "selected": "hold",
+      "box": {
+        "x": 25,
+        "y": 75,
+        "width": 340,
+        "height": 44
+      }
+    }
+  ]
+}
