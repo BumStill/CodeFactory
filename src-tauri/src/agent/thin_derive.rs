@@ -808,6 +808,47 @@ mod tests {
         assert_eq!(queued, 0, "被限流的会话要留待下一轮，不得静默标记完成");
     }
 
+    /// M146/R4+R5 的唤醒侧：此前的用例只断言 `failure_reason` 的文案，没有断言冲突
+    /// 事实真的排出了一次唤醒。冲突必须带原因排一次修复唤醒（thin-repair）。
+    #[tokio::test]
+    async fn m146_conflicting_pr_queues_one_repair_wake_with_reason() {
+        let db = fixture().await;
+        ensure_wake_table(&db).await;
+        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: true }, ""))
+            .await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',776,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason) VALUES ('derive',776,'ThroughMerge',1,'PR #776 存在合并冲突（mergeable=CONFLICTING），需要解决冲突后重新交付')")
+            .execute(&db).await.unwrap();
+        heartbeat_external(&db, "derive").await.unwrap();
+        let wakes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id,prompt FROM wakeup_schedules WHERE session_id='derive' ORDER BY id",
+        ).fetch_all(&db).await.unwrap();
+        assert_eq!(wakes.len(), 1, "冲突必须唤醒会话一次：{wakes:?}");
+        assert!(wakes[0].0.starts_with("thin-repair-"), "冲突是外部失败，走修复唤醒：{}", wakes[0].0);
+        assert!(wakes[0].1.contains("合并冲突"), "唤醒必须带原因：{}", wakes[0].1);
+    }
+
+    /// M146/R1+R5 的「一次」：合并后的同一份观测重复心跳，收尾唤醒只排一次。
+    #[tokio::test]
+    async fn m146_closeout_wake_is_queued_only_once() {
+        let db = fixture().await;
+        ensure_wake_table(&db).await;
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',776,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('delivered','derive','assistant','PR 已交付，等待合并监视',100)")
+            .execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,merged_at) VALUES ('derive',776,'ThroughMerge',1,'PR #776 已合并',5000)")
+            .execute(&db).await.unwrap();
+        for round in 1..=3 {
+            heartbeat_external(&db, "derive").await.unwrap();
+            let wakes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND id LIKE 'thin-closeout-%'")
+                .fetch_one(&db).await.unwrap();
+            assert_eq!(wakes, 1, "第 {round} 次心跳重复唤醒了收尾回合");
+        }
+    }
+
     #[tokio::test]
     async fn stop_reason_is_a_fact_even_when_cache_says_running() {
         let db = fixture().await;
