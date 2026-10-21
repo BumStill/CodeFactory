@@ -2731,7 +2731,12 @@ impl ObjectiveStore {
         .fetch_one(&mut **tx)
         .await?;
         if stop_requested > 0 {
-            bail!("chat admission fenced by durable session cancellation");
+            // M145-R2: the message either starts a turn or gets one human
+            // sentence — never a bare internal identifier. A stop that predates
+            // this message is settled before admission (see
+            // `settle_stale_chat_session_cancel`), so reaching here means the
+            // user pressed stop *while* this message was being admitted.
+            bail!("chat admission fenced by durable session cancellation：会话刚被停止，这条消息没有启动新回合，请再发一次");
         }
 
         // R10: the message entry is not an identity court. A missing root row,
@@ -3336,6 +3341,46 @@ impl ObjectiveStore {
         &self,
         session_id: &str,
     ) -> anyhow::Result<Vec<(String, Option<String>, ObjectiveSnapshot)>> {
+        self.consume_chat_session_cancel_until(session_id, None).await
+    }
+
+    /// M145-R1: a user message *is* the intent to continue after a stop.
+    ///
+    /// The stop fence used to be absolute: if `cancel_chat` failed to settle its
+    /// own intent (Windows `database is locked`), every later message admission
+    /// was refused with `chat admission fenced by durable session cancellation`
+    /// and only a restart cleared it. A user who typed a new message has
+    /// unambiguously asked to continue, so admission first finishes the *older*
+    /// stop: still-live Objectives of that stop are cancelled and the intent is
+    /// marked settled. Intents requested at/after this admission (a genuinely
+    /// concurrent stop) are left alone and still fence.
+    pub async fn settle_stale_chat_session_cancel(
+        &self,
+        session_id: &str,
+        before_ms: i64,
+    ) -> anyhow::Result<usize> {
+        let stale: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_session_cancel_intents
+             WHERE session_id=? AND status='requested' AND requested_at < ?",
+        )
+        .bind(session_id)
+        .bind(before_ms)
+        .fetch_one(&self.pool)
+        .await?;
+        if stale == 0 {
+            return Ok(0);
+        }
+        let cancelled = self
+            .consume_chat_session_cancel_until(session_id, Some(before_ms))
+            .await?;
+        Ok(cancelled.len())
+    }
+
+    async fn consume_chat_session_cancel_until(
+        &self,
+        session_id: &str,
+        before_ms: Option<i64>,
+    ) -> anyhow::Result<Vec<(String, Option<String>, ObjectiveSnapshot)>> {
         let mut cancelled = Vec::new();
         loop {
             let live = sqlx::query_as::<_, (String, Option<String>)>(
@@ -3383,11 +3428,14 @@ impl ObjectiveStore {
         let settled = sqlx::query(
             "UPDATE chat_session_cancel_intents
              SET status='settled', settled_at=?, updated_at=?
-             WHERE session_id=? AND status='requested'",
+             WHERE session_id=? AND status='requested'
+               AND (? IS NULL OR requested_at < ?)",
         )
         .bind(now)
         .bind(now)
         .bind(session_id)
+        .bind(before_ms)
+        .bind(before_ms)
         .execute(&mut *tx)
         .await?;
         if settled.rows_affected() != 1 {
@@ -13069,6 +13117,193 @@ CREATE TABLE objectives (
             resumed.failure_code.as_deref(),
             Some("browser_pairing_restored")
         );
+    }
+
+    #[tokio::test]
+    async fn stale_stop_intent_is_settled_by_the_next_message_but_a_concurrent_stop_still_fences() {
+        let pool = pool().await;
+        crate::agent::delivery_run::ensure_schema(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, updated_at INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sessions(id) VALUES ('session-m145-stale')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-m145-stale".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("session-m145-stale".into()),
+                root_turn_id: Some("turn-m145-stale".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "informational_answer".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-m145-stale', 'session-m145-stale', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The reported failure: `cancel_chat` asked for the stop, its settlement
+        // then lost the SQLite busy race, so the intent stayed `requested` with
+        // this Objective still live.
+        let stop_at = Utc::now().timestamp_millis() - 1_000;
+        sqlx::query(
+            "INSERT INTO chat_session_cancel_intents
+             (session_id, status, requested_at, updated_at)
+             VALUES ('session-m145-stale', 'requested', ?, ?)",
+        )
+        .bind(stop_at)
+        .bind(stop_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let fenced: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_session_cancel_intents
+             WHERE session_id='session-m145-stale' AND status='requested'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fenced, 1, "the durable fence is real before admission");
+
+        // R1: the user's next message is the continue intent, so admission
+        // finishes the older stop instead of refusing the message.
+        let settled = store
+            .settle_stale_chat_session_cancel("session-m145-stale", stop_at + 1)
+            .await
+            .unwrap();
+        assert_eq!(settled, 1, "the stale stop's live Objective was cancelled");
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM chat_session_cancel_intents WHERE session_id='session-m145-stale'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "settled");
+        assert_eq!(
+            store.get(&objective.id).await.unwrap().unwrap().status,
+            ObjectiveStatus::Cancelled
+        );
+        let still_fenced: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_session_cancel_intents
+             WHERE session_id='session-m145-stale' AND status='requested'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still_fenced, 0, "admission is no longer fenced");
+
+        // A stop requested *after* this message is a genuine concurrent stop and
+        // must keep fencing: settlement only reaches intents older than it.
+        let newer_stop = stop_at + 60_000;
+        sqlx::query(
+            "UPDATE chat_session_cancel_intents
+             SET status='requested', requested_at=?, settled_at=NULL WHERE session_id='session-m145-stale'",
+        )
+        .bind(newer_stop)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let settled = store
+            .settle_stale_chat_session_cancel("session-m145-stale", stop_at + 1)
+            .await
+            .unwrap();
+        assert_eq!(settled, 0);
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM chat_session_cancel_intents WHERE session_id='session-m145-stale'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "requested", "a concurrent stop keeps its fence");
+    }
+
+    /// M145-R3: two stops of the same turn produce exactly one notice, and a
+    /// later user message re-arms a new one for the next turn.
+    #[tokio::test]
+    async fn stop_notice_is_inserted_once_per_stopped_turn() {
+        let pool = pool().await;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS messages (
+               id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let user_turn_at = Utc::now().timestamp_millis() - 5_000;
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, role, content, created_at)
+             VALUES ('user-m145-1', 'session-m145-notice', 'user', '继续', ?)",
+        )
+        .bind(user_turn_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first = crate::commands::chat::insert_stop_notice_once(
+            &pool,
+            "session-m145-notice",
+            "已停止：这一步不再继续",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, 1, "the first stop of the turn is explained once");
+        let second = crate::commands::chat::insert_stop_notice_once(
+            &pool,
+            "session-m145-notice",
+            "已停止：这一步不再继续",
+        )
+        .await
+        .unwrap();
+        assert_eq!(second, 0, "a second stop of the same turn adds no second line");
+        let notices: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE session_id='session-m145-notice' AND content LIKE '已停止%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(notices, 1);
+
+        let next_turn_at = Utc::now().timestamp_millis() + 1;
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, role, content, created_at)
+             VALUES ('user-m145-2', 'session-m145-notice', 'user', '新任务', ?)",
+        )
+        .bind(next_turn_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let next_turn = crate::commands::chat::insert_stop_notice_once(
+            &pool,
+            "session-m145-notice",
+            "已停止：这一步不再继续",
+        )
+        .await
+        .unwrap();
+        assert_eq!(next_turn, 1, "a new user message gets its own stop notice");
     }
 
     #[tokio::test]
