@@ -957,6 +957,97 @@ fn command_has_forge_mutation(command: &str) -> bool {
 /// name a runner (`ls vitest.config*`) stays a probe, while
 /// `ls x && pnpm test` is not one — one acceptance segment is enough to make
 /// the whole command's exit status a verdict.
+/// Review intent is separate from completion evidence: unknown query tools are
+/// allowed, but explicit side effects in any executed segment are not.
+pub fn review_command_mutation(command: &str) -> Option<(String, &'static str)> {
+    if has_opaque_executable_heredoc(command) {
+        return Some((command.lines().next().unwrap_or(command).to_owned(), "执行脚本可能写入文件"));
+    }
+    for segment in split_shell_syntax(command, true) {
+        let payload = execution_payload(&segment);
+        if payload != segment.trim() && (payload.contains(';') || payload.contains('|') || payload.contains('\n')) {
+            if let Some(reason) = review_command_mutation(&payload) { return Some(reason); }
+        }
+        // Substitution executes even inside double quotes. Keep it opaque rather
+        // than letting a query-shaped outer verb hide arbitrary shell code.
+        if payload.contains("$(") || payload.contains('`') {
+            return Some((segment, "命令替换可能产生写入副作用"));
+        }
+        let words = review_shell_words(&payload);
+        let Some(first) = words.first() else { continue; };
+        let binary = first.rsplit(['/', '\\']).next().unwrap_or(first).trim_end_matches(".exe");
+        let lower = words.iter().map(|word| word.to_ascii_lowercase()).collect::<Vec<_>>();
+        let mut normalized = lower.clone();
+        normalized[0] = binary.to_ascii_lowercase();
+        // Strip global git flags before inspecting the actual subcommand.
+        if binary == "git" {
+            let mut index = 1;
+            while index < normalized.len() && normalized[index].starts_with('-') {
+                let takes_value = matches!(normalized[index].as_str(), "-c" | "-C" | "--git-dir" | "--work-tree");
+                index += if takes_value || normalized[index] == "-c" { 2 } else { 1 };
+            }
+            // -C lowercases to -c above and both consume one value.
+            normalized = std::iter::once("git".to_owned()).chain(normalized.into_iter().skip(index)).collect();
+        }
+        let normalized_command = normalized.join(" ");
+        let redirect = words.iter().enumerate().any(|(i, word)| {
+            word == ">" && words.get(i + 1).is_none_or(|target| target != "/dev/null" && !target.starts_with('&'))
+        });
+        let reason = if redirect {
+            Some("重定向会写入文件")
+        } else if is_forge_mutation_segment(&normalized_command)
+            || (binary == "glab" && lower.iter().skip(1).any(|word| matches!(word.as_str(), "create" | "merge" | "edit" | "close" | "delete" | "run" | "publish" | "upload")))
+            || (binary == "git" && normalized.get(1).is_some_and(|verb| verb == "remote")
+                && normalized.get(2).is_some_and(|verb| !matches!(verb.as_str(), "-v" | "--verbose" | "show" | "get-url"))) {
+            Some("Git 或 GitHub 操作会写入状态")
+        } else if matches!(binary, "rm" | "mv" | "cp" | "mkdir" | "touch" | "chmod" | "chown" | "tee" | "install" | "apply_patch")
+            || (binary == "find" && lower.iter().any(|word| matches!(word.as_str(), "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fprint" | "-fprintf" | "-fls")))
+            || (binary == "sed" && lower.iter().any(|word| word.starts_with("-i")))
+            || (binary == "perl" && lower.iter().any(|word| word.starts_with('-') && word.contains('i')))
+        {
+            Some("命令会写入文件或产生副作用")
+        } else if (matches!(binary, "pip" | "pip3" | "python" | "python3" | "uv" | "npm" | "pnpm" | "yarn" | "bun" | "cargo" | "brew" | "apt" | "apt-get" | "gem" | "bundle" | "composer" | "dotnet" | "go" | "apk" | "dnf" | "yum")
+            && is_dependency_install_command(&normalized_command))
+            || (matches!(binary, "git" | "gh" | "glab" | "npm" | "pnpm" | "cargo" | "docker" | "podman" | "kubectl" | "helm" | "vercel" | "netlify")
+                && is_delivery_state_mutation(&normalized_command)) {
+            Some("安装或交付操作会写入状态")
+        } else if binary == "curl" && lower.iter().any(|word| {
+            matches!(word.as_str(), "post" | "put" | "delete" | "patch" | "-d" | "--data" | "--data-raw" | "--data-binary" | "-f" | "--form" | "-t" | "--upload-file" | "-o" | "--output")
+                || word.starts_with("-xpost") || word.starts_with("-xput") || word.starts_with("-xdelete")
+                || word.starts_with("--data=") || word.starts_with("--output=")
+                || word.strip_prefix("--request=").is_some_and(|method| matches!(method, "post" | "put" | "delete" | "patch"))
+        }) {
+            Some("请求或输出操作会产生写入副作用")
+        } else if has_inline_interpreter_workspace_mutation(&payload.to_ascii_lowercase()) {
+            Some("脚本会写入文件")
+        } else { None };
+        if let Some(reason) = reason { return Some((segment, reason)); }
+    }
+    None
+}
+
+// Preserve quoted arguments as a single data word; expose only unquoted output
+// redirections as operators. Never search query arguments for command names.
+fn review_shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped { word.push(ch); escaped = false; continue; }
+        if ch == '\\' && quote != Some('\'') { escaped = true; continue; }
+        if quote == Some(ch) { quote = None; continue; }
+        if quote.is_some() { word.push(ch); continue; }
+        if matches!(ch, '\'' | '"') { quote = Some(ch); continue; }
+        if ch.is_whitespace() || ch == '>' {
+            if !word.is_empty() { words.push(std::mem::take(&mut word)); }
+            if ch == '>' && words.last().is_none_or(|word| word != ">") { words.push(">".to_owned()); }
+        } else { word.push(ch); }
+    }
+    if !word.is_empty() { words.push(word); }
+    words
+}
+
 pub fn command_is_read_only_probe(command: &str) -> bool {
     let control = shell_control_text(command);
     let segments = shell_verification_segments(&control)

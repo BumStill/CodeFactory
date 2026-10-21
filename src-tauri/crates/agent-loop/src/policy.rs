@@ -632,6 +632,56 @@ pub fn completion_command_and_kind(
 }
 
 #[cfg(test)]
+mod m138_tests {
+    use super::*;
+
+    fn denial(command: &str) -> Option<String> {
+        capability_denial(TurnCapability::ReviewOnly, "bash", command,
+            &ToolKind::Mutation, &serde_json::json!({"command": command}))
+    }
+
+    #[test]
+    fn m138_readonly_compositions_are_allowed() {
+        for command in [
+            "git status --short; git log -1 --oneline; gh pr view --json number,state 2>/dev/null; ps -eo pid,etime,args | grep '[s]leep 60'",
+            "ls > /dev/null", "ps | grep x", "git status && gh pr checks || gh run list\ndate",
+            "git branch; git remote -v; git rev-parse HEAD; git ls-files",
+            "unknown-query --summary | head", "grep 'rm x; git commit; > output' README.md",
+            "find . -name '*.rs'", "env; which git; cat a | wc -l",
+        ] {
+            assert!(denial(command).is_none(), "{command}: {:?}", denial(command));
+        }
+    }
+
+    #[test]
+    fn m138_explicit_side_effects_are_denied() {
+        for command in [
+            "git status; git commit -m x", "cat a > b", "ls >> /tmp/m138-output",
+            "unknown-query > output", "ps | tee output", "git branch -D synthetic",
+            "git -C repo push", "gh pr create", "gh workflow run ci", "npm install x",
+            "curl -X POST https://example.invalid", "curl -XPUT https://example.invalid",
+            "find . -delete", "find . -exec rm {} \\;", "chmod +x a", "touch a",
+            "env rm a", "bash -c 'git status; rm a'", "echo $(touch a)",
+            "(git status; rm a)", "bash -c 'touch a'", "gem install x",
+            "cat a 1>output", "ls >| output", "curl --request=DELETE https://example.invalid",
+            "git status && mkdir a", "git status || cp a b", "git status\nmv a b",
+        ] {
+            assert!(denial(command).is_some(), "{command}");
+        }
+    }
+
+    #[test]
+    fn m138_denial_names_segment_and_reason() {
+        let denial = denial("git status; git commit -m x").unwrap();
+        assert!(denial.contains("git commit -m x"), "{denial}");
+        assert!(!denial.contains("git status"), "{denial}");
+        assert!(denial.contains("写入") || denial.contains("副作用"), "{denial}");
+        assert!(denial.chars().count() < 160, "{denial}");
+        assert!(!denial.contains("high-risk"), "{denial}");
+    }
+}
+
+#[cfg(test)]
 mod m130_tests {
     use super::*;
 
@@ -775,13 +825,7 @@ fn is_planning_document_write(tool_name: &str, args: &serde_json::Value) -> bool
 /// Without it the model retries the same write through a heredoc, then a patch,
 /// then hands the blocker to the user (2026-07-30 field report).
 fn review_only_denial(tool_name: &str) -> String {
-    format!(
-        "已跳过与当前显式只读意图冲突的 `{tool_name}` 变更动作；这不是账号权限、GitHub 权限或 high-risk 命令判定。\
-继续完成当前只读目标，不要要求用户重复确认；后续用户意图变化时重新逐动作判断。\
-需要把方案落盘时，用 `write_file` 或 `edit_file` 写 `docs/` 下的 Markdown 文档\
-（例如 `docs/plans/<slug>.md`），不要用 shell、heredoc 或 patch 写文件。\
-代码、配置、测试以及 AGENTS.md / CLAUDE.md / README.md 在当前显式只读约束下不修改。"
-    )
+    format!("当前是只读任务，已跳过 `{tool_name}`：该工具会写入或产生副作用；方案文档请用 write_file 写入 docs/，不要要求用户重复确认。")
 }
 
 /// Appended to the write tools' schema on a review turn, so the model learns the
@@ -845,8 +889,12 @@ pub fn capability_denial(
             if is_planning_document_write(tool_name, args) {
                 return None;
             }
-            let mutating = matches!(kind, ToolKind::Mutation | ToolKind::BackgroundServiceStart)
-                || (tool_name == "bash" && is_delivery_command(_command));
+            if tool_name == "bash" {
+                return codefactory_agent_core::review_command_mutation(_command).map(|(segment, reason)| {
+                    format!("当前是只读任务，已跳过片段 `{segment}`：{reason}；不要要求用户重复确认。")
+                });
+            }
+            let mutating = matches!(kind, ToolKind::Mutation | ToolKind::BackgroundServiceStart);
             if mutating || !is_review_safe_named_tool(tool_name) {
                 Some(review_only_denial(tool_name))
             } else {
@@ -1592,12 +1640,12 @@ mod tests {
             &serde_json::json!({"command": "python3 -"}),
         )
         .expect("shell mutation must be denied");
-        assert!(denial.contains("write_file"), "names the allowed tool");
-        assert!(denial.contains("docs/"), "names the allowed location");
+        assert!(denial.contains("python3"), "names the denied segment");
+        assert!(denial.contains("写入"), "explains the side effect");
         assert!(denial.contains("不要要求用户重复确认"));
         assert!(!denial.contains("请由用户明确要求"));
         assert!(!denial.contains("本回合"));
-        assert!(denial.contains("不是账号权限"));
+        assert!(!denial.contains("账号权限"));
     }
 
     #[test]
