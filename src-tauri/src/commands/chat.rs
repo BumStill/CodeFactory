@@ -1262,6 +1262,7 @@ async fn clear_chat_running_if_current(
         .is_some_and(|current| Arc::ptr_eq(current, completed_control))
     {
         flags.remove(session_id);
+        crate::unregister_session_executor(session_id, completed_control);
     }
 }
 
@@ -1280,8 +1281,142 @@ async fn admit_chat_run(
     if active.contains_key(session_id) {
         return Err(AppError::Other("CHAT_RUN_BUSY".into()));
     }
+    crate::register_session_executor(session_id, &control);
     active.insert(session_id.to_string(), control);
     Ok(())
+}
+
+/// Synthetic executable acceptance: a real desktop transport waits on HTTP while
+/// the production heartbeat derivation and startup/heartbeat selector run.
+#[cfg(not(test))]
+pub(crate) async fn thin_executor_liveness_smoke() -> anyhow::Result<serde_json::Value> {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    let fixture = tempfile::tempdir()?;
+    let pool = crate::storage::db::connect("sqlite::memory:").await?;
+    let session = format!("synthetic-liveness-{}", Uuid::new_v4());
+    sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,permission_mode,created_at,updated_at,delivery_mode) VALUES (?,'synthetic',?,'synthetic-model','trusted',1,1,'thin')")
+        .bind(&session).bind(fixture.path().to_string_lossy().as_ref()).execute(&pool).await?;
+    let control = Arc::new(crate::ChatRunControl::pending());
+    let runs: crate::ChatCancelMap = Default::default();
+    admit_chat_run(&runs, &std::sync::atomic::AtomicBool::new(false), &session, control.clone()).await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let admission = admit_persisted_chat_turn(&pool, &control, &session, None, "只读回答 synthetic greeting，不需要编程或交付。")
+        .await.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let base = format!("http://{}", listener.local_addr()?);
+    listener.set_nonblocking(true)?;
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let tool_command = if cfg!(windows) {
+        "Start-Sleep -Seconds 3; Write-Output 'Synthetic greeting complete.'"
+    } else {
+        "sleep 3; printf 'Synthetic greeting complete.\\n'"
+    };
+    let server = std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut arrived_tx = Some(arrived_tx);
+        for round in 0..2 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    anyhow::ensure!(std::time::Instant::now() < deadline, "model request never arrived");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let count = stream.read(&mut chunk)?;
+            anyhow::ensure!(count > 0, "truncated model request");
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length = headers.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    if key.eq_ignore_ascii_case("content-length") { value.trim().parse::<usize>().ok() } else { None }
+                }).unwrap_or(0);
+                if request.len() >= end + 4 + length { break; }
+            }
+        }
+        if round == 0 {
+            let _ = arrived_tx.take().expect("first request").send(());
+            release_rx.recv_timeout(Duration::from_secs(30))?;
+            let delta = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"synthetic-fetch","type":"function","function":{"name":"bash","arguments":serde_json::json!({"command":tool_command,"description":"synthetic read-only liveness wait","timeout_sec":15}).to_string()}}]},"finish_reason":null}]});
+            let body = format!("data: {delta}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n");
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)?;
+            continue;
+        }
+        let body = "data: {\"id\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic greeting complete.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)?;
+        }
+        Ok(())
+    });
+    let history = crate::storage::load_agent_history(&pool, &session).await?;
+    let sink = Arc::new(crate::agent::events::CollectingEventSink::new());
+    let mut agent = crate::agent::AgentLoop::new_headless(
+        sink.clone(), pool.clone(), session.clone(),
+        "synthetic-endpoint".into(), "synthetic-model".into(), base, "synthetic-key".into(),
+        crate::config::settings::ApiStyle::Openai, fixture.path().to_path_buf(),
+        Arc::new(tokio::sync::RwLock::new(crate::config::settings::Settings::default())),
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        Arc::new(crate::mcp::McpManager::new()), None, crate::agent::AgentMode::Interactive,
+    ).with_cancel(control.cancel.clone());
+    let runner = tokio::spawn(async move { agent.run(history).await });
+    tokio::time::timeout(Duration::from_secs(30), arrived_rx).await??;
+    for _ in 0..3 {
+        anyhow::ensure!(!runner.is_finished(), "model wait was not exercised");
+        let state = crate::agent::thin_derive::refresh(&pool, &session).await?;
+        anyhow::ensure!(state.state == crate::agent::thin_state::SessionState::Running, "heartbeat ended a live model wait");
+        for grace in [0, crate::agent::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS] {
+            let selected = crate::agent::thin_restart::running_without_executor(
+                &pool, Utc::now().timestamp_millis() + 3_600_000, grace,
+                |id| crate::session_executor_alive(id) != Some(false),
+            ).await?;
+            anyhow::ensure!(!selected.contains(&session), "recovery selected a live model wait");
+        }
+        anyhow::ensure!(!control.cancel.load(Ordering::SeqCst), "heartbeat cancelled the run");
+    }
+    release_tx.send(())?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if sink.events().iter().any(|event| matches!(event,
+                crate::openrouter::types::StreamEvent::ToolCallStart { name, .. } if name == "bash")) { break; }
+            anyhow::ensure!(!runner.is_finished(), "run ended before tool wait: {:?}", sink.events());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    }).await??;
+    for _ in 0..3 {
+        anyhow::ensure!(!runner.is_finished(), "tool wait was not exercised");
+        anyhow::ensure!(crate::agent::thin_derive::refresh(&pool, &session).await?.state == crate::agent::thin_state::SessionState::Running, "heartbeat ended tool wait");
+        for grace in [0, crate::agent::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS] {
+            let selected = crate::agent::thin_restart::running_without_executor(&pool,
+                Utc::now().timestamp_millis() + 3_600_000, grace,
+                |id| crate::session_executor_alive(id) != Some(false)).await?;
+            anyhow::ensure!(!selected.contains(&session), "recovery selected live tool wait");
+        }
+        anyhow::ensure!(!control.cancel.load(Ordering::SeqCst), "heartbeat cancelled tool wait");
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(45), runner).await??
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    anyhow::ensure!(outcome.final_text == "Synthetic greeting complete.", "wrong final answer: {:?}", outcome.final_text);
+    server.join().map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
+    crate::agent::thin_state::settle_final(&pool, &session, &admission.root_turn_id, None).await?;
+    clear_chat_running_if_current(&runs, &session, &control).await;
+    let state = crate::agent::thin_derive::refresh(&pool, &session).await?;
+    anyhow::ensure!(state.state == crate::agent::thin_state::SessionState::Ended, "answer did not settle");
+    let answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant' AND content='Synthetic greeting complete.'")
+        .bind(&session).fetch_one(&pool).await?;
+    anyhow::ensure!(answers == 1, "expected exactly one persisted answer, got {answers}");
+    let tool_results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='tool' AND content LIKE '%Synthetic greeting complete.%'")
+        .bind(&session).fetch_one(&pool).await?;
+    anyhow::ensure!(tool_results == 1, "real bash result was not persisted");
+    Ok(serde_json::json!({"ok":true,"model_transport":"real_http_sse_synthetic_provider","heartbeat_ticks":6,"startup_and_heartbeat_scans":12,"final_state":"ended","answers":answers,"dispatch_exercised":false,"tool_wait_exercised":true,"bash_results":tool_results}))
 }
 
 fn chat_settlement_status(objective: &crate::agent::objective::ObjectiveSnapshot) -> &'static str {
@@ -3774,6 +3909,17 @@ pub(crate) async fn resume_thin_running_session(
     let thin = crate::agent::thin_state::load(&db, &session_id)
         .await.map_err(|error| AppError::Other(error.to_string()))?
         .unwrap_or_else(crate::agent::thin_state::ThinState::running);
+    if thin.state != crate::agent::thin_state::SessionState::Running {
+        return Ok(());
+    }
+    let eligible = crate::agent::thin_restart::running_without_executor(
+        &db, Utc::now().timestamp_millis(),
+        crate::agent::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS,
+        |id| crate::session_executor_alive(id) != Some(false),
+    ).await?;
+    if !eligible.contains(&session_id) {
+        return Ok(());
+    }
     let resumable: Option<(String, String, i64, i64)> = sqlx::query_as(
         "SELECT turn.root_turn_id, objective.id, objective.revision, turn.updated_at
          FROM chat_turn_state turn
@@ -4615,6 +4761,41 @@ fn select_chat_mode(
 mod tests {
     use super::*;
     use crate::agent::failover::{ActiveRouteState, EndpointHealthRegistry};
+
+    #[tokio::test]
+    async fn live_executor_without_durable_registration_survives_three_ticks() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('live-no-row','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&pool).await.unwrap();
+        let runs: crate::ChatCancelMap = Default::default();
+        let reserved = std::sync::atomic::AtomicBool::new(false);
+        let control = Arc::new(crate::ChatRunControl::pending());
+        admit_chat_run(&runs, &reserved, "live-no-row", control.clone()).await.unwrap();
+        for _phase in ["admission", "model_wait", "tool_wait"] {
+            let state = crate::agent::thin_derive::refresh(&pool, "live-no-row").await.unwrap();
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::Running);
+            assert!(!control.cancel.load(Ordering::SeqCst));
+            let candidates = crate::agent::thin_restart::running_without_executor(
+                &pool, Utc::now().timestamp_millis(), 0,
+                |id| runs.try_lock().unwrap().contains_key(id),
+            ).await.unwrap();
+            assert!(candidates.is_empty());
+        }
+        sqlx::query("INSERT INTO chat_session_cancel_intents(session_id,status,requested_at,updated_at) VALUES ('live-no-row','requested',?,?)")
+            .bind(Utc::now().timestamp_millis()).bind(Utc::now().timestamp_millis())
+            .execute(&pool).await.unwrap();
+        assert_eq!(crate::agent::thin_derive::refresh(&pool, "live-no-row").await.unwrap().state,
+            crate::agent::thin_state::SessionState::Ended,
+            "a live task unwinding after stop must not reopen the session");
+        clear_chat_running_if_current(&runs, "live-no-row", &control).await;
+        drop(control);
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('live-answer','live-no-row','assistant','Synthetic answer',?)")
+            .bind(Utc::now().timestamp_millis()).execute(&pool).await.unwrap();
+        let state = crate::agent::thin_derive::refresh(&pool, "live-no-row").await.unwrap();
+        assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+        assert!(state.reason.as_deref().unwrap().starts_with("cancelled"));
+    }
+
 
     #[tokio::test]
     async fn thin_settlement_persists_completed_or_nonfailure_wake_wait() {
