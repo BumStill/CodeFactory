@@ -59,6 +59,33 @@ fn is_external_failure(reason: &str) -> bool {
     reason.contains("检查失败：") || reason.contains("已关闭但未合并") || reason.contains("存在合并冲突") || reason.contains("被合并队列退回")
 }
 
+/// M150：把一次观测结果落库。
+/// 关键约束：失败原因**只是当下事实的投影**，不是历史资产。当最新观测不再包含
+/// 任何失败（典型：PR 已合并，或 PR 从未打开过），旧失败原因必须清除；否则
+/// `COALESCE` 会让它永久存活，同时 `closeout_queued` 归零，于是每轮心跳都重排
+/// 一次修复唤醒，反复消耗模型与 API 额度（现场：PR #829 合并后仍每 60s 唤醒）。
+/// 非失败原因（合并完成）不清除，它代表已经发生的事实。
+async fn apply_observation(
+    db: &SqlitePool,
+    session: &str,
+    number: i64,
+    ceiling: &str,
+    reason: Option<&str>,
+    merged_at: Option<i64>,
+) -> sqlx::Result<()> {
+    let stale_failure = reason.is_none() && sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM thin_external_observations WHERE session_id=? AND (completed_reason LIKE '%检查失败：%' OR completed_reason LIKE '%已关闭但未合并%')",
+    ).bind(session).fetch_one(db).await? == 1;
+    if stale_failure {
+        sqlx::query("UPDATE thin_external_observations SET completed_reason=NULL,merged_at=COALESCE(?,merged_at) WHERE session_id=? AND pr_number=? AND ceiling=?")
+            .bind(merged_at).bind(session).bind(number).bind(ceiling).execute(db).await?;
+        return Ok(());
+    }
+    sqlx::query("UPDATE thin_external_observations SET closeout_queued=CASE WHEN completed_reason IS ? THEN closeout_queued ELSE 0 END,completed_reason=COALESCE(?,completed_reason),merged_at=COALESCE(?,merged_at) WHERE session_id=? AND pr_number=? AND ceiling=?")
+        .bind(reason).bind(reason).bind(merged_at).bind(session).bind(number).bind(ceiling).execute(db).await?;
+    Ok(())
+}
+
 /// 合并时间（gh `mergedAt`，RFC3339）→ 毫秒；未知即 None（不伪造事实）。
 fn merged_at_millis(pr: &serde_json::Value) -> Option<i64> {
     let raw = pr["mergedAt"].as_str()?;
@@ -169,8 +196,7 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
             Some((failure_reason(&pr, number).or_else(|| completion_reason(&pr, &observe_ceiling, released, number)), merged_at))
         }).await.ok().flatten();
         if let Some((reason, merged_at)) = observed {
-            sqlx::query("UPDATE thin_external_observations SET closeout_queued=CASE WHEN completed_reason IS ? THEN closeout_queued ELSE 0 END,completed_reason=COALESCE(?,completed_reason),merged_at=COALESCE(?,merged_at) WHERE session_id=? AND pr_number=? AND ceiling=?")
-                .bind(reason.as_deref()).bind(reason.as_deref()).bind(merged_at).bind(session).bind(number).bind(&ceiling).execute(db).await?;
+            apply_observation(db, session, number, &ceiling, reason.as_deref(), merged_at).await?;
         }
     }
     let pending: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
@@ -806,6 +832,42 @@ mod tests {
         assert_eq!(mine, 0, "已有 2 个收尾回合在排队时必须让出额度");
         let queued: i64 = sqlx::query_scalar("SELECT closeout_queued FROM thin_external_observations WHERE session_id='derive'").fetch_one(&db).await.unwrap();
         assert_eq!(queued, 0, "被限流的会话要留待下一轮，不得静默标记完成");
+    }
+
+    /// M150：PR 已合并、但 ceiling 是 ThroughRelease 且还没发布时，新观测既不是失败
+    /// 也不是完成。旧失败原因必须被清除——否则 COALESCE 会永久保留它、同时把
+    /// closeout_queued 重置为 0，于是每轮心跳都重排一次 thin-repair 唤醒
+    /// （现场：PR #829 合并后仍每 60s 收到同一条失败唤醒）。
+    #[tokio::test]
+    async fn m150_terminal_pr_clears_stale_failure_instead_of_requeueing_repair() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',829,'ThroughRelease')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued) VALUES ('derive',829,'ThroughRelease',1,'PR #829 检查失败：scenario-gate-pr',1)")
+            .execute(&db).await.unwrap();
+        apply_observation(&db, "derive", 829, "ThroughRelease", None, Some(1_792_622_995_000)).await.unwrap();
+        let row: (Option<String>, i64, Option<i64>) = sqlx::query_as(
+            "SELECT completed_reason,closeout_queued,merged_at FROM thin_external_observations WHERE session_id='derive'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(row.0, None, "合并后旧失败原因必须清除");
+        assert_eq!(row.1, 1, "清除失败不得把 closeout_queued 归零，否则会再排一次修复唤醒");
+        assert_eq!(row.2, Some(1_792_622_995_000), "合并时间仍要落库");
+    }
+
+    /// M150 的反向保护：PR 仍开着且出现新失败时，必须照旧重新排队一次修复回合。
+    #[tokio::test]
+    async fn m150_live_pr_new_failure_still_requeues() {
+        let db = fixture().await;
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',829,'ThroughMerge')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason,closeout_queued) VALUES ('derive',829,'ThroughMerge',1,'PR #829 检查失败：unit-tests',1)")
+            .execute(&db).await.unwrap();
+        apply_observation(&db, "derive", 829, "ThroughMerge", Some("PR #829 检查失败：scenario-gate-pr"), None).await.unwrap();
+        let row: (Option<String>, i64) = sqlx::query_as(
+            "SELECT completed_reason,closeout_queued FROM thin_external_observations WHERE session_id='derive'",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(row.0.as_deref(), Some("PR #829 检查失败：scenario-gate-pr"));
+        assert_eq!(row.1, 0, "新失败必须重新排队一次修复回合");
     }
 
     /// M146/R4+R5 的唤醒侧：此前的用例只断言 `failure_reason` 的文案，没有断言冲突
