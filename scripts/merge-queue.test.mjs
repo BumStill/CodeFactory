@@ -84,6 +84,7 @@ import {
   drainQueue,
   watchQueue,
   versionBumpHandoff,
+  resolveSquashSubject,
   verifyRequiredChecks,
   releaseMergedBatch,
 } from './merge-queue.mjs';
@@ -1042,4 +1043,60 @@ test('M127 — runQueue records the failing check so the block can self-heal', a
   await runQueue(adapter, {});
   assert.equal(adapter.calls.blocked.length, 1);
   assert.equal(adapter.calls.blocked[0].checkName, 'check-frontend');
+});
+
+// ---------------------------------------------------------------------------
+// M147: a stale PR title must not relabel the whole release batch
+// ---------------------------------------------------------------------------
+
+test('M147: a PR title copied from an already-merged base commit yields to the PR own subject', () => {
+  const base = ['chore: bump version to 1.91.15 (#820)', 'fix(chat): 准入栈帧装箱'];
+  assert.equal(
+    resolveSquashSubject(
+      'chore: bump version to 1.91.15 (#820)',
+      ['M146: 回退 scenario-registry 改动\n\nbody'],
+      base,
+    ),
+    'M146: 回退 scenario-registry 改动',
+  );
+});
+
+test('M147: a genuine version-bump title is kept even when the base tip shares it', () => {
+  // Corrected expectation: once the PR-number suffix is normalised away the
+  // candidate and the newest own subject are both stale, and M147 must keep
+  // the candidate rather than substitute the already-merged subject.
+  assert.equal(
+    resolveSquashSubject('chore: bump version to 1.91.15', ['chore: bump version to 1.91.15'],
+      ['chore: bump version to 1.91.15 (#820)']),
+    'chore: bump version to 1.91.15',
+  );
+});
+
+test('M147: an accurate PR title is never rewritten', () => {
+  const base = ['chore: bump version to 1.91.15 (#820)'];
+  assert.equal(
+    resolveSquashSubject('fix(chat): 收尾回填与唤醒准入', ['wip: 中间提交'], base),
+    'fix(chat): 收尾回填与唤醒准入',
+  );
+});
+
+test('M147: several PR commits pick the newest non-stale subject', () => {
+  const base = ['chore: bump version to 1.91.15 (#820)'];
+  assert.equal(
+    resolveSquashSubject(
+      'chore: bump version to 1.91.15 (#820)',
+      ['docs: 记录规格', 'fix(chat): 真正的修复'],
+      base,
+    ),
+    'fix(chat): 真正的修复',
+  );
+});
+
+test('M147: with no better subject the candidate is kept instead of inventing one', () => {
+  assert.equal(
+    resolveSquashSubject('chore: bump version to 1.91.15 (#820)',
+      ['chore: bump version to 1.91.15 (#820)'], ['chore: bump version to 1.91.15 (#820)']),
+    'chore: bump version to 1.91.15 (#820)',
+  );
+  assert.equal(resolveSquashSubject('', [], []), 'fix: synthetic change');
 });
