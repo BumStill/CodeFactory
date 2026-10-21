@@ -30,4 +30,4 @@ R5：dev app 浏览器只读和网页读取实测未执行。真机验收由编�
 
 README-Update: reviewed
 README-Update-Reason: 内部活性及恢复修复，不改变公开产品承诺。
-Scenario-Test: SC-001
+Scenario-Test: CXD-001, HLT-001, HLT-003, HLT-004, HLT-005, RTE-003, RTE-004
