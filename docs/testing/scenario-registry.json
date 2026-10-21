@@ -433,7 +433,7 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/http_util.rs", "src-tauri/src/agent/model_transport.rs", "src-tauri/src/agent/internal_text.rs", "src-tauri/src/openrouter/client.rs", "src-tauri/src/agent/mod.rs", "src-tauri/src/agent/objective.rs", "src-tauri/src/agent/stop_fence.rs", "src-tauri/src/commands/chat.rs", "src/components/MessageList.tsx"],
+      "change_patterns": ["src-tauri/src/http_util.rs", "src-tauri/src/agent/model_transport.rs", "src-tauri/src/agent/internal_text.rs", "src-tauri/src/openrouter/client.rs", "src-tauri/src/agent/mod.rs", "src/components/MessageList.tsx"],
       "automated_by": ["rust:model_request_without_first_byte_times_out_instead_of_hanging", "rust:model_request_budgets_are_finite", "rust:first_byte_timeout_classifies_as_transport_failure", "path:src/components/MessageList.turnStatus.test.tsx"],
       "required_evidence": ["L0", "L1", "L2"],
       "gates": ["pull_request"]
