@@ -276,16 +276,12 @@ pub async fn sweep(db: &SqlitePool, now_ms: i64) -> sqlx::Result<usize> {
             continue;
         }
         let what = waiting_for.unwrap_or_else(|| "未命名事项".to_string());
-        // M158/R2+R3：外部事项（PR / CI / 发版）是系统自己监视的对象。到期没有
-        // 进展时继续由心跳跟进（派生层会重新登记监视），绝不把内部状态词摆到
-        // 用户面前；只有真正的用户侧等待才问一句他能回答的话。
-        if super::thin::is_system_followed(&what) {
-            continue;
-        }
         let next = ThinState {
             state: SessionState::WaitingUser,
             waiting_for: Some(what.clone()),
-            question: Some(format!("还没等到「{what}」。要我继续等，还是先结束？")),
+            question: Some(format!(
+                "你等的 {what} 已失效（唤醒源不存在或已过期）。需要你决定是否继续等待或结束。"
+            )),
             ..ThinState::running()
         };
         save(db, &session_id, &next).await?;

@@ -33,6 +33,12 @@ fn has_internal_wording(text: &str) -> bool {
         .any(|token| text.contains(token))
 }
 
+/// M158/R2：系统自己盯着的等待。外部对象之外，后台任务 / 定时唤醒这类系统
+/// 占位等待同样不属于用户的决定——它只能由系统心跳跟进或结束，不能问用户。
+fn is_system_followed(what: &str) -> bool {
+    super::thin::is_external_object(what) || what.contains("后台任务") || what.contains("定时唤醒")
+}
+
 /// 从一段会话事实里认最后一个 PR 号：`/pull/<n>` 链接，或「PR #<n>」叙述。
 fn last_pr_number(text: &str) -> Option<i64> {
     let mut number = None;
@@ -580,7 +586,7 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             if let Some(what) = previous
                 .waiting_for
                 .clone()
-                .filter(|what| super::thin::is_system_followed(what))
+                .filter(|what| is_system_followed(what))
             {
                 return Ok(ThinState {
                     state: SessionState::WaitingWake,
@@ -741,6 +747,40 @@ mod tests {
         let expired = refresh(&db, "derive").await.unwrap();
         assert_eq!(expired.state, SessionState::WaitingWake, "监视到期的外部等待仍由系统跟进：{expired:?}");
         assert!(expired.question.is_none());
+    }
+
+    /// M158/R3：历史上写进库里的内部问题（waiting_user + 内部用词）不得永久粘在
+    /// 界面上；派生层用用户能回答的话重写它，且不再出现内部状态词。
+    #[tokio::test]
+    async fn m158_legacy_internal_question_is_rewritten_without_internal_wording() {
+        let db = fixture().await;
+        super::super::thin_state::save(&db, "derive", &ThinState {
+            state: SessionState::WaitingUser,
+            waiting_for: Some("目标目录确认".into()),
+            question: Some("没有活着的唤醒源，请选择继续监视或结束任务".into()),
+            ..ThinState::running()
+        })
+        .await
+        .unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingUser, "{state:?}");
+        let question = state.question.clone().unwrap_or_default();
+        assert!(question.contains("目标目录确认"), "{question}");
+        assert!(!has_internal_wording(&question), "{question}");
+    }
+
+    /// M158/R2：后台任务 / 定时唤醒这类系统占位等待也是系统自己跟进的，
+    /// 到期没有进展时不许把它变成用户的问题。
+    #[tokio::test]
+    async fn m158_system_placeholder_wait_never_becomes_a_user_question() {
+        for what in ["后台任务或未来定时唤醒", "定时唤醒（十分钟后）", "PR / CI 监视"] {
+            let db = fixture().await;
+            super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
+                super::super::thin_state::WaitNeed::External { what: what.into(), covered: false }, "")).await.unwrap();
+            let state = refresh(&db, "derive").await.unwrap();
+            assert_eq!(state.state, SessionState::WaitingWake, "{what}: {state:?}");
+            assert!(state.question.is_none(), "{what}: {:?}", state.question);
+        }
     }
 
     #[test]
