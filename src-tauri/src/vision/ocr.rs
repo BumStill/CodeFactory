@@ -15,6 +15,8 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
+use crate::util::no_window::NoWindow;
+
 /// 一个识别出的文字块及其归一化位置。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OcrWord {
@@ -55,6 +57,7 @@ async fn candidates() -> Vec<&'static str> {
 async fn command_exists(name: &str) -> bool {
     let probe = if cfg!(target_os = "windows") { "where" } else { "which" };
     Command::new(probe)
+        .no_window()
         .arg(name)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -232,6 +235,7 @@ print(lines.joined(separator: "\n"))
         if needs_build {
             std::fs::write(&source, SHIM).map_err(|error| format!("SHIM_WRITE: {error}"))?;
             let output = Command::new("swiftc")
+                .no_window()
                 .arg("-O")
                 .arg("-o")
                 .arg(&binary)
@@ -252,6 +256,7 @@ print(lines.joined(separator: "\n"))
     pub async fn recognize(image_path: &Path) -> Result<OcrResult, String> {
         let binary = shim_binary().await?;
         let output = Command::new(&binary)
+            .no_window()
             .arg(image_path)
             .output()
             .await
@@ -353,6 +358,7 @@ $out -join "`n"
         let script = dir.join("windows-ocr.ps1");
         std::fs::write(&script, SCRIPT).map_err(|error| format!("OCR_WRITE: {error}"))?;
         let output = Command::new("powershell")
+            .no_window()
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-ExecutionPolicy")
@@ -385,6 +391,7 @@ mod tesseract {
 
     pub async fn recognize(image_path: &Path) -> Result<OcrResult, String> {
         let output = Command::new("tesseract")
+            .no_window()
             .arg(image_path)
             .arg("stdout")
             .arg("tsv")

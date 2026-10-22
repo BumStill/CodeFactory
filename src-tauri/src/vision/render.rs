@@ -12,6 +12,8 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
+use crate::util::no_window::NoWindow;
+
 /// 一页渲染结果。
 #[derive(Debug, Clone)]
 pub struct RenderedPage {
@@ -24,6 +26,7 @@ pub struct RenderedPage {
 fn command_exists(name: &str) -> bool {
     let probe = if cfg!(target_os = "windows") { "where" } else { "which" };
     std::process::Command::new(probe)
+        .no_window()
         .arg(name)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -136,6 +139,7 @@ pub async fn quicklook_thumbnail(source: &Path, out_dir: &Path, size: u32) -> Re
     std::fs::create_dir_all(out_dir).map_err(|error| format!("RENDER_DIR: {error}"))?;
     let before = newest_png(out_dir);
     let output = Command::new("qlmanage")
+        .no_window()
         .arg("-t")
         .arg("-s")
         .arg(size.to_string())
@@ -199,6 +203,7 @@ try {
         let script = out_dir.join("export-slide.ps1");
         std::fs::write(&script, SCRIPT).map_err(|error| format!("PPT_SCRIPT: {error}"))?;
         let output = Command::new("powershell")
+            .no_window()
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-ExecutionPolicy")
@@ -240,6 +245,7 @@ mod libreoffice {
         if command_exists("pdftoppm") {
             let prefix = out_dir.join(format!("page-{page}"));
             let output = Command::new("pdftoppm")
+                .no_window()
                 .arg("-f")
                 .arg(page.to_string())
                 .arg("-l")
@@ -270,6 +276,7 @@ mod libreoffice {
         if page == 1 && command_exists("sips") {
             let png = out_dir.join("page-1.png");
             let output = Command::new("sips")
+                .no_window()
                 .arg("-s")
                 .arg("format")
                 .arg("png")
@@ -293,6 +300,7 @@ mod libreoffice {
             return Err("SOFFICE_MISSING: 未安装 LibreOffice".to_string());
         }
         let output = Command::new("soffice")
+            .no_window()
             .arg("--headless")
             .arg("--convert-to")
             .arg("pdf")
