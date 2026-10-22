@@ -42,7 +42,7 @@
 | 位置 | 改动 |
 |---|---|
 | `crates/agent-loop/src/history_repair.rs`（新增） | `repair_interrupted_history`：幂等修复历史 —— 悬空 tool call 补一条明确的「结果未知」tool 结果；孤立 tool 结果（含无 id 的）丢弃；非首条 `system` 降级为 `user`。干净历史原样通过。 |
-| `crates/agent-loop/src/run.rs` | 在唯一的 loop 入口 `run_agent_loop` 解构后立即调用修复，断点续跑、用户「继续」、重试三条路径同时受益。 |
+| `crates/agent-loop/src/run.rs` | 在唯一的 loop 入口 `run_agent_loop` 解构后立即调用修复；断点续跑、用户「继续」和系统自动自愈三条路径同时受益，不需要用户做技术性操作。 |
 | `commands/chat.rs::push_thin_resume_prompt` | 续跑提示改为 `user` 角色，不再覆盖系统提示词。 |
 | `commands/chat.rs` 续跑失败分支 | stop label 带上真实错误首行（截断 160 字符，空则回退旧常量），界面能直接看到被拒绝的原因。 |
 
