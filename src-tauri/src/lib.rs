@@ -1889,6 +1889,10 @@ pub fn run() {
                 objective_pool.clone(),
                 data_dir.join("execution-workspaces"),
             );
+            // M151 R10: a managed worktree can drift (branch switched by the
+            // session itself, directory deleted) while the app is closed. Heal
+            // those once on startup instead of letting the session sit parked.
+            agent::execution_workspace::spawn_incident_healer(objective_pool.clone());
             agent::quota_live::spawn_refresh(app.handle().clone());
             app.manage(commands::terminal::TerminalState::new());
 

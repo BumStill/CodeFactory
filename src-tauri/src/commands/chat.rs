@@ -2293,6 +2293,31 @@ async fn settle_chat_objective_from_error(
     Ok(revised)
 }
 
+/// M151 R10: turn a setup failure into one sentence the user can act on.
+///
+/// The text lands in the conversation/objective diagnostics, so it must not
+/// contain paths, error chains or internal codes.
+fn setup_failure_reason(error: &AppError) -> String {
+    let text = error.to_string();
+    if text.contains("branch changed with uncommitted changes") {
+        return "这个会话的工作区被切到了别的分支，而且还有未提交的改动。系统没有动你的文件：\
+                请提交或暂存后重试，也可以直接新建会话继续。"
+            .to_string();
+    }
+    if text.contains("identity mismatch") {
+        return "这个会话的工作区分支被改动了，系统没能自动切回去，所以这一轮没有开始。\
+                历史和摘要都还在，重试即可继续。"
+            .to_string();
+    }
+    if text.contains("path missing") {
+        return "这个会话的工作区目录不见了，系统没能自动重建，所以这一轮没有开始。\
+                历史和摘要都还在，重试即可继续。"
+            .to_string();
+    }
+    "系统没能准备好这个会话的工作区，这一轮没有开始；历史和摘要都还在，重试即可继续。"
+        .to_string()
+}
+
 /// A detached foreground runner cannot return a settlement error to its IPC
 /// caller. Re-read the durable Objective and, only when the same revision is
 /// still active, transfer the failure to system-owned recovery. A newer or
@@ -4200,7 +4225,7 @@ pub(crate) async fn resume_thin_running_session(
             structured_read_only,
         },
     );
-    let effective_cwd = resolve_chat_execution_cwd(
+    let effective_cwd = match resolve_chat_execution_cwd(
         &app,
         &db,
         &objective_id,
@@ -4208,7 +4233,26 @@ pub(crate) async fn resume_thin_running_session(
         &session.cwd,
         contract.capability,
     )
-    .await?;
+    .await
+    {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            // M151 R10: workspace preparation is the last fallible step before
+            // the model is called. A failure here used to unwind through `?`,
+            // leaving chat_turn_state at `working` with zero model calls — the
+            // session then showed "working" forever. Settle the admitted turn
+            // atomically, with a human reason, before surfacing the error.
+            let reason = setup_failure_reason(&error);
+            if let Err(settle_error) = running_guard.settle_now(Some(&reason)).await {
+                tracing::error!(
+                    session = %session_id,
+                    %settle_error,
+                    "failed to settle admitted chat setup after workspace preparation failed"
+                );
+            }
+            return Err(error);
+        }
+    };
 
     let event_name = format!("stream:{session_id}");
     let app_for_run = app.clone();
@@ -4571,7 +4615,7 @@ async fn resume_chat_objective_inner(
             ));
         }
     };
-    let effective_cwd = resolve_chat_execution_cwd(
+    let effective_cwd = match resolve_chat_execution_cwd(
         &app,
         &db,
         &objective.id,
@@ -4579,7 +4623,24 @@ async fn resume_chat_objective_inner(
         &session.cwd,
         capability,
     )
-    .await?;
+    .await
+    {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            // M151 R10: same contract as the thin-restart path — a workspace
+            // preparation failure settles the admitted turn with a human
+            // reason instead of leaving it `working` forever.
+            let reason = setup_failure_reason(&error);
+            if let Err(settle_error) = running_guard.settle_now(Some(&reason)).await {
+                tracing::error!(
+                    session = %session_id,
+                    %settle_error,
+                    "failed to settle admitted chat setup after workspace preparation failed"
+                );
+            }
+            return Err(error);
+        }
+    };
 
     let event_name = format!("stream:{session_id}");
     let force_context_compression = context_authorization.and_then(|authorization| {
