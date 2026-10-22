@@ -7,7 +7,7 @@
 // leaves evidence behind.
 import { describe, expect, it, vi } from "vitest";
 
-import { captureScreenshot } from "../../scripts/lib/capture-screenshot.mjs";
+import { captureScreenshot } from "./captureScreenshot.mjs";
 
 type Capture = (options: Record<string, unknown>) => Promise<void>;
 

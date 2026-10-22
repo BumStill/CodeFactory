@@ -13,7 +13,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
 import { gotoScenario } from "./headless-acceptance-support.mjs";
-import { captureScreenshot } from "./lib/capture-screenshot.mjs";
+import { captureScreenshot } from "../src/acceptance/captureScreenshot.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
