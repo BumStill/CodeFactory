@@ -3982,6 +3982,242 @@ pub(crate) fn append_release_urgency(message: String, urgency: Option<ReleaseUrg
     )
 }
 
+/// M156 R3: a body trailer is machine-read, so it may carry a pure value only.
+/// Every trailer a delivery body is read for, in the order the tool emits them.
+const PR_TRAILER_KEYS: [&str; 4] = [
+    "release-urgency",
+    "breaking change",
+    "breaking-change",
+    "co-authored-by",
+];
+
+fn pr_trailer_key(line: &str) -> Option<(&'static str, String)> {
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim();
+    PR_TRAILER_KEYS
+        .iter()
+        .find(|canonical| key.eq_ignore_ascii_case(canonical))
+        .map(|canonical| (*canonical, value.trim().to_string()))
+}
+
+/// Split a trailer value into its machine token and whatever prose follows it,
+/// so `immediate —— 说明` keeps the value and loses the explanation from the
+/// trailer line instead of making the whole batch `invalid_urgency`.
+fn split_trailer_value(value: &str) -> (String, String) {
+    let trimmed = value.trim();
+    let end = trimmed
+        .char_indices()
+        .find(|(_, c)| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '—' | '–' | '-' | ',' | '，' | '、' | ';' | '；' | '(' | '（' | ')' | '）' | '。'
+                        | ':' | '：'
+                )
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(trimmed.len());
+    let head = trimmed[..end].to_string();
+    let tail = trimmed[end..]
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '—' | '–' | '-' | ',' | '，' | '、' | ';' | '；' | '(' | '（' | ')' | '）' | '。'
+                        | '.'
+                        | ':'
+                        | '：'
+                )
+        })
+        .to_string();
+    (head, tail)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrTrailerNormalization {
+    pub body: String,
+    pub changed: bool,
+    pub notes: Vec<String>,
+}
+
+/// M156 R3: one trailer paragraph, at the end, deduplicated, with pure values.
+///
+/// Three real failures motivated this: a hand-written
+/// `Release-Urgency: immediate —— 说明` trailer made the whole release batch
+/// `invalid_urgency`; an appended paragraph pushed the trailer out of the final
+/// paragraph so it stopped being a footer; and the same trailer written twice
+/// made the batch ambiguous. The explanation text is rescued into the paragraph
+/// immediately above the footer instead of being dropped.
+pub(crate) fn normalize_pr_body_trailers(
+    body: &str,
+    urgency: Option<ReleaseUrgency>,
+) -> PrTrailerNormalization {
+    let mut notes: Vec<String> = Vec::new();
+    let mut prose: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let mut urgencies: Vec<String> = Vec::new();
+    let mut breaking: Vec<String> = Vec::new();
+    let mut co_authored: Vec<String> = Vec::new();
+    let mut fenced = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            kept.push(line.to_string());
+            continue;
+        }
+        let trailer = (!fenced).then(|| pr_trailer_key(trimmed)).flatten();
+        let Some((key, value)) = trailer else {
+            kept.push(line.to_string());
+            continue;
+        };
+        match key {
+            "release-urgency" => {
+                let (head, tail) = split_trailer_value(&value);
+                let lowered = head.to_ascii_lowercase();
+                if matches!(lowered.as_str(), "immediate" | "hold") {
+                    if urgencies.contains(&lowered) {
+                        notes.push(format!("去重了重复的 `Release-Urgency: {value}`"));
+                    } else {
+                        urgencies.push(lowered);
+                    }
+                    if !tail.is_empty() && !prose.contains(&tail) {
+                        notes.push(format!(
+                            "`Release-Urgency` 只保留纯值 `{head}`，说明文字移到最后一段之前的正文"
+                        ));
+                        prose.push(tail);
+                    }
+                } else {
+                    notes.push(format!(
+                        "删除了非法 `Release-Urgency: {value}`：只允许 `immediate` / `hold` 或不写"
+                    ));
+                }
+            }
+            "breaking change" | "breaking-change" => {
+                let canonical = format!("BREAKING CHANGE: {value}");
+                if !breaking.contains(&canonical) {
+                    breaking.push(canonical);
+                }
+            }
+            _ => {
+                let canonical = format!("Co-Authored-By: {value}");
+                if !co_authored.contains(&canonical) {
+                    co_authored.push(canonical);
+                }
+            }
+        }
+    }
+    if let Some(urgency) = urgency {
+        let value = urgency.as_str().to_ascii_lowercase();
+        if urgencies.iter().any(|existing| existing != &value) {
+            notes.push(format!(
+                "正文里的 Release-Urgency 与本次调用声明的 `{value}` 不一致，以调用声明为准"
+            ));
+        } else if urgencies.is_empty() {
+            notes.push(format!("按本次调用声明补上 `Release-Urgency: {value}`"));
+        }
+        urgencies = vec![value];
+    } else if urgencies.len() > 1 {
+        notes.push(format!(
+            "多个不同的 Release-Urgency（{}）只保留第一个：`{}`",
+            urgencies.join(", "),
+            urgencies[0]
+        ));
+        urgencies.truncate(1);
+    }
+
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut sections: Vec<String> = Vec::new();
+    if !kept.is_empty() {
+        sections.push(kept.join("\n"));
+    }
+    if !prose.is_empty() {
+        sections.push(prose.join("\n"));
+    }
+    let mut trailer_lines: Vec<String> = urgencies
+        .iter()
+        .map(|value| format!("Release-Urgency: {value}"))
+        .collect();
+    trailer_lines.extend(breaking);
+    trailer_lines.extend(co_authored);
+    if !trailer_lines.is_empty() {
+        sections.push(trailer_lines.join("\n"));
+    }
+    let normalized = if sections.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", sections.join("\n\n"))
+    };
+    // A body that is already correct is handed back byte-for-byte: rewriting it
+    // for whitespace alone would churn the PR body and can perturb callers that
+    // pass the reconciled text straight into the release planner.
+    let changed = normalized.trim_end() != body.trim_end();
+    PrTrailerNormalization {
+        body: if changed {
+            normalized
+        } else {
+            body.to_string()
+        },
+        changed,
+        notes,
+    }
+}
+
+/// M156 R4: the fail-closed backstop behind [`normalize_pr_body_trailers`].
+/// Empty means the body's trailers are machine-readable as CI reads them.
+pub(crate) fn pr_body_trailer_problems(body: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut fenced = false;
+    let mut urgencies: Vec<String> = Vec::new();
+    let mut last_trailer_line = None;
+    for (index, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let Some((key, value)) = pr_trailer_key(trimmed) else {
+            continue;
+        };
+        last_trailer_line = Some(index);
+        if key != "release-urgency" {
+            continue;
+        }
+        if !matches!(value.as_str(), "immediate" | "hold") {
+            problems.push(format!(
+                "`Release-Urgency: {value}` 不是纯值：只允许 `immediate` / `hold`，说明文字必须放在上一行"
+            ));
+        }
+        if !urgencies.contains(&value) {
+            urgencies.push(value);
+        }
+    }
+    if urgencies.len() > 1 {
+        problems.push(format!(
+            "正文里出现多个不同的 Release-Urgency（{}），只会有一个生效",
+            urgencies.join(", ")
+        ));
+    }
+    if let Some(index) = last_trailer_line {
+        if body
+            .lines()
+            .skip(index + 1)
+            .any(|line| !line.trim().is_empty())
+        {
+            problems.push(
+                "trailer 不在最后一个段落：追加的正文把它挤出了 footer，发布工具将读不到它"
+                    .to_string(),
+            );
+        }
+    }
+    problems
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ReleaseMetadata {
     urgencies: Vec<String>,
@@ -4468,9 +4704,20 @@ pub(crate) fn prepare_thin_pr_body(
         reconcile_scenario_contract_body(root, remote, &base, body, &mut steps)?;
     let readme_changed = readme_changed_on_branch(root, remote, &base)?;
     let assembled = apply_readme_declaration(&scenario_body, readme_changed)?.body;
-    // `Release-Urgency` belongs in the final paragraph, so it is placed after the
-    // README block and is idempotent when the caller already declared it.
-    let assembled = append_release_urgency(assembled, urgency);
+    // M156 R3: `Release-Urgency`/`BREAKING CHANGE` stay a pure-value footer in the
+    // final paragraph; an appended block can no longer push the trailer out of it.
+    let normalized = normalize_pr_body_trailers(&assembled, urgency);
+    if normalized.changed {
+        steps.push(StepResult::ok("pr_trailers", normalized.notes.join("; ")));
+    }
+    let assembled = normalized.body;
+    let trailer_problems = pr_body_trailer_problems(&assembled);
+    if !trailer_problems.is_empty() {
+        return Err(format!(
+            "PR 正文的 trailer 无法规范化，未推送任何提交：\n- {}",
+            trailer_problems.join("\n- ")
+        ));
+    }
     validate_pr_body_intent(&assembled)?;
     precheck_thin_pr_body(root, title, &format!("{remote}/{base}"), &assembled)?;
     Ok(assembled)
@@ -6066,6 +6313,26 @@ pub async fn deliver<R: DeliveryRemote>(
             ))
         }
     };
+    // M156 R3: the same trailer normalization the thin path runs, so both paths
+    // hand `plan_release` a pure-value footer in the final paragraph.
+    let normalized_body = normalize_pr_body_trailers(&pr_body, opts.release_urgency);
+    if normalized_body.changed {
+        outcome.steps.push(StepResult::ok(
+            "pr_trailers",
+            normalized_body.notes.join("; "),
+        ));
+    }
+    pr_body = normalized_body.body;
+    let trailer_problems = pr_body_trailer_problems(&pr_body);
+    if !trailer_problems.is_empty() {
+        return outcome.blocked_at(StepResult::blocked(
+            "pr_body",
+            format!(
+                "PR 正文的 trailer 无法规范化，未继续远端交付：\n- {}",
+                trailer_problems.join("\n- ")
+            ),
+        ));
+    }
     let mut release_policy = match prepare_release_policy(
         &repo.root,
         &repo.remote,
@@ -19025,6 +19292,151 @@ mod thin_body_contract_tests {
             "validator rejected the generated body\nstdout: {}\nstderr: {}\nbody:\n{body}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// M156 R5: one fixture per real failure from 2026-10-22, driven through the
+/// pure seams so the contract is machine-checked without a network or a repo.
+#[cfg(test)]
+mod m156_trailer_tests {
+    use super::*;
+
+    fn lines_starting_with(body: &str, prefix: &str) -> Vec<String> {
+        body.lines()
+            .filter(|line| line.trim().starts_with(prefix))
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    /// #834 / #836: the body reached `check-frontend` without the two README
+    /// declaration lines, so the README contract failed after the PR was open.
+    #[test]
+    fn missing_readme_declaration_is_restored_exactly_once() {
+        let body = "Summary line for the PR.\n\n## 变更\n\n- one thing\n\nRelease-Urgency: immediate\n";
+        let declared = apply_readme_declaration(body, false)
+            .expect("README declaration must be derivable")
+            .body;
+        let normalized = normalize_pr_body_trailers(&declared, None).body;
+        let decisions = lines_starting_with(&normalized, "README-Update:");
+        assert_eq!(decisions.len(), 1, "{normalized}");
+        assert!(
+            matches!(decisions[0].as_str(), "README-Update: required" | "README-Update: reviewed"),
+            "{normalized}"
+        );
+        let reasons = lines_starting_with(&normalized, "README-Update-Reason:");
+        assert_eq!(reasons.len(), 1, "{normalized}");
+        assert!(
+            reasons[0].trim_start_matches("README-Update-Reason:").trim().len() >= 4,
+            "{normalized}"
+        );
+        assert!(
+            normalized.trim_end().ends_with("Release-Urgency: immediate"),
+            "trailer must stay the footer\n{normalized}"
+        );
+        assert!(pr_body_trailer_problems(&normalized).is_empty(), "{normalized}");
+    }
+
+    /// #842: `Release-Urgency: immediate —— 说明` was not a pure value, so
+    /// `plan_release` answered `invalid_urgency` and skipped the whole batch.
+    #[test]
+    fn hand_written_urgency_explanation_becomes_a_pure_value() {
+        let body = "Summary.\n\nRelease-Urgency: immediate —— 因为主路径坏了\n";
+        assert!(
+            !pr_body_trailer_problems(body).is_empty(),
+            "the fixture must start broken"
+        );
+        let normalized = normalize_pr_body_trailers(body, None);
+        assert!(normalized.changed, "{normalized:?}");
+        assert_eq!(
+            lines_starting_with(&normalized.body, "Release-Urgency:"),
+            vec!["Release-Urgency: immediate".to_string()],
+            "{}",
+            normalized.body
+        );
+        assert!(
+            normalized.body.contains("因为主路径坏了"),
+            "the explanation is kept as prose, not dropped\n{}",
+            normalized.body
+        );
+        assert!(
+            normalized
+                .body
+                .trim_end()
+                .ends_with("Release-Urgency: immediate"),
+            "{}",
+            normalized.body
+        );
+        assert!(pr_body_trailer_problems(&normalized.body).is_empty());
+        // Normalizing twice changes nothing further.
+        let again = normalize_pr_body_trailers(&normalized.body, None);
+        assert!(!again.changed, "{again:?}");
+    }
+
+    /// #834: a paragraph appended after the trailer pushed it out of the final
+    /// paragraph, and the release planner then never saw the trailer.
+    #[test]
+    fn trailer_pushed_out_of_the_last_paragraph_moves_back() {
+        let body = "Summary.\n\nRelease-Urgency: immediate\n\n## 追加\n\n后面又补了一段。\n";
+        assert!(
+            !pr_body_trailer_problems(body).is_empty(),
+            "the fixture must start broken"
+        );
+        let normalized = normalize_pr_body_trailers(body, None);
+        assert!(normalized.changed);
+        assert!(
+            normalized
+                .body
+                .trim_end()
+                .ends_with("Release-Urgency: immediate"),
+            "{}",
+            normalized.body
+        );
+        assert!(normalized.body.contains("后面又补了一段"), "{}", normalized.body);
+        assert!(pr_body_trailer_problems(&normalized.body).is_empty());
+    }
+
+    /// #842 / #834: duplicated or contradictory trailers collapse to exactly
+    /// one machine-read line, and the explicit call argument is authoritative.
+    #[test]
+    fn duplicate_and_conflicting_trailers_collapse_to_one() {
+        let duplicated =
+            "Summary.\n\nRelease-Urgency: immediate\n\nRelease-Urgency: immediate\n";
+        let normalized = normalize_pr_body_trailers(duplicated, None);
+        assert_eq!(
+            lines_starting_with(&normalized.body, "Release-Urgency:"),
+            vec!["Release-Urgency: immediate".to_string()]
+        );
+        assert!(pr_body_trailer_problems(&normalized.body).is_empty());
+
+        let conflicting = "Summary.\n\nRelease-Urgency: immediate\n\nRelease-Urgency: hold\n";
+        let decided = normalize_pr_body_trailers(conflicting, None);
+        assert_eq!(
+            lines_starting_with(&decided.body, "Release-Urgency:"),
+            vec!["Release-Urgency: immediate".to_string()],
+            "{}",
+            decided.body
+        );
+        assert!(decided.notes.iter().any(|note| note.contains("只保留第一个")));
+
+        let explicit = normalize_pr_body_trailers(conflicting, Some(ReleaseUrgency::Hold));
+        assert_eq!(
+            lines_starting_with(&explicit.body, "Release-Urgency:"),
+            vec!["Release-Urgency: hold".to_string()],
+            "{}",
+            explicit.body
+        );
+
+        let invalid = normalize_pr_body_trailers("Summary.\n\nRelease-Urgency: 明天发布\n", None);
+        assert!(lines_starting_with(&invalid.body, "Release-Urgency:").is_empty());
+        assert!(invalid.notes.iter().any(|note| note.contains("非法")));
+        assert!(pr_body_trailer_problems(&invalid.body).is_empty());
+
+        // An urgency the caller supplied is added when the body has none.
+        let added = normalize_pr_body_trailers("Summary.\n", Some(ReleaseUrgency::Immediate));
+        assert_eq!(
+            lines_starting_with(&added.body, "Release-Urgency:"),
+            vec!["Release-Urgency: immediate".to_string()]
         );
     }
 }
