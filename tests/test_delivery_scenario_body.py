@@ -61,5 +61,42 @@ class DeliveryScenarioBodyTests(unittest.TestCase):
             self.assertIn('absent.py', missing.stderr)
 
 
+    def _real_base(self):
+        try:
+            return subprocess.check_output(
+                ['git', '-C', str(ROOT), 'merge-base', 'HEAD', 'origin/main'],
+                text=True, stderr=subprocess.DEVNULL).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return ''
+
+    def test_real_repository_change_set_declares_every_affected_scenario(self):
+        """#842 fixture: the branch's real diff must union every matching pattern."""
+        base = self._real_base()
+        if not base:
+            self.skipTest('origin/main is not available in this checkout')
+        head = subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip()
+        if base == head:
+            self.skipTest('the branch has no committed change against origin/main yet')
+        changed = subprocess.check_output(
+            ['git', '-C', str(ROOT), 'diff', '--name-only', base, 'HEAD'], text=True).split()
+        self.assertTrue(changed, 'the branch must change at least one file')
+        result = subprocess.run(['python3', str(ADAPTER), str(VALIDATOR), str(ROOT), base],
+                                input='Real fixture body\n', text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        declared = [line.strip() for line in json.loads(result.stdout)['body'].splitlines()
+                    if line.startswith('Scenario-Test:')]
+        self.assertEqual(len(declared), 1, declared)
+        ids = {item.strip() for item in declared[0].split(':', 1)[1].split(',') if item.strip()}
+        registry = json.loads((ROOT / 'docs/testing/scenario-registry.json').read_text())
+        import fnmatch
+        expected = set()
+        for scenario in registry['scenarios']:
+            for pattern in scenario.get('change_patterns', []):
+                if any(fnmatch.fnmatch(path, pattern) for path in changed):
+                    expected.add(scenario['id'])
+                    break
+        self.assertTrue(expected <= ids, f'missing {sorted(expected - ids)} for {changed}')
+
+
 if __name__ == '__main__':
     unittest.main()
