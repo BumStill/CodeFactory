@@ -51,6 +51,12 @@ pub(crate) fn is_external_object(what: &str) -> bool {
         .any(|token| ASCII.contains(&token))
 }
 
+/// M158/R2：系统自己盯着的等待。外部对象之外，后台任务/定时唤醒这类系统
+/// 占位等待同样不属于用户的决定——它只能由系统心跳跟进或结束，不能问用户。
+pub(crate) fn is_system_followed(what: &str) -> bool {
+    is_external_object(what) || what.contains("后台任务") || what.contains("定时唤醒")
+}
+
 /// Pending work observed by a tool, not inferred from a legacy failure code.
 pub(crate) async fn record_unwatched_wait(db: &sqlx::SqlitePool, session: &str, waiting_for: &str) -> sqlx::Result<()> {
     sqlx::raw_sql(include_str!("../../migrations/0023_thin_wait_notes.sql")).execute(db).await?;
@@ -168,13 +174,30 @@ mod phase2_state_tests {
     async fn thin_state_round_trips_and_expired_wake_becomes_a_user_question() {
         let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         thin_state::ensure(&db).await.unwrap();
-        thin_state::save(&db, "synthetic-session", &thin_state::after_final(WaitNeed::External { what: "CI 结束".into(), covered: true }, "")).await.unwrap();
-        let loaded = thin_state::load(&db, "synthetic-session").await.unwrap().unwrap();
-        assert_eq!(loaded.state, SessionState::WaitingWake);
+        thin_state::save(&db, "synthetic-session", &thin_state::after_final(WaitNeed::External { what: "客户的回复".into(), covered: true }, "")).await.unwrap();
+        sqlx::query("UPDATE thin_session_state SET updated_at=1 WHERE session_id='synthetic-session'").execute(&db).await.unwrap();
         let swept = thin_state::sweep(&db, i64::MAX / 4).await.unwrap();
         assert_eq!(swept, 1);
+        // 用户侧等待：问题必须是一句用户能回答的话，不含内部状态词。
         let expired = thin_state::load(&db, "synthetic-session").await.unwrap().unwrap();
         assert_eq!(expired.state, SessionState::WaitingUser);
-        assert!(expired.question.as_deref().unwrap_or_default().contains("已失效"));
+        let question = expired.question.unwrap_or_default();
+        assert!(question.contains("客户的回复"), "{question}");
+        assert!(!question.contains("唤醒源"), "M158/R3：内部词不得出现在问题里：{question}");
+    }
+
+    /// M158/R2+R3：等外部事项（PR / CI）到期时不再问用户「要不要继续监视」，
+    /// 只由系统心跳继续观察——这条等待不属于用户的决定。
+    #[tokio::test]
+    async fn m158_expired_external_wait_is_never_a_user_question() {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        thin_state::ensure(&db).await.unwrap();
+        thin_state::save(&db, "synthetic-session", &thin_state::after_final(WaitNeed::External { what: "CI 结束".into(), covered: true }, "")).await.unwrap();
+        sqlx::query("UPDATE thin_session_state SET updated_at=1 WHERE session_id='synthetic-session'").execute(&db).await.unwrap();
+        let swept = thin_state::sweep(&db, i64::MAX / 4).await.unwrap();
+        assert_eq!(swept, 0, "外部事项不是给用户的问题");
+        let kept = thin_state::load(&db, "synthetic-session").await.unwrap().unwrap();
+        assert_eq!(kept.state, SessionState::WaitingWake);
+        assert!(kept.question.is_none());
     }
 }

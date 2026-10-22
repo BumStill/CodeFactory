@@ -26,6 +26,100 @@ async fn has_column(db: &SqlitePool, table: &str, column: &str) -> sqlx::Result<
     Ok(rows.iter().any(|row| row.0 == column))
 }
 
+/// M158/R3：用户可见的文案里不得出现内部状态词（唤醒源 / 外部事项 / 状态名）。
+fn has_internal_wording(text: &str) -> bool {
+    ["唤醒源", "外部事项", "waiting_user", "waiting_wake"]
+        .iter()
+        .any(|token| text.contains(token))
+}
+
+/// 从一段会话事实里认最后一个 PR 号：`/pull/<n>` 链接，或「PR #<n>」叙述。
+fn last_pr_number(text: &str) -> Option<i64> {
+    let mut number = None;
+    let mut rest = text;
+    while let Some(at) = rest.find("/pull/") {
+        let tail = &rest[at + "/pull/".len()..];
+        let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if let Ok(found) = digits.parse::<i64>() {
+            number = Some(found);
+        }
+        rest = tail;
+    }
+    if number.is_some() {
+        return number;
+    }
+    let has_pr_word = text.to_lowercase().contains("pr");
+    if !has_pr_word {
+        return None;
+    }
+    let mut rest = text;
+    while let Some(at) = rest.find('#') {
+        let tail = &rest[at + 1..];
+        let digits: String = tail.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if let Ok(found) = digits.parse::<i64>() {
+            number = Some(found);
+        }
+        rest = tail;
+    }
+    number
+}
+
+/// 最近会话事实里认领的 PR 号；认不出就是没有（不猜）。
+async fn discovered_pr(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
+    if !has_table(db, "messages").await? {
+        return Ok(None);
+    }
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT content FROM messages WHERE session_id=? AND (content LIKE '%/pull/%' OR content LIKE '%PR #%') ORDER BY created_at DESC LIMIT 20",
+    )
+    .bind(session)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.iter().find_map(|(content,)| last_pr_number(content)))
+}
+
+/// M158/R1+R2：授权交付会话开出 PR 后，系统**自己**登记 PR 监视。
+/// 先认已有的交付引用；没有时从会话事实里认领 PR 链接，登记默认交付引用
+/// （ceiling: merged）并建立观测行，让既有心跳（≥180 秒、遵守 GitHub 配额
+/// 策略）立刻接管。这件事绝不再升级成「请选择继续监视或结束任务」。
+pub(crate) async fn ensure_pr_monitor(db: &SqlitePool, session: &str) -> sqlx::Result<Option<i64>> {
+    if !has_table(db, "thin_delivery_refs").await? {
+        return Ok(None);
+    }
+    let existing: Option<(i64, String)> =
+        sqlx::query_as("SELECT pr_number,ceiling FROM thin_delivery_refs WHERE session_id=?")
+            .bind(session)
+            .fetch_optional(db)
+            .await?;
+    let (number, ceiling) = match existing {
+        Some(found) => found,
+        None => match discovered_pr(db, session).await? {
+            Some(number) => {
+                sqlx::query(
+                    "INSERT INTO thin_delivery_refs (session_id,branch,pr_number,ceiling) VALUES (?,?,?,'ThroughMerge') ON CONFLICT(session_id) DO NOTHING",
+                )
+                .bind(session)
+                .bind(format!("pr-{number}"))
+                .bind(number)
+                .execute(db)
+                .await?;
+                (number, "ThroughMerge".to_string())
+            }
+            None => return Ok(None),
+        },
+    };
+    ensure_external(db).await?;
+    sqlx::query(
+        "INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,closeout_queued) VALUES (?,?,?,0,0) ON CONFLICT(session_id) DO UPDATE SET pr_number=excluded.pr_number,ceiling=excluded.ceiling,observed_at=0,completed_reason=NULL,closeout_queued=0 WHERE thin_external_observations.pr_number<>excluded.pr_number",
+    )
+    .bind(session)
+    .bind(number)
+    .bind(&ceiling)
+    .execute(db)
+    .await?;
+    Ok(Some(number))
+}
+
 fn completion_reason(pr: &serde_json::Value, ceiling: &str, released: bool, number: i64) -> Option<String> {
     let terminal = pr["state"] == "MERGED";
     if !terminal || (matches!(ceiling, "ThroughRelease" | "through_release") && !released) {
@@ -435,7 +529,14 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     } else if let Some((_, reason)) = &terminal {
         let previous = super::thin_state::load(db, session).await?;
         // A final answer may deliberately settle to waiting_wake. A stop never does.
-        if stopped_at > 0 || previous.as_ref().is_none_or(|state| state.state != SessionState::WaitingWake) {
+        // M158/R3：历史上写进库里的「没有活着的唤醒源」问题（waiting_user +
+        // 内部用词）同样不算终态，交给下面的派生重新登记监视。
+        let still_waiting = previous.as_ref().is_some_and(|state| {
+            state.state == SessionState::WaitingWake
+                || (state.state == SessionState::WaitingUser
+                    && state.question.as_deref().is_some_and(has_internal_wording))
+        });
+        if stopped_at > 0 || !still_waiting {
             return Ok(ThinState::ended(reason, "本会话记录"));
         }
     }
@@ -457,12 +558,46 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         }
     }
     if let Some(previous) = super::thin_state::load(db, session).await? {
-        if previous.state == SessionState::WaitingWake {
+        // M158/R1+R2+R3：还在等外部事项（PR / CI / 发版）时，系统自己登记监视，
+        // 状态是 waiting_wake；只有真的等用户决定时才问用户，而且用他能回答的话。
+        // 历史上那条「没有活着的唤醒源，请选择继续监视或结束任务」的内部问题
+        // 也在这里被重新派生掉，不让它永久粘在界面上。
+        let internal_limbo = previous.state == SessionState::WaitingUser
+            && previous
+                .question
+                .as_deref()
+                .is_some_and(has_internal_wording);
+        if previous.state == SessionState::WaitingWake || internal_limbo {
+            if let Some(number) = ensure_pr_monitor(db, session).await? {
+                return Ok(ThinState {
+                    state: SessionState::WaitingWake,
+                    waiting_for: Some(format!("等 PR #{number} 的 CI 结果与合并")),
+                    wake_source: Some("系统自动监视（心跳，间隔不少于 180 秒）".into()),
+                    reason: Some(format!("PR #{number} 还没合并，系统会自动跟进，不需要你回复")),
+                    ..ThinState::running()
+                });
+            }
+            if let Some(what) = previous
+                .waiting_for
+                .clone()
+                .filter(|what| super::thin::is_system_followed(what))
+            {
+                return Ok(ThinState {
+                    state: SessionState::WaitingWake,
+                    waiting_for: Some(what),
+                    wake_source: Some("系统自动监视（心跳，间隔不少于 180 秒）".into()),
+                    reason: Some("外部事项仍未完成，系统会自动跟进".into()),
+                    ..ThinState::running()
+                });
+            }
+            let what = previous
+                .waiting_for
+                .clone()
+                .unwrap_or_else(|| "下一步".to_string());
             return Ok(ThinState {
                 state: SessionState::WaitingUser,
-                waiting_for: previous.waiting_for,
-                question: Some("外部事项尚无法确认完成，且没有活着的唤醒源。请选择继续监视或结束任务。".into()),
-                reason: Some("唤醒源已失效；系统自动重试/自愈未取得完成事实".into()),
+                waiting_for: Some(what.clone()),
+                question: Some(format!("还在等「{what}」。要我继续等，还是先结束这个任务？")),
                 ..ThinState::running()
             });
         }
@@ -584,20 +719,28 @@ mod tests {
         assert!(!has_table(&db, "thin_external_observations").await.unwrap());
     }
 
+    /// M158 取代 M140 的「外部等待立刻抛给用户」：等 PR / CI 是系统自己能监视的
+    /// 对象，没有活着的监视源时由系统登记默认心跳，绝不变成用户的问题
+    /// （现场 816bc573 / 9161c74a）。
     #[tokio::test]
-    async fn m140_unwatched_wait_is_immediately_surfaced_but_live_monitor_stays() {
+    async fn m158_external_wait_stays_a_system_wait_with_or_without_a_live_monitor() {
         let db = fixture().await;
         let waiting = super::super::thin_state::after_final(
             super::super::thin_state::WaitNeed::External { what: "交付 PR / CI".into(), covered: false }, "");
         super::super::thin_state::save(&db, "derive", &waiting).await.unwrap();
-        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::WaitingUser);
+        let unwatched = refresh(&db, "derive").await.unwrap();
+        assert_eq!(unwatched.state, SessionState::WaitingWake, "{unwatched:?}");
+        assert!(unwatched.question.is_none(), "外部等待不得变成用户问题：{:?}", unwatched.question);
+        assert!(unwatched.wake_source.unwrap_or_default().contains("系统自动监视"));
         super::super::thin_state::save(&db, "derive", &waiting).await.unwrap();
         super::super::background_tasks::wake_source_cover(&db, "derive").await;
         sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES ('monitor','derive','synthetic','agent_decided',9223372036854775807,'pending',1)")
             .execute(&db).await.unwrap();
         assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::WaitingWake);
         sqlx::query("UPDATE wakeup_schedules SET next_at=1").execute(&db).await.unwrap();
-        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::WaitingUser);
+        let expired = refresh(&db, "derive").await.unwrap();
+        assert_eq!(expired.state, SessionState::WaitingWake, "监视到期的外部等待仍由系统跟进：{expired:?}");
+        assert!(expired.question.is_none());
     }
 
     #[test]
@@ -1022,5 +1165,66 @@ mod tests {
         let state = derive_state(&db, "derive").await.unwrap();
         assert_eq!(state.state, SessionState::Ended);
         assert!(state.reason.unwrap().contains("cancelled"));
+    }
+
+    /// M158/R1+R2+R3（现场：会话 816bc573 / 9161c74a 开完 PR 后停在
+    /// 「外部事项尚无法确认完成，且没有活着的唤醒源。请选择继续监视或结束任务。」）：
+    /// 交付回合结束时，系统必须自己登记 PR 监视，派生 waiting_wake，
+    /// 并且绝不把内部状态词变成给用户的问题。
+    #[tokio::test]
+    async fn m158_opened_pr_registers_system_monitor_instead_of_asking_the_user() {
+        let db = fixture().await;
+        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, ""))
+            .await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('created','derive','assistant','已开 PR：https://github.com/BumStill/CodeFactory/pull/846',100)")
+            .execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "开完 PR 不得停在 waiting_user：{state:?}");
+        assert!(state.question.is_none(), "不得把内部决策变成给用户的问题：{:?}", state.question);
+        assert!(state.waiting_for.as_deref().unwrap_or_default().contains("#846"), "{:?}", state.waiting_for);
+        let reference: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM thin_delivery_refs WHERE session_id='derive' AND pr_number=846",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(reference, 1, "PR 监视必须真的登记成交付引用");
+        let observed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM thin_external_observations WHERE session_id='derive' AND pr_number=846",
+        ).fetch_one(&db).await.unwrap();
+        assert_eq!(observed, 1, "登记之后必须有可被心跳观测的行");
+        for text in [state.waiting_for, state.question, state.reason, state.wake_source].into_iter().flatten() {
+            assert!(!has_internal_wording(&text), "用户可见文案不得含内部词：{text}");
+        }
+    }
+
+    /// M158/R3：已经落库的「没有活着的唤醒源」这一行会被重新派生掉。
+    #[tokio::test]
+    async fn m158_legacy_limbo_row_is_rederived_into_a_system_monitor() {
+        let db = fixture().await;
+        let mut limbo = super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, "");
+        limbo.state = SessionState::WaitingUser;
+        limbo.question = Some("外部事项尚无法确认完成，且没有活着的唤醒源。请选择继续监视或结束任务。".into());
+        super::super::thin_state::save(&db, "derive", &limbo).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('created','derive','assistant','PR #846 已开，等 CI',100)")
+            .execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake, "{state:?}");
+        assert!(state.question.is_none(), "内部问题必须消失：{:?}", state.question);
+        assert!(state.waiting_for.as_deref().unwrap_or_default().contains("#846"));
+    }
+
+    /// M158/R3：真的等用户时，问题写成用户能回答的一句，且不含内部词。
+    #[tokio::test]
+    async fn m158_user_wait_question_uses_plain_wording() {
+        let db = fixture().await;
+        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::Unwatched { what: "客户的回复".into() }, ""))
+            .await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingUser, "{state:?}");
+        let question = state.question.clone().unwrap_or_default();
+        assert!(question.contains("客户的回复"), "{question}");
+        assert!(!has_internal_wording(&question), "内部词不得出现在问题里：{question}");
+        assert!(state.wake_source.is_none() || !has_internal_wording(&state.wake_source.clone().unwrap_or_default()));
     }
 }
