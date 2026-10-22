@@ -34,6 +34,7 @@ import {
   systemOwnsObjective,
 } from "../lib/turnOwnership";
 import { statusBannerView } from "../lib/statusBanner";
+import { invoke } from "../lib/tauri";
 import { sessionTurnState } from "../lib/sessionTurnState";
 import {
   summarizeTurnEvidence,
@@ -949,6 +950,76 @@ function isToolAmplificationNotice(detail: string): boolean {
   return detail.includes("本回合工具调用较多") && detail.includes("收敛剩余步骤");
 }
 
+// M151：卡住的会话必须能自己导出「为什么卡」的事实，并在没有活执行者时被拉回
+// 可用状态。入口就长在「正在做」这句话旁边——用户此刻看的正是这里。
+function StuckSessionRecovery({ sessionId }: { sessionId: string }) {
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const explain = async () => {
+    setBusy(true);
+    try {
+      const report = await invoke<Record<string, unknown>>("session_diagnostics", { sessionId });
+      const text = JSON.stringify(report, null, 2);
+      try {
+        await navigator.clipboard.writeText(text);
+        setNotice("诊断已复制到剪贴板");
+      } catch {
+        const derived = (report?.derived_state as { state?: string } | undefined)?.state;
+        const matching = report?.cache_matches_facts;
+        setNotice(`推导状态 ${derived ?? "未知"}｜缓存与事实${matching ? "一致" : "不一致"}`);
+      }
+    } catch (error) {
+      setNotice(`诊断失败：${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const reset = async () => {
+    setBusy(true);
+    try {
+      const outcome = await invoke<{ reset: boolean; reason?: string | null; resulting_state?: string }>(
+        "reset_session_state",
+        { sessionId },
+      );
+      setNotice(
+        outcome.reset
+          ? `已重置为${outcome.resulting_state === "ended" ? "已结束" : "等待你"}，消息都还在`
+          : outcome.reason || "当前无法重置",
+      );
+    } catch (error) {
+      setNotice(`重置失败：${String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <span data-testid="stuck-session-recovery" className="inline-flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void explain()}
+        title="导出这个会话为什么卡住的事实依据（不含消息正文）"
+        className="rounded-lg border border-surface-4 px-1.5 py-0.5 text-caption text-gray-400 hover:bg-surface-3 disabled:opacity-50"
+      >
+        会话诊断
+      </button>
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void reset()}
+        title="在没有活执行者时把状态拉回可用；不会删除任何消息"
+        className="rounded-lg border border-surface-4 px-1.5 py-0.5 text-caption text-gray-400 hover:bg-surface-3 disabled:opacity-50"
+      >
+        重置会话状态
+      </button>
+      {notice && <span role="status" className="text-caption text-gray-500">{notice}</span>}
+    </span>
+  );
+}
+
 const MessageRow = memo(function MessageRow({
   msg,
   isStreamingTail,
@@ -1384,15 +1455,18 @@ const MessageRow = memo(function MessageRow({
         const copy = thinStateCopy(thin);
         if (!copy || thin.state === "ended") return null;
         return (
-          <div
-            data-testid="thin-state"
-            data-thin-state={thin.state}
-            className="mt-1 inline-flex max-w-[72ch] items-start gap-1.5 text-caption text-gray-400"
-          >
-            <span className="select-none">
-              {thin.state === "waiting_user" ? "需要你决定" : thin.state === "waiting_wake" ? "等唤醒" : "正在做"}
-            </span>
-            <span className="break-words text-gray-500">{copy.replace(/^(需要你决定|等唤醒|正在做)[：:]?/, "")}</span>
+          <div className="mt-1 flex max-w-[72ch] flex-col gap-1">
+            <div
+              data-testid="thin-state"
+              data-thin-state={thin.state}
+              className="inline-flex items-start gap-1.5 text-caption text-gray-400"
+            >
+              <span className="select-none">
+                {thin.state === "waiting_user" ? "需要你决定" : thin.state === "waiting_wake" ? "等唤醒" : "正在做"}
+              </span>
+              <span className="break-words text-gray-500">{copy.replace(/^(需要你决定|等唤醒|正在做)[：:]?/, "")}</span>
+            </div>
+            {conversationKey && <StuckSessionRecovery sessionId={conversationKey} />}
           </div>
         );
       })()}

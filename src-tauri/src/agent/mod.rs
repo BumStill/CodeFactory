@@ -44,6 +44,8 @@ pub mod quota_cap;
 pub mod quota_live;
 pub mod usage_windows;
 pub mod scheduler;
+/// M151：会话级诊断与状态重置（存量会话卡「正在做 · 等待中」）。
+pub mod objective_diagnostics;
 /// CF-STOP：停止栅栏（「停止」真的停下）与 PR 侧的如实收尾。
 pub mod stop_fence;
 pub mod sse_buffer;

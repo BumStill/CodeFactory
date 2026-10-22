@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { UIMessage } from "../stores/chatEvents";
+
+const invokeMock = vi.hoisted(() => vi.fn());
+vi.mock("../lib/tauri", () => ({ invoke: invokeMock }));
+
 import { MessageList } from "./MessageList";
 
 const NOW = new Date("2026-08-18T10:00:00.000Z").getTime();
@@ -406,5 +410,47 @@ describe("inline active-turn status", () => {
     expect(screen.getByTestId("settled-turn-status")).toHaveTextContent(
       "已结束 · 2.5K tokens · 02:00",
     );
+  });
+});
+
+// M151：卡住的会话在「正在做」旁边给出自救入口——导出事实，或在没有活执行者时
+// 重置状态。被拒绝时必须说明原因，不能假装成功。
+describe("stuck session recovery", () => {
+  const stuck = assistant({
+    turnActivity: {
+      rootTurnId: "user",
+      revision: 1,
+      phase: "acting",
+      status: "active",
+      kind: "thin_running",
+      label: "正在做：等待模型返回",
+      waitingReason: null,
+      updatedAt: NOW,
+      terminalReason: null,
+    },
+  });
+
+  it("exports diagnostics and reports a refused reset instead of claiming success", async () => {
+    invokeMock.mockReset();
+    invokeMock
+      .mockResolvedValueOnce({ session_id: "s1", derived_state: { state: "running" }, cache_matches_facts: false })
+      .mockResolvedValueOnce({ reset: false, reason: "会话仍有活着的执行者，请先停止该回合再重置" });
+
+    render(<MessageList messages={[stuck]} streaming={false} cwd={null} conversationKey="s1" />);
+
+    expect(screen.getByTestId("thin-state")).toHaveTextContent("正在做");
+    fireEvent.click(screen.getByRole("button", { name: "会话诊断" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("session_diagnostics", { sessionId: "s1" }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "重置会话状态" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("reset_session_state", { sessionId: "s1" }),
+    );
+    expect(
+      await screen.findByText("会话仍有活着的执行者，请先停止该回合再重置"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/已重置为/)).toBeNull();
   });
 });
