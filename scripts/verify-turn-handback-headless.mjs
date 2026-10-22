@@ -13,6 +13,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright-core";
 import { gotoScenario } from "./headless-acceptance-support.mjs";
+import { captureScreenshot } from "./lib/capture-screenshot.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const viteCli = path.join(root, "node_modules", "vite", "bin", "vite.js");
@@ -182,21 +183,21 @@ async function main() {
     );
     await page.emulateMedia({ reducedMotion: "no-preference" });
 
-    await page.screenshot({ path: path.join(artifactDir, "turn-handback-wide.png"), fullPage: true });
+    await captureScreenshot(page, path.join(artifactDir, "turn-handback-wide.png"));
     await page.setViewportSize({ width: 430, height: 780 });
     await inlineStatus.scrollIntoViewIfNeeded();
     assert(
       await inlineStatus.isVisible(),
       "the compact running receipt must remain visible in a narrow viewport",
     );
-    await page.screenshot({ path: path.join(artifactDir, "turn-handback-narrow.png"), fullPage: true });
+    await captureScreenshot(page, path.join(artifactDir, "turn-handback-narrow.png"));
     for (const theme of ["dark", "light"]) {
       await page.evaluate((value) => document.documentElement.dataset.theme = value, theme);
       assert(!(await page.locator("main").textContent()).includes("M30_LATE_"), "M30 late output must never reach the transcript");
       assert((await page.getByRole("region", { name: "M30 next turn" }).textContent()).includes("M30 新回合正常输出"), "M30 next turn must display normal output");
-      await page.screenshot({ path: path.join(artifactDir, `m30-${theme}-narrow.png`), fullPage: true });
+      await captureScreenshot(page, path.join(artifactDir, `m30-${theme}-narrow.png`));
       await page.setViewportSize({ width: 1366, height: 768 });
-      await page.screenshot({ path: path.join(artifactDir, `m30-${theme}-wide.png`), fullPage: true });
+      await captureScreenshot(page, path.join(artifactDir, `m30-${theme}-wide.png`));
       await page.setViewportSize({ width: 430, height: 780 });
     }
     console.log(JSON.stringify({
