@@ -68,6 +68,9 @@ pub struct RouteCandidatePlan {
     /// next turn (whose plan is rebuilt) brings it straight back once the window
     /// resets.
     quota_skips: Vec<(String, String)>,
+    /// M152：达到"留余量"上限、但没有可用备选时保留首选端点，这里存要给
+    /// 会话看的原因。它不改变当前路由，只负责把软偏好被放弃的理由说清楚。
+    quota_keep_notice: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +87,7 @@ impl RouteCandidatePlan {
             candidates: vec![primary],
             initial_selection: InitialRouteSelection::Preferred,
             quota_skips: Vec::new(),
+            quota_keep_notice: None,
         }
     }
 
@@ -94,6 +98,7 @@ impl RouteCandidatePlan {
             candidates: vec![primary],
             initial_selection: InitialRouteSelection::HealthAware,
             quota_skips: Vec::new(),
+            quota_keep_notice: None,
         }
     }
 
@@ -112,6 +117,16 @@ impl RouteCandidatePlan {
             .iter()
             .find(|(name, _)| name == endpoint)
             .map(|(_, notice)| notice.as_str())
+    }
+
+    /// M152/R1：记录"留余量"没能生效的原因。软偏好被放弃时首选端点留在原位，
+    /// 这句原因照原样出现在会话里，用户不必猜为什么还在用 GPT。
+    pub fn keep_capped_primary(&mut self, notice: String) {
+        self.quota_keep_notice = Some(notice);
+    }
+
+    pub fn quota_keep_notice(&self) -> Option<&str> {
+        self.quota_keep_notice.as_deref()
     }
 
     pub fn push_fallback(&mut self, candidate: RouteCandidate) {
@@ -497,6 +512,7 @@ impl ActiveRouteState {
         let quota_notice = plan
             .quota_notice(&plan.candidates[preferred_index].endpoint_name)
             .map(str::to_string);
+        let keep_notice = plan.quota_keep_notice.clone();
         let current_index = if quota_notice.is_some() {
             let quota_skips = &plan.quota_skips;
             plan.candidates
@@ -505,6 +521,10 @@ impl ActiveRouteState {
                 .skip(preferred_index + 1)
                 .find(|(_, candidate)| {
                     health.is_available(&candidate.endpoint_name)
+                        // M152/R2：留余量的落点必须真的能用。没有凭据的端点在这里
+                        // 就被排除，否则它只会在传输层变成 AUTH_MISSING，连败几次
+                        // 之后把整轮任务结束掉。
+                        && candidate.has_usable_credential()
                         && quota_skips
                             .iter()
                             .all(|(name, _)| name != &candidate.endpoint_name)
@@ -514,20 +534,34 @@ impl ActiveRouteState {
         } else {
             preferred_index
         };
-        let initial_route_change = (current_index > 0).then(|| RouteChange {
-            from_endpoint: plan.candidates[0].endpoint_name.clone(),
-            from_model: plan.candidates[0].model_id.clone(),
-            to_endpoint: plan.candidates[current_index].endpoint_name.clone(),
-            to_model: plan.candidates[current_index].model_id.clone(),
-            reason: quota_notice
-                .clone()
-                .unwrap_or_else(|| "端点处于临时冷却期".into()),
-            kind: if quota_notice.is_some() {
-                RouteChangeKind::QuotaCap
-            } else {
-                RouteChangeKind::Unavailable
-            },
-        });
+        let initial_route_change = if current_index > 0 {
+            Some(RouteChange {
+                from_endpoint: plan.candidates[0].endpoint_name.clone(),
+                from_model: plan.candidates[0].model_id.clone(),
+                to_endpoint: plan.candidates[current_index].endpoint_name.clone(),
+                to_model: plan.candidates[current_index].model_id.clone(),
+                reason: quota_notice
+                    .clone()
+                    .unwrap_or_else(|| "端点处于临时冷却期".into()),
+                kind: if quota_notice.is_some() {
+                    RouteChangeKind::QuotaCap
+                } else {
+                    RouteChangeKind::Unavailable
+                },
+            })
+        } else {
+            // M152/R1：没有可用的留余量落点时留在首选端点上，但要说明原因。
+            keep_notice
+                .filter(|_| preferred_index == 0)
+                .map(|notice| RouteChange {
+                    from_endpoint: plan.candidates[0].endpoint_name.clone(),
+                    from_model: plan.candidates[0].model_id.clone(),
+                    to_endpoint: plan.candidates[0].endpoint_name.clone(),
+                    to_model: plan.candidates[0].model_id.clone(),
+                    reason: notice,
+                    kind: RouteChangeKind::QuotaCap,
+                })
+        };
         Self {
             inner: Arc::new(Mutex::new(ActiveRouteInner {
                 candidates: plan.candidates,
@@ -573,6 +607,9 @@ impl ActiveRouteState {
             // CF-WINDOW-R4/R5：换模型和等待都要如实说出原因，所以分开记两类。
             let mut window_blocked: Vec<String> = Vec::new();
             let mut quota_blocked: Vec<String> = Vec::new();
+            // M152/R1：只到"留余量"上限（还没用满）的端点，在所有候选都不可用
+            // 时仍然是本轮可用的兜底。这里存它的 index 与要显示的说明。
+            let mut soft_keep: Option<(usize, String)> = None;
             // M86：等待说明要列出**全部**原因（时段、额度、缺凭据）与最早可用时间。
             let mut causes: Vec<super::usage_windows::WaitCause> = Vec::new();
             let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
@@ -593,6 +630,32 @@ impl ActiveRouteState {
                     let cap = config.quota_cap_for(&route.endpoint_name);
                     let budget = super::quota_cap::SubscriptionBudget::default();
                     if let Some(breach) = ledger.evaluate(&route.endpoint_name, cap, budget, now).or_else(|| ledger.evaluate(&route.base_url, cap, budget, now)) {
+                        // M152/R2：没有凭据的端点先被排除，绝不能让"留余量"把
+                        // 这一轮交给一个只会在传输层变成 AUTH_MISSING 的路由。
+                        if !route.has_usable_credential() && !ignore_windows {
+                            skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some("route_prefilter:missing_credential".into()) });
+                            causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
+                            return None;
+                        }
+                        // M152/R1：留余量是软偏好。没用满的端点保留为兜底，先让
+                        // 真正可用的其它候选赢；一个都没有时再回到它继续本轮。
+                        if !breach.is_hard_exhausted() {
+                            if soft_keep.is_none() {
+                                let reset = breach.reset_hint(now).map(|hint| format!("，{hint}")).unwrap_or_default();
+                                soft_keep = Some((
+                                    index,
+                                    format!(
+                                        "{} 本{}已用 {}%，当前没有其它可用端点，系统继续使用 {}{}。",
+                                        label,
+                                        breach.window.label(),
+                                        breach.used_percent,
+                                        label,
+                                        reset
+                                    ),
+                                ));
+                            }
+                            return None;
+                        }
                         // M86：额度门禁的预过滤同样是一步要写进路由记录的动作。
                         skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":breach.resets_at_ms}))) });
                         if let Some(next) = breach.resets_at_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
@@ -630,20 +693,28 @@ impl ActiveRouteState {
                 }
                 causes
             };
+            // M152/R1：真正可用的候选优先；一个都没有时回到只到软性上限的端点。
+            let selected = selected.or(soft_keep.as_ref().map(|(index, _)| *index));
+            let keep_reason = selected.and_then(|index| {
+                soft_keep
+                    .as_ref()
+                    .filter(|(kept, _)| *kept == index)
+                    .map(|(_, notice)| notice.clone())
+            });
             if let Some(index) = selected {
                 inner.current_index = index;
                 let to = inner.candidates[index].clone();
                 return Ok((from.endpoint_name != to.endpoint_name || from.model_id != to.model_id).then(|| RouteChange {
                     from_endpoint: from.endpoint_name.clone(), from_model: from.model_id,
                     to_endpoint: to.endpoint_name.clone(), to_model: to.model_id.clone(),
-                    reason: format!(
+                    reason: keep_reason.unwrap_or_else(|| format!(
                         "已切到 {}{}",
                         to.model_id,
                         blocked_causes(&window_blocked, &quota_blocked, next_available)
                             .first()
                             .map(|cause| format!("：{cause}"))
                             .unwrap_or_default()
-                    ),
+                    )),
                     kind: RouteChangeKind::QuotaCap,
                 }));
             }
@@ -1715,6 +1786,101 @@ mod tests {
         let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(Default::default())));
         assert!(!state.has_available_fallback(), "M125: credentials are required for a usable fallback");
+    }
+
+    /// M152/R1：留余量是软偏好。备选端点没有凭据就不算"可用备选"，被跳过的
+    /// 首选端点必须原地留下，而不是把这一轮交给一个注定 AUTH_MISSING 的路由。
+    #[test]
+    fn m152_capped_primary_stays_when_the_fallback_has_no_credential() {
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-5.5"));
+        let mut fallback = route("openrouter", "gpt-5.5");
+        fallback.credential_ref = None;
+        fallback.legacy_inline_api_key = None;
+        plan.push_fallback(fallback);
+        plan.skip_for_quota(
+            "chatgpt",
+            "GPT 本周窗口已用 80%，为给你留余量已切到 OpenRouter，约 18:20 恢复。".into(),
+        );
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        assert_eq!(
+            state.current().endpoint_name, "chatgpt",
+            "M152: 缺凭据的备选不能被当成留余量的落点"
+        );
+        assert!(state.take_initial_route_change().is_none());
+    }
+
+    /// M152/R1 + R4：备选全部硬性不可用时，只到达软性上限（留余量）的首选仍然
+    /// 可用——这一轮继续在它上面跑，并说清楚原因，而不是变成技术失败。
+    #[tokio::test]
+    async fn m152_reserve_capped_primary_is_kept_when_every_alternative_is_blocked() {
+        let mut primary = route("chatgpt", "gpt-5.5");
+        primary.base_url = "https://m152-primary.example".into();
+        let mut fallback = route("chatgpt-backup", "gpt-5.5");
+        fallback.base_url = "https://m152-backup.example".into();
+
+        let mut settings = crate::config::settings::Settings::default();
+        for (name, url) in [
+            ("chatgpt", primary.base_url.clone()),
+            ("chatgpt-backup", fallback.base_url.clone()),
+        ] {
+            settings.endpoints.insert(
+                name.into(),
+                crate::config::settings::Endpoint {
+                    base_url: url,
+                    key_ref: Some(format!("{name}-key-ref")),
+                    api_style: crate::config::settings::ApiStyle::Chatgpt,
+                    custom_models: vec![],
+                    active_model: None,
+                },
+            );
+        }
+
+        let ledger = crate::agent::quota_cap::shared_quota_ledger();
+        let now = crate::agent::usage_windows::now_ms();
+        let quota = |ratio: f64| crate::agent::quota_cap::EndpointQuota {
+            source: crate::agent::quota_cap::UsageSource::ServerReported,
+            five_hour: crate::agent::quota_cap::WindowUsage {
+                used_ratio: ratio,
+                resets_at_ms: Some(now + 1_800_000),
+            },
+            weekly: crate::agent::quota_cap::WindowUsage {
+                used_ratio: 0.1,
+                resets_at_ms: Some(now + 86_400_000),
+            },
+            observed_at_ms: now,
+        };
+        ledger.record_server_usage(&primary.base_url, quota(0.85));
+        ledger.record_server_usage(&fallback.base_url, quota(1.0));
+
+        let mut plan = RouteCandidatePlan::new(primary.clone());
+        plan.push_fallback(fallback.clone());
+        plan.skip_for_quota(
+            "chatgpt",
+            "GPT 本五小时窗口已用 85%，为给你留余量已切到 ChatGPT，约 18:20 恢复。".into(),
+        );
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
+
+        let change = state
+            .admit_model_availability(None, false, None)
+            .await
+            .expect("M152: 没有可用备选时保留 GPT，不得变成技术失败");
+        assert_eq!(state.current().endpoint_name, "chatgpt");
+        let change = change.expect("保留软性上限的端点必须给出说明");
+        assert!(
+            change.notice().contains("继续使用"),
+            "{}",
+            change.notice()
+        );
+
+        ledger.clear(&primary.base_url);
+        ledger.clear(&fallback.base_url);
     }
 
     /// CF-PFB-R6. Fixed mode is a pin: one candidate, no fallback, ever.
