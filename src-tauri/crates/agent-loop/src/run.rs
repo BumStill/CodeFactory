@@ -913,7 +913,7 @@ pub async fn run_agent_loop(
     svc: LoopServices,
 ) -> Result<RunOutcome, LoopError> {
     let LoopInputs {
-        mut messages,
+        messages,
         system_prompt,
         tool_defs,
         completion_instruction,
@@ -924,6 +924,11 @@ pub async fn run_agent_loop(
         knowledge_library_ids,
         cancel,
     } = inputs;
+    // M154：一次回合在工具执行中途被杀会在历史里留下悬空 tool call / 孤立
+    // tool 结果 / 末尾 system 提示，三者都会让下一次请求被 provider 直接拒绝
+    // （几秒失败、不落库任何 assistant 消息）。在唯一入口做一次幂等修复，
+    // 断点续跑和用户点「继续」两条路径同时受益。
+    let mut messages = crate::history_repair::repair_interrupted_history(messages);
     let RunConfig {
         finalization,
         turn_capability: initial_turn_capability,

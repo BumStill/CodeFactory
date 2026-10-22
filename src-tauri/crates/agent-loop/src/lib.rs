@@ -23,6 +23,7 @@
 pub mod command_activity;
 pub mod context;
 pub mod events;
+pub mod history_repair;
 pub mod journal;
 pub mod policy;
 pub mod protocol;
