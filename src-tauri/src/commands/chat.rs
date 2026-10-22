@@ -4325,6 +4325,23 @@ pub(crate) async fn resume_thin_running_session(
         ),
         Err(error_text) => {
             tracing::error!("thin restart agent loop error: {error_text}");
+            // M154：过去这里写死常量 "agent loop error"，真实错误被丢掉，
+            // 界面只剩「同一个技术失败连续 3 次: agent loop stopped: agent loop
+            // error」，无法判断是不是历史形状被 provider 拒绝。保留首行细节。
+            let stop_label = {
+                let first = error_text
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(160)
+                    .collect::<String>();
+                if first.trim().is_empty() {
+                    "agent loop error".to_string()
+                } else {
+                    format!("agent loop error: {first}")
+                }
+            };
             let settled = crate::agent::thin_state::settle_outcome(
                 &db,
                 &session_id,
@@ -4332,11 +4349,12 @@ pub(crate) async fn resume_thin_running_session(
                 false,
                 false,
                 "",
-                "agent loop error",
+                &stop_label,
                 None,
             )
             .await
             .map_err(|error| AppError::Other(error.to_string()))?;
+            // M154：失败时关闭 objective，否则会话停在 running（幽灵回合）。
             crate::agent::thin_state::close_objective(&db, &objective_id, &settled)
                 .await
                 .map_err(|error| AppError::Other(error.to_string()))?;
@@ -4411,11 +4429,29 @@ async fn push_thin_resume_prompt(
     {
         tracing::warn!(%error, session = %session_id, "thin restart: failed to mark interrupted tool calls");
     }
-    history.push(crate::storage::Message {
+    history.push(thin_resume_message(key, session_id, at, &summary));
+    Ok(())
+}
+
+/// M154：续跑提示必须是 `user` 角色，见 `m154_resume_message_is_a_user_turn`。
+///
+/// 历史末尾那条提示过去是 `system`：ChatGPT / Anthropic 两条 wire 路径对
+/// `system` 都是「赋值」而不是「追加」（`agent/model_transport.rs` 里
+/// `instructions = ...` / `system = ...`），一句几十字的续跑提示会把整段系统
+/// 提示词（工具协议、完成门槛、objective 规则）整体覆盖；另有 provider 直接
+/// 拒绝出现在对话中间或末尾的 system 消息。两种情况都会让续跑的第一轮请求
+/// 在几秒内失败，且失败发生在任何 assistant 消息落库之前。
+pub(crate) fn thin_resume_message(
+    key: &str,
+    session_id: &str,
+    at: i64,
+    summary: &str,
+) -> crate::storage::Message {
+    crate::storage::Message {
         id: format!("thin-resume:{key}"),
         session_id: session_id.to_string(),
-        role: "system".into(),
-        content: crate::agent::thin::resume_prompt(at, &summary),
+        role: "user".into(),
+        content: crate::agent::thin::resume_prompt(at, summary),
         endpoint_id: None,
         model_id: None,
         input_tokens: None,
@@ -4424,8 +4460,7 @@ async fn push_thin_resume_prompt(
         reasoning_content: None,
         completion_state: None,
         created_at: Utc::now().timestamp_millis(),
-    });
-    Ok(())
+    }
 }
 
 async fn resume_chat_objective_inner(
@@ -8258,5 +8293,52 @@ mod stack_probe {
             bytes <= 16 * 1024,
             "admission future grew to {bytes} bytes; box heavy awaits (budget 16384)"
         );
+    }
+}
+
+#[cfg(test)]
+mod m154_resume_after_midturn_kill_tests {
+    use super::*;
+
+    /// M154 主路径断言：断点续跑追加的那条消息必须是 user 回合，且经历史修复后
+    /// 仍然是最后一条（不会变成 system，也不会被当成 tool 往返）。
+    #[test]
+    fn m154_resume_message_is_a_user_turn() {
+        let message = thin_resume_message("root-1", "session-1", 1_792_654_969_927, "bash: sleep 60");
+        assert_eq!(message.role, "user", "resume prompt must not be a system turn");
+        assert_eq!(message.id, "thin-resume:root-1");
+        assert!(message.tool_calls.is_none());
+
+        // 把「中断前的历史 + 续跑提示」按 wire 形状喂给修复器：最后一条仍是
+        // user，中间不出现 system。
+        let repaired = codefactory_agent_loop::history_repair::repair_interrupted_history(vec![
+            codefactory_agent_loop::types::ChatMessage {
+                role: "system".into(),
+                content: codefactory_agent_loop::types::MessageContent::Text("you are codefactory".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+            codefactory_agent_loop::types::ChatMessage {
+                role: "user".into(),
+                content: codefactory_agent_loop::types::MessageContent::Text("只读演练：sleep 60".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+            codefactory_agent_loop::types::ChatMessage {
+                role: message.role.clone(),
+                content: codefactory_agent_loop::types::MessageContent::Text(message.content.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+            },
+        ]);
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired.last().unwrap().role, "user");
+        assert_eq!(repaired.iter().filter(|m| m.role == "system").count(), 1);
     }
 }
