@@ -61,6 +61,14 @@ const PAGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// bounded by the same realities as `LAUNCH_TIMEOUT`. Sharing `OP_TIMEOUT` made
 /// a real cold-runner wait surface as the opaque "browser operation timed out".
 const PAGE_CREATE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a close keeps asking for proof that the process exited after the
+/// forced kill has been requested. A kill is a request, not a reaping: on a
+/// loaded host (CI Windows runners are the observed case) the process handle
+/// can still report "running" for seconds after `kill` returned. Reporting a
+/// close failure we cannot distinguish from host slowness is the wrong
+/// outcome; reporting success without proof is worse. So the proof is retried
+/// within this window and the error stands only if it never arrives.
+const EXIT_PROOF_GRACE: Duration = Duration::from_secs(15);
 /// One settle probe. Bounded well under `OP_TIMEOUT` so a probe that blocks
 /// while the target swaps execution contexts still leaves room for the next
 /// probe instead of spending the whole operation budget in silence.
@@ -982,7 +990,23 @@ async fn teardown(live: &mut LiveSession, session_id: &str) -> Result<()> {
         Some(tokio::time::timeout(Duration::from_secs(5), live.browser.kill()).await)
     };
     live.handler.abort();
-    let stopped = graceful_proven || matches!(forced, Some(Ok(Some(Ok(())))));
+    let mut stopped = graceful_proven || matches!(forced, Some(Ok(Some(Ok(())))));
+    if !stopped {
+        // Asking once is not proof: `kill` requests a termination, the reap can
+        // land after it returns. Keep asking inside a bounded window so a slow
+        // host is not reported as "could not prove process exit".
+        let deadline = tokio::time::Instant::now() + EXIT_PROOF_GRACE;
+        while tokio::time::Instant::now() < deadline {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(2), live.browser.wait()).await,
+                Ok(Ok(_))
+            ) {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
     #[cfg(target_os = "macos")]
     let stopped = if let Some(process) = live.process.as_mut() {
         process.stop().is_ok()
