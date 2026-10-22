@@ -777,6 +777,332 @@ async fn verify_cancelled(pool: &SqlitePool, expect_consumed: usize) -> anyhow::
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// M157：回合中途重启的跨进程 liveness
+//
+// 2026-10-22 一天内四次「正在做」永久卡住都是同一个形状：上一个进程把回合停在
+// `running`，重启后的进程既不续跑也不结算，用户看到的是一句永远不动的「正在做」。
+// 这些断言是可执行的守门：任何让它们失败的产品改动都意味着该退化回来了。
+// ---------------------------------------------------------------------------
+
+const LIVENESS_MIDTURN_SESSION: &str = "liveness-midturn-session";
+const LIVENESS_STREAMING_SESSION: &str = "liveness-streaming-session";
+const LIVENESS_DEAD_INSTANCE: &str = "liveness-process-that-died";
+const LIVENESS_RUN: &str = "liveness-midturn-run";
+const LIVENESS_ROOT_TURN: &str = "liveness-midturn-root";
+const LIVENESS_TOOL_MESSAGE: &str = "liveness-midturn-assistant";
+const LIVENESS_TOOL: &str = "liveness-midturn-tool";
+/// 现场是回合开始 66 秒后重启；这里取远大于心跳宽限的 90 分钟，确保两条扫描
+/// （启动无宽限 / 心跳守宽限）都已「该接管」。
+const LIVENESS_STALE_AGE_MS: i64 = 90 * 60 * 1_000;
+
+async fn ensure_thin_session(
+    pool: &SqlitePool,
+    session_id: &str,
+    title: &str,
+) -> anyhow::Result<()> {
+    let now = Utc::now().timestamp_millis();
+    sqlx::query(
+        "INSERT OR IGNORE INTO sessions
+         (id, title, cwd, model_id, endpoint_id, model_policy,
+          permission_mode, delivery_mode, created_at, updated_at)
+         VALUES (?, ?, ?, 'smoke-model', 'smoke-endpoint',
+                 'fixed', 'trusted', 'thin', ?, ?)",
+    )
+    .bind(session_id)
+    .bind(title)
+    .bind(std::env::temp_dir().to_string_lossy().as_ref())
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 播种两处真实旋转下来的现场：
+/// 1. 回合中途：用户消息 + 未结算回合 + 在飞工具调用 + 上一进程留下的 live 控制行；
+/// 2. 只有 `running` 缓存行、连回合投影都没有的会话（同样会永久卡住）。
+async fn seed_liveness_sessions(pool: &SqlitePool) -> anyhow::Result<()> {
+    let now = Utc::now().timestamp_millis();
+    let stale = now - LIVENESS_STALE_AGE_MS;
+    ensure_thin_session(pool, LIVENESS_MIDTURN_SESSION, "Liveness mid-turn restart smoke").await?;
+    ensure_thin_session(pool, LIVENESS_STREAMING_SESSION, "Liveness streaming restart smoke")
+        .await?;
+    // 第二种真实现场：模型流式阶段被打断——用户消息在，回合未结算，
+    // 上一进程留下 live 控制行，但还没有任何工具调用可结算。
+    sqlx::query(
+        "INSERT INTO messages(id, session_id, role, content, created_at)
+         VALUES ('liveness-streaming-user', ?, 'user', ?, ?)",
+    )
+    .bind(LIVENESS_STREAMING_SESSION)
+    .bind(ORIGINAL_INSTRUCTION)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO chat_turn_state
+         (root_turn_id, session_id, task_segment_id, revision, phase, status,
+          recent_activity_kind, recent_activity_label, started_at, updated_at)
+         VALUES ('liveness-streaming-root', ?, NULL, 1, 'tool_executing', 'active',
+                 'thinking', '正在思考', ?, ?)",
+    )
+    .bind(LIVENESS_STREAMING_SESSION)
+    .bind(stale)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO chat_run_controls
+         (run_instance_id, session_id, root_turn_id, status,
+          created_process_instance, created_at, updated_at)
+         VALUES ('liveness-streaming-run', ?, 'liveness-streaming-root', 'active', ?, ?, ?)",
+    )
+    .bind(LIVENESS_STREAMING_SESSION)
+    .bind(LIVENESS_DEAD_INSTANCE)
+    .bind(stale)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO messages(id, session_id, role, content, created_at)
+         VALUES ('liveness-midturn-user', ?, 'user', ?, ?)",
+    )
+    .bind(LIVENESS_MIDTURN_SESSION)
+    .bind(ORIGINAL_INSTRUCTION)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO messages(id, session_id, role, content, created_at)
+         VALUES (?, ?, 'assistant', '我先改一下这个文件。', ?)",
+    )
+    .bind(LIVENESS_TOOL_MESSAGE)
+    .bind(LIVENESS_MIDTURN_SESSION)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO chat_turn_state
+         (root_turn_id, session_id, task_segment_id, revision, phase, status,
+          recent_activity_kind, recent_activity_label, started_at, updated_at)
+         VALUES (?, ?, NULL, 1, 'tool_executing', 'active',
+                 'tool', '写入文件', ?, ?)",
+    )
+    .bind(LIVENESS_ROOT_TURN)
+    .bind(LIVENESS_MIDTURN_SESSION)
+    .bind(stale)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO tool_calls(id, message_id, tool_name, arguments, status, created_at)
+         VALUES (?, ?, 'write_file', '{}', 'pending', ?)",
+    )
+    .bind(LIVENESS_TOOL)
+    .bind(LIVENESS_TOOL_MESSAGE)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+    // 控制行必须最后播种：它引用回合投影与在飞工具调用。
+    sqlx::query(
+        "INSERT INTO chat_run_controls
+         (run_instance_id, session_id, root_turn_id, status,
+          created_process_instance, created_at, updated_at)
+         VALUES (?, ?, ?, 'active', ?, ?, ?)",
+    )
+    .bind(LIVENESS_RUN)
+    .bind(LIVENESS_MIDTURN_SESSION)
+    .bind(LIVENESS_ROOT_TURN)
+    .bind(LIVENESS_DEAD_INSTANCE)
+    .bind(stale)
+    .bind(stale)
+    .execute(pool)
+    .await?;
+
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        let mut state = super::thin_state::ThinState::running();
+        state.updated_at = stale;
+        super::thin_state::save(pool, session, &state).await?;
+    }
+
+    let running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM thin_session_state WHERE state='running' AND session_id IN (?,?)",
+    )
+    .bind(LIVENESS_MIDTURN_SESSION)
+    .bind(LIVENESS_STREAMING_SESSION)
+    .fetch_one(pool)
+    .await?;
+    if running != 2 {
+        bail!("M157: could not seed two running thin sessions, got {running}");
+    }
+    Ok(())
+}
+
+async fn live_run_control_count(pool: &SqlitePool, session: &str) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat_run_controls
+         WHERE session_id=? AND status IN ('active','cancel_requested')",
+    )
+    .bind(session)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// 第一次「重启」：新进程必须看见被打断的会话，并把上一进程的无主控制行和
+/// 在飞工具调用结算掉——但不能把用户的输入丢掉，也不能伪造一个「已完成」。
+async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
+    let now = Utc::now().timestamp_millis();
+    let startup = super::thin_restart::running_interrupted_by_restart(pool, now, |_| false).await?;
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        if !startup.iter().any(|candidate| candidate == session) {
+            bail!(
+                "M157: the restart scan dropped running session {session}, so it would stay \
+                 「正在做」forever (startup candidates={startup:?})"
+            );
+        }
+    }
+    let heartbeat = super::thin_restart::running_without_executor(
+        pool,
+        now,
+        super::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS,
+        |_| false,
+    )
+    .await?;
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        if !heartbeat.iter().any(|candidate| candidate == session) {
+            bail!(
+                "M157: the heartbeat scan dropped running session {session} (candidates={heartbeat:?})"
+            );
+        }
+    }
+
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        let retired = super::objective_diagnostics::retire_orphan_run_controls(pool, session).await?;
+        if retired != 1 {
+            bail!(
+                "M157: expected exactly one phantom run control to be retired for {session}, \
+                 retired={retired}"
+            );
+        }
+        let live = live_run_control_count(pool, session).await?;
+        if live != 0 {
+            bail!(
+                "M157: {session} still holds {live} live run control(s) after restart; \
+                 the next user message would queue forever"
+            );
+        }
+    }
+
+    let marked =
+        super::thin_restart::mark_interrupted_tool_calls(pool, LIVENESS_MIDTURN_SESSION).await?;
+    if marked != 1 {
+        bail!("M157: expected the in-flight tool call to be settled as unknown, marked={marked}");
+    }
+    let still_pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_calls tool
+         JOIN messages message ON message.id=tool.message_id
+         WHERE message.session_id=? AND tool.status IN ('pending','approved')
+           AND (tool.result IS NULL OR TRIM(tool.result)='')",
+    )
+    .bind(LIVENESS_MIDTURN_SESSION)
+    .fetch_one(pool)
+    .await?;
+    if still_pending != 0 {
+        bail!("M157: {still_pending} tool call(s) stayed pending across the restart");
+    }
+    let note: Option<String> =
+        sqlx::query_scalar("SELECT error FROM tool_calls WHERE id=?").bind(LIVENESS_TOOL).fetch_one(pool).await?;
+    match note.as_deref().map(str::trim) {
+        Some(text) if !text.is_empty() => {}
+        _ => bail!("M157: the interrupted tool call carries no 「结果未知」note"),
+    }
+
+    let user_messages: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'",
+    )
+    .bind(LIVENESS_MIDTURN_SESSION)
+    .fetch_one(pool)
+    .await?;
+    if user_messages != 1 {
+        bail!("M157: the restart changed the user's message count to {user_messages}");
+    }
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT status FROM chat_turn_state WHERE root_turn_id=?")
+            .bind(LIVENESS_ROOT_TURN)
+            .fetch_one(pool)
+            .await?;
+    if state.as_deref() != Some("active") {
+        bail!(
+            "M157: the restart fabricated a terminal turn ({state:?}); the turn must be resumed, \
+             not silently ended"
+        );
+    }
+    let thin = super::thin_state::load(pool, LIVENESS_MIDTURN_SESSION)
+        .await?
+        .ok_or_else(|| anyhow!("M157: thin state vanished for {LIVENESS_MIDTURN_SESSION}"))?;
+    if thin.state != super::thin_state::SessionState::Running {
+        bail!(
+            "M157: thin state became {:?} while the turn is still open (no answer was written)",
+            thin.state
+        );
+    }
+    Ok(())
+}
+
+/// 第二次「重启」：结算必须幂等，且宽限期内不能热循环；用户仍然不需要再补一句。
+async fn verify_liveness_second_restart(pool: &SqlitePool) -> anyhow::Result<()> {
+    let now = Utc::now().timestamp_millis();
+    let startup = super::thin_restart::running_interrupted_by_restart(pool, now, |_| false).await?;
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        if !startup.iter().any(|candidate| candidate == session) {
+            bail!(
+                "M157: a second restart lost running session {session}; the interrupted turn \
+                 became invisible instead of being completed (candidates={startup:?})"
+            );
+        }
+    }
+    let heartbeat = super::thin_restart::running_without_executor(
+        pool,
+        now,
+        super::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS,
+        |_| false,
+    )
+    .await?;
+    if heartbeat.iter().any(|candidate| candidate == LIVENESS_MIDTURN_SESSION) {
+        bail!("M157: the just-retired session is re-selected inside the grace window (hot loop)");
+    }
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        let retired = super::objective_diagnostics::retire_orphan_run_controls(pool, session).await?;
+        if retired != 0 {
+            bail!(
+                "M157: run control retirement is not idempotent for {session}, \
+                 retired={retired} on the second pass"
+            );
+        }
+    }
+    let marked =
+        super::thin_restart::mark_interrupted_tool_calls(pool, LIVENESS_MIDTURN_SESSION).await?;
+    if marked != 0 {
+        bail!("M157: tool interruption marking is not idempotent, marked={marked} on the second pass");
+    }
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        let user_messages: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'")
+                .bind(session)
+                .fetch_one(pool)
+                .await?;
+        if user_messages != 1 {
+            bail!("M157: {session} ended up with {user_messages} user message(s) after two restarts");
+        }
+        let live = live_run_control_count(pool, session).await?;
+        if live != 0 {
+            bail!("M157: {session} still holds {live} live run control(s) after two restarts");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_worker(state_dir: &Path, phase: &str) -> anyhow::Result<()> {
     let db_url = format!("sqlite:{}", state_dir.join("history-session.db").display());
     let pool = crate::storage::db::connect(&db_url).await?;
@@ -789,6 +1115,9 @@ pub(crate) async fn run_worker(state_dir: &Path, phase: &str) -> anyhow::Result<
         "verify-stop" => verify_cancelled(&pool, 1).await,
         "verify-stop-again" => verify_cancelled(&pool, 0).await,
         "seed-abandoned" => seed_abandoned_session(&pool).await,
+        "seed-liveness" => seed_liveness_sessions(&pool).await,
+        "verify-liveness" => verify_liveness_after_restart(&pool).await,
+        "verify-liveness-again" => verify_liveness_second_restart(&pool).await,
         "sweep-abandoned" => sweep_abandoned_after_restart(&pool).await,
         "verify-abandoned" => verify_abandoned_settled(&pool).await,
         _ => bail!("unknown history-session worker phase {phase}"),
@@ -914,12 +1243,16 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             "seed-abandoned",
             "sweep-abandoned",
             "verify-abandoned",
+            // M157：回合中途重启的 liveness 必须每次 PR 真跑一遍。
+            "seed-liveness",
+            "verify-liveness",
+            "verify-liveness-again",
         ] {
             pids.push(run_phase(&root, phase).await?);
         }
         pids.sort_unstable();
         pids.dedup();
-        if pids.len() != 11 {
+        if pids.len() != 14 {
             bail!("history-session smoke did not observe distinct worker processes");
         }
 
@@ -992,9 +1325,16 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
             "schema_matrix": schema_matrix,
             "scenario_ids": ["E2E-002", "E2E-003", "E2E-007"],
             "build_git_sha": option_env!("CODEFACTORY_BUILD_GIT_SHA").unwrap_or("unknown"),
-            "process_restart_count": 10,
+            "process_restart_count": 14,
             "abandoned_objective_reaped_across_restart": true,
             "terminal_objective_orphan_receipt_swept": true,
+            "liveness_receipt_schema": "codefactory.liveness_restart_smoke.v1",
+            "mid_turn_restart_still_selected_after_restart": true,
+            "mid_turn_restart_never_left_running_alone": true,
+            "mid_turn_restart_phantom_run_control_retired": true,
+            "mid_turn_restart_tool_call_marked_unknown": true,
+            "mid_turn_restart_idempotent_on_second_restart": true,
+            "mid_turn_restart_no_user_reprompt_needed": true,
             "sweeps_are_idempotent": true,
             "sweep_timer_oracle_status": "supervisor_cadence_covered_by_unit_wiring_only",
             "abandoned_phase_registry_status": "runs_on_every_pr_but_not_yet_registered_as_HLT-006_E2E-012",
