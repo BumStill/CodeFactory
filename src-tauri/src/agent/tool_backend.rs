@@ -2580,7 +2580,19 @@ impl ToolBackend for DesktopToolBackend {
         // Desktop surface = native tools + every connected MCP tool. (The
         // anonymous KB-tool strip stays in the loop for now — it depends on the
         // run's anonymous flag; folded in when the loop moves in slice 4.6.)
-        let mut defs = crate::tools::all_definitions();
+        let mut defs = {
+            // 视觉模型自己就能看图，不该再看到 `view_image`。
+            let settings = self.settings.read().await;
+            let endpoint = settings.default_endpoint.clone();
+            let model = settings
+                .endpoints
+                .get(&endpoint)
+                .and_then(|route| route.active_model.clone())
+                .unwrap_or_else(|| settings.default_model.clone());
+            let has_vision =
+                crate::agent::context::model_supports_vision(&settings, &endpoint, &model);
+            crate::tools::definitions_for_capability(has_vision)
+        };
         let mcp_tools = self.mcp_manager.list_all_tools().await;
         if let Ok(mut names) = self.mcp_tool_names.write() {
             names.clear();

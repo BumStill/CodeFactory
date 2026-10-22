@@ -84,6 +84,10 @@ fn default_model_policy() -> String {
 pub struct Settings {
     pub endpoints: HashMap<String, Endpoint>,
     pub default_endpoint: String,
+    /// 用户指定的"视觉助手"路由：`endpoint::model`、`endpoint/model` 或裸模型名。
+    /// 空 = 自动选择（优先当前默认端点，其次其它明确支持视觉的端点）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_assistant: Option<String>,
     pub default_model: String,
     /// Routing strategy copied into each newly created session. Existing
     /// sessions remain independent after creation.
@@ -657,6 +661,7 @@ impl Default for Settings {
         Self {
             endpoints,
             default_endpoint: "openrouter".into(),
+            vision_assistant: None,
             default_model: "anthropic/claude-opus-4-7".into(),
             default_model_policy: default_model_policy(),
             // Action-biased default: non-destructive reads + writes (incl.

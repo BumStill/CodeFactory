@@ -28,7 +28,7 @@ pub(crate) mod first_request_latency;
 #[cfg(not(test))]
 pub(crate) mod history_session_smoke;
 pub mod hooks;
-mod internal_text;
+pub(crate) mod internal_text;
 pub mod journal;
 mod lifecycle_hooks;
 pub mod model_transport;

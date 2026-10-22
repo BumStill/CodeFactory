@@ -22,6 +22,7 @@ pub mod shell_policy;
 pub mod skill_mgmt;
 pub mod test_path;
 pub mod update_plan;
+pub mod view_image;
 pub mod workspace_path;
 pub mod write;
 pub mod xlsx;
@@ -212,7 +213,21 @@ pub fn all_definitions() -> Vec<crate::openrouter::types::ToolDefinition> {
         delivery::definition(),
         parallel::definition(),
         update_plan::definition(),
+        view_image::definition(),
     ]
+}
+
+/// 按"当前模型是否自带视觉"裁剪工具清单。
+///
+/// 自带视觉的模型直接看图即可，不该看到 `view_image`（否则会把图片当普通
+/// 文件读，或绕一圈再问自己）；不支持图像的模型才需要这条桥。
+pub fn definitions_for_capability(
+    model_has_vision: bool,
+) -> Vec<crate::openrouter::types::ToolDefinition> {
+    all_definitions()
+        .into_iter()
+        .filter(|definition| !(model_has_vision && definition.function.name == "view_image"))
+        .collect()
 }
 
 pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
@@ -234,6 +249,7 @@ pub async fn dispatch(name: &str, args: Value, ctx: &ExecCtx) -> Result<ToolOutp
         "wakeup_cancel" => wakeup::execute_cancel(args, ctx).await,
         "browser_session" => browser_session::execute(args, ctx).await,
         "web_fetch" => web_fetch::execute(args, ctx).await,
+        "view_image" => Ok(view_image::execute(args, ctx).await),
         "write_pptx" => pptx::execute(args, ctx).await,
         "read_pptx" => pptx_edit::execute_read(args, ctx).await,
         "edit_pptx" => pptx_edit::execute_edit(args, ctx).await,
