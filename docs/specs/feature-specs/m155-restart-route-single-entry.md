@@ -46,3 +46,16 @@ ChatGPT（会话正在用的订阅端点）已过留余量阈值、DeepSeek 在�
   release 流水线。现有 `--history-session-smoke` 父/子进程框架是落点。本轮为紧急
   修复，先保证路由与结算逻辑正确并有用例覆盖；真机重启验收仍由编排方发版后按
   R4 步骤核对。
+
+## 附带修复：关闭浏览器的退出证明改为有界重试
+
+PR #842 的首轮 CI 在 `check-rust`（Windows runner）失败于
+`tools::browser_session::tests::thin_browser_open_reaches_driver_without_receipt`，
+错误是「browser close and forced kill could not prove process exit」。与本单的路由修复
+无关，是同一条易抖路径：`teardown()` 只问一次退出证明——`close`+`wait` 各 5 秒，
+拿不到就判失败。`kill` 只是请求终止，回收可以晚于它返回；负载高的 runner 上这就是
+「主机慢」被误报成「关不掉」。
+
+现在 `teardown()` 在首次询问失败后，于 `EXIT_PROOF_GRACE`（15 秒）窗口内以 2 秒
+超时 + 250 毫秒间隔反复向 `Browser::wait()` 要证明：拿到就成功，整个窗口都拿不到
+才保留原错误。**没有放宽为无证据的成功**——「必须证明进程退出」这条不变量不变。
