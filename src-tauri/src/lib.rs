@@ -56,6 +56,7 @@ mod storage;
 mod tools;
 mod trajectory;
 mod util;
+pub mod vision;
 pub mod window_state;
 
 use sqlx::SqlitePool;

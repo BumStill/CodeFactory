@@ -98,6 +98,30 @@
   ],
   "scenarios": [
     {
+      "id": "VIS-001",
+      "name": "不支持图像的模型也能看图（视觉桥）",
+      "category": "content_rendering",
+      "priority": "P1",
+      "source_kind": "product_contract",
+      "change_patterns": [
+        "src-tauri/src/vision/*.rs",
+        "src-tauri/src/tools/view_image.rs"
+      ],
+      "automated_by": [
+        "rust:image_is_sent_as_an_image_url_part_and_the_answer_comes_back",
+        "rust:real_ocr_reads_text_from_a_rendered_image",
+        "rust:schema_exposure_follows_model_vision_capability",
+        "rust:cache_hit_does_not_call_the_backend_twice"
+      ],
+      "required_evidence": [
+        "L0",
+        "L1"
+      ],
+      "gates": [
+        "pull_request"
+      ]
+    },
+    {
       "id": "HLT-001",
       "name": "一次授权后跨进程自动完成",
       "category": "long_task_continuity",
