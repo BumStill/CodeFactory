@@ -3693,9 +3693,11 @@ impl ObjectiveStore {
     ) -> anyhow::Result<usize> {
         let now = Utc::now().timestamp_millis();
         let updated = sqlx::query(
+            // M151/R7：`cancel_requested` 同样是 live 状态（占着会话级排他锁），
+            // 上一进程留下的这类行必须和前一种一起回收，否则新回合永远排队。
             "UPDATE chat_run_controls
              SET status='completed', settled_at=?, updated_at=?
-             WHERE status='active'
+             WHERE status IN ('active','cancel_requested')
                AND created_process_instance<>?",
         )
         .bind(now)

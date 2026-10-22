@@ -2267,3 +2267,34 @@ mod tests {
         assert_eq!(resolved.as_deref(), Some("deepseek-v4-pro"));
     }
 }
+
+/// M151：导出单个会话「为什么卡住」的全部事实依据（脱敏，不含消息正文）。
+#[tauri::command]
+pub async fn session_diagnostics(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::agent::objective_diagnostics::SessionDiagnostics, AppError> {
+    let db = state.db.read().await.clone();
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".into());
+    crate::agent::objective_diagnostics::collect(
+        &db,
+        session_id.trim(),
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        shell.as_str(),
+    )
+    .await
+    .map_err(|error| AppError::Other(format!("会话诊断生成失败：{error}")))
+}
+
+/// M151：把没有活执行者的会话拉回可用状态；有活执行者时拒绝。
+#[tauri::command]
+pub async fn reset_session_state(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<crate::agent::objective_diagnostics::ResetOutcome, AppError> {
+    let db = state.db.read().await.clone();
+    crate::agent::objective_diagnostics::reset_session_state(&db, session_id.trim())
+        .await
+        .map_err(|error| AppError::Other(format!("会话状态重置失败：{error}")))
+}

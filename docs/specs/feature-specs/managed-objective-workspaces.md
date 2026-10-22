@@ -38,6 +38,14 @@
 - Git identity、fetch、worktree add、reattach 或 delivery binding 失败：`waiting_system/platform_incident`，零代码副作用，不要求用户发送“继续”。
 - 现有 worktree 与 DB identity 不一致：只读观察并保留两侧证据，不猜测、不覆盖、不删除。
 
+### 启动期 incident 自愈（M151 R10）
+
+- 停靠在 `incident` 的受管工作区必须在启动时重修一次，而不是永久不可再附着：分支被切走但工作区干净的，切回注册分支后按 identity 复核恢复为 `active`；worktree 目录消失的，从分支重建。
+- 自愈只在干净工作区上进行：存在未提交/未跟踪改动时绝不 checkout，工作区保持 `incident`，未提交内容原样保留。
+- 仍无法修复时保留 incident 行与其原始 `failure_detail`，并把同一句原因记录到 objective 的技术失败详情，使会话列表能说明阻塞原因，而不是无声挂起。
+- 状态守卫 `ATTACHABLE_STATES` 保护的是进行中的工作，不是把可修复工作区锁死；incident 的修复发生在守卫之前。
+- 交给外部进程（`git worktree add/remove`、`git -C`）的路径必须去掉 Windows verbatim 前缀：`canonicalize` 得到的 `\\?\C:\...` 仅对 `std::fs` 有效，git 会以 `could not create leading directories ... Invalid argument` 拒绝它，重建因此失败。`external_path` 负责剥离（`\\?\C:\…` → `C:\…`，`\\?\UNC\…` → `\\…`），`external_path_str` 是同一变换的 UTF-8 入口，两条路径都有断言覆盖。
+
 ### 异步 closeout 安全契约
 
 - lifecycle supervisor 启动后立即扫描并按 60 秒周期重试；同一候选同时持有 workspace CAS lease 与 repo lease，活 lease 不得被终态幂等 reconciliation 清除。

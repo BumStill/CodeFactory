@@ -466,6 +466,18 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
                 ..ThinState::running()
             });
         }
+        // M151/R2：缓存说 running，但这里已经没有任何活着的执行者。回合结束会
+        // 注销执行者，进程重启/崩溃也会让执行者消失；此时把 running 原样返回，
+        // 界面就永远显示「正在做」，用户发不出下一条消息，也不知道依赖是什么。
+        // 终态之外一律降级成可解释的「已结束」，而不是让缓存自持。
+        if previous.state == SessionState::Running
+            && super::objective_diagnostics::dead_process_run_control(db, session).await?
+        {
+            return Ok(ThinState::ended(
+                "上一回合的执行者已随进程退出（遗留运行控制行），可重置会话状态后重新开始",
+                "本会话记录",
+            ));
+        }
         return Ok(previous);
     }
     if latest_user.is_some() {

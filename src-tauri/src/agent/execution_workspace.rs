@@ -519,11 +519,42 @@ struct RepoObservation {
     base_sha: String,
 }
 
+/// Windows `canonicalize` yields verbatim paths (`\\?\C:\...`). `std::fs`
+/// accepts them, but child processes do not: `git worktree add
+/// "\\?\C:\..."` dies with "could not create leading directories ...
+/// Invalid argument". Every path handed to a child process drops it first.
+fn external_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if !text
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case(r"\\?\"))
+    {
+        return path.to_path_buf();
+    }
+    let rest = &text[4..];
+    if rest
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("unc\\"))
+    {
+        return PathBuf::from(format!(r"\\{}", &rest[4..]));
+    }
+    PathBuf::from(rest)
+}
+
+fn external_path_str(path: &Path) -> Result<String> {
+    external_path(path)
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("path is not valid UTF-8: {}", path.display()))
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let mut command = Command::new("git");
     command
         .arg("-C")
-        .arg(cwd)
+        .arg(external_path(cwd))
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
     let mut command = command.no_window();
@@ -686,6 +717,60 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
         ],
     )
     .is_ok()
+}
+
+/// M151 R10: put a managed worktree back on its registered branch.
+///
+/// A clean worktree (no staged, unstaged or untracked changes) is switched
+/// back with a plain checkout. Anything dirty is left exactly as the user left
+/// it and reported, so no uncommitted work is ever discarded by self-healing.
+fn restore_registered_branch(worktree: &Path, branch: &str) -> Result<()> {
+    let status = git(worktree, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    if !status.trim().is_empty() {
+        bail!(
+            "managed workspace identity mismatch: branch changed with uncommitted changes; \
+             start a new session or commit/stash them, then continue"
+        );
+    }
+    git(worktree, &["checkout", branch])?;
+    let restored = git(worktree, &["branch", "--show-current"])?;
+    if restored != branch {
+        bail!("managed workspace identity mismatch: branch changed and could not be restored");
+    }
+    Ok(())
+}
+
+/// M151 R10: rebuild a managed worktree whose directory disappeared.
+fn rebuild_missing_worktree(row: &WorkspaceRow) -> Result<PathBuf> {
+    let repo_root = PathBuf::from(&row.repo_root);
+    let path = PathBuf::from(&row.worktree_path);
+    if !is_git_repository(&repo_root) {
+        bail!("repository root {} is no longer a git repository", repo_root.display());
+    }
+    if !branch_exists(&repo_root, &row.branch_name) {
+        bail!(
+            "registered branch {} no longer exists in {}",
+            row.branch_name,
+            repo_root.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // A vanished directory leaves stale `worktrees/<name>` metadata behind;
+    // pruning it is what lets `worktree add` reuse the same path and branch.
+    git(&repo_root, &["worktree", "prune"])?;
+    let add_path = external_path_str(&path)?;
+    git(
+        &repo_root,
+        &["worktree", "add", &add_path, &row.branch_name],
+    )?;
+    path.canonicalize().map_err(|error| {
+        anyhow!(
+            "rebuilt worktree path is still missing: {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn remote_branch_exists(root: &Path, remote: &str, branch: &str) -> Result<bool> {
@@ -1496,16 +1581,16 @@ fn inspect_and_remove_candidate(
                 ),
             });
         }
-        if let Err(error) = git(
-            &canonical_repo_root,
-            &[
-                "worktree",
-                "remove",
-                workspace_path
-                    .to_str()
-                    .ok_or_else(|| anyhow!("managed workspace path is not valid UTF-8"))?,
-            ],
-        ) {
+        let remove_path = match external_path_str(&workspace_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_remove_failed",
+                    detail: error.to_string(),
+                })
+            }
+        };
+        if let Err(error) = git(&canonical_repo_root, &["worktree", "remove", &remove_path]) {
             return Ok(CandidateDisposition::Preserved {
                 code: "workspace_cleanup_remove_failed",
                 detail: error.to_string(),
@@ -3138,11 +3223,119 @@ async fn recover_incident_if_identity_is_whole(
     }
 }
 
+/// M151 R10: repair every parked incident workspace once, at startup.
+///
+/// Each incident is handed to the normal attach path, which self-heals a
+/// switched-but-clean branch and rebuilds a vanished worktree from its branch.
+/// Whatever still cannot be repaired keeps its incident row and, when the
+/// incident belongs to a session, records a user-visible reason against its
+/// objective so the session list stops hanging without explanation.
+pub async fn heal_incident_workspaces(pool: &SqlitePool) -> Vec<(String, String)> {
+    let rows: Vec<(String, String)> = match sqlx::query_as(
+        "SELECT objective_id, COALESCE(failure_detail, '') FROM execution_workspaces
+         WHERE state='incident' ORDER BY updated_at",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "startup: could not list incident workspaces");
+            return Vec::new();
+        }
+    };
+    let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+    let mut unrepaired = Vec::new();
+    for (objective_id, previous_detail) in rows {
+        let state = match attach_existing(pool, &objective_id, "startup-self-heal").await {
+            Ok(Some(row)) => row.state,
+            Ok(None) => "missing".to_string(),
+            Err(error) => {
+                // Prefer the recorded incident detail: that is the actionable
+                // sentence ("branch changed with uncommitted changes; start a
+                // new session ..."). The attach failure is usually just the
+                // state guard, which explains nothing to the user.
+                let reason = if previous_detail.trim().is_empty() {
+                    error.to_string()
+                } else {
+                    previous_detail.clone()
+                };
+                record_incident_reason(&store, &objective_id, &reason).await;
+                unrepaired.push((objective_id, reason));
+                continue;
+            }
+        };
+        if state == "active" {
+            tracing::info!(
+                %objective_id,
+                "startup: managed workspace self-healed out of incident"
+            );
+            continue;
+        }
+        record_incident_reason(&store, &objective_id, &previous_detail).await;
+        unrepaired.push((objective_id, previous_detail));
+    }
+    unrepaired
+}
+
+async fn record_incident_reason(
+    store: &crate::agent::objective::ObjectiveStore,
+    objective_id: &str,
+    detail: &str,
+) {
+    if detail.trim().is_empty() {
+        return;
+    }
+    // A managed workspace only ever belongs to an interactive run, so the
+    // reason is recorded on the chat rail the session list already shows.
+    if let Err(error) = store
+        .record_failure_detail(
+            objective_id,
+            crate::agent::objective::RecoveryDomain::Chat,
+            "managed_workspace_incident",
+            "managed_workspace_incident",
+            detail,
+        )
+        .await
+    {
+        tracing::warn!(%objective_id, %error, "startup: could not record workspace incident reason");
+    }
+}
+
+/// One-shot startup pass over incident managed workspaces.
+pub fn spawn_incident_healer(pool: SqlitePool) {
+    tauri::async_runtime::spawn(async move {
+        let unrepaired = heal_incident_workspaces(&pool).await;
+        if !unrepaired.is_empty() {
+            tracing::warn!(
+                count = unrepaired.len(),
+                "startup: managed workspaces still in incident after self-heal"
+            );
+        }
+    });
+}
+
 async fn reattach_inner(
     pool: &SqlitePool,
     row: WorkspaceRow,
     process_instance: &str,
 ) -> Result<ExecutionWorkspace> {
+    // M151 R10: a parked incident is repaired *before* the state guard runs —
+    // the guard protects live work, it must not make a recoverable workspace
+    // permanently unusable. A dirty worktree is left untouched here and stays
+    // parked, so self-healing can never discard uncommitted work.
+    if row.state == "incident" {
+        let path = PathBuf::from(&row.worktree_path);
+        if path.exists() {
+            if let Err(error) = restore_registered_branch(&path, &row.branch_name) {
+                tracing::warn!(
+                    objective_id = %row.objective_id,
+                    %error,
+                    "incident repair: branch is not restorable yet"
+                );
+            }
+        }
+    }
     let row = recover_incident_if_identity_is_whole(pool, row).await;
     if !ATTACHABLE_STATES.contains(&row.state.as_str()) {
         bail!("managed workspace is not attachable in state {}", row.state);
@@ -3157,6 +3350,7 @@ async fn reattach_inner(
             mark_incident(pool, &row.objective_id, &error.to_string()).await;
             return Err(error);
         }
+        let add_path = external_path_str(&path)?;
         if let Err(error) = git(
             &repo_root,
             &[
@@ -3164,8 +3358,7 @@ async fn reattach_inner(
                 "add",
                 "-b",
                 &row.branch_name,
-                path.to_str()
-                    .ok_or_else(|| anyhow!("workspace path is not valid UTF-8"))?,
+                &add_path,
                 &row.base_sha,
             ],
         ) {
@@ -3176,12 +3369,29 @@ async fn reattach_inner(
     let canonical_path = match path.canonicalize() {
         Ok(path) => path,
         Err(error) => {
-            let error = anyhow!(
-                "managed workspace path missing: {}: {error}",
-                path.display()
-            );
-            mark_identity_incident(pool, &row.objective_id, &error.to_string()).await;
-            return Err(error);
+            // M151 R10: a managed worktree directory can vanish (cache cleanup,
+            // user deletion, failed move). Its branch still carries every
+            // commit, so the workspace is rebuilt from that branch instead of
+            // leaving the session permanently incident.
+            match rebuild_missing_worktree(&row) {
+                Ok(path) => {
+                    tracing::info!(
+                        objective_id = %row.objective_id,
+                        branch = %row.branch_name,
+                        path = %path.display(),
+                        "managed workspace self-healed: rebuilt missing worktree from its branch"
+                    );
+                    path
+                }
+                Err(rebuild_error) => {
+                    let error = anyhow!(
+                        "managed workspace path missing: {}: {error}; rebuild failed: {rebuild_error}",
+                        path.display()
+                    );
+                    mark_identity_incident(pool, &row.objective_id, &error.to_string()).await;
+                    return Err(error);
+                }
+            }
         }
     };
     let branch = match git(&canonical_path, &["branch", "--show-current"]) {
@@ -3192,9 +3402,25 @@ async fn reattach_inner(
         }
     };
     if branch != row.branch_name {
-        let error = anyhow!("managed workspace identity mismatch: branch changed");
-        mark_identity_incident(pool, &row.objective_id, &error.to_string()).await;
-        return Err(error);
+        // M151 R10: the session itself may have switched this managed
+        // worktree to another branch (for example while opening a governance
+        // PR). That is a recoverable identity drift, not a lost workspace:
+        // a clean worktree is simply put back on its registered branch, and
+        // committed work still reachable from that branch is never discarded.
+        // Dirty worktrees keep their incident so the user decides.
+        match restore_registered_branch(&canonical_path, &row.branch_name) {
+            Ok(()) => {
+                tracing::info!(
+                    objective_id = %row.objective_id,
+                    branch = %row.branch_name,
+                    "managed workspace self-healed: switched back to its registered branch"
+                );
+            }
+            Err(error) => {
+                mark_identity_incident(pool, &row.objective_id, &error.to_string()).await;
+                return Err(error);
+            }
+        }
     }
     let (repo_identity, worktree_identity, head_sha) = match workspace_identity(&canonical_path) {
         Ok(identity) => identity,
@@ -3567,6 +3793,7 @@ async fn allocate_new_locked(
         if branch_exists(&observed.root, &branch_name) {
             bail!("reserved managed workspace branch already exists");
         }
+        let add_path = external_path_str(&worktree_path)?;
         git(
             &observed.root,
             &[
@@ -3574,9 +3801,7 @@ async fn allocate_new_locked(
                 "add",
                 "-b",
                 &branch_name,
-                worktree_path
-                    .to_str()
-                    .ok_or_else(|| anyhow!("workspace path is not valid UTF-8"))?,
+                &add_path,
                 &observed.base_ref,
             ],
         )?;
@@ -3729,6 +3954,7 @@ pub async fn verify_objective_workspace(
 mod tests {
     use super::{
         acquire_repo_allocation_lock, allocate_or_attach, attach_existing, ensure_schema,
+        external_path, external_path_str, heal_incident_workspaces,
         latest_for_session, mark_objective_terminal_in_tx, release_repo_allocation_lock,
         run_cleanup_pass, verify_objective_workspace, ExecutionWorkspaceRequest,
         PREVIOUS_WORK_NOT_CARRIED_FORWARD,
@@ -3993,25 +4219,11 @@ mod tests {
         .await
         .unwrap();
 
-        // What the agent did: switch the managed worktree onto another branch.
-        git(&workspace.worktree_path, &["checkout", "-b", "some-other-branch"]);
-        let conflicted = attach_existing(&pool, "objective-incident-recovers", "process-b").await;
-        assert!(
-            conflicted.is_err(),
-            "a switched branch must still park the workspace"
-        );
-        let state: String = sqlx::query_scalar(
-            "SELECT state FROM execution_workspaces WHERE objective_id=?",
-        )
-        .bind("objective-incident-recovers")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(state, "incident");
+        // An older build (or a crash mid-heal) parked it while the worktree
+        // itself is intact and clean.
+        park_as_incident(&pool, "objective-incident-recovers", "branch changed").await;
 
-        // Put the branch back; the conflict is gone.
-        git(&workspace.worktree_path, &["checkout", &workspace.branch_name]);
-        let recovered = attach_existing(&pool, "objective-incident-recovers", "process-c")
+        let recovered = attach_existing(&pool, "objective-incident-recovers", "process-b")
             .await
             .expect("a workspace whose identity is whole again must return to service")
             .expect("the recovered workspace must be handed back");
@@ -4039,6 +4251,13 @@ mod tests {
         .await
         .unwrap();
         git(&workspace.worktree_path, &["checkout", "-b", "still-wrong-branch"]);
+        // Uncommitted work on the foreign branch: restoring the branch would
+        // lose it, so this conflict is still real.
+        std::fs::write(
+            Path::new(&workspace.worktree_path).join("half-done.txt"),
+            "uncommitted",
+        )
+        .unwrap();
         assert!(attach_existing(&pool, "objective-incident-stays", "process-b")
             .await
             .is_err());
@@ -4355,8 +4574,24 @@ mod tests {
         assert_eq!(first.base_sha, second.base_sha);
     }
 
+    #[test]
+    fn external_paths_drop_the_windows_verbatim_prefix_before_reaching_git() {
+        assert_eq!(
+            external_path(Path::new(r"\\?\C:\Users\me\work")).to_string_lossy(),
+            r"C:\Users\me\work"
+        );
+        assert_eq!(
+            external_path(Path::new(r"\\?\UNC\server\share\work")).to_string_lossy(),
+            r"\\server\share\work"
+        );
+        assert_eq!(
+            external_path(Path::new("/tmp/plain/work")).to_string_lossy(),
+            "/tmp/plain/work"
+        );
+    }
+
     #[tokio::test]
-    async fn reattach_identity_mismatch_becomes_a_durable_incident() {
+    async fn reattach_restores_a_switched_branch_and_continues() {
         let (_temp, root, _remote, container) = init_repo();
         let pool = pool_with_objective("objective-dirty-root").await;
         let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
@@ -4367,11 +4602,37 @@ mod tests {
             &["checkout", "-q", "-b", "unexpected-branch"],
         );
 
+        let recovered = attach_existing(&pool, "objective-dirty-root", "process-b")
+            .await
+            .unwrap()
+            .expect("a switched but clean worktree is recoverable");
+
+        assert_eq!(recovered.state, "active");
+        let branch = git(&workspace.worktree_path, &["branch", "--show-current"]);
+        assert_eq!(branch, workspace.branch_name);
+        assert_eq!(recovered.worktree_path, workspace.worktree_path);
+    }
+
+    #[tokio::test]
+    async fn reattach_never_discards_uncommitted_work_on_a_switched_branch() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        git(
+            &workspace.worktree_path,
+            &["checkout", "-q", "-b", "unexpected-branch"],
+        );
+        let dirty = Path::new(&workspace.worktree_path).join("uncommitted.txt");
+        std::fs::write(&dirty, "keep me").unwrap();
+
         let error = attach_existing(&pool, "objective-dirty-root", "process-b")
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("branch changed"));
+        assert!(error.to_string().contains("uncommitted changes"), "{error}");
+        assert!(dirty.exists(), "self-healing must not delete user work");
         let state: String =
             sqlx::query_scalar("SELECT state FROM execution_workspaces WHERE objective_id=?")
                 .bind("objective-dirty-root")
@@ -4379,6 +4640,120 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(state, "incident");
+    }
+
+    #[tokio::test]
+    async fn reattach_rebuilds_a_deleted_worktree_from_its_branch() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&workspace.worktree_path).unwrap();
+        assert!(!Path::new(&workspace.worktree_path).exists());
+        // Windows canonicalization stores `\\?\C:\...`, which git rejects
+        // ("could not create leading directories ... Invalid argument").
+        assert!(
+            !external_path_str(Path::new(&workspace.worktree_path))
+                .unwrap()
+                .starts_with(r"\\?\"),
+            "git must never receive a verbatim path"
+        );
+
+        let recovered = attach_existing(&pool, "objective-dirty-root", "process-b")
+            .await
+            .unwrap()
+            .expect("a vanished worktree is rebuilt from its branch");
+
+        assert_eq!(recovered.state, "active");
+        assert_eq!(recovered.worktree_path, workspace.worktree_path);
+        let branch = git(&workspace.worktree_path, &["branch", "--show-current"]);
+        assert_eq!(branch, workspace.branch_name);
+        let head = git(&workspace.worktree_path, &["rev-parse", "HEAD"]);
+        assert_eq!(head, workspace.base_sha);
+    }
+
+    #[tokio::test]
+    async fn startup_heal_brings_a_parked_workspace_back_to_active() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        git(
+            &workspace.worktree_path,
+            &["checkout", "-q", "-b", "unexpected-branch"],
+        );
+        park_as_incident(&pool, "objective-dirty-root", "branch changed").await;
+
+        let unrepaired = heal_incident_workspaces(&pool).await;
+
+        assert!(unrepaired.is_empty(), "{unrepaired:?}");
+        let state = workspace_state(&pool, "objective-dirty-root").await;
+        assert_eq!(state, "active");
+        let branch = git(&workspace.worktree_path, &["branch", "--show-current"]);
+        assert_eq!(branch, workspace.branch_name);
+    }
+
+    #[tokio::test]
+    async fn startup_heal_records_a_visible_reason_when_it_cannot_repair() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let workspace = allocate_or_attach(&pool, request(&root, &container, "process-a"))
+            .await
+            .unwrap();
+        git(
+            &workspace.worktree_path,
+            &["checkout", "-q", "-b", "unexpected-branch"],
+        );
+        std::fs::write(
+            Path::new(&workspace.worktree_path).join("uncommitted.txt"),
+            "keep me",
+        )
+        .unwrap();
+        park_as_incident(&pool, "objective-dirty-root", "branch changed").await;
+
+        let unrepaired = heal_incident_workspaces(&pool).await;
+
+        assert_eq!(unrepaired.len(), 1, "{unrepaired:?}");
+        assert_eq!(
+            workspace_state(&pool, "objective-dirty-root").await,
+            "incident"
+        );
+        // The reason the user sees is the recorded incident detail, carried
+        // forward verbatim so the session list can explain the block.
+        assert_eq!(unrepaired[0].1, "branch changed");
+        let detail: String = sqlx::query_scalar(
+            "SELECT COALESCE(failure_detail, '') FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind("objective-dirty-root")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(detail, "branch changed");
+        let preserved = Path::new(&workspace.worktree_path).join("uncommitted.txt");
+        assert!(preserved.exists(), "self-healing must not discard uncommitted work");
+    }
+
+    async fn park_as_incident(pool: &SqlitePool, objective_id: &str, detail: &str) {
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET state='incident', failure_code='workspace_identity_conflict', failure_detail=?
+             WHERE objective_id=?",
+        )
+        .bind(detail)
+        .bind(objective_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn workspace_state(pool: &SqlitePool, objective_id: &str) -> String {
+        sqlx::query_scalar("SELECT state FROM execution_workspaces WHERE objective_id=?")
+            .bind(objective_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
