@@ -200,12 +200,10 @@ fn resolve_route_candidates(
         };
 
         let credential_ref = if endpoint_requires_api_key(&endpoint.api_style) {
-            Some(
-                endpoint
-                    .key_ref
-                    .clone()
-                    .unwrap_or_else(|| format!("codefactory.endpoint.{endpoint_name}")),
-            )
+            // M152/R2：只有用户真的保存过凭据（key_ref 已落盘）才算有凭据。
+            // 这里过去会合成 `codefactory.endpoint.{name}`，让没配 key 的端点
+            // 看起来可用，留余量切过去之后才在传输层变成 AUTH_MISSING。
+            endpoint.key_ref.clone()
         } else {
             None
         };
@@ -302,6 +300,20 @@ pub(crate) async fn resolve_route_plan(
                 continue;
             };
             let alternative = candidates[index + 1..].iter().find(|later| {
+                // M152/R1：交接前先确认备选真的可用——有凭据、不在时段外、
+                // 没到额度上限。否则留下的只是一次注定失败（AUTH_MISSING）的切换。
+                if !later.has_usable_credential() {
+                    return false;
+                }
+                if crate::agent::usage_windows::effective_rule(
+                    settings,
+                    &later.endpoint_name,
+                    &later.model_id,
+                )
+                .is_some_and(|rule| !rule.evaluate(now_ms).available)
+                {
+                    return false;
+                }
                 if !settings.endpoint_is_subscription(&later.endpoint_name) {
                     return true;
                 }
@@ -312,19 +324,21 @@ pub(crate) async fn resolve_route_plan(
                     .is_none()
             });
             let Some(alternative) = alternative else {
-                // No endpoint to hand over to: say so honestly instead of
-                // silently eating the headroom the user asked us to keep.
+                // M152/R1：留余量是软偏好。没有可用备选时继续使用当前端点，并把
+                // 原因写进会话说明——既不暂停工作，也不让这一轮走向失败。
                 let reset = breach
                     .reset_hint(now_ms)
-                    .map(|hint| format!("，{hint}后会自动继续"))
+                    .map(|hint| format!("，{hint}后额度会恢复"))
                     .unwrap_or_default();
-                return Err(AppError::Other(format!(
-                    "为避免用光订阅额度，{} 本{}已用 {}%，已暂停向它发送请求；当前没有其它可用端点{}。",
+                plan.keep_capped_primary(format!(
+                    "{} 本{}已用 {}%，为避免用光余量本应让出，但当前没有其它可用端点，系统继续使用 {}{}。",
                     crate::agent::failover::endpoint_label(&candidate.endpoint_name),
                     breach.window.label(),
                     breach.used_percent,
+                    crate::agent::failover::endpoint_label(&candidate.endpoint_name),
                     reset,
-                )));
+                ));
+                break;
             };
             let notice = breach.handover_notice(
                 &crate::agent::failover::endpoint_label(&alternative.endpoint_name),
@@ -7784,6 +7798,82 @@ mod tests {
         assert!(reset_state.take_initial_route_change().is_none());
 
         ledger.clear(QUOTA_TEST_BASE);
+    }
+
+    /// M152/R1：留余量的备选必须真的可用。备选没有凭据时计划保留 GPT，既不报
+    /// 错也不切走，并把原因写进会话说明。
+    #[tokio::test]
+    async fn m152_reserve_handover_requires_a_usable_alternative() {
+        use crate::agent::quota_cap::{
+            shared_quota_ledger, EndpointQuota, UsageSource, WindowUsage,
+        };
+
+        const BASE: &str = "https://m152-quota-gpt.example";
+        let mut settings = crate::config::settings::Settings::default();
+        settings.default_endpoint = "quota-gpt".into();
+        settings.default_model = "gpt-5.5".into();
+        settings.endpoints.clear();
+        settings.endpoints.insert(
+            "quota-gpt".into(),
+            Endpoint {
+                base_url: BASE.into(),
+                key_ref: Some("codex-session".into()),
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-5.5".into()),
+            },
+        );
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://m152-deepseek.example/v1".into(),
+                key_ref: None,
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+
+        let ledger = shared_quota_ledger();
+        let now = chrono::Utc::now().timestamp_millis();
+        ledger.record_server_usage(
+            BASE,
+            EndpointQuota {
+                source: UsageSource::ServerReported,
+                five_hour: WindowUsage {
+                    used_ratio: 0.85,
+                    resets_at_ms: Some(now + 1_800_000),
+                },
+                weekly: WindowUsage {
+                    used_ratio: 0.2,
+                    resets_at_ms: Some(now + 86_400_000),
+                },
+                observed_at_ms: now,
+            },
+        );
+
+        let (plan, _) = resolve_route_plan(&settings, "gpt-5.5", "prefer", false)
+            .await
+            .expect("M152: 没有可用的留余量备选时不能直接报错");
+        assert_eq!(plan.candidates()[0].endpoint_name, "quota-gpt");
+        assert!(
+            plan.quota_notice("quota-gpt").is_none(),
+            "M152: 缺凭据的备选不能承载留余量切走"
+        );
+        assert!(
+            plan.quota_keep_notice()
+                .is_some_and(|notice| notice.contains("继续使用")),
+            "M152: 保留 GPT 的原因要写进会话说明：{:?}",
+            plan.quota_keep_notice()
+        );
+
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        assert_eq!(state.current().endpoint_name, "quota-gpt");
+
+        ledger.clear(BASE);
     }
 
     #[test]
