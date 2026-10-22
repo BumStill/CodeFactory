@@ -519,11 +519,42 @@ struct RepoObservation {
     base_sha: String,
 }
 
+/// Windows `canonicalize` yields verbatim paths (`\\?\C:\...`). `std::fs`
+/// accepts them, but child processes do not: `git worktree add
+/// "\\?\C:\..."` dies with "could not create leading directories ...
+/// Invalid argument". Every path handed to a child process drops it first.
+fn external_path(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if !text
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case(r"\\?\"))
+    {
+        return path.to_path_buf();
+    }
+    let rest = &text[4..];
+    if rest
+        .get(..4)
+        .is_some_and(|head| head.eq_ignore_ascii_case("unc\\"))
+    {
+        return PathBuf::from(format!(r"\\{}", &rest[4..]));
+    }
+    PathBuf::from(rest)
+}
+
+fn external_path_str(path: &Path) -> Result<String> {
+    external_path(path)
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("path is not valid UTF-8: {}", path.display()))
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let mut command = Command::new("git");
     command
         .arg("-C")
-        .arg(cwd)
+        .arg(external_path(cwd))
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
     let mut command = command.no_window();
@@ -729,15 +760,10 @@ fn rebuild_missing_worktree(row: &WorkspaceRow) -> Result<PathBuf> {
     // A vanished directory leaves stale `worktrees/<name>` metadata behind;
     // pruning it is what lets `worktree add` reuse the same path and branch.
     git(&repo_root, &["worktree", "prune"])?;
+    let add_path = external_path_str(&path)?;
     git(
         &repo_root,
-        &[
-            "worktree",
-            "add",
-            path.to_str()
-                .ok_or_else(|| anyhow!("workspace path is not valid UTF-8"))?,
-            &row.branch_name,
-        ],
+        &["worktree", "add", &add_path, &row.branch_name],
     )?;
     path.canonicalize().map_err(|error| {
         anyhow!(
@@ -1555,16 +1581,16 @@ fn inspect_and_remove_candidate(
                 ),
             });
         }
-        if let Err(error) = git(
-            &canonical_repo_root,
-            &[
-                "worktree",
-                "remove",
-                workspace_path
-                    .to_str()
-                    .ok_or_else(|| anyhow!("managed workspace path is not valid UTF-8"))?,
-            ],
-        ) {
+        let remove_path = match external_path_str(&workspace_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(CandidateDisposition::Preserved {
+                    code: "workspace_cleanup_remove_failed",
+                    detail: error.to_string(),
+                })
+            }
+        };
+        if let Err(error) = git(&canonical_repo_root, &["worktree", "remove", &remove_path]) {
             return Ok(CandidateDisposition::Preserved {
                 code: "workspace_cleanup_remove_failed",
                 detail: error.to_string(),
@@ -3324,6 +3350,7 @@ async fn reattach_inner(
             mark_incident(pool, &row.objective_id, &error.to_string()).await;
             return Err(error);
         }
+        let add_path = external_path_str(&path)?;
         if let Err(error) = git(
             &repo_root,
             &[
@@ -3331,8 +3358,7 @@ async fn reattach_inner(
                 "add",
                 "-b",
                 &row.branch_name,
-                path.to_str()
-                    .ok_or_else(|| anyhow!("workspace path is not valid UTF-8"))?,
+                &add_path,
                 &row.base_sha,
             ],
         ) {
@@ -3767,6 +3793,7 @@ async fn allocate_new_locked(
         if branch_exists(&observed.root, &branch_name) {
             bail!("reserved managed workspace branch already exists");
         }
+        let add_path = external_path_str(&worktree_path)?;
         git(
             &observed.root,
             &[
@@ -3774,9 +3801,7 @@ async fn allocate_new_locked(
                 "add",
                 "-b",
                 &branch_name,
-                worktree_path
-                    .to_str()
-                    .ok_or_else(|| anyhow!("workspace path is not valid UTF-8"))?,
+                &add_path,
                 &observed.base_ref,
             ],
         )?;
@@ -3929,7 +3954,7 @@ pub async fn verify_objective_workspace(
 mod tests {
     use super::{
         acquire_repo_allocation_lock, allocate_or_attach, attach_existing, ensure_schema,
-        heal_incident_workspaces,
+        external_path, external_path_str, heal_incident_workspaces,
         latest_for_session, mark_objective_terminal_in_tx, release_repo_allocation_lock,
         run_cleanup_pass, verify_objective_workspace, ExecutionWorkspaceRequest,
         PREVIOUS_WORK_NOT_CARRIED_FORWARD,
@@ -4549,6 +4574,22 @@ mod tests {
         assert_eq!(first.base_sha, second.base_sha);
     }
 
+    #[test]
+    fn external_paths_drop_the_windows_verbatim_prefix_before_reaching_git() {
+        assert_eq!(
+            external_path(Path::new(r"\\?\C:\Users\me\work")).to_string_lossy(),
+            r"C:\Users\me\work"
+        );
+        assert_eq!(
+            external_path(Path::new(r"\\?\UNC\server\share\work")).to_string_lossy(),
+            r"\\server\share\work"
+        );
+        assert_eq!(
+            external_path(Path::new("/tmp/plain/work")).to_string_lossy(),
+            "/tmp/plain/work"
+        );
+    }
+
     #[tokio::test]
     async fn reattach_restores_a_switched_branch_and_continues() {
         let (_temp, root, _remote, container) = init_repo();
@@ -4610,6 +4651,14 @@ mod tests {
             .unwrap();
         std::fs::remove_dir_all(&workspace.worktree_path).unwrap();
         assert!(!Path::new(&workspace.worktree_path).exists());
+        // Windows canonicalization stores `\\?\C:\...`, which git rejects
+        // ("could not create leading directories ... Invalid argument").
+        assert!(
+            !external_path_str(Path::new(&workspace.worktree_path))
+                .unwrap()
+                .starts_with(r"\\?\"),
+            "git must never receive a verbatim path"
+        );
 
         let recovered = attach_existing(&pool, "objective-dirty-root", "process-b")
             .await
