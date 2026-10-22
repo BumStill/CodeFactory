@@ -105,7 +105,8 @@
       "source_kind": "product_contract",
       "change_patterns": [
         "src-tauri/src/vision/*.rs",
-        "src-tauri/src/tools/view_image.rs"
+        "src-tauri/src/tools/view_image.rs",
+        "src-tauri/src/tools/mod.rs"
       ],
       "automated_by": [
         "rust:image_is_sent_as_an_image_url_part_and_the_answer_comes_back",
