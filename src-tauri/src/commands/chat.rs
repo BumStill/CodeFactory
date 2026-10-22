@@ -207,6 +207,14 @@ fn resolve_route_candidates(
         } else {
             None
         };
+        if endpoint_requires_api_key(&endpoint.api_style) && credential_ref.is_none() {
+            // M155/R1：没有凭据的端点根本不进路由计划——既不可能是首选，
+            // 也不可能被"留余量"或失败切换选中。过去它们留在候选里，续跑
+            // 一旦切过去就只会在传输层变成 AUTH_MISSING（现场会话 db4a6…），
+            // 而回合已经被准入，于是永远停在运行中。
+            excluded.push(format!("{endpoint_name}：尚未配置凭据"));
+            continue;
+        }
 
         candidates.push(RouteCandidate {
             supports_vision: crate::agent::context::model_supports_vision(
@@ -227,6 +235,38 @@ fn resolve_route_candidates(
         candidates,
         excluded,
     }
+}
+
+/// M155 R1：**唯一**的回合路由入口。
+///
+/// 正常回合、thin restart 续跑、系统唤醒续跑和用户「继续」都必须从这里拿路由。
+/// 过去这些入口各自先调 `settings_for_session_route` 再调 `resolve_route_plan`：
+/// 看起来等价，但任何一处漏掉其中一步、或换了参数口径（固定策略、图片能力、
+/// 会话端点），就会选出另一套端点——M155 现场里续跑因此绕开了「留余量的软偏好」
+/// 和「没有凭据的端点不参与切换」这两条判定，落到无凭据的端点上变成 AUTH_MISSING，
+/// 回合永远停在运行中。现在只有一个函数，入口无法再分叉。
+pub(crate) struct TurnRoute {
+    /// 本回合冻结的路由视图。`default_endpoint` 仍是用户的偏好，不会被写回设置。
+    pub settings: Settings,
+    pub plan: RouteCandidatePlan,
+    pub excluded: Vec<String>,
+}
+
+pub(crate) async fn resolve_turn_route(
+    settings: &Settings,
+    endpoint_id: Option<&str>,
+    model_id: &str,
+    model_policy: &str,
+    requires_vision: bool,
+) -> Result<TurnRoute, AppError> {
+    let turn_settings = settings_for_session_route(settings, endpoint_id, model_id, model_policy)?;
+    let (plan, excluded) =
+        resolve_route_plan(&turn_settings, model_id, model_policy, requires_vision).await?;
+    Ok(TurnRoute {
+        settings: turn_settings,
+        plan,
+        excluded,
+    })
 }
 
 pub(crate) async fn resolve_route_plan(
@@ -3689,12 +3729,6 @@ async fn send_message_with_origin(
     // Freeze all locally usable routes for this turn. This is a runtime
     // availability plan only: it never overwrites the user's preferred
     // endpoint/model in Settings.
-    let turn_settings = setup_or_recover!(settings_for_session_route(
-        &settings,
-        session.endpoint_id.as_deref(),
-        &session.model_id,
-        &session.model_policy,
-    ));
     // Fetch history as the agent should see it — excludes gate-rejected drafts.
     // It is also the capability source for the frozen turn plan.
     let history = {
@@ -3704,15 +3738,18 @@ async fn send_message_with_origin(
     let requires_vision = history.iter().any(|message| {
         !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
     });
-    let (route_plan, excluded_routes) = setup_or_recover!(
-        resolve_route_plan(
-            &turn_settings,
-            &session.model_id,
-            &session.model_policy,
-            requires_vision,
-        )
-        .await
-    );
+    let TurnRoute {
+        settings: turn_settings,
+        plan: route_plan,
+        excluded: excluded_routes,
+    } = setup_or_recover!(resolve_turn_route(
+        &settings,
+        session.endpoint_id.as_deref(),
+        &session.model_id,
+        &session.model_policy,
+        requires_vision,
+    )
+    .await);
     tracing::debug!(stage = "route_quota", elapsed_ms = route_started.elapsed().as_millis() as u64, "first request preparation");
     let primary_route = route_plan
         .candidates()
@@ -4210,22 +4247,43 @@ pub(crate) async fn resume_thin_running_session(
     )
     .await?;
 
-    let turn_settings = settings_for_session_route(
+    let requires_vision = history.iter().any(|message| {
+        !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
+    });
+    // M155 R1：续跑与正常回合共用同一个路由入口，不再自己拼一套。
+    let (route_plan, _) = match resolve_turn_route(
         &settings_snapshot,
         session.endpoint_id.as_deref(),
         &session.model_id,
         &session.model_policy,
-    )?;
-    let requires_vision = history.iter().any(|message| {
-        !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
-    });
-    let (route_plan, _) = resolve_route_plan(
-        &turn_settings,
-        &session.model_id,
-        &session.model_policy,
         requires_vision,
     )
-    .await?;
+    .await
+    {
+        Ok(route) => (route.plan, route.excluded),
+        Err(error) => {
+            // M155 R2：这一回合已经准入（`running` + `working`），随后在**模型调用
+            // 之前**就失败（路由不可解析、额度、凭据）。过去这里直接 `?` 返回，
+            // 只留一行日志：thin_session_state 永远 running、chat_turn_state 永远
+            // working、零模型调用，用户的下一条消息被排在一个死回合后面。
+            // 现在原子结算成可解释的等待，完整原因写进会话与日志。
+            let reason = error.to_string();
+            if let Err(settle_error) = running_guard.settle_now(Some(&reason)).await {
+                tracing::error!(
+                    session = %session_id,
+                    %settle_error,
+                    reason = %reason,
+                    "failed to settle resumed turn after route resolution failed"
+                );
+            }
+            tracing::warn!(
+                session = %session_id,
+                reason = %reason,
+                "thin restart: route resolution failed; turn settled as a wait"
+            );
+            return Err(error);
+        }
+    };
     let primary_route = route_plan
         .candidates()
         .first()
@@ -4611,22 +4669,33 @@ async fn resume_chat_objective_inner(
             created_at: chrono::Utc::now().timestamp_millis(),
         });
     }
-    let turn_settings = settings_for_session_route(
+    let requires_vision = history.iter().any(|message| {
+        !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
+    });
+    // M155 R1/R2：与 thin restart 同一条路由入口、同一套前置失败结算。
+    let (route_plan, _) = match resolve_turn_route(
         &settings_snapshot,
         session.endpoint_id.as_deref(),
         &session.model_id,
         &session.model_policy,
-    )?;
-    let requires_vision = history.iter().any(|message| {
-        !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
-    });
-    let (route_plan, _) = resolve_route_plan(
-        &turn_settings,
-        &session.model_id,
-        &session.model_policy,
         requires_vision,
     )
-    .await?;
+    .await
+    {
+        Ok(route) => (route.plan, route.excluded),
+        Err(error) => {
+            let reason = error.to_string();
+            if let Err(settle_error) = running_guard.settle_now(Some(&reason)).await {
+                tracing::error!(
+                    session = %session_id,
+                    %settle_error,
+                    reason = %reason,
+                    "failed to settle resumed objective after route resolution failed"
+                );
+            }
+            return Err(error);
+        }
+    };
     let primary_route = route_plan
         .candidates()
         .first()
@@ -4922,13 +4991,19 @@ pub async fn send_message_anonymous(
         .collect();
     full_history.push(anon_message(&session_id, "user".into(), content));
     let active_policy = model_policy.as_deref().unwrap_or("prefer");
-    let turn_settings =
-        settings_for_session_route(&settings, endpoint_id.as_deref(), &model_id, active_policy)?;
     let requires_vision = full_history.iter().any(|message| {
         !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
     });
-    let (route_plan, _excluded_routes) =
-        resolve_route_plan(&turn_settings, &model_id, active_policy, requires_vision).await?;
+    // M155 R1：用户「继续/重试」也走同一个路由入口。
+    let (route_plan, _excluded_routes) = resolve_turn_route(
+        &settings,
+        endpoint_id.as_deref(),
+        &model_id,
+        active_policy,
+        requires_vision,
+    )
+    .await
+    .map(|route| (route.plan, route.excluded))?;
     let primary_route = route_plan
         .candidates()
         .first()
@@ -7666,6 +7741,254 @@ mod tests {
         let resolution = resolve_route_candidates(&settings, "gpt-5.5");
 
         assert!(!resolution.candidates.is_empty());
+    }
+
+    fn route_shape(plan: &RouteCandidatePlan) -> Vec<(String, String, Option<String>)> {
+        plan.candidates()
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.endpoint_name.clone(),
+                    candidate.model_id.clone(),
+                    candidate.credential_ref.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn source_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} is present"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{signature} has a body"));
+        &rest[..end + 2]
+    }
+
+    /// M155 R1/R4：现场 fixture 的重启路由回归。
+    ///
+    /// 现场（v1.91.24，会话 db4a6…）：ChatGPT 已过留余量阈值，DeepSeek 在窗口外，
+    /// OpenRouter 从来没有保存过凭据。续跑走了另一套选路切到 OpenRouter，传输层
+    /// 立刻 AUTH_MISSING，而回合已经被准入，于是永远停在运行中。
+    #[tokio::test]
+    async fn restart_route_keeps_the_usable_endpoint_and_never_targets_a_credential_less_fallback() {
+        let mut settings = Settings::default();
+        settings.default_endpoint = "chatgpt".into();
+        settings.default_model = "gpt-6.1-sol".into();
+        settings.endpoints.clear();
+        settings.endpoints.insert(
+            "chatgpt".into(),
+            Endpoint {
+                base_url: crate::codex_auth::CHATGPT_BASE_URL.into(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: Some("gpt-6.1-sol".into()),
+            },
+        );
+        settings.endpoints.insert(
+            "deepseek".into(),
+            Endpoint {
+                base_url: "https://api.deepseek.example/v1".into(),
+                key_ref: Some("deepseek-secret".into()),
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("deepseek-v4-pro".into()),
+            },
+        );
+        settings.endpoints.insert(
+            "openrouter".into(),
+            Endpoint {
+                base_url: "https://openrouter.example/v1".into(),
+                key_ref: None,
+                api_style: ApiStyle::Openai,
+                custom_models: vec![],
+                active_model: Some("anthropic/claude-opus-4-7".into()),
+            },
+        );
+
+        // 续跑与正常回合共用同一条入口：同一个会话必然得到同一份计划。
+        let resumed = resolve_turn_route(&settings, Some("chatgpt"), "gpt-6.1-sol", "prefer", false)
+            .await
+            .expect("restart route resolves");
+        let normal = resolve_turn_route(&settings, Some("chatgpt"), "gpt-6.1-sol", "prefer", false)
+            .await
+            .expect("normal route resolves");
+        assert_eq!(route_shape(&resumed.plan), route_shape(&normal.plan));
+
+        // 首选必须是会话正在用的订阅端点，不是没有凭据的 OpenRouter。
+        assert_eq!(resumed.plan.candidates()[0].endpoint_name, "chatgpt");
+
+        // 没有凭据的端点根本不进计划：既做不了首选，也做不了切换目标。
+        assert!(
+            resumed
+                .plan
+                .candidates()
+                .iter()
+                .all(|candidate| candidate.endpoint_name != "openrouter"),
+            "没有凭据的 OpenRouter 不得出现在可切换计划里"
+        );
+        assert!(
+            resumed
+                .excluded
+                .iter()
+                .any(|reason| reason.contains("openrouter") && reason.contains("凭据")),
+            "被排除的端点必须给出人话原因，实际是 {:?}",
+            resumed.excluded
+        );
+        for candidate in resumed.plan.candidates().iter().skip(1) {
+            let endpoint = &settings.endpoints[&candidate.endpoint_name];
+            let usable =
+                candidate.credential_ref.is_some() || endpoint.api_style == ApiStyle::Chatgpt;
+            assert!(
+                usable,
+                "{} 没有任何凭据却被列为可切换的备选",
+                candidate.endpoint_name
+            );
+        }
+    }
+
+    /// M155 R1/R2（结构回归）：续跑入口不得再自己拼路由，也不得在模型调用之前
+    /// 失败后直接返回，把回合留在 running。
+    #[test]
+    fn resume_entry_points_use_the_single_turn_route_entry_and_settle_failures() {
+        let source = include_str!("chat.rs");
+        for entry in [
+            "pub(crate) async fn resume_thin_running_session(",
+            "async fn resume_chat_objective_inner(",
+        ] {
+            let body = source_body(source, entry);
+            assert!(
+                body.contains("resolve_turn_route("),
+                "{entry} 必须走唯一路由入口"
+            );
+            assert!(
+                !body.contains("settings_for_session_route("),
+                "{entry} 不得自己拼会话路由"
+            );
+            assert!(
+                !body.contains("resolve_route_plan("),
+                "{entry} 不得旁路唯一路由入口"
+            );
+            assert!(
+                body.contains("settle_now(Some(&reason))"),
+                "{entry} 在模型调用前失败时必须结算回合"
+            );
+        }
+    }
+
+    /// M155 R2/R4：续跑在模型调用之前失败（这里是 M155 现场那句 AUTH_MISSING），
+    /// 必须结算成一个可解释的等待——不能留在 Active 回合里，且新的「继续」
+    /// 立即可被准入（运行控制已结算）。
+    #[tokio::test]
+    async fn route_failure_before_the_first_model_call_settles_the_turn_as_a_wait() {
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_turn_state (
+               root_turn_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL,
+               objective_id TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::agent::objective::ensure_schema(&pool).await.unwrap();
+        let store = ObjectiveStore::new(pool.clone());
+        let objective = store
+            .create(CreateObjective {
+                id: "objective-route-failure".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("session-route-failure".into()),
+                root_turn_id: Some("turn-route-failure".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "validated_change".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state(root_turn_id, session_id, objective_id)
+             VALUES ('turn-route-failure', 'session-route-failure', ?)",
+        )
+        .bind(&objective.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let control = crate::ChatRunControl::pending();
+        register_chat_run_control(&pool, &control, "session-route-failure")
+            .await
+            .unwrap();
+        bind_chat_run_root(
+            &pool,
+            &control.run_instance_id,
+            "session-route-failure",
+            "turn-route-failure",
+        )
+        .await
+        .unwrap();
+        bind_chat_run_objective(
+            &pool,
+            &control.run_instance_id,
+            "session-route-failure",
+            "turn-route-failure",
+            &objective.id,
+            objective.revision,
+        )
+        .await
+        .unwrap();
+
+        let reason = "首选端点失败：AUTH_MISSING: openrouter 尚未配置凭据\n所有可用模型端点均不可用".to_string();
+        let settled = converge_aborted_chat_setup(
+            &pool,
+            &control,
+            "session-route-failure",
+            Some(&reason),
+        )
+        .await
+        .expect("the admitted turn converges")
+        .expect("the objective carries the receipt");
+        assert_ne!(
+            settled.objective.status,
+            ObjectiveStatus::Active,
+            "路由失败不得把回合留在运行中的 Active 状态"
+        );
+        assert!(
+            matches!(
+                settled.objective.status,
+                ObjectiveStatus::WaitingSystem
+                    | ObjectiveStatus::WaitingCoreInput
+                    | ObjectiveStatus::WaitingAuthorization
+                    | ObjectiveStatus::WaitingBusinessDecision
+            ),
+            "失败必须以可解释的等待结算，实际是 {:?} / failure_code {:?}",
+            settled.objective.status,
+            settled.objective.failure_code
+        );
+        let control_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id=?")
+                .bind(&control.run_instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            control_status, "completed",
+            "运行控制必须结算，下一条「继续」不能被死回合挡住"
+        );
     }
 
     #[tokio::test]
