@@ -196,7 +196,7 @@ def _git_file(root: Path, ref: str, relative: str) -> bytes | None:
         capture_output=True,
     )
     if verify.returncode != 0:
-        raise ValueError(f"scenario mappings cannot verify base ref: {ref}")
+        raise ValueError(f"scenario mappings cannot diff against base ref: {ref}")
     result = subprocess.run(
         ["git", "-C", str(root), "show", f"{ref}:{relative}"],
         capture_output=True,

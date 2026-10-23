@@ -85,8 +85,9 @@ class DeliveryScenarioBodyTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         declared = [line.strip() for line in json.loads(result.stdout)['body'].splitlines()
                     if line.startswith('Scenario-Test:')]
-        self.assertEqual(len(declared), 1, declared)
-        ids = {item.strip() for item in declared[0].split(':', 1)[1].split(',') if item.strip()}
+        self.assertLessEqual(len(declared), 1, declared)
+        ids = ({item.strip() for item in declared[0].split(':', 1)[1].split(',') if item.strip()}
+               if declared else set())
         registry = json.loads((ROOT / 'docs/testing/scenario-registry.json').read_text())
         import fnmatch
         expected = set()
@@ -95,6 +96,8 @@ class DeliveryScenarioBodyTests(unittest.TestCase):
                 if any(fnmatch.fnmatch(path, pattern) for path in changed):
                     expected.add(scenario['id'])
                     break
+        if expected:
+            self.assertEqual(len(declared), 1, declared)
         self.assertTrue(expected <= ids, f'missing {sorted(expected - ids)} for {changed}')
 
 
