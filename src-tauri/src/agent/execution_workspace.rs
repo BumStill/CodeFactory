@@ -4265,6 +4265,13 @@ mod tests {
         }
     }
 
+    /// Read a file as text with line endings normalized to LF: Windows CI
+    /// checks worktrees out with core.autocrlf, so dirty files can round-trip
+    /// as CRLF through git without the content itself changing.
+    fn text(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+    }
+
     fn git(cwd: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .no_window()
@@ -5485,10 +5492,17 @@ mod tests {
         super::repair_session_split(&pool, "split-session", "restart").await.unwrap();
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces WHERE state='active'")
             .fetch_one(&pool).await.unwrap(), 1);
-        assert_eq!(std::fs::read_to_string(a.worktree_path.join("first.txt")).unwrap(), "first edit\n");
-        assert_eq!(std::fs::read_to_string(a.worktree_path.join("second.txt")).unwrap(), "second edit\n");
+        // Windows CI checks these worktrees out with core.autocrlf, so a dirty
+        // file's line endings legitimately come back as CRLF. The property under
+        // test is that the edit survives recovery, not that git kept LF bytes,
+        // so compare text with line endings normalized.
+        assert_eq!(text(&a.worktree_path.join("first.txt")), "first edit\n");
+        assert_eq!(text(&b.worktree_path.join("second.txt")), "second edit\n");
         let rescue = format!("refs/codefactory/rescue/{}", b.id);
-        assert_eq!(git(&root, &["show", &format!("{rescue}:second.txt")]), "second edit");
+        assert_eq!(
+            git(&root, &["show", &format!("{rescue}:second.txt")]).replace("\r\n", "\n"),
+            "second edit"
+        );
         super::repair_session_split(&pool, "split-session", "restart").await.unwrap();
         assert_eq!(workspace_state_of(&pool, "split-b").await.as_deref(), Some("closed"));
     }
