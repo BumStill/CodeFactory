@@ -469,6 +469,11 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         ).bind(session).fetch_optional(db).await?;
         if let Some(end) = end { if terminal.as_ref().is_none_or(|old| end.0 > old.0) { terminal = Some(end); } }
     }
+    if terminal.as_ref().is_some_and(|(_, reason)| reason == "delivery_pending") {
+        if let Some(state) = super::thin_state::load(db, session).await?.filter(|state| state.state == SessionState::WaitingUser) {
+            return Ok(state);
+        }
+    }
     let mut pending_question_at = 0;
     if has_table(db, "thin_wait_notes").await? {
         pending_question_at = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(question.created_at) FROM thin_wait_notes note JOIN messages question ON question.id=note.root_turn_id WHERE note.session_id=? AND NOT EXISTS (SELECT 1 FROM messages answer WHERE answer.session_id=note.session_id AND answer.role='user' AND answer.created_at>question.created_at)")
