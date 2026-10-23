@@ -114,6 +114,10 @@ impl std::error::Error for ToolError {}
 /// Where and how the loop's tool calls execute.
 #[async_trait::async_trait]
 pub trait ToolBackend: Send + Sync {
+    /// Fact-based delivery guard, independent of the candidate answer text.
+    async fn pending_delivery(&self, _session_id: &str, _cwd: &std::path::Path) -> Result<bool, ToolError> {
+        Ok(false)
+    }
     /// Task-scoped thin policy; legacy backends keep the full completion gate.
     async fn thin_mode(&self, _session_id: &str) -> bool { false }
     /// Internal next-step guard; never persisted as a user-facing message.

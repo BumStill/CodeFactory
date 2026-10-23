@@ -388,6 +388,17 @@ pub async fn settle_outcome(
     stop_label: &str,
     external_what: Option<String>,
 ) -> sqlx::Result<ThinState> {
+    // M160: a bounded delivery stop is not a completed task. Read the typed
+    // turn fact, never classify the model's final text.
+    if blocked {
+        let pending: Option<String> = sqlx::query_scalar("SELECT waiting_reason FROM chat_turn_state WHERE root_turn_id=? AND terminal_reason='delivery_pending'")
+            .bind(root_turn_id).fetch_optional(db).await?.flatten();
+        if let Some(reason) = pending {
+            let state = ask_user(db, session_id, &reason).await?;
+            project_turn(db, root_turn_id, &state).await?;
+            return Ok(state);
+        }
+    }
     if outcome_settles_final(finished, blocked, final_text) {
         settle_final(db, session_id, root_turn_id, external_what).await
     } else {
@@ -474,6 +485,19 @@ mod settle_tests {
              INSERT INTO objectives (id,status) VALUES ('o-1','active');",
         ).execute(&db).await.unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn m160_delivery_limit_is_waiting_user_not_completed() {
+        let db = db().await;
+        sqlx::query("UPDATE chat_turn_state SET terminal_reason='delivery_pending', waiting_reason='交付仍未完成，改动保留' WHERE root_turn_id='root-1'").execute(&db).await.unwrap();
+        let state = settle_outcome(&db, "s-1", "root-1", false, true, "not delivered", "Blocked", None).await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingUser);
+        assert_eq!(state.question.as_deref(), Some("交付仍未完成，改动保留"));
+        assert_eq!(load(&db, "s-1").await.unwrap().unwrap().state, SessionState::WaitingUser);
+        close_objective(&db, "o-1", &state).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id='o-1'").fetch_one(&db).await.unwrap();
+        assert_eq!(status, "active", "pending delivery must not terminalize the objective");
     }
 
     #[tokio::test]

@@ -978,6 +978,8 @@ pub async fn run_agent_loop(
     let mut blocker_terminal_reason: Option<String> = None;
     let mut completion_summary_retry_used = false;
     let mut completion_recovery_attempts = 0_u32;
+    // M160: independent of generic recovery and never reset by tool batches.
+    let mut delivery_continuations = 0_u32;
     // CF-MSP-R3: the evidence as of the previous rejected final response. A
     // round that advanced it did real work and must not be charged as a
     // recovery, so the budget only bounds rounds that changed nothing.
@@ -1588,6 +1590,37 @@ pub async fn run_agent_loop(
                     emitted_terminal = true;
                     terminal_stop_reason = Some(StopReason::Blocked);
                     break;
+                }
+                // M160: this applies even to thin, and never inspects reply wording.
+                if !summary_only_round {
+                    let pending = tool_backend.pending_delivery(&audit_session_id, &cwd).await;
+                    if !matches!(pending, Ok(false)) {
+                        persistence.mark_rejected_candidate(assistant_message_id.as_deref()).await?;
+                        if matches!(pending, Ok(true)) && delivery_continuations < 2 {
+                            delivery_continuations += 1;
+                            events.round_ended().await;
+                            messages.push(crate::types::ChatMessage {
+                                role: "user".into(),
+                                content: crate::types::MessageContent::Text(
+                                    "系统自动续交付：工作区仍有未交付改动，且没有对应 PR。现在调用 deliver_changes 完成已授权交付；不要只总结剩余步骤。".into(),
+                                ),
+                                tool_calls: None, tool_call_id: None, name: None, reasoning_content: None,
+                            });
+                            continue;
+                        }
+                        let reason = match pending {
+                            Err(error) => format!("暂未完成交付：无法确认工作区与 PR 状态（{}）。系统自动重试/自愈，改动保留。", error.message),
+                            _ => "暂未完成交付：系统已自动续交付两次，仍未找到对应 PR。改动保留，系统自动重试/自愈。".into(),
+                        };
+                        persistence.persist_gate_message(&reason, "turn_notice").await?;
+                        events.emit(crate::types::StreamEvent::CompletionGateAction { kind: "turn_notice".into(), detail: reason.clone() });
+                        publish_turn_activity(persistence.as_ref(), events.as_ref(), root_turn_id.as_deref(),
+                            "finalizing", "blocked", "blocked", &reason, Some(&reason), Some("delivery_pending")).await?;
+                        return Ok(run_outcome_for_terminal(
+                            &completion_gate, StopReason::Blocked,
+                            (total_input_tokens, total_output_tokens), &reason,
+                        ));
+                    }
                 }
                 // Systemic fact-check: a tool-call-free reply asserting a
                 // machine-verifiable obstacle (delivery blocked / command
@@ -4402,6 +4435,70 @@ mod tests {
             is_chatgpt: false,
             cwd: std::path::PathBuf::from("/tmp"),
         }
+    }
+
+    struct PendingDeliveryTools {
+        pending: AtomicBool,
+        opened: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolBackend for PendingDeliveryTools {
+        async fn thin_mode(&self, _: &str) -> bool { true }
+        async fn pending_delivery(&self, _: &str, _: &std::path::Path) -> Result<bool, ToolError> {
+            Ok(self.pending.load(Ordering::SeqCst))
+        }
+        async fn list_schemas(&self) -> Vec<ToolDefinition> { vec![tool_definition()] }
+        async fn execute(&self, call: &ToolCall, args: &serde_json::Value, ctx: &ToolCtx) -> Result<ToolInvocationResult, ToolError> {
+            assert_eq!(call.function.name, "deliver_changes");
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            self.pending.store(false, Ordering::SeqCst);
+            ScriptedTools.execute(call, args, ctx).await
+        }
+    }
+
+    #[tokio::test]
+    async fn m160_final_answer_continues_delivery_without_user_message() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response("Implementation verified", vec![], 0),
+            response("Deliver now", vec![call("pr", "deliver_changes", serde_json::json!({}))], 1),
+            response("PR opened", vec![], 2),
+        ]));
+        let tools = Arc::new(PendingDeliveryTools { pending: AtomicBool::new(true), opened: AtomicUsize::new(0) });
+        let persistence = Arc::new(RecordingPersistence::default());
+        let mut svc = services(transport.clone(), persistence.clone(), Arc::new(CollectingEventSink::new()));
+        svc.tools = tools.clone();
+        let mut cfg = config();
+        cfg.max_iterations = 5;
+        let outcome = run_agent_loop(inputs(), cfg, svc).await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Finished);
+        assert_eq!(tools.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.requests().len(), 3);
+        assert!(persistence.notices.lock().unwrap().is_empty(), "internal instruction must not become a conversation notice");
+    }
+
+    #[tokio::test]
+    async fn m160_delivery_retries_are_bounded() {
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            response("done", vec![], 0), response("done", vec![], 1), response("done", vec![], 2),
+        ]));
+        let mut svc = services(transport.clone(), Arc::new(RecordingPersistence::default()), Arc::new(CollectingEventSink::new()));
+        svc.tools = Arc::new(PendingDeliveryTools { pending: AtomicBool::new(true), opened: AtomicUsize::new(0) });
+        let mut cfg = config();
+        cfg.max_iterations = 5;
+        let outcome = run_agent_loop(inputs(), cfg, svc).await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Blocked);
+        assert_eq!(transport.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn m160_no_pending_delivery_finishes_normally() {
+        let transport = Arc::new(ScriptedTransport::new(vec![response("read-only result", vec![], 0)]));
+        let mut svc = services(transport.clone(), Arc::new(RecordingPersistence::default()), Arc::new(CollectingEventSink::new()));
+        svc.tools = Arc::new(PendingDeliveryTools { pending: AtomicBool::new(false), opened: AtomicUsize::new(0) });
+        let outcome = run_agent_loop(inputs(), config(), svc).await.unwrap();
+        assert_eq!(outcome.stop_reason, StopReason::Finished);
+        assert_eq!(transport.requests().len(), 1);
     }
 
     fn services(

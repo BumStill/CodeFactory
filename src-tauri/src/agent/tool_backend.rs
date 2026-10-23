@@ -1214,6 +1214,68 @@ pub(super) struct DesktopToolBackend {
     pub(super) mcp_tool_names: std::sync::Arc<std::sync::RwLock<HashSet<String>>>,
 }
 
+/// M160: inspect only the current managed checkout, never the answer text.
+async fn pending_workspace_delivery(
+    db: &sqlx::SqlitePool, session_id: &str, cwd: &Path, ceiling_enabled: bool,
+) -> Result<bool, ToolError> {
+    if !ceiling_enabled || !super::fetch_session_delivery_authorized(db, session_id).await {
+        return Ok(false);
+    }
+    let error = |e: String| ToolError { message: e };
+    let has_table: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='execution_workspaces'")
+        .fetch_one(db).await.map_err(|e| error(e.to_string()))?;
+    if has_table == 0 { return Ok(false); }
+    let workspace = sqlx::query("SELECT objective_id, worktree_path, base_sha FROM execution_workspaces WHERE session_id=? AND state IN ('active','delivering','cleanup_pending') AND worktree_path=? ORDER BY updated_at DESC LIMIT 1")
+        .bind(session_id).bind(cwd.to_string_lossy().as_ref()).fetch_optional(db).await.map_err(|e| error(e.to_string()))?;
+    let Some(workspace) = workspace else { return Ok(false); };
+    let path: String = workspace.get("worktree_path");
+    let base: String = workspace.get("base_sha");
+    let objective: String = workspace.get("objective_id");
+    // Use the bounded subprocess runner; no network observation on read-only tasks.
+    let facts = tokio::task::spawn_blocking(move || {
+        let path = Path::new(&path);
+        let status = super::delivery::git(path, &["status", "--porcelain"])?;
+        let diff = super::delivery::git(path, &["diff", "--name-only", &base, "HEAD", "--"])?;
+        let head = super::delivery::git(path, &["rev-parse", "HEAD"])?;
+        Ok::<_, String>((!status.trim().is_empty(), !diff.trim().is_empty(), head))
+    }).await.map_err(|e| error(e.to_string()))?.map_err(error)?;
+    if facts.0 { return Ok(true); } // PR cannot include uncommitted changes.
+    if !facts.1 { return Ok(false); }
+    let has_delivery: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'")
+        .fetch_one(db).await.map_err(|e| error(e.to_string()))?;
+    let delivered: i64 = if has_delivery == 0 { 0 } else { sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_runs WHERE objective_id=? AND workspace_path=?
+         AND canonical_head_sha=? AND canonical_pr_number IS NOT NULL AND canonical_pr_url IS NOT NULL
+         AND reached_ceiling IN ('pr_open','ci_green','merged','release_triggered','deployment_succeeded','live_verified')
+         AND status NOT IN ('cancelled','rejected')")
+        .bind(objective).bind(cwd.to_string_lossy().as_ref()).bind(&facts.2)
+        .fetch_one(db).await.map_err(|e| error(e.to_string()))? };
+    if delivered > 0 { return Ok(false); }
+    // Thin delivery intentionally does not create legacy delivery_runs. Its PR
+    // reference must be checked against live state/head, not mistaken for no PR.
+    let has_thin: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_delivery_refs'")
+        .fetch_one(db).await.map_err(|e| error(e.to_string()))?;
+    if has_thin > 0 {
+        let number: Option<i64> = sqlx::query_scalar("SELECT pr_number FROM thin_delivery_refs WHERE session_id=?")
+            .bind(session_id).fetch_optional(db).await.map_err(|e| error(e.to_string()))?;
+        if let Some(number) = number {
+            let cwd = cwd.to_path_buf();
+            let observed = tokio::task::spawn_blocking(move || {
+                let remote = super::delivery::gh_remote_for(&cwd).ok_or_else(|| "无法读取 PR 所属仓库".to_string())?;
+                remote.observed_pr_states(&[number])
+            }).await.map_err(|e| error(e.to_string()))?;
+            // A recorded open/merged PR for this session IS the corresponding
+            // delivery. An unobservable GitHub must not block a finished task.
+            if let Ok(states) = observed {
+                if let Some(pr) = states.get(&number) {
+                    if matches!(pr.state.as_str(), "OPEN" | "MERGED") { return Ok(false); }
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 impl DesktopToolBackend {
     async fn ensure_observation_schema(&self) -> Result<(), ToolError> {
         sqlx::raw_sql(include_str!(
@@ -2554,6 +2616,11 @@ async fn mark_side_effect_started_in_tx(
 
 #[async_trait::async_trait]
 impl ToolBackend for DesktopToolBackend {
+    async fn pending_delivery(&self, session_id: &str, cwd: &Path) -> Result<bool, ToolError> {
+        let ceiling = super::fetch_session_delivery_ceiling(&self.db, session_id).await
+            .unwrap_or(self.settings.read().await.delivery_ceiling);
+        pending_workspace_delivery(&self.db, session_id, cwd, ceiling.rank() > 0).await
+    }
     async fn thin_mode(&self, session_id: &str) -> bool { super::thin::is_thin(&self.db, session_id).await }
     async fn external_wait_completion_hint(&self, session_id: &str) -> Option<String> {
         if super::thin::is_thin(&self.db, session_id).await {
@@ -2843,6 +2910,46 @@ mod tests {
     const TEST_ROOT_TURN_ID: &str = "root-tool-fencing";
     const TEST_OBJECTIVE_ID: &str = "5cf0bf25-2ed8-4cad-a775-f55cd16f0830";
     const TEST_BINDING_ID: &str = "binding-tool-fencing";
+
+    #[tokio::test]
+    async fn m160_workspace_facts_cover_committed_dirty_readonly_and_authorization() {
+        let backend = backend().await;
+        let db = &backend.db;
+        sqlx::raw_sql("CREATE TABLE sessions(id TEXT PRIMARY KEY, delivery_authorized INTEGER); INSERT INTO sessions VALUES('synthetic',1);
+            CREATE TABLE execution_workspaces(objective_id TEXT, session_id TEXT, worktree_path TEXT, base_sha TEXT, state TEXT, updated_at INTEGER);
+            CREATE TABLE delivery_runs(objective_id TEXT, workspace_path TEXT, canonical_head_sha TEXT, canonical_pr_number INTEGER, canonical_pr_url TEXT, reached_ceiling TEXT, status TEXT);")
+            .execute(db).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| super::super::delivery::git(path, args).unwrap();
+        git(&["init"]);
+        git(&["config", "user.name", "Synthetic"]);
+        git(&["config", "user.email", "synthetic@example.invalid"]);
+        std::fs::write(path.join("code.txt"), "base\n").unwrap();
+        git(&["add", "code.txt"]); git(&["commit", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        sqlx::query("INSERT INTO execution_workspaces VALUES('objective','synthetic',?,?,'active',1)")
+            .bind(path.to_string_lossy().as_ref()).bind(&base).execute(db).await.unwrap();
+        assert!(!pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "read-only checkout ends normally");
+        std::fs::write(path.join("code.txt"), "implemented\n").unwrap();
+        assert!(pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "dirty changes need delivery");
+        git(&["add", "code.txt"]); git(&["commit", "-m", "fix: synthetic"]);
+        assert!(pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "committed without PR must continue");
+        assert!(!pending_workspace_delivery(db, "synthetic", path, false).await.unwrap(), "ceiling off must not continue");
+        sqlx::query("UPDATE sessions SET delivery_authorized=0").execute(db).await.unwrap();
+        assert!(!pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "no authorization must not continue");
+        sqlx::query("UPDATE sessions SET delivery_authorized=1").execute(db).await.unwrap();
+        let head = git(&["rev-parse", "HEAD"]);
+        sqlx::query("INSERT INTO delivery_runs VALUES('objective',?,?,1,'https://example.invalid/pr/1','pr_open','waiting')")
+            .bind(path.to_string_lossy().as_ref()).bind(&head).execute(db).await.unwrap();
+        assert!(!pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "exact PR head is already delivered");
+        sqlx::query("UPDATE delivery_runs SET canonical_head_sha='stale'").execute(db).await.unwrap();
+        assert!(pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "stale PR head must not cover new commit");
+        sqlx::query("UPDATE delivery_runs SET canonical_head_sha=?, reached_ceiling='merged', status='merged'").bind(&head).execute(db).await.unwrap();
+        assert!(!pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "merged exact head is delivered");
+        std::fs::write(path.join("new.txt"), "not in PR").unwrap();
+        assert!(pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "PR does not cover untracked changes");
+    }
 
     async fn backend() -> DesktopToolBackend {
         let db = SqlitePoolOptions::new()
