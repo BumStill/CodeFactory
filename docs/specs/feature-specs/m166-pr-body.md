@@ -26,6 +26,6 @@ Spec：原始任务规格与 Implementation Notes 已入库。Compatibility：M1
 
 合并后核对 merged=true、squash commit 在 origin/main、远端精确分支与本地状态；清理任务专属构建目录，不删除应用管理的工作区。不执行发布。无待决 Spec Amendment。
 
-Scenario-Test: UI-009
+Scenario-Test: UI-009, HLT-005, SKL-002
 README-Update: reviewed
 README-Update-Reason: 修复既有信任模式的组合命令作用域判定，不改变公开安装、隐私或平台承诺。
