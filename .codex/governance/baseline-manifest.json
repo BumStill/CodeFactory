@@ -37,6 +37,7 @@
     ".githooks/pre-push",
     ".github/workflows/governed-delivery.yml",
     "tools/governance/validate_repo_governance_baseline.py",
+    "tools/governance/validate_acceptance_ledger.py",
     "tools/governance/check_repo_governance.ps1",
     "tools/governance/diagnose_release_latency.py",
     "tools/governance/validate_long_task_record.py",
