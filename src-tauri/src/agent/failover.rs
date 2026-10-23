@@ -598,7 +598,8 @@ impl ActiveRouteState {
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) { return Err("cancelled".into()); }
             let now = super::usage_windows::now_ms();
             let config = settings.read().await;
-            if !durable_wait && config.model_usage_windows.is_empty() && config.endpoint_usage_windows.is_empty() { return Ok(None); }
+            if !durable_wait && config.model_usage_windows.is_empty() && config.endpoint_usage_windows.is_empty()
+                && !self.inner.lock().expect("active route mutex poisoned").candidates.iter().any(|route| config.endpoint_is_subscription(&route.endpoint_name)) { return Ok(None); }
             let delay = {
             let mut inner = self.inner.lock().expect("active route mutex poisoned");
             let from = inner.candidates[inner.current_index].clone();
@@ -607,14 +608,17 @@ impl ActiveRouteState {
             // CF-WINDOW-R4/R5：换模型和等待都要如实说出原因，所以分开记两类。
             let mut window_blocked: Vec<String> = Vec::new();
             let mut quota_blocked: Vec<String> = Vec::new();
-            // M152/R1：只到"留余量"上限（还没用满）的端点，在所有候选都不可用
-            // 时仍然是本轮可用的兜底。这里存它的 index 与要显示的说明。
-            let mut soft_keep: Option<(usize, String)> = None;
             // M86：等待说明要列出**全部**原因（时段、额度、缺凭据）与最早可用时间。
             let mut causes: Vec<super::usage_windows::WaitCause> = Vec::new();
             let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
                 let label = endpoint_label(&route.endpoint_name);
                 if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name) { return None; }
+                // M164：忽略使用时段不是绕过凭据的授权；缺凭据端点也不贡献唤醒时间。
+                if !route.has_usable_credential() {
+                    skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some("route_prefilter:missing_credential".into()) });
+                    causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
+                    return None;
+                }
                 if let Some(rule) = super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id) {
                     let status = rule.evaluate(now);
                     if !status.available && !ignore_windows {
@@ -637,29 +641,11 @@ impl ActiveRouteState {
                             causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
                             return None;
                         }
-                        // M152/R1：留余量是软偏好。没用满的端点保留为兜底，先让
-                        // 真正可用的其它候选赢；一个都没有时再回到它继续本轮。
-                        if !breach.is_hard_exhausted() {
-                            if soft_keep.is_none() {
-                                let reset = breach.reset_hint(now).map(|hint| format!("，{hint}")).unwrap_or_default();
-                                soft_keep = Some((
-                                    index,
-                                    format!(
-                                        "{} 本{}已用 {}%，当前没有其它可用端点，系统继续使用 {}{}。",
-                                        label,
-                                        breach.window.label(),
-                                        breach.used_percent,
-                                        label,
-                                        reset
-                                    ),
-                                ));
-                            }
-                            return None;
-                        }
+                        // M164：达到用户上限即不可用，不允许无备选时软兜底。
                         // M86：额度门禁的预过滤同样是一步要写进路由记录的动作。
                         skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":breach.resets_at_ms}))) });
                         if let Some(next) = breach.resets_at_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
-                        causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::QuotaCap, breach.resets_at_ms));
+                        causes.push(super::usage_windows::WaitCause::new(format!("{label} 已到你设的 {}% 上限", breach.cap_percent), super::usage_windows::WaitCauseKind::QuotaCap, breach.resets_at_ms));
                         quota_blocked.push(route.model_id.clone());
                         return None;
                     }
@@ -693,28 +679,20 @@ impl ActiveRouteState {
                 }
                 causes
             };
-            // M152/R1：真正可用的候选优先；一个都没有时回到只到软性上限的端点。
-            let selected = selected.or(soft_keep.as_ref().map(|(index, _)| *index));
-            let keep_reason = selected.and_then(|index| {
-                soft_keep
-                    .as_ref()
-                    .filter(|(kept, _)| *kept == index)
-                    .map(|(_, notice)| notice.clone())
-            });
             if let Some(index) = selected {
                 inner.current_index = index;
                 let to = inner.candidates[index].clone();
                 return Ok((from.endpoint_name != to.endpoint_name || from.model_id != to.model_id).then(|| RouteChange {
                     from_endpoint: from.endpoint_name.clone(), from_model: from.model_id,
                     to_endpoint: to.endpoint_name.clone(), to_model: to.model_id.clone(),
-                    reason: keep_reason.unwrap_or_else(|| format!(
+                    reason: format!(
                         "已切到 {}{}",
                         to.model_id,
                         blocked_causes(&window_blocked, &quota_blocked, next_available)
                             .first()
                             .map(|cause| format!("：{cause}"))
                             .unwrap_or_default()
-                    )),
+                    ),
                     kind: RouteChangeKind::QuotaCap,
                 }));
             }
@@ -1812,10 +1790,9 @@ mod tests {
         assert!(state.take_initial_route_change().is_none());
     }
 
-    /// M152/R1 + R4：备选全部硬性不可用时，只到达软性上限（留余量）的首选仍然
-    /// 可用——这一轮继续在它上面跑，并说清楚原因，而不是变成技术失败。
+    /// M164/R1/R5：用户上限是硬门禁，无备选也不得继续请求 GPT。
     #[tokio::test]
-    async fn m152_reserve_capped_primary_is_kept_when_every_alternative_is_blocked() {
+    async fn m164_reserve_capped_primary_waits_when_every_alternative_is_blocked() {
         let mut primary = route("chatgpt", "gpt-5.5");
         primary.base_url = "https://m152-primary.example".into();
         let mut fallback = route("chatgpt-backup", "gpt-5.5");
@@ -1867,20 +1844,71 @@ mod tests {
         );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
 
-        let change = state
-            .admit_model_availability(None, false, None)
-            .await
-            .expect("M152: 没有可用备选时保留 GPT，不得变成技术失败");
-        assert_eq!(state.current().endpoint_name, "chatgpt");
-        let change = change.expect("保留软性上限的端点必须给出说明");
-        assert!(
-            change.notice().contains("继续使用"),
-            "{}",
-            change.notice()
-        );
+        let error = state.admit_model_availability(None, false, None).await.unwrap_err();
+        let unavailable = ModelUnavailable::parse(&error).unwrap();
+        assert_eq!(unavailable.resume_at_ms, Some(now + 1_800_000 + 250));
+        assert!(!unavailable.notice.contains("继续使用"));
+        assert!(state.inner.lock().unwrap().failures.is_empty());
 
         ledger.clear(&primary.base_url);
         ledger.clear(&fallback.base_url);
+    }
+
+    #[tokio::test]
+    async fn m164_hard_cap_matrix_and_deepseek_boundary() {
+        let _serial = super::super::usage_windows::clock_test_lock();
+        let clock = |time: &str| chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{time}:00+08:00")).unwrap().timestamp_millis();
+        let now = clock("10:00");
+        super::super::usage_windows::set_clock_override_ms(Some(now));
+        let mut gpt = route("m164-gpt", "gpt");
+        gpt.base_url = "https://m164.synthetic.example".into();
+        gpt.api_style = ApiStyle::Chatgpt;
+        let mut plan = RouteCandidatePlan::new(gpt.clone());
+        plan.push_fallback(route("deepseek", "pro"));
+        let mut missing = route("openrouter", "synthetic");
+        missing.credential_ref = None;
+        missing.legacy_inline_api_key = None;
+        plan.push_fallback(missing);
+        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut config = crate::config::settings::Settings::default();
+        config.endpoints.insert("m164-gpt".into(), crate::config::settings::Endpoint {
+            base_url: gpt.base_url.clone(), key_ref: None, api_style: ApiStyle::Chatgpt,
+            custom_models: vec![], active_model: None,
+        });
+        config.model_usage_windows.insert(super::super::usage_windows::model_key("deepseek", "pro"), super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap());
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(config)));
+        let ledger = super::super::quota_cap::shared_quota_ledger();
+        for (five, week, blocked) in [(0.81, 0.1, true), (0.80, 0.1, true), (0.79, 0.1, false), (0.21, 0.83, true), (0.37, 0.23, false)] {
+            ledger.record_server_usage(&gpt.base_url, super::super::quota_cap::EndpointQuota {
+                source: super::super::quota_cap::UsageSource::ServerReported,
+                five_hour: super::super::quota_cap::WindowUsage { used_ratio: five, resets_at_ms: Some(clock("14:00")) },
+                weekly: super::super::quota_cap::WindowUsage { used_ratio: week, resets_at_ms: Some(clock("16:00")) }, observed_at_ms: now,
+            });
+            let result = state.admit_model_availability(None, false, None).await;
+            if blocked {
+                let unavailable = ModelUnavailable::parse(&result.unwrap_err()).unwrap();
+                assert_eq!(unavailable.resume_at_ms, Some(clock("12:00") + 250));
+                assert!(!unavailable.notice.contains("已切到 OpenRouter"));
+            } else {
+                result.unwrap();
+                assert_eq!(state.current().endpoint_name, "m164-gpt");
+            }
+        }
+        ledger.record_server_usage(&gpt.base_url, super::super::quota_cap::EndpointQuota {
+            source: super::super::quota_cap::UsageSource::ServerReported,
+            five_hour: super::super::quota_cap::WindowUsage { used_ratio: 0.81, resets_at_ms: Some(clock("14:00")) },
+            weekly: super::super::quota_cap::WindowUsage::empty(), observed_at_ms: now,
+        });
+        // 忽略时段只放行 DeepSeek，绝不能放行已达硬上限的 GPT。
+        state.admit_model_availability(None, true, None).await.unwrap();
+        assert_eq!(state.current().endpoint_name, "deepseek");
+        super::super::usage_windows::set_clock_override_ms(Some(clock("12:00")));
+        state.admit_model_availability(None, false, None).await.unwrap();
+        assert_eq!(state.current().endpoint_name, "deepseek");
+        assert!(state.inner.lock().unwrap().failures.is_empty());
+        assert!(state.attempt_snapshots(false).iter().all(|attempt| attempt.status != "failed"));
+        ledger.clear(&gpt.base_url);
+        super::super::usage_windows::set_clock_override_ms(None);
     }
 
     /// CF-PFB-R6. Fixed mode is a pin: one candidate, no fallback, ever.

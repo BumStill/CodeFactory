@@ -341,8 +341,21 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     }
     let state = if error_text == "agent loop stopped: Cancelled" {
         ThinState::ended("cancelled：回合已取消", "本会话记录")
-    } else if error_text.contains("no_model_available") || super::failover::ModelUnavailable::parse(error_text).is_some() {
-        after_no_model(60 * 1_000)
+    } else if let Some(unavailable) = super::failover::ModelUnavailable::parse(error_text) {
+        if let Some(at) = unavailable.resume_at_ms {
+            super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, &unavailable.notice).await?;
+            ThinState {
+                waiting_for: Some(unavailable.notice),
+                wake_source: Some(format!("model-availability-{session_id}")),
+                ..after_no_model(at.saturating_sub(now()))
+            }
+        } else {
+            ThinState::ended(&unavailable.notice, "本会话记录")
+        }
+    } else if error_text.contains("no_model_available") {
+        let at = now().saturating_add(60_000);
+        super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, "模型暂不可用").await?;
+        after_no_model(60_000)
     } else {
         record_technical_failure(db, session_id, &first_line(error_text)).await?
     };
@@ -461,6 +474,44 @@ mod settle_tests {
              INSERT INTO objectives (id,status) VALUES ('o-1','active');",
         ).execute(&db).await.unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn m164_model_wait_persists_exact_wake_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("restart.db").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m164','synthetic','/synthetic','model',1,1,'thin')").execute(&db).await.unwrap();
+        let due = now() + 7_200_250;
+        let unavailable = super::super::failover::ModelUnavailable {
+            resume_at_ms: Some(due), notice: "GPT 已到你设的 80% 上限，约到点自动继续".into(),
+        };
+        let state = settle_error(&db, "m164", "root-m164", &unavailable.encode()).await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake);
+        let wakes = super::super::background_tasks::list_wakeups(&db, "m164").await.unwrap();
+        assert_eq!(wakes.len(), 1, "waiting_wake 必须有真实落盘调度，而非仅 wake_source 文本");
+        assert_eq!(wakes[0].next_at, (due + 999) / 1000);
+        settle_error(&db, "m164", "root-m164", &unavailable.encode()).await.unwrap();
+        assert_eq!(super::super::background_tasks::list_wakeups(&db, "m164").await.unwrap().len(), 1);
+        db.close().await;
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        struct Sink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl super::super::background_tasks::WakeSink for Sink {
+            fn enqueue(&self, session: String, text: String) -> super::super::background_tasks::WakeFuture {
+                assert_eq!(session, "m164");
+                assert!(text.contains("系统自动重试/自愈"));
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { true })
+            }
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Sink(calls.clone());
+        let at = (due + 999) / 1000;
+        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at - 1).await, 0);
+        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at).await, 1);
+        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at + 1).await, 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        db.close().await;
     }
 
     #[tokio::test]

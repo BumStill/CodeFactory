@@ -995,6 +995,26 @@ async fn ensure_wakeup_schema(pool: &SqlitePool) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// 系统模型等待不受用户工具的 60 秒/6 小时输入范围约束；绝对恢复时间直接落盘。
+/// 固定 session ID 去重，避免同一等待的重复结算产生多个续跑回合。
+pub(crate) async fn persist_model_wakeup(
+    pool: &SqlitePool, session: &str, root: &str, at_ms: i64, notice: &str,
+) -> sqlx::Result<()> {
+    ensure_wakeup_schema(pool).await?;
+    sqlx::query(
+        "INSERT INTO wakeup_schedules(id,session_id,root_turn_id,prompt,source,next_at,status,created_at)
+         VALUES (?,?,?,?,'agent_decided',?,'pending',?)
+         ON CONFLICT(id) DO UPDATE SET root_turn_id=excluded.root_turn_id,
+           prompt=excluded.prompt,next_at=excluded.next_at,status='pending',last_fired_at=NULL",
+    )
+    .bind(format!("model-availability-{session}"))
+    .bind(session).bind(root)
+    .bind(format!("{notice}。系统自动重试/自愈：模型可用时间已到，重新检查凭据、使用时段和用户额度硬上限，继续原任务。"))
+    .bind(at_ms.saturating_add(999).div_euclid(1000)).bind(now_secs())
+    .execute(pool).await?;
+    Ok(())
+}
+
 /// R2：创建唤醒。时限、提示文本、上限都在落库前校验，因此被拒时不留任何行。
 pub async fn schedule_wakeup_at(
     pool: &SqlitePool,
