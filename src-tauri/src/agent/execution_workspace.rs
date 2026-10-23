@@ -3753,7 +3753,7 @@ async fn inherit_predecessor_locked(
            AND workspace.objective_id<>?
            AND workspace.repo_identity=?
            AND workspace.state IN ('allocating', 'active', 'delivering', 'cleanup_pending')
-           AND objectives.status IN ('completed', 'cancelled', 'failed')
+           AND objectives.status IN ('completed', 'cancelled', 'failed', 'legacy_orphan')
          ORDER BY workspace.updated_at DESC
          LIMIT 5",
     )
@@ -4024,7 +4024,27 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
         let path = Path::new(&row.worktree_path);
         (workspace_has_uncommitted_changes(path) || workspace_has_commits_beyond_base(path, &row.base_sha)).then_some(i)
     }).collect();
-    let keep = dirty.first().copied().unwrap_or(0);
+    let keep = match dirty.first().copied() {
+        Some(index) => index,
+        None => {
+            // M169/R3: when none of the split workspaces has local work, the
+            // current one is the workspace the delivery runs in (it owns the
+            // canonical PR) — not merely the oldest row.
+            let pr_owner: Option<String> = sqlx::query_scalar(
+                "SELECT objective_id FROM execution_workspaces
+                 WHERE session_id=? AND state IN ('active','allocating','delivering')
+                   AND COALESCE(canonical_pr_number, 0) > 0
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+            )
+            .bind(session)
+            .fetch_optional(pool)
+            .await?;
+            pr_owner
+                .as_ref()
+                .and_then(|owner| rows.iter().position(|row| &row.objective_id == owner))
+                .unwrap_or(0)
+        }
+    };
     let keeper = rows.remove(keep);
     let mut snapshot = rescue_snapshot(&keeper)?;
     // Capture all branches before changing any files or durable state.
@@ -5507,6 +5527,59 @@ mod tests {
         assert_eq!(workspace_state_of(&pool, "split-b").await.as_deref(), Some("closed"));
     }
 
+    /// M169/R3: a session that already split keeps the workspace its PR lives
+    /// in, even when none of the copies has local edits — the empty duplicate is
+    /// the one that must close.
+    #[tokio::test]
+    async fn split_recovery_keeps_the_workspace_that_owns_the_pull_request() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["pr-split-a", "pr-split-b"]).await;
+        let _a = allocate_or_attach(
+            &pool,
+            request_for_session(&root, &container, "pr-split-a", "pr-split-session", "p-a"),
+        )
+        .await
+        .unwrap();
+        let b = allocate_or_attach(
+            &pool,
+            request_for_session(&root, &container, "pr-split-b", "other-session", "p-b"),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE execution_workspaces SET session_id='pr-split-session'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        record_open_pr(&pool, "pr-split-b", 861).await;
+
+        super::repair_session_split(&pool, "pr-split-session", "restart")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            workspace_state_of(&pool, "pr-split-b").await.as_deref(),
+            Some("active"),
+            "the PR workspace must stay current"
+        );
+        assert_eq!(
+            workspace_state_of(&pool, "pr-split-a").await.as_deref(),
+            Some("closed"),
+            "the empty duplicate must close"
+        );
+        let active_path: String = sqlx::query_scalar(
+            "SELECT worktree_path FROM execution_workspaces
+             WHERE session_id='pr-split-session' AND state='active'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            active_path,
+            b.worktree_path.to_string_lossy().to_string(),
+            "the surviving mutable workspace must be the PR workspace"
+        );
+    }
+
     /// U24 (a): the user stops a task that has uncommitted work, then sends
     /// another message in the same session. The next Objective must continue in
     /// the same worktree/branch instead of starting over in an empty checkout.
@@ -5549,6 +5622,62 @@ mod tests {
             workspace_state_of(&pool, "objective-stop-a").await,
             None,
             "the workspace belongs to the continued Objective now"
+        );
+    }
+
+    /// M169: a settled turn (`legacy_orphan`) whose delivery is still open is
+    /// the same task. If any entry does create the next Objective, it must still
+    /// inherit the one managed workspace and its canonical PR — otherwise the
+    /// delivery continues on a branch nobody edited.
+    #[tokio::test]
+    async fn a_legacy_orphan_with_an_open_delivery_hands_its_workspace_forward() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool =
+            pool_with_objectives(&["objective-orphan-a", "objective-orphan-b"]).await;
+        let workspace_a = allocate_or_attach(
+            &pool,
+            request_for_session(&root, &container, "objective-orphan-a", "orphan-session", "p-a"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace_a.worktree_path.join("draft.txt"), "unfinished fix\n").unwrap();
+        record_open_pr(&pool, "objective-orphan-a", 861).await;
+
+        // Exactly what the settled chat turn does.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE objectives SET status='legacy_orphan' WHERE id='objective-orphan-a'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        mark_objective_terminal_in_tx(
+            &mut tx,
+            "objective-orphan-a",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let workspace_b = allocate_or_attach(
+            &pool,
+            request_for_session(&root, &container, "objective-orphan-b", "orphan-session", "p-b"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workspace_b.worktree_path, workspace_a.worktree_path,
+            "an open delivery keeps its worktree even after the turn settled"
+        );
+        assert_eq!(workspace_b.branch_name, workspace_a.branch_name);
+        assert_eq!(
+            workspace_pr_number(&pool, "objective-orphan-b").await,
+            Some(861),
+            "the canonical PR belongs to the continued task"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_b.worktree_path.join("draft.txt")).unwrap(),
+            "unfinished fix\n"
         );
     }
 

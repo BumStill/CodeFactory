@@ -2653,7 +2653,6 @@ struct ChatContinuationSetup {
     previous_segment_id: Option<String>,
     expected_objective_id: Option<String>,
     driver: Option<String>,
-    ambiguous: bool,
 }
 
 #[derive(Debug)]
@@ -2691,6 +2690,58 @@ pub(crate) async fn admit_headless_chat_turn(
         root_turn_id: admission.root_turn_id,
         objective: admission.objective,
     })
+}
+
+/// M169: the chat anchor of the session's unfinished delivery, if any.
+///
+/// Answers "which Objective and which of its turns owns the work this session
+/// still has to finish", using durable delivery state (a canonical PR that has
+/// not reached a merge) rather than the Objective's lifecycle column or the
+/// message's wording.
+async fn open_delivery_chat_anchor(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    current_root_turn_id: &str,
+) -> Result<Option<(String, String, String)>, AppError> {
+    let has_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if has_table == 0 {
+        return Ok(None);
+    }
+    let objective_id: Option<String> = sqlx::query_scalar(
+        "SELECT delivery.objective_id
+         FROM delivery_runs delivery
+         JOIN objectives objective ON objective.id=delivery.objective_id
+         WHERE objective.session_id=?
+           AND delivery.canonical_pr_number IS NOT NULL
+           AND delivery.status NOT IN ('completed','failed','cancelled','rejected','merged')
+           AND delivery.reached_ceiling NOT IN
+               ('merged','release_triggered','deployment_succeeded','live_verified')
+         ORDER BY delivery.updated_at DESC, delivery.rowid DESC
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(objective_id) = objective_id else {
+        return Ok(None);
+    };
+    let anchor = sqlx::query_as::<_, (String, String)>(
+        "SELECT turn.root_turn_id, turn.task_segment_id
+         FROM chat_turn_state turn
+         WHERE turn.objective_id=? AND turn.session_id=? AND turn.root_turn_id<>?
+         ORDER BY turn.started_at DESC, turn.rowid DESC
+         LIMIT 1",
+    )
+    .bind(&objective_id)
+    .bind(session_id)
+    .bind(current_root_turn_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(anchor.map(|(root_turn_id, segment_id)| (objective_id, root_turn_id, segment_id)))
 }
 
 async fn resolve_open_chat_objective_continuation_in_tx(
@@ -2747,6 +2798,21 @@ async fn resolve_open_chat_objective_continuation_in_tx(
     let Some((objective_id, objective_status, continuation_root_turn_id, previous_segment_id)) =
         candidates.into_iter().next()
     else {
+        // M169: the lifecycle column is not the session's task identity. When
+        // this conversation still owns an unfinished delivery (a canonical PR
+        // that has not reached a merge), the settled Objective is the task the
+        // follow-up continues. Keeping it also keeps the one managed workspace
+        // that delivery runs in.
+        if let Some((objective_id, continuation_root_turn_id, previous_segment_id)) =
+            open_delivery_chat_anchor(&mut **tx, session_id, root_turn_id).await?
+        {
+            return Ok(ChatContinuationResolution::Unique {
+                objective_id,
+                continuation_root_turn_id,
+                previous_segment_id,
+                driver: "open_delivery_continued".to_string(),
+            });
+        }
         return Ok(ChatContinuationResolution::None);
     };
     let delivery_status = sqlx::query_scalar::<_, String>(
@@ -3031,7 +3097,6 @@ async fn admit_persisted_chat_turn_with_origin(
             previous_segment_id: None,
             expected_objective_id: Some(objective_id),
             driver: None,
-            ambiguous: false,
         },
         ChatContinuationResolution::Unique {
             objective_id,
@@ -3043,7 +3108,6 @@ async fn admit_persisted_chat_turn_with_origin(
             previous_segment_id: Some(previous_segment_id),
             expected_objective_id: Some(objective_id),
             driver: Some(driver),
-            ambiguous: false,
         },
         ChatContinuationResolution::None | ChatContinuationResolution::Ambiguous => {
             ChatContinuationSetup {
@@ -3051,7 +3115,6 @@ async fn admit_persisted_chat_turn_with_origin(
                 previous_segment_id: legacy_continuation.map(|(segment, _)| segment),
                 expected_objective_id: None,
                 driver: None,
-                ambiguous: false,
             }
         }
     };
@@ -3261,92 +3324,26 @@ async fn admit_persisted_chat_turn_with_origin(
     })
 }
 
-/// Resolve reprompt continuity from opaque Objective state, never message
-/// keywords or a parseable id. DeliveryRun may refine the diagnostic driver
-/// only after the Objective has already been uniquely selected.
+/// Test-facing entry point: the same continuation resolution the admission
+/// transaction performs, run on its own connection so a probe can inspect the
+/// resulting state without holding a turn open.
+#[cfg(test)]
 async fn resolve_open_chat_objective_continuation(
     pool: &sqlx::SqlitePool,
     session_id: &str,
     root_turn_id: &str,
     current_ordinal: i64,
 ) -> Result<ChatContinuationResolution, AppError> {
-    let current_binding = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT objective_id FROM chat_turn_state
-         WHERE root_turn_id=? AND session_id=?",
+    let mut tx = pool.begin().await?;
+    let resolution = resolve_open_chat_objective_continuation_in_tx(
+        &mut tx,
+        session_id,
+        root_turn_id,
+        current_ordinal,
     )
-    .bind(root_turn_id)
-    .bind(session_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten()
-    .filter(|value| !value.is_empty());
-    if let Some(objective_id) = current_binding {
-        return Ok(ChatContinuationResolution::AlreadyBound { objective_id });
-    }
-
-    let candidates = sqlx::query_as::<_, (String, String, String, String)>(
-        "SELECT objective.id, objective.status, turn.root_turn_id, segment.id
-         FROM objectives objective
-         JOIN chat_turn_state turn ON turn.objective_id=objective.id
-         JOIN chat_task_segments segment ON segment.id=turn.task_segment_id
-         WHERE turn.session_id=? AND turn.root_turn_id<>?
-           AND objective.status NOT IN ('completed', 'cancelled', 'legacy_orphan')
-           AND segment.ordinal<?
-           AND segment.ordinal=(
-             SELECT MAX(prior_segment.ordinal)
-             FROM chat_turn_state prior_turn
-             JOIN chat_task_segments prior_segment ON prior_segment.id=prior_turn.task_segment_id
-             WHERE prior_turn.objective_id=objective.id
-               AND prior_turn.session_id=?
-               AND prior_turn.root_turn_id<>?
-               AND prior_segment.ordinal<?
-           )
-         ORDER BY objective.id
-         LIMIT 2",
-    )
-    .bind(session_id)
-    .bind(root_turn_id)
-    .bind(current_ordinal)
-    .bind(session_id)
-    .bind(root_turn_id)
-    .bind(current_ordinal)
-    .fetch_all(pool)
     .await?;
-    if candidates.len() > 1 {
-        return Ok(ChatContinuationResolution::Ambiguous);
-    }
-    let Some((objective_id, objective_status, continuation_root_turn_id, previous_segment_id)) =
-        candidates.into_iter().next()
-    else {
-        return Ok(ChatContinuationResolution::None);
-    };
-    let delivery_status = sqlx::query_scalar::<_, String>(
-        "SELECT status FROM delivery_runs
-         WHERE objective_id=?
-           AND status NOT IN ('completed', 'failed', 'cancelled', 'rejected')
-         ORDER BY updated_at DESC, id DESC LIMIT 1",
-    )
-    .bind(&objective_id)
-    .fetch_optional(pool)
-    .await?;
-    let driver = match (objective_status.as_str(), delivery_status.as_deref()) {
-        ("waiting_system", Some("waiting")) => "recoverable_waiting_open",
-        ("waiting_system", Some("awaiting_completion_arbitration")) => {
-            "completion_arbitration_open"
-        }
-        ("waiting_system", _) => "system_owned_remediation_open",
-        ("waiting_core_input", _) => "core_input_response",
-        ("waiting_authorization", _) => "authorization_response",
-        ("waiting_business_decision", _) => "business_decision_response",
-        _ => "authorized_objective_still_open",
-    }
-    .to_string();
-    Ok(ChatContinuationResolution::Unique {
-        objective_id,
-        continuation_root_turn_id,
-        previous_segment_id,
-        driver,
-    })
+    tx.commit().await?;
+    Ok(resolution)
 }
 
 impl ChatRunningSetupGuard {
@@ -5758,6 +5755,277 @@ mod tests {
         assert_eq!(projection.terminal_reason, None);
     }
 
+    /// M169 (P0, user-reported, v1.91.30 session feb07c3a): a follow-up message
+    /// in a session whose authorized delivery is still open must continue the
+    /// SAME Objective — the turn settled to `legacy_orphan` while PR #861 was
+    /// still open, and the next message started a second Objective in a second
+    /// worktree, so the delivery that "continued" ran on a branch nobody had
+    /// edited.
+    #[tokio::test]
+    async fn followup_message_with_an_open_delivery_continues_the_same_objective() {
+        let dir = std::env::temp_dir().join(format!("cf-chat-m169-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::storage::db::connect(dir.join("chat.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('m169-session', 'title', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, role, content) in [
+            ("m169-prior-root", "user", "修复 M168，授权交付"),
+            ("m169-prior-answer", "assistant", "PR #861 已开，CI 在跑"),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages (id, session_id, role, content, created_at)
+                 VALUES (?, 'm169-session', ?, ?, 1)",
+            )
+            .bind(id)
+            .bind(role)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO chat_task_segments
+             (id, session_id, ordinal, title, status, goal_root_turn_id, created_at, updated_at)
+             VALUES ('m169-prior-segment', 'm169-session', 1, '上一轮', 'completed',
+                     'm169-prior-root', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives
+             (id, kind, session_id, root_turn_id, status, decision_type, domain,
+              requested_acceptance, reached_acceptance, evidence_ref, created_at, updated_at,
+              completed_at, requires_user_action)
+             VALUES ('m169-prior-objective', 'delivery', 'm169-session',
+                     'm169-prior-root', 'legacy_orphan', 'platform_incident', 'delivery',
+                     '授权交付', 'PR #861 已开', 'evidence:m169', 1, 1, 1, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, task_segment_id, objective_id, phase, status,
+              started_at, updated_at)
+             VALUES ('m169-prior-root', 'm169-session', 'm169-prior-segment',
+                     'm169-prior-objective', 'delivery', 'completed', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The state fact the rule reads: PR #861 is open, nothing merged yet.
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, run_kind, session_id, root_turn_id, objective_id, canonical_pr_number,
+              canonical_pr_url, requested_ceiling, reached_ceiling, stage, status,
+              last_observed_at, last_progress_at, app_version, app_build, process_instance,
+              created_at, updated_at)
+             VALUES ('m169-delivery', 'chat', 'm169-session', 'm169-prior-root',
+                     'm169-prior-objective', 861, 'https://example.invalid/pr/861',
+                     'through_merge', 'pr_opened', 'ci_wait', 'waiting',
+                     1, 1, '1.91.30', 'test', 'synthetic-test', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let control = crate::ChatRunControl::pending();
+        let receipt = admit_persisted_chat_turn(
+            &pool,
+            &control,
+            "m169-session",
+            None,
+            "CI 红了，继续修它",
+        )
+        .await
+        .expect("a follow-up message in a session with an open delivery must be admitted");
+
+        assert_eq!(
+            receipt.objective.id, "m169-prior-objective",
+            "the follow-up must continue the Objective that still owns the open PR"
+        );
+        assert_eq!(
+            receipt.continuation_driver.as_deref(),
+            Some("open_delivery_continued")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objectives WHERE session_id='m169-session'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1,
+            "the session must not gain a second Objective for the same task"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM objectives WHERE id='m169-prior-objective'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "active",
+            "continuing the task revives the settled record instead of orphaning it"
+        );
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_events
+             WHERE objective_id='m169-prior-objective' AND event_type='open_delivery_continued'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 1, "the continuation must be auditable");
+
+        // R4: the next ordinary message, admitted through a *separate*
+        // connection (the cross-process shape used by a second app instance),
+        // still continues the same Objective and adds no second one.
+        let pool2 = crate::storage::db::connect(dir.join("chat.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        // The previous turn settles before the next message arrives: its control
+        // row is `completed` (the liveness index only holds live rows) and its
+        // turn state is closed. Model that persisted shape before message two.
+        sqlx::query(
+            "UPDATE chat_run_controls
+             SET status='completed', settled_at=1, objective_id=NULL, objective_revision=NULL
+             WHERE session_id='m169-session'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE chat_turn_state SET status='completed' WHERE session_id='m169-session'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A second message is a second turn: it arrives with its own pending run
+        // control, exactly like the second app instance's fresh admission.
+        let control2 = crate::ChatRunControl::pending();
+        let receipt2 = admit_persisted_chat_turn(
+            &pool2,
+            &control2,
+            "m169-session",
+            None,
+            "CI 还没过，继续等并修",
+        )
+        .await
+        .expect("the second follow-up must be admitted from another connection");
+        assert_eq!(
+            receipt2.objective.id, "m169-prior-objective",
+            "a second follow-up must stay on the same Objective across processes"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM objectives WHERE session_id='m169-session'"
+            )
+            .fetch_one(&pool2)
+            .await
+            .unwrap(),
+            1,
+            "two ordinary follow-ups still mean one Objective"
+        );
+        pool2.close().await;
+        pool.close().await;
+    }
+
+    /// The state fact is a merge, not a PR number: once the delivery reached a
+    /// merge the same session's next message is genuinely new work and must get
+    /// its own Objective.
+    #[tokio::test]
+    async fn followup_after_a_merged_delivery_starts_a_new_objective() {
+        let dir = std::env::temp_dir().join(format!("cf-chat-m169m-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::storage::db::connect(dir.join("chat.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at)
+             VALUES ('m169m-session', 'title', '/tmp', 'model', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content, created_at)
+             VALUES ('m169m-prior-root', 'm169m-session', 'user', '修复 M168', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_task_segments
+             (id, session_id, ordinal, title, status, goal_root_turn_id, created_at, updated_at)
+             VALUES ('m169m-prior-segment', 'm169m-session', 1, '上一轮', 'completed',
+                     'm169m-prior-root', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO objectives
+             (id, kind, session_id, root_turn_id, status, decision_type, domain,
+              requested_acceptance, reached_acceptance, evidence_ref, created_at, updated_at,
+              completed_at)
+             VALUES ('m169m-prior-objective', 'delivery', 'm169m-session',
+                     'm169m-prior-root', 'completed', 'complete', 'delivery', '授权交付',
+                     '已合并', 'evidence:m169m', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_turn_state
+             (root_turn_id, session_id, task_segment_id, objective_id, phase, status,
+              started_at, updated_at)
+             VALUES ('m169m-prior-root', 'm169m-session', 'm169m-prior-segment',
+                     'm169m-prior-objective', 'delivery', 'completed', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO delivery_runs
+             (id, run_kind, session_id, root_turn_id, objective_id, canonical_pr_number,
+              canonical_pr_url, requested_ceiling, reached_ceiling, stage, status,
+              last_observed_at, last_progress_at, app_version, app_build, process_instance,
+              created_at, updated_at)
+             VALUES ('m169m-delivery', 'chat', 'm169m-session', 'm169m-prior-root',
+                     'm169m-prior-objective', 861, 'https://example.invalid/pr/861',
+                     'through_merge', 'merged', 'merged', 'merged',
+                     1, 1, '1.91.30', 'test', 'synthetic-test', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let control = crate::ChatRunControl::pending();
+        let receipt = admit_persisted_chat_turn(
+            &pool,
+            &control,
+            "m169m-session",
+            None,
+            "下一件事：整理发布说明",
+        )
+        .await
+        .expect("a message after a merged delivery must be admitted");
+
+        assert_ne!(
+            receipt.objective.id, "m169m-prior-objective",
+            "a merged delivery finished the task; the next message is new work"
+        );
+        pool.close().await;
+    }
+
     /// M129 (P0, user-reported): 「全部都执行」 sent right after the previous
     /// turn ended used to be refused with an identity error the user could never
     /// get past. The contextual approval must start a new turn and keep history.
@@ -6177,6 +6445,7 @@ mod tests {
                 task_segment_id TEXT,
                 user_reprompt_driver TEXT,
                 objective_id TEXT,
+                started_at INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL
             )",
         )
@@ -6186,7 +6455,8 @@ mod tests {
         sqlx::query(
             "CREATE TABLE objectives (
                 id TEXT PRIMARY KEY,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                session_id TEXT
             )",
         )
         .execute(&pool)
@@ -6198,6 +6468,8 @@ mod tests {
                 objective_id TEXT,
                 status TEXT NOT NULL,
                 wait_class TEXT,
+                canonical_pr_number INTEGER,
+                reached_ceiling TEXT,
                 updated_at INTEGER NOT NULL
             )",
         )

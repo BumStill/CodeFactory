@@ -2083,6 +2083,45 @@ fn turn_wording_constraint_detail(payload: &serde_json::Value) -> String {
     detail
 }
 
+/// M169: the delivery this session is still working on.
+///
+/// The session's own task identity is a state fact, not a wording cue and not
+/// the Objective's lifecycle column: a turn that ended while its PR was still
+/// open settles the Objective to `legacy_orphan`, yet the *session* still has a
+/// delivery to finish. Read that fact from `delivery_runs` — an unfinished run
+/// with a canonical PR that has not reached a merge — so the next message in the
+/// same conversation continues the same Objective and the same managed
+/// workspace instead of opening a second one (M163 covered system wakes; this
+/// covers the human follow-up entry).
+const OPEN_DELIVERY_OBJECTIVE_SQL: &str = "SELECT delivery.objective_id
+     FROM delivery_runs delivery
+     JOIN objectives objective ON objective.id=delivery.objective_id
+     WHERE objective.session_id=?
+       AND delivery.canonical_pr_number IS NOT NULL
+       AND delivery.status NOT IN ('completed','failed','cancelled','rejected','merged')
+       AND delivery.reached_ceiling NOT IN
+           ('merged','release_triggered','deployment_succeeded','live_verified')
+     ORDER BY delivery.updated_at DESC, delivery.rowid DESC
+     LIMIT 1";
+
+pub(crate) async fn open_delivery_objective_id_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    session_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let has_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_table == 0 {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar(OPEN_DELIVERY_OBJECTIVE_SQL)
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await?)
+}
+
 impl ObjectiveStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -2831,9 +2870,22 @@ impl ObjectiveStore {
                         .bind(&continuation_binding)
                         .fetch_optional(&mut **tx)
                         .await?;
+                // M169: a settled turn is not a finished task. When this
+                // Objective still owns an unfinished delivery (a canonical PR
+                // that has not reached a merge), the human's next message
+                // continues it — even though its lifecycle column already reads
+                // `legacy_orphan`/`completed`. Without this the same task got a
+                // second Objective and a second worktree, and the delivery then
+                // ran on a branch nobody had edited.
+                let owns_open_delivery =
+                    open_delivery_objective_id_in_tx(tx, session_id).await?.as_deref()
+                        == Some(continuation_binding.as_str());
                 match status.as_deref() {
                     None => tracing::warn!(%continuation_binding, "chat entry ignored a missing continuation objective"),
-                    Some(status) if !matches!(status, "completed" | "cancelled" | "legacy_orphan") => {
+                    Some(status)
+                        if !matches!(status, "completed" | "cancelled" | "legacy_orphan")
+                            || owns_open_delivery =>
+                    {
                         candidates.push(continuation_binding);
                     }
                     Some(_) => {}
@@ -2920,6 +2972,12 @@ impl ObjectiveStore {
             // U18/R1: remember whether the objective was mid-recovery, so the
             // takeover audit below can name what the user's message superseded.
             let prior_status = objective.status;
+            // M169: reviving a settled Objective is only allowed for the one
+            // that still owns this session's unfinished delivery, and that fact
+            // was read from durable delivery state above (never from wording).
+            let revives_open_delivery =
+                open_delivery_objective_id_in_tx(tx, session_id).await?.as_deref()
+                    == Some(objective_id.as_str());
             let next_revision = objective.revision + 1;
             let next_recovery_generation =
                 if objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED) {
@@ -2940,7 +2998,7 @@ impl ObjectiveStore {
                    last_observed_process_instance=?,
                    last_progress_at=?, updated_at=?, completed_at=NULL
                  WHERE id=? AND revision=?
-                   AND status NOT IN ('completed','cancelled','legacy_orphan')",
+                   AND (status NOT IN ('completed','cancelled','legacy_orphan') OR ?)",
             )
             .bind(next_revision)
             .bind(target_kind.as_str())
@@ -2952,6 +3010,7 @@ impl ObjectiveStore {
             .bind(now)
             .bind(&objective_id)
             .bind(objective.revision)
+            .bind(if revives_open_delivery { 1_i64 } else { 0_i64 })
             .execute(&mut **tx)
             .await?;
             if updated.rows_affected() != 1 {
@@ -3115,6 +3174,8 @@ impl ObjectiveStore {
             .bind(next_revision)
             .bind(if legacy_root_to_reconcile.is_some() {
                 "legacy_root_reconciled"
+            } else if revives_open_delivery {
+                "open_delivery_continued"
             } else {
                 "contextual_root_bound"
             })
