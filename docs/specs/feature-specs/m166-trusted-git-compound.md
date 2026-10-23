@@ -19,3 +19,5 @@ Release-Urgency: default
 - Requirements Traceability：R1/R3 对应合成组合命令、真实 Git 工作树与备份恢复测试；R2 对应未知变量、命令替换、越界和管道作用域反例；M159 原有远端历史与备份测试保留。
 - Applicable Harnesses：Spec、Compatibility（标准模式与旧 M159）、Payload（shell 字段级权限判定）、Observation（备份 ref 与审批记录）、AI Collaboration；无 UI 布局变更。Release Harness 以合并交接为界，不执行发版。
 - 后台入口继续使用既有 bash/dispatch 权限路由，不新增 GUI 依赖。真机验收由编排方发版后完成：信任模式运行两条合成命令核对无审批、备份 ref 可恢复；替换为主仓库/其他会话路径或 force push 后核对产生审批；标准模式确认行为不变。
+- Windows 路径（M166 续，PR #861 首轮 CI 暴露）：Windows 托管工作区路径以反斜杠分隔（`C:\...`），命令里必须加引号。分解器此前把引号内的 `\` 也当转义符拒绝，导致同一组合命令在 Windows 上整条退回审批（`m159_gateway_session_identity_backup_and_remote_fence` 在 Windows 断言失败）。现在引号内的 `\` 按字面量处理，引号外仍拒绝（转义/续行无法静态确认），双引号内 `\"`、`\\`、`\$`、`` \` `` 仍按转义拒绝。该修正不放宽 R1/R2：越界、动态展开、远端写操作的拒绝路径不变。
+- 测试可移植性：`m159_trusted_git.rs` 的 shell 执行统一走 `shell()`（Windows 用 Git for Windows 的 `bin/bash.exe`，其它平台用 `sh`），使 R3 的端到端执行在 Windows 上同样被验证。

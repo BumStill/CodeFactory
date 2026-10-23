@@ -89,7 +89,18 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
     let mut quote = None;
     let mut variables = std::collections::HashMap::<String, String>::new();
     while let Some(c) = chars.next() {
-        if matches!(c, '\n' | '\r' | '`' | '\\') { return None; }
+        if matches!(c, '\n' | '\r' | '`') { return None; }
+        if c == '\\' {
+            // A backslash is a path separator on Windows and survives inside
+            // quotes, so a quoted Windows worktree path must stay literal.
+            // Outside quotes it is an escape or line continuation; inside double
+            // quotes the escapes a shell would still act on are refused.
+            if quote.is_none() { return None; }
+            if quote == Some('"') && matches!(chars.peek(), Some('"') | Some('\\') | Some('$') | Some('`')) { return None; }
+            word.text.push(c);
+            started = true;
+            continue;
+        }
         if c == '\'' && quote != Some('"') || c == '"' && quote != Some('\'') {
             quote = if quote == Some(c) { None } else { Some(c) };
             started = true;
@@ -284,4 +295,46 @@ fn snapshot(root: &Path, paths: &[String]) -> Option<String> {
     })();
     let _ = std::fs::remove_dir_all(dir);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    fn words(command: &str) -> Option<Vec<Vec<String>>> {
+        super::segments(command).map(|segments| {
+            segments.into_iter().map(|s| s.words.into_iter().map(|w| w.text).collect()).collect()
+        })
+    }
+
+    #[test]
+    fn m166_quoted_backslash_paths_stay_literal_words() {
+        // Windows worktrees are quoted with backslash separators. Treating a
+        // backslash inside quotes as an escape silently demotes the whole
+        // composition to an approval prompt.
+        let command = r#"cd "C:\Users\runneradmin\AppData\Local\Temp\ws"; git stash push -m prefill; git status --porcelain | head"#;
+        let parsed = words(command).expect("quoted Windows path must parse");
+        assert_eq!(parsed[0], vec!["cd", r"C:\Users\runneradmin\AppData\Local\Temp\ws"]);
+        assert_eq!(parsed[1], vec!["git", "stash", "push", "-m", "prefill"]);
+        assert_eq!(parsed[2], vec!["git", "status", "--porcelain"]);
+        assert_eq!(parsed[3], vec!["head"]);
+        let assigned = words(r#"S="C:\ws\two"; git -C "$S" worktree remove --force "C:\ws\one""#)
+            .expect("quoted assignment must parse");
+        assert_eq!(assigned[0], vec![r"S=C:\ws\two"]);
+        assert_eq!(assigned[1], vec!["git", "-C", r"C:\ws\two", "worktree", "remove", "--force", r"C:\ws\one"]);
+    }
+
+    #[test]
+    fn m166_backslash_escapes_outside_quotes_stay_rejected() {
+        for command in [
+            r"cd C:\ws; git status",
+            r#"cd "C:\ws\"; git status"#,
+            r#"cd "C:\\ws"; git status"#,
+            r#"cd "C:$\ws"; git status"#,
+        ] {
+            assert!(words(command).is_none(), "{command}");
+        }
+        assert_eq!(
+            words(r#"cd "C:\ws" && git status"#).map(|p| p[0].clone()),
+            Some(vec!["cd".to_string(), r"C:\ws".to_string()])
+        );
+    }
 }

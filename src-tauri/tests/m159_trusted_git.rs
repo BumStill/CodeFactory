@@ -12,6 +12,14 @@ fn git(root: &Path, args: &[&str]) -> String {
     assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
+fn shell(root: &Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let exec_path = std::path::PathBuf::from(git(root, &["--exec-path"]));
+        exec_path.ancestors().map(|base| base.join("bin/bash.exe"))
+            .find(|candidate| candidate.is_file())
+            .expect("Git for Windows installation must supply Git Bash")
+    } else { std::path::PathBuf::from("sh") }
+}
 fn fixture() -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!("cf-m159-{}-{:?}-{}", std::process::id(), std::thread::current().id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir_all(&root).unwrap();
@@ -49,13 +57,7 @@ fn m159_r1_four_incident_shapes_and_backup_restore() {
         assert_eq!(git(&root, &["rev-parse", &format!("{backup}^1")]), head);
         assert_eq!(git(&root, &["show", ":tracked.txt"]), "staged content");
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "unstaged content");
-        let shell = if cfg!(windows) {
-            let exec_path = std::path::PathBuf::from(git(&root, &["--exec-path"]));
-            exec_path.ancestors().map(|base| base.join("bin/bash.exe"))
-                .find(|candidate| candidate.is_file())
-                .expect("Git for Windows installation must supply Git Bash")
-        } else { std::path::PathBuf::from("sh") };
-        let output = Command::new(shell).args(["-c", &command]).current_dir(&root).output().unwrap();
+        let output = Command::new(shell(&root)).args(["-c", &command]).current_dir(&root).output().unwrap();
         assert!(output.status.success(), "{command}: {}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(git(&root, &["show", &format!("{backup}:generated.txt")]), "untracked content");
         std::fs::remove_dir_all(root).unwrap();
@@ -90,7 +92,7 @@ fn m166_r3_registered_worktree_remove_snapshots_and_foreign_fences() {
     assert!(!trusted_git::registered_rewrite(&roots, &root, &format!("{command}; git push --force origin main")));
     let references = trusted_git::backup_registered(&roots, &root, &command).unwrap();
     let reference = references.split(',').find(|r| git(&root, &["show", &format!("{r}:tracked.txt")]) == "owned dirty data").unwrap();
-    let output = Command::new("sh").args(["-c", &command]).current_dir(&root).output().unwrap();
+    let output = Command::new(shell(&root)).args(["-c", &command]).current_dir(&root).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(!target.exists());
     assert_eq!(git(&root, &["show", &format!("{reference}:tracked.txt")]), "owned dirty data");
