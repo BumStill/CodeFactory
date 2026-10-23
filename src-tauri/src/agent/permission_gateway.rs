@@ -74,6 +74,20 @@ pub(crate) struct DesktopPermissionGateway {
     pub(super) browser_act_granted: AtomicBool,
 }
 
+pub(super) async fn registered_git_roots(db: &SqlitePool, session: &str) -> Option<Vec<std::path::PathBuf>> {
+    super::execution_workspace::ensure_schema(db).await.ok()?;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT objective_id, worktree_path FROM execution_workspaces WHERE session_id=? AND state IN ('active','delivering')",
+    ).bind(session).fetch_all(db).await.ok()?;
+    let mut roots = Vec::new();
+    for (objective, path) in rows {
+        let path = std::path::PathBuf::from(path);
+        super::execution_workspace::verify_objective_workspace(db, &objective, &path).await.ok()?;
+        roots.push(path);
+    }
+    (!roots.is_empty()).then_some(roots)
+}
+
 async fn resolve_session_permission_policy(
     db: &SqlitePool,
     session_id: &str,
@@ -126,8 +140,10 @@ impl PermissionGateway for DesktopPermissionGateway {
                 return permission_recovery_rejected();
             }
             if let (Some(root), Some(command)) = (self.managed_workspace_root().await, bash_command) {
-                if super::trusted_git::backup(&root, command).is_some() {
-                    return PermissionOutcome::Allow;
+                if let Some(roots) = registered_git_roots(&self.db, &self.session_id).await {
+                    if super::trusted_git::backup_registered(&roots, &root, command).is_some() {
+                        return PermissionOutcome::Allow;
+                    }
                 }
             }
             return self.request_permission(tool_call, args.clone(), bash_command).await;
@@ -780,6 +796,11 @@ mod tests {
         assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow);
         let reference = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
         assert_eq!(m159_git(&root, &["show", &format!("{reference}:tracked.txt")]), "uncommitted");
+        assert!(gateway.pending_permissions.lock().await.is_empty());
+        let compound = format!("cd \"{}\"; git stash push -m prefill; git fetch --prune origin main; git merge origin/main --no-edit; git stash pop; git status --porcelain | head", root.display());
+        let compound_args = serde_json::json!({"command": compound});
+        let compound_call = ToolCall { id: "m166-compound".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: compound_args.to_string() } };
+        assert_eq!(gateway.authorize(&compound_call, &compound_args, Some(&compound)).await, PermissionOutcome::Allow);
         assert!(gateway.pending_permissions.lock().await.is_empty());
         for command in ["git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
             let args = serde_json::json!({"command":command});

@@ -2653,11 +2653,19 @@ impl ToolBackend for DesktopToolBackend {
                     .bind(session).fetch_optional(&self.db).await.ok().flatten().as_deref() == Some("trusted"),
                 None => false,
             };
-            if trusted && super::trusted_git::local_rewrite(&ctx.working_directory, args["command"].as_str().unwrap_or_default()) {
-                // Revalidate and back up at the actual execution cwd, not only
-                // the permission projection. A failed snapshot never dispatches.
-                Some(super::trusted_git::backup(&ctx.working_directory, args["command"].as_str().unwrap_or_default())
-                    .ok_or_else(|| ToolError { message: "Workspace backup failed; local rewrite was not executed".into() })?)
+            if trusted {
+                let roots = match ctx.session_id.as_deref() {
+                    Some(session) => super::permission_gateway::registered_git_roots(&self.db, session).await,
+                    None => None,
+                };
+                match roots {
+                    Some(roots) if super::trusted_git::registered_rewrite(&roots, &ctx.working_directory, args["command"].as_str().unwrap_or_default()) => {
+                        // Repeat the same identity proof and snapshots at dispatch.
+                        Some(super::trusted_git::backup_registered(&roots, &ctx.working_directory, args["command"].as_str().unwrap_or_default())
+                            .ok_or_else(|| ToolError { message: "Workspace backup failed; local rewrite was not executed".into() })?)
+                    }
+                    _ => None,
+                }
             } else { None }
         } else { None };
         let exec_ctx = crate::tools::ExecCtx {
