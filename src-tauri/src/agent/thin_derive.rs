@@ -701,10 +701,6 @@ mod tests {
         const CHILD: &str = "CODEFACTORY_M168_PR_FIXTURE";
         if let Ok(url) = std::env::var(CHILD) {
             let db = crate::storage::db::connect(&url).await.unwrap();
-            // Reopening a legacy DB applies the application's mode default.
-            // This fixture specifically exercises the thin PR monitor.
-            sqlx::query("UPDATE sessions SET delivery_mode='thin' WHERE id='derive'")
-                .execute(&db).await.unwrap();
             heartbeat_external(&db, "derive").await.unwrap();
             struct Sink;
             impl WakeSink for Sink {
@@ -730,7 +726,7 @@ mod tests {
         super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
             super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, "")).await.unwrap();
         sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
-        ensure_external(&db).await.unwrap();
+        ensure_pr_monitor(&db, "derive").await.unwrap();
         let reason = failure_reason(&serde_json::json!({"state":"OPEN", "statusCheckRollup":[{"name":"synthetic-ci","conclusion":"FAILURE"}]}), 73).unwrap();
         apply_observation(&db, "derive", 73, "ThroughMerge", Some(&reason), None).await.unwrap();
         // The observation was persisted, but the app died before queuing its wake.
