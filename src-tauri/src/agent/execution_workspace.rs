@@ -4099,6 +4099,8 @@ mod tests {
             .unwrap()
             .success());
         git(&root, &["init", "--initial-branch=main"]);
+        // Synthetic byte assertions must not inherit Windows/global checkout filters.
+        git(&root, &["config", "core.autocrlf", "false"]);
         git(&root, &["config", "user.name", "CodeFactory Test"]);
         git(&root, &["config", "user.email", "test@codefactory.invalid"]);
         std::fs::write(root.join("base.txt"), "base\n").unwrap();
