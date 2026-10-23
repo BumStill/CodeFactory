@@ -2,6 +2,8 @@
 
 本目录的权威机器源是 `scenario-registry.json`。它统一管理业务场景、UI acceptance、运行时 smoke、复杂 E2E 组合、证据等级和执行 gate。
 
+新增产品文件到场景的映射只写 `scenario-mappings.json`（非信任根、只增不删，仅可引用已存在且 active 的 Scenario ID）；场景定义、gate、证据等级以及删除或缩小映射仍只能改 `scenario-registry.json`。两处映射在门禁与 PR 元数据中取并集。
+
 ## 当前规模
 
 <!-- scenario-registry-summary:start -->

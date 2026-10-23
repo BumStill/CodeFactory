@@ -10,14 +10,16 @@ def reconcile(validator_path, root, base, body, validate_registry=False):
     spec = importlib.util.spec_from_file_location('delivery_scenario_validator', validator_path)
     validator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(validator)
-    registry = validator.load_registry(root / 'docs/testing/scenario-registry.json')
+    files, error = validator._changed_files(root, base)
+    if error:
+        raise ValueError(error)
+    # Load after the diff so an unresolvable base keeps reporting "cannot diff",
+    # while a readable base still enforces the append-only mapping contract.
+    registry = validator.load_registry(root / 'docs/testing/scenario-registry.json', base_ref=base)
     if validate_registry:
         errors = validator.validate_registry(registry, root)
         if errors:
             raise ValueError('; '.join(errors))
-    files, error = validator._changed_files(root, base)
-    if error:
-        raise ValueError(error)
     files = validator.scenario_impact_files(root, base, files)
     product = [path for path in files if validator._is_product_file(path)]
     impacted = sorted(validator._impacted_scenarios(product, registry))

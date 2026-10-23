@@ -279,8 +279,13 @@ def main() -> int:
     if not expected_runner.is_file():
         errors.append(f"trusted policy runner is missing: {expected_runner}")
 
+    base_ref = args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip()
+    if args.stage == "local" and not base_ref:
+        base_ref = _resolve_local_base(repo_root)
     try:
-        registry = load_registry(repo_root / "docs/testing/scenario-registry.json")
+        registry = load_registry(
+            repo_root / "docs/testing/scenario-registry.json", base_ref=base_ref or None
+        )
     except ValueError as exc:
         registry = {}
         errors.append(str(exc))
@@ -292,9 +297,6 @@ def main() -> int:
     else:
         errors.extend(validate_trust_root_immutability(repo_root, policy_root))
 
-    base_ref = args.base_ref or os.environ.get("SCENARIO_TEST_BASE_SHA", "").strip()
-    if args.stage == "local" and not base_ref:
-        base_ref = _resolve_local_base(repo_root)
     files, diff_error = _changed_files(repo_root, base_ref)
     if diff_error:
         errors.append(f"scenario gate failed closed: {diff_error}")
