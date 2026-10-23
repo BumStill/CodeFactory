@@ -127,6 +127,15 @@ pub(crate) async fn ensure_pr_monitor(db: &SqlitePool, session: &str) -> sqlx::R
 }
 
 fn completion_reason(pr: &serde_json::Value, ceiling: &str, released: bool, number: i64) -> Option<String> {
+    if pr["state"] == "OPEN" {
+        let green = pr["statusCheckRollup"].as_array().is_some_and(|checks| {
+            !checks.is_empty() && checks.iter().all(|check| {
+                check["state"] == "SUCCESS" || (check["status"] == "COMPLETED"
+                    && matches!(check["conclusion"].as_str(), Some("SUCCESS" | "NEUTRAL" | "SKIPPED")))
+            })
+        });
+        return green.then(|| format!("PR #{number} 检查已全绿"));
+    }
     let terminal = pr["state"] == "MERGED";
     if !terminal || (matches!(ceiling, "ThroughRelease" | "through_release") && !released) {
         return None;
@@ -156,7 +165,7 @@ fn failure_reason(pr: &serde_json::Value, number: i64) -> Option<String> {
 }
 
 fn is_external_failure(reason: &str) -> bool {
-    reason.contains("检查失败：") || reason.contains("已关闭但未合并") || reason.contains("存在合并冲突") || reason.contains("被合并队列退回")
+    reason.contains("检查已全绿") || reason.contains("检查失败：") || reason.contains("已关闭但未合并") || reason.contains("存在合并冲突") || reason.contains("被合并队列退回")
 }
 
 /// M150：把一次观测结果落库。
@@ -174,7 +183,7 @@ async fn apply_observation(
     merged_at: Option<i64>,
 ) -> sqlx::Result<()> {
     let stale_failure = reason.is_none() && sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM thin_external_observations WHERE session_id=? AND (completed_reason LIKE '%检查失败：%' OR completed_reason LIKE '%已关闭但未合并%')",
+        "SELECT COUNT(*) FROM thin_external_observations WHERE session_id=? AND (completed_reason NOT LIKE '%已合并%')",
     ).bind(session).fetch_one(db).await? == 1;
     if stale_failure {
         sqlx::query("UPDATE thin_external_observations SET completed_reason=NULL,merged_at=COALESCE(?,merged_at) WHERE session_id=? AND pr_number=? AND ceiling=?")
@@ -274,7 +283,7 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
     sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling) VALUES (?,?,?) ON CONFLICT(session_id) DO UPDATE SET pr_number=excluded.pr_number,ceiling=excluded.ceiling,observed_at=0,completed_reason=NULL,closeout_queued=0 WHERE pr_number<>excluded.pr_number OR ceiling<>excluded.ceiling")
         .bind(session).bind(number).bind(&ceiling).execute(db).await?;
     let at = chrono::Utc::now().timestamp_millis();
-    let claimed = sqlx::query("UPDATE thin_external_observations SET observed_at=? WHERE session_id=? AND (completed_reason IS NULL OR completed_reason LIKE '%检查失败：%' OR completed_reason LIKE '%已关闭但未合并%') AND observed_at<=?")
+    let claimed = sqlx::query("UPDATE thin_external_observations SET observed_at=? WHERE session_id=? AND (completed_reason IS NULL OR completed_reason NOT LIKE '%已合并%') AND observed_at<=?")
         .bind(at).bind(session).bind(at - 180_000).execute(db).await?.rows_affected() == 1;
     if claimed {
         let observe_ceiling = ceiling.clone();
@@ -330,7 +339,9 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
         if queued {
             let failed = is_external_failure(&reason);
             let prefix = if failed { "thin-repair" } else { "thin-closeout" };
-            let prompt = if failed {
+            let prompt = if reason.contains("检查已全绿") {
+                format!("{reason}。系统自动重试/自愈：核对必需检查与交付授权，满足条件后标记 merge-queue: armed，由合并队列合并并继续监视；不要手工合并。")
+            } else if failed {
                 format!("{reason}。系统自动重试/自愈：诊断失败检查，修复后在同一分支重新交付并继续监视；PR 关闭时先核查原因再恢复交付。不向用户询问是否继续监视。")
             } else {
                 format!("{reason}，交付外部事项已完成。现在执行任务模板 §8 收尾：确认合并与 squash commit、检查并清理远端分支、检查本地未提交/未推送状态、清理本任务产物与后台进程，然后给出收尾回答。不要重复交付；若已无事可做直接报告完成。")
@@ -435,6 +446,14 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         None => return Ok(super::thin_state::load(db, session).await?.unwrap_or_else(ThinState::running)),
         Some(false) => {}
     }
+    let pending_background: i64 = if has_table(db, "background_tasks").await? {
+        sqlx::query_scalar("SELECT COUNT(*) FROM background_tasks WHERE session_id=? AND wake_state='pending'")
+            .bind(session).fetch_one(db).await?
+    } else { 0 };
+    let due_wakes: i64 = if has_table(db, "wakeup_schedules").await? {
+        sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND next_at<=?")
+            .bind(session).bind(at / 1000).fetch_one(db).await?
+    } else { 0 };
     let tasks: i64 = if has_table(db, "background_tasks").await? {
         sqlx::query_scalar("SELECT COUNT(*) FROM background_tasks WHERE session_id=? AND status='running'")
             .bind(session).fetch_one(db).await?
@@ -490,7 +509,14 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     if completed.as_deref().is_some_and(is_external_failure) {
         let repaired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules wake JOIN messages answer ON answer.session_id=wake.session_id AND answer.role='assistant' AND answer.created_at>=wake.last_fired_at*1000 AND TRIM(answer.content)<>'' AND (answer.tool_calls IS NULL OR answer.tool_calls='' OR answer.tool_calls='[]') AND (answer.completion_state IS NULL OR answer.completion_state='' OR answer.completion_state='final') WHERE wake.session_id=? AND wake.id LIKE 'thin-repair-%' AND wake.status='done' AND wake.prompt LIKE (SELECT completed_reason || '%' FROM thin_external_observations WHERE session_id=?)")
             .bind(session).bind(session).fetch_one(db).await?;
-        if repaired == 0 && pending_question_at == 0 { return Ok(ThinState::running()); }
+        if repaired == 0 && pending_question_at == 0 {
+            return Ok(ThinState {
+                state: SessionState::WaitingWake,
+                waiting_for: Some("系统自动重试/自愈：接续 PR 检查结果".into()),
+                wake_source: Some("持久投递器自动重试".into()),
+                ..ThinState::running()
+            });
+        }
     }
     // M148/R3：未完成的已交付 PR 是外部进行中事项——只要它还在，下面的终态推导
     // 不得结束会话。v1.91.x 的现场：等待 PR 的会话被写成
@@ -534,7 +560,7 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             return Ok(ThinState::ended("定时唤醒未开始回合（上一回合已结算）", "本会话记录"));
         }
         // A newly admitted message is a fact even before the transport is registered.
-        if terminal.is_some() {
+        if terminal.is_some() && pending_background + due_wakes == 0 {
             return Ok(ThinState::running());
         }
     } else if let Some((_, reason)) = &terminal {
@@ -567,6 +593,14 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
                 return Ok(ThinState { state: SessionState::WaitingUser, question: Some(what), ..ThinState::running() });
             }
         }
+    }
+    if pending_background + due_wakes > 0 {
+        return Ok(ThinState {
+            state: SessionState::WaitingWake,
+            waiting_for: Some("系统自动重试/自愈：接续后台结果".into()),
+            wake_source: Some("持久投递器自动重试".into()),
+            ..ThinState::running()
+        });
     }
     if let Some(previous) = super::thin_state::load(db, session).await? {
         // M158/R1+R2+R3：还在等外部事项（PR / CI / 发版）时，系统自己登记监视，
@@ -649,6 +683,100 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn m168_pending_pr_wake_without_executor_is_not_running() {
+        let db = fixture().await;
+        super::super::background_tasks::wake_source_cover(&db, "derive").await;
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason) VALUES ('derive',73,'ThroughMerge',?,'PR #73 检查失败：synthetic-ci')")
+            .bind(chrono::Utc::now().timestamp_millis() + 3_600_000).execute(&db).await.unwrap();
+        heartbeat_external(&db, "derive").await.unwrap();
+        assert_eq!(derive_state(&db, "derive").await.unwrap().state, SessionState::WaitingWake);
+    }
+
+    #[tokio::test]
+    async fn m168_cross_process_pr_ci_failure_is_delivered_after_restart() {
+        use super::super::background_tasks::{WakeSink, WakeFuture, drain_due_wakeups_at};
+        const CHILD: &str = "CODEFACTORY_M168_PR_FIXTURE";
+        if let Ok(url) = std::env::var(CHILD) {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            heartbeat_external(&db, "derive").await.unwrap();
+            struct Sink;
+            impl WakeSink for Sink {
+                fn enqueue(&self, session: String, text: String) -> WakeFuture {
+                    assert_eq!(session, "derive");
+                    assert!(text.contains("synthetic-ci"));
+                    assert!(text.contains("系统自动重试/自愈"));
+                    Box::pin(async { true })
+                }
+            }
+            let due: i64 = sqlx::query_scalar("SELECT next_at FROM wakeup_schedules WHERE status='pending'")
+                .fetch_one(&db).await.unwrap();
+            assert_eq!(drain_due_wakeups_at(&db, &Sink, due).await, 1);
+            assert_eq!(drain_due_wakeups_at(&db, &Sink, due + 1).await, 0);
+            db.close().await;
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("fixture.sqlite").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('derive','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, "")).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_pr_monitor(&db, "derive").await.unwrap();
+        let reason = failure_reason(&serde_json::json!({"state":"OPEN", "statusCheckRollup":[{"name":"synthetic-ci","conclusion":"FAILURE"}]}), 73).unwrap();
+        apply_observation(&db, "derive", 73, "ThroughMerge", Some(&reason), None).await.unwrap();
+        // The observation was persisted, but the app died before queuing its wake.
+        sqlx::query("UPDATE thin_external_observations SET observed_at=?")
+            .bind(chrono::Utc::now().timestamp_millis() + 3_600_000).execute(&db).await.unwrap();
+        db.close().await;
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["m168_cross_process_pr_ci_failure_is_delivered_after_restart", "--nocapture"])
+            .env(CHILD, &url).output().await.unwrap();
+        assert!(output.status.success(), "child failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let reopened = crate::storage::db::connect(&url).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='done' AND fire_count=1")
+            .fetch_one(&reopened).await.unwrap();
+        assert_eq!(count, 1);
+        heartbeat_external(&reopened, "derive").await.unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules").fetch_one(&reopened).await.unwrap();
+        assert_eq!(total, 1);
+        reopened.close().await;
+    }
+
+    #[test]
+    fn m168_all_green_ci_is_a_wake_condition() {
+        let pr = serde_json::json!({"state":"OPEN", "statusCheckRollup":[
+            {"name":"synthetic-test", "status":"COMPLETED", "conclusion":"SUCCESS"},
+            {"context":"synthetic-status", "state":"SUCCESS"}
+        ]});
+        assert_eq!(completion_reason(&pr, "ThroughMerge", false, 168).as_deref(), Some("PR #168 检查已全绿"));
+        let pending = serde_json::json!({"state":"OPEN", "statusCheckRollup":[
+            {"name":"synthetic-test", "status":"IN_PROGRESS", "conclusion":""}
+        ]});
+        assert!(completion_reason(&pending, "ThroughMerge", false, 168).is_none());
+        assert!(completion_reason(&serde_json::json!({"state":"OPEN", "statusCheckRollup":[]}), "ThroughMerge", false, 168).is_none());
+    }
+
+    #[tokio::test]
+    async fn m168_pending_wake_without_executor_is_not_running() {
+        let db = fixture().await;
+        super::super::background_tasks::schedule_wakeup(&db,
+            super::super::background_tasks::WakeupRequest {
+                session_id: "derive".into(), root_turn_id: None, prompt: "synthetic".into(),
+                source: super::super::background_tasks::TaskSource::AgentDecided,
+                after_sec: Some(60), every_sec: None,
+            }).await.unwrap();
+        sqlx::query("UPDATE wakeup_schedules SET next_at=1").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m168-user','derive','user','synthetic',1)")
+            .execute(&db).await.unwrap();
+        let state = derive_state(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake);
+    }
+
     async fn fixture() -> SqlitePool {
         let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('derive','synthetic','/synthetic','model',1,1,'thin')")
@@ -683,7 +811,7 @@ mod tests {
             .bind(chrono::Utc::now().timestamp_millis()).execute(&db).await.unwrap();
         heartbeat_external(&db, "derive").await.unwrap();
         heartbeat_external(&db, "derive").await.unwrap();
-        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Running);
+        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::WaitingWake);
         struct Sink;
         impl super::super::background_tasks::WakeSink for Sink {
             fn enqueue(&self, _: String, text: String) -> super::super::background_tasks::WakeFuture {
@@ -893,7 +1021,7 @@ mod tests {
         assert_eq!(derive_state(&db, "derive").await.unwrap().state, SessionState::WaitingUser);
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('answer','derive','user','使用 synthetic',200)")
             .execute(&db).await.unwrap();
-        assert_eq!(derive_state(&db, "derive").await.unwrap().state, SessionState::Running);
+        assert_eq!(derive_state(&db, "derive").await.unwrap().state, SessionState::WaitingWake);
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('final','derive','assistant','完成',300)")
             .execute(&db).await.unwrap();
         assert_eq!(derive_state(&db, "derive").await.unwrap().reason.as_deref(), Some("最终回答已完成"));
