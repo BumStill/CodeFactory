@@ -4340,6 +4340,8 @@ mod tests {
             request_for(&root, &container, "objective-incident-stays", "process-a"),
         ).await.unwrap();
         let path = &workspace.worktree_path;
+        // Byte-preservation assertions must not inherit host Git CRLF conversion.
+        git(path, &["config", "core.autocrlf", "false"]);
         let registered_head = git(path, &["rev-parse", "HEAD"]);
         git(path, &["checkout", "-b", "still-wrong-branch"]);
         std::fs::write(path.join("base.txt"), "staged\n").unwrap();
@@ -4372,6 +4374,7 @@ mod tests {
             request_for(&root, &container, "objective-conflict", "process-a")).await.unwrap();
         sqlx::query("CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at INTEGER)").execute(&pool).await.unwrap();
         let path = &workspace.worktree_path;
+        git(path, &["config", "core.autocrlf", "false"]);
         std::fs::write(path.join("base.txt"), "registered\n").unwrap();
         git(path, &["add", "base.txt"]);
         git(path, &["commit", "-m", "registered change"]);
@@ -4407,6 +4410,7 @@ mod tests {
         let pool = pool_with_objective("objective-interrupted").await;
         let workspace = allocate_or_attach(&pool, request_for(&root, &container, "objective-interrupted", "process-a")).await.unwrap();
         let path = &workspace.worktree_path;
+        git(path, &["config", "core.autocrlf", "false"]);
         git(path, &["checkout", "-b", "foreign-interrupted"]);
         std::fs::write(path.join("new.txt"), "retained\n").unwrap();
         let reference = "refs/codefactory/rescue/objective-interrupted/synthetic";
