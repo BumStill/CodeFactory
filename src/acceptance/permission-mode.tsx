@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 
 import "../styles/globals.css";
 import { PermissionModePicker } from "../components/PermissionModePicker";
+import { ToolCallCard } from "../components/ToolCallCard";
 import { SettingsPage } from "../pages/Settings/SettingsPage";
 import { useChatStore, freshRuntime } from "../stores/chat";
 import { useSettingsStore } from "../stores/settings";
@@ -80,6 +81,9 @@ function PermissionModeAcceptanceApp() {
 
   return (
     <main className="min-h-screen bg-bg p-6 text-gray-200" aria-label="Permission mode acceptance">
+      <section aria-label="M159 workspace scope" className="max-w-full mb-4">
+        <ToolCallCard tc={{ id: "synthetic-local", name: "bash", args: '{"command":"git reset --hard HEAD"}', status: "done", metadata: { workspace_scope: "own_task", backup_ref: "refs/codefactory/backup/synthetic" } }} />
+      </section>
       <h1 className="mb-4 text-heading font-semibold">Session permission mode acceptance</h1>
       <section aria-label="Workspace toolbar" className="mb-4 rounded-lg border border-border bg-surface-1 p-3">
         <h2 className="mb-2 text-body font-medium">Workspace toolbar</h2>

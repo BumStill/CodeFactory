@@ -461,6 +461,11 @@ export const ToolCallCard = memo(function ToolCallCard({ tc }: Props) {
         {summary && (
           <span className="min-w-0 truncate font-mono text-note text-gray-600">· {summary}</span>
         )}
+        {tc.name === "bash" && tc.metadata?.workspace_scope === "own_task" && (
+          <span className="min-w-0 text-caption text-status-info" title={String(tc.metadata.backup_ref ?? "")}>
+            仅影响本任务工作区
+          </span>
+        )}
         {lineStats ? <ToolLineStatsBadge stats={lineStats} /> : null}
         <span className={`shrink-0 ${lineStats ? "ml-1" : "ml-auto"}`}>{statusIcon}</span>
       </button>

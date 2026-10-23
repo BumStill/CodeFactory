@@ -268,8 +268,8 @@
       "category": "permission_safety",
       "priority": "P1",
       "source_kind": "product_contract",
-      "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs", "src-tauri/src/agent/permission_gateway.rs"],
-      "automated_by": ["pnpm:test:permission-mode:headless", "rust:m139_readonly_compositions_skip_approval", "rust:m139_standard_write_waits_then_approval_continues"],
+      "change_patterns": ["src/components/*Permission*.tsx", "src/stores/permission*.ts", "src-tauri/src/permissions*.rs", "src-tauri/src/agent/permission_gateway.rs", "src-tauri/src/agent/trusted_git.rs", "src/acceptance/permission-mode.tsx", "scripts/verify-permission-mode-headless.mjs"],
+      "automated_by": ["pnpm:test:permission-mode:headless", "rust:m139_readonly_compositions_skip_approval", "rust:m139_standard_write_waits_then_approval_continues", "rust:m159_gateway_session_identity_backup_and_remote_fence", "rust:m159_standard_reset_still_requests_approval", "path:src/components/ToolCallCard.workspace.test.tsx"],
       "required_evidence": ["L1", "L3"],
       "gates": ["pull_request", "manual_canary"]
     },
