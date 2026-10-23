@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -20,7 +22,29 @@ def make_failure(code: str, message: str, file: Path, missing_or_invalid: str, r
     }
 
 
-def main() -> int:
+def _acceptance_ledger_problems(repo_root: Path, body_file: str | None, base_ref: str | None) -> list[str]:
+    """M162 R2：PR 引用的规格（或已存在的账本）必须逐条有状态与证据。
+
+    与交付预检共用 `validate_acceptance_ledger.py` 的唯一实现——基线侧不另写一套判断。
+    """
+    module_path = Path(__file__).resolve().parent / "validate_acceptance_ledger.py"
+    if not module_path.exists():
+        return [f"缺少验收账本校验器：{module_path}"]
+    spec = importlib.util.spec_from_file_location("validate_acceptance_ledger", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    report = module.build_report(repo_root, module.read_body(body_file), base_ref)
+    return list(report["problems"])
+
+
+def main(argv: list[str] | None = None) -> int:
+    # M162: 账本校验可以带 --body-file / --base-ref；缺省时从 GITHUB_EVENT_PATH 取 PR 正文，
+    # 两者都没有（push 到 main）则退化为"已存在账本的自洽检查"。
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--body-file", default=None)
+    parser.add_argument("--base-ref", default=None)
+    arguments, _ = parser.parse_known_args(argv)
+
     repo_root = Path(__file__).resolve().parents[2]
     manifest_path = repo_root / ".codex" / "governance" / "baseline-manifest.json"
     failures: list[dict] = []
@@ -103,6 +127,21 @@ def main() -> int:
                     )
                 )
         checked_items.append("marker_checks")
+
+    ledger_problems = _acceptance_ledger_problems(repo_root, arguments.body_file, arguments.base_ref)
+    if ledger_problems:
+        failures.append(
+            make_failure(
+                "ACCEPTANCE_LEDGER_INCOMPLETE",
+                "规格里的需求项没有在验收账本中逐条给出状态与证据。",
+                repo_root / "docs" / "acceptance",
+                "; ".join(ledger_problems[:10]),
+                "在 docs/acceptance/<task-id>.md 为每个 R 项写一行状态与证据；"
+                "deferred 必须写原因与后续任务。",
+            )
+        )
+    else:
+        checked_items.append("acceptance_ledger")
 
     result = {
         "status": "fail" if failures else "pass",

@@ -4923,6 +4923,13 @@ fn precheck_thin_pr_body(
             "tools/governance/validate_scenario_test_governance.py",
             true,
         ),
+        (
+            // M162: 规格里的每个 R 项都要在 docs/acceptance/<task-id>.md 里有状态和证据，
+            // 缺项在 push 之前就挡住，而不是推一个注定过不了基线的 PR。
+            "验收账本 (validate_acceptance_ledger.py)",
+            "tools/governance/validate_acceptance_ledger.py",
+            false,
+        ),
     ];
     for (label, script, with_title) in checks {
         let script_path = root.join(script);
