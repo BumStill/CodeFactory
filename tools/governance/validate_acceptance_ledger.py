@@ -196,7 +196,12 @@ def ledger_for_spec(repo_root: Path, spec_path: Path, declared: str | None = Non
 def _git(repo_root: Path, *arguments: str) -> str | None:
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_root), *arguments], capture_output=True, text=True, timeout=60
+            ["git", "-C", str(repo_root), *arguments],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60
         )
     except (OSError, subprocess.SubprocessError):
         return None
