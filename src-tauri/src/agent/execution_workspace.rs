@@ -3966,7 +3966,10 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
         let full_objectives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='requires_user_action'")
             .fetch_one(&mut *tx).await?;
         if full_objectives > 0 {
-            sqlx::query("UPDATE objectives SET status='legacy_orphan', decision_type='continue', requires_user_action=0, lease_owner=NULL, lease_expires_at=NULL, recovery_owner=NULL, remediation_id=NULL, next_observation_at=NULL WHERE id=?")
+            // System-owned closure: the supervisor already folded this duplicate
+            // objective into the keeper, so the record is closed automatically and
+            // never becomes a manual handoff waiting for the user.
+            sqlx::query("UPDATE objectives SET status='legacy_orphan', decision_type='platform_incident', requires_user_action=0, lease_owner=NULL, lease_expires_at=NULL, recovery_owner=NULL, remediation_id=NULL, next_observation_at=NULL WHERE id=?")
                 .bind(&row.objective_id).execute(&mut *tx).await?;
         } else {
             sqlx::query("UPDATE objectives SET status='legacy_orphan' WHERE id=?")
