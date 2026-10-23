@@ -2847,6 +2847,26 @@ impl ObjectiveStore {
             }
         }
 
+        // M163: transport anchors can disappear after restart or after a turn
+        // settles. A wake is never a new authorization; resolve the durable
+        // session identity before considering creation of another Objective.
+        if candidates.is_empty() && !origin.is_user() {
+            let previous: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM objectives WHERE session_id=?
+                 AND status NOT IN ('completed','cancelled','legacy_orphan')
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+            )
+            .bind(session_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            if let Some(previous) = previous {
+                candidates.push(previous);
+            } else {
+                // Late notices after completion/cancellation are stale work,
+                // never authorization for a new Objective/worktree.
+                bail!("system wake has no unfinished objective to continue");
+            }
+        }
         candidates.sort();
         candidates.dedup();
         // Ambiguity resolves to the binding the current turn already owns;
@@ -12138,6 +12158,56 @@ CREATE TABLE objectives (
             .unwrap();
         let remediation_id = waiting.remediation_id.clone().unwrap();
         (pool, store, waiting.id, remediation_id)
+    }
+
+    #[tokio::test]
+    async fn m163_three_unanchored_wakes_keep_one_objective() {
+        let session = "synthetic-m163";
+        let (pool, store, original, _) = m148_waiting_session_with_leftover_turn(session).await;
+        super::super::execution_workspace::ensure_schema(&pool).await.unwrap();
+        // Use the real allocator and real files, not an in-memory count alone.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        use crate::util::no_window::NoWindow;
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git").no_window().current_dir(&root)
+                .args(args).output().unwrap().status.success());
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["config", "user.name", "Synthetic"]);
+        git(&["config", "user.email", "synthetic@example.invalid"]);
+        std::fs::write(root.join("base.txt"), "base").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "synthetic base"]);
+        let request = |objective: &str, process: &str| super::super::execution_workspace::ExecutionWorkspaceRequest {
+            objective_id: objective.into(), session_id: Some(session.into()),
+            source_cwd: root.clone(), workspace_container: temp.path().join("managed"),
+            process_instance: process.into(),
+        };
+        let workspace = super::super::execution_workspace::allocate_or_attach(&pool, request(&original, "first"))
+            .await.unwrap();
+        std::fs::write(workspace.worktree_path.join("draft.txt"), "visible after restart").unwrap();
+        for n in 0..3 {
+            let root = format!("synthetic-wake-{n}");
+            sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,status) VALUES (?,?,'active')")
+                .bind(&root).bind(session).execute(&pool).await.unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            let admitted = store.ensure_or_continue_chat_objective_in_tx_with_origin(
+                &mut tx, session, &root, None, ObjectiveKind::Delivery,
+                "delivery_receipt", TurnOrigin::SystemWake,
+            ).await.unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(admitted.id, original, "a wake without a transport anchor is still the same task");
+            let attached = super::super::execution_workspace::allocate_or_attach(&pool, request(&admitted.id, &format!("restart-{n}")))
+                .await.unwrap();
+            assert_eq!(attached.worktree_path, workspace.worktree_path);
+            assert_eq!(std::fs::read_to_string(attached.worktree_path.join("draft.txt")).unwrap(), "visible after restart");
+        }
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces")
+            .fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM objectives")
+            .fetch_one(&pool).await.unwrap(), 1);
     }
 
     /// M148：后台任务结束通知、定时唤醒、PR 监视心跳都走这条准入路径。它们只是

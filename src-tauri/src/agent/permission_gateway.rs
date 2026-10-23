@@ -813,7 +813,12 @@ mod tests {
     async fn wait_for_durable_intent(
         gateway: &DesktopPermissionGateway,
     ) -> PermissionIntentSnapshot {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // Poll with a real sleep rather than a yield_now spin: the admitting task
+        // needs the executor and the DB to make progress, and a spin loop on a
+        // saturated CI runner starves exactly the work it is waiting for. The
+        // budget is generous because this is a liveness wait, not a latency
+        // assertion.
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if let Some(intent_id) = gateway
                     .pending_permissions
@@ -828,7 +833,7 @@ mod tests {
                         return intent;
                     }
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -836,7 +841,8 @@ mod tests {
     }
 
     async fn take_pending_sender(gateway: &DesktopPermissionGateway) -> oneshot::Sender<bool> {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // Same liveness budget and cooperative sleep as wait_for_durable_intent.
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let mut pending = gateway.pending_permissions.lock().await;
                 if let Some(key) = pending.keys().next().cloned() {
@@ -844,7 +850,7 @@ mod tests {
                     return sender;
                 }
                 drop(pending);
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await

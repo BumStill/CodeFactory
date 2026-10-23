@@ -287,6 +287,22 @@ describe("CF-HDE-R7 · 送达如实回报", () => {
     );
   });
 
+  it("M163 slow admission retries share the original send", async () => {
+    seed({});
+    let finish!: () => void;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "send_message") await new Promise<void>((resolve) => { finish = resolve; });
+      return undefined;
+    });
+    const input = { sessionId: "A", message: "synthetic slow admission", mode: "steer" as const };
+    await expect(dispatchSend(input, { timeoutMs: 20 })).rejects.toMatchObject({ code: "delivery_failed" });
+    const retry = dispatchSend(input, { timeoutMs: 200 });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message")).toHaveLength(1);
+    finish();
+    await retry;
+  });
+
   it("后端一直没有受理：回报 delivery_failed，绝不说 ok", async () => {
     seed({});
     invokeMock.mockImplementation(async (cmd: string) => {
