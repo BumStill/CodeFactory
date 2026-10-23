@@ -17,6 +17,15 @@ Harness：Spec、Compatibility、Observation、Release、AI Collaboration。
 原始规格：docs/specs/feature-specs/m168-bg-wake-delivery.md。
 真机验收由编排方发版安装后完成；本任务止于合并，not live。
 
+- `thin_derive::tests::m168_cross_process_pr_ci_failure_is_delivered_after_restart`：真实子进程读取已持久化 CI 失败观测，恢复生成计划并通过统一投递器送达，父进程再次心跳不重复排队。
+- `background_tasks::tests::m168_restarted_live_orphan_without_receipt_is_lost`：覆盖启动时仍存活的孤儿后续退出，没有退出收据时按 lost 而非 exited 结算。
+
+## 续做验证记录
+- 场景治理（`--ci`）、README contract、M162 验收账本预检均已通过。
+- 前端完整测试：159 个文件、1055 项通过（含 lightModeAudit）；生产构建与 Rust 验证执行中，结果待补。
+- 原保存会话记录的 failure-first：阻塞 sink、全绿判断、跨进程 lost 判定、无 executor pending 状态均曾失败；续做不将这些历史记录冒充本会话新运行结果。
+- 独立只读审查已通过并行任务工具派发，未使用模板禁止的 delegate_tasks。
+
 Spec Amendment: 无。
 Scenario-Test: HLT-001, HLT-004, RTE-005, CXD-002
 README-Update: reviewed

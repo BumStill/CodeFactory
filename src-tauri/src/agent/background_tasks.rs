@@ -735,13 +735,9 @@ async fn watch_orphan(pool: SqlitePool, task: BackgroundTask) {
         + Duration::from_secs(task.timeout_sec.max(1));
     loop {
         if !process_alive(pid) {
-            let present = Path::new(&task.output_path).exists();
-            let status = if present {
-                TaskStatus::Exited
-            } else {
-                TaskStatus::Lost
-            };
-            settle(&pool, &task.id, status, None, true).await;
+            // After restart we can observe disappearance, not an exit receipt.
+            // A log file may contain partial output from a failed/lost process.
+            settle(&pool, &task.id, TaskStatus::Lost, None, true).await;
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2102,6 +2098,27 @@ mod tests {
             .unwrap();
         ensure_schema(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn m168_restarted_live_orphan_without_receipt_is_lost() {
+        let pool = memory_pool().await;
+        let dir = scratch_dir("m168-live-orphan");
+        let log = dir.join("output.log");
+        std::fs::write(&log, "synthetic output, not an exit receipt").unwrap();
+        sqlx::query("INSERT INTO background_tasks(id,session_id,command,cwd,source,status,pid,process_started_at,output_path,created_at,timeout_sec,wake_state) VALUES ('orphan','synthetic','exit 0',?,'agent_decided','running',4294967294,'dead',?,1,60,'none')")
+            .bind(dir.to_string_lossy().as_ref()).bind(log.to_string_lossy().as_ref())
+            .execute(&pool).await.unwrap();
+        let task = get(&pool, "orphan").await.unwrap().unwrap();
+        watch_orphan(pool.clone(), task).await;
+        let settled = get(&pool, "orphan").await.unwrap().unwrap();
+        assert_eq!(settled.status, TaskStatus::Lost);
+        assert_eq!(settled.wake_state, "pending");
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_pending_wakes(&pool, sink(&recorder)).await, 1);
+        assert!(recorder.take()[0].1.contains("无法确认结果"));
+        pool.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

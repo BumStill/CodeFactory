@@ -509,7 +509,14 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     if completed.as_deref().is_some_and(is_external_failure) {
         let repaired: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules wake JOIN messages answer ON answer.session_id=wake.session_id AND answer.role='assistant' AND answer.created_at>=wake.last_fired_at*1000 AND TRIM(answer.content)<>'' AND (answer.tool_calls IS NULL OR answer.tool_calls='' OR answer.tool_calls='[]') AND (answer.completion_state IS NULL OR answer.completion_state='' OR answer.completion_state='final') WHERE wake.session_id=? AND wake.id LIKE 'thin-repair-%' AND wake.status='done' AND wake.prompt LIKE (SELECT completed_reason || '%' FROM thin_external_observations WHERE session_id=?)")
             .bind(session).bind(session).fetch_one(db).await?;
-        if repaired == 0 && pending_question_at == 0 { return Ok(ThinState::running()); }
+        if repaired == 0 && pending_question_at == 0 {
+            return Ok(ThinState {
+                state: SessionState::WaitingWake,
+                waiting_for: Some("系统自动重试/自愈：接续 PR 检查结果".into()),
+                wake_source: Some("持久投递器自动重试".into()),
+                ..ThinState::running()
+            });
+        }
     }
     // M148/R3：未完成的已交付 PR 是外部进行中事项——只要它还在，下面的终态推导
     // 不得结束会话。v1.91.x 的现场：等待 PR 的会话被写成
@@ -676,6 +683,74 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn m168_pending_pr_wake_without_executor_is_not_running() {
+        let db = fixture().await;
+        super::super::background_tasks::wake_source_cover(&db, "derive").await;
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,completed_reason) VALUES ('derive',73,'ThroughMerge',?,'PR #73 检查失败：synthetic-ci')")
+            .bind(chrono::Utc::now().timestamp_millis() + 3_600_000).execute(&db).await.unwrap();
+        heartbeat_external(&db, "derive").await.unwrap();
+        assert_eq!(derive_state(&db, "derive").await.unwrap().state, SessionState::WaitingWake);
+    }
+
+    #[tokio::test]
+    async fn m168_cross_process_pr_ci_failure_is_delivered_after_restart() {
+        use super::super::background_tasks::{WakeSink, WakeFuture, drain_due_wakeups_at};
+        const CHILD: &str = "CODEFACTORY_M168_PR_FIXTURE";
+        if let Ok(url) = std::env::var(CHILD) {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            // Reopening a legacy DB applies the application's mode default.
+            // This fixture specifically exercises the thin PR monitor.
+            sqlx::query("UPDATE sessions SET delivery_mode='thin' WHERE id='derive'")
+                .execute(&db).await.unwrap();
+            heartbeat_external(&db, "derive").await.unwrap();
+            struct Sink;
+            impl WakeSink for Sink {
+                fn enqueue(&self, session: String, text: String) -> WakeFuture {
+                    assert_eq!(session, "derive");
+                    assert!(text.contains("synthetic-ci"));
+                    assert!(text.contains("系统自动重试/自愈"));
+                    Box::pin(async { true })
+                }
+            }
+            let due: i64 = sqlx::query_scalar("SELECT next_at FROM wakeup_schedules WHERE status='pending'")
+                .fetch_one(&db).await.unwrap();
+            assert_eq!(drain_due_wakeups_at(&db, &Sink, due).await, 1);
+            assert_eq!(drain_due_wakeups_at(&db, &Sink, due + 1).await, 0);
+            db.close().await;
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("fixture.sqlite").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('derive','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        super::super::thin_state::save(&db, "derive", &super::super::thin_state::after_final(
+            super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, "")).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','synthetic',73,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        let reason = failure_reason(&serde_json::json!({"state":"OPEN", "statusCheckRollup":[{"name":"synthetic-ci","conclusion":"FAILURE"}]}), 73).unwrap();
+        apply_observation(&db, "derive", 73, "ThroughMerge", Some(&reason), None).await.unwrap();
+        // The observation was persisted, but the app died before queuing its wake.
+        sqlx::query("UPDATE thin_external_observations SET observed_at=?")
+            .bind(chrono::Utc::now().timestamp_millis() + 3_600_000).execute(&db).await.unwrap();
+        db.close().await;
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["m168_cross_process_pr_ci_failure_is_delivered_after_restart", "--nocapture"])
+            .env(CHILD, &url).output().await.unwrap();
+        assert!(output.status.success(), "child failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let reopened = crate::storage::db::connect(&url).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='done' AND fire_count=1")
+            .fetch_one(&reopened).await.unwrap();
+        assert_eq!(count, 1);
+        heartbeat_external(&reopened, "derive").await.unwrap();
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules").fetch_one(&reopened).await.unwrap();
+        assert_eq!(total, 1);
+        reopened.close().await;
+    }
+
     #[test]
     fn m168_all_green_ci_is_a_wake_condition() {
         let pr = serde_json::json!({"state":"OPEN", "statusCheckRollup":[
@@ -740,7 +815,7 @@ mod tests {
             .bind(chrono::Utc::now().timestamp_millis()).execute(&db).await.unwrap();
         heartbeat_external(&db, "derive").await.unwrap();
         heartbeat_external(&db, "derive").await.unwrap();
-        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Running);
+        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::WaitingWake);
         struct Sink;
         impl super::super::background_tasks::WakeSink for Sink {
             fn enqueue(&self, _: String, text: String) -> super::super::background_tasks::WakeFuture {
