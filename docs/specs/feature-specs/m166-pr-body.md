@@ -26,6 +26,15 @@ Spec：原始任务规格与 Implementation Notes 已入库。Compatibility：M1
 
 合并后核对 merged=true、squash commit 在 origin/main、远端精确分支与本地状态；清理任务专属构建目录，不删除应用管理的工作区。不执行发布。无待决 Spec Amendment。
 
+## M166 续（Windows 反斜杠路径，PR #861 首轮 CI 暴露）
+
+- 现象：同一组合命令在 macOS 放行，在 Windows 仍弹审批。`scenario-execution` 的 `execute-windows` 与 `receipt` 失败，`check-rust` 在 `m159_gateway_session_identity_backup_and_remote_fence` 上断言 `PermissionOutcome::Allow` 实际得到 `Deny(TimedOut)`。
+- 根因：Windows 托管工作区路径以反斜杠分隔且必须加引号（`cd "C:\…\ws"`）。分解器（`trusted_git::segments`）把引号内的 `\` 也当转义符拒绝，`segments` 返回 `None`，整条组合命令失去静态证明，退回审批。
+- 修正：引号内的 `\` 按字面量处理；引号外仍一律拒绝（转义/续行无法静态确认）；双引号内的 `\"`、`\\`、`\$`、`` \` `` 仍按转义拒绝。R1/R2 的拒绝面（越界、未知变量、命令替换、重定向、远端写）不变。
+- TDD：先写 `trusted_git::tests::m166_quoted_backslash_paths_stay_literal_words` 与 `m166_backslash_escapes_outside_quotes_stay_rejected`，在无修复代码上运行到红（`segments=None`），再上修复转绿。
+- 可移植性：`m159_trusted_git.rs` 的 shell 执行抽成 `shell()`（Windows 用 Git for Windows 的 `bin/bash.exe`，其它平台 `sh`），仅替换调用方式，断言未改动；这样 R3 的端到端执行在 Windows 也真正跑得到。
+- 回归：`m159_gateway_session_identity_backup_and_remote_fence` 1/1、`trusted_git::tests` 2/2、`--test m159_trusted_git` 7/7（合并最新 origin/main 后重跑）。
+
 Scenario-Test: UI-009, HLT-005, SKL-002
 README-Update: reviewed
 README-Update-Reason: 修复既有信任模式的组合命令作用域判定，不改变公开安装、隐私或平台承诺。
