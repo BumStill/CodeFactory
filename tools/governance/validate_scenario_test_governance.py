@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import fnmatch
 import json
 import os
@@ -172,7 +173,137 @@ def scenario_impact_files(repo_root: Path, base_ref: str, files: list[str]) -> l
     return [] if _is_version_manifest_only_patch(files, result.stdout) else files
 
 
-def load_registry(path: Path = REGISTRY_PATH) -> dict[str, Any]:
+SCENARIO_MAPPINGS_PATH = "docs/testing/scenario-mappings.json"
+MAPPING_PROTECTED_PATHS = (
+    SCENARIO_MAPPINGS_PATH,
+    "docs/testing/scenario-registry.json",
+    "tools/governance/run_scenario_harness_gate.py",
+    "tools/governance/scenario_execution.py",
+    "tools/governance/validate_scenario_test_governance.py",
+)
+
+
+def _git_file(root: Path, ref: str, relative: str) -> bytes | None:
+    """Read one file at ``ref``; ``None`` means the ref exists but has no such file.
+
+    An unresolvable base must fail closed: otherwise deleting the base object
+    would silently erase every append-only entry instead of rejecting a
+    shrinking candidate.
+    """
+
+    verify = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        capture_output=True,
+    )
+    if verify.returncode != 0:
+        raise ValueError(f"scenario mappings cannot diff against base ref: {ref}")
+    result = subprocess.run(
+        ["git", "-C", str(root), "show", f"{ref}:{relative}"],
+        capture_output=True,
+    )
+    if result.returncode == 0:
+        return result.stdout
+    if b"does not exist in" in result.stderr or b"exists on disk" in result.stderr:
+        return None
+    raise ValueError(f"scenario mappings cannot read {relative} at {ref}: {result.stderr.decode('utf-8', 'replace').strip()}")
+
+
+def _parse_mappings(raw: bytes, label: str) -> list[tuple[str, str]]:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid scenario mappings JSON in {label}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError(f"scenario mappings in {label} must be an object with schema_version 1")
+    entries = payload.get("mappings")
+    if not isinstance(entries, list):
+        raise ValueError(f"scenario mappings in {label} must contain a mappings list")
+    parsed: list[tuple[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"pattern", "scenario_id"}:
+            raise ValueError(f"scenario mappings in {label} must be {{pattern, scenario_id}} objects")
+        pattern, scenario_id = entry["pattern"], entry["scenario_id"]
+        if not isinstance(pattern, str) or not isinstance(scenario_id, str):
+            raise ValueError(f"scenario mappings in {label} must use string values")
+        parsed.append((pattern, scenario_id))
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"scenario mappings in {label} contain duplicate entries")
+    return parsed
+
+
+def _validate_mapping_entry(pattern: str, scenario_id: str, registry: dict[str, Any]) -> None:
+    if not pattern.strip() or "/" not in pattern:
+        raise ValueError(f"scenario mapping pattern must name a path below a directory: {pattern!r}")
+    head = pattern.split("/", 1)[0]
+    if any(character in head for character in "*?["):
+        raise ValueError(f"scenario mapping pattern must not match the whole repository: {pattern!r}")
+    if any(fnmatch.fnmatch(path, pattern) for path in MAPPING_PROTECTED_PATHS):
+        raise ValueError(f"scenario mapping pattern may not target trust-root files: {pattern!r}")
+    scenario = next(
+        (item for item in registry.get("scenarios", []) if item.get("id") == scenario_id),
+        None,
+    )
+    if scenario is None:
+        raise ValueError(f"scenario mapping references an unknown Scenario ID: {scenario_id}")
+    lifecycle = str(
+        scenario.get("status")
+        or scenario.get("lifecycle")
+        or ("inactive" if scenario.get("active") is False else "")
+    ).lower()
+    gates = set(scenario.get("gates") or [])
+    if lifecycle in {"inactive", "retired", "deprecated"} or "pull_request" not in gates:
+        raise ValueError(f"scenario mapping must reference an active Scenario ID: {scenario_id}")
+
+
+def load_scenario_mappings(
+    root: Path,
+    registry: dict[str, Any],
+    *,
+    base_ref: str | None = None,
+) -> list[tuple[str, str]]:
+    """Load the append-only product-file mappings that sit beside the registry.
+
+    The registry stays the only trust root: this file may only ADD
+    ``pattern -> existing active Scenario ID`` pairs, so an ordinary PR can map
+    a new product file without rewriting the file that judges it.
+    """
+
+    candidate = root / SCENARIO_MAPPINGS_PATH
+    if candidate.is_symlink():
+        raise ValueError("scenario mappings must not be a symlink")
+    if not candidate.exists():
+        entries: list[tuple[str, str]] = []
+    else:
+        if not candidate.is_file():
+            raise ValueError("scenario mappings must be a regular file")
+        entries = _parse_mappings(candidate.read_bytes(), SCENARIO_MAPPINGS_PATH)
+    for pattern, scenario_id in entries:
+        _validate_mapping_entry(pattern, scenario_id, registry)
+    if base_ref is None:
+        return entries
+    base_raw = _git_file(root, base_ref, SCENARIO_MAPPINGS_PATH)
+    base_entries = _parse_mappings(base_raw, f"{base_ref}:{SCENARIO_MAPPINGS_PATH}") if base_raw else []
+    missing = sorted(set(base_entries) - set(entries))
+    if missing:
+        raise ValueError(
+            "scenario mappings are append-only; existing entries cannot be removed or retargeted: "
+            + ", ".join(f"{pattern} -> {scenario_id}" for pattern, scenario_id in missing)
+        )
+    return entries
+
+
+def _merge_scenario_mappings(registry: dict[str, Any], entries: list[tuple[str, str]]) -> dict[str, Any]:
+    merged = copy.deepcopy(registry)
+    by_id = {scenario.get("id"): scenario for scenario in merged.get("scenarios", [])}
+    for pattern, scenario_id in entries:
+        scenario = by_id[scenario_id]
+        patterns = scenario.setdefault("change_patterns", [])
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return merged
+
+
+def load_registry(path: Path = REGISTRY_PATH, *, base_ref: str | None = None) -> dict[str, Any]:
     if path.is_symlink():
         raise ValueError(f"scenario registry must not be a symlink: {path}")
     try:
@@ -183,7 +314,9 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, Any]:
         raise ValueError(f"invalid scenario registry JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError("scenario registry root must be an object")
-    return payload
+    root = path.parent.parent.parent
+    entries = load_scenario_mappings(root, payload, base_ref=base_ref)
+    return _merge_scenario_mappings(payload, entries) if entries else payload
 
 
 def _duplicates(values: list[str]) -> set[str]:
