@@ -2825,6 +2825,15 @@ async fn admit_persisted_chat_turn_with_origin(
     if content.trim().is_empty() {
         return Err(AppError::Other("chat input cannot be empty".into()));
     }
+    // Repair historical split bindings before the admission transaction reads
+    // continuation identity. The same entry works in headless/locked-screen runs.
+    // Best effort: recovery must never fail or serialize an otherwise valid
+    // admission (a concurrent writer can hold SQLite's single write lock).
+    if let Err(error) = crate::agent::execution_workspace::repair_session_split(
+        pool, session_id, &crate::agent::objective::current_process_instance(),
+    ).await {
+        tracing::warn!(%error, "split workspace recovery deferred");
+    }
     let root_turn_id = requested_root_turn_id
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)

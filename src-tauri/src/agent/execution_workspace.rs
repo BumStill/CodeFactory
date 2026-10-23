@@ -2468,6 +2468,18 @@ pub(crate) fn spawn_cleanup_supervisor(
             "managed workspace cleanup supervisor started"
         );
         loop {
+            let sessions: Result<Vec<String>, _> = sqlx::query_scalar(
+                "SELECT session_id FROM execution_workspaces
+                 WHERE session_id IS NOT NULL AND state IN ('active','allocating','delivering')
+                 GROUP BY session_id HAVING COUNT(*)>1",
+            ).fetch_all(&pool).await;
+            if let Ok(sessions) = sessions {
+                for session in sessions {
+                    if let Err(error) = repair_session_split_under_repo_lock(&pool, &session, &process_instance).await {
+                        tracing::warn!(%error, "split workspace recovery preserved originals; retrying later");
+                    }
+                }
+            }
             match run_cleanup_pass_with(
                 &pool,
                 &workspace_container,
@@ -3860,6 +3872,148 @@ async fn allocate_new_locked(
     Ok(workspace)
 }
 
+/// Preserve the complete index/worktree (including untracked files) without
+/// changing the user's index or branch. Every recovery write has a rescue ref.
+fn rescue_snapshot(row: &WorkspaceRow) -> Result<String> {
+    let path = Path::new(&row.worktree_path);
+    let index = tempfile::tempdir()?;
+    let index_path = index.path().join("index");
+    let run = |args: &[&str]| -> Result<String> {
+        let output = Command::new("git").no_window().args(args).current_dir(path)
+            .env("GIT_INDEX_FILE", &index_path)
+            .env("GIT_AUTHOR_NAME", "CodeFactory Recovery")
+            .env("GIT_AUTHOR_EMAIL", "recovery@codefactory.invalid")
+            .env("GIT_COMMITTER_NAME", "CodeFactory Recovery")
+            .env("GIT_COMMITTER_EMAIL", "recovery@codefactory.invalid")
+            .output()?;
+        if !output.status.success() {
+            bail!("workspace rescue failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    };
+    run(&["read-tree", "HEAD"])?;
+    run(&["add", "-A"])?;
+    let tree = run(&["write-tree"])?;
+    let head = git(path, &["rev-parse", "HEAD"])?;
+    let snapshot = run(&["commit-tree", &tree, "-p", &head, "-m", "preserve split workspace"])?;
+    // Never overwrite the first rescue point on retry.
+    let rescue = format!("refs/codefactory/rescue/{}", row.id);
+    if git(path, &["rev-parse", "--verify", &rescue]).is_err() {
+        git(path, &["update-ref", &rescue, &snapshot])?;
+    }
+    Ok(snapshot)
+}
+
+/// M163/R2: startup and allocation share this recovery path. No directories or
+/// branches are removed; conflicts leave all originals and rescue refs intact.
+async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result<()> {
+    let mut rows: Vec<WorkspaceRow> = sqlx::query_as(
+        "SELECT id, objective_id, session_id, repo_identity, repo_root, git_common_dir,
+                worktree_path, worktree_identity, branch_name, base_ref, base_sha,
+                head_sha, state, lease_owner FROM execution_workspaces
+         WHERE session_id=? AND state IN ('active','allocating','delivering')
+         ORDER BY created_at ASC, id ASC",
+    ).bind(session).fetch_all(pool).await?;
+    if rows.len() < 2 { return Ok(()); }
+    let repo = rows[0].repo_identity.clone();
+    for row in &rows {
+        let path = Path::new(&row.worktree_path);
+        let (actual_repo, identity, _) = workspace_identity(path)?;
+        if actual_repo != row.repo_identity || row.worktree_identity.as_deref() != Some(identity.as_str())
+            || git(path, &["branch", "--show-current"])? != row.branch_name {
+            bail!("split workspace identity changed; preserving originals");
+        }
+    }
+    if rows.iter().any(|row| row.repo_identity != repo) {
+        bail!("split session spans repositories; preserving every workspace");
+    }
+    let dirty: Vec<usize> = rows.iter().enumerate().filter_map(|(i, row)| {
+        let path = Path::new(&row.worktree_path);
+        (workspace_has_uncommitted_changes(path) || workspace_has_commits_beyond_base(path, &row.base_sha)).then_some(i)
+    }).collect();
+    let keep = dirty.first().copied().unwrap_or(0);
+    let keeper = rows.remove(keep);
+    let mut snapshot = rescue_snapshot(&keeper)?;
+    // Capture all branches before changing any files or durable state.
+    let mut snapshots = Vec::new();
+    for row in &rows { snapshots.push(rescue_snapshot(row)?); }
+    let path = Path::new(&keeper.worktree_path);
+    for donor in &snapshots {
+        let tree = git(path, &["merge-tree", "--write-tree", &snapshot, donor])?;
+        let tree = tree.lines().next().ok_or_else(|| anyhow!("missing recovered tree"))?;
+        // Use commit-tree solely as a merge input; the managed branch is unchanged.
+        let output = Command::new("git").no_window().current_dir(path)
+            .args(["-c", "user.name=CodeFactory Recovery", "-c", "user.email=recovery@codefactory.invalid",
+                "commit-tree", tree, "-p", &snapshot, "-p", donor, "-m", "combine split workspace rescue"])
+            .output()?;
+        if !output.status.success() { bail!("cannot create recovered merge snapshot"); }
+        snapshot = String::from_utf8(output.stdout)?.trim().to_string();
+    }
+    // A clean donor must not erase a keeper's untracked edits when checking
+    // out the combined tree. All content is already durable in rescue refs.
+    git(path, &["read-tree", "--reset", "-u", &snapshot])?;
+    // Leave recovered edits unstaged, preserving the original branch identity.
+    git(path, &["reset", "--mixed", "HEAD"])?;
+    let mut tx = pool.begin().await?;
+    for row in &rows {
+        sqlx::query("UPDATE execution_workspaces SET state='closed', lease_owner=NULL, lease_expires_at=NULL, closed_at=?, updated_at=? WHERE id=?")
+            .bind(Utc::now().timestamp_millis()).bind(Utc::now().timestamp_millis()).bind(&row.id).execute(&mut *tx).await?;
+        let has_turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_turn_state'").fetch_one(&mut *tx).await?;
+        if has_turns > 0 {
+            sqlx::query("UPDATE chat_turn_state SET objective_id=? WHERE objective_id=? AND session_id=?")
+                .bind(&keeper.objective_id).bind(&row.objective_id).bind(session).execute(&mut *tx).await?;
+        }
+        let full_objectives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='requires_user_action'")
+            .fetch_one(&mut *tx).await?;
+        if full_objectives > 0 {
+            sqlx::query("UPDATE objectives SET status='legacy_orphan', decision_type='continue', requires_user_action=0, lease_owner=NULL, lease_expires_at=NULL, recovery_owner=NULL, remediation_id=NULL, next_observation_at=NULL WHERE id=?")
+                .bind(&row.objective_id).execute(&mut *tx).await?;
+        } else {
+            sqlx::query("UPDATE objectives SET status='legacy_orphan' WHERE id=?")
+                .bind(&row.objective_id).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn repair_session_split_under_repo_lock(
+    pool: &SqlitePool,
+    session: &str,
+    process: &str,
+) -> Result<()> {
+    let repo: Option<String> = sqlx::query_scalar("SELECT repo_identity FROM execution_workspaces WHERE session_id=? AND state IN ('active','allocating','delivering') LIMIT 1")
+        .bind(session).fetch_optional(pool).await?;
+    if let Some(repo) = repo {
+        acquire_repo_allocation_lock(pool, &repo, process).await?;
+        let result = repair_session_split_locked(pool, session).await;
+        release_repo_allocation_lock(pool, &repo, process).await;
+        result?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn repair_session_split(pool: &SqlitePool, session: &str, process: &str) -> Result<()> {
+    // Cheap gate first: admission runs this on every turn, so a normal session
+    // must not pay for schema work or a write transaction.
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_workspaces
+         WHERE session_id=? AND state IN ('active','allocating','delivering')",
+    )
+    .bind(session)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+    if active < 2 {
+        return Ok(());
+    }
+    ensure_schema(pool).await?;
+    let _guard = ALLOCATION_LOCK.lock().await;
+    repair_session_split_under_repo_lock(pool, session, process).await
+}
+
 pub async fn allocate_or_attach(
     pool: &SqlitePool,
     request: ExecutionWorkspaceRequest,
@@ -5183,6 +5337,29 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn m163_split_recovery_preserves_both_dirty_workspaces() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["split-a", "split-b"]).await;
+        let a = allocate_or_attach(&pool, request_for_session(&root, &container, "split-a", "split-session", "old-a")).await.unwrap();
+        // Simulate a historical second admission: allocate under another session,
+        // then restore the persisted split shape before startup recovery.
+        let b = allocate_or_attach(&pool, request_for_session(&root, &container, "split-b", "other-session", "old-b")).await.unwrap();
+        std::fs::write(a.worktree_path.join("first.txt"), "first edit\n").unwrap();
+        std::fs::write(b.worktree_path.join("second.txt"), "second edit\n").unwrap();
+        sqlx::query("UPDATE execution_workspaces SET session_id='split-session', created_at=CASE objective_id WHEN 'split-a' THEN 1 ELSE 2 END")
+            .execute(&pool).await.unwrap();
+        super::repair_session_split(&pool, "split-session", "restart").await.unwrap();
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces WHERE state='active'")
+            .fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(a.worktree_path.join("first.txt")).unwrap(), "first edit\n");
+        assert_eq!(std::fs::read_to_string(a.worktree_path.join("second.txt")).unwrap(), "second edit\n");
+        let rescue = format!("refs/codefactory/rescue/{}", b.id);
+        assert_eq!(git(&root, &["show", &format!("{rescue}:second.txt")]), "second edit");
+        super::repair_session_split(&pool, "split-session", "restart").await.unwrap();
+        assert_eq!(workspace_state_of(&pool, "split-b").await.as_deref(), Some("closed"));
     }
 
     /// U24 (a): the user stops a task that has uncommitted work, then sends
