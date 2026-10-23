@@ -341,7 +341,28 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     }
     let state = if error_text == "agent loop stopped: Cancelled" {
         ThinState::ended("cancelled：回合已取消", "本会话记录")
-    } else if error_text.contains("no_model_available") || super::failover::ModelUnavailable::parse(error_text).is_some() {
+    } else if let Some(unavailable) = super::failover::ModelUnavailable::parse(error_text) {
+        if let Some(at) = unavailable.resume_at_ms {
+            // M164：状态描述不是计时器。与状态一同持久化真实唤醒，重启后由
+            // background_tasks 的 due 扫描继续投递；固定 id 使结算重放幂等。
+            super::background_tasks::ensure_schema(db).await?;
+            let at_secs = at.saturating_add(999) / 1000;
+            let id = format!("model-availability-{session_id}");
+            sqlx::query("INSERT INTO wakeup_schedules (id,session_id,root_turn_id,prompt,source,after_sec,every_sec,next_at,status,fire_count,created_at,last_fired_at) VALUES (?,?,?,?,'agent_decided',?,NULL,?,'pending',0,?,NULL) ON CONFLICT(id) DO UPDATE SET root_turn_id=excluded.root_turn_id,prompt=excluded.prompt,after_sec=excluded.after_sec,next_at=excluded.next_at,status='pending',last_fired_at=NULL")
+                .bind(&id).bind(session_id).bind(root_turn_id)
+                .bind(format!("{} 模型可用时间已到，请重新检查可用端点并自动续跑原任务。", unavailable.notice))
+                .bind((at_secs - now() / 1000).max(1)).bind(at_secs).bind(now() / 1000)
+                .execute(db).await?;
+            ThinState {
+                state: SessionState::WaitingWake,
+                waiting_for: Some(unavailable.notice),
+                wake_source: Some(id),
+                ..ThinState::running()
+            }
+        } else {
+            ThinState::ended(&unavailable.notice, "本会话记录")
+        }
+    } else if error_text.contains("no_model_available") {
         after_no_model(60 * 1_000)
     } else {
         record_technical_failure(db, session_id, &first_line(error_text)).await?
@@ -461,6 +482,41 @@ mod settle_tests {
              INSERT INTO objectives (id,status) VALUES ('o-1','active');",
         ).execute(&db).await.unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn m164_model_wait_registers_a_persistent_due_wakeup_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("wake.db").display());
+        let pool = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m164','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&pool).await.unwrap();
+        let at = now() + 120_000;
+        let error = super::super::failover::ModelUnavailable {
+            notice: "GPT 已到你设的 80% 上限，约 14:00 自动继续".into(),
+            resume_at_ms: Some(at),
+        }.encode();
+        let state = settle_error(&pool, "m164", "m164-root", &error).await.unwrap();
+        assert_eq!(state.state, SessionState::WaitingWake);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='m164' AND status='pending' AND next_at=?")
+            .bind((at + 999) / 1000).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "M164: waiting_wake must own a real persisted timer");
+        pool.close().await;
+        let reopened = crate::storage::db::connect(&url).await.unwrap();
+        struct Sink(std::sync::Mutex<Vec<String>>);
+        impl super::super::background_tasks::WakeSink for Sink {
+            fn enqueue(&self, session: String, text: String) -> super::super::background_tasks::WakeFuture {
+                assert_eq!(session, "m164");
+                self.0.lock().unwrap().push(text);
+                Box::pin(async { true })
+            }
+        }
+        let sink = Sink(Default::default());
+        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&reopened, &sink, (at + 999) / 1000 - 1).await, 0);
+        let fired = super::super::background_tasks::drain_due_wakeups_at(&reopened, &sink, (at + 999) / 1000).await;
+        assert_eq!(fired, 1, "M164: restart must not lose the wake");
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&reopened, &sink, (at + 999) / 1000 + 1).await, 0);
     }
 
     #[tokio::test]

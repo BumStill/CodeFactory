@@ -204,10 +204,9 @@ pub struct CapBreach {
 }
 
 impl CapBreach {
-    /// M152：`100%` 表示服务端已经真的用满，只能等重置；`80%` 这类"留余量"上限
-    /// 只是偏好——没有其它可用端点时，本轮仍然可以继续在它上面跑。
+    /// M164：用户设置的上限就是硬门禁，不等待服务端耗尽至 100%。
     pub fn is_hard_exhausted(&self) -> bool {
-        self.used_percent >= 100
+        self.used_percent >= self.cap_percent
     }
 
     /// "约 18:20 恢复" — plain-language reset hint, or `None` when the service

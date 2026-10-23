@@ -364,20 +364,8 @@ pub(crate) async fn resolve_route_plan(
                     .is_none()
             });
             let Some(alternative) = alternative else {
-                // M152/R1：留余量是软偏好。没有可用备选时继续使用当前端点，并把
-                // 原因写进会话说明——既不暂停工作，也不让这一轮走向失败。
-                let reset = breach
-                    .reset_hint(now_ms)
-                    .map(|hint| format!("，{hint}后额度会恢复"))
-                    .unwrap_or_default();
-                plan.keep_capped_primary(format!(
-                    "{} 本{}已用 {}%，为避免用光余量本应让出，但当前没有其它可用端点，系统继续使用 {}{}。",
-                    crate::agent::failover::endpoint_label(&candidate.endpoint_name),
-                    breach.window.label(),
-                    breach.used_percent,
-                    crate::agent::failover::endpoint_label(&candidate.endpoint_name),
-                    reset,
-                ));
+                // M164：达到用户硬上限，无落点则由请求前准入登记持久等待。
+                // 不发布虚假的切换通知，也不承诺继续使用已封顶端点。
                 break;
             };
             let notice = breach.handover_notice(
@@ -8218,12 +8206,7 @@ mod tests {
             plan.quota_notice("quota-gpt").is_none(),
             "M152: 缺凭据的备选不能承载留余量切走"
         );
-        assert!(
-            plan.quota_keep_notice()
-                .is_some_and(|notice| notice.contains("继续使用")),
-            "M152: 保留 GPT 的原因要写进会话说明：{:?}",
-            plan.quota_keep_notice()
-        );
+        assert!(plan.quota_keep_notice().is_none(), "M164: 不得承诺继续使用已到上限的 GPT");
 
         let state = ActiveRouteState::from_plan_with_health(
             plan,

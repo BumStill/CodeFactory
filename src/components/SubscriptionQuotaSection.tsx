@@ -79,7 +79,7 @@ export function SubscriptionQuotaSection() {
             订阅用量上限
           </p>
           <p className="text-label text-gray-500">
-            到上限后 CodeFactory 会自动改用下一个端点，给你自己留余量；窗口重置后自动切回订阅端点。
+            到上限后停止向该端点发起新请求，改用可用端点；没有可用端点时等待并自动继续，给你自己留余量。
           </p>
         </div>
       </div>
@@ -108,7 +108,7 @@ export function SubscriptionQuotaSection() {
                       role="status"
                       className="rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-caption text-amber-700 dark:text-amber-400"
                     >
-                      已达上限，已切到其它端点，为你保留余量
+                      已达上限，停止新请求，为你保留余量
                     </span>
                   )}
                 </div>

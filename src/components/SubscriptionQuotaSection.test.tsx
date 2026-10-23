@@ -54,7 +54,7 @@ describe("SubscriptionQuotaSection (CF-QUOTA-R4)", () => {
     expect(await screen.findByText("本窗口已用 85%（上限 80%）", { exact: false })).toBeTruthy();
     expect(screen.getByText("本周已用 20%（上限 80%）", { exact: false })).toBeTruthy();
     expect(screen.getByText("服务端读数")).toBeTruthy();
-    expect(screen.getByText("已达上限，已切到其它端点，为你保留余量")).toBeTruthy();
+    expect(screen.getByText("已达上限，停止新请求，为你保留余量")).toBeTruthy();
     expect(screen.getByText(/约 \d{2}:\d{2} 恢复/)).toBeTruthy();
   });
 
@@ -63,7 +63,7 @@ describe("SubscriptionQuotaSection (CF-QUOTA-R4)", () => {
     render(<SubscriptionQuotaSection />);
 
     expect(await screen.findByText("本地估算")).toBeTruthy();
-    expect(screen.queryByText("已达上限，已切到其它端点，为你保留余量")).toBeNull();
+    expect(screen.queryByText("已达上限，停止新请求，为你保留余量")).toBeNull();
   });
 
   it("saves a changed window cap through the settings store", async () => {

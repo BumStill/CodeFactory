@@ -82,7 +82,7 @@ async function assertSurface(page, theme) {
     `${theme}: the over-cap endpoint must show its used share against its cap`,
   );
   assert(
-    await page.getByText("已达上限，已切到其它端点，为你保留余量").isVisible(),
+    await page.getByText("已达上限，停止新请求，为你保留余量").isVisible(),
     `${theme}: an endpoint over its cap must say CodeFactory handed over`,
   );
   assert(
