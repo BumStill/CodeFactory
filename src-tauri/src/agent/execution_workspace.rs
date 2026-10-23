@@ -719,24 +719,74 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
-/// M151 R10: put a managed worktree back on its registered branch.
-///
-/// A clean worktree (no staged, unstaged or untracked changes) is switched
-/// back with a plain checkout. Anything dirty is left exactly as the user left
-/// it and reported, so no uncommitted work is ever discarded by self-healing.
-fn restore_registered_branch(worktree: &Path, branch: &str) -> Result<()> {
+/// M161: persist a complete snapshot before any destructive Git operation.
+async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktree: &Path) -> Result<()> {
+    let branch = &row.branch_name;
+    let (repo_identity, worktree_identity, _) = workspace_identity(worktree)?;
+    if repo_identity != row.repo_identity || row.worktree_identity.as_deref().is_some_and(|id| id != worktree_identity) {
+        bail!("managed workspace identity mismatch: repo or gitdir changed");
+    }
+    if git(worktree, &["branch", "--show-current"])? == *branch {
+        return Ok(());
+    }
     let status = git(worktree, &["status", "--porcelain=v1", "--untracked-files=all"])?;
-    if !status.trim().is_empty() {
-        bail!(
-            "managed workspace identity mismatch: branch changed with uncommitted changes; \
-             start a new session or commit/stash them, then continue"
-        );
+    if status.is_empty() {
+        git(worktree, &["checkout", "--no-overwrite-ignore", branch])?;
+        return Ok(());
     }
-    git(worktree, &["checkout", branch])?;
-    let restored = git(worktree, &["branch", "--show-current"])?;
-    if restored != branch {
-        bail!("managed workspace identity mismatch: branch changed and could not be restored");
+    // A private index leaves the real staged/unstaged state untouched until the
+    // snapshot is reachable. No commit hooks, signing or user identity required.
+    let index = tempfile::tempdir()?;
+    let index_path = index.path().join("index");
+    let run = |args: &[&str]| -> Result<String> {
+        let output = Command::new("git").no_window().arg("-C").arg(external_path(worktree))
+            .args(args).env("GIT_INDEX_FILE", external_path(&index_path))
+            .env("GIT_AUTHOR_NAME", "CodeFactory Rescue").env("GIT_AUTHOR_EMAIL", "rescue@codefactory.invalid")
+            .env("GIT_COMMITTER_NAME", "CodeFactory Rescue").env("GIT_COMMITTER_EMAIL", "rescue@codefactory.invalid")
+            .output()?;
+        if !output.status.success() { bail!("rescue snapshot failed: {}", String::from_utf8_lossy(&output.stderr)); }
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    };
+    let head = git(worktree, &["rev-parse", "HEAD"])?;
+    run(&["read-tree", "HEAD"])?;
+    run(&["add", "-A", "--", "."])?;
+    let tree = run(&["write-tree"])?;
+    let snapshot = run(&["commit-tree", &tree, "-p", &head, "-m", "CodeFactory workspace rescue"])?;
+    let rescue = format!("refs/codefactory/rescue/{}/{}-{}", row.objective_id, Utc::now().timestamp_millis(), uuid::Uuid::new_v4());
+    git(worktree, &["update-ref", &rescue, &snapshot, ""])?;
+    sqlx::query("INSERT INTO execution_workspace_rescues (rescue_ref,objective_id,snapshot_sha,phase,created_at) VALUES (?,?,?,'snapshotted',?)")
+        .bind(&rescue).bind(&row.objective_id).bind(&snapshot).bind(Utc::now().timestamp_millis()).execute(pool).await?;
+    tracing::info!(objective_id=%row.objective_id, %rescue, %snapshot, "workspace rescue snapshot persisted");
+    // Stash preserves the original index and untracked tree as additional
+    // parents. The first snapshot already protects files if stash is interrupted.
+    git(worktree, &["-c", "user.name=CodeFactory Rescue", "-c", "user.email=rescue@codefactory.invalid", "stash", "push", "--include-untracked", "-m", &rescue])?;
+    let stash = git(worktree, &["rev-parse", "refs/stash"])?;
+    git(worktree, &["update-ref", &rescue, &stash, &snapshot])?;
+    git(worktree, &["checkout", "--no-overwrite-ignore", branch])?;
+    let applied = git(worktree, &["stash", "apply", "--index", &rescue]);
+    let conflict = applied.is_err();
+    if conflict {
+        // Only tracked content is reset. Untracked/ignored files are never
+        // broadly cleaned: successfully replayed new files may safely remain.
+        git(worktree, &["reset", "--hard", "HEAD"])?;
     }
+    let detail = if conflict {
+        format!("工作区已自动恢复，可以继续；改动重放有冲突，原始改动已完整保全在 {rescue}。")
+    } else {
+        format!("工作区已自动恢复，未提交改动已重新应用；保全位置：{rescue}。")
+    };
+    // Persist the outcome even for startup recovery; messages are optional only
+    // for non-interactive objectives (including synthetic fixtures).
+    sqlx::query("UPDATE execution_workspaces SET failure_detail=? WHERE objective_id=?")
+        .bind(&detail).bind(&row.objective_id).execute(pool).await?;
+    sqlx::query("UPDATE execution_workspace_rescues SET snapshot_sha=?,phase=?,detail=? WHERE rescue_ref=?")
+        .bind(&stash).bind(if conflict { "conflict_preserved" } else { "applied" }).bind(&detail).bind(&rescue).execute(pool).await?;
+    if let Some(session) = row.session_id.as_deref() {
+        sqlx::query("INSERT INTO messages (id,session_id,role,content,created_at) VALUES (?,?,'assistant',?,?)")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(session).bind(&detail)
+            .bind(Utc::now().timestamp_millis()).execute(pool).await?;
+    }
+    tracing::info!(objective_id=%row.objective_id, %rescue, conflict, %detail, "workspace rescue completed");
     Ok(())
 }
 
@@ -2890,6 +2940,8 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await
     .context("ensure managed execution workspace schema")?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS execution_workspace_rescues (rescue_ref TEXT PRIMARY KEY, objective_id TEXT NOT NULL, snapshot_sha TEXT NOT NULL, phase TEXT NOT NULL, detail TEXT, created_at INTEGER NOT NULL)")
+        .execute(pool).await?;
     let objective_columns = sqlx::query("PRAGMA table_info(objectives)")
         .fetch_all(pool)
         .await?;
@@ -3327,7 +3379,7 @@ async fn reattach_inner(
     if row.state == "incident" {
         let path = PathBuf::from(&row.worktree_path);
         if path.exists() {
-            if let Err(error) = restore_registered_branch(&path, &row.branch_name) {
+            if let Err(error) = restore_registered_branch(pool, &row, &path).await {
                 tracing::warn!(
                     objective_id = %row.objective_id,
                     %error,
@@ -3408,7 +3460,7 @@ async fn reattach_inner(
         // a clean worktree is simply put back on its registered branch, and
         // committed work still reachable from that branch is never discarded.
         // Dirty worktrees keep their incident so the user decides.
-        match restore_registered_branch(&canonical_path, &row.branch_name) {
+        match restore_registered_branch(pool, &row, &canonical_path).await {
             Ok(()) => {
                 tracing::info!(
                     objective_id = %row.objective_id,
@@ -4123,6 +4175,8 @@ mod tests {
             .await
             .unwrap();
         ensure_schema(&pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at INTEGER)")
+            .execute(&pool).await.unwrap();
         pool
     }
 
@@ -4258,24 +4312,12 @@ mod tests {
             "uncommitted",
         )
         .unwrap();
-        assert!(attach_existing(&pool, "objective-incident-stays", "process-b")
-            .await
-            .is_err());
-
-        // The branch is NOT restored, so every later attach must keep failing.
-        let again = attach_existing(&pool, "objective-incident-stays", "process-c").await;
-        assert!(
-            again.is_err(),
-            "an unresolved identity conflict must not be recovered"
-        );
-        let state: String = sqlx::query_scalar(
-            "SELECT state FROM execution_workspaces WHERE objective_id=?",
-        )
-        .bind("objective-incident-stays")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(state, "incident");
+        let recovered = attach_existing(&pool, "objective-incident-stays", "process-b")
+            .await.unwrap().unwrap();
+        assert_eq!(recovered.state, "active");
+        let again = attach_existing(&pool, "objective-incident-stays", "process-c").await.unwrap().unwrap();
+        assert_eq!(again.state, "active");
+        assert_eq!(std::fs::read_to_string(workspace.worktree_path.join("half-done.txt")).unwrap(), "uncommitted");
     }
 
     fn request(root: &Path, container: &Path, process_instance: &str) -> ExecutionWorkspaceRequest {
@@ -4627,19 +4669,16 @@ mod tests {
         let dirty = Path::new(&workspace.worktree_path).join("uncommitted.txt");
         std::fs::write(&dirty, "keep me").unwrap();
 
-        let error = attach_existing(&pool, "objective-dirty-root", "process-b")
+        let recovered = attach_existing(&pool, "objective-dirty-root", "process-b")
             .await
-            .unwrap_err();
+            .unwrap().unwrap();
 
-        assert!(error.to_string().contains("uncommitted changes"), "{error}");
-        assert!(dirty.exists(), "self-healing must not delete user work");
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM execution_workspaces WHERE objective_id=?")
-                .bind("objective-dirty-root")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(state, "incident");
+        assert_eq!(recovered.state, "active");
+        assert_eq!(std::fs::read_to_string(&dirty).unwrap(), "keep me");
+        assert_eq!(git(&workspace.worktree_path, &["branch", "--show-current"]), workspace.branch_name);
+        let refs = git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/rescue/objective-dirty-root/"]);
+        assert!(!refs.is_empty());
+        assert_eq!(git(&root, &["show", &format!("{}^3:uncommitted.txt", refs.lines().next().unwrap())]), "keep me");
     }
 
     #[tokio::test]
@@ -4715,24 +4754,73 @@ mod tests {
 
         let unrepaired = heal_incident_workspaces(&pool).await;
 
-        assert_eq!(unrepaired.len(), 1, "{unrepaired:?}");
-        assert_eq!(
-            workspace_state(&pool, "objective-dirty-root").await,
-            "incident"
-        );
-        // The reason the user sees is the recorded incident detail, carried
-        // forward verbatim so the session list can explain the block.
-        assert_eq!(unrepaired[0].1, "branch changed");
-        let detail: String = sqlx::query_scalar(
-            "SELECT COALESCE(failure_detail, '') FROM execution_workspaces WHERE objective_id=?",
-        )
-        .bind("objective-dirty-root")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(detail, "branch changed");
+        assert!(unrepaired.is_empty(), "{unrepaired:?}");
+        assert_eq!(workspace_state(&pool, "objective-dirty-root").await, "active");
+        assert_eq!(git(&workspace.worktree_path, &["branch", "--show-current"]), workspace.branch_name);
         let preserved = Path::new(&workspace.worktree_path).join("uncommitted.txt");
         assert!(preserved.exists(), "self-healing must not discard uncommitted work");
+    }
+
+    #[tokio::test]
+    async fn m161_conflict_preserves_snapshot_and_session_can_continue() {
+        let (_temp, root, remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let ws = allocate_or_attach(&pool, request(&root, &container, "a")).await.unwrap();
+        let path = &ws.worktree_path;
+        let remote_before = git(&remote, &["rev-parse", "refs/heads/main"]);
+        std::fs::write(path.join("base.txt"), "registered\n").unwrap();
+        git(path, &["add", "base.txt"]);
+        git(path, &["commit", "-m", "registered change"]);
+        let registered = git(path, &["rev-parse", "HEAD"]);
+        git(path, &["checkout", "-b", "foreign", &ws.base_sha]);
+        std::fs::write(path.join("base.txt"), "rescued\n").unwrap();
+        std::fs::write(path.join("new file.txt"), "untracked\n").unwrap();
+        park_as_incident(&pool, &ws.objective_id, "branch changed").await;
+        assert!(heal_incident_workspaces(&pool).await.is_empty());
+        assert_eq!(workspace_state(&pool, &ws.objective_id).await, "active");
+        assert_eq!(git(path, &["branch", "--show-current"]), ws.branch_name);
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), registered);
+        assert_eq!(git(path, &["ls-files", "--unmerged"]), "");
+        assert_eq!(std::fs::read_to_string(path.join("base.txt")).unwrap(), "registered\n");
+        let (rescue, phase, detail): (String, String, String) = sqlx::query_as("SELECT rescue_ref,phase,detail FROM execution_workspace_rescues")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(phase, "conflict_preserved");
+        assert!(detail.contains(&rescue) && detail.contains("可以继续"));
+        assert_eq!(git(path, &["show", &format!("{rescue}:base.txt")]), "rescued");
+        assert_eq!(git(path, &["show", &format!("{rescue}^3:new file.txt")]), "untracked");
+        assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), remote_before);
+        let message: String = sqlx::query_scalar("SELECT content FROM messages WHERE role='assistant'").fetch_one(&pool).await.unwrap();
+        assert_eq!(message, detail);
+        assert!(attach_existing(&pool, &ws.objective_id, "b").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn m161_startup_heals_seven_incidents_once_with_index_and_files_intact() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("synthetic-0").await;
+        for i in 0..7 {
+            let objective = format!("synthetic-{i}");
+            if i > 0 { sqlx::query("INSERT INTO objectives(id) VALUES (?)").bind(&objective).execute(&pool).await.unwrap(); }
+            let ws = allocate_or_attach(&pool, request_for(&root, &container, &objective, "a")).await.unwrap();
+            git(&ws.worktree_path, &["checkout", "-b", &format!("foreign-{i}")]);
+            std::fs::write(ws.worktree_path.join("base.txt"), "staged\n").unwrap();
+            git(&ws.worktree_path, &["add", "base.txt"]);
+            std::fs::write(ws.worktree_path.join("base.txt"), "unstaged\n").unwrap();
+            std::fs::write(ws.worktree_path.join("new.txt"), format!("untracked-{i}\n")).unwrap();
+            park_as_incident(&pool, &objective, "branch changed with uncommitted changes").await;
+        }
+        assert!(heal_incident_workspaces(&pool).await.is_empty());
+        for i in 0..7 {
+            let objective = format!("synthetic-{i}");
+            let ws = attach_existing(&pool, &objective, "b").await.unwrap().unwrap();
+            assert_eq!(ws.state, "active");
+            assert_eq!(git(&ws.worktree_path, &["show", ":base.txt"]), "staged");
+            assert_eq!(std::fs::read_to_string(ws.worktree_path.join("base.txt")).unwrap(), "unstaged\n");
+            assert_eq!(std::fs::read_to_string(ws.worktree_path.join("new.txt")).unwrap(), format!("untracked-{i}\n"));
+        }
+        assert!(heal_incident_workspaces(&pool).await.is_empty());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_workspace_rescues WHERE phase='applied'").fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 7);
     }
 
     async fn park_as_incident(pool: &SqlitePool, objective_id: &str, detail: &str) {
