@@ -193,26 +193,44 @@ def ledger_for_spec(repo_root: Path, spec_path: Path, declared: str | None = Non
     return repo_root / LEDGER_DIR / f"{task_id_for_spec(spec_path)}.md"
 
 
-def _git_changed_files(repo_root: Path, base_ref: str | None) -> list[str]:
-    if not base_ref:
-        return []
-    commands = []
+def _git(repo_root: Path, *arguments: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *arguments], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _resolve_base(repo_root: Path, base_ref: str) -> str | None:
+    """挑**一个**基线：`origin/<base>` 优先，其次本地 `<base>`。
+
+    只取第一个能解析的引用。曾经把两者一起并进变更集，结果一个过期的本地
+    `main` 会把几周前的规格都算成"本次改动"，让每次交付都因旧账失败。
+    """
     for candidate in (f"origin/{base_ref}", base_ref):
-        commands.append(["git", "-C", str(repo_root), "diff", "--name-only", f"{candidate}...HEAD"])
-    commands.append(["git", "-C", str(repo_root), "diff", "--name-only", "HEAD"])
-    commands.append(["git", "-C", str(repo_root), "diff", "--name-only", "--cached"])
+        if _git(repo_root, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}") is not None:
+            return candidate
+    return None
+
+
+def _git_changed_files(repo_root: Path, base_ref: str | None) -> list[str]:
     changed: list[str] = []
-    for command in commands:
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if result.returncode != 0:
-            continue
-        for name in result.stdout.splitlines():
+
+    def add(output: str | None) -> None:
+        for name in (output or "").splitlines():
             name = name.strip()
             if name and name not in changed:
                 changed.append(name)
+
+    if base_ref:
+        resolved = _resolve_base(repo_root, base_ref)
+        if resolved:
+            add(_git(repo_root, "diff", "--name-only", f"{resolved}...HEAD"))
+    # 未提交/已暂存的改动同样属于"这次 PR"，本地预检时账本可能还没提交。
+    add(_git(repo_root, "diff", "--name-only", "HEAD"))
+    add(_git(repo_root, "diff", "--name-only", "--cached"))
     return changed
 
 

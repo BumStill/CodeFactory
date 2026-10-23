@@ -209,6 +209,46 @@ class AcceptanceLedgerTest(unittest.TestCase):
         self.assertEqual(0, passed.returncode, passed.stdout + passed.stderr)
         self.assertEqual("pass", json.loads(passed.stdout)["status"])
 
+    # 回归：曾经把 origin/main...HEAD 与过期本地 main...HEAD 一起并进变更集，
+    # 结果几周前的规格被当成"本次改动"，每次交付都因旧账变红。
+    def test_only_one_base_ref_is_consulted(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_git(repo_root, *arguments):
+            calls.append(arguments)
+            if arguments[0] == "rev-parse":
+                return "deadbeef\n"
+            if arguments[:3] == ("diff", "--name-only", "origin/main...HEAD"):
+                return "docs/specs/feature-specs/m999-demo.md\n"
+            return ""
+
+        original = self.module._git
+        self.module._git = fake_git
+        try:
+            changed = self.module._git_changed_files(self.root, "main")
+        finally:
+            self.module._git = original
+
+        self.assertEqual(["docs/specs/feature-specs/m999-demo.md"], changed)
+        self.assertIn(("diff", "--name-only", "origin/main...HEAD"), calls)
+        self.assertNotIn(("diff", "--name-only", "main...HEAD"), calls)
+
+    def test_working_tree_edits_count_as_this_pr_even_before_commit(self) -> None:
+        def fake_git(repo_root, *arguments):
+            if arguments[0] == "rev-parse":
+                return None
+            if arguments[:3] == ("diff", "--name-only", "HEAD"):
+                return "docs/specs/feature-specs/m999-demo.md\n"
+            return ""
+
+        original = self.module._git
+        self.module._git = fake_git
+        try:
+            changed = self.module._git_changed_files(self.root, None)
+        finally:
+            self.module._git = original
+        self.assertEqual(["docs/specs/feature-specs/m999-demo.md"], changed)
+
     def test_cli_without_body_or_base_ref_self_checks_existing_ledgers(self) -> None:
         self.ledger_path.write_text(
             COMPLETE_LEDGER.replace(
