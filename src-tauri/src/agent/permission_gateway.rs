@@ -114,6 +114,24 @@ impl PermissionGateway for DesktopPermissionGateway {
             return outcome;
         }
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
+        // M159: delivery authority is not authority to force-push, delete a
+        // remote ref, or discard local work. Prove and snapshot first.
+        if policy.full_access && tool_call.function.name == "bash"
+            && bash_command.is_some_and(super::trusted_git::sensitive)
+        {
+            let key = format!("bash({})", bash_command.unwrap_or_default());
+            if policy.deny.iter().any(|pattern| super::glob_match(pattern, "bash") || super::glob_match(pattern, &key))
+                || matches!(crate::tools::shell_policy::classify_command(bash_command.unwrap_or_default()), crate::tools::shell_policy::ShellCommandPolicy::Deny { .. })
+            {
+                return permission_recovery_rejected();
+            }
+            if let (Some(root), Some(command)) = (self.managed_workspace_root().await, bash_command) {
+                if super::trusted_git::backup(&root, command).is_some() {
+                    return PermissionOutcome::Allow;
+                }
+            }
+            return self.request_permission(tool_call, args.clone(), bash_command).await;
+        }
         if remote {
             // The session switch never overrides an explicit per-tool deny.
             if let PermissionDecision::Deny(reason) = decide_permission_for_call(
@@ -497,11 +515,16 @@ impl DesktopPermissionGateway {
     /// keeps every existing confirmation: an unknown root can never widen the
     /// automatic-allow rule.
     async fn managed_workspace_root(&self) -> Option<std::path::PathBuf> {
+        let scope = self.resolve_scope().await.ok()?;
         let view = super::execution_workspace::latest_for_session(&self.db, &self.session_id)
             .await
             .ok()
             .flatten()?;
+        if view.objective_id != scope.objective_id || !matches!(view.state.as_str(), "active" | "delivering") {
+            return None;
+        }
         let path = std::path::PathBuf::from(view.worktree_path);
+        super::execution_workspace::verify_objective_workspace(&self.db, &scope.objective_id, &path).await.ok()?;
         path.is_dir().then_some(path)
     }
 
@@ -714,6 +737,77 @@ mod tests {
             browser_read_granted: false,
             browser_act_granted: AtomicBool::new(false),
         })
+    }
+
+    fn m159_git(root: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
+        assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    #[tokio::test]
+    async fn m159_gateway_session_identity_backup_and_remote_fence() {
+        let gateway = durable_test_gateway().await;
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 1").execute(&gateway.db).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        m159_git(&root, &["init", "-q"]);
+        m159_git(&root, &["config", "user.name", "Synthetic"]);
+        m159_git(&root, &["config", "user.email", "synthetic@example.invalid"]);
+        std::fs::write(root.join("tracked.txt"), "base").unwrap();
+        m159_git(&root, &["add", "."]);
+        m159_git(&root, &["commit", "-qm", "synthetic"]);
+        super::super::execution_workspace::ensure_schema(&gateway.db).await.unwrap();
+        // Register exact synthetic Git identity without invoking network allocation.
+        let common = m159_git(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        let gitdir = m159_git(&root, &["rev-parse", "--absolute-git-dir"]);
+        let branch = m159_git(&root, &["branch", "--show-current"]);
+        let head = m159_git(&root, &["rev-parse", "HEAD"]);
+        // The identity implementation is exercised through the public verifier;
+        // obtain its ordinary digest inputs exactly as workspace allocation does.
+        let repo = super::super::delivery::resolve_repo(&root, None).unwrap();
+        let identity = super::super::delivery::capture_delivery_identity(&repo).unwrap();
+        let (repo_identity, worktree_identity) = (identity.repo_identity, identity.worktree_identity);
+        sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('synthetic-workspace','5eea633e-59f9-42bc-91f8-0a19a5c49711','permission-test',?,?,?,?,?,?, 'HEAD',?,?,'active',1,1)")
+            .bind(repo_identity).bind(root.to_string_lossy().as_ref()).bind(common).bind(root.to_string_lossy().as_ref()).bind(worktree_identity).bind(branch).bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
+        assert!(!gitdir.is_empty());
+        std::fs::write(root.join("tracked.txt"), "uncommitted").unwrap();
+        let command = "git reset --hard HEAD";
+        let args = serde_json::json!({"command": command});
+        let call = ToolCall { id: "m159-local".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow);
+        let reference = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+        assert_eq!(m159_git(&root, &["show", &format!("{reference}:tracked.txt")]), "uncommitted");
+        assert!(gateway.pending_permissions.lock().await.is_empty());
+        for command in ["git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m159-remote".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            let other = gateway.clone();
+            let command = command.to_string();
+            let task = tokio::spawn(async move { other.authorize(&call, &args, Some(&command)).await });
+            let intent = wait_for_durable_intent(&gateway).await;
+            assert!(!task.is_finished());
+            PermissionIntentStore::new(gateway.db.clone()).record_user_response(&intent.prompt_key(), PermissionPromptResponse::Deny, chrono::Utc::now().timestamp_millis()).await.unwrap();
+            take_pending_sender(&gateway).await.send(false).unwrap();
+            assert!(matches!(task.await.unwrap(), PermissionOutcome::Deny(_)));
+        }
+        // Another session's registered workspace never establishes ownership.
+        sqlx::query("UPDATE execution_workspaces SET session_id='other-session'").execute(&gateway.db).await.unwrap();
+        assert!(gateway.managed_workspace_root().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn m159_standard_reset_still_requests_approval() {
+        let gateway = test_gateway("standard").await;
+        let command = "git reset --hard HEAD";
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m159-standard".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let other = gateway.clone();
+        let task = tokio::spawn(async move { other.authorize(&call, &args, Some(command)).await });
+        take_pending_sender(&gateway).await.send(false).unwrap();
+        assert!(matches!(task.await.unwrap(), PermissionOutcome::Deny(_)));
     }
 
     async fn wait_for_durable_intent(

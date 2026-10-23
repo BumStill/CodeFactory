@@ -2645,6 +2645,21 @@ impl ToolBackend for DesktopToolBackend {
             } => (receipt_id, browser_execution),
         };
 
+        let local_backup = if call.function.name == "bash"
+            && args.get("command").and_then(serde_json::Value::as_str).is_some_and(super::trusted_git::sensitive)
+        {
+            let trusted = match ctx.session_id.as_deref() {
+                Some(session) => sqlx::query_scalar::<_, String>("SELECT permission_mode FROM sessions WHERE id=?")
+                    .bind(session).fetch_optional(&self.db).await.ok().flatten().as_deref() == Some("trusted"),
+                None => false,
+            };
+            if trusted && super::trusted_git::local_rewrite(&ctx.working_directory, args["command"].as_str().unwrap_or_default()) {
+                // Revalidate and back up at the actual execution cwd, not only
+                // the permission projection. A failed snapshot never dispatches.
+                Some(super::trusted_git::backup(&ctx.working_directory, args["command"].as_str().unwrap_or_default())
+                    .ok_or_else(|| ToolError { message: "Workspace backup failed; local rewrite was not executed".into() })?)
+            } else { None }
+        } else { None };
         let exec_ctx = crate::tools::ExecCtx {
             cwd: ctx.working_directory.clone(),
             #[cfg(not(test))]
@@ -2691,6 +2706,11 @@ impl ToolBackend for DesktopToolBackend {
         };
 
         let mut result = invocation_from_output(output, command, kind);
+        if let Some(reference) = local_backup {
+            let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
+            metadata["workspace_scope"] = serde_json::json!("own_task");
+            metadata["backup_ref"] = serde_json::json!(reference);
+        }
         if let Some(session) = ctx.session_id.as_deref() {
             if super::thin::is_thin(&self.db, session).await && call.function.name == "deliver_changes" {
                 if let Some(hint) = super::thin::external_wait_hint(&self.db, session).await {

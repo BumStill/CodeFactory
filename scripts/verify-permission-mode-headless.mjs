@@ -113,6 +113,19 @@ async function main() {
     assert((await page.getByRole("tab", { name: "权限" }).count()) === 0, "global permissions tab should be hidden");
     assert((await page.getByText("工具权限").count()) === 0, "global tool-list editor should be hidden");
 
+    for (const theme of ["light", "dark"]) {
+      for (const width of [1366, 390]) {
+        await page.setViewportSize({ width, height: 768 });
+        await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
+        const badge = page.getByText("仅影响本任务工作区", { exact: true });
+        await badge.waitFor({ state: "visible" });
+        await badge.scrollIntoViewIfNeeded();
+        const box = await badge.boundingBox();
+        assert(box && box.x >= 0 && box.x + box.width <= width, "workspace badge must fit viewport");
+        assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), "no horizontal overflow");
+        await page.screenshot({ path: path.join(artifactDir, `m159-${theme}-${width}.png`), fullPage: true });
+      }
+    }
     await page.screenshot({ path: path.join(artifactDir, "permission-mode.png"), fullPage: true });
     console.log(JSON.stringify({
       status: "pass",
