@@ -5992,12 +5992,26 @@ mod tests {
         });
         // The old deferred transaction fails immediately while this lock is held;
         // the shared bounded retry survives until the lock is released. Release
-        // after a few milliseconds, and with ROLLBACK rather than COMMIT: the
-        // retry budget is only CONTENTION_ATTEMPTS (50ms + 100ms backoff), so a
-        // WAL fsync on commit plus a descheduled test thread could outlast it on
-        // Windows and surface code 5 through the retry instead of after it.
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        held.rollback().await.unwrap();
+        // with ROLLBACK rather than COMMIT: the retry budget is only
+        // CONTENTION_ATTEMPTS (50ms + 100ms backoff), so a WAL fsync plus a late
+        // holder could outlast it and surface code 5 through the retry.
+        //
+        // The release must not ride this test's runtime. `#[tokio::test]` is a
+        // current-thread runtime, so a `tokio::time::sleep` here competes with the
+        // admission task's own retry timers on one worker: in a saturated
+        // `--lib` run the holder's timer can be serviced only after the 150ms
+        // budget has already elapsed, which fails the test without any product
+        // defect. A dedicated OS thread keeps the property that matters (the lock
+        // is held across at least one admission attempt) and takes runtime
+        // scheduling out of the outcome.
+        let release = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("helper runtime for the lock holder");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            runtime.block_on(async move { held.rollback().await.unwrap() });
+        });
         let receipt = admission.await.unwrap().expect("send must recover lock contention in place");
         // Guard against a vacuous pass: a run that never met the held lock would
         // finish before the retry's first 50ms backoff could elapse.
@@ -6005,6 +6019,7 @@ mod tests {
             admission_started.elapsed() >= std::time::Duration::from_millis(45),
             "admission must have met the held write lock and retried instead of sailing through"
         );
+        release.join().expect("the lock holder must release cleanly");
         assert_eq!(receipt.root_turn_id, "m144-root");
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m144-root' AND content='继续 synthetic'")
             .fetch_one(&pool).await.unwrap();
