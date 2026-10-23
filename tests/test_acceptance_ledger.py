@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -257,12 +258,18 @@ class AcceptanceLedgerTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        # This case explicitly exercises the no-PR-context route, even on CI.
+        environment = os.environ.copy()
+        environment.pop("GITHUB_EVENT_PATH", None)
         broken = subprocess.run(
             [sys.executable, str(MODULE_PATH), "--repo", str(self.root)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            env=environment,
         )
         self.assertEqual(1, broken.returncode, broken.stdout + broken.stderr)
+        self.assertEqual(["existing_ledgers"], json.loads(broken.stdout)["checked"])
 
 
 class DeliveryPrecheckWiringTest(unittest.TestCase):
