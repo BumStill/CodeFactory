@@ -49,8 +49,14 @@ fn m159_r1_four_incident_shapes_and_backup_restore() {
         assert_eq!(git(&root, &["rev-parse", &format!("{backup}^1")]), head);
         assert_eq!(git(&root, &["show", ":tracked.txt"]), "staged content");
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "unstaged content");
-        let output = Command::new(if cfg!(windows) { "bash" } else { "sh" }).args(["-c", &command]).current_dir(&root).output().unwrap();
-        assert!(output.status.success());
+        let shell = if cfg!(windows) {
+            let exec_path = std::path::PathBuf::from(git(&root, &["--exec-path"]));
+            exec_path.ancestors().map(|base| base.join("bin/bash.exe"))
+                .find(|candidate| candidate.is_file())
+                .expect("Git for Windows installation must supply Git Bash")
+        } else { std::path::PathBuf::from("sh") };
+        let output = Command::new(shell).args(["-c", &command]).current_dir(&root).output().unwrap();
+        assert!(output.status.success(), "{command}: {}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(git(&root, &["show", &format!("{backup}:generated.txt")]), "untracked content");
         std::fs::remove_dir_all(root).unwrap();
     }

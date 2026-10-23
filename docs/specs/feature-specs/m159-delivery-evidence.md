@@ -24,4 +24,4 @@ Spec Amendment：无。
 
 README-Update: reviewed
 README-Update-Reason: 修复既有工作区权限边界，不改变公开安装、平台或隐私承诺。
-Scenario-Test: UI-009
+Scenario-Test: UI-009, HLT-001, HLT-005, SKL-002, SKL-003, UI-013
