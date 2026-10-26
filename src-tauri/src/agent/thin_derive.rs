@@ -830,13 +830,22 @@ mod tests {
                 let state = refresh(&db, session).await.unwrap();
                 assert_ne!(state.state, SessionState::Ended, "M187 stale workspace receipt ended {session}");
             }
+            // A new delivery must never be settled by an older PR receipt.
+            sqlx::query("INSERT INTO thin_delivery_refs VALUES ('new-delivery','synthetic',188,'ThroughMerge')")
+                .execute(&db).await.unwrap();
+            let mut waiting = ThinState::running();
+            waiting.state = SessionState::WaitingWake;
+            super::super::thin_state::save(&db, "new-delivery", &waiting).await.unwrap();
+            merged_settlement::settle_merged_sessions(&db).await.unwrap();
+            let state = super::super::thin_state::load(&db, "new-delivery").await.unwrap().unwrap();
+            assert_ne!(state.state, SessionState::Ended, "M187 stale PR settled new delivery");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.path().join("m187.sqlite").display());
         let db = crate::storage::db::connect(&url).await.unwrap();
         ensure_external(&db).await.unwrap();
-        for session in ["tool-pending", "tool-running", "thinking", "background"] {
+        for session in ["tool-pending", "tool-running", "thinking", "background", "new-delivery"] {
             sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?, 'synthetic','/synthetic','model',1,1,'thin')")
                 .bind(session).execute(&db).await.unwrap();
             sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES (?,?,'assistant','working',1)")
