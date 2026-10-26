@@ -148,9 +148,14 @@ def _is_version_manifest_only_patch(files: list[str], patch: str) -> bool:
 
 
 def scenario_impact_files(repo_root: Path, base_ref: str, files: list[str]) -> list[str]:
-    """Return files that may affect scenarios, exempting an exact version bump."""
+    """Exclude synchronized version metadata, even in a mixed release batch.
 
-    if set(files) != VERSION_MANIFEST_FILES:
+    Only the manifest sub-diff may qualify; every other changed file retains
+    its scenario impact. Configuration/dependency edits still fail closed.
+    """
+
+    manifests = [path for path in files if path in VERSION_MANIFEST_FILES]
+    if set(manifests) != VERSION_MANIFEST_FILES:
         return files
     result = subprocess.run(
         [
@@ -170,7 +175,9 @@ def scenario_impact_files(repo_root: Path, base_ref: str, files: list[str]) -> l
     )
     if result.returncode != 0:
         return files
-    return [] if _is_version_manifest_only_patch(files, result.stdout) else files
+    if not _is_version_manifest_only_patch(manifests, result.stdout):
+        return files
+    return [path for path in files if path not in VERSION_MANIFEST_FILES]
 
 
 SCENARIO_MAPPINGS_PATH = "docs/testing/scenario-mappings.json"
