@@ -4590,6 +4590,8 @@ pub(crate) fn thin_resume_message(
     summary: &str,
 ) -> crate::storage::Message {
     crate::storage::Message {
+        seq: None,
+        revision: 1,
         id: format!("thin-resume:{key}"),
         session_id: session_id.to_string(),
         role: "user".into(),
@@ -4739,6 +4741,8 @@ async fn resume_chat_objective_inner(
         objective.failure_code.as_deref(),
     ) {
         history.push(crate::storage::Message {
+            seq: None,
+            revision: 1,
             id: format!("system-continuation:{}:{}", objective.id, objective.revision),
             session_id: session_id.clone(),
             role: "system".into(),
@@ -4973,6 +4977,8 @@ fn anon_message(session_id: &str, role: String, content: String) -> crate::stora
     // Dummy id / timestamps: these Messages only feed the model this run and
     // are never written to the DB.
     crate::storage::Message {
+        seq: None,
+        revision: 1,
         id: Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
         role,

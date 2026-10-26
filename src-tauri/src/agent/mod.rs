@@ -31,6 +31,7 @@ pub mod hooks;
 pub(crate) mod internal_text;
 pub mod journal;
 mod lifecycle_hooks;
+pub mod memory_manifest;
 pub mod model_transport;
 pub mod failure_summary;
 pub mod objective;
@@ -1438,7 +1439,13 @@ impl AgentLoop {
             .rev()
             .find(|message| message.role == "user" && message.completion_state.is_none())
             .map(|message| message.id.clone());
-        let messages = Self::build_openai_messages(history, system_prompt);
+        let messages = memory_manifest::assemble_for_request(
+            &self.db,
+            &self.session_id,
+            history,
+            system_prompt,
+        )
+        .await;
         let inputs = codefactory_agent_loop::run::LoopInputs {
             messages,
             system_prompt: system_prompt.to_string(),
@@ -1760,92 +1767,9 @@ impl AgentLoop {
         history: Vec<Message>,
         system_prompt: &str,
     ) -> Vec<ChatMessage> {
-        // β (2026-09-28): a wording-level constraint reaches the model as an
-        // INSTRUCTION here — the same place the turn's context is assembled — and
-        // only when the turn actually carries one. It never touches capability.
-        let turn_constraint = history
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .and_then(|message| constraint_instruction_block(&message.content));
-        let system_text = match turn_constraint {
-            Some(block) => format!("{system_prompt}\n\n{block}"),
-            None => system_prompt.to_string(),
-        };
-        let mut msgs = vec![ChatMessage {
-            role: "system".into(),
-            content: MessageContent::Text(system_text),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-            reasoning_content: None,
-        }];
-        let repaired_history = repair_incomplete_tool_history(replayable_history(history));
-        let replayed_command_repair = replayed_command_repair_prompt(&repaired_history);
-        for m in repaired_history {
-            match m.role.as_str() {
-                "tool" => {
-                    // Content stored as: {"tool_call_id": "…", "content": "…"}
-                    let (tool_call_id, content) = parse_tool_message_content(&m.content);
-                    msgs.push(ChatMessage {
-                        role: "tool".into(),
-                        content: MessageContent::Text(content),
-                        tool_calls: None,
-                        tool_call_id: Some(tool_call_id),
-                        name: None,
-                        reasoning_content: None,
-                    });
-                }
-                "assistant" => {
-                    // Restore tool_calls if they were persisted as JSON
-                    let tool_calls: Option<Vec<ToolCall>> = m
-                        .tool_calls
-                        .as_deref()
-                        .and_then(|s| serde_json::from_str(s).ok());
-                    msgs.push(ChatMessage {
-                        role: "assistant".into(),
-                        content: MessageContent::Text(m.content),
-                        tool_calls,
-                        tool_call_id: None,
-                        name: None,
-                        // Replay reasoning_content verbatim so DeepSeek reasoner
-                        // models don't 400 on the next turn.
-                        reasoning_content: m.reasoning_content,
-                    });
-                }
-                _ => {
-                    // Convert markdown file:// image links → vision content
-                    // parts when present, leaving plain text untouched.
-                    // Missing files / unsupported types fall back to text
-                    // silently (see attachments::extract_openai_parts).
-                    let parts = attachments::extract_openai_parts(&m.content);
-                    let content = if parts.is_empty() {
-                        MessageContent::Text(m.content)
-                    } else {
-                        MessageContent::Parts(parts)
-                    };
-                    msgs.push(ChatMessage {
-                        role: m.role,
-                        content,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                        reasoning_content: None,
-                    });
-                }
-            }
-        }
-        if let Some(prompt) = replayed_command_repair {
-            msgs.push(ChatMessage {
-                role: "user".into(),
-                content: MessageContent::Text(prompt),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                reasoning_content: None,
-            });
-        }
-        msgs
+        // 唯一的装配实现在 `memory_manifest::assemble_with_provenance`：装配与来源
+        // 回执出自同一次执行，这里只丢掉回执（阶段 A 不做投影）。
+        memory_manifest::assemble_with_provenance(history, system_prompt).0
     }
 
     // ── Anthropic-specific helpers ────────────────────────────────────────────
@@ -2559,6 +2483,8 @@ async fn persist_cancelled_tool_batch(
 fn repair_incomplete_tool_history(history: Vec<Message>) -> Vec<Message> {
     fn synthetic_tool_message(session_id: &str, tool_call_id: &str, created_at: i64) -> Message {
         Message {
+            seq: None,
+            revision: 1,
             id: format!("recovered-tool-{tool_call_id}"),
             session_id: session_id.to_owned(),
             role: "tool".into(),
@@ -4181,6 +4107,8 @@ mod tests {
 
     fn stored_message(role: &str, content: &str, tool_calls: Option<String>) -> Message {
         Message {
+            seq: None,
+            revision: 1,
             id: Uuid::new_v4().to_string(),
             session_id: "session-1".into(),
             role: role.into(),

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 pub mod db;
+pub mod message_sequence;
 pub mod tasks;
 pub mod write_lock;
 
@@ -90,6 +91,23 @@ pub struct Message {
     /// rebuilds provider history. NULL for ordinary messages.
     pub completion_state: Option<String>,
     pub created_at: i64,
+    /// Stable per-session ordering identity (MEM-A). Backfilled by
+    /// `0025_message_sequence.sql` from `(created_at, rowid)` and assigned by an
+    /// `AFTER INSERT` trigger afterwards, so "the Nth message of this session"
+    /// survives VACUUM, identical timestamps and concurrent writers.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub seq: Option<i64>,
+    /// Content version (MEM-A). Bumped by trigger when the replayed content or
+    /// gate semantics change, so an assembly receipt can say which version of a
+    /// row it actually sent.
+    #[serde(default = "default_message_revision")]
+    #[sqlx(default)]
+    pub revision: i64,
+}
+
+fn default_message_revision() -> i64 {
+    1
 }
 
 /// Session history as the *agent* should see it, ordered oldest-first.
@@ -166,7 +184,7 @@ pub async fn load_agent_history(
              SELECT 1 FROM gate_events g \
              WHERE g.message_id = m.id AND g.kind = 'rejected_candidate' \
            ) \
-         ORDER BY m.created_at ASC, m.rowid ASC",
+         ORDER BY m.seq IS NULL, m.seq ASC, m.created_at ASC, m.rowid ASC",
     )
     .bind(session_id)
     .fetch_all(pool)
@@ -205,7 +223,8 @@ mod tests {
         sqlx::query(
             "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, \
              content TEXT, endpoint_id TEXT, model_id TEXT, input_tokens INTEGER, output_tokens INTEGER, \
-             tool_calls TEXT, reasoning_content TEXT, completion_state TEXT, created_at INTEGER)",
+             tool_calls TEXT, reasoning_content TEXT, completion_state TEXT, created_at INTEGER, \
+             seq INTEGER, revision INTEGER NOT NULL DEFAULT 1)",
         )
         .execute(&db)
         .await
