@@ -16,7 +16,9 @@ use crate::util::no_window::NoWindow;
 pub(crate) mod workspace_recovery_budget {
     use sqlx::SqlitePool;
     pub async fn ensure(pool: &SqlitePool) -> sqlx::Result<()> {
-        sqlx::query("CREATE TABLE IF NOT EXISTS workspace_recovery_budget(session_id TEXT PRIMARY KEY,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,last_error TEXT,settled_reason TEXT)").execute(pool).await?;
+        crate::storage::db::retry_write(|| async {
+            sqlx::query("CREATE TABLE IF NOT EXISTS workspace_recovery_budget(session_id TEXT PRIMARY KEY,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,last_error TEXT,settled_reason TEXT)").execute(pool).await
+        }).await?;
         Ok(())
     }
     pub async fn due(pool: &SqlitePool, session: &str, now: i64) -> sqlx::Result<bool> {
