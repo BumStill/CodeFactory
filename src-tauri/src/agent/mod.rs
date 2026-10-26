@@ -22,6 +22,7 @@ pub mod delivery_run;
 pub mod dispatch;
 pub mod events;
 pub(crate) mod execution_workspace;
+pub(crate) use execution_workspace::workspace_recovery_budget;
 mod fact_checker;
 pub mod failover;
 pub(crate) mod first_request_latency;
