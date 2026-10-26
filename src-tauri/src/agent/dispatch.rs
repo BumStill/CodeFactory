@@ -467,8 +467,25 @@ fn without_scoped_file_limits(lowercased: &str) -> String {
         })
 }
 
+/// M175: pasted specifications, templates and logs are context, not the user's
+/// action directive. Use the first instruction paragraph; quoted/fenced/heading
+/// blocks end that paragraph even when the paste omitted a blank separator.
+fn instruction_paragraph(message: &str) -> &str {
+    let message = message.trim();
+    let mut end = 0;
+    for line in message.split_inclusive('\n') {
+        let text = line.trim();
+        if text.is_empty() || text.starts_with('>') || text.starts_with("```")
+            || text.starts_with('#') {
+            break;
+        }
+        end += line.len();
+    }
+    message[..end].trim()
+}
+
 fn has_hard_read_only_directive(user_msg: &str) -> bool {
-    let text = without_scoped_file_limits(&user_msg.to_ascii_lowercase());
+    let text = without_scoped_file_limits(&instruction_paragraph(user_msg).to_ascii_lowercase());
     // Conditional constraints govern their branch, not the entire turn.
     let text = text.split([ '。', '；', ';' ]).filter(|clause| {
         let clause = clause.trim_start();
@@ -968,16 +985,27 @@ pub fn resolve_turn_delivery_authorization(
     intent: TurnIntent,
     persisted: bool,
 ) -> (ChatContract, DeliveryAuthorizationUpdate) {
-    let mut contract = decide_chat_contract_with_intent(prev_assistant, user_msg, intent);
-    // R1: text can lower authority, never enable session delivery.
-    let revoked = is_delivery_revocation(user_msg);
-    contract.capability = if contract.grants.explicit_read_only {
-        TurnCapability::ReviewOnly
-    } else if persisted && !revoked {
-        TurnCapability::Deliver
+    let instruction = instruction_paragraph(user_msg);
+    let mut contract = decide_chat_contract_with_intent(prev_assistant, instruction, intent);
+    // M175 R1/R3: a structured session grant outranks wording inference, but
+    // never an explicitly structured review-only subagent boundary.
+    let revoked = is_delivery_revocation(instruction);
+    if persisted && !revoked && !intent.structured_read_only {
+        if contract.grants.explicit_read_only {
+            tracing::info!(
+                kind = "authorized_delivery_posture_conflict",
+                resolution = "structured_delivery_authorization_wins",
+                "M175: wording inferred read-only; keeping authorized implementation"
+            );
+        }
+        contract.mode = AgentMode::Execute;
+        contract.capability = TurnCapability::Deliver;
+        contract.grants.explicit_read_only = false;
+    } else if contract.grants.explicit_read_only {
+        contract.capability = TurnCapability::ReviewOnly;
     } else {
-        TurnCapability::Implement
-    };
+        contract.capability = TurnCapability::Implement;
+    }
     (contract, if revoked { DeliveryAuthorizationUpdate::Revoked } else { DeliveryAuthorizationUpdate::Unchanged })
 }
 
@@ -1125,6 +1153,7 @@ pub fn decide_chat_contract_with_intent(
     user_msg: &str,
     intent: TurnIntent,
 ) -> ChatContract {
+    let user_msg = instruction_paragraph(user_msg);
     let read_only = intent.structured_read_only || has_hard_read_only_directive(user_msg);
     let grants = TurnGrants {
         browser_read: grants_browser_read(user_msg),
@@ -1211,6 +1240,33 @@ pub fn decide_chat_mode(prev_assistant: Option<&str>, user_msg: &str) -> AgentMo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m175_authorized_inline_template_cannot_remove_write_authority() {
+        let message = "开始实施：修复合成任务，授权交付（ceiling: merged）。\n\n# 合成规格\n只读审查一下，不要修改代码；only review, do not implement.\n\n# 合成模板\n不要推送；规划角色只分析。";
+        for instruction in [message, "只读审查一下，不要修改代码"] {
+            let (contract, update) = resolve_turn_delivery_authorization(None, instruction, TurnIntent::default(), true);
+            assert_eq!(contract.mode, AgentMode::Execute);
+            assert_eq!(contract.capability, TurnCapability::Deliver);
+            assert!(!contract.grants.explicit_read_only);
+            assert_eq!(update, DeliveryAuthorizationUpdate::Unchanged);
+        }
+        let (review, _) = resolve_turn_delivery_authorization(None, "只读审查一下", TurnIntent::default(), false);
+        assert_eq!(review.capability, TurnCapability::ReviewOnly);
+        let (structured, _) = resolve_turn_delivery_authorization(None, message, TurnIntent { structured_read_only: true }, true);
+        assert_eq!(structured.capability, TurnCapability::ReviewOnly);
+    }
+
+    #[test]
+    fn m175_only_the_first_instruction_paragraph_selects_posture() {
+        let message = "修复合成问题。\n\n> 不要修改代码\n```text\nonly review\n```";
+        let contract = decide_chat_contract(None, message);
+        assert_eq!(contract.mode, AgentMode::Execute);
+        assert_eq!(contract.capability, TurnCapability::Implement);
+        let (revoked, update) = resolve_turn_delivery_authorization(None, "不要推送，修复后只在本地验证。", TurnIntent::default(), true);
+        assert_eq!(revoked.capability, TurnCapability::Implement);
+        assert_eq!(update, DeliveryAuthorizationUpdate::Revoked);
+    }
 
     #[test]
     fn browser_read_grant_comes_only_from_the_current_user_message() {
