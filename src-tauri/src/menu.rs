@@ -299,15 +299,11 @@ pub fn handle_menu_event(app: &AppHandle<Wry>, menu_id: &str) {
         let resolved = app
             .try_state::<SessionMenuStateHandle>()
             .and_then(|handle| {
-                handle
-                    .0
-                    .lock()
-                    .ok()
-                    .and_then(|guard| {
-                        guard
-                            .as_ref()
-                            .and_then(|handles| handles.switch_sessions.get(index).cloned().flatten())
-                    })
+                handle.0.lock().ok().and_then(|guard| {
+                    guard
+                        .as_ref()
+                        .and_then(|handles| handles.switch_sessions.get(index).cloned().flatten())
+                })
             });
         match resolved {
             Some(session_id) => event.session_id = Some(session_id),
@@ -356,7 +352,10 @@ pub fn sync_session_menu(
     handle: tauri::State<'_, SessionMenuStateHandle>,
     state: SessionMenuState,
 ) -> Result<(), String> {
-    let mut guard = handle.0.lock().map_err(|_| "menu state poisoned".to_string())?;
+    let mut guard = handle
+        .0
+        .lock()
+        .map_err(|_| "menu state poisoned".to_string())?;
     let Some(handles) = guard.as_mut() else {
         // 菜单还没装好(极早期),静默接受:下一次同步会补上。
         return Ok(());
@@ -471,11 +470,19 @@ mod tests {
         assert_eq!(slots.len(), SWITCH_SLOTS);
         assert_eq!(
             slots[0],
-            Some(("aaaaaaaa-1".to_string(), "新会话(9537257c,5 分钟前)".to_string(), false))
+            Some((
+                "aaaaaaaa-1".to_string(),
+                "新会话(9537257c,5 分钟前)".to_string(),
+                false
+            ))
         );
         assert_eq!(
             slots[1],
-            Some(("bbbbbbbb-2".to_string(), "修复菜单(11112222,2 小时前)".to_string(), true))
+            Some((
+                "bbbbbbbb-2".to_string(),
+                "修复菜单(11112222,2 小时前)".to_string(),
+                true
+            ))
         );
         // 超出列表长度的槽位必须是空的 —— 菜单里不能留下上次的僵尸会话。
         assert!(slots.iter().skip(2).all(|slot| slot.is_none()));

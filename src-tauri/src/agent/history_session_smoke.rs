@@ -443,7 +443,11 @@ async fn sweep_abandoned_after_restart(pool: &SqlitePool) -> anyhow::Result<()> 
     let claims = store
         .claim_due_remediation_batch("history-abandoned-probe", 8, 30_000)
         .await?;
-    if claims.claims.iter().any(|claim| claim.objective.id == stalled) {
+    if claims
+        .claims
+        .iter()
+        .any(|claim| claim.objective.id == stalled)
+    {
         bail!("fixture is wrong: the stalled Objective was already claimable");
     }
 
@@ -825,9 +829,18 @@ async fn ensure_thin_session(
 async fn seed_liveness_sessions(pool: &SqlitePool) -> anyhow::Result<()> {
     let now = Utc::now().timestamp_millis();
     let stale = now - LIVENESS_STALE_AGE_MS;
-    ensure_thin_session(pool, LIVENESS_MIDTURN_SESSION, "Liveness mid-turn restart smoke").await?;
-    ensure_thin_session(pool, LIVENESS_STREAMING_SESSION, "Liveness streaming restart smoke")
-        .await?;
+    ensure_thin_session(
+        pool,
+        LIVENESS_MIDTURN_SESSION,
+        "Liveness mid-turn restart smoke",
+    )
+    .await?;
+    ensure_thin_session(
+        pool,
+        LIVENESS_STREAMING_SESSION,
+        "Liveness streaming restart smoke",
+    )
+    .await?;
     // 第二种真实现场：模型流式阶段被打断——用户消息在，回合未结算，
     // 上一进程留下 live 控制行，但还没有任何工具调用可结算。
     sqlx::query(
@@ -978,7 +991,8 @@ async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> 
     }
 
     for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
-        let retired = super::objective_diagnostics::retire_orphan_run_controls(pool, session).await?;
+        let retired =
+            super::objective_diagnostics::retire_orphan_run_controls(pool, session).await?;
         if retired != 1 {
             bail!(
                 "M157: expected exactly one phantom run control to be retired for {session}, \
@@ -1011,19 +1025,20 @@ async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> 
     if still_pending != 0 {
         bail!("M157: {still_pending} tool call(s) stayed pending across the restart");
     }
-    let note: Option<String> =
-        sqlx::query_scalar("SELECT error FROM tool_calls WHERE id=?").bind(LIVENESS_TOOL).fetch_one(pool).await?;
+    let note: Option<String> = sqlx::query_scalar("SELECT error FROM tool_calls WHERE id=?")
+        .bind(LIVENESS_TOOL)
+        .fetch_one(pool)
+        .await?;
     match note.as_deref().map(str::trim) {
         Some(text) if !text.is_empty() => {}
         _ => bail!("M157: the interrupted tool call carries no 「结果未知」note"),
     }
 
-    let user_messages: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'",
-    )
-    .bind(LIVENESS_MIDTURN_SESSION)
-    .fetch_one(pool)
-    .await?;
+    let user_messages: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'")
+            .bind(LIVENESS_MIDTURN_SESSION)
+            .fetch_one(pool)
+            .await?;
     if user_messages != 1 {
         bail!("M157: the restart changed the user's message count to {user_messages}");
     }
@@ -1069,11 +1084,15 @@ async fn verify_liveness_second_restart(pool: &SqlitePool) -> anyhow::Result<()>
         |_| false,
     )
     .await?;
-    if heartbeat.iter().any(|candidate| candidate == LIVENESS_MIDTURN_SESSION) {
+    if heartbeat
+        .iter()
+        .any(|candidate| candidate == LIVENESS_MIDTURN_SESSION)
+    {
         bail!("M157: the just-retired session is re-selected inside the grace window (hot loop)");
     }
     for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
-        let retired = super::objective_diagnostics::retire_orphan_run_controls(pool, session).await?;
+        let retired =
+            super::objective_diagnostics::retire_orphan_run_controls(pool, session).await?;
         if retired != 0 {
             bail!(
                 "M157: run control retirement is not idempotent for {session}, \
@@ -1084,7 +1103,9 @@ async fn verify_liveness_second_restart(pool: &SqlitePool) -> anyhow::Result<()>
     let marked =
         super::thin_restart::mark_interrupted_tool_calls(pool, LIVENESS_MIDTURN_SESSION).await?;
     if marked != 0 {
-        bail!("M157: tool interruption marking is not idempotent, marked={marked} on the second pass");
+        bail!(
+            "M157: tool interruption marking is not idempotent, marked={marked} on the second pass"
+        );
     }
     for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
         let user_messages: i64 =
@@ -1093,7 +1114,9 @@ async fn verify_liveness_second_restart(pool: &SqlitePool) -> anyhow::Result<()>
                 .fetch_one(pool)
                 .await?;
         if user_messages != 1 {
-            bail!("M157: {session} ended up with {user_messages} user message(s) after two restarts");
+            bail!(
+                "M157: {session} ended up with {user_messages} user message(s) after two restarts"
+            );
         }
         let live = live_run_control_count(pool, session).await?;
         if live != 0 {
@@ -1367,4 +1390,3 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         Err(error) => Err(error),
     }
 }
-

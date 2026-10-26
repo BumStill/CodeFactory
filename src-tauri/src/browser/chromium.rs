@@ -452,7 +452,10 @@ async fn wait_for_document_settled(page: &Page, requested: &str) -> Result<()> {
             Ok(Ok(current)) => last = format!("url={}", current.unwrap_or_default()),
             Ok(Err(error)) => last = format!("url probe failed: {error}"),
             Err(_) => {
-                last = format!("url probe silent for {}ms", PAGE_SETTLE_PROBE_TIMEOUT.as_millis())
+                last = format!(
+                    "url probe silent for {}ms",
+                    PAGE_SETTLE_PROBE_TIMEOUT.as_millis()
+                )
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -602,32 +605,49 @@ impl BrowserDriver for ChromiumDriver {
             // cancellation at any await drops the owner before the profile.
             drop(config);
             let plan = super::macos_spawn::LaunchPlan::managed(
-                &user_data_dir, debugging_port, headless_requested(),
+                &user_data_dir,
+                debugging_port,
+                headless_requested(),
             );
             debug_assert!(plan.disclaim);
-            process = Some(super::macos_spawn::spawn(&executable, &plan.args)
-                .map_err(|error| error.to_string())?);
-            let client = reqwest::Client::builder().no_proxy().build()
+            process = Some(
+                super::macos_spawn::spawn(&executable, &plan.args)
+                    .map_err(|error| error.to_string())?,
+            );
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .build()
                 .map_err(|error| error.to_string())?;
             let connected = tokio::time::timeout(LAUNCH_TIMEOUT, async {
                 loop {
                     // Use our existing reqwest 0.12 client for loopback discovery;
                     // chromiumoxide's 0.13 HTTP connector requires a TLS provider
                     // even for HTTP. Direct ws:// connect has no TLS dependency.
-                    if let Ok(response) = client.get(format!("{reconnect_endpoint}/json/version")).send().await {
+                    if let Ok(response) = client
+                        .get(format!("{reconnect_endpoint}/json/version"))
+                        .send()
+                        .await
+                    {
                         if let Ok(value) = response.json::<serde_json::Value>().await {
                             if let Some(endpoint) = value["webSocketDebuggerUrl"].as_str() {
-                                if endpoint.starts_with(&format!("ws://127.0.0.1:{debugging_port}/")) {
-                                    if let Ok(pair) = Browser::connect(endpoint.to_string()).await { break pair; }
+                                if endpoint
+                                    .starts_with(&format!("ws://127.0.0.1:{debugging_port}/"))
+                                {
+                                    if let Ok(pair) = Browser::connect(endpoint.to_string()).await {
+                                        break pair;
+                                    }
                                 }
                             }
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-            }).await.map_err(|_| "DevTools endpoint launch timed out".to_string())?;
+            })
+            .await
+            .map_err(|_| "DevTools endpoint launch timed out".to_string())?;
             Ok::<_, String>(connected)
-        }).await;
+        })
+        .await;
         let (mut browser, mut handler) = match launched {
             Ok(Ok(pair)) => pair,
             Ok(Err(error)) => {
@@ -719,7 +739,10 @@ impl BrowserDriver for ChromiumDriver {
         let navigation_error = match navigation {
             Ok(Ok(_)) => None,
             Ok(Err(error)) => Some(format!("Navigation to {url} failed: {error}")),
-            Err(_) => Some(format!("Navigation to {url} timed out after {}s", OP_TIMEOUT.as_secs())),
+            Err(_) => Some(format!(
+                "Navigation to {url} timed out after {}s",
+                OP_TIMEOUT.as_secs()
+            )),
         };
         if let Some(error) = navigation_error {
             let _ = authorizer.unknown().await;

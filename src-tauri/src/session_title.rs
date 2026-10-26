@@ -731,10 +731,7 @@ pub(crate) fn spawn_title_generation(
                     Ok(title) => (title, TITLE_SOURCE_GENERATED, None),
                     Err(rejection) => {
                         // Only the category is recorded — never the model's text.
-                        tracing::warn!(
-                            "session title generation rejected: {}",
-                            rejection.code()
-                        );
+                        tracing::warn!("session title generation rejected: {}", rejection.code());
                         (
                             safe_local_fallback(&user_message),
                             TITLE_SOURCE_FALLBACK,
@@ -904,7 +901,8 @@ mod tests {
         );
         // Whitespace-only content is still an empty visible answer.
         assert_eq!(
-            title_from_model_output("   \n\n", Some("最终标题：登录问题排查"), "完全不同").as_deref(),
+            title_from_model_output("   \n\n", Some("最终标题：登录问题排查"), "完全不同")
+                .as_deref(),
             Ok("登录问题排查")
         );
     }
@@ -912,13 +910,23 @@ mod tests {
     #[test]
     fn every_rejection_category_maps_to_its_own_code() {
         let copying_prompt = "请你先仔细阅读下面的背景信息不要马上改代码";
-        let cases: [( &str, Option<&str>, &str, &str); 6] = [
+        let cases: [(&str, Option<&str>, &str, &str); 6] = [
             ("", None, "完全不同的用户需求", "empty_output"),
             ("   \n\n", None, "完全不同的用户需求", "empty_output"),
             ("", Some("继续\nok"), "完全不同的用户需求", "reasoning_only"),
             ("继续", None, "完全不同的用户需求", "low_information"),
-            ("撤销 AKIAIOSFODNN7EXAMPLE 密钥", None, "完全不同的用户需求", "sensitive"),
-            (copying_prompt, None, "请你先仔细阅读下面的背景信息不要马上改代码。我发现标题有问题", "copies_prompt"),
+            (
+                "撤销 AKIAIOSFODNN7EXAMPLE 密钥",
+                None,
+                "完全不同的用户需求",
+                "sensitive",
+            ),
+            (
+                copying_prompt,
+                None,
+                "请你先仔细阅读下面的背景信息不要马上改代码。我发现标题有问题",
+                "copies_prompt",
+            ),
         ];
         for (content, reasoning, prompt, expected) in cases {
             let rejection = title_from_model_output(content, reasoning, prompt)
@@ -966,12 +974,11 @@ mod tests {
             )
             .await;
         }
-        let stored: Vec<String> = sqlx::query_scalar(
-            "SELECT failure_code FROM session_title_attempts ORDER BY id",
-        )
-        .fetch_all(&db)
-        .await
-        .unwrap();
+        let stored: Vec<String> =
+            sqlx::query_scalar("SELECT failure_code FROM session_title_attempts ORDER BY id")
+                .fetch_all(&db)
+                .await
+                .unwrap();
         assert_eq!(
             stored,
             vec![
@@ -989,8 +996,12 @@ mod tests {
         assert!(is_transient_title_failure("PROVIDER_ERROR: overloaded"));
         assert!(is_transient_title_failure("SESSION_TITLE_TIMEOUT"));
         assert!(is_transient_title_failure("database is locked"));
-        assert!(!is_transient_title_failure("AUTH_MISSING: custom has no configured credential"));
-        assert!(!is_transient_title_failure("CREDENTIAL_ACCESS_REQUIRED: custom (Unavailable)"));
+        assert!(!is_transient_title_failure(
+            "AUTH_MISSING: custom has no configured credential"
+        ));
+        assert!(!is_transient_title_failure(
+            "CREDENTIAL_ACCESS_REQUIRED: custom (Unavailable)"
+        ));
     }
 
     #[test]
@@ -1053,8 +1064,15 @@ mod tests {
 
     #[test]
     fn provisional_titles_preserve_distinct_redacted_first_message_topics() {
-        let prompts = ["修复支付回调测试失败", "修复搜索分页测试失败", "整理桌面快捷键文档"];
-        let titles: Vec<String> = prompts.iter().map(|prompt| safe_local_fallback(prompt)).collect();
+        let prompts = [
+            "修复支付回调测试失败",
+            "修复搜索分页测试失败",
+            "整理桌面快捷键文档",
+        ];
+        let titles: Vec<String> = prompts
+            .iter()
+            .map(|prompt| safe_local_fallback(prompt))
+            .collect();
         for (prompt, title) in prompts.iter().zip(&titles) {
             assert_eq!(title, prompt);
             assert!(title.graphemes(true).count() <= MAX_TITLE_CHARS);
@@ -1063,12 +1081,20 @@ mod tests {
         let private = safe_local_fallback("修复支付回调 token=super-secret");
         assert!(private.contains("支付回调"));
         assert!(!private.contains("super-secret"));
-        assert!(safe_local_fallback(&"验证中文分页边界".repeat(20)).graphemes(true).count() <= MAX_TITLE_CHARS);
+        assert!(
+            safe_local_fallback(&"验证中文分页边界".repeat(20))
+                .graphemes(true)
+                .count()
+                <= MAX_TITLE_CHARS
+        );
     }
 
     #[test]
     fn fallback_preserves_topic_without_sensitive_metadata() {
-        assert_eq!(safe_local_fallback("新建 session 的名字，需要自动总结"), "新建 session 的名字，需要自动总结");
+        assert_eq!(
+            safe_local_fallback("新建 session 的名字，需要自动总结"),
+            "新建 session 的名字，需要自动总结"
+        );
         let title = safe_local_fallback("登录失败 token=super-secret");
         assert!(title.contains("登录失败"));
         assert!(!title.contains("super-secret"));
@@ -1229,12 +1255,16 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(compare_and_set_title(&db, "fallback", "登录问题修复", "generated")
-            .await
-            .unwrap());
-        assert!(!compare_and_set_title(&db, "manual", "迟到标题", "generated")
-            .await
-            .unwrap());
+        assert!(
+            compare_and_set_title(&db, "fallback", "登录问题修复", "generated")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !compare_and_set_title(&db, "manual", "迟到标题", "generated")
+                .await
+                .unwrap()
+        );
         let title: String = sqlx::query_scalar("SELECT title FROM sessions WHERE id='fallback'")
             .fetch_one(&db)
             .await
@@ -1338,7 +1368,9 @@ mod tests {
                 let fallback = safe_local_fallback(&prompt);
                 if session_id == "s5" {
                     // A hand-renamed title is never overwritten automatically.
-                    assert!(!session_title_is_replaceable(&db, &session_id).await.unwrap());
+                    assert!(!session_title_is_replaceable(&db, &session_id)
+                        .await
+                        .unwrap());
                     assert!(!compare_and_set_title(
                         &db,
                         &session_id,
@@ -1349,16 +1381,15 @@ mod tests {
                     .unwrap());
                     return;
                 }
-                assert!(compare_and_set_title(
-                    &db,
-                    &session_id,
-                    &fallback,
-                    TITLE_SOURCE_FALLBACK
-                )
-                .await
-                .unwrap());
+                assert!(
+                    compare_and_set_title(&db, &session_id, &fallback, TITLE_SOURCE_FALLBACK)
+                        .await
+                        .unwrap()
+                );
                 // The naming job settles later and may replace the fallback.
-                assert!(session_title_is_replaceable(&db, &session_id).await.unwrap());
+                assert!(session_title_is_replaceable(&db, &session_id)
+                    .await
+                    .unwrap());
                 let generated = format!("模块{index}登录修复");
                 assert!(compare_and_set_title(
                     &db,

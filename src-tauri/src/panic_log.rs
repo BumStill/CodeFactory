@@ -135,9 +135,17 @@ mod tests {
             dir.path(),
             "time: t\nversion: 9.9.9\nthread: tokio-rt-worker\nlocation: src/x.rs:12:5\nmessage: boom\n",
         );
-        let written = std::fs::read_dir(dir.path()).unwrap().next().unwrap().unwrap();
+        let written = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
         let body = std::fs::read_to_string(written.path()).unwrap();
-        for field in ["thread: tokio-rt-worker", "location: src/x.rs:12:5", "message: boom"] {
+        for field in [
+            "thread: tokio-rt-worker",
+            "location: src/x.rs:12:5",
+            "message: boom",
+        ] {
             assert!(body.contains(field), "missing {field:?} in:\n{body}");
         }
     }

@@ -109,8 +109,13 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         }
     }
     for field in ["title", "body", "expect_branch"] {
-        if args.get(field).is_some_and(|value| !value.is_null() && !value.is_string()) {
-            return Ok(ToolOutput::err(format!("参数 {field} 必须是字符串，请修正后重试。")));
+        if args
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Ok(ToolOutput::err(format!(
+                "参数 {field} 必须是字符串，请修正后重试。"
+            )));
         }
     }
     let Some(settings) = ctx.settings.clone() else {
@@ -135,8 +140,7 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     // M116-R3: a request above that authorization is refused here, before any
     // side effect, instead of being silently clamped or reported as an identity
     // collision of the caller's own delivery.
-    let session_ceiling =
-        load_session_delivery_ceiling(ctx).await;
+    let session_ceiling = load_session_delivery_ceiling(ctx).await;
     if let Some(refusal) = ceiling_request_refusal(
         settings.delivery_ceiling,
         session_ceiling,
@@ -197,13 +201,7 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             ));
         }
         let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
-        let outcome = delivery::deliver_release_only(
-            &ctx.cwd,
-            &opts,
-            remote.as_ref(),
-            None,
-        )
-        .await;
+        let outcome = delivery::deliver_release_only(&ctx.cwd, &opts, remote.as_ref(), None).await;
         return Ok(tool_output_for_outcome(&outcome));
     }
 
@@ -212,7 +210,13 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             // Thin tasks finish the session-authorized delivery, even when a
             // model accidentally asks to stop at an earlier checkpoint.
             let ceiling = settings.delivery_ceiling;
-            return super::delivery_thin::execute(&args, ctx, ceiling, &settings.delivery_exclude_globs).await;
+            return super::delivery_thin::execute(
+                &args,
+                ctx,
+                ceiling,
+                &settings.delivery_exclude_globs,
+            )
+            .await;
         }
     }
 
@@ -255,10 +259,13 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         Err(error) => return Err(error),
     };
     let ceiling_note = if let (Some(db), Some(run)) = (ctx.db.as_ref(), durable.as_ref()) {
-        let (effective, note) = resume_ceiling(db, &run.id, settings.delivery_ceiling, requested_ceiling).await?;
+        let (effective, note) =
+            resume_ceiling(db, &run.id, settings.delivery_ceiling, requested_ceiling).await?;
         opts.requested_ceiling = Some(effective);
         note
-    } else { None };
+    } else {
+        None
+    };
     if opts.expect_branch.is_none() {
         opts.expect_branch = durable.as_ref().map(|run| run.head_branch.clone());
     }
@@ -276,54 +283,65 @@ async fn execute_inner(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         ));
     }
 
-    let mut lease_guard = durable.as_ref().and_then(|run| ctx.db.as_ref().map(|db| DeliveryLeaseGuard {
-        db: db.clone(), id: run.id.clone(), process: run.process.clone(), epoch: run.claim_epoch, released: false,
-    }));
+    let mut lease_guard = durable.as_ref().and_then(|run| {
+        ctx.db.as_ref().map(|db| DeliveryLeaseGuard {
+            db: db.clone(),
+            id: run.id.clone(),
+            process: run.process.clone(),
+            epoch: run.claim_epoch,
+            released: false,
+        })
+    });
     let result = async {
-    let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
-    if let (Some(db), Some(run)) = (ctx.db.as_ref(), durable.as_ref()) {
-        // A foreground re-admission advances the epoch just like a startup
-        // takeover. It must reconcile before the first mutation too.
-        await_delivery_with_lease_heartbeat(db, run,
-            reconcile_foreground_claim(db, run, remote.as_ref())).await??;
-    }
-
-    loop {
-        let delivery_future = delivery::deliver(
-            &ctx.cwd,
-            settings.delivery_ceiling,
-            settings.delivery_merge_method,
-            settings.delivery_ci_timeout_secs,
-            &opts,
-            remote.as_ref(),
-            None,
-        );
-        let outcome = if let (Some(db), Some(durable)) = (ctx.db.as_ref(), durable.as_ref()) {
-            await_delivery_with_lease_heartbeat(db, durable, delivery_future).await?
-        } else {
-            delivery_future.await
-        };
-
-        if let (Some(db), Some(session_id)) = (ctx.db.as_ref(), ctx.session_id.as_deref()) {
-            persist_delivery_ref(db, session_id, &outcome).await?;
-        }
-        if let (Some(db), Some(durable)) = (ctx.db.as_ref(), durable.as_mut()) {
-            persist_durable_outcome(db, durable, &outcome).await?;
-            opts.expected_identity = Some(durable.identity_snapshot());
+        let remote = delivery::resolve_delivery_remote(&ctx.cwd, &settings);
+        if let (Some(db), Some(run)) = (ctx.db.as_ref(), durable.as_ref()) {
+            // A foreground re-admission advances the epoch just like a startup
+            // takeover. It must reconcile before the first mutation too.
+            await_delivery_with_lease_heartbeat(
+                db,
+                run,
+                reconcile_foreground_claim(db, run, remote.as_ref()),
+            )
+            .await??;
         }
 
-        if outcome.validate_contract().is_err() {
+        loop {
+            let delivery_future = delivery::deliver(
+                &ctx.cwd,
+                settings.delivery_ceiling,
+                settings.delivery_merge_method,
+                settings.delivery_ci_timeout_secs,
+                &opts,
+                remote.as_ref(),
+                None,
+            );
+            let outcome = if let (Some(db), Some(durable)) = (ctx.db.as_ref(), durable.as_ref()) {
+                await_delivery_with_lease_heartbeat(db, durable, delivery_future).await?
+            } else {
+                delivery_future.await
+            };
+
+            if let (Some(db), Some(session_id)) = (ctx.db.as_ref(), ctx.session_id.as_deref()) {
+                persist_delivery_ref(db, session_id, &outcome).await?;
+            }
+            if let (Some(db), Some(durable)) = (ctx.db.as_ref(), durable.as_mut()) {
+                persist_durable_outcome(db, durable, &outcome).await?;
+                opts.expected_identity = Some(durable.identity_snapshot());
+            }
+
+            if outcome.validate_contract().is_err() {
+                return Ok(tool_output_for_outcome(&outcome));
+            }
+
+            if outcome.final_state != "waiting" {
+                return Ok(tool_output_for_outcome(&outcome));
+            }
+
+            // Waiting is a durable handoff, not an in-flight mutation lease.
             return Ok(tool_output_for_outcome(&outcome));
         }
-
-        if outcome.final_state != "waiting" {
-            return Ok(tool_output_for_outcome(&outcome));
-        }
-
-        // Waiting is a durable handoff, not an in-flight mutation lease.
-        return Ok(tool_output_for_outcome(&outcome));
     }
-    }.await;
+    .await;
     if let Some(guard) = lease_guard.as_mut() {
         guard.release("invocation_return").await?;
     }
@@ -345,8 +363,15 @@ struct DeliveryLeaseGuard {
 
 impl DeliveryLeaseGuard {
     async fn release(&mut self, reason: &str) -> Result<()> {
-        delivery_run::release_delivery_lease(&self.db, &self.id, &self.process, self.epoch,
-            chrono::Utc::now().timestamp_millis(), reason).await?;
+        delivery_run::release_delivery_lease(
+            &self.db,
+            &self.id,
+            &self.process,
+            self.epoch,
+            chrono::Utc::now().timestamp_millis(),
+            reason,
+        )
+        .await?;
         self.released = true;
         Ok(())
     }
@@ -354,7 +379,9 @@ impl DeliveryLeaseGuard {
 
 impl Drop for DeliveryLeaseGuard {
     fn drop(&mut self) {
-        if self.released { return; }
+        if self.released {
+            return;
+        }
         let db = self.db.clone();
         let id = self.id.clone();
         let process = self.process.clone();
@@ -487,7 +514,10 @@ fn active_delivery_lease_output(
     // evidence that the mutation holder is stalled. Never steal its lease.
     if holder.canonical_pr_number.is_some()
         && matches!(holder.status.as_deref(), Some("waiting" | "running"))
-        && matches!(holder.stage.as_deref(), Some("ci" | "ci_observation" | "merge" | "merge_queue"))
+        && matches!(
+            holder.stage.as_deref(),
+            Some("ci" | "ci_observation" | "merge" | "merge_queue")
+        )
     {
         return ToolOutput::waiting(format!(
             "已附着当前交付 PR #{}；阶段 {}，状态 {}。系统继续观察，无需编排方解锁。",
@@ -1094,40 +1124,95 @@ async fn reconcile_foreground_claim<R: delivery::DeliveryRemote>(
     remote: Option<&R>,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
-    if delivery_run::verify_delivery_mutation_permit(db, &run.id, &run.process, run.claim_epoch, now).await? {
+    if delivery_run::verify_delivery_mutation_permit(
+        db,
+        &run.id,
+        &run.process,
+        run.claim_epoch,
+        now,
+    )
+    .await?
+    {
         return Ok(());
     }
-    let row = sqlx::query("SELECT * FROM delivery_runs WHERE id=? AND lease_owner=? AND claim_epoch=?")
-        .bind(&run.id).bind(&run.process.instance_id).bind(run.claim_epoch)
-        .fetch_one(db).await?;
+    let row =
+        sqlx::query("SELECT * FROM delivery_runs WHERE id=? AND lease_owner=? AND claim_epoch=?")
+            .bind(&run.id)
+            .bind(&run.process.instance_id)
+            .bind(run.claim_epoch)
+            .fetch_one(db)
+            .await?;
     let claimed = delivery_run::ClaimedRecovery {
-        run_id: run.id.clone(), claim_epoch: run.claim_epoch,
+        run_id: run.id.clone(),
+        claim_epoch: run.claim_epoch,
         objective_id: run.objective_id.clone(),
         workspace_path: run.workspace_path.to_string_lossy().into_owned(),
-        worktree_identity: run.worktree_identity.clone(), repo_identity: run.repo_identity.clone(),
-        base_branch: row.try_get("base_branch")?, head_branch: run.head_branch.clone(),
-        change_set_digest: run.change_set_digest.clone(), expected_head_sha: run.expected_head_sha.clone(),
-        requested_ceiling: row.try_get("requested_ceiling")?, autonomous_completion: row.try_get::<i64,_>("autonomous_completion")? != 0,
-        canonical_pr_number: row.try_get("canonical_pr_number")?, canonical_pr_url: row.try_get("canonical_pr_url")?,
-        canonical_head_sha: row.try_get("canonical_head_sha")?, pr_title_intent: row.try_get("pr_title_intent")?, pr_body_intent: row.try_get("pr_body_intent")?,
-        reached_ceiling: row.try_get("reached_ceiling")?, stage: row.try_get("stage")?, status: row.try_get("status")?,
-        wait_class: row.try_get("wait_class")?, next_action: row.try_get("next_action")?,
-        next_action_authorized: row.try_get::<i64,_>("next_action_authorized")? != 0,
-        failure_signature: row.try_get("failure_signature")?, stage_attempt: row.try_get("stage_attempt")?, progress_revision: row.try_get("progress_revision")?,
+        worktree_identity: run.worktree_identity.clone(),
+        repo_identity: run.repo_identity.clone(),
+        base_branch: row.try_get("base_branch")?,
+        head_branch: run.head_branch.clone(),
+        change_set_digest: run.change_set_digest.clone(),
+        expected_head_sha: run.expected_head_sha.clone(),
+        requested_ceiling: row.try_get("requested_ceiling")?,
+        autonomous_completion: row.try_get::<i64, _>("autonomous_completion")? != 0,
+        canonical_pr_number: row.try_get("canonical_pr_number")?,
+        canonical_pr_url: row.try_get("canonical_pr_url")?,
+        canonical_head_sha: row.try_get("canonical_head_sha")?,
+        pr_title_intent: row.try_get("pr_title_intent")?,
+        pr_body_intent: row.try_get("pr_body_intent")?,
+        reached_ceiling: row.try_get("reached_ceiling")?,
+        stage: row.try_get("stage")?,
+        status: row.try_get("status")?,
+        wait_class: row.try_get("wait_class")?,
+        next_action: row.try_get("next_action")?,
+        next_action_authorized: row.try_get::<i64, _>("next_action_authorized")? != 0,
+        failure_signature: row.try_get("failure_signature")?,
+        stage_attempt: row.try_get("stage_attempt")?,
+        progress_revision: row.try_get("progress_revision")?,
         action: delivery_run::RecoveryAction::ObserveOnly,
     };
     let mut observed = delivery::observe_delivery_takeover_with_receipted_parent(
-        &run.workspace_path, Some(&claimed.base_branch), &run.head_branch, &run.identity_snapshot(),
-        claimed.canonical_pr_number.map(|n| n as u64), claimed.canonical_pr_url.as_deref(), None, remote,
-    ).await.map_err(crate::errors::AppError::Other)?;
-    let release_seen = reconcile_unresolved_delivery_mutation_intents(db, &claimed, &run.process, remote, &mut observed)
-        .await?;
-    delivery::reconcile_local_release_intent(&run.workspace_path, Some(&claimed.base_branch),
-        &run.head_branch, &run.expected_head_sha, !release_seen, remote)
-        .await.map_err(crate::errors::AppError::Other)?;
-    if !delivery_run::mark_delivery_claim_reconciled(db, &run.id, &run.process, run.claim_epoch,
-        chrono::Utc::now().timestamp_millis()).await? {
-        return Err(crate::errors::AppError::Other("foreground reconciliation lost its owner/epoch; no mutation dispatched".into()));
+        &run.workspace_path,
+        Some(&claimed.base_branch),
+        &run.head_branch,
+        &run.identity_snapshot(),
+        claimed.canonical_pr_number.map(|n| n as u64),
+        claimed.canonical_pr_url.as_deref(),
+        None,
+        remote,
+    )
+    .await
+    .map_err(crate::errors::AppError::Other)?;
+    let release_seen = reconcile_unresolved_delivery_mutation_intents(
+        db,
+        &claimed,
+        &run.process,
+        remote,
+        &mut observed,
+    )
+    .await?;
+    delivery::reconcile_local_release_intent(
+        &run.workspace_path,
+        Some(&claimed.base_branch),
+        &run.head_branch,
+        &run.expected_head_sha,
+        !release_seen,
+        remote,
+    )
+    .await
+    .map_err(crate::errors::AppError::Other)?;
+    if !delivery_run::mark_delivery_claim_reconciled(
+        db,
+        &run.id,
+        &run.process,
+        run.claim_epoch,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?
+    {
+        return Err(crate::errors::AppError::Other(
+            "foreground reconciliation lost its owner/epoch; no mutation dispatched".into(),
+        ));
     }
     Ok(())
 }
@@ -1139,19 +1224,36 @@ async fn resume_ceiling(
     authorized: DeliveryCeiling,
     requested: Option<DeliveryCeiling>,
 ) -> Result<(DeliveryCeiling, Option<String>)> {
-    let selected = requested.map(|value| authorized.clamp_request(value)).unwrap_or(authorized);
-    let recorded = sqlx::query_scalar::<_, String>(
-        "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
-    ).bind(id).fetch_optional(db).await?;
-    let Some(recorded) = recorded else { return Ok((selected, None)); };
-    let previous = parse_ceiling(&recorded).ok_or_else(||
-        crate::errors::AppError::Other(format!("unrecognized recorded delivery ceiling: {recorded}")))?;
+    let selected = requested
+        .map(|value| authorized.clamp_request(value))
+        .unwrap_or(authorized);
+    let recorded =
+        sqlx::query_scalar::<_, String>("SELECT requested_ceiling FROM delivery_runs WHERE id=?")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
+    let Some(recorded) = recorded else {
+        return Ok((selected, None));
+    };
+    let previous = parse_ceiling(&recorded).ok_or_else(|| {
+        crate::errors::AppError::Other(format!(
+            "unrecognized recorded delivery ceiling: {recorded}"
+        ))
+    })?;
     if authorized.clamp_request(previous) != previous {
         return Err(crate::errors::AppError::ToolArgument(format!(
-            "已记录上限 {recorded} 超出当前会话/配置授权上限 {}；未执行交付，请使用当前授权范围。", ceiling_label(authorized))));
+            "已记录上限 {recorded} 超出当前会话/配置授权上限 {}；未执行交付，请使用当前授权范围。",
+            ceiling_label(authorized)
+        )));
     }
     if selected.clamp_request(previous) != previous {
-        return Ok((previous, Some(format!("同一交付沿用 {recorded}（本次请求 {}），未扩大授权范围。", ceiling_label(selected)))));
+        return Ok((
+            previous,
+            Some(format!(
+                "同一交付沿用 {recorded}（本次请求 {}），未扩大授权范围。",
+                ceiling_label(selected)
+            )),
+        ));
     }
     Ok((selected, None))
 }
@@ -1184,7 +1286,9 @@ async fn prepare_durable_run(
         .map_err(crate::errors::AppError::ToolArgument)?;
     if expected_branch.is_some_and(|expected| expected != repo.branch) {
         return Err(crate::errors::AppError::ToolArgument(format!(
-            "expect_branch 不匹配当前交付分支 {}；未执行交付，请核对后重试。", repo.branch)));
+            "expect_branch 不匹配当前交付分支 {}；未执行交付，请核对后重试。",
+            repo.branch
+        )));
     }
     let identity =
         delivery::capture_delivery_identity(&repo).map_err(crate::errors::AppError::Other)?;
@@ -1288,18 +1392,19 @@ async fn reconcile_advanced_delivery_run_identity(
         return Ok(());
     }
     // Only a legitimate forward advance of the expected head may reconcile.
-    let non_head_matches =
-        existing.try_get::<String, _>("objective_id")? == run.objective_id
-            && existing.try_get::<String, _>("run_kind")? == run.run_kind
-            && existing.try_get::<Option<String>, _>("session_id")? == run.session_id
-            && existing.try_get::<Option<String>, _>("task_id")? == run.task_id
-            && existing.try_get::<String, _>("workspace_path")? == run.workspace_path
-            && existing.try_get::<String, _>("worktree_identity")? == run.worktree_identity
-            && existing.try_get::<String, _>("repo_identity")? == run.repo_identity
-            && existing.try_get::<String, _>("base_branch")? == run.base_branch
-            && existing.try_get::<String, _>("head_branch")? == run.head_branch
-            && delivery_run::delivery_ceiling_allows_resume(
-                &existing.try_get::<String, _>("requested_ceiling")?, &run.requested_ceiling);
+    let non_head_matches = existing.try_get::<String, _>("objective_id")? == run.objective_id
+        && existing.try_get::<String, _>("run_kind")? == run.run_kind
+        && existing.try_get::<Option<String>, _>("session_id")? == run.session_id
+        && existing.try_get::<Option<String>, _>("task_id")? == run.task_id
+        && existing.try_get::<String, _>("workspace_path")? == run.workspace_path
+        && existing.try_get::<String, _>("worktree_identity")? == run.worktree_identity
+        && existing.try_get::<String, _>("repo_identity")? == run.repo_identity
+        && existing.try_get::<String, _>("base_branch")? == run.base_branch
+        && existing.try_get::<String, _>("head_branch")? == run.head_branch
+        && delivery_run::delivery_ceiling_allows_resume(
+            &existing.try_get::<String, _>("requested_ceiling")?,
+            &run.requested_ceiling,
+        );
     // CF-TRUTH-R6: continuing the same delivery in the same worktree with a new
     // pending change-set is a legitimate advance, not a foreign identity. Only
     // a rewritten head (or a different objective/worktree/repo/branch) stays a
@@ -1347,7 +1452,9 @@ fn delivery_is_forward_advance(
     let Ok(next) = repository.revparse_single(next_head) else {
         return Ok(false);
     };
-    Ok(repository.graph_descendant_of(next.id(), previous.id()).unwrap_or(false))
+    Ok(repository
+        .graph_descendant_of(next.id(), previous.id())
+        .unwrap_or(false))
 }
 
 fn foreground_delivery_process_identity() -> ProcessIdentity {
@@ -1483,7 +1590,8 @@ fn build_delivery_identity_revision(
         ));
     }
     if observed_head_sha == durable.expected_head_sha
-        && observed_change_set_digest == durable.change_set_digest {
+        && observed_change_set_digest == durable.change_set_digest
+    {
         return Ok(None);
     }
     if observed_head_sha.is_empty() || observed_change_set_digest.is_empty() {
@@ -2220,7 +2328,8 @@ async fn reconcile_claimed_forward_advance_identity(
     let observed =
         delivery::capture_delivery_identity(&repo).map_err(crate::errors::AppError::Other)?;
     if observed.head_sha == claimed.expected_head_sha
-        && observed.change_set_digest == claimed.change_set_digest {
+        && observed.change_set_digest == claimed.change_set_digest
+    {
         return Ok(false);
     }
     // Same repo/worktree and a real descendant is required. Anything else (a
@@ -2724,8 +2833,13 @@ async fn reconcile_receipted_local_commit_head(
             change_set_digest: evidence.previous_change_set_digest.clone(),
         };
         delivery::observe_receipted_local_commit(
-            &cwd, Some(&claimed.base_branch), &claimed.head_branch, &previous, &evidence,
-        ).map_err(crate::errors::AppError::Other)?;
+            &cwd,
+            Some(&claimed.base_branch),
+            &claimed.head_branch,
+            &previous,
+            &evidence,
+        )
+        .map_err(crate::errors::AppError::Other)?;
         return Ok(None);
     }
     if current.head_sha == persisted.head_sha && evidence.expected_head_sha != persisted.head_sha {
@@ -2878,14 +2992,23 @@ struct ObservedMergedPr {
 
 #[async_trait::async_trait]
 impl crate::agent::execution_workspace::CanonicalPrObserver for ObservedMergedPr {
-    async fn observe(&self, _repo: &std::path::Path, number: i64, url: &str, head: &str)
-        -> anyhow::Result<crate::agent::execution_workspace::CanonicalPrState> {
+    async fn observe(
+        &self,
+        _repo: &std::path::Path,
+        number: i64,
+        url: &str,
+        head: &str,
+    ) -> anyhow::Result<crate::agent::execution_workspace::CanonicalPrState> {
         use crate::agent::execution_workspace::CanonicalPrState;
-        Ok(if number == self.number && url == self.url && head == self.head {
-            CanonicalPrState::Merged { merge_sha: self.merge_sha.clone() }
-        } else {
-            CanonicalPrState::Unknown("different canonical PR".into())
-        })
+        Ok(
+            if number == self.number && url == self.url && head == self.head {
+                CanonicalPrState::Merged {
+                    merge_sha: self.merge_sha.clone(),
+                }
+            } else {
+                CanonicalPrState::Unknown("different canonical PR".into())
+            },
+        )
     }
 }
 
@@ -2910,15 +3033,20 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
         // (`waiting_core_input` / `agent_action_required`), which the cleanup
         // reconcile set did not cover, so this supervisor re-claimed them every
         // 15s and re-ran `gh pr view` four times a minute, forever.
-        let concluded = crate::agent::execution_workspace::pr_observation_concluded(
-            &db,
-            &claimed.run_id,
-        )
-        .await
-        .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+        let concluded =
+            crate::agent::execution_workspace::pr_observation_concluded(&db, &claimed.run_id)
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
         if concluded {
-            delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
-                chrono::Utc::now().timestamp_millis(), "canonical_pr_observation_concluded").await?;
+            delivery_run::release_delivery_lease(
+                &db,
+                &claimed.run_id,
+                &process,
+                claimed.claim_epoch,
+                chrono::Utc::now().timestamp_millis(),
+                "canonical_pr_observation_concluded",
+            )
+            .await?;
             return Ok(());
         }
         // M118/R3: the persisted expected head is a perfectly good known head
@@ -2937,45 +3065,85 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
             _ => Ok(delivery::MergeObservation::Unsupported),
         };
         match observed {
-            Ok(delivery::MergeObservation::Merged { merge_sha }) if !merge_sha.trim().is_empty() => {
+            Ok(delivery::MergeObservation::Merged { merge_sha })
+                if !merge_sha.trim().is_empty() =>
+            {
                 crate::agent::execution_workspace::record_supervisor_pr_observation(
-                    &db, &claimed.run_id, "merged", true,
+                    &db,
+                    &claimed.run_id,
+                    "merged",
+                    true,
                 )
                 .await
                 .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
-                delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
-                    chrono::Utc::now().timestamp_millis(), "canonical_pr_observed_before_takeover").await?;
+                delivery_run::release_delivery_lease(
+                    &db,
+                    &claimed.run_id,
+                    &process,
+                    claimed.claim_epoch,
+                    chrono::Utc::now().timestamp_millis(),
+                    "canonical_pr_observed_before_takeover",
+                )
+                .await?;
                 crate::agent::execution_workspace::reconcile_parked_delivery_progress(
-                    &db, &ObservedMergedPr { number, url: claimed.canonical_pr_url.clone().unwrap_or_default(), head: claimed.canonical_head_sha.clone().unwrap_or_default(), merge_sha }, &process.instance_id,
-                ).await.map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+                    &db,
+                    &ObservedMergedPr {
+                        number,
+                        url: claimed.canonical_pr_url.clone().unwrap_or_default(),
+                        head: claimed.canonical_head_sha.clone().unwrap_or_default(),
+                        merge_sha,
+                    },
+                    &process.instance_id,
+                )
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
                 return Ok(());
             }
             Ok(delivery::MergeObservation::ClosedUnmerged) => {
                 // Closed without merge is a conclusion: nothing can change it
                 // by asking again, and the next pass must not re-observe.
                 crate::agent::execution_workspace::record_supervisor_pr_observation(
-                    &db, &claimed.run_id, "closed", true,
+                    &db,
+                    &claimed.run_id,
+                    "closed",
+                    true,
                 )
                 .await
                 .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
-                delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
-                    chrono::Utc::now().timestamp_millis(), "canonical_pr_observation_concluded").await?;
+                delivery_run::release_delivery_lease(
+                    &db,
+                    &claimed.run_id,
+                    &process,
+                    claimed.claim_epoch,
+                    chrono::Utc::now().timestamp_millis(),
+                    "canonical_pr_observation_concluded",
+                )
+                .await?;
                 return Ok(());
             }
             Ok(delivery::MergeObservation::OpenSameHead { .. }) => {
                 crate::agent::execution_workspace::record_supervisor_pr_observation(
-                    &db, &claimed.run_id, "open", false,
+                    &db,
+                    &claimed.run_id,
+                    "open",
+                    false,
                 )
                 .await
                 .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
             }
             Ok(delivery::MergeObservation::HeadChanged { actual_head })
-                if remote.is_some_and(|remote| remote.head_is_explained(&claimed.expected_head_sha, &actual_head)) => {
-                    crate::agent::execution_workspace::record_supervisor_pr_observation(
-                        &db, &claimed.run_id, "open", false,
-                    )
-                    .await
-                    .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+                if remote.is_some_and(|remote| {
+                    remote.head_is_explained(&claimed.expected_head_sha, &actual_head)
+                }) =>
+            {
+                crate::agent::execution_workspace::record_supervisor_pr_observation(
+                    &db,
+                    &claimed.run_id,
+                    "open",
+                    false,
+                )
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
             }
             Ok(delivery::MergeObservation::HeadChanged { actual_head }) => {
                 // M118/R3: a positively observed head the delivery cannot
@@ -2999,12 +3167,22 @@ async fn resume_claimed_delivery_with_remote<R: delivery::DeliveryRemote>(
                 // do remember the answer so the next claim backs off instead of
                 // re-asking every poll.
                 crate::agent::execution_workspace::record_supervisor_pr_observation(
-                    &db, &claimed.run_id, "unknown", false,
+                    &db,
+                    &claimed.run_id,
+                    "unknown",
+                    false,
                 )
                 .await
                 .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
-                delivery_run::release_delivery_lease(&db, &claimed.run_id, &process, claimed.claim_epoch,
-                    chrono::Utc::now().timestamp_millis(), "canonical_pr_observed_before_takeover").await?;
+                delivery_run::release_delivery_lease(
+                    &db,
+                    &claimed.run_id,
+                    &process,
+                    claimed.claim_epoch,
+                    chrono::Utc::now().timestamp_millis(),
+                    "canonical_pr_observed_before_takeover",
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -3413,22 +3591,35 @@ async fn record_or_park_local_takeover_identity_conflict(
     let mut failure = local_takeover_identity_conflict_observation(claimed);
     // A PR number alone is not merge evidence. Genuine foreign identities
     // retain the original bounded fail-closed path until merge is confirmed.
-    if !matches!(claimed.reached_ceiling.as_str(),
-        "merged" | "release_triggered" | "deployment_succeeded" | "live_verified") {
+    if !matches!(
+        claimed.reached_ceiling.as_str(),
+        "merged" | "release_triggered" | "deployment_succeeded" | "live_verified"
+    ) {
         failure.status = "platform_incident".into();
         let signature = failure.failure_signature.as_deref().ok_or_else(|| {
             crate::errors::AppError::Other("delivery identity conflict has no signature".into())
         })?;
         let attempt = delivery_run::next_delivery_failure_attempt(
-            db, &claimed.run_id, process, claimed.claim_epoch, signature,
+            db,
+            &claimed.run_id,
+            process,
+            claimed.claim_epoch,
+            signature,
             chrono::Utc::now().timestamp_millis(),
-        ).await?;
+        )
+        .await?;
         if attempt >= delivery_run::MAX_IDENTICAL_TAKEOVER_FAILURES {
             ObjectiveStore::new(db.clone())
                 .park_delivery_identity_incident_after_takeover(
-                    &claimed.objective_id, &claimed.run_id, process,
-                    claimed.claim_epoch, signature, attempt,
-                ).await.map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
+                    &claimed.objective_id,
+                    &claimed.run_id,
+                    process,
+                    claimed.claim_epoch,
+                    signature,
+                    attempt,
+                )
+                .await
+                .map_err(|error| crate::errors::AppError::Other(error.to_string()))?;
             return Ok(());
         }
     }
@@ -3468,9 +3659,14 @@ pub(crate) fn spawn_delivery_recovery_supervisor(
         loop {
             // Observe and settle expired canonical PRs before claiming replay
             // authority. Keep the cleanup supervisor independent as a fallback.
-            if let Err(error) = crate::agent::execution_workspace::reconcile_parked_delivery_progress(
-                &pool, &crate::agent::execution_workspace::RemoteCanonicalPrObserver, &process.instance_id,
-            ).await {
+            if let Err(error) =
+                crate::agent::execution_workspace::reconcile_parked_delivery_progress(
+                    &pool,
+                    &crate::agent::execution_workspace::RemoteCanonicalPrObserver,
+                    &process.instance_id,
+                )
+                .await
+            {
                 tracing::warn!(%error, "recovery supervisor: canonical PR observation failed; skipping takeover");
                 tokio::time::sleep(recovery_supervisor_poll_interval()).await;
                 continue;
@@ -3702,12 +3898,19 @@ fn render_report(outcome: &delivery::DeliveryOutcome) -> String {
     }
     out.push_str(&format!("\n{}", outcome.summary));
     if outcome.final_state == "blocked" || outcome.final_state == "waiting" {
-        out.push_str(&format!("\n卡在哪一步: {}\n在等什么: {}\n谁能解开: {}\n已保留提交: {}；分支: {}；PR: {}\n",
-            outcome.stage, outcome.next_action.as_deref().unwrap_or(&outcome.summary),
-            if outcome.recovery_class == delivery::RecoveryClass::CoreInputRequired { "用户提供上述外部核心输入" } else { "系统恢复执行器在条件满足后续接原交付" },
+        out.push_str(&format!(
+            "\n卡在哪一步: {}\n在等什么: {}\n谁能解开: {}\n已保留提交: {}；分支: {}；PR: {}\n",
+            outcome.stage,
+            outcome.next_action.as_deref().unwrap_or(&outcome.summary),
+            if outcome.recovery_class == delivery::RecoveryClass::CoreInputRequired {
+                "用户提供上述外部核心输入"
+            } else {
+                "系统恢复执行器在条件满足后续接原交付"
+            },
             outcome.commit_sha.as_deref().unwrap_or("本次尚无提交证据"),
             outcome.branch.as_deref().unwrap_or("本次尚无分支证据"),
-            outcome.pr_url.as_deref().unwrap_or("本次尚无 PR 证据")));
+            outcome.pr_url.as_deref().unwrap_or("本次尚无 PR 证据")
+        ));
         out.push_str(
             "\n\n注意:本次交付没有达到请求边界；只能报告上面明确列出的已完成步骤。\
 即使之后查询发现仓库出现了新的合并或发布,那也是其他执行器(并行 agent 或自动化流水线)\
@@ -3751,7 +3954,9 @@ pub(crate) fn resolve_authorized_ceiling(
     if configured == DeliveryCeiling::Off {
         return DeliveryCeiling::Off;
     }
-    session.map(|ceiling| configured.clamp_request(ceiling)).unwrap_or(configured)
+    session
+        .map(|ceiling| configured.clamp_request(ceiling))
+        .unwrap_or(configured)
 }
 
 /// M116-R3: refuse an explicit request that exceeds the authorized ceiling.
@@ -3810,7 +4015,9 @@ fn parse_release_urgency(s: &str) -> Option<ReleaseUrgency> {
 /// call would replace a self-inflicted release block with a self-inflicted
 /// delivery block. Delivery proceeds on the ordinary cadence and the report
 /// says the signal was ignored.
-pub(super) fn release_urgency_from_args(args: &Value) -> std::result::Result<Option<ReleaseUrgency>, String> {
+pub(super) fn release_urgency_from_args(
+    args: &Value,
+) -> std::result::Result<Option<ReleaseUrgency>, String> {
     let Some(raw) = args.get("release_urgency") else {
         return Ok(None);
     };
@@ -5026,28 +5233,44 @@ mod tests {
 
     #[test]
     fn m91_ci_attachment_reports_pr_without_stalling() {
-        let message = format!("[delivery-lease-holder] {}", json!({
-            "run_id": "synthetic-ci", "lease_owner": "synthetic-observer",
-            "lease_mode": "mutation", "claim_epoch": 3, "reconciled_claim_epoch": 3,
-            "progress_revision": 1, "lease_expires_at": 90000,
-            "stage": "ci", "status": "waiting", "canonical_pr_number": 42,
-            "canonical_pr_url": "https://example.invalid/pr/42", "wait_class": "ci_pending"
-        }));
+        let message = format!(
+            "[delivery-lease-holder] {}",
+            json!({
+                "run_id": "synthetic-ci", "lease_owner": "synthetic-observer",
+                "lease_mode": "mutation", "claim_epoch": 3, "reconciled_claim_epoch": 3,
+                "progress_revision": 1, "lease_expires_at": 90000,
+                "stage": "ci", "status": "waiting", "canonical_pr_number": 42,
+                "canonical_pr_url": "https://example.invalid/pr/42", "wait_class": "ci_pending"
+            })
+        );
         for stage in ["ci", "merge", "merge_queue"] {
-        for status in ["waiting", "running"] {
-        let mut payload: Value = serde_json::from_str(message.split_once("] ").unwrap().1).unwrap();
-        payload["stage"] = json!(stage);
-        payload["status"] = json!(status);
-        let message = format!("[delivery-lease-holder] {}", payload);
-        for _ in 0..5 {
-            let output = active_delivery_lease_output(&message, DeliveryCeiling::ThroughMerge, None, 1000);
-            assert!(!output.is_error);
-            let metadata = output.metadata.unwrap();
-            assert_eq!(metadata["pr_number"], 42);
-            assert_eq!(metadata["stage"], stage);
-            assert_eq!(metadata["next_action"], if stage == "ci" { "observe_ci" } else { "observe_merge_queue" });
-        }
-        }
+            for status in ["waiting", "running"] {
+                let mut payload: Value =
+                    serde_json::from_str(message.split_once("] ").unwrap().1).unwrap();
+                payload["stage"] = json!(stage);
+                payload["status"] = json!(status);
+                let message = format!("[delivery-lease-holder] {}", payload);
+                for _ in 0..5 {
+                    let output = active_delivery_lease_output(
+                        &message,
+                        DeliveryCeiling::ThroughMerge,
+                        None,
+                        1000,
+                    );
+                    assert!(!output.is_error);
+                    let metadata = output.metadata.unwrap();
+                    assert_eq!(metadata["pr_number"], 42);
+                    assert_eq!(metadata["stage"], stage);
+                    assert_eq!(
+                        metadata["next_action"],
+                        if stage == "ci" {
+                            "observe_ci"
+                        } else {
+                            "observe_merge_queue"
+                        }
+                    );
+                }
+            }
         }
     }
 
@@ -5097,12 +5320,8 @@ mod tests {
             90_000,
         );
         for attachment in 1..MAX_LEASE_ATTACHMENTS_WITHOUT_PROGRESS {
-            let output = active_delivery_lease_output(
-                &frozen,
-                DeliveryCeiling::ThroughRelease,
-                None,
-                1_000,
-            );
+            let output =
+                active_delivery_lease_output(&frozen, DeliveryCeiling::ThroughRelease, None, 1_000);
             let metadata = output.metadata.expect("delivery metadata");
             assert_eq!(metadata["recoverable"], true);
             assert_eq!(metadata["attachment_count"], attachment as i64);
@@ -5739,7 +5958,10 @@ mod tests {
         };
 
         let observation = local_takeover_identity_conflict_observation(&claimed);
-        assert_eq!(observation.status, "waiting", "R7: replay identity conflict is not a platform incident");
+        assert_eq!(
+            observation.status, "waiting",
+            "R7: replay identity conflict is not a platform incident"
+        );
         assert_eq!(
             observation.wait_class.as_deref(),
             Some("delivery_identity_conflict")
@@ -5785,7 +6007,10 @@ mod tests {
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
         recovery_git(&worktree, &["push", "-q", "-u", "origin", "main"]);
-        recovery_git(&worktree, &["checkout", "-q", "-b", "fix/u22-base-advanced"]);
+        recovery_git(
+            &worktree,
+            &["checkout", "-q", "-b", "fix/u22-base-advanced"],
+        );
         std::fs::write(worktree.join("work.txt"), "the change\n").unwrap();
         recovery_git(&worktree, &["add", "work.txt"]);
         recovery_git(&worktree, &["commit", "-q", "-m", "feat: the change"]);
@@ -5872,12 +6097,9 @@ mod tests {
         expected_head_sha: &str,
         canonical_pr: Option<(i64, &str)>,
     ) -> i64 {
-        let (repo, _) = delivery::resolve_delivery_repo(
-            worktree,
-            Some("main"),
-            Some("fix/u22-base-advanced"),
-        )
-        .unwrap();
+        let (repo, _) =
+            delivery::resolve_delivery_repo(worktree, Some("main"), Some("fix/u22-base-advanced"))
+                .unwrap();
         let observed = delivery::capture_delivery_identity(&repo).unwrap();
         let run = NewDeliveryRun {
             id: run_id.into(),
@@ -5976,20 +6198,46 @@ mod tests {
         let process = ProcessIdentity::new("synthetic-restarted-owner", "test", "test");
         let claimed = u22_expire_and_claim(&pool, id, &process).await;
         let prepared = PreparedDurableRun {
-            id: id.into(), process: process.clone(), claim_epoch: claimed.claim_epoch,
-            objective_id: objective.into(), workspace_path: worktree.clone(),
-            worktree_identity: claimed.worktree_identity, repo_identity: claimed.repo_identity,
-            change_set_digest: claimed.change_set_digest, expected_head_sha: head.clone(),
+            id: id.into(),
+            process: process.clone(),
+            claim_epoch: claimed.claim_epoch,
+            objective_id: objective.into(),
+            workspace_path: worktree.clone(),
+            worktree_identity: claimed.worktree_identity,
+            repo_identity: claimed.repo_identity,
+            change_set_digest: claimed.change_set_digest,
+            expected_head_sha: head.clone(),
             head_branch: claimed.head_branch,
         };
         let now = chrono::Utc::now().timestamp_millis();
-        assert!(!delivery_run::verify_delivery_mutation_permit(&pool, id, &process, prepared.claim_epoch, now).await.unwrap());
-        reconcile_foreground_claim::<LocalCommitRecoveryRemote>(&pool, &prepared, None).await.unwrap();
-        assert!(delivery_run::verify_delivery_mutation_permit(&pool, id, &process, prepared.claim_epoch,
-            chrono::Utc::now().timestamp_millis()).await.unwrap());
+        assert!(!delivery_run::verify_delivery_mutation_permit(
+            &pool,
+            id,
+            &process,
+            prepared.claim_epoch,
+            now
+        )
+        .await
+        .unwrap());
+        reconcile_foreground_claim::<LocalCommitRecoveryRemote>(&pool, &prepared, None)
+            .await
+            .unwrap();
+        assert!(delivery_run::verify_delivery_mutation_permit(
+            &pool,
+            id,
+            &process,
+            prepared.claim_epoch,
+            chrono::Utc::now().timestamp_millis()
+        )
+        .await
+        .unwrap());
         assert_eq!(recovery_git(&worktree, &["rev-parse", "HEAD"]), head);
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_mutation_intents WHERE run_id=?")
-            .bind(id).fetch_one(&pool).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM delivery_mutation_intents WHERE run_id=?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 0, "reconciliation must dispatch no mutation");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -6129,7 +6377,11 @@ mod tests {
 
     async fn m118_run_with_open_pr_intent(
         run_id: &str,
-    ) -> (sqlx::SqlitePool, ProcessIdentity, delivery_run::ClaimedRecovery) {
+    ) -> (
+        sqlx::SqlitePool,
+        ProcessIdentity,
+        delivery_run::ClaimedRecovery,
+    ) {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -6391,18 +6643,34 @@ mod tests {
         let pool = u22_pool().await;
         u22_seed_objective(&pool, "truth-restage", "objective-truth-restage").await;
         let head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
-        u22_create_run(&pool, &worktree, "truth-restage", "objective-truth-restage", &head, None).await;
+        u22_create_run(
+            &pool,
+            &worktree,
+            "truth-restage",
+            "objective-truth-restage",
+            &head,
+            None,
+        )
+        .await;
         std::fs::write(worktree.join("work.txt"), "updated synthetic change\n").unwrap();
         recovery_git(&worktree, &["add", "work.txt"]);
         let owner = ProcessIdentity::new("truth-recovery", "test", "test");
         let mut claimed = u22_expire_and_claim(&pool, "truth-restage", &owner).await;
         let before_digest = claimed.change_set_digest.clone();
-        assert!(reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &owner).await.unwrap(),
-            "restaging after a failed plan must not strand recovery");
+        assert!(
+            reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &owner)
+                .await
+                .unwrap(),
+            "restaging after a failed plan must not strand recovery"
+        );
         assert_eq!(claimed.expected_head_sha, head);
         assert_ne!(claimed.change_set_digest, before_digest);
-        let revisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_identity_revisions WHERE run_id='truth-restage'")
-            .fetch_one(&pool).await.unwrap();
+        let revisions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_identity_revisions WHERE run_id='truth-restage'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(revisions, 1);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -6415,7 +6683,18 @@ mod tests {
         let objective_id = "objective-u22-base-advanced";
         u22_seed_objective(&pool, run_id, objective_id).await;
         let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
-        assert!(u22_create_run(&pool, &worktree, run_id, objective_id, &pre_merge_head, None).await > 0);
+        assert!(
+            u22_create_run(
+                &pool,
+                &worktree,
+                run_id,
+                objective_id,
+                &pre_merge_head,
+                None
+            )
+            .await
+                > 0
+        );
 
         let merged_head = u22_advance_base_and_merge(&worktree);
         assert_ne!(merged_head, pre_merge_head);
@@ -6429,14 +6708,16 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(persisted, pre_merge_head, "the durable head still names the pre-merge commit");
+        assert_eq!(
+            persisted, pre_merge_head,
+            "the durable head still names the pre-merge commit"
+        );
 
         let takeover = ProcessIdentity::new("u22-takeover", "test", "test");
         let mut claimed = u22_expire_and_claim(&pool, run_id, &takeover).await;
-        let reconciled =
-            reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
-                .await
-                .unwrap();
+        let reconciled = reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
+            .await
+            .unwrap();
         assert!(
             reconciled,
             "a merge of the moved base is an identity revision, not a conflict"
@@ -6483,7 +6764,15 @@ mod tests {
         let objective_id = "objective-u22-branch-reset";
         u22_seed_objective(&pool, run_id, objective_id).await;
         let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
-        u22_create_run(&pool, &worktree, run_id, objective_id, &pre_merge_head, None).await;
+        u22_create_run(
+            &pool,
+            &worktree,
+            run_id,
+            objective_id,
+            &pre_merge_head,
+            None,
+        )
+        .await;
 
         let tree = recovery_git(&worktree, &["rev-parse", "HEAD^{tree}"]);
         let unrelated = recovery_git(&worktree, &["commit-tree", &tree, "-m", "unrelated"]);
@@ -6495,11 +6784,13 @@ mod tests {
 
         let takeover = ProcessIdentity::new("u22-takeover", "test", "test");
         let mut claimed = u22_expire_and_claim(&pool, run_id, &takeover).await;
-        let reconciled =
-            reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
-                .await
-                .unwrap();
-        assert!(!reconciled, "a rewritten history is never reconciled as a revision");
+        let reconciled = reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
+            .await
+            .unwrap();
+        assert!(
+            !reconciled,
+            "a rewritten history is never reconciled as a revision"
+        );
         assert_eq!(claimed.expected_head_sha, pre_merge_head);
         assert_eq!(u22_identity_revision_count(&pool, run_id).await, 0);
 
@@ -6550,9 +6841,11 @@ mod tests {
         let merged_head = u22_advance_base_and_merge(&worktree);
         let takeover = ProcessIdentity::new("u22-takeover", "test", "test");
         let mut claimed = u22_expire_and_claim(&pool, run_id, &takeover).await;
-        assert!(reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
-            .await
-            .unwrap());
+        assert!(
+            reconcile_claimed_forward_advance_identity(&pool, &mut claimed, &takeover)
+                .await
+                .unwrap()
+        );
         assert_eq!(claimed.expected_head_sha, merged_head);
 
         let remote = ForeignPrHeadRemote {
@@ -6588,7 +6881,15 @@ mod tests {
         let objective_id = "objective-m98-ancestor";
         u22_seed_objective(&pool, run_id, objective_id).await;
         let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
-        u22_create_run(&pool, &worktree, run_id, objective_id, &pre_merge_head, None).await;
+        u22_create_run(
+            &pool,
+            &worktree,
+            run_id,
+            objective_id,
+            &pre_merge_head,
+            None,
+        )
+        .await;
         recovery_git(
             &worktree,
             &["push", "-q", "origin", "fix/u22-base-advanced"],
@@ -6682,8 +6983,15 @@ mod tests {
         let objective_id = "objective-u22-race";
         u22_seed_objective(&pool, run_id, objective_id).await;
         let pre_merge_head = recovery_git(&worktree, &["rev-parse", "HEAD"]);
-        let owner_epoch =
-            u22_create_run(&pool, &worktree, run_id, objective_id, &pre_merge_head, None).await;
+        let owner_epoch = u22_create_run(
+            &pool,
+            &worktree,
+            run_id,
+            objective_id,
+            &pre_merge_head,
+            None,
+        )
+        .await;
         let merged_head = u22_advance_base_and_merge(&worktree);
 
         // The agent's redelivery claims the run first and concludes the revision.
@@ -6717,7 +7025,10 @@ mod tests {
             "exactly one conclusion is written"
         );
         let (head, wait_class, failure_code) = u22_run_state(&pool, run_id).await;
-        assert_eq!(head, merged_head, "the one conclusion is the continued delivery");
+        assert_eq!(
+            head, merged_head,
+            "the one conclusion is the continued delivery"
+        );
         assert_ne!(wait_class.as_deref(), Some("delivery_identity_conflict"));
         assert_ne!(failure_code.as_deref(), Some("delivery_identity_conflict"));
         std::fs::remove_dir_all(fixture_root).ok();
@@ -6916,13 +7227,24 @@ mod tests {
         // M100: a later owner may edit after the child identity was persisted.
         std::fs::write(worktree.join("recovery.txt"), "follow-up after restart\n").unwrap();
         assert_eq!(
-            reconcile_receipted_local_commit_head(&pool, &mut claimed_after_second_loss, &third_process)
-                .await.unwrap(),
+            reconcile_receipted_local_commit_head(
+                &pool,
+                &mut claimed_after_second_loss,
+                &third_process
+            )
+            .await
+            .unwrap(),
             None,
             "the settled child is not a fresh parent-to-child recovery"
         );
-        assert_eq!(recovery_git(&worktree, &["rev-parse", "HEAD"]), committed_head);
-        assert_eq!(std::fs::read_to_string(worktree.join("recovery.txt")).unwrap(), "follow-up after restart\n");
+        assert_eq!(
+            recovery_git(&worktree, &["rev-parse", "HEAD"]),
+            committed_head
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("recovery.txt")).unwrap(),
+            "follow-up after restart\n"
+        );
         std::fs::remove_dir_all(fixture_root).ok();
     }
 
@@ -8107,9 +8429,14 @@ mod tests {
             confirmation.get("confirmation").and_then(Value::as_str),
             Some("pr_body_adopted_observed_body")
         );
-        assert_eq!(confirmation.get("adopted").and_then(Value::as_bool), Some(true));
         assert_eq!(
-            confirmation.get("intent_operation_key").and_then(Value::as_str),
+            confirmation.get("adopted").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            confirmation
+                .get("intent_operation_key")
+                .and_then(Value::as_str),
             Some(intent_key.as_str())
         );
         assert_eq!(
@@ -8168,21 +8495,51 @@ mod tests {
 
     #[tokio::test]
     async fn m117_resume_retains_recorded_ceiling_within_authorization() {
-        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-            .connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE delivery_runs(id TEXT, requested_ceiling TEXT)").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO delivery_runs VALUES ('same-run', 'through_merge')").execute(&db).await.unwrap();
-        let (ceiling, note) = resume_ceiling(&db, "same-run", DeliveryCeiling::ThroughMerge,
-            Some(DeliveryCeiling::ThroughCiGreen)).await.unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE delivery_runs(id TEXT, requested_ceiling TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO delivery_runs VALUES ('same-run', 'through_merge')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let (ceiling, note) = resume_ceiling(
+            &db,
+            "same-run",
+            DeliveryCeiling::ThroughMerge,
+            Some(DeliveryCeiling::ThroughCiGreen),
+        )
+        .await
+        .unwrap();
         assert_eq!(ceiling, DeliveryCeiling::ThroughMerge);
         assert!(note.unwrap().contains("沿用 through_merge"));
-        assert!(resume_ceiling(&db, "same-run", DeliveryCeiling::PrOnly,
-            Some(DeliveryCeiling::PrOnly)).await.is_err());
-        let stored: String = sqlx::query_scalar("SELECT requested_ceiling FROM delivery_runs WHERE id='same-run'")
-            .fetch_one(&db).await.unwrap();
+        assert!(resume_ceiling(
+            &db,
+            "same-run",
+            DeliveryCeiling::PrOnly,
+            Some(DeliveryCeiling::PrOnly)
+        )
+        .await
+        .is_err());
+        let stored: String =
+            sqlx::query_scalar("SELECT requested_ceiling FROM delivery_runs WHERE id='same-run'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(stored, "through_merge");
-        let (new_ceiling, note) = resume_ceiling(&db, "new-run", DeliveryCeiling::ThroughMerge,
-            Some(DeliveryCeiling::PrOnly)).await.unwrap();
+        let (new_ceiling, note) = resume_ceiling(
+            &db,
+            "new-run",
+            DeliveryCeiling::ThroughMerge,
+            Some(DeliveryCeiling::PrOnly),
+        )
+        .await
+        .unwrap();
         assert_eq!(new_ceiling, DeliveryCeiling::PrOnly);
         assert!(note.is_none());
     }
@@ -8192,12 +8549,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut ctx = ExecCtx::new(temp.path().into(), None);
         ctx.settings = Some(crate::config::settings::Settings::default());
-        let output = execute(json!({"ceiling": "typo"}), &ctx).await
+        let output = execute(json!({"ceiling": "typo"}), &ctx)
+            .await
             .expect("argument errors must not abort the agent loop");
         assert!(output.is_error);
-        assert!(serde_json::to_value(output).unwrap().to_string().contains("无效 ceiling"));
+        assert!(serde_json::to_value(output)
+            .unwrap()
+            .to_string()
+            .contains("无效 ceiling"));
         let retry = execute(json!({"ceiling": "pr_only"}), &ctx).await.unwrap();
-        assert!(!serde_json::to_value(retry).unwrap().to_string().contains("无效 ceiling"));
+        assert!(!serde_json::to_value(retry)
+            .unwrap()
+            .to_string()
+            .contains("无效 ceiling"));
     }
 
     #[tokio::test]
@@ -8207,32 +8571,53 @@ mod tests {
         let signature = git2::Signature::now("Synthetic", "fixture@example.invalid").unwrap();
         let tree_id = repo.index().unwrap().write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[]).unwrap();
-        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-            .connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE task_runs(id TEXT, objective_id TEXT)").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO task_runs VALUES ('task', 'objective')").execute(&db).await.unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+            .unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE task_runs(id TEXT, objective_id TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task_runs VALUES ('task', 'objective')")
+            .execute(&db)
+            .await
+            .unwrap();
         let mut ctx = ExecCtx::new(temp.path().into(), Some(db));
         ctx.task_id = Some("task".into());
         ctx.settings = Some(crate::config::settings::Settings::default());
-        let output = execute(json!({"expect_branch": "wrong-branch"}), &ctx).await
+        let output = execute(json!({"expect_branch": "wrong-branch"}), &ctx)
+            .await
             .expect("a correctable branch argument must reach the model, not recovery");
         assert!(output.is_error);
     }
 
     #[tokio::test]
     async fn m116_tool_refuses_above_session_before_repository_side_effects() {
-        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-            .connect("sqlite::memory:").await.unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY, delivery_ceiling TEXT)")
-            .execute(&db).await.unwrap();
+            .execute(&db)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions VALUES ('synthetic-m116', 'pr_only')")
-            .execute(&db).await.unwrap();
+            .execute(&db)
+            .await
+            .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let mut ctx = ExecCtx::new(temp.path().into(), Some(db));
         ctx.session_id = Some("synthetic-m116".into());
         ctx.settings = Some(crate::config::settings::Settings::default());
-        assert_eq!(load_session_delivery_ceiling(&ctx).await, Some(DeliveryCeiling::PrOnly));
+        assert_eq!(
+            load_session_delivery_ceiling(&ctx).await,
+            Some(DeliveryCeiling::PrOnly)
+        );
         let output = execute(json!({"ceiling": "merged"}), &ctx).await.unwrap();
         let value = serde_json::to_value(&output).unwrap().to_string();
         assert!(value.contains("本会话已授权的交付上限"), "{value}");
@@ -8245,8 +8630,14 @@ mod tests {
         use DeliveryCeiling::*;
         // The production shape: global setting pr_only, dispatch authorized
         // merged, the agent asked for through_merge.
-        assert_eq!(resolve_authorized_ceiling(ThroughRelease, Some(ThroughMerge)), ThroughMerge);
-        assert_eq!(resolve_authorized_ceiling(PrOnly, Some(ThroughMerge)), PrOnly);
+        assert_eq!(
+            resolve_authorized_ceiling(ThroughRelease, Some(ThroughMerge)),
+            ThroughMerge
+        );
+        assert_eq!(
+            resolve_authorized_ceiling(PrOnly, Some(ThroughMerge)),
+            PrOnly
+        );
         assert_eq!(
             ceiling_request_refusal(ThroughRelease, Some(ThroughMerge), Some(ThroughMerge)),
             None,
@@ -8264,7 +8655,10 @@ mod tests {
             "the caller is in the original workspace: {refusal}"
         );
         // A session may narrow the global setting; the narrowed bound wins.
-        assert_eq!(resolve_authorized_ceiling(ThroughRelease, Some(PrOnly)), PrOnly);
+        assert_eq!(
+            resolve_authorized_ceiling(ThroughRelease, Some(PrOnly)),
+            PrOnly
+        );
         // `off` is an absolute veto: no message turns delivery back on.
         assert_eq!(resolve_authorized_ceiling(Off, Some(ThroughRelease)), Off);
         assert!(ceiling_request_refusal(Off, Some(ThroughRelease), Some(PrOnly)).is_some());

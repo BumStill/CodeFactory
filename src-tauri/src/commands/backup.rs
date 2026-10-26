@@ -49,11 +49,7 @@ pub async fn export_user_data(app: AppHandle, target_path: String) -> Result<Exp
     })
 }
 
-fn write_zip(
-    file: std::fs::File,
-    settings_path: &Path,
-    db_path: &Path,
-) -> std::io::Result<()> {
+fn write_zip(file: std::fs::File, settings_path: &Path, db_path: &Path) -> std::io::Result<()> {
     // Use STORED (no compression) — the SQLite DB is already compact and
     // settings.json is tiny; compression adds bytes for small files plus
     // it spares us a heavy dep.
@@ -126,8 +122,7 @@ pub async fn import_user_data(app: AppHandle, source_path: String) -> Result<Imp
             if cur.len() < 4 {
                 break;
             }
-            let name_len =
-                u32::from_le_bytes(cur[..4].try_into().unwrap()) as usize;
+            let name_len = u32::from_le_bytes(cur[..4].try_into().unwrap()) as usize;
             cur = &cur[4..];
             if cur.len() < name_len + 8 {
                 return Err(AppError::Other("Corrupt backup file (truncated)".into()));
@@ -136,8 +131,7 @@ pub async fn import_user_data(app: AppHandle, source_path: String) -> Result<Imp
                 .map_err(|e| AppError::Other(format!("Bad entry name: {e}")))?
                 .to_string();
             cur = &cur[name_len..];
-            let data_len =
-                u64::from_le_bytes(cur[..8].try_into().unwrap()) as usize;
+            let data_len = u64::from_le_bytes(cur[..8].try_into().unwrap()) as usize;
             cur = &cur[8..];
             if cur.len() < data_len {
                 return Err(AppError::Other("Corrupt backup file (data short)".into()));

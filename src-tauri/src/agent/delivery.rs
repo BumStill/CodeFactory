@@ -219,8 +219,10 @@ impl DeliveryOutcome {
         self.retry_after_ms = None;
         self.next_action = Some(notice.clone());
         self.reached_state = reached_state_from_steps(&self.steps);
-        self.steps
-            .push(StepResult::skipped(stage, format!("{notice}（停止原因：{reason}）")));
+        self.steps.push(StepResult::skipped(
+            stage,
+            format!("{notice}（停止原因：{reason}）"),
+        ));
         self.final_state = "stopped".into();
         self.summary = notice;
         self
@@ -754,7 +756,8 @@ pub(crate) fn validate_pr_body_intent(body: &str) -> Result<(), String> {
         .unwrap_or("");
     if readme_reason.is_empty() {
         problems.push(
-            "缺少非空的 `README-Update-Reason:` 行，用来说明 README 是否需要更新以及为什么。".to_string(),
+            "缺少非空的 `README-Update-Reason:` 行，用来说明 README 是否需要更新以及为什么。"
+                .to_string(),
         );
     }
     if problems.is_empty() {
@@ -820,7 +823,9 @@ pub(crate) async fn arm_merge_queue_with_bounded_retry<R: DeliveryRemote + ?Size
                 // Withdraw a label we just wrote instead of leaving it armed.
                 if let Some(reason) = stop_reason(opts).await {
                     let withdrawal = remote.clear_merge_queue_arm(number).await;
-                    return Err(format!("已停止: {reason}; 合并排队撤回结果: {withdrawal:?}"));
+                    return Err(format!(
+                        "已停止: {reason}; 合并排队撤回结果: {withdrawal:?}"
+                    ));
                 }
                 return Ok(attempt);
             }
@@ -1600,11 +1605,18 @@ pub trait DeliveryRemote {
     /// Projection-only normalization after the shared proof. Provider evidence
     /// remains raw everywhere else (CI and durable canonical-head advancement).
     async fn observe_explained_open_pr(
-        &self, head: &str, base: &str, expected: &str,
+        &self,
+        head: &str,
+        base: &str,
+        expected: &str,
     ) -> Result<OpenPrObservation, String> {
         let mut observation = self.observe_open_pr(head, base).await?;
         if let OpenPrObservation::Open(observed) = &mut observation {
-            if observed.head_sha.as_deref().is_some_and(|actual| self.head_is_explained(expected, actual)) {
+            if observed
+                .head_sha
+                .as_deref()
+                .is_some_and(|actual| self.head_is_explained(expected, actual))
+            {
                 observed.head_sha = Some(expected.to_string());
             }
         }
@@ -1791,7 +1803,11 @@ pub(crate) fn dev_command(program: &str) -> Command {
     command
 }
 
-fn retry_delivery_network<T>(step: &str, mut operation: impl FnMut() -> Result<T, String>, mut sleep: impl FnMut(u64)) -> Result<T, String> {
+fn retry_delivery_network<T>(
+    step: &str,
+    mut operation: impl FnMut() -> Result<T, String>,
+    mut sleep: impl FnMut(u64),
+) -> Result<T, String> {
     for attempt in 1..=3 {
         match operation() {
             Ok(value) => return Ok(value),
@@ -1824,34 +1840,63 @@ fn remote_error_is_rate_limited(detail: &str) -> bool {
 
 pub(crate) fn bounded_delivery_output(command: &mut Command) -> Result<String, String> {
     use std::io::Read;
-    command.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().map_err(|error| format!("failed to spawn delivery command: {error}"))?;
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn delivery command: {error}"))?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || { let mut bytes = Vec::new(); stdout.read_to_end(&mut bytes).map(|_| bytes) });
-    let err = std::thread::spawn(move || { let mut bytes = Vec::new(); stderr.read_to_end(&mut bytes).map(|_| bytes) });
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
     let started = std::time::Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? { break status; }
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
         if started.elapsed() >= std::time::Duration::from_secs(30) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("timeout：交付子进程超过 30 秒；等待网络或代理恢复，由系统重试；远端结果未知".into());
+            return Err(
+                "timeout：交付子进程超过 30 秒；等待网络或代理恢复，由系统重试；远端结果未知"
+                    .into(),
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    let stdout = out.join().map_err(|_| "delivery stdout reader failed")?.map_err(|e| e.to_string())?;
-    let stderr = err.join().map_err(|_| "delivery stderr reader failed")?.map_err(|e| e.to_string())?;
-    if status.success() { Ok(String::from_utf8_lossy(&stdout).trim().into()) }
-    else { Err(String::from_utf8_lossy(&stderr).trim().into()) }
+    let stdout = out
+        .join()
+        .map_err(|_| "delivery stdout reader failed")?
+        .map_err(|e| e.to_string())?;
+    let stderr = err
+        .join()
+        .map_err(|_| "delivery stderr reader failed")?
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).trim().into())
+    } else {
+        Err(String::from_utf8_lossy(&stderr).trim().into())
+    }
 }
 
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let network = matches!(args.first(), Some(&"fetch" | &"push" | &"ls-remote"));
-    let mut operation = || bounded_delivery_output(dev_command("git").arg("-C").arg(cwd).args(args));
+    let mut operation =
+        || bounded_delivery_output(dev_command("git").arg("-C").arg(cwd).args(args));
     if network {
-        retry_delivery_network(args[0], operation, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))
-    } else { operation() }
+        retry_delivery_network(args[0], operation, |seconds| {
+            std::thread::sleep(std::time::Duration::from_secs(seconds))
+        })
+    } else {
+        operation()
+    }
 }
 
 fn git_with_index(cwd: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
@@ -3043,16 +3088,31 @@ pub(crate) fn delivery_head_is_explained(
 /// Read-only proof for commits already present locally. Never infer a queue
 /// merge merely from ancestry: require exactly the known head and main parents.
 fn local_queue_synced_head(repo: &RepoContext, known: &str, actual: &str) -> bool {
-    let Ok(repository) = git2::Repository::open(&repo.root) else { return false; };
-    let Some(commit) = git2::Oid::from_str(actual).ok()
-        .and_then(|oid| repository.find_commit(oid).ok()) else { return false; };
+    let Ok(repository) = git2::Repository::open(&repo.root) else {
+        return false;
+    };
+    let Some(commit) = git2::Oid::from_str(actual)
+        .ok()
+        .and_then(|oid| repository.find_commit(oid).ok())
+    else {
+        return false;
+    };
     let parents: Vec<String> = commit.parent_ids().map(|oid| oid.to_string()).collect();
-    let Some(other) = queue_sync_other_parent(known, &parents) else { return false; };
+    let Some(other) = queue_sync_other_parent(known, &parents) else {
+        return false;
+    };
     // A stale local main is conservative; the provider can prove newer main.
     let reference = format!("refs/remotes/{}/{}", repo.remote, repo.default_branch);
-    let Some(main) = repository.revparse_single(&reference).ok() else { return false; };
-    let Ok(other) = git2::Oid::from_str(other) else { return false; };
-    main.id() == other || repository.graph_descendant_of(main.id(), other).unwrap_or(false)
+    let Some(main) = repository.revparse_single(&reference).ok() else {
+        return false;
+    };
+    let Ok(other) = git2::Oid::from_str(other) else {
+        return false;
+    };
+    main.id() == other
+        || repository
+            .graph_descendant_of(main.id(), other)
+            .unwrap_or(false)
 }
 
 fn observe_remote_ref_head(repo: &RepoContext, branch: &str) -> Result<Option<String>, String> {
@@ -3109,7 +3169,11 @@ pub async fn observe_delivery_takeover<R: DeliveryRemote>(
 /// mutation permit and pushes the child. No other remote head is accepted.
 /// M98-R3: true when the remote head is this workspace's own past — equal to
 /// the local head or a real ancestor of it. A foreign commit is neither.
-fn remote_head_is_explained_by_local(repo_root: &Path, remote_head: &str, local_head: &str) -> bool {
+fn remote_head_is_explained_by_local(
+    repo_root: &Path,
+    remote_head: &str,
+    local_head: &str,
+) -> bool {
     if remote_head.is_empty() || local_head.is_empty() {
         return false;
     }
@@ -3144,9 +3208,18 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
     let identity = capture_delivery_identity(&repo)?;
     // Observe terminal truth before any mutable head fence, including local drift.
     let merge_observation = if let Some(number) = persisted_canonical_pr_number {
-        Some(remote.ok_or_else(|| "canonical PR exists but no read-only provider observer is available".to_string())?
-            .observe_merge(number, &persisted_identity.head_sha).await?)
-    } else { None };
+        Some(
+            remote
+                .ok_or_else(|| {
+                    "canonical PR exists but no read-only provider observer is available"
+                        .to_string()
+                })?
+                .observe_merge(number, &persisted_identity.head_sha)
+                .await?,
+        )
+    } else {
+        None
+    };
     let merged = matches!(&merge_observation, Some(MergeObservation::Merged { merge_sha }) if !merge_sha.is_empty());
     // M99 / R3: the run's own child commit may already exist locally (and on the
     // remote) while the durable identity still names its parent. That is a
@@ -3157,7 +3230,11 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
             &persisted_identity.head_sha,
             receipted_parent_head,
             &identity.head_sha,
-            || remote.is_some_and(|remote| remote.head_is_explained(&persisted_identity.head_sha, &identity.head_sha)),
+            || {
+                remote.is_some_and(|remote| {
+                    remote.head_is_explained(&persisted_identity.head_sha, &identity.head_sha)
+                })
+            },
         );
     // Only the head may differ, and only for a proven own push: the worktree
     // must be clean, so no unreceipted edit rides along with the new head.
@@ -3177,10 +3254,19 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
 
     // R2: branch movement cannot override positive canonical merge evidence.
     let remote_head = observe_remote_branch_head(&repo)?;
-    let head_explained = |head: &str| delivery_head_is_explained(
-        Some(&repo), &persisted_identity.head_sha, receipted_parent_head, head,
-        || remote.is_some_and(|remote| remote.head_is_explained(&persisted_identity.head_sha, head)),
-    );
+    let head_explained = |head: &str| {
+        delivery_head_is_explained(
+            Some(&repo),
+            &persisted_identity.head_sha,
+            receipted_parent_head,
+            head,
+            || {
+                remote.is_some_and(|remote| {
+                    remote.head_is_explained(&persisted_identity.head_sha, head)
+                })
+            },
+        )
+    };
     let remote_explainable = merged || remote_head.as_deref().is_none_or(head_explained);
     if !remote_explainable {
         return Err(format!(
@@ -3256,8 +3342,7 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
             // check above already accepted as explained (own push or an
             // ancestor of the receipted local head). Accept the same head here;
             // anything else is still foreign and fails closed.
-            MergeObservation::HeadChanged { actual_head }
-                if head_explained(&actual_head) => {}
+            MergeObservation::HeadChanged { actual_head } if head_explained(&actual_head) => {}
             MergeObservation::HeadChanged { actual_head } => {
                 return Err(format!(
                     "canonical PR #{pr_number} moved to unrecognized head {actual_head}"
@@ -3278,11 +3363,19 @@ pub(crate) async fn observe_delivery_takeover_with_receipted_parent<R: DeliveryR
 
     Ok(DeliveryTakeoverObservation {
         // A merge is settlement evidence, never permission to adopt drift.
-        identity: if merged { persisted_identity.clone() } else { identity },
+        identity: if merged {
+            persisted_identity.clone()
+        } else {
+            identity
+        },
         remote_head_sha: remote_head,
         canonical_pr_number,
         canonical_pr_url,
-        canonical_head_sha: if merged { Some(persisted_identity.head_sha.clone()) } else { canonical_head_sha },
+        canonical_head_sha: if merged {
+            Some(persisted_identity.head_sha.clone())
+        } else {
+            canonical_head_sha
+        },
     })
 }
 
@@ -3491,7 +3584,15 @@ fn is_excluded(path: &str, extra: &[String]) -> bool {
 /// The untracked source files delivery WOULD add (for tests + previews):
 /// `??` porcelain entries minus the noise denylist.
 pub fn untracked_source_paths(root: &Path, extra: &[String]) -> Result<Vec<String>, String> {
-    let porcelain = git(root, &["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"])?;
+    let porcelain = git(
+        root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+    )?;
     let mut out = Vec::new();
     for line in porcelain.lines() {
         if line.len() < 4 {
@@ -3718,10 +3819,9 @@ fn derived_title_prefix(staged_paths: &[String]) -> &'static str {
         "docs"
     } else if all_under(".github/") {
         "ci"
-    } else if relevant
-        .iter()
-        .all(|path| path.contains("/tests/") || path.contains(".test.") || path.starts_with("tests/"))
-    {
+    } else if relevant.iter().all(|path| {
+        path.contains("/tests/") || path.contains(".test.") || path.starts_with("tests/")
+    }) {
         "test"
     } else {
         "fix"
@@ -3748,7 +3848,9 @@ fn common_directory_label(paths: &[String]) -> String {
             .unwrap_or_default();
         dirs.push(components);
     }
-    let Some(first) = dirs.first().cloned() else { return String::new(); };
+    let Some(first) = dirs.first().cloned() else {
+        return String::new();
+    };
     let mut common = first;
     for dir in &dirs[1..] {
         let shared = common
@@ -3771,7 +3873,9 @@ fn contextual_subject_from_paths(paths: &[String]) -> String {
         if path.is_empty() {
             continue;
         }
-        let Some(stem) = std::path::Path::new(path).file_stem().and_then(|stem| stem.to_str())
+        let Some(stem) = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
         else {
             continue;
         };
@@ -3826,15 +3930,31 @@ fn is_canonical_delivery_title(title: &str) -> bool {
     if title.contains(['\n', '\r']) {
         return false;
     }
-    let Some((kind, subject)) = title.split_once(':') else { return false; };
+    let Some((kind, subject)) = title.split_once(':') else {
+        return false;
+    };
     let kind = kind.trim().trim_end_matches('!');
     let kind = kind.split_once('(').map_or(kind, |(base, _)| base);
     let subject = subject.trim();
-    let placeholder = subject.strip_prefix("update ")
+    let placeholder = subject
+        .strip_prefix("update ")
         .and_then(|s| s.strip_suffix(" file(s)"))
         .is_some_and(|count| count.parse::<usize>().is_ok());
-    matches!(kind, "fix" | "feat" | "docs" | "ci" | "test" | "chore" | "refactor" | "perf" | "build" | "style" | "revert")
-        && !subject.is_empty() && !placeholder
+    matches!(
+        kind,
+        "fix"
+            | "feat"
+            | "docs"
+            | "ci"
+            | "test"
+            | "chore"
+            | "refactor"
+            | "perf"
+            | "build"
+            | "style"
+            | "revert"
+    ) && !subject.is_empty()
+        && !placeholder
 }
 
 fn canonical_delivery_title(
@@ -3844,7 +3964,10 @@ fn canonical_delivery_title(
     title: Option<&str>,
     staged_paths: &[String],
 ) -> String {
-    if let Some(title) = title.map(str::trim).filter(|title| is_canonical_delivery_title(title)) {
+    if let Some(title) = title
+        .map(str::trim)
+        .filter(|title| is_canonical_delivery_title(title))
+    {
         return title.to_string();
     }
     // The branch's own commits are the strongest witness of intent that exists
@@ -3880,13 +4003,25 @@ fn canonical_delivery_title(
     // ends up naming work it did not do, so the caller must refuse instead.
     // Retries have no staged paths, but plain-subject commits still carry
     // their own change evidence. Apply the identical base exclusions.
-    let mut path_args = vec!["log".to_string(), "--format=".into(),
-        "--name-only".into(), branch.into(), "--not".into(), base.into()];
+    let mut path_args = vec![
+        "log".to_string(),
+        "--format=".into(),
+        "--name-only".into(),
+        branch.into(),
+        "--not".into(),
+        base.into(),
+    ];
     path_args.extend(base_exclusion_refs(root, base));
     let path_args: Vec<&str> = path_args.iter().map(String::as_str).collect();
     let own_paths = git(root, &path_args).unwrap_or_default();
     let mut paths = staged_paths.to_vec();
-    paths.extend(own_paths.lines().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string));
+    paths.extend(
+        own_paths
+            .lines()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string),
+    );
     paths.sort();
     paths.dedup();
     // CF-TRUTH-R2 (M92): the subject comes from the changed paths, never from a
@@ -3904,8 +4039,11 @@ fn generate_commit_message_for_paths(
     title: Option<&str>,
     _staged_paths: &[String],
 ) -> String {
-    title.map(str::trim).filter(|title| is_canonical_delivery_title(title))
-        .unwrap_or_default().to_string()
+    title
+        .map(str::trim)
+        .filter(|title| is_canonical_delivery_title(title))
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn release_urgency_trailers(message: &str) -> Vec<String> {
@@ -3974,7 +4112,11 @@ pub(crate) fn append_release_urgency(message: String, urgency: Option<ReleaseUrg
     }
     let footer_started = !release_urgency_trailers(&message).is_empty()
         || !breaking_change_trailers(&message).is_empty()
-        || message.rsplit("\n\n").next().is_some_and(|footer| footer.lines().any(|line| line.starts_with("Co-Authored-By:")));
+        || message.rsplit("\n\n").next().is_some_and(|footer| {
+            footer
+                .lines()
+                .any(|line| line.starts_with("Co-Authored-By:"))
+        });
     format!(
         "{}{}Release-Urgency: {value}",
         message.trim_end(),
@@ -4011,8 +4153,20 @@ fn split_trailer_value(value: &str) -> (String, String) {
             c.is_whitespace()
                 || matches!(
                     c,
-                    '—' | '–' | '-' | ',' | '，' | '、' | ';' | '；' | '(' | '（' | ')' | '）' | '。'
-                        | ':' | '：'
+                    '—' | '–'
+                        | '-'
+                        | ','
+                        | '，'
+                        | '、'
+                        | ';'
+                        | '；'
+                        | '('
+                        | '（'
+                        | ')'
+                        | '）'
+                        | '。'
+                        | ':'
+                        | '：'
                 )
         })
         .map(|(index, _)| index)
@@ -4023,7 +4177,18 @@ fn split_trailer_value(value: &str) -> (String, String) {
             c.is_whitespace()
                 || matches!(
                     c,
-                    '—' | '–' | '-' | ',' | '，' | '、' | ';' | '；' | '(' | '（' | ')' | '）' | '。'
+                    '—' | '–'
+                        | '-'
+                        | ','
+                        | '，'
+                        | '、'
+                        | ';'
+                        | '；'
+                        | '('
+                        | '（'
+                        | ')'
+                        | '）'
+                        | '。'
                         | '.'
                         | ':'
                         | '：'
@@ -4272,7 +4437,10 @@ fn release_only_batch_policy(
     let mut invalid = false;
     for message in commit_messages {
         let subject = message.lines().next().unwrap_or_default();
-        let prefix = subject.split_once(':').map(|(prefix, _)| prefix).unwrap_or("");
+        let prefix = subject
+            .split_once(':')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or("");
         has_release_change |= prefix == "feat"
             || prefix.starts_with("feat(")
             || prefix == "fix"
@@ -4528,7 +4696,9 @@ fn reconcile_scenario_contract_body(
     }
     use std::io::Write;
     let mut input = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-    input.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    input
+        .write_all(body.as_bytes())
+        .map_err(|e| e.to_string())?;
     let output = bounded_delivery_output(
         dev_command("python3")
             .arg("-c")
@@ -4537,7 +4707,9 @@ fn reconcile_scenario_contract_body(
             .arg(root)
             .arg(format!("{remote}/{base}"))
             .arg("--validate-registry")
-            .stdin(std::process::Stdio::from(input.reopen().map_err(|e| e.to_string())?)),
+            .stdin(std::process::Stdio::from(
+                input.reopen().map_err(|e| e.to_string())?,
+            )),
     )?;
     let result: ScenarioBodyReconciliation = serde_json::from_str(&output)
         .map_err(|e| format!("scenario validator returned invalid output: {e}"))?;
@@ -4668,23 +4840,47 @@ pub(crate) fn precheck_thin_governance(root: &Path) -> Result<(Vec<String>, u64)
     let base = thin_base_branch(root, "origin")?;
     let started = std::time::Instant::now();
     let output = bounded_delivery_output(
-        dev_command("python3").current_dir(root)
-            .arg("-c").arg(include_str!("../../../scripts/delivery-governance-precheck.py"))
-            .arg(root).arg(format!("origin/{base}")),
+        dev_command("python3")
+            .current_dir(root)
+            .arg("-c")
+            .arg(include_str!(
+                "../../../scripts/delivery-governance-precheck.py"
+            ))
+            .arg(root)
+            .arg(format!("origin/{base}")),
     );
-    let unavailable = |detail: String| Ok((vec![format!("governance validator unavailable: {detail}")], started.elapsed().as_millis() as u64));
-    let output = match output { Ok(output) => output, Err(detail) => return unavailable(detail) };
+    let unavailable = |detail: String| {
+        Ok((
+            vec![format!("governance validator unavailable: {detail}")],
+            started.elapsed().as_millis() as u64,
+        ))
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err(detail) => return unavailable(detail),
+    };
     let result: serde_json::Value = match serde_json::from_str(&output) {
         Ok(result) => result,
         Err(error) => return unavailable(error.to_string()),
     };
     if result["ok"] == false {
-        return Err(format!("本地治理预检失败，未推送任何提交：{}", result["error"].as_str().unwrap_or(&output)));
+        return Err(format!(
+            "本地治理预检失败，未推送任何提交：{}",
+            result["error"].as_str().unwrap_or(&output)
+        ));
     }
     if result["ok"] != true {
         return unavailable("invalid validator envelope".into());
     }
-    let warnings = result["warnings"].as_array().map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+    let warnings = result["warnings"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok((warnings, result["elapsed_ms"].as_u64().unwrap_or(0)))
 }
 
@@ -4700,8 +4896,7 @@ pub(crate) fn prepare_thin_pr_body(
     // M132: the body opens with what changed and why; every declaration the
     // validators need comes after that sentence run.
     let body = &ensure_pr_summary(root, title, body);
-    let scenario_body =
-        reconcile_scenario_contract_body(root, remote, &base, body, &mut steps)?;
+    let scenario_body = reconcile_scenario_contract_body(root, remote, &base, body, &mut steps)?;
     let readme_changed = readme_changed_on_branch(root, remote, &base)?;
     let assembled = apply_readme_declaration(&scenario_body, readme_changed)?.body;
     // M156 R3: `Release-Urgency`/`BREAKING CHANGE` stay a pure-value footer in the
@@ -4736,11 +4931,27 @@ mod m132_summary_tests {
         git(&dir, &["init", "-q"]).unwrap();
         std::fs::write(dir.join("note.txt"), "synthetic\n").unwrap();
         git(&dir, &["add", "."]).unwrap();
-        git(&dir, &["-c", "user.name=QA", "-c", "user.email=qa@example.invalid",
-            "commit", "-q", "-m", "feat: keep the thin PR title honest",
-            "-m", "The queue woke on a stale head while the title said nothing about the change."]).unwrap();
-        let body = ensure_pr_summary(&dir, "feat: keep the thin PR title honest",
-            "Scenario-Test: HLT-001\nREADME-Update: reviewed");
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.name=QA",
+                "-c",
+                "user.email=qa@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "feat: keep the thin PR title honest",
+                "-m",
+                "The queue woke on a stale head while the title said nothing about the change.",
+            ],
+        )
+        .unwrap();
+        let body = ensure_pr_summary(
+            &dir,
+            "feat: keep the thin PR title honest",
+            "Scenario-Test: HLT-001\nREADME-Update: reviewed",
+        );
         assert!(body.starts_with("The queue woke on a stale head"), "{body}");
         assert!(body.contains("Scenario-Test: HLT-001"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4749,11 +4960,16 @@ mod m132_summary_tests {
     /// R2: a real summary is never duplicated; the title claim is the last resort.
     #[test]
     fn existing_summary_is_kept_and_title_claim_is_the_last_resort() {
-        assert!(body_starts_with_summary("This fixes the title the queue copied."));
+        assert!(body_starts_with_summary(
+            "This fixes the title the queue copied."
+        ));
         let kept = ensure_pr_summary(Path::new("/nonexistent"), "feat: x", "Already a summary.");
         assert_eq!(kept, "Already a summary.");
-        let fallback = ensure_pr_summary(Path::new("/nonexistent"), "feat: keep the title honest",
-            "Scenario-Test: HLT-001");
+        let fallback = ensure_pr_summary(
+            Path::new("/nonexistent"),
+            "feat: keep the title honest",
+            "Scenario-Test: HLT-001",
+        );
         assert!(fallback.starts_with("keep the title honest"), "{fallback}");
         assert!(fallback.ends_with("Scenario-Test: HLT-001"), "{fallback}");
     }
@@ -4784,7 +5000,10 @@ fn body_starts_with_summary(body: &str) -> bool {
     {
         return false;
     }
-    let key = line.split_once(':').map(|(key, _)| key.trim()).unwrap_or("");
+    let key = line
+        .split_once(':')
+        .map(|(key, _)| key.trim())
+        .unwrap_or("");
     let declaration = !key.is_empty()
         && key.len() <= 40
         && !key.contains(' ')
@@ -4910,7 +5129,9 @@ fn precheck_thin_pr_body(
 ) -> Result<(), String> {
     use std::io::Write;
     let mut input = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-    input.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    input
+        .write_all(body.as_bytes())
+        .map_err(|e| e.to_string())?;
     let path = input.path().to_path_buf();
     let checks = [
         (
@@ -5185,19 +5406,16 @@ pub async fn deliver_release_only<R: DeliveryRemote>(
         return outcome.blocked_at(StepResult::blocked("base_sync", error));
     }
 
-    let batch_messages = match release_batch_messages(
-        &repo.root,
-        &repo.remote,
-        &repo.default_branch,
-    ) {
-        Ok(messages) => messages,
-        Err(error) => {
-            return outcome.blocked_at(StepResult::blocked(
-                "release_batch",
-                format!("无法读取上个 tag 之后的提交批次: {error}"),
-            ))
-        }
-    };
+    let batch_messages =
+        match release_batch_messages(&repo.root, &repo.remote, &repo.default_branch) {
+            Ok(messages) => messages,
+            Err(error) => {
+                return outcome.blocked_at(StepResult::blocked(
+                    "release_batch",
+                    format!("无法读取上个 tag 之后的提交批次: {error}"),
+                ))
+            }
+        };
     let decision_head = match observe_remote_ref_head(&repo, &repo.default_branch) {
         Ok(Some(head)) => head,
         Ok(None) => {
@@ -5246,7 +5464,9 @@ pub async fn deliver_release_only<R: DeliveryRemote>(
     ) {
         Ok(head) => head,
         Err(reason) => {
-            outcome.steps.push(StepResult::skipped("release", reason.clone()));
+            outcome
+                .steps
+                .push(StepResult::skipped("release", reason.clone()));
             return outcome.blocked_at(StepResult::blocked(
                 "release",
                 format!("{reason}（批次 {} 个提交）", batch_messages.len()),
@@ -5349,7 +5569,10 @@ pub async fn deliver_release_only<R: DeliveryRemote>(
         .await
         {
             Ok(observation) => observation,
-            Err(error) => return outcome.blocked_on_uncertain_side_effect(StepResult::blocked("release", error)),
+            Err(error) => {
+                return outcome
+                    .blocked_on_uncertain_side_effect(StepResult::blocked("release", error))
+            }
         };
         match observation {
             ReleaseDispatchObservation::Triggered {
@@ -5409,7 +5632,9 @@ pub async fn deliver_release_only<R: DeliveryRemote>(
             }
         }
     };
-    outcome.steps.push(StepResult::ok("release_run", run_detail));
+    outcome
+        .steps
+        .push(StepResult::ok("release_run", run_detail));
 
     // `CF-REL-R3`: wait for the release to be genuinely published — not a draft,
     // and carrying Windows, macOS and updater artifacts.
@@ -5423,10 +5648,8 @@ pub async fn deliver_release_only<R: DeliveryRemote>(
         {
             Ok(status) => status,
             Err(error) => {
-                return outcome.blocked_on_uncertain_side_effect(StepResult::blocked(
-                    "release",
-                    error,
-                ))
+                return outcome
+                    .blocked_on_uncertain_side_effect(StepResult::blocked("release", error))
             }
         };
         match status {
@@ -5446,10 +5669,7 @@ pub async fn deliver_release_only<R: DeliveryRemote>(
                         let names = assets.unwrap_or_default();
                         outcome.steps.push(StepResult::ok(
                             "release_published",
-                            format!(
-                                "{detail}；已确认跨平台产物: {}",
-                                names.join(", ")
-                            ),
+                            format!("{detail}；已确认跨平台产物: {}", names.join(", ")),
                         ));
                         outcome.summary = format!(
                             "已发布 {} 的发布（head {}），包含 Windows/macOS/更新文件产物。",
@@ -5462,7 +5682,10 @@ pub async fn deliver_release_only<R: DeliveryRemote>(
                         if std::time::Instant::now() >= publish_deadline {
                             return outcome.blocked_at(StepResult::blocked(
                                 "release_assets",
-                                format!("发布在 {} 秒内产物仍不完整: {reason}", timing.publish_timeout_secs),
+                                format!(
+                                    "发布在 {} 秒内产物仍不完整: {reason}",
+                                    timing.publish_timeout_secs
+                                ),
                             ));
                         }
                     }
@@ -5493,7 +5716,10 @@ pub async fn deliver_release_only<R: DeliveryRemote>(
                 if std::time::Instant::now() >= publish_deadline {
                     return outcome.blocked_at(StepResult::blocked(
                         "release_published",
-                        format!("发布在 {} 秒内仍未完成: {detail}", timing.publish_timeout_secs),
+                        format!(
+                            "发布在 {} 秒内仍未完成: {detail}",
+                            timing.publish_timeout_secs
+                        ),
                     ));
                 }
             }
@@ -5724,7 +5950,8 @@ pub async fn deliver<R: DeliveryRemote>(
     // the PR title it opens — computed before the commit exists, so a placeholder
     // title cannot become the subject `main` ends up carrying after squash merge.
     let receipt_title = match read_delivery_receipt(
-        &repo, &git(&repo.root, &["rev-parse", "HEAD"]).unwrap_or_default(),
+        &repo,
+        &git(&repo.root, &["rev-parse", "HEAD"]).unwrap_or_default(),
     ) {
         Ok(receipt) => receipt.and_then(|r| r.pr_title),
         Err(error) => return outcome.blocked_at(StepResult::blocked("receipt", error)),
@@ -5776,7 +6003,9 @@ pub async fn deliver<R: DeliveryRemote>(
                 != Some(commit_plan.original_index_digest.as_str())
             || git2::Repository::open(&repo.root)
                 .and_then(|repository| repository.index()?.write_tree())
-                .ok().map(|oid| oid.to_string()).as_deref()
+                .ok()
+                .map(|oid| oid.to_string())
+                .as_deref()
                 != Some(commit_plan.original_index_tree_sha.as_str())
         {
             return outcome.blocked_at(StepResult::blocked(
@@ -6269,15 +6498,19 @@ pub async fn deliver<R: DeliveryRemote>(
     // `opts`), then from the last applied receipt. The intent wins so a resend
     // with a corrected title/body can converge an already-open PR instead of
     // being frozen into whatever was opened first.
-    let intent_title = opts
-        .title
+    let intent_title = opts.title.clone().or_else(|| {
+        prior_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.pr_title.clone())
+    });
+    let intent_body = opts.body.clone().or_else(|| {
+        prior_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.pr_body.clone())
+    });
+    let mut pr_title = intent_title
         .clone()
-        .or_else(|| prior_receipt.as_ref().and_then(|receipt| receipt.pr_title.clone()));
-    let intent_body = opts
-        .body
-        .clone()
-        .or_else(|| prior_receipt.as_ref().and_then(|receipt| receipt.pr_body.clone()));
-    let mut pr_title = intent_title.clone().unwrap_or_else(|| delivery_subject.clone());
+        .unwrap_or_else(|| delivery_subject.clone());
     // The title may have come from session context rather than from this
     // branch. Never let it claim a bigger release than the commits justify.
     let commit_slot = branch_commit_slot(&repo.root, &repo.default_branch, &repo.branch);
@@ -6301,7 +6534,11 @@ pub async fn deliver<R: DeliveryRemote>(
         "由 CodeFactory 自动交付。\n\n🤖 Generated with CodeFactory".to_string()
     });
     let requested_pr_body = match reconcile_scenario_contract_body(
-        &repo.root, &repo.remote, &repo.default_branch, &requested_pr_body, &mut outcome.steps,
+        &repo.root,
+        &repo.remote,
+        &repo.default_branch,
+        &requested_pr_body,
+        &mut outcome.steps,
     ) {
         Ok(body) => body,
         Err(error) => return outcome.blocked_at(StepResult::blocked("scenario_test", error)),
@@ -6482,7 +6719,11 @@ pub async fn deliver<R: DeliveryRemote>(
             remote_pr.body.clone()
         };
         let desired_body_source = match reconcile_scenario_contract_body(
-            &repo.root, &repo.remote, &repo.default_branch, &desired_body_source, &mut outcome.steps,
+            &repo.root,
+            &repo.remote,
+            &repo.default_branch,
+            &desired_body_source,
+            &mut outcome.steps,
         ) {
             Ok(body) => body,
             Err(error) => return outcome.blocked_at(StepResult::blocked("scenario_test", error)),
@@ -6520,9 +6761,7 @@ pub async fn deliver<R: DeliveryRemote>(
             {
                 return outcome.blocked_at(StepResult::blocked(
                     "pr",
-                    format!(
-                        "PR #{pr_number} 的标题/正文未收敛到交付意图，自动更新失败: {error}"
-                    ),
+                    format!("PR #{pr_number} 的标题/正文未收敛到交付意图，自动更新失败: {error}"),
                 ));
             }
             outcome.steps.push(StepResult::ok(
@@ -6669,7 +6908,7 @@ pub async fn deliver<R: DeliveryRemote>(
 source=agent_decided。任务结束被唤醒后：失败→修复并 push 后重新调用 deliver_changes；\
 全绿→重新调用 deliver_changes 续接合并且打 `merge-queue: armed`。"
                     ),
-                )
+                );
             }
         }
 
@@ -6745,7 +6984,11 @@ source=agent_decided。任务结束被唤醒后：失败→修复并 push 后重
         };
         pr_title = refreshed_pr.title;
         let scenario_body = match reconcile_scenario_contract_body(
-            &repo.root, &repo.remote, &repo.default_branch, &refreshed_pr.body, &mut outcome.steps,
+            &repo.root,
+            &repo.remote,
+            &repo.default_branch,
+            &refreshed_pr.body,
+            &mut outcome.steps,
         ) {
             Ok(body) => body,
             Err(error) => return outcome.blocked_at(StepResult::blocked("scenario_test", error)),
@@ -7756,7 +7999,9 @@ impl DeliveryRemote for HookRemote {
         {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                let observation = self.observe_explained_open_pr(head, base, expected_head_sha).await?;
+                let observation = self
+                    .observe_explained_open_pr(head, base, expected_head_sha)
+                    .await?;
                 return observed_committed_pr_projection(
                     &receipt,
                     observation,
@@ -7888,7 +8133,8 @@ impl DeliveryRemote for HookRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<(), String> {
         exact_open_pr_projection(
-            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha)
+                .await?,
             Some(number),
             expected_head_sha,
         )?
@@ -8161,10 +8407,11 @@ impl DeliveryRemote for HookRemote {
                     self.id
                 )
             })?;
-        if response.status != "merged" && response
-            .head_sha
-            .as_deref()
-            .is_some_and(|head| head != expected_head)
+        if response.status != "merged"
+            && response
+                .head_sha
+                .as_deref()
+                .is_some_and(|head| head != expected_head)
         {
             return Ok(MergeObservation::HeadChanged {
                 actual_head: response.head_sha.unwrap_or_default(),
@@ -8371,9 +8618,7 @@ pub fn gh_cli_available_for_host(hostname: &str) -> bool {
     // prompt is rebuilt on EVERY model request (the field trace saw 18/minute).
     // Cache the answer per process: 10 minutes for "logged in", 1 minute for
     // "not logged in" so a fresh `gh auth login` is picked up quickly.
-    github_api_budget::cached_auth_probe(hostname, || {
-        gh_cli_available_probe(hostname)
-    })
+    github_api_budget::cached_auth_probe(hostname, || gh_cli_available_probe(hostname))
 }
 
 fn gh_cli_available_probe(hostname: &str) -> bool {
@@ -8395,9 +8640,7 @@ fn gh_cli_available_probe(hostname: &str) -> bool {
 }
 
 fn gh_auth_status_for_host(bin: &str, hostname: &str) -> bool {
-    github_api_budget::record_gh_call(
-        github_api_budget::CALLER_AUTH_PROBE,
-    );
+    github_api_budget::record_gh_call(github_api_budget::CALLER_AUTH_PROBE);
     dev_command(bin)
         .args(["auth", "status", "--hostname", hostname])
         .stdout(std::process::Stdio::null())
@@ -8494,11 +8737,7 @@ fn gh_pr_create_args(title: &str, body: &str, head: &str, base: &str) -> Vec<Str
 }
 
 fn gh_pr_edit_args(number: u64, title: Option<&str>, body: &str) -> Vec<String> {
-    let mut args = vec![
-        "pr".into(),
-        "edit".into(),
-        number.to_string(),
-    ];
+    let mut args = vec!["pr".into(), "edit".into(), number.to_string()];
     if let Some(title) = title {
         args.push("--title".into());
         args.push(title.into());
@@ -8972,7 +9211,9 @@ impl GhCliRemote {
             "api".into(),
             format!("repos/{}/rules/branches/{}", self.repo, self.default_branch),
         ]))?;
-        Ok(crate::git_remote::github::ci_check_states(&value, &required))
+        Ok(crate::git_remote::github::ci_check_states(
+            &value, &required,
+        ))
     }
 
     /// M114/R4: one batched listing for every due candidate in this repository.
@@ -9106,9 +9347,7 @@ impl GhCliRemote {
         })
     }
 
-    pub(crate) fn observed_rate_limit(
-        &self,
-    ) -> Option<github_api_budget::RateLimitSnapshot> {
+    pub(crate) fn observed_rate_limit(&self) -> Option<github_api_budget::RateLimitSnapshot> {
         let raw = self.gh(&["api".into(), "rate_limit".into()]).ok()?;
         github_api_budget::parse_rate_limit(&raw)
     }
@@ -9164,17 +9403,37 @@ pub fn gh_remote_for(cwd: &Path) -> Option<GhCliRemote> {
 impl GhCliRemote {
     fn gh(&self, args: &[String]) -> Result<String, String> {
         let step = args.iter().take(2).cloned().collect::<Vec<_>>().join(" ");
-        let operation = || bounded_delivery_output(dev_command("gh").current_dir(&self.cwd).args(args));
+        let operation =
+            || bounded_delivery_output(dev_command("gh").current_dir(&self.cwd).args(args));
         // Creation is reconciled by open_or_get_pr before redispatch. Never
         // blindly replay an ambiguous external mutation here.
-        if args.get(1).is_some_and(|arg| matches!(arg.as_str(), "view" | "list" | "status")) || args.first().is_some_and(|arg| arg == "api") && !args.iter().any(|arg| arg == "--method" || arg == "-X" || arg == "-f" || arg == "-F") {
-            retry_delivery_network(&step, operation, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))
-        } else { operation() }
+        if args
+            .get(1)
+            .is_some_and(|arg| matches!(arg.as_str(), "view" | "list" | "status"))
+            || args.first().is_some_and(|arg| arg == "api")
+                && !args
+                    .iter()
+                    .any(|arg| arg == "--method" || arg == "-X" || arg == "-f" || arg == "-F")
+        {
+            retry_delivery_network(&step, operation, |seconds| {
+                std::thread::sleep(std::time::Duration::from_secs(seconds))
+            })
+        } else {
+            operation()
+        }
     }
 
-    pub(crate) fn observed_queue_arm(&self, number: u64, expected_head: &str) -> Result<bool, String> {
+    pub(crate) fn observed_queue_arm(
+        &self,
+        number: u64,
+        expected_head: &str,
+    ) -> Result<bool, String> {
         let raw = self.gh(&[
-            "pr".into(), "view".into(), number.to_string(), "-R".into(), self.repo.clone(),
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+            "-R".into(),
+            self.repo.clone(),
             "--json".into(),
             "headRefOid,labels".into(),
         ])?;
@@ -9182,9 +9441,14 @@ impl GhCliRemote {
         if value.get("headRefOid").and_then(|v| v.as_str()) != Some(expected_head) {
             return Err("PR head changed while observing queue arm".into());
         }
-        Ok(value.get("labels").and_then(|v| v.as_array()).is_some_and(|labels| {
-            labels.iter().any(|label| label.get("name").and_then(|v| v.as_str()) == Some(MERGE_QUEUE_ARM_LABEL))
-        }))
+        Ok(value
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .is_some_and(|labels| {
+                labels.iter().any(|label| {
+                    label.get("name").and_then(|v| v.as_str()) == Some(MERGE_QUEUE_ARM_LABEL)
+                })
+            }))
     }
 
     fn merge_observation(
@@ -9218,13 +9482,22 @@ fn parse_github_merge_observation(
         .to_string();
     // Queue synchronization may advance the head before merging. Positive
     // merge evidence is authoritative; open PRs still require the pinned head.
-    if value.get("state").and_then(serde_json::Value::as_str)
-        .is_some_and(|state| state.eq_ignore_ascii_case("MERGED")) {
-        let merge_sha = value.get("mergeCommit").and_then(|merge| merge.get("oid"))
-            .and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    if value
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("MERGED"))
+    {
+        let merge_sha = value
+            .get("mergeCommit")
+            .and_then(|merge| merge.get("oid"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
         return if merge_sha.trim().is_empty() {
             Err("GitHub reports MERGED but returned no merge commit SHA".into())
-        } else { Ok(MergeObservation::Merged { merge_sha }) };
+        } else {
+            Ok(MergeObservation::Merged { merge_sha })
+        };
     }
     if !actual_head.is_empty() && actual_head != expected_head {
         return Ok(MergeObservation::HeadChanged { actual_head });
@@ -9322,7 +9595,10 @@ impl DeliveryRemote for GhCliRemote {
     fn head_is_explained(&self, known: &str, observed: &str) -> bool {
         let repo = resolve_repo(&self.cwd, Some(&self.default_branch)).ok();
         delivery_head_is_explained(repo.as_ref(), known, None, observed, || {
-            self.queue_synced_head(known, observed).ok().flatten().is_some()
+            self.queue_synced_head(known, observed)
+                .ok()
+                .flatten()
+                .is_some()
         })
     }
     /// U31: arm the PR for the repository merge queue. Idempotent and
@@ -9367,7 +9643,8 @@ impl DeliveryRemote for GhCliRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         if let Some(pr) = exact_open_pr_projection(
-            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha)
+                .await?,
             None,
             expected_head_sha,
         )? {
@@ -9394,7 +9671,9 @@ impl DeliveryRemote for GhCliRemote {
         {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                let observation = self.observe_explained_open_pr(head, base, expected_head_sha).await?;
+                let observation = self
+                    .observe_explained_open_pr(head, base, expected_head_sha)
+                    .await?;
                 return observed_committed_pr_projection(
                     &receipt,
                     observation,
@@ -9405,15 +9684,38 @@ impl DeliveryRemote for GhCliRemote {
             }
         };
         let result = (|| {
-            retry_delivery_network("pr create", || {
-                // A failed create may already have committed remotely. Read
-                // the exact head/base projection before any retry.
-                let raw = self.gh(&["pr".into(), "list".into(), "--head".into(), head.into(), "--base".into(), base.into(), "--state".into(), "open".into(), "--json".into(), "number,url,title,body,headRefOid".into(), "--limit".into(), "1".into()])?;
-                if exact_open_pr_projection(parse_gh_open_pr_state(&raw, head, base)?, None, expected_head_sha)?.is_some() {
-                    return Ok(String::new());
-                }
-                self.gh(&gh_pr_create_args(title, body, head, base))
-            }, |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)))?;
+            retry_delivery_network(
+                "pr create",
+                || {
+                    // A failed create may already have committed remotely. Read
+                    // the exact head/base projection before any retry.
+                    let raw = self.gh(&[
+                        "pr".into(),
+                        "list".into(),
+                        "--head".into(),
+                        head.into(),
+                        "--base".into(),
+                        base.into(),
+                        "--state".into(),
+                        "open".into(),
+                        "--json".into(),
+                        "number,url,title,body,headRefOid".into(),
+                        "--limit".into(),
+                        "1".into(),
+                    ])?;
+                    if exact_open_pr_projection(
+                        parse_gh_open_pr_state(&raw, head, base)?,
+                        None,
+                        expected_head_sha,
+                    )?
+                    .is_some()
+                    {
+                        return Ok(String::new());
+                    }
+                    self.gh(&gh_pr_create_args(title, body, head, base))
+                },
+                |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)),
+            )?;
             let created = self.gh(&[
                 "pr".into(),
                 "view".into(),
@@ -9504,7 +9806,8 @@ impl DeliveryRemote for GhCliRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<(), String> {
         exact_open_pr_projection(
-            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha)
+                .await?,
             Some(number),
             expected_head_sha,
         )?
@@ -10758,7 +11061,8 @@ impl DeliveryRemote for GitlabRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         if let Some(pr) = exact_open_pr_projection(
-            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha)
+                .await?,
             None,
             expected_head_sha,
         )? {
@@ -10785,7 +11089,9 @@ impl DeliveryRemote for GitlabRemote {
         {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                let observation = self.observe_explained_open_pr(head, base, expected_head_sha).await?;
+                let observation = self
+                    .observe_explained_open_pr(head, base, expected_head_sha)
+                    .await?;
                 return observed_committed_pr_projection(
                     &receipt,
                     observation,
@@ -10898,7 +11204,8 @@ impl DeliveryRemote for GitlabRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<(), String> {
         exact_open_pr_projection(
-            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha)
+                .await?,
             Some(number),
             expected_head_sha,
         )?
@@ -10954,8 +11261,14 @@ impl DeliveryRemote for GitlabRemote {
                 return Ok(());
             }
         };
-        match crate::git_remote::gitlab::update_pr_body(&self.client, &self.repo, number, title, body)
-            .await
+        match crate::git_remote::gitlab::update_pr_body(
+            &self.client,
+            &self.repo,
+            number,
+            title,
+            body,
+        )
+        .await
         {
             Ok(()) => {
                 if let Err(error) = self
@@ -11086,8 +11399,10 @@ impl DeliveryRemote for GitlabRemote {
                     .and_then(serde_json::Value::as_str)
             })
             .unwrap_or("");
-        if !actual_head.is_empty() && actual_head != expected_head
-            && value.get("state").and_then(serde_json::Value::as_str) != Some("merged") {
+        if !actual_head.is_empty()
+            && actual_head != expected_head
+            && value.get("state").and_then(serde_json::Value::as_str) != Some("merged")
+        {
             return Ok(MergeObservation::HeadChanged {
                 actual_head: actual_head.to_string(),
             });
@@ -11204,7 +11519,8 @@ impl DeliveryRemote for GithubRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<DeliveryPr, String> {
         if let Some(pr) = exact_open_pr_projection(
-            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha)
+                .await?,
             None,
             expected_head_sha,
         )? {
@@ -11231,7 +11547,9 @@ impl DeliveryRemote for GithubRemote {
         {
             DeliveryMutationBegin::Dispatch(intent) => intent,
             DeliveryMutationBegin::AlreadyCommitted(receipt) => {
-                let observation = self.observe_explained_open_pr(head, base, expected_head_sha).await?;
+                let observation = self
+                    .observe_explained_open_pr(head, base, expected_head_sha)
+                    .await?;
                 return observed_committed_pr_projection(
                     &receipt,
                     observation,
@@ -11358,7 +11676,8 @@ impl DeliveryRemote for GithubRemote {
         mutation_permit: Option<&DeliveryMutationPermit>,
     ) -> Result<(), String> {
         exact_open_pr_projection(
-            self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+            self.observe_explained_open_pr(head, base, expected_head_sha)
+                .await?,
             Some(number),
             expected_head_sha,
         )?
@@ -11414,8 +11733,14 @@ impl DeliveryRemote for GithubRemote {
                 return Ok(());
             }
         };
-        match crate::git_remote::github::update_pr_body(&self.client, &self.repo, number, title, body)
-            .await
+        match crate::git_remote::github::update_pr_body(
+            &self.client,
+            &self.repo,
+            number,
+            title,
+            body,
+        )
+        .await
         {
             Ok(()) => {
                 if let Err(error) = self
@@ -11716,8 +12041,10 @@ impl DeliveryRemote for GithubRemote {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
-        if !actual_head.is_empty() && actual_head != expected_head
-            && value.get("merged").and_then(serde_json::Value::as_bool) != Some(true) {
+        if !actual_head.is_empty()
+            && actual_head != expected_head
+            && value.get("merged").and_then(serde_json::Value::as_bool) != Some(true)
+        {
             return Ok(MergeObservation::HeadChanged { actual_head });
         }
         if value
@@ -12048,7 +12375,10 @@ pub(crate) mod github_api_budget {
 
     /// Minimum gap before the next background observation of a PR that belongs
     /// to an objective that is waiting for the user.
-    pub(crate) fn min_observation_delay_ms(objective_status: &str, requires_user_action: bool) -> i64 {
+    pub(crate) fn min_observation_delay_ms(
+        objective_status: &str,
+        requires_user_action: bool,
+    ) -> i64 {
         if requires_user_action || matches!(objective_status, "waiting_core_input") {
             USER_WAIT_OBSERVATION_MIN_DELAY_MS
         } else {
@@ -12262,42 +12592,74 @@ mod tests {
         for step in ["fetch", "push", "pr view", "pr create"] {
             let mut attempts = 0;
             let mut delays = Vec::new();
-            let result = retry_delivery_network(step, || {
-                attempts += 1;
-                if attempts < 3 { Err("LibreSSL SSL_ERROR_SYSCALL".into()) } else { Ok("preserved".to_string()) }
-            }, |delay| delays.push(delay));
+            let result = retry_delivery_network(
+                step,
+                || {
+                    attempts += 1;
+                    if attempts < 3 {
+                        Err("LibreSSL SSL_ERROR_SYSCALL".into())
+                    } else {
+                        Ok("preserved".to_string())
+                    }
+                },
+                |delay| delays.push(delay),
+            );
             assert_eq!(result.unwrap(), "preserved");
             assert_eq!(attempts, 3);
             assert_eq!(delays, vec![1, 2]);
-            let error = retry_delivery_network(step, || Err::<String, _>("HTTP 503".into()), |_| {}).unwrap_err();
+            let error =
+                retry_delivery_network(step, || Err::<String, _>("HTTP 503".into()), |_| {})
+                    .unwrap_err();
             assert!(error.contains(step) && error.contains("3 次") && error.contains("未删除"));
         }
         let fixture = tempfile::tempdir().unwrap();
         let config = fixture.path().join("gitconfig");
         std::fs::write(&config, "[http]\n proxy = http://127.0.0.1:18080\n").unwrap();
-        let output = dev_command("git").env("GIT_CONFIG_GLOBAL", &config)
+        let output = dev_command("git")
+            .env("GIT_CONFIG_GLOBAL", &config)
             .env("HTTPS_PROXY", "http://127.0.0.1:18081")
-            .args(["config", "--global", "--get", "http.proxy"]).output().unwrap();
+            .args(["config", "--global", "--get", "http.proxy"])
+            .output()
+            .unwrap();
         assert!(output.status.success());
-        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "http://127.0.0.1:18080");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "http://127.0.0.1:18080"
+        );
     }
 
     #[test]
     fn cf_lease_ssl_errors_are_transient() {
-        assert!(remote_error_is_retryable("LibreSSL SSL_ERROR_SYSCALL github.com:443"));
+        assert!(remote_error_is_retryable(
+            "LibreSSL SSL_ERROR_SYSCALL github.com:443"
+        ));
         assert!(remote_error_is_retryable("HTTP 500 Internal Server Error"));
-
     }
 
     #[test]
     fn u28_release_only_batch_policy_is_fail_closed() {
         let cases = [
-            (vec!["fix: repair updater\n\nRelease-Urgency: immediate"], false, false, true),
+            (
+                vec!["fix: repair updater\n\nRelease-Urgency: immediate"],
+                false,
+                false,
+                true,
+            ),
             (vec!["docs: clarify release"], false, false, false),
-            (vec!["fix: guarded\n\nRelease-Urgency: hold"], false, false, false),
+            (
+                vec!["fix: guarded\n\nRelease-Urgency: hold"],
+                false,
+                false,
+                false,
+            ),
             (vec!["docs: forced"], true, true, true),
             (vec!["docs: unapproved force"], true, false, false),
-            (vec!["fix: hold stays guarded\n\nRelease-Urgency: hold"], true, true, false),
+            (
+                vec!["fix: hold stays guarded\n\nRelease-Urgency: hold"],
+                true,
+                true,
+                false,
+            ),
         ];
         for (messages, force, approved, expected) in cases {
             assert_eq!(
@@ -12317,7 +12679,10 @@ mod tests {
         ];
         assert!(release_assets_complete(&assets));
         assert!(!release_assets_complete(&assets[..2]));
-        assert!(!release_assets_complete(&["latest.json", "CodeFactory.dmg"]));
+        assert!(!release_assets_complete(&[
+            "latest.json",
+            "CodeFactory.dmg"
+        ]));
     }
 
     #[test]
@@ -12326,8 +12691,16 @@ mod tests {
             .split("\n#[cfg(test)]")
             .next()
             .unwrap();
-        for forbidden in ["git tag -f", "git push --delete", "DELETE /repos/", "PATCH /repos/"] {
-            assert!(!production.contains(forbidden), "forbidden release operation: {forbidden}");
+        for forbidden in [
+            "git tag -f",
+            "git push --delete",
+            "DELETE /repos/",
+            "PATCH /repos/",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "forbidden release operation: {forbidden}"
+            );
         }
     }
 
@@ -12472,8 +12845,8 @@ mod tests {
         )
         .unwrap();
 
-        let out = deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main"))
-            .await;
+        let out =
+            deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main")).await;
 
         assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
         assert_eq!(out.reached_state, "release_published", "{:?}", out.steps);
@@ -12533,8 +12906,8 @@ mod tests {
             calls: calls.clone(),
         };
 
-        let out = deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main"))
-            .await;
+        let out =
+            deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main")).await;
 
         assert_eq!(out.final_state, "blocked", "{:?}", out.steps);
         assert_eq!(calls.release.load(Ordering::SeqCst), 0);
@@ -12564,16 +12937,17 @@ mod tests {
         calls
             .release_observation_failures
             .store(1, Ordering::SeqCst);
-        *calls.live_status.lock().unwrap() =
-            Some(ObservationStatus::Success("GitHub Release v1.84.2 is published".into()));
+        *calls.live_status.lock().unwrap() = Some(ObservationStatus::Success(
+            "GitHub Release v1.84.2 is published".into(),
+        ));
         *calls.release_assets.lock().unwrap() = Some(vec![
             "CodeFactory_1.84.2_x64-setup.exe".into(),
             "CodeFactory_1.84.2_x64.dmg".into(),
             "latest.json".into(),
         ]);
 
-        let out = deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main"))
-            .await;
+        let out =
+            deliver_release_only(&root, &release_only_opts(), Some(&remote), Some("main")).await;
 
         assert_eq!(out.final_state, "delivered", "{:?}", out.steps);
         assert_eq!(
@@ -12601,7 +12975,9 @@ mod tests {
             calls: calls.clone(),
         };
         *calls.release_observation.lock().unwrap() = Some(ReleaseDispatchObservation::Absent);
-        calls.release_run_never_appears.store(true, Ordering::SeqCst);
+        calls
+            .release_run_never_appears
+            .store(true, Ordering::SeqCst);
 
         let mut opts = release_only_opts();
         opts.release_only_timing.run_appears_timeout_secs = 1;
@@ -12655,7 +13031,10 @@ mod tests {
         fn backoff_doubles_and_caps_at_one_hour() {
             // R3: 1m → 2m → 4m … ≤ 60m.
             let seconds: Vec<i64> = (1..=9).map(|n| observation_delay_ms(n) / 1000).collect();
-            assert_eq!(seconds, vec![60, 120, 240, 480, 960, 1920, 3600, 3600, 3600]);
+            assert_eq!(
+                seconds,
+                vec![60, 120, 240, 480, 960, 1920, 3600, 3600, 3600]
+            );
             assert_eq!(observation_delay_ms(0), 0);
             // A changed observation resets to the base delay, not to the cap.
             assert_eq!(
@@ -12802,7 +13181,10 @@ mod tests {
             |_| sleeps += 1,
         )
         .expect_err("rate limited delivery must fail");
-        assert_eq!(attempts, 1, "a rate-limited call must not be retried at all");
+        assert_eq!(
+            attempts, 1,
+            "a rate-limited call must not be retried at all"
+        );
         assert_eq!(sleeps, 0, "no immediate backoff-sleep retry");
         assert!(error.contains("额度受限"), "{error}");
 
@@ -13217,9 +13599,16 @@ mod tests {
             validate_pr_body_intent(missing_reason).expect_err("README-Update-Reason is required");
         assert!(error.contains("README-Update-Reason"), "{error}");
 
-        for declaration in ["", "Scenario-Test: none\n", "Scenario-Test: SC-001\n", "Scenario-Test: SYN-101\nScenario-Test: SYN-202\n"] {
-            validate_pr_body_intent(&format!("{declaration}README-Update: reviewed\nREADME-Update-Reason: synthetic"))
-                .expect("M95 derives scenario IDs after intent validation");
+        for declaration in [
+            "",
+            "Scenario-Test: none\n",
+            "Scenario-Test: SC-001\n",
+            "Scenario-Test: SYN-101\nScenario-Test: SYN-202\n",
+        ] {
+            validate_pr_body_intent(&format!(
+                "{declaration}README-Update: reviewed\nREADME-Update-Reason: synthetic"
+            ))
+            .expect("M95 derives scenario IDs after intent validation");
         }
         // Control group: the template-compliant body passes unchanged.
         validate_pr_body_intent(
@@ -13265,7 +13654,9 @@ README-Update: reviewed\nREADME-Update-Reason: 本轮不改变产品承诺与安
         use std::sync::atomic::Ordering;
         let root = feature_branch_repo("m114c-arm-failure");
         let calls = stub_calls();
-        calls.arm_fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        calls
+            .arm_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let remote = StubRemote {
             ci: CiStatus::Success,
             existing_pr: None,
@@ -13407,7 +13798,10 @@ README-Update: reviewed\nREADME-Update-Reason: 本轮不改变产品承诺与安
             .await
             .expect("the same rung resumes the same delivery");
         let rungs = flaky.rungs.lock().unwrap().clone();
-        assert_eq!(rungs, vec!["git_stage".to_string(), "git_stage".to_string()]);
+        assert_eq!(
+            rungs,
+            vec!["git_stage".to_string(), "git_stage".to_string()]
+        );
 
         // Anti-case: when re-acquisition is genuinely impossible the budget
         // runs out and the failure still names the rung, fail-closed.
@@ -13529,8 +13923,12 @@ README-Update: reviewed\nREADME-Update-Reason: 本轮不改变产品承诺与安
             "state": "MERGED", "headRefOid": "queue-advanced-head",
             "mergeCommit": {"oid": "synthetic-merge"}
         });
-        assert_eq!(parse_github_merge_observation(&value, "original-head").unwrap(),
-            MergeObservation::Merged { merge_sha: "synthetic-merge".into() });
+        assert_eq!(
+            parse_github_merge_observation(&value, "original-head").unwrap(),
+            MergeObservation::Merged {
+                merge_sha: "synthetic-merge".into()
+            }
+        );
     }
 
     #[test]
@@ -15018,7 +15416,8 @@ README-Update-Reason: synthetic fixture\n\nbody"
             mutation_permit: Option<&DeliveryMutationPermit>,
         ) -> Result<(), String> {
             exact_open_pr_projection(
-                self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+                self.observe_explained_open_pr(head, base, expected_head_sha)
+                    .await?,
                 Some(number),
                 expected_head_sha,
             )?
@@ -15080,7 +15479,8 @@ README-Update-Reason: synthetic fixture\n\nbody"
             *remote = Some((title, body.to_string()));
             drop(remote);
             exact_updated_pr_projection(
-                self.observe_explained_open_pr(head, base, expected_head_sha).await?,
+                self.observe_explained_open_pr(head, base, expected_head_sha)
+                    .await?,
                 number,
                 body,
                 head,
@@ -15329,15 +15729,9 @@ README-Update-Reason: synthetic fixture\n\nbody"
         ) -> Result<ObservationStatus, String> {
             // U28: default stays Unsupported so every pre-existing test keeps its
             // old outcome; a release-only test opts in by setting a verdict.
-            Ok(self
-                .calls
-                .live_status
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or(ObservationStatus::Unsupported(
-                    "stub live verifier not configured".into(),
-                )))
+            Ok(self.calls.live_status.lock().unwrap().clone().unwrap_or(
+                ObservationStatus::Unsupported("stub live verifier not configured".into()),
+            ))
         }
 
         async fn release_asset_names(&self, _sha: &str) -> Result<Option<Vec<String>>, String> {
@@ -16075,7 +16469,10 @@ else:
         assert!(out.summary.contains("CI 正在进行"), "{}", out.summary);
         let next = out.next_action.as_deref().unwrap_or_default();
         assert!(next.contains("background_task_start"), "{next}");
-        assert!(next.contains("180"), "推荐间隔必须说明 M114 的 180s 下限：{next}");
+        assert!(
+            next.contains("180"),
+            "推荐间隔必须说明 M114 的 180s 下限：{next}"
+        );
     }
 
     #[tokio::test]
@@ -16532,28 +16929,83 @@ Release-Urgency: hold"
             let parent = capture_delivery_identity(&repo).unwrap();
             let plan = prepare_scoped_commit(&root, &[]).unwrap();
             let message = "fix: initial receipted change";
-            let head = git(&root, &["-c", "user.name=CodeFactory", "-c", "user.email=noreply@codefactory.local", "commit-tree", &plan.target_tree_sha, "-p", &parent.head_sha, "-m", message]).unwrap();
-            let evidence = LocalCommitIntentEvidence::prepared(&parent, &repo.branch, &plan.original_index_tree_sha, &plan.original_index_digest, &plan.target_index_digest, &plan.source_manifest_digest, &plan.target_tree_sha, &head, message);
-            materialize_receipted_local_commit(&root, Some("main"), "feat/x", &parent, &evidence).unwrap();
+            let head = git(
+                &root,
+                &[
+                    "-c",
+                    "user.name=CodeFactory",
+                    "-c",
+                    "user.email=noreply@codefactory.local",
+                    "commit-tree",
+                    &plan.target_tree_sha,
+                    "-p",
+                    &parent.head_sha,
+                    "-m",
+                    message,
+                ],
+            )
+            .unwrap();
+            let evidence = LocalCommitIntentEvidence::prepared(
+                &parent,
+                &repo.branch,
+                &plan.original_index_tree_sha,
+                &plan.original_index_digest,
+                &plan.target_index_digest,
+                &plan.source_manifest_digest,
+                &plan.target_tree_sha,
+                &head,
+                message,
+            );
+            materialize_receipted_local_commit(&root, Some("main"), "feat/x", &parent, &evidence)
+                .unwrap();
             for edit in 0..edits {
                 std::fs::write(root.join("feature.rs"), format!("// follow-up {edit}\n")).unwrap();
             }
             git(&root, &["add", "feature.rs"]).unwrap();
             let index = git(&root, &["write-tree"]).unwrap();
-            let observed = observe_receipted_local_commit(&root, Some("main"), "feat/x", &parent, &evidence).unwrap();
+            let observed =
+                observe_receipted_local_commit(&root, Some("main"), "feat/x", &parent, &evidence)
+                    .unwrap();
             assert_eq!(observed.head_sha, head);
             assert_eq!(git(&root, &["write-tree"]).unwrap(), index);
             assert_eq!(git(&root, &["rev-parse", "HEAD"]).unwrap(), head);
             let calls = stub_calls();
-            let remote = StubRemote { ci: CiStatus::Success, existing_pr: None, merge_queues: false, merge_ok: true, caps: every_capability(), calls };
-            let outcome = deliver(&root, DeliveryCeiling::PrOnly, MergeMethod::Squash, 1, &DeliverOpts { title: Some("fix: follow-up edit".into()), expect_branch: Some("feat/x".into()), expected_identity: Some(observed), ..DeliverOpts::default() }, Some(&remote), Some("main")).await;
+            let remote = StubRemote {
+                ci: CiStatus::Success,
+                existing_pr: None,
+                merge_queues: false,
+                merge_ok: true,
+                caps: every_capability(),
+                calls,
+            };
+            let outcome = deliver(
+                &root,
+                DeliveryCeiling::PrOnly,
+                MergeMethod::Squash,
+                1,
+                &DeliverOpts {
+                    title: Some("fix: follow-up edit".into()),
+                    expect_branch: Some("feat/x".into()),
+                    expected_identity: Some(observed),
+                    ..DeliverOpts::default()
+                },
+                Some(&remote),
+                Some("main"),
+            )
+            .await;
             assert_ne!(outcome.final_state, "blocked", "{:?}", outcome.steps);
             let next = git(&root, &["rev-parse", "HEAD"]).unwrap();
             assert_ne!(next, head);
             assert_eq!(git(&root, &["rev-parse", "HEAD^"]).unwrap(), head);
-            assert_eq!(observe_remote_branch_head(&repo).unwrap().as_deref(), Some(next.as_str()));
+            assert_eq!(
+                observe_remote_branch_head(&repo).unwrap().as_deref(),
+                Some(next.as_str())
+            );
             assert!(remote_head_is_own_pushed_commit(&repo, &head, &next));
-            assert_eq!(std::fs::read_to_string(root.join("feature.rs")).unwrap(), format!("// follow-up {}\n", edits - 1));
+            assert_eq!(
+                std::fs::read_to_string(root.join("feature.rs")).unwrap(),
+                format!("// follow-up {}\n", edits - 1)
+            );
             std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
         }
     }
@@ -16786,12 +17238,40 @@ Release-Urgency: hold"
             let main = git(&root, &["rev-parse", "main"]).unwrap();
             let actual = match kind {
                 "own-push" => {
-                    let next = git(&root, &["commit-tree", &tree, "-p", &persisted.head_sha, "-m", "own child"]).unwrap();
-                    git(&root, &["push", "-q", "origin", &format!("{next}:refs/heads/feat/x")]).unwrap();
+                    let next = git(
+                        &root,
+                        &[
+                            "commit-tree",
+                            &tree,
+                            "-p",
+                            &persisted.head_sha,
+                            "-m",
+                            "own child",
+                        ],
+                    )
+                    .unwrap();
+                    git(
+                        &root,
+                        &["push", "-q", "origin", &format!("{next}:refs/heads/feat/x")],
+                    )
+                    .unwrap();
                     next
                 }
                 "ancestor" => main.clone(),
-                "queue" => git(&root, &["commit-tree", &tree, "-p", &persisted.head_sha, "-p", &main, "-m", "queue update"]).unwrap(),
+                "queue" => git(
+                    &root,
+                    &[
+                        "commit-tree",
+                        &tree,
+                        "-p",
+                        &persisted.head_sha,
+                        "-p",
+                        &main,
+                        "-m",
+                        "queue update",
+                    ],
+                )
+                .unwrap(),
                 _ => git(&root, &["commit-tree", &tree, "-m", "foreign root"]).unwrap(),
             };
             // Test the policy and actual metadata read path with a real hook
@@ -16801,33 +17281,95 @@ Release-Urgency: hold"
             std::fs::write(&hook, format!(
                 "import json,sys\nr=json.load(sys.stdin)\nprint(json.dumps({{'status':'open','number':7,'url':'https://example/pr/7','title':'fix: synthetic','body':'body','head_sha':'{actual}'}}))\n"
             )).unwrap();
-            let adapter = HookRemote::new("synthetic".into(), format!("python3 {}", hook.display()), root.clone());
+            let adapter = HookRemote::new(
+                "synthetic".into(),
+                format!("python3 {}", hook.display()),
+                root.clone(),
+            );
             let expected = kind != "foreign";
-            assert_eq!(adapter.head_is_explained(&persisted.head_sha, &actual), expected, "policy {kind}");
-            let metadata = adapter.observe_explained_open_pr("feat/x", "main", &persisted.head_sha).await.unwrap();
-            assert_eq!(exact_updated_pr_projection(metadata, 7, "body", "feat/x", "main", &persisted.head_sha).is_ok(), expected, "metadata {kind}");
+            assert_eq!(
+                adapter.head_is_explained(&persisted.head_sha, &actual),
+                expected,
+                "policy {kind}"
+            );
+            let metadata = adapter
+                .observe_explained_open_pr("feat/x", "main", &persisted.head_sha)
+                .await
+                .unwrap();
+            assert_eq!(
+                exact_updated_pr_projection(
+                    metadata,
+                    7,
+                    "body",
+                    "feat/x",
+                    "main",
+                    &persisted.head_sha
+                )
+                .is_ok(),
+                expected,
+                "metadata {kind}"
+            );
             // Isolate canonical checking from branch checking, then exercise
             // the remote-branch fence with the very same head.
             for branch_moved in [false, true] {
                 if branch_moved {
-                    git(&root, &["push", "-q", "origin", &format!("{actual}:refs/fixture/observed")]).unwrap();
-                    git(&root.parent().unwrap().join("origin.git"), &["update-ref", "refs/heads/feat/x", &actual]).unwrap();
+                    git(
+                        &root,
+                        &[
+                            "push",
+                            "-q",
+                            "origin",
+                            &format!("{actual}:refs/fixture/observed"),
+                        ],
+                    )
+                    .unwrap();
+                    git(
+                        &root.parent().unwrap().join("origin.git"),
+                        &["update-ref", "refs/heads/feat/x", &actual],
+                    )
+                    .unwrap();
                 }
                 let calls = stub_calls();
                 *calls.pr_head.lock().unwrap() = Some(actual.clone());
-                let remote = StubRemote { ci: CiStatus::Success, existing_pr: None,
-                    merge_queues: false, merge_ok: true, caps: every_capability(), calls };
+                let remote = StubRemote {
+                    ci: CiStatus::Success,
+                    existing_pr: None,
+                    merge_queues: false,
+                    merge_ok: true,
+                    caps: every_capability(),
+                    calls,
+                };
                 let result = observe_delivery_takeover_with_receipted_parent(
-                    &root, Some("main"), "feat/x", &persisted, Some(7), Some("https://example/pr/7"), None, Some(&remote),
-                ).await;
-                assert_eq!(result.is_ok(), expected, "takeover/canonical {kind}, branch_moved={branch_moved}: {result:?}");
+                    &root,
+                    Some("main"),
+                    "feat/x",
+                    &persisted,
+                    Some(7),
+                    Some("https://example/pr/7"),
+                    None,
+                    Some(&remote),
+                )
+                .await;
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "takeover/canonical {kind}, branch_moved={branch_moved}: {result:?}"
+                );
             }
             // Local takeover after a queue-sync fast forward uses the policy too.
             if kind == "queue" {
                 git(&root, &["reset", "--hard", &actual]).unwrap();
                 let result = observe_delivery_takeover_with_receipted_parent::<StubRemote>(
-                    &root, Some("main"), "feat/x", &persisted, None, None, None, None,
-                ).await;
+                    &root,
+                    Some("main"),
+                    "feat/x",
+                    &persisted,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
                 assert!(result.is_ok(), "local takeover queue: {result:?}");
             }
             persisted.head_sha.clear();
@@ -16852,24 +17394,53 @@ Release-Urgency: hold"
             let sync = if merged {
                 git(&root, &["commit-tree", &tree, "-m", "foreign after merge"]).unwrap()
             } else {
-                git(&root, &["commit-tree", &tree, "-p", &persisted.head_sha, "-p", &main, "-m", "queue update"]).unwrap()
+                git(
+                    &root,
+                    &[
+                        "commit-tree",
+                        &tree,
+                        "-p",
+                        &persisted.head_sha,
+                        "-p",
+                        &main,
+                        "-m",
+                        "queue update",
+                    ],
+                )
+                .unwrap()
             };
             // Simulate the forge writing origin without updating this checkout's
             // tracking ref. Merely looking like our own push cannot pass it.
             let origin = root.parent().unwrap().join("origin.git");
-            git(&root, &["push", "-q", "origin", &format!("{sync}:refs/fixture/sync")]).unwrap();
+            git(
+                &root,
+                &["push", "-q", "origin", &format!("{sync}:refs/fixture/sync")],
+            )
+            .unwrap();
             git(&origin, &["update-ref", "refs/heads/feat/x", &sync]).unwrap();
             let calls = stub_calls();
             *calls.pr_head.lock().unwrap() = Some(sync.clone());
             calls.merged.store(merged, Ordering::SeqCst);
             let remote = StubRemote {
-                ci: CiStatus::Success, existing_pr: None, merge_queues: false,
-                merge_ok: true, caps: every_capability(), calls,
+                ci: CiStatus::Success,
+                existing_pr: None,
+                merge_queues: false,
+                merge_ok: true,
+                caps: every_capability(),
+                calls,
             };
             let observation = observe_delivery_takeover_with_receipted_parent(
-                &root, Some("main"), "feat/x", &persisted, Some(7),
-                Some("https://github.com/example/project/pull/7"), None, Some(&remote),
-            ).await.expect("queue sync or confirmed merge must not fail on branch drift");
+                &root,
+                Some("main"),
+                "feat/x",
+                &persisted,
+                Some(7),
+                Some("https://github.com/example/project/pull/7"),
+                None,
+                Some(&remote),
+            )
+            .await
+            .expect("queue sync or confirmed merge must not fail on branch drift");
             assert_eq!(observation.canonical_pr_number, Some(7));
             assert_eq!(observation.remote_head_sha.as_deref(), Some(sync.as_str()));
             std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
@@ -17032,7 +17603,10 @@ Release-Urgency: hold"
         git(&root, &["add", "child.rs"]).unwrap();
         commit("fix: delivery child");
         git(&root, &["push", "-q", "origin", "feat/x"]).unwrap();
-        let child = git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let child = git(&root, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
         std::fs::write(root.join("local.rs"), "pub fn local() {}\n").unwrap();
         git(&root, &["add", "local.rs"]).unwrap();
         commit("fix: local follow-up");
@@ -17635,7 +18209,9 @@ Release-Urgency: hold"
             "停止之后 CI 变绿，合并仍然不能发生"
         );
         assert!(
-            !out.steps.iter().any(|s| s.step == "merge" && s.status == "ok"),
+            !out.steps
+                .iter()
+                .any(|s| s.step == "merge" && s.status == "ok"),
             "{:?}",
             out.steps
         );
@@ -17662,13 +18238,24 @@ Release-Urgency: hold"
             calls: calls.clone(),
         };
         let out = deliver(
-            &root, DeliveryCeiling::ThroughMerge, MergeMethod::Squash, 5,
-            &DeliverOpts { stop_gate: Some(gate), ..DeliverOpts::default() },
-            Some(&remote), Some("main"),
-        ).await;
+            &root,
+            DeliveryCeiling::ThroughMerge,
+            MergeMethod::Squash,
+            5,
+            &DeliverOpts {
+                stop_gate: Some(gate),
+                ..DeliverOpts::default()
+            },
+            Some(&remote),
+            Some("main"),
+        )
+        .await;
         assert_eq!(out.final_state, "stopped", "{:?}", out.steps);
-        assert_eq!(calls.queue_arms.load(Ordering::SeqCst), 0,
-            "M47: a green CI response must not authorize merging after explicit stop");
+        assert_eq!(
+            calls.queue_arms.load(Ordering::SeqCst),
+            0,
+            "M47: a green CI response must not authorize merging after explicit stop"
+        );
         assert_eq!(calls.open_pr.load(Ordering::SeqCst), 1);
         assert_eq!(calls.merge.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
@@ -17707,7 +18294,11 @@ Release-Urgency: hold"
             )
             .await;
             assert_eq!(out.final_state, "stopped", "{:?}", out.steps);
-            assert!(out.summary.contains("本地改动保留在工作区"), "{}", out.summary);
+            assert!(
+                out.summary.contains("本地改动保留在工作区"),
+                "{}",
+                out.summary
+            );
         }
 
         assert_eq!(calls.open_pr.load(Ordering::SeqCst), 0);
@@ -17759,7 +18350,11 @@ Release-Urgency: hold"
             git(&origin, &["show-ref", "--verify", "refs/heads/feat/x"]).is_err(),
             "停止在推送之前，远端不应出现这个分支"
         );
-        assert!(out.summary.contains("本地改动保留在工作区"), "{}", out.summary);
+        assert!(
+            out.summary.contains("本地改动保留在工作区"),
+            "{}",
+            out.summary
+        );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -18959,7 +19554,8 @@ GITHUB.COM:
     // ── CF-TRUTH-R2: the delivery subject must be a real conventional title ──
 
     fn git_in(root: &std::path::Path, args: &[&str]) {
-        let status = std::process::Command::new("git").no_window()
+        let status = std::process::Command::new("git")
+            .no_window()
             .arg("-C")
             .arg(root)
             .args(args)
@@ -18986,7 +19582,12 @@ GITHUB.COM:
         git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
         git_in(
             root,
-            &["checkout", "-q", "-b", "codefactory/objective-b8af1a61fd71788e579add0a1cd6fb3c"],
+            &[
+                "checkout",
+                "-q",
+                "-b",
+                "codefactory/objective-b8af1a61fd71788e579add0a1cd6fb3c",
+            ],
         );
 
         // The pre-fix behaviour is kept as an explicit negative control: this is
@@ -19016,8 +19617,11 @@ GITHUB.COM:
 
         // The commit this delivery writes carries that exact subject, and it is
         // the same string the PR title uses.
-        let message =
-            generate_commit_message_for_paths("codefactory/objective-b8af1a61", Some(&title), &staged);
+        let message = generate_commit_message_for_paths(
+            "codefactory/objective-b8af1a61",
+            Some(&title),
+            &staged,
+        );
         assert_eq!(message.lines().next(), Some(title.as_str()));
         assert!(
             conventional_slot(message.lines().next().unwrap()) > 0,
@@ -19035,13 +19639,21 @@ GITHUB.COM:
         git_in(root, &["commit", "-q", "-m", "chore: old local baseline"]);
         git_in(root, &["branch", "work/task"]);
         std::fs::write(root.join("file.txt"), "unrelated upstream\n").unwrap();
-        git_in(root, &["commit", "-qam", "feat(release): unrelated main change"]);
+        git_in(
+            root,
+            &["commit", "-qam", "feat(release): unrelated main change"],
+        );
         git_in(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git_in(root, &["checkout", "-q", "work/task"]);
         git_in(root, &["reset", "--hard", "origin/main"]);
         // Local main is stale, but the managed branch includes latest origin/main.
-        let title = canonical_delivery_title(root, "work/task", "main", None,
-            &["src-tauri/src/agent/objective.rs".into()]);
+        let title = canonical_delivery_title(
+            root,
+            "work/task",
+            "main",
+            None,
+            &["src-tauri/src/agent/objective.rs".into()],
+        );
         assert_ne!(title, "feat(release): unrelated main change");
         assert!(title.starts_with("fix:"));
     }
@@ -19049,8 +19661,10 @@ GITHUB.COM:
     #[test]
     fn m66_missing_change_and_title_fails_closed() {
         let sandbox = tempfile::tempdir().unwrap();
-        assert!(canonical_delivery_title(sandbox.path(), "work/task", "main", None, &[]).is_empty(),
-            "no evidence for a title must not fabricate a deliverable subject");
+        assert!(
+            canonical_delivery_title(sandbox.path(), "work/task", "main", None, &[]).is_empty(),
+            "no evidence for a title must not fabricate a deliverable subject"
+        );
     }
 
     #[test]
@@ -19059,7 +19673,10 @@ GITHUB.COM:
         git(&root, &["add", "feature.rs"]).unwrap();
         git(&root, &["commit", "-q", "-m", "feature"]).unwrap();
         let title = canonical_delivery_title(&root, "feat/x", "main", None, &[]);
-        assert!(title.starts_with("fix:"), "own committed paths must derive a title: {title:?}");
+        assert!(
+            title.starts_with("fix:"),
+            "own committed paths must derive a title: {title:?}"
+        );
     }
 
     /// A supplied conventional title is never rewritten: the caller's judgement
@@ -19071,11 +19688,21 @@ GITHUB.COM:
             "src-tauri/src/agent/delivery.rs".to_string(),
             "src-tauri/src/agent/objective.rs".to_string(),
         ];
-        let derived = canonical_delivery_title(sandbox.path(),
-            "codefactory/objective-synthetic", "main", None, &paths);
-        assert!(!derived.is_empty(), "change evidence must still name the change");
-        assert!(!derived.contains("file(s)") && !derived.contains("update "),
-            "a file count is not a title: {derived:?}");
+        let derived = canonical_delivery_title(
+            sandbox.path(),
+            "codefactory/objective-synthetic",
+            "main",
+            None,
+            &paths,
+        );
+        assert!(
+            !derived.is_empty(),
+            "change evidence must still name the change"
+        );
+        assert!(
+            !derived.contains("file(s)") && !derived.contains("update "),
+            "a file count is not a title: {derived:?}"
+        );
         assert_eq!(derived, "fix: agent");
     }
 
@@ -19087,13 +19714,15 @@ GITHUB.COM:
         git(&root, &["commit", "-q", "-m", title]).unwrap();
         std::fs::write(root.join("feature.rs"), "followup").unwrap();
         git(&root, &["commit", "-qam", "feat: update 3 file(s)"]).unwrap();
-        let selected = canonical_delivery_title(&root, "feat/x", "main", None,
-            &["feature.rs".into()]);
+        let selected =
+            canonical_delivery_title(&root, "feat/x", "main", None, &["feature.rs".into()]);
         assert_eq!(selected, title);
         let message = generate_commit_message_for_paths("feat/x", Some(&selected), &[]);
         assert_eq!(message.lines().next(), Some(title));
-        assert_eq!(canonical_delivery_title(&root, "feat/x", "main",
-            Some("fix: update 8 file(s)"), &[]), title);
+        assert_eq!(
+            canonical_delivery_title(&root, "feat/x", "main", Some("fix: update 8 file(s)"), &[]),
+            title
+        );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -19126,7 +19755,8 @@ GITHUB.COM:
         git_in(root, &["add", "."]);
         git_in(root, &["commit", "-q", "-m", "chore: baseline"]);
         let base = String::from_utf8(
-            std::process::Command::new("git").no_window()
+            std::process::Command::new("git")
+                .no_window()
                 .arg("-C")
                 .arg(root)
                 .args(["rev-parse", "HEAD"])
@@ -19156,7 +19786,8 @@ GITHUB.COM:
             .expect("repository root")
             .to_path_buf();
         let plan = |revision_range: &str| -> serde_json::Value {
-            let output = std::process::Command::new("python3").no_window()
+            let output = std::process::Command::new("python3")
+                .no_window()
                 .arg(repo_root.join("tools/release/plan_release.py"))
                 .arg("--repo")
                 .arg(root)
@@ -19181,7 +19812,16 @@ GITHUB.COM:
 
         // Negative control: the placeholder subject from the field session is
         // exactly what made this plan skip the whole batch.
-        git_in(root, &["commit", "-q", "--allow-empty", "-m", FIELD_PLACEHOLDER_TITLE]);
+        git_in(
+            root,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                FIELD_PLACEHOLDER_TITLE,
+            ],
+        );
         let placeholder = plan(&format!("{head}..HEAD"));
         assert_eq!(placeholder["skip"], true);
         assert_eq!(placeholder["slot"], "none");
@@ -19244,8 +19884,7 @@ mod thin_body_contract_tests {
 
     #[test]
     fn assembly_adds_the_readme_declaration_once() {
-        let assembled =
-            apply_readme_declaration("## Summary\n\nsynthetic change", false).unwrap();
+        let assembled = apply_readme_declaration("## Summary\n\nsynthetic change", false).unwrap();
         assert!(assembled.changed);
         let body = append_release_urgency(assembled.body, None);
         assert_eq!(body.matches("README-Update:").count(), 1, "{body}");
@@ -19320,7 +19959,8 @@ mod m156_trailer_tests {
     /// declaration lines, so the README contract failed after the PR was open.
     #[test]
     fn missing_readme_declaration_is_restored_exactly_once() {
-        let body = "Summary line for the PR.\n\n## 变更\n\n- one thing\n\nRelease-Urgency: immediate\n";
+        let body =
+            "Summary line for the PR.\n\n## 变更\n\n- one thing\n\nRelease-Urgency: immediate\n";
         let declared = apply_readme_declaration(body, false)
             .expect("README declaration must be derivable")
             .body;
@@ -19328,20 +19968,32 @@ mod m156_trailer_tests {
         let decisions = lines_starting_with(&normalized, "README-Update:");
         assert_eq!(decisions.len(), 1, "{normalized}");
         assert!(
-            matches!(decisions[0].as_str(), "README-Update: required" | "README-Update: reviewed"),
+            matches!(
+                decisions[0].as_str(),
+                "README-Update: required" | "README-Update: reviewed"
+            ),
             "{normalized}"
         );
         let reasons = lines_starting_with(&normalized, "README-Update-Reason:");
         assert_eq!(reasons.len(), 1, "{normalized}");
         assert!(
-            reasons[0].trim_start_matches("README-Update-Reason:").trim().len() >= 4,
+            reasons[0]
+                .trim_start_matches("README-Update-Reason:")
+                .trim()
+                .len()
+                >= 4,
             "{normalized}"
         );
         assert!(
-            normalized.trim_end().ends_with("Release-Urgency: immediate"),
+            normalized
+                .trim_end()
+                .ends_with("Release-Urgency: immediate"),
             "trailer must stay the footer\n{normalized}"
         );
-        assert!(pr_body_trailer_problems(&normalized).is_empty(), "{normalized}");
+        assert!(
+            pr_body_trailer_problems(&normalized).is_empty(),
+            "{normalized}"
+        );
     }
 
     /// #842: `Release-Urgency: immediate —— 说明` was not a pure value, so
@@ -19399,7 +20051,11 @@ mod m156_trailer_tests {
             "{}",
             normalized.body
         );
-        assert!(normalized.body.contains("后面又补了一段"), "{}", normalized.body);
+        assert!(
+            normalized.body.contains("后面又补了一段"),
+            "{}",
+            normalized.body
+        );
         assert!(pr_body_trailer_problems(&normalized.body).is_empty());
     }
 
@@ -19407,8 +20063,7 @@ mod m156_trailer_tests {
     /// one machine-read line, and the explicit call argument is authoritative.
     #[test]
     fn duplicate_and_conflicting_trailers_collapse_to_one() {
-        let duplicated =
-            "Summary.\n\nRelease-Urgency: immediate\n\nRelease-Urgency: immediate\n";
+        let duplicated = "Summary.\n\nRelease-Urgency: immediate\n\nRelease-Urgency: immediate\n";
         let normalized = normalize_pr_body_trailers(duplicated, None);
         assert_eq!(
             lines_starting_with(&normalized.body, "Release-Urgency:"),
@@ -19424,7 +20079,10 @@ mod m156_trailer_tests {
             "{}",
             decided.body
         );
-        assert!(decided.notes.iter().any(|note| note.contains("只保留第一个")));
+        assert!(decided
+            .notes
+            .iter()
+            .any(|note| note.contains("只保留第一个")));
 
         let explicit = normalize_pr_body_trailers(conflicting, Some(ReleaseUrgency::Hold));
         assert_eq!(

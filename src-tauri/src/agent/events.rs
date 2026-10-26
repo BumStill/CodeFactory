@@ -45,12 +45,22 @@ mod tests {
     #[test]
     fn stream_payload_retains_root_and_original_event_fields() {
         for root in ["old-root", "next-root"] {
-            let payload = scoped_payload(&StreamEvent::TextDelta { content: "synthetic".into() }, Some(root));
+            let payload = scoped_payload(
+                &StreamEvent::TextDelta {
+                    content: "synthetic".into(),
+                },
+                Some(root),
+            );
             assert_eq!(payload["type"], "text_delta");
             assert_eq!(payload["content"], "synthetic");
             assert_eq!(payload["source_root_turn_id"], root);
         }
-        let legacy = scoped_payload(&StreamEvent::TextDelta { content: "legacy".into() }, None);
+        let legacy = scoped_payload(
+            &StreamEvent::TextDelta {
+                content: "legacy".into(),
+            },
+            None,
+        );
         assert!(legacy.get("source_root_turn_id").is_none());
     }
 }

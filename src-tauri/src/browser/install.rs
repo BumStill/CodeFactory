@@ -118,8 +118,8 @@ fn install_root_candidates_from(
     home_dir: Option<PathBuf>,
     temp_dir: Option<PathBuf>,
 ) -> Vec<PathBuf> {
-    let local = local_data_dir
-        .map(|dir| append_segments(dir.join("CodeFactory"), BROWSER_CACHE_SEGMENTS));
+    let local =
+        local_data_dir.map(|dir| append_segments(dir.join("CodeFactory"), BROWSER_CACHE_SEGMENTS));
     let home =
         home_dir.map(|home| append_segments(home.join(".codefactory"), BROWSER_CACHE_SEGMENTS));
     let temp = temp_dir.map(|dir| append_segments(dir.join("CodeFactory"), BROWSER_CACHE_SEGMENTS));
@@ -244,7 +244,9 @@ pub enum InstallState {
     /// Nothing usable — the caller should download. `previous` names a version
     /// whose directory exists but is unusable, so the UI can say "repairing"
     /// instead of "installing".
-    Missing { previous: Option<String> },
+    Missing {
+        previous: Option<String>,
+    },
 }
 
 /// Look for a usable browser under `root`.
@@ -277,12 +279,17 @@ pub fn detect(root: &Path, platform: Platform) -> InstallState {
 ///
 /// Returns the root it was found in alongside the state, so a repair writes back
 /// where the broken install already is instead of splitting it across two trees.
-pub fn detect_in_any(candidates: &[PathBuf], platform: Platform) -> (Option<PathBuf>, InstallState) {
+pub fn detect_in_any(
+    candidates: &[PathBuf],
+    platform: Platform,
+) -> (Option<PathBuf>, InstallState) {
     let mut repairable: Option<(PathBuf, String)> = None;
     for root in candidates {
         match detect(root, platform) {
             InstallState::Ready(found) => return (Some(root.clone()), InstallState::Ready(found)),
-            InstallState::Missing { previous: Some(version) } => {
+            InstallState::Missing {
+                previous: Some(version),
+            } => {
                 // Remember the first repairable install but keep looking: a
                 // complete install in a later root beats repairing this one.
                 if repairable.is_none() {
@@ -317,9 +324,7 @@ fn read_marker(root: &Path) -> Option<String> {
     // steer path construction.
     let ok = !version.is_empty()
         && version.len() <= 32
-        && version
-            .chars()
-            .all(|c| c.is_ascii_digit() || c == '.' );
+        && version.chars().all(|c| c.is_ascii_digit() || c == '.');
     ok.then(|| version.to_string())
 }
 
@@ -461,7 +466,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn install_root_policy_uses_windows_local_app_data_when_available() {
         let local = PathBuf::from(r"C:\Users\Ada\AppData\Local");
@@ -525,7 +529,10 @@ mod tests {
 
         // A single root is the bug this exists to fix: when the first choice is
         // not writable there has to be somewhere else to go.
-        assert!(candidates.len() >= 2, "a fallback root must exist: {candidates:?}");
+        assert!(
+            candidates.len() >= 2,
+            "a fallback root must exist: {candidates:?}"
+        );
         // Compared as text rather than with `starts_with`, which is component-wise
         // and so cannot match a Windows-shaped prefix when the test runs on Linux.
         let first = candidates[0].to_string_lossy().to_string();

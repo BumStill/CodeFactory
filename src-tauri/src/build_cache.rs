@@ -145,7 +145,9 @@ pub fn task_cache_root(workspace: &Path) -> PathBuf {
 /// The repository's shared cargo cache (used by `pnpm cargo:shared` and by the
 /// worktree post-checkout hook).
 pub fn shared_cache_root(main_checkout: &Path) -> PathBuf {
-    main_checkout.join(".codefactory-cache").join("cargo-target")
+    main_checkout
+        .join(".codefactory-cache")
+        .join("cargo-target")
 }
 
 /// CF-BLD-R5: two tasks must never share one target directory for their *final*
@@ -314,7 +316,11 @@ pub fn plan_eviction_protecting(
                 .is_some_and(|owner| protected_owners.iter().any(|kept| kept == owner))
     };
     let total: u64 = entries.iter().map(|e| e.bytes).sum();
-    let protected_bytes: u64 = entries.iter().filter(|e| protected(e)).map(|e| e.bytes).sum();
+    let protected_bytes: u64 = entries
+        .iter()
+        .filter(|e| protected(e))
+        .map(|e| e.bytes)
+        .sum();
     let mut evict = Vec::new();
     let mut freed_bytes = 0u64;
     if total > limit {
@@ -743,13 +749,14 @@ fn path_to_owner(relative: &Path) -> Option<String> {
     let mut parts: Vec<String> = relative
         .components()
         .filter_map(|component| match component {
-            std::path::Component::Normal(name) => {
-                Some(name.to_string_lossy().into_owned())
-            }
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
             _ => None,
         })
         .collect();
-    if parts.last().is_some_and(|last| last == ".codefactory-cache") {
+    if parts
+        .last()
+        .is_some_and(|last| last == ".codefactory-cache")
+    {
         parts.pop();
     }
     if parts.is_empty() {
@@ -970,20 +977,34 @@ pub fn workspace_is_ended(workspace_state: &str, objective_status: Option<&str>)
 }
 
 /// R2a uses persisted activity in milliseconds, never cache mtimes.
-pub fn failed_cache_is_idle(status: Option<&str>, last_activity_ms: i64, now_ms: i64, idle_ms: i64) -> bool {
-    status == Some("failed") && last_activity_ms > 0 && now_ms.saturating_sub(last_activity_ms) >= idle_ms
+pub fn failed_cache_is_idle(
+    status: Option<&str>,
+    last_activity_ms: i64,
+    now_ms: i64,
+    idle_ms: i64,
+) -> bool {
+    status == Some("failed")
+        && last_activity_ms > 0
+        && now_ms.saturating_sub(last_activity_ms) >= idle_ms
 }
 
 pub fn configured_failed_idle_ms() -> i64 {
     std::env::var("CODEFACTORY_FAILED_CACHE_IDLE_HOURS")
-        .ok().and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|hours| hours.is_finite() && *hours > 0.0 && *hours <= i64::MAX as f64 / 3_600_000.0)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|hours| {
+            hours.is_finite() && *hours > 0.0 && *hours <= i64::MAX as f64 / 3_600_000.0
+        })
         .map(|hours| (hours * 3_600_000.0).ceil() as i64)
         .unwrap_or(24 * 3_600_000)
 }
 
 pub fn sweep_trigger(first_pass: bool) -> &'static str {
-    if first_pass { "startup" } else { "runtime_sweep" }
+    if first_pass {
+        "startup"
+    } else {
+        "runtime_sweep"
+    }
 }
 
 /// Run R2, then the R8 backlog rule, then R1 — in that order, so the ceiling
@@ -1038,16 +1059,17 @@ pub fn maintain_entries(
             .filter(|entry| !removed.contains(&entry.path))
             .filter(|entry| !entry.in_use)
             .filter(|entry| {
-                !entry.owner.as_ref().is_some_and(|owner| {
-                    request
-                        .protected_owners
-                        .iter()
-                        .any(|kept| kept == owner)
-                })
+                !entry
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| request.protected_owners.iter().any(|kept| kept == owner))
             })
             .filter(|entry| {
                 entry.owner.as_ref().is_some_and(|owner| {
-                    request.orphan_owners.iter().any(|candidate| candidate == owner)
+                    request
+                        .orphan_owners
+                        .iter()
+                        .any(|candidate| candidate == owner)
                 })
             })
             .filter(|entry| entry.last_used_unix < request.idle_before_unix)
@@ -1085,8 +1107,7 @@ pub fn maintain_entries(
     evicted_bytes = evicted_bytes.saturating_add(apply_plan(&budget, request.trigger, log));
     removed.extend(budget.evict.iter().map(|entry| entry.path.clone()));
 
-    let after_bytes =
-        before_bytes.saturating_sub(reclaimed_bytes.saturating_add(evicted_bytes));
+    let after_bytes = before_bytes.saturating_sub(reclaimed_bytes.saturating_add(evicted_bytes));
     MaintenanceOutcome {
         scanned: entries.len(),
         before_bytes,
@@ -1424,16 +1445,25 @@ mod tests {
         );
         // Only the dependency cache is shared, and it is not inside a task.
         let shared = shared_cache_root(&PathBuf::from("/tmp/repo"));
-        assert_eq!(shared, PathBuf::from("/tmp/repo/.codefactory-cache/cargo-target"));
+        assert_eq!(
+            shared,
+            PathBuf::from("/tmp/repo/.codefactory-cache/cargo-target")
+        );
         // The shared lock wait is bounded: past the limit a task proceeds.
         assert!(shared_lock_within_limit(Duration::from_secs(30)));
-        assert!(!shared_lock_within_limit(SHARED_LOCK_WAIT_LIMIT + Duration::from_secs(1)));
+        assert!(!shared_lock_within_limit(
+            SHARED_LOCK_WAIT_LIMIT + Duration::from_secs(1)
+        ));
     }
 
     #[test]
     fn heavy_build_detection_matches_compile_and_full_test_commands_only() {
-        assert!(HeavyBuildLimiter::is_heavy_build_command("cargo test --workspace"));
-        assert!(HeavyBuildLimiter::is_heavy_build_command("CARGO_TARGET_DIR=/tmp/x cargo build"));
+        assert!(HeavyBuildLimiter::is_heavy_build_command(
+            "cargo test --workspace"
+        ));
+        assert!(HeavyBuildLimiter::is_heavy_build_command(
+            "CARGO_TARGET_DIR=/tmp/x cargo build"
+        ));
         assert!(HeavyBuildLimiter::is_heavy_build_command("pnpm test"));
         assert!(!HeavyBuildLimiter::is_heavy_build_command("git status"));
         assert!(!HeavyBuildLimiter::is_heavy_build_command("ls src-tauri"));
@@ -1497,13 +1527,48 @@ mod tests {
     fn failed_idle_boundary_and_activity_reset() {
         let now = 200_000_000i64;
         let hour = 3_600_000;
-        assert!(!failed_cache_is_idle(Some("failed"), now - 23 * hour, now, 24 * hour));
-        assert!(failed_cache_is_idle(Some("failed"), now - 25 * hour, now, 24 * hour));
-        assert!(!failed_cache_is_idle(Some("failed"), now - hour, now, 24 * hour));
-        assert!(!failed_cache_is_idle(Some("active"), now - 25 * hour, now, 24 * hour));
-        assert!(!failed_cache_is_idle(Some("failed"), now + hour, now, 24 * hour));
-        assert!(failed_cache_is_idle(Some("failed"), now - 24 * hour, now, 24 * hour));
-        assert!(failed_cache_is_idle(Some("failed"), now - 2 * hour, now, hour));
+        assert!(!failed_cache_is_idle(
+            Some("failed"),
+            now - 23 * hour,
+            now,
+            24 * hour
+        ));
+        assert!(failed_cache_is_idle(
+            Some("failed"),
+            now - 25 * hour,
+            now,
+            24 * hour
+        ));
+        assert!(!failed_cache_is_idle(
+            Some("failed"),
+            now - hour,
+            now,
+            24 * hour
+        ));
+        assert!(!failed_cache_is_idle(
+            Some("active"),
+            now - 25 * hour,
+            now,
+            24 * hour
+        ));
+        assert!(!failed_cache_is_idle(
+            Some("failed"),
+            now + hour,
+            now,
+            24 * hour
+        ));
+        assert!(failed_cache_is_idle(
+            Some("failed"),
+            now - 24 * hour,
+            now,
+            24 * hour
+        ));
+        assert!(failed_cache_is_idle(
+            Some("failed"),
+            now - 2 * hour,
+            now,
+            hour
+        ));
     }
 
     #[test]
@@ -1551,9 +1616,30 @@ mod tests {
     #[test]
     fn r2_runtime_pass_reclaims_ended_tasks_and_leaves_live_and_in_use_caches_alone() {
         let root = temp_dir("r2-runtime");
-        let live = owned(&root, "cargo-target-live", 4096, 1_700_000_000, false, "task-live");
-        let busy = owned(&root, "cargo-target-busy", 4096, 1_700_000_000, true, "task-done");
-        let done = owned(&root, "cargo-target-done", 8192, 1_700_000_000, false, "task-done");
+        let live = owned(
+            &root,
+            "cargo-target-live",
+            4096,
+            1_700_000_000,
+            false,
+            "task-live",
+        );
+        let busy = owned(
+            &root,
+            "cargo-target-busy",
+            4096,
+            1_700_000_000,
+            true,
+            "task-done",
+        );
+        let done = owned(
+            &root,
+            "cargo-target-done",
+            8192,
+            1_700_000_000,
+            false,
+            "task-done",
+        );
         let entries = vec![live.clone(), busy.clone(), done.clone()];
         let ended = vec!["task-done".to_string()];
         let none: Vec<String> = Vec::new();
@@ -1587,7 +1673,11 @@ mod tests {
         let ended: Vec<String> = Vec::new();
         let orphans = vec!["task-gone".to_string()];
 
-        let outcome = maintain_entries(&entries, &request(&root, &ended, &orphans, 5_000, u64::MAX), None);
+        let outcome = maintain_entries(
+            &entries,
+            &request(&root, &ended, &orphans, 5_000, u64::MAX),
+            None,
+        );
 
         assert_eq!(outcome.removed, vec![old.path.clone()]);
         assert!(
@@ -1608,8 +1698,11 @@ mod tests {
         let ended: Vec<String> = Vec::new();
         let none: Vec<String> = Vec::new();
 
-        let outcome =
-            maintain_entries(&[a.clone(), b.clone()], &request(&root, &ended, &none, 0, 4096), None);
+        let outcome = maintain_entries(
+            &[a.clone(), b.clone()],
+            &request(&root, &ended, &none, 0, 4096),
+            None,
+        );
 
         assert_eq!(outcome.evicted_bytes, 4096);
         assert_eq!(outcome.after_bytes, 4096);
@@ -1663,11 +1756,22 @@ mod tests {
 
         // Ask for more room than exists: the guard may clear every other task
         // but must never touch the directory this build is about to write into.
-        let freed = reclaim_until(&container, std::slice::from_ref(&mine), 64 * 1024, "test", None);
+        let freed = reclaim_until(
+            &container,
+            std::slice::from_ref(&mine),
+            64 * 1024,
+            "test",
+            None,
+        );
 
         assert_eq!(freed, 4096, "only the other task's cache is reclaimable");
-        assert!(mine.join("cargo-target-test").exists(), "the current build's cache is kept");
-        assert!(!task_cache_root(&container.join("task-two")).join("cargo-target-test").exists());
+        assert!(
+            mine.join("cargo-target-test").exists(),
+            "the current build's cache is kept"
+        );
+        assert!(!task_cache_root(&container.join("task-two"))
+            .join("cargo-target-test")
+            .exists());
     }
 
     #[test]
@@ -1677,7 +1781,10 @@ mod tests {
             assert_eq!(configured_budget_bytes(), DEFAULT_BUDGET_BYTES);
         }
         if std::env::var("CODEFACTORY_BUILD_CACHE_FLOOR_GB").is_err() {
-            assert_eq!(configured_free_space_floor_bytes(), DEFAULT_FREE_SPACE_FLOOR_BYTES);
+            assert_eq!(
+                configured_free_space_floor_bytes(),
+                DEFAULT_FREE_SPACE_FLOOR_BYTES
+            );
         }
         if std::env::var("CODEFACTORY_MAX_HEAVY_BUILDS").is_err() {
             assert_eq!(configured_max_heavy_builds(), DEFAULT_MAX_HEAVY_BUILDS);
@@ -1723,7 +1830,12 @@ mod tests {
         assert_eq!(report.heavy_build_limit, 1);
         assert!(report.heavy_build_status.is_none());
         let rendered = serde_json::to_value(&report).unwrap();
-        for field in ["total_bytes", "budget_bytes", "entries", "heavy_builds_running"] {
+        for field in [
+            "total_bytes",
+            "budget_bytes",
+            "entries",
+            "heavy_builds_running",
+        ] {
             assert!(rendered.get(field).is_some(), "report must carry {field}");
         }
     }
@@ -1752,7 +1864,11 @@ mod tests {
 
         let scanned = scan_workspace_container(&container);
 
-        assert_eq!(scanned.len(), 1, "nested task cache must be scanned: {scanned:?}");
+        assert_eq!(
+            scanned.len(),
+            1,
+            "nested task cache must be scanned: {scanned:?}"
+        );
         assert_eq!(scanned[0].bytes, 4096);
         assert_eq!(
             scanned[0].owner.as_deref(),
@@ -1764,7 +1880,9 @@ mod tests {
     #[test]
     fn owner_of_a_nested_worktree_is_the_workspace_path_not_the_repo_bucket() {
         let container = PathBuf::from("/data/execution-workspaces");
-        let worktree = container.join("94eef8f7b2987cbf").join("9836f5aa40c05ec34cd801fa");
+        let worktree = container
+            .join("94eef8f7b2987cbf")
+            .join("9836f5aa40c05ec34cd801fa");
         let expected = Some("94eef8f7b2987cbf/9836f5aa40c05ec34cd801fa".to_string());
 
         assert_eq!(owner_from_workspace_path(&worktree, &container), expected);
@@ -1811,9 +1929,30 @@ mod tests {
     #[test]
     fn r1_never_evicts_the_cache_of_a_task_that_can_still_continue() {
         let container = temp_dir("r1-protected");
-        let live_a = owned(&container, "cargo-target-live-a", 4096, 1_000, false, "repo-a/live");
-        let live_b = owned(&container, "cargo-target-live-b", 4096, 2_000, false, "repo-a/live");
-        let done = owned(&container, "cargo-target-done", 4096, 3_000, false, "repo-a/done");
+        let live_a = owned(
+            &container,
+            "cargo-target-live-a",
+            4096,
+            1_000,
+            false,
+            "repo-a/live",
+        );
+        let live_b = owned(
+            &container,
+            "cargo-target-live-b",
+            4096,
+            2_000,
+            false,
+            "repo-a/live",
+        );
+        let done = owned(
+            &container,
+            "cargo-target-done",
+            4096,
+            3_000,
+            false,
+            "repo-a/done",
+        );
         let entries = vec![live_a.clone(), live_b.clone(), done.clone()];
         let ended: Vec<String> = Vec::new();
         let orphans: Vec<String> = Vec::new();
@@ -1838,13 +1977,19 @@ mod tests {
         );
 
         assert_eq!(outcome.evicted_bytes, 4096);
-        assert!(!done.path.exists(), "the idle ended cache answers the ceiling");
+        assert!(
+            !done.path.exists(),
+            "the idle ended cache answers the ceiling"
+        );
         assert!(
             live_a.path.exists() && live_b.path.exists(),
             "a task that can still continue keeps its cache even over the ceiling"
         );
         assert_eq!(outcome.protected_bytes, 8192);
-        assert_eq!(outcome.overflow_bytes, 4096, "the shortfall is reported, not hidden");
+        assert_eq!(
+            outcome.overflow_bytes, 4096,
+            "the shortfall is reported, not hidden"
+        );
     }
 
     #[test]

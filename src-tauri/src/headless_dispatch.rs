@@ -64,7 +64,11 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// does not state it explicitly does not deserialize at all.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DispatchReleaseUrgency { Immediate, Default, Hold }
+pub enum DispatchReleaseUrgency {
+    Immediate,
+    Default,
+    Hold,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
@@ -102,7 +106,9 @@ pub enum Request {
         permission_mode: String,
     },
     /// CF-HDE-R1: query objective state / latest reply summary / PR number.
-    Status { session_id: String },
+    Status {
+        session_id: String,
+    },
     /// Explicit acceptance; does not authorize execution or remote mutations.
     /// `objective_id` disambiguates a session that holds several merged
     /// objectives awaiting acceptance.
@@ -119,7 +125,9 @@ pub enum Request {
         model: String,
     },
     /// CF-HDE-R6 (M27): switch the session shown in the GUI.
-    SwitchSession { session_id: String },
+    SwitchSession {
+        session_id: String,
+    },
     /// CF-HDE-R6: stop the current run.
     Stop {
         #[serde(default)]
@@ -129,7 +137,10 @@ pub enum Request {
     ListApprovals {},
     /// CF-HDE-R6: approve/deny one pending request. Approving still goes
     /// through the same permission rules — this is not a blanket grant.
-    ResolveApproval { approval_id: String, approve: bool },
+    ResolveApproval {
+        approval_id: String,
+        approve: bool,
+    },
     /// CF-HDE-R6 (M42): move the main window back to the main display.
     FocusMainDisplay {},
     /// CF-BLD-R4: reclaim what is safe to reclaim from the build cache
@@ -140,9 +151,17 @@ pub enum Request {
     /// talked into deleting a cache by the wording of a message.
     CleanBuildCache {},
     /// CF-QUOTA-R2: read the same subscription status as Settings.
-    SetSessionUsageWindowOverride { session_id: String, ignore: bool },
+    SetSessionUsageWindowOverride {
+        session_id: String,
+        ignore: bool,
+    },
     GetUsageWindows {},
-    SetUsageWindow { endpoint: String, #[serde(default)] model: Option<String>, rule: Option<crate::agent::usage_windows::UsageWindow> },
+    SetUsageWindow {
+        endpoint: String,
+        #[serde(default)]
+        model: Option<String>,
+        rule: Option<crate::agent::usage_windows::UsageWindow>,
+    },
     GetQuota {},
     /// CF-QUOTA-R2: partial per-endpoint cap update; no paid endpoint changes.
     SetQuotaCap {
@@ -154,7 +173,9 @@ pub enum Request {
     },
 }
 
-fn deserialize_quota_cap<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u8>, D::Error> {
+fn deserialize_quota_cap<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u8>, D::Error> {
     u8::deserialize(deserializer).map(Some)
 }
 
@@ -313,7 +334,9 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             objective_id,
         } => {
             require_non_empty("session_id", session_id)?;
-            if outcome != "accepted" { return Err(ErrorBody::invalid("outcome must be accepted")); }
+            if outcome != "accepted" {
+                return Err(ErrorBody::invalid("outcome must be accepted"));
+            }
             if let Some(objective_id) = objective_id {
                 require_non_empty("objective_id", objective_id)?;
             }
@@ -336,22 +359,40 @@ pub fn validate_request(request: &Request) -> Result<(), ErrorBody> {
             require_non_empty("approval_id", approval_id)?
         }
         Request::FocusMainDisplay {} => {}
-        Request::SetSessionUsageWindowOverride { session_id, .. } => require_non_empty("session_id", session_id)?,
+        Request::SetSessionUsageWindowOverride { session_id, .. } => {
+            require_non_empty("session_id", session_id)?
+        }
         Request::GetUsageWindows {} => {}
-        Request::SetUsageWindow { endpoint, model, rule } => {
+        Request::SetUsageWindow {
+            endpoint,
+            model,
+            rule,
+        } => {
             require_non_empty("endpoint", endpoint)?;
-            if let Some(model) = model { require_non_empty("model", model)?; }
-            if let Some(rule) = rule { rule.validate().map_err(ErrorBody::invalid)?; }
+            if let Some(model) = model {
+                require_non_empty("model", model)?;
+            }
+            if let Some(rule) = rule {
+                rule.validate().map_err(ErrorBody::invalid)?;
+            }
         }
         Request::CleanBuildCache {} | Request::GetQuota {} => {}
-        Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
+        Request::SetQuotaCap {
+            endpoint,
+            five_hour_percent,
+            weekly_percent,
+        } => {
             require_non_empty("endpoint", endpoint)?;
             if five_hour_percent.is_none() && weekly_percent.is_none() {
-                return Err(ErrorBody::invalid("at least one quota cap must be supplied"));
+                return Err(ErrorBody::invalid(
+                    "at least one quota cap must be supplied",
+                ));
             }
             for value in [five_hour_percent, weekly_percent].into_iter().flatten() {
                 if !(1..=100).contains(value) {
-                    return Err(ErrorBody::invalid("quota caps must be integers from 1 to 100"));
+                    return Err(ErrorBody::invalid(
+                        "quota caps must be integers from 1 to 100",
+                    ));
                 }
             }
         }
@@ -471,14 +512,28 @@ impl AuditEntry {
                 entry.message = Some(format!("ignore_usage_windows={ignore}"));
             }
             Request::GetUsageWindows {} => {}
-            Request::SetUsageWindow { endpoint, model, rule } => {
-                entry.message = Some(format!("endpoint={endpoint}; model={}; rule={}", model.as_deref().unwrap_or("<endpoint>"), serde_json::to_string(rule).unwrap_or_default()));
+            Request::SetUsageWindow {
+                endpoint,
+                model,
+                rule,
+            } => {
+                entry.message = Some(format!(
+                    "endpoint={endpoint}; model={}; rule={}",
+                    model.as_deref().unwrap_or("<endpoint>"),
+                    serde_json::to_string(rule).unwrap_or_default()
+                ));
             }
             Request::GetQuota {} => {}
-            Request::SetQuotaCap { endpoint, five_hour_percent, weekly_percent } => {
+            Request::SetQuotaCap {
+                endpoint,
+                five_hour_percent,
+                weekly_percent,
+            } => {
                 entry.message = Some(format!("endpoint={endpoint}; five_hour_percent={five_hour_percent:?}; weekly_percent={weekly_percent:?}"));
             }
-            Request::ListApprovals {} | Request::FocusMainDisplay {} | Request::CleanBuildCache {} => {}
+            Request::ListApprovals {}
+            | Request::FocusMainDisplay {}
+            | Request::CleanBuildCache {} => {}
             Request::ResolveApproval { approval_id, .. } => {
                 entry.message = Some(format!("approval_id={approval_id}"));
             }
@@ -561,9 +616,7 @@ pub trait DispatchHost: Send + Sync + 'static {
 /// "another local user" is testable without a second account.
 pub fn authorize_peer(peer_uid: u32, current_uid: u32) -> Result<(), ErrorBody> {
     if peer_uid != current_uid {
-        return Err(ErrorBody::denied(
-            "request came from a different user",
-        ));
+        return Err(ErrorBody::denied("request came from a different user"));
     }
     Ok(())
 }
@@ -935,7 +988,9 @@ pub mod client {
             .read_line(&mut line)
             .map_err(|error| ErrorBody::internal(format!("could not read reply: {error}")))?;
         if line.trim().is_empty() {
-            return Err(ErrorBody::internal("the app closed the connection".to_string()));
+            return Err(ErrorBody::internal(
+                "the app closed the connection".to_string(),
+            ));
         }
         Ok(line.trim().to_string())
     }
@@ -1014,8 +1069,7 @@ pub const DISPATCH_REQUEST_EVENT: &str = "dispatch:request";
 #[cfg(unix)]
 pub mod bridge {
     use super::{
-        operation_of, AuditLog, DispatchHost, ErrorBody, Request, Response,
-        DISPATCH_REQUEST_EVENT,
+        operation_of, AuditLog, DispatchHost, ErrorBody, Request, Response, DISPATCH_REQUEST_EVENT,
     };
     use std::collections::HashMap;
     use std::sync::mpsc::{channel, Receiver, Sender};
@@ -1035,7 +1089,10 @@ pub mod bridge {
         timeout: Duration,
     }
 
-    fn wait_for_interface(rx: Receiver<Response>, timeout: Duration) -> Result<serde_json::Value, ErrorBody> {
+    fn wait_for_interface(
+        rx: Receiver<Response>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, ErrorBody> {
         match rx.recv_timeout(timeout) {
             Ok(response) if response.ok => Ok(response.result.unwrap_or(serde_json::Value::Null)),
             Ok(response) => Err(response.error.unwrap_or_else(|| ErrorBody::internal("the request was refused"))),
@@ -1089,7 +1146,10 @@ pub mod bridge {
                 "request": request,
             });
             if let Err(error) = self.app.emit(DISPATCH_REQUEST_EVENT, payload) {
-                self.settle(&request_id, Response::failed(ErrorBody::internal("dropped")));
+                self.settle(
+                    &request_id,
+                    Response::failed(ErrorBody::internal("dropped")),
+                );
                 return Err(ErrorBody::internal(format!(
                     "could not reach the app interface: {error}"
                 )));
@@ -1126,17 +1186,29 @@ pub mod bridge {
             assert_eq!(error.code, "frontend_timeout");
             assert!(error.message.contains("frontend did not respond"));
             assert!(started.elapsed() < Duration::from_secs(1));
-            assert!(tx.send(Response::ok(serde_json::json!({"late": true}))).is_err());
+            assert!(tx
+                .send(Response::ok(serde_json::json!({"late": true})))
+                .is_err());
         }
 
         #[test]
         fn m83_reply_preserves_success_and_failure() {
             let (tx, rx) = channel();
-            tx.send(Response::ok(serde_json::json!({"synthetic": 42}))).unwrap();
-            assert_eq!(wait_for_interface(rx, Duration::from_millis(20)).unwrap()["synthetic"], 42);
+            tx.send(Response::ok(serde_json::json!({"synthetic": 42})))
+                .unwrap();
+            assert_eq!(
+                wait_for_interface(rx, Duration::from_millis(20)).unwrap()["synthetic"],
+                42
+            );
             let (tx, rx) = channel();
-            tx.send(Response::failed(ErrorBody::internal("synthetic failure"))).unwrap();
-            assert_eq!(wait_for_interface(rx, Duration::from_millis(20)).unwrap_err().message, "synthetic failure");
+            tx.send(Response::failed(ErrorBody::internal("synthetic failure")))
+                .unwrap();
+            assert_eq!(
+                wait_for_interface(rx, Duration::from_millis(20))
+                    .unwrap_err()
+                    .message,
+                "synthetic failure"
+            );
         }
     }
 
@@ -1159,7 +1231,9 @@ pub mod bridge {
 /// Move the main window back onto the main display. Native, so it works while
 /// the screen is locked.
 #[cfg(unix)]
-pub fn focus_main_display(app: &tauri::AppHandle<tauri::Wry>) -> Result<serde_json::Value, ErrorBody> {
+pub fn focus_main_display(
+    app: &tauri::AppHandle<tauri::Wry>,
+) -> Result<serde_json::Value, ErrorBody> {
     use tauri::Manager;
     let window = app
         .get_window("main")
@@ -1175,8 +1249,8 @@ pub fn focus_main_display(app: &tauri::AppHandle<tauri::Wry>) -> Result<serde_js
         .map_err(|error| ErrorBody::internal(format!("could not read the window size: {error}")))?;
 
     // Centre the window on the main display, never off its top-left corner.
-    let x = monitor_position.x
-        + ((monitor_size.width as i32 - window_size.width as i32).max(0) / 2);
+    let x =
+        monitor_position.x + ((monitor_size.width as i32 - window_size.width as i32).max(0) / 2);
     let y = monitor_position.y + 40;
 
     let already_there = window
@@ -1251,7 +1325,8 @@ mod tests {
     fn delivery_authorization_is_required_and_never_inferred_from_wording() {
         // The text explicitly asks for a merge, and the request still fails:
         // only the structured field can authorize delivery (M48).
-        let raw = r#"{"operation":"send","session_id":"s-1","message":"please open a PR and merge it"}"#;
+        let raw =
+            r#"{"operation":"send","session_id":"s-1","message":"please open a PR and merge it"}"#;
         assert!(parse_request(raw).is_err());
         let request = parse_request(&send_json("merge it", Some(false)))
             .expect("the explicit field is accepted as data");
@@ -1287,8 +1362,8 @@ mod tests {
         // CF-HDE-R8: `mode` is optional (absent = the interface's plain Enter,
         // i.e. steer), and an unknown direction is refused rather than guessed —
         // guessing wrong means the user thinks they interjected and they queued.
-        let absent = parse_request(&send_json("go", Some(false)))
-            .expect("send without mode stays legal");
+        let absent =
+            parse_request(&send_json("go", Some(false))).expect("send without mode stays legal");
         assert!(matches!(absent, Request::Send { mode: None, .. }));
         for mode in SEND_MODES {
             let raw = format!(
@@ -1318,13 +1393,19 @@ mod tests {
     #[test]
     fn field_validation_is_fail_closed() {
         assert!(parse_request(&send_json("   ", Some(false))).is_err());
-        assert!(parse_request(r#"{"operation":"send","session_id":"","message":"hi","delivery_authorized":false}"#).is_err());
+        assert!(parse_request(
+            r#"{"operation":"send","session_id":"","message":"hi","delivery_authorized":false}"#
+        )
+        .is_err());
         assert!(parse_request(
             r#"{"operation":"set_permission","session_id":"s-1","permission_mode":"godmode"}"#
         )
         .is_err());
         assert!(parse_request(r#"{"operation":"set_model","model":""}"#).is_err());
-        assert!(parse_request(r#"{"operation":"resolve_approval","approval_id":"","approve":true}"#).is_err());
+        assert!(parse_request(
+            r#"{"operation":"resolve_approval","approval_id":"","approve":true}"#
+        )
+        .is_err());
         for mode in PERMISSION_MODES {
             assert!(parse_request(&format!(
                 r#"{{"operation":"set_permission","session_id":"s-1","permission_mode":"{mode}"}}"#
@@ -1488,18 +1569,40 @@ mod unix_tests {
             fn execute(&self, request: &Request) -> Result<serde_json::Value, ErrorBody> {
                 let mut settings = self.0.lock().unwrap();
                 match request {
-                    Request::SetUsageWindow { endpoint, model, rule } => {
-                        if let Some(rule) = rule { rule.validate().map_err(ErrorBody::invalid)?; }
-                        let key = model.as_deref().map(|model| crate::agent::usage_windows::model_key(endpoint, model)).unwrap_or_else(|| endpoint.clone());
-                        let rules = if model.is_some() { &mut settings.model_usage_windows } else { &mut settings.endpoint_usage_windows };
-                        if let Some(rule) = rule { rules.insert(key, rule.clone()); } else { rules.remove(&key); }
+                    Request::SetUsageWindow {
+                        endpoint,
+                        model,
+                        rule,
+                    } => {
+                        if let Some(rule) = rule {
+                            rule.validate().map_err(ErrorBody::invalid)?;
+                        }
+                        let key = model
+                            .as_deref()
+                            .map(|model| crate::agent::usage_windows::model_key(endpoint, model))
+                            .unwrap_or_else(|| endpoint.clone());
+                        let rules = if model.is_some() {
+                            &mut settings.model_usage_windows
+                        } else {
+                            &mut settings.endpoint_usage_windows
+                        };
+                        if let Some(rule) = rule {
+                            rules.insert(key, rule.clone());
+                        } else {
+                            rules.remove(&key);
+                        }
                         Ok(serde_json::json!({"endpoint":endpoint,"model":model,"rule":rule}))
                     }
-                    Request::GetUsageWindows {} => Ok(serde_json::to_value(&settings.model_usage_windows).unwrap()),
+                    Request::GetUsageWindows {} => {
+                        Ok(serde_json::to_value(&settings.model_usage_windows).unwrap())
+                    }
                     Request::SetSessionUsageWindowOverride { session_id, ignore } => {
                         // 后台入口落到界面按钮用的同一个函数上，不另造一条路径。
-                        crate::agent::usage_windows::cache_session_override(session_id.clone(), *ignore)
-                            .map_err(ErrorBody::invalid)?;
+                        crate::agent::usage_windows::cache_session_override(
+                            session_id.clone(),
+                            *ignore,
+                        )
+                        .map_err(ErrorBody::invalid)?;
                         Ok(serde_json::json!({"session_id":session_id,"ignore":ignore}))
                     }
                     _ => Err(ErrorBody::invalid("unsupported test operation")),
@@ -1510,7 +1613,9 @@ mod unix_tests {
         let path = dir.path().join("window.sock");
         let audit_path = dir.path().join("audit.jsonl");
         let listener = socket::bind(&path).unwrap();
-        let host: std::sync::Arc<dyn DispatchHost> = std::sync::Arc::new(WindowHost(std::sync::Mutex::new(crate::config::settings::Settings::default())));
+        let host: std::sync::Arc<dyn DispatchHost> = std::sync::Arc::new(WindowHost(
+            std::sync::Mutex::new(crate::config::settings::Settings::default()),
+        ));
         let audit = AuditLog::new(&audit_path);
         let worker = std::thread::spawn(move || {
             for _ in 0..4 {
@@ -1518,7 +1623,7 @@ mod unix_tests {
                 server::handle_connection(stream, &host, Some(&audit), socket::current_uid());
             }
         });
-        for (model, mode) in [("pro","custom"),("flash","anytime")] {
+        for (model, mode) in [("pro", "custom"), ("flash", "anytime")] {
             let request = serde_json::json!({"operation":"set_usage_window","endpoint":"synthetic","model":model,"rule":{"mode":mode,"timezone":"UTC","weekdays":[1],"periods":[{"start":"09:00","end":"12:00"}]}});
             let reply = client::request(&path, &request.to_string()).unwrap();
             assert!(reply.ok);
@@ -1527,22 +1632,43 @@ mod unix_tests {
         let reply = client::request(&path, r#"{"operation":"get_usage_windows"}"#).unwrap();
         assert!(reply.ok);
         let config = reply.result.unwrap();
-        assert_eq!(config[crate::agent::usage_windows::model_key("synthetic","pro")]["mode"], "custom");
-        assert_eq!(config[crate::agent::usage_windows::model_key("synthetic","flash")]["mode"], "anytime");
+        assert_eq!(
+            config[crate::agent::usage_windows::model_key("synthetic", "pro")]["mode"],
+            "custom"
+        );
+        assert_eq!(
+            config[crate::agent::usage_windows::model_key("synthetic", "flash")]["mode"],
+            "anytime"
+        );
         // CF-WINDOW-R6/R7：「本会话忽略时段限制」也要能从后台入口下得去，
         // 而且落到界面按钮用的同一份会话状态上。
         let session = "dispatch-window-override-session";
-        assert!(!crate::agent::usage_windows::session_ignores_windows(session));
+        assert!(!crate::agent::usage_windows::session_ignores_windows(
+            session
+        ));
         let reply = client::request(&path, &serde_json::json!({"operation":"set_session_usage_window_override","session_id":session,"ignore":true}).to_string()).unwrap();
         assert!(reply.ok, "{:?}", reply.error);
         assert_eq!(reply.result.unwrap()["ignore"], true);
-        assert!(crate::agent::usage_windows::session_ignores_windows(session), "后台入口必须落到界面用的同一份状态上");
+        assert!(
+            crate::agent::usage_windows::session_ignores_windows(session),
+            "后台入口必须落到界面用的同一份状态上"
+        );
         crate::agent::usage_windows::cache_session_override(session.into(), false).unwrap();
-        assert!(!crate::agent::usage_windows::session_ignores_windows(session));
+        assert!(!crate::agent::usage_windows::session_ignores_windows(
+            session
+        ));
         worker.join().unwrap();
         let log = std::fs::read_to_string(audit_path).unwrap();
-        assert!(log.contains("set_usage_window") && log.contains("get_usage_windows") && log.contains("model=pro"));
-        assert!(log.contains("set_session_usage_window_override") && log.contains("ignore_usage_windows=true"), "豁免操作必须留审计：{log}");
+        assert!(
+            log.contains("set_usage_window")
+                && log.contains("get_usage_windows")
+                && log.contains("model=pro")
+        );
+        assert!(
+            log.contains("set_session_usage_window_override")
+                && log.contains("ignore_usage_windows=true"),
+            "豁免操作必须留审计：{log}"
+        );
     }
 
     #[test]
@@ -1564,11 +1690,8 @@ mod unix_tests {
             let _ = server::serve(listener, host, Some(audit));
         });
 
-        let response = client::request(
-            &path,
-            r#"{"operation":"status","session_id":"s-1"}"#,
-        )
-        .expect("a real client reaches the server");
+        let response = client::request(&path, r#"{"operation":"status","session_id":"s-1"}"#)
+            .expect("a real client reaches the server");
         assert!(response.ok);
         assert_eq!(
             response.result.unwrap()["operation"],
@@ -1588,4 +1711,3 @@ mod unix_tests {
         );
     }
 }
-

@@ -90,17 +90,27 @@ pub async fn execute_read(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
-        Err(e) => return Ok(ToolOutput::err(format!("Cannot open {}: {e}", path.display()))),
+        Err(e) => {
+            return Ok(ToolOutput::err(format!(
+                "Cannot open {}: {e}",
+                path.display()
+            )))
+        }
     };
     let mut archive = match zip::ZipArchive::new(file) {
         Ok(a) => a,
         Err(e) => return Ok(ToolOutput::err(format!("Invalid .pptx (not a zip): {e}"))),
     };
 
-    let mut slide_nos: Vec<usize> = archive.file_names().filter_map(slide_no_from_name).collect();
+    let mut slide_nos: Vec<usize> = archive
+        .file_names()
+        .filter_map(slide_no_from_name)
+        .collect();
     slide_nos.sort_unstable();
     if slide_nos.is_empty() {
-        return Ok(ToolOutput::err("No slides found in deck (ppt/slides/slideN.xml missing)"));
+        return Ok(ToolOutput::err(
+            "No slides found in deck (ppt/slides/slideN.xml missing)",
+        ));
     }
 
     let mut out = String::new();
@@ -115,7 +125,10 @@ pub async fn execute_read(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         let mut xml = String::new();
         if archive
             .by_name(&name)
-            .and_then(|mut f| f.read_to_string(&mut xml).map_err(zip::result::ZipError::from))
+            .and_then(|mut f| {
+                f.read_to_string(&mut xml)
+                    .map_err(zip::result::ZipError::from)
+            })
             .is_err()
         {
             continue;
@@ -152,7 +165,11 @@ fn outline_for_slide(xml: &str, slide_no: usize, with_format: bool, out: &mut St
             for (pi, para) in paras.iter().enumerate() {
                 let text = paragraph_text(xml, para);
                 let shown = if text.is_empty() { "(empty)" } else { &text };
-                let fmt = if with_format { format_summary(xml, para) } else { String::new() };
+                let fmt = if with_format {
+                    format_summary(xml, para)
+                } else {
+                    String::new()
+                };
                 out.push_str(&format!("  s{slide_no}.{fi}.{pi}: {fmt}{shown}\n"));
             }
         }
@@ -163,7 +180,9 @@ fn outline_for_slide(xml: &str, slide_no: usize, with_format: bool, out: &mut St
 /// formatting (paragraph `algn` + the first run's `rPr`). Empty when nothing of
 /// note is set. Drives the `with_format` audit before format_pptx.
 fn format_summary(xml: &str, para: &ElemSpan) -> String {
-    let Some(inner) = para.inner else { return String::new() };
+    let Some(inner) = para.inner else {
+        return String::new();
+    };
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(p) = find_simple_elements(xml, "a:pPr", inner).into_iter().next() {
@@ -197,9 +216,15 @@ fn format_summary(xml: &str, para: &ElemSpan) -> String {
                             parts.push(format!("font={tf}"));
                         }
                     }
-                    if let Some(sf) = find_simple_elements(xml, "a:solidFill", rpi).into_iter().next() {
+                    if let Some(sf) = find_simple_elements(xml, "a:solidFill", rpi)
+                        .into_iter()
+                        .next()
+                    {
                         if let Some(si) = sf.inner {
-                            if let Some(c) = find_simple_elements(xml, "a:srgbClr", si).into_iter().next() {
+                            if let Some(c) = find_simple_elements(xml, "a:srgbClr", si)
+                                .into_iter()
+                                .next()
+                            {
                                 if let Some(v) = attr_value(&xml[c.outer.0..c.outer.1], "val") {
                                     parts.push(format!("color={v}"));
                                 }
@@ -352,7 +377,12 @@ pub async fn execute_edit(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     // Read just the targeted slides' XML.
     let file = match std::fs::File::open(&src) {
         Ok(f) => f,
-        Err(e) => return Ok(ToolOutput::err(format!("Cannot open {}: {e}", src.display()))),
+        Err(e) => {
+            return Ok(ToolOutput::err(format!(
+                "Cannot open {}: {e}",
+                src.display()
+            )))
+        }
     };
     let mut archive = match zip::ZipArchive::new(file) {
         Ok(a) => a,
@@ -366,7 +396,10 @@ pub async fn execute_edit(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         let mut xml = String::new();
         if archive
             .by_name(&name)
-            .and_then(|mut f| f.read_to_string(&mut xml).map_err(zip::result::ZipError::from))
+            .and_then(|mut f| {
+                f.read_to_string(&mut xml)
+                    .map_err(zip::result::ZipError::from)
+            })
             .is_err()
         {
             return Ok(ToolOutput::err(format!(
@@ -437,7 +470,10 @@ fn apply_edits_to_slide(xml: &str, edits: &[&Edit]) -> std::result::Result<Strin
         match e.op {
             EditOp::Replace => {
                 let text = e.text.as_deref().ok_or_else(|| {
-                    format!("replace edit for s{}.{}.{} requires `text`", e.slide, e.frame, e.para)
+                    format!(
+                        "replace edit for s{}.{}.{} requires `text`",
+                        e.slide, e.frame, e.para
+                    )
                 })?;
                 let rebuilt = rebuild_paragraph(xml, para, text);
                 splices.push((para.outer.0, para.outer.1, rebuilt));
@@ -465,7 +501,9 @@ fn apply_edits_to_slide(xml: &str, edits: &[&Edit]) -> std::result::Result<Strin
     for w in splices.windows(2) {
         // w[0] has the larger start (applied first). It must not overlap w[1].
         if w[1].1 > w[0].0 {
-            return Err("overlapping edits target the same paragraph; issue one edit per paragraph".into());
+            return Err(
+                "overlapping edits target the same paragraph; issue one edit per paragraph".into(),
+            );
         }
     }
 
@@ -500,7 +538,11 @@ fn rebuild_paragraph(xml: &str, para: &ElemSpan, new_text: &str) -> String {
         .into_iter()
         .next()
         .and_then(|r| r.inner)
-        .and_then(|(rs, re)| find_simple_elements(xml, "a:rPr", (rs, re)).into_iter().next())
+        .and_then(|(rs, re)| {
+            find_simple_elements(xml, "a:rPr", (rs, re))
+                .into_iter()
+                .next()
+        })
         .map(|e| xml[e.outer.0..e.outer.1].to_string())
         .unwrap_or_default();
 
@@ -778,17 +820,27 @@ pub async fn execute_format(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 
     let file = match std::fs::File::open(&src) {
         Ok(f) => f,
-        Err(e) => return Ok(ToolOutput::err(format!("Cannot open {}: {e}", src.display()))),
+        Err(e) => {
+            return Ok(ToolOutput::err(format!(
+                "Cannot open {}: {e}",
+                src.display()
+            )))
+        }
     };
     let mut archive = match zip::ZipArchive::new(file) {
         Ok(a) => a,
         Err(e) => return Ok(ToolOutput::err(format!("Invalid .pptx (not a zip): {e}"))),
     };
 
-    let mut slide_nos: Vec<usize> = archive.file_names().filter_map(slide_no_from_name).collect();
+    let mut slide_nos: Vec<usize> = archive
+        .file_names()
+        .filter_map(slide_no_from_name)
+        .collect();
     slide_nos.sort_unstable();
     if slide_nos.is_empty() {
-        return Ok(ToolOutput::err("No slides found in deck (ppt/slides/slideN.xml missing)"));
+        return Ok(ToolOutput::err(
+            "No slides found in deck (ppt/slides/slideN.xml missing)",
+        ));
     }
 
     let mut modified: HashMap<String, Vec<u8>> = HashMap::new();
@@ -799,7 +851,10 @@ pub async fn execute_format(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         let mut xml = String::new();
         if archive
             .by_name(&name)
-            .and_then(|mut f| f.read_to_string(&mut xml).map_err(zip::result::ZipError::from))
+            .and_then(|mut f| {
+                f.read_to_string(&mut xml)
+                    .map_err(zip::result::ZipError::from)
+            })
             .is_err()
         {
             continue;
@@ -840,7 +895,8 @@ pub async fn execute_format(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }
 
     let overflow_section = if overflow.is_empty() {
-        "\nNo text-overflow risk detected after formatting (estimated — no render engine).".to_string()
+        "\nNo text-overflow risk detected after formatting (estimated — no render engine)."
+            .to_string()
     } else {
         format!("\n⚠ Overflow risk (estimated — no render engine):\n{}Lower the font size, shorten the text, or enlarge the box to resolve.", overflow.trim_end_matches('\n'))
     };
@@ -870,7 +926,9 @@ fn normalize_rules(rules: &mut [Rule]) -> std::result::Result<(), String> {
             return Err(format!("rule {i}: size must be between 1 and 400 points"));
         }
         if r.line_spacing.is_some_and(|s| s <= 0.0) {
-            return Err(format!("rule {i}: line_spacing must be a positive percentage"));
+            return Err(format!(
+                "rule {i}: line_spacing must be a positive percentage"
+            ));
         }
         if r.space_before.is_some_and(|s| s < 0.0) || r.space_after.is_some_and(|s| s < 0.0) {
             return Err(format!("rule {i}: space_before/space_after must be >= 0"));
@@ -930,22 +988,49 @@ fn format_slide(
             }
 
             if para_fmt {
-                match find_simple_elements(xml, "a:pPr", pinner).into_iter().next() {
-                    Some(p) => splices.push((p.outer.0, p.outer.1, rewrite_props(xml, p, ElemKind::PPr, &fmt))),
-                    None => splices.push((pinner.0, pinner.0, new_props("a:pPr", ElemKind::PPr, &fmt))),
+                match find_simple_elements(xml, "a:pPr", pinner)
+                    .into_iter()
+                    .next()
+                {
+                    Some(p) => splices.push((
+                        p.outer.0,
+                        p.outer.1,
+                        rewrite_props(xml, p, ElemKind::PPr, &fmt),
+                    )),
+                    None => {
+                        splices.push((pinner.0, pinner.0, new_props("a:pPr", ElemKind::PPr, &fmt)))
+                    }
                 }
             }
             if run_fmt {
                 for run in find_simple_elements(xml, "a:r", pinner) {
                     let Some(rinner) = run.inner else { continue };
-                    match find_simple_elements(xml, "a:rPr", rinner).into_iter().next() {
-                        Some(rp) => splices.push((rp.outer.0, rp.outer.1, rewrite_props(xml, rp, ElemKind::RPr, &fmt))),
-                        None => splices.push((rinner.0, rinner.0, new_props("a:rPr", ElemKind::RPr, &fmt))),
+                    match find_simple_elements(xml, "a:rPr", rinner)
+                        .into_iter()
+                        .next()
+                    {
+                        Some(rp) => splices.push((
+                            rp.outer.0,
+                            rp.outer.1,
+                            rewrite_props(xml, rp, ElemKind::RPr, &fmt),
+                        )),
+                        None => splices.push((
+                            rinner.0,
+                            rinner.0,
+                            new_props("a:rPr", ElemKind::RPr, &fmt),
+                        )),
                     }
                 }
                 // The paragraph mark's run properties, so empty/trailing lines match too.
-                if let Some(ep) = find_simple_elements(xml, "a:endParaRPr", pinner).into_iter().next() {
-                    splices.push((ep.outer.0, ep.outer.1, rewrite_props(xml, ep, ElemKind::RPr, &fmt)));
+                if let Some(ep) = find_simple_elements(xml, "a:endParaRPr", pinner)
+                    .into_iter()
+                    .next()
+                {
+                    splices.push((
+                        ep.outer.0,
+                        ep.outer.1,
+                        rewrite_props(xml, ep, ElemKind::RPr, &fmt),
+                    ));
                 }
             }
             changed += 1;
@@ -955,7 +1040,9 @@ fn format_slide(
     splices.sort_by_key(|s| std::cmp::Reverse(s.0));
     for w in splices.windows(2) {
         if w[1].1 > w[0].0 {
-            return Err(format!("internal: overlapping format splices on slide {slide_no}"));
+            return Err(format!(
+                "internal: overlapping format splices on slide {slide_no}"
+            ));
         }
     }
     let mut out = xml.to_string();
@@ -970,7 +1057,11 @@ fn format_slide(
 fn rewrite_props(xml: &str, span: ElemSpan, kind: ElemKind, fmt: &Fmt) -> String {
     let s = &xml[span.outer.0..span.outer.1];
     let mut el = Element::parse(s).unwrap_or_else(|| Element {
-        prefixed: if matches!(kind, ElemKind::PPr) { "a:pPr".into() } else { "a:rPr".into() },
+        prefixed: if matches!(kind, ElemKind::PPr) {
+            "a:pPr".into()
+        } else {
+            "a:rPr".into()
+        },
         attrs: Vec::new(),
         children: Vec::new(),
     });
@@ -981,7 +1072,11 @@ fn rewrite_props(xml: &str, span: ElemSpan, kind: ElemKind, fmt: &Fmt) -> String
 /// Build a fresh `<a:rPr>` / `<a:pPr>` element from `fmt` (used when the target
 /// run/paragraph had no property element yet).
 fn new_props(prefixed: &str, kind: ElemKind, fmt: &Fmt) -> String {
-    let mut el = Element { prefixed: prefixed.into(), attrs: Vec::new(), children: Vec::new() };
+    let mut el = Element {
+        prefixed: prefixed.into(),
+        attrs: Vec::new(),
+        children: Vec::new(),
+    };
     apply_fmt(&mut el, kind, fmt);
     el.serialize(kind)
 }
@@ -999,7 +1094,10 @@ fn apply_fmt(el: &mut Element, kind: ElemKind, f: &Fmt) {
                 el.set_attr("i", if it { "1" } else { "0" }.into());
             }
             if let Some(c) = &f.color {
-                el.set_child("a:solidFill", format!("<a:solidFill><a:srgbClr val=\"{c}\"/></a:solidFill>"));
+                el.set_child(
+                    "a:solidFill",
+                    format!("<a:solidFill><a:srgbClr val=\"{c}\"/></a:solidFill>"),
+                );
             }
             if let Some(font) = &f.font {
                 let esc = xml_escape(font);
@@ -1013,13 +1111,31 @@ fn apply_fmt(el: &mut Element, kind: ElemKind, f: &Fmt) {
                 el.set_attr("algn", a.clone());
             }
             if let Some(ls) = f.line_spacing {
-                el.set_child("a:lnSpc", format!("<a:lnSpc><a:spcPct val=\"{}\"/></a:lnSpc>", (ls * 1000.0).round() as i64));
+                el.set_child(
+                    "a:lnSpc",
+                    format!(
+                        "<a:lnSpc><a:spcPct val=\"{}\"/></a:lnSpc>",
+                        (ls * 1000.0).round() as i64
+                    ),
+                );
             }
             if let Some(sb) = f.space_before {
-                el.set_child("a:spcBef", format!("<a:spcBef><a:spcPts val=\"{}\"/></a:spcBef>", (sb * 100.0).round() as i64));
+                el.set_child(
+                    "a:spcBef",
+                    format!(
+                        "<a:spcBef><a:spcPts val=\"{}\"/></a:spcBef>",
+                        (sb * 100.0).round() as i64
+                    ),
+                );
             }
             if let Some(sa) = f.space_after {
-                el.set_child("a:spcAft", format!("<a:spcAft><a:spcPts val=\"{}\"/></a:spcAft>", (sa * 100.0).round() as i64));
+                el.set_child(
+                    "a:spcAft",
+                    format!(
+                        "<a:spcAft><a:spcPts val=\"{}\"/></a:spcAft>",
+                        (sa * 100.0).round() as i64
+                    ),
+                );
             }
         }
     }
@@ -1069,7 +1185,11 @@ impl Element {
                 split_children(&s[gt + 1..inner_end])
             }
         };
-        Some(Element { prefixed, attrs, children })
+        Some(Element {
+            prefixed,
+            attrs,
+            children,
+        })
     }
 
     fn set_attr(&mut self, name: &str, val: String) {
@@ -1277,7 +1397,9 @@ fn find_simple_elements(xml: &str, tag: &str, region: (usize, usize)) -> Vec<Ele
     let mut i = region.0;
 
     while i < hi {
-        let Some(rel) = xml[i..hi].find(&open_pat) else { break };
+        let Some(rel) = xml[i..hi].find(&open_pat) else {
+            break;
+        };
         let open_start = i + rel;
         let name_end = open_start + open_pat.len();
         // The char after the tag name must delimit it, else this is a longer
@@ -1290,14 +1412,21 @@ fn find_simple_elements(xml: &str, tag: &str, region: (usize, usize)) -> Vec<Ele
             i = name_end;
             continue;
         }
-        let Some(gt_rel) = xml[name_end..hi].find('>') else { break };
+        let Some(gt_rel) = xml[name_end..hi].find('>') else {
+            break;
+        };
         let open_tag_end = name_end + gt_rel + 1; // just past '>'
         if open_tag_end >= 2 && bytes[open_tag_end - 2] == b'/' {
-            out.push(ElemSpan { outer: (open_start, open_tag_end), inner: None });
+            out.push(ElemSpan {
+                outer: (open_start, open_tag_end),
+                inner: None,
+            });
             i = open_tag_end;
             continue;
         }
-        let Some(close_rel) = xml[open_tag_end..hi].find(&close_pat) else { break };
+        let Some(close_rel) = xml[open_tag_end..hi].find(&close_pat) else {
+            break;
+        };
         let inner_start = open_tag_end;
         let inner_end = open_tag_end + close_rel;
         let outer_end = inner_end + close_pat.len();
@@ -1312,7 +1441,9 @@ fn find_simple_elements(xml: &str, tag: &str, region: (usize, usize)) -> Vec<Ele
 
 /// Concatenated visible text of a paragraph (all its `<a:t>` runs, unescaped).
 fn paragraph_text(xml: &str, para: &ElemSpan) -> String {
-    let Some(inner) = para.inner else { return String::new() };
+    let Some(inner) = para.inner else {
+        return String::new();
+    };
     let mut s = String::new();
     for t in find_simple_elements(xml, "a:t", inner) {
         if let Some((a, b)) = t.inner {
@@ -1464,7 +1595,9 @@ fn shape_ext(xml: &str, sp_inner: (usize, usize)) -> Option<(f64, f64)> {
         .into_iter()
         .next()?;
     let region = xfrm.inner?;
-    let ext = find_simple_elements(xml, "a:ext", region).into_iter().next()?;
+    let ext = find_simple_elements(xml, "a:ext", region)
+        .into_iter()
+        .next()?;
     let tag = &xml[ext.outer.0..ext.outer.1];
     let cx = attr_value(tag, "cx")?.parse::<f64>().ok()?;
     let cy = attr_value(tag, "cy")?.parse::<f64>().ok()?;
@@ -1585,9 +1718,14 @@ fn para_line_height(xml: &str, para_inner: (usize, usize)) -> LineHeight {
         .next()
     {
         if let Some(inner) = ppr.inner {
-            if let Some(ln) = find_simple_elements(xml, "a:lnSpc", inner).into_iter().next() {
+            if let Some(ln) = find_simple_elements(xml, "a:lnSpc", inner)
+                .into_iter()
+                .next()
+            {
                 if let Some(lin) = ln.inner {
-                    if let Some(pct) = find_simple_elements(xml, "a:spcPct", lin).into_iter().next()
+                    if let Some(pct) = find_simple_elements(xml, "a:spcPct", lin)
+                        .into_iter()
+                        .next()
                     {
                         if let Some(v) = attr_value(&xml[pct.outer.0..pct.outer.1], "val")
                             .and_then(|s| s.parse::<f64>().ok())
@@ -1595,7 +1733,9 @@ fn para_line_height(xml: &str, para_inner: (usize, usize)) -> LineHeight {
                             return LineHeight::Factor(v / 100_000.0);
                         }
                     }
-                    if let Some(pts) = find_simple_elements(xml, "a:spcPts", lin).into_iter().next()
+                    if let Some(pts) = find_simple_elements(xml, "a:spcPts", lin)
+                        .into_iter()
+                        .next()
                     {
                         if let Some(v) = attr_value(&xml[pts.outer.0..pts.outer.1], "val")
                             .and_then(|s| s.parse::<f64>().ok())
@@ -1625,7 +1765,9 @@ fn para_space(xml: &str, para_inner: (usize, usize), which: &str, font_pt: f64) 
         if let Some(inner) = ppr.inner {
             if let Some(sp) = find_simple_elements(xml, tag, inner).into_iter().next() {
                 if let Some(spin) = sp.inner {
-                    if let Some(pts) = find_simple_elements(xml, "a:spcPts", spin).into_iter().next()
+                    if let Some(pts) = find_simple_elements(xml, "a:spcPts", spin)
+                        .into_iter()
+                        .next()
                     {
                         if let Some(v) = attr_value(&xml[pts.outer.0..pts.outer.1], "val")
                             .and_then(|s| s.parse::<f64>().ok())
@@ -1633,7 +1775,9 @@ fn para_space(xml: &str, para_inner: (usize, usize), which: &str, font_pt: f64) 
                             return v / 100.0;
                         }
                     }
-                    if let Some(pct) = find_simple_elements(xml, "a:spcPct", spin).into_iter().next()
+                    if let Some(pct) = find_simple_elements(xml, "a:spcPct", spin)
+                        .into_iter()
+                        .next()
                     {
                         if let Some(v) = attr_value(&xml[pct.outer.0..pct.outer.1], "val")
                             .and_then(|s| s.parse::<f64>().ok())
@@ -1799,7 +1943,10 @@ fn resolve_layout_geometry<R: Read + Seek>(
     let mut rels = String::new();
     if archive
         .by_name(&rels_name)
-        .and_then(|mut f| f.read_to_string(&mut rels).map_err(zip::result::ZipError::from))
+        .and_then(|mut f| {
+            f.read_to_string(&mut rels)
+                .map_err(zip::result::ZipError::from)
+        })
         .is_err()
     {
         return map;
@@ -1811,7 +1958,10 @@ fn resolve_layout_geometry<R: Read + Seek>(
     let mut layout = String::new();
     if archive
         .by_name(&layout_name)
-        .and_then(|mut f| f.read_to_string(&mut layout).map_err(zip::result::ZipError::from))
+        .and_then(|mut f| {
+            f.read_to_string(&mut layout)
+                .map_err(zip::result::ZipError::from)
+        })
         .is_err()
     {
         return map;
@@ -1875,11 +2025,14 @@ mod tests {
         let mut zip = ZipWriter::new(buf);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         // A media part we must NOT disturb.
-        zip.start_file::<_, ()>("ppt/media/image1.png", opts).unwrap();
+        zip.start_file::<_, ()>("ppt/media/image1.png", opts)
+            .unwrap();
         zip.write_all(b"\x89PNG\r\n\x1a\nFAKEIMAGE").unwrap();
-        zip.start_file::<_, ()>("ppt/theme/theme1.xml", opts).unwrap();
+        zip.start_file::<_, ()>("ppt/theme/theme1.xml", opts)
+            .unwrap();
         zip.write_all(b"<theme>accent1=ABC123</theme>").unwrap();
-        zip.start_file::<_, ()>("ppt/slides/slide1.xml", opts).unwrap();
+        zip.start_file::<_, ()>("ppt/slides/slide1.xml", opts)
+            .unwrap();
         zip.write_all(slide1.as_bytes()).unwrap();
         zip.finish().unwrap().into_inner()
     }
@@ -1915,13 +2068,25 @@ mod tests {
         let paras = find_simple_elements(SLIDE1, "a:p", frames[1].inner.unwrap());
         let rebuilt = rebuild_paragraph(SLIDE1, &paras[0], "Much richer first bullet");
         // First run's rPr (sz="2400") preserved; pPr (bullet) preserved.
-        assert!(rebuilt.contains("sz=\"2400\""), "first run rPr lost: {rebuilt}");
-        assert!(rebuilt.contains("buChar"), "paragraph bullet props lost: {rebuilt}");
+        assert!(
+            rebuilt.contains("sz=\"2400\""),
+            "first run rPr lost: {rebuilt}"
+        );
+        assert!(
+            rebuilt.contains("buChar"),
+            "paragraph bullet props lost: {rebuilt}"
+        );
         assert!(rebuilt.contains("<a:t>Much richer first bullet</a:t>"));
         // The second run's bold text must be gone (folded into one run).
-        assert!(!rebuilt.contains("bullet</a:t>") || rebuilt.matches("<a:t>").count() == 1,
-            "expected a single run after replace: {rebuilt}");
-        assert_eq!(rebuilt.matches("<a:t>").count(), 1, "expected exactly one text run");
+        assert!(
+            !rebuilt.contains("bullet</a:t>") || rebuilt.matches("<a:t>").count() == 1,
+            "expected a single run after replace: {rebuilt}"
+        );
+        assert_eq!(
+            rebuilt.matches("<a:t>").count(),
+            1,
+            "expected exactly one text run"
+        );
     }
 
     #[test]
@@ -1929,20 +2094,46 @@ mod tests {
         let frames = find_simple_elements(SLIDE1, "p:txBody", (0, SLIDE1.len()));
         let paras = find_simple_elements(SLIDE1, "a:p", frames[0].inner.unwrap());
         let rebuilt = rebuild_paragraph(SLIDE1, &paras[0], "A < B & \"C\"");
-        assert!(rebuilt.contains("A &lt; B &amp; &quot;C&quot;"), "got: {rebuilt}");
+        assert!(
+            rebuilt.contains("A &lt; B &amp; &quot;C&quot;"),
+            "got: {rebuilt}"
+        );
     }
 
     #[test]
     fn apply_replace_and_insert_after_in_one_slide() {
         let edits = vec![
-            Edit { op: EditOp::Replace, slide: 1, frame: 0, para: 0, text: Some("New Title".into()), texts: None },
-            Edit { op: EditOp::InsertAfter, slide: 1, frame: 1, para: 1, text: None, texts: Some(vec!["Third bullet".into(), "Fourth bullet".into()]) },
+            Edit {
+                op: EditOp::Replace,
+                slide: 1,
+                frame: 0,
+                para: 0,
+                text: Some("New Title".into()),
+                texts: None,
+            },
+            Edit {
+                op: EditOp::InsertAfter,
+                slide: 1,
+                frame: 1,
+                para: 1,
+                text: None,
+                texts: Some(vec!["Third bullet".into(), "Fourth bullet".into()]),
+            },
         ];
         let refs: Vec<&Edit> = edits.iter().collect();
         let new_xml = apply_edits_to_slide(SLIDE1, &refs).unwrap();
-        assert!(new_xml.contains("<a:t>New Title</a:t>"), "title not replaced");
-        assert!(new_xml.contains("<a:t>Third bullet</a:t>"), "insert missing");
-        assert!(new_xml.contains("<a:t>Fourth bullet</a:t>"), "second insert missing");
+        assert!(
+            new_xml.contains("<a:t>New Title</a:t>"),
+            "title not replaced"
+        );
+        assert!(
+            new_xml.contains("<a:t>Third bullet</a:t>"),
+            "insert missing"
+        );
+        assert!(
+            new_xml.contains("<a:t>Fourth bullet</a:t>"),
+            "second insert missing"
+        );
         // Inserted bullets cloned the bullet formatting.
         let content = find_simple_elements(&new_xml, "p:txBody", (0, new_xml.len()));
         let paras = find_simple_elements(&new_xml, "a:p", content[1].inner.unwrap());
@@ -1951,7 +2142,14 @@ mod tests {
 
     #[test]
     fn missing_locator_errors_clearly() {
-        let edits = vec![Edit { op: EditOp::Replace, slide: 1, frame: 9, para: 0, text: Some("x".into()), texts: None }];
+        let edits = vec![Edit {
+            op: EditOp::Replace,
+            slide: 1,
+            frame: 9,
+            para: 0,
+            text: Some("x".into()),
+            texts: None,
+        }];
         let refs: Vec<&Edit> = edits.iter().collect();
         let err = apply_edits_to_slide(SLIDE1, &refs).unwrap_err();
         assert!(err.contains("no frame index 9"), "got: {err}");
@@ -1966,11 +2164,21 @@ mod tests {
         let ctx = ExecCtx::new(cwd.clone(), None);
 
         // read_pptx surfaces the locators + current text.
-        let read = execute_read(json!({ "path": "deck.pptx" }), &ctx).await.unwrap();
+        let read = execute_read(json!({ "path": "deck.pptx" }), &ctx)
+            .await
+            .unwrap();
         assert!(!read.is_error, "read_pptx errored: {}", read.content);
-        assert!(read.content.contains("s1.0.0"), "missing title locator: {}", read.content);
+        assert!(
+            read.content.contains("s1.0.0"),
+            "missing title locator: {}",
+            read.content
+        );
         assert!(read.content.contains("Original Title"));
-        assert!(read.content.contains("title"), "placeholder hint missing: {}", read.content);
+        assert!(
+            read.content.contains("title"),
+            "placeholder hint missing: {}",
+            read.content
+        );
 
         // edit_pptx rewrites the title and appends a KB-derived bullet.
         let edit = execute_edit(
@@ -1993,13 +2201,25 @@ mod tests {
         let out_bytes = std::fs::read(cwd.join("deck-enriched.pptx")).unwrap();
         let mut zip = ZipArchive::new(Cursor::new(out_bytes)).unwrap();
         let mut slide = String::new();
-        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut slide).unwrap();
+        zip.by_name("ppt/slides/slide1.xml")
+            .unwrap()
+            .read_to_string(&mut slide)
+            .unwrap();
         assert!(slide.contains("Enriched Title"), "title not enriched");
         assert!(slide.contains("KB-derived bullet"), "bullet not appended");
         let mut img = Vec::new();
-        zip.by_name("ppt/media/image1.png").unwrap().read_to_end(&mut img).unwrap();
-        assert_eq!(img, b"\x89PNG\r\n\x1a\nFAKEIMAGE", "media must survive the edit");
-        assert!(std::fs::read(cwd.join("deck.pptx")).unwrap() == deck, "source deck must be untouched");
+        zip.by_name("ppt/media/image1.png")
+            .unwrap()
+            .read_to_end(&mut img)
+            .unwrap();
+        assert_eq!(
+            img, b"\x89PNG\r\n\x1a\nFAKEIMAGE",
+            "media must survive the edit"
+        );
+        assert!(
+            std::fs::read(cwd.join("deck.pptx")).unwrap() == deck,
+            "source deck must be untouched"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -2014,14 +2234,27 @@ mod tests {
 
     #[test]
     fn format_sets_font_size_color_on_existing_rpr() {
-        let rules = fmt_all(json!({ "scope": "all", "font": "Calibri", "size": 18, "color": "#1F2937" }));
+        let rules =
+            fmt_all(json!({ "scope": "all", "font": "Calibri", "size": 18, "color": "#1F2937" }));
         let (out, changed) = format_slide(SLIDE1, 1, &rules).unwrap();
-        assert!(changed >= 3, "expected title + two bullets touched, got {changed}");
-        assert!(out.contains("<a:latin typeface=\"Calibri\"/>"), "font not set: {out}");
+        assert!(
+            changed >= 3,
+            "expected title + two bullets touched, got {changed}"
+        );
+        assert!(
+            out.contains("<a:latin typeface=\"Calibri\"/>"),
+            "font not set: {out}"
+        );
         assert!(out.contains("<a:ea typeface=\"Calibri\"/>"));
         assert!(out.contains("<a:cs typeface=\"Calibri\"/>"));
-        assert!(out.contains("sz=\"1800\""), "size not converted to hundredths: {out}");
-        assert!(out.contains("<a:srgbClr val=\"1F2937\"/>"), "color not set: {out}");
+        assert!(
+            out.contains("sz=\"1800\""),
+            "size not converted to hundredths: {out}"
+        );
+        assert!(
+            out.contains("<a:srgbClr val=\"1F2937\"/>"),
+            "color not set: {out}"
+        );
         // The original bold run keeps its b="1" (we didn't set bold).
         assert!(out.contains("b=\"1\""), "unrelated bold attribute dropped");
     }
@@ -2033,11 +2266,23 @@ mod tests {
         let rules = fmt_all(json!({ "scope": "all", "size": 20, "align": "center" }));
         let (out, changed) = format_slide(xml, 1, &rules).unwrap();
         assert_eq!(changed, 1);
-        assert!(out.contains("<a:rPr sz=\"2000\"/>"), "rPr not created: {out}");
-        assert!(out.contains("<a:pPr algn=\"ctr\">") || out.contains("algn=\"ctr\""), "pPr not created: {out}");
+        assert!(
+            out.contains("<a:rPr sz=\"2000\"/>"),
+            "rPr not created: {out}"
+        );
+        assert!(
+            out.contains("<a:pPr algn=\"ctr\">") || out.contains("algn=\"ctr\""),
+            "pPr not created: {out}"
+        );
         // rPr must sit before the text run content, pPr before the runs.
-        assert!(out.find("<a:pPr").unwrap() < out.find("<a:r>").unwrap(), "pPr must precede runs");
-        assert!(out.find("<a:rPr").unwrap() < out.find("<a:t>").unwrap(), "rPr must precede a:t");
+        assert!(
+            out.find("<a:pPr").unwrap() < out.find("<a:r>").unwrap(),
+            "pPr must precede runs"
+        );
+        assert!(
+            out.find("<a:rPr").unwrap() < out.find("<a:t>").unwrap(),
+            "rPr must precede a:t"
+        );
     }
 
     #[test]
@@ -2050,15 +2295,29 @@ mod tests {
         assert!(fill < latin, "solidFill must precede latin in rPr: {out}");
 
         // pPr: lnSpc (0) before spcBef (1) before spcAft (2).
-        let rules = fmt_all(json!({ "scope": "body", "line_spacing": 150, "space_before": 6, "space_after": 12 }));
+        let rules = fmt_all(
+            json!({ "scope": "body", "line_spacing": 150, "space_before": 6, "space_after": 12 }),
+        );
         let (out, _) = format_slide(SLIDE1, 1, &rules).unwrap();
         let ln = out.find("<a:lnSpc>").expect("lnSpc");
         let bef = out.find("<a:spcBef>").expect("spcBef");
         let aft = out.find("<a:spcAft>").expect("spcAft");
-        assert!(ln < bef && bef < aft, "pPr spacing children out of order: {out}");
-        assert!(out.contains("<a:spcPct val=\"150000\"/>"), "line spacing units: {out}");
-        assert!(out.contains("<a:spcBef><a:spcPts val=\"600\"/></a:spcBef>"), "space_before units: {out}");
-        assert!(out.contains("<a:spcAft><a:spcPts val=\"1200\"/></a:spcAft>"), "space_after units: {out}");
+        assert!(
+            ln < bef && bef < aft,
+            "pPr spacing children out of order: {out}"
+        );
+        assert!(
+            out.contains("<a:spcPct val=\"150000\"/>"),
+            "line spacing units: {out}"
+        );
+        assert!(
+            out.contains("<a:spcBef><a:spcPts val=\"600\"/></a:spcBef>"),
+            "space_before units: {out}"
+        );
+        assert!(
+            out.contains("<a:spcAft><a:spcPts val=\"1200\"/></a:spcAft>"),
+            "space_after units: {out}"
+        );
         // Existing bullet props (buChar, rank 6) survive.
         assert!(out.contains("buChar"), "bullet props dropped: {out}");
     }
@@ -2069,7 +2328,10 @@ mod tests {
         let (out, _) = format_slide(SLIDE1, 1, &rules).unwrap();
         // Title size becomes 5400; the body bullets keep their 2400.
         assert!(out.contains("sz=\"5400\""), "title not resized: {out}");
-        assert!(out.contains("sz=\"2400\""), "body size should be untouched: {out}");
+        assert!(
+            out.contains("sz=\"2400\""),
+            "body size should be untouched: {out}"
+        );
     }
 
     #[test]
@@ -2085,14 +2347,16 @@ mod tests {
 
     #[test]
     fn invalid_color_rejected() {
-        let mut rules: Vec<Rule> = vec![serde_json::from_value(json!({ "color": "not-a-color" })).unwrap()];
+        let mut rules: Vec<Rule> =
+            vec![serde_json::from_value(json!({ "color": "not-a-color" })).unwrap()];
         let err = normalize_rules(&mut rules).unwrap_err();
         assert!(err.contains("invalid color"), "got: {err}");
     }
 
     #[test]
     fn frame_without_slide_rejected() {
-        let mut rules: Vec<Rule> = vec![serde_json::from_value(json!({ "frame": 0, "size": 18 })).unwrap()];
+        let mut rules: Vec<Rule> =
+            vec![serde_json::from_value(json!({ "frame": 0, "size": 18 })).unwrap()];
         let err = normalize_rules(&mut rules).unwrap_err();
         assert!(err.contains("`frame` requires `slide`"), "got: {err}");
     }
@@ -2107,7 +2371,10 @@ mod tests {
         assert!(out.contains("lang=\"en-US\""));
         assert!(out.contains("b=\"1\""));
         assert!(out.contains("<a:hlinkClick r:id=\"rId3\"/>"));
-        assert!(out.find("<a:latin").unwrap() < out.find("<a:hlinkClick").unwrap(), "latin(6) must precede hlinkClick(10): {out}");
+        assert!(
+            out.find("<a:latin").unwrap() < out.find("<a:hlinkClick").unwrap(),
+            "latin(6) must precede hlinkClick(10): {out}"
+        );
     }
 
     #[tokio::test]
@@ -2137,17 +2404,32 @@ mod tests {
         let out_bytes = std::fs::read(cwd.join("deck-pretty.pptx")).unwrap();
         let mut zip = ZipArchive::new(Cursor::new(out_bytes)).unwrap();
         let mut slide = String::new();
-        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut slide).unwrap();
-        assert!(slide.contains("<a:latin typeface=\"Calibri\"/>"), "font missing: {slide}");
+        zip.by_name("ppt/slides/slide1.xml")
+            .unwrap()
+            .read_to_string(&mut slide)
+            .unwrap();
+        assert!(
+            slide.contains("<a:latin typeface=\"Calibri\"/>"),
+            "font missing: {slide}"
+        );
         assert!(slide.contains("sz=\"4000\""), "title size missing");
         assert!(slide.contains("sz=\"1800\""), "body size missing");
-        assert!(slide.contains("<a:spcPct val=\"120000\"/>"), "line spacing missing");
+        assert!(
+            slide.contains("<a:spcPct val=\"120000\"/>"),
+            "line spacing missing"
+        );
         assert!(slide.contains("<a:t>Original Title</a:t>"), "text mangled");
         // Media survives; source untouched.
         let mut img = Vec::new();
-        zip.by_name("ppt/media/image1.png").unwrap().read_to_end(&mut img).unwrap();
+        zip.by_name("ppt/media/image1.png")
+            .unwrap()
+            .read_to_end(&mut img)
+            .unwrap();
         assert_eq!(img, b"\x89PNG\r\n\x1a\nFAKEIMAGE");
-        assert!(std::fs::read(cwd.join("deck.pptx")).unwrap() == deck, "source deck must be untouched");
+        assert!(
+            std::fs::read(cwd.join("deck.pptx")).unwrap() == deck,
+            "source deck must be untouched"
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -2160,12 +2442,26 @@ mod tests {
         std::fs::write(cwd.join("deck.pptx"), &deck).unwrap();
         let ctx = ExecCtx::new(cwd.clone(), None);
 
-        let read = execute_read(json!({ "path": "deck.pptx", "with_format": true }), &ctx).await.unwrap();
+        let read = execute_read(json!({ "path": "deck.pptx", "with_format": true }), &ctx)
+            .await
+            .unwrap();
         assert!(!read.is_error, "read errored: {}", read.content);
         // Title run is 40pt bold, centered.
-        assert!(read.content.contains("sz=40"), "size summary missing: {}", read.content);
-        assert!(read.content.contains("algn=ctr"), "align summary missing: {}", read.content);
-        assert!(read.content.contains("b]") || read.content.contains("b "), "bold summary missing: {}", read.content);
+        assert!(
+            read.content.contains("sz=40"),
+            "size summary missing: {}",
+            read.content
+        );
+        assert!(
+            read.content.contains("algn=ctr"),
+            "align summary missing: {}",
+            read.content
+        );
+        assert!(
+            read.content.contains("b]") || read.content.contains("b "),
+            "bold summary missing: {}",
+            read.content
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }
@@ -2187,14 +2483,23 @@ mod tests {
 
         // Media + theme bytes unchanged.
         let mut img = Vec::new();
-        zip.by_name("ppt/media/image1.png").unwrap().read_to_end(&mut img).unwrap();
+        zip.by_name("ppt/media/image1.png")
+            .unwrap()
+            .read_to_end(&mut img)
+            .unwrap();
         assert_eq!(img, b"\x89PNG\r\n\x1a\nFAKEIMAGE");
         let mut theme = String::new();
-        zip.by_name("ppt/theme/theme1.xml").unwrap().read_to_string(&mut theme).unwrap();
+        zip.by_name("ppt/theme/theme1.xml")
+            .unwrap()
+            .read_to_string(&mut theme)
+            .unwrap();
         assert_eq!(theme, "<theme>accent1=ABC123</theme>");
         // Slide updated.
         let mut s = String::new();
-        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut s).unwrap();
+        zip.by_name("ppt/slides/slide1.xml")
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         assert!(s.contains("Brand New Title"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2270,7 +2575,10 @@ mod tests {
 <p:txBody><a:bodyPr><a:noAutofit/></a:bodyPr><a:p><a:r><a:rPr sz="1800"/><a:t>Short</a:t></a:r></a:p></p:txBody></p:sp>
 </p:spTree></p:cSld></p:sld>"#;
         let reports = slide_overflow_reports(slide, &empty_geom());
-        assert!(reports.is_empty(), "roomy box should not overflow: {reports:?}");
+        assert!(
+            reports.is_empty(),
+            "roomy box should not overflow: {reports:?}"
+        );
     }
 
     #[test]
@@ -2280,7 +2588,10 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].autofit, Autofit::Shrink);
         let rendered = render_overflow(1, &reports);
-        assert!(rendered.contains("auto-shrink"), "shrink advice missing: {rendered}");
+        assert!(
+            rendered.contains("auto-shrink"),
+            "shrink advice missing: {rendered}"
+        );
     }
 
     #[test]
@@ -2368,8 +2679,16 @@ mod tests {
             .await
             .unwrap();
         assert!(!res.is_error, "read errored: {}", res.content);
-        assert!(res.content.contains("⚠"), "overflow warning missing: {}", res.content);
-        assert!(res.content.contains("frame 0"), "frame locator missing: {}", res.content);
+        assert!(
+            res.content.contains("⚠"),
+            "overflow warning missing: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("frame 0"),
+            "frame locator missing: {}",
+            res.content
+        );
 
         std::fs::remove_dir_all(&cwd).ok();
     }

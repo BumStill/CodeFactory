@@ -12,14 +12,19 @@ pub fn record(stage: &str, started: Instant) {
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     tracing::debug!(stage, elapsed_ms, "first request preparation");
     let _ = STAGES.try_with(|stages| {
-        stages.lock().unwrap().entry(stage.to_string()).or_insert(elapsed_ms);
+        stages
+            .lock()
+            .unwrap()
+            .entry(stage.to_string())
+            .or_insert(elapsed_ms);
     });
 }
 
 pub async fn observe<F: std::future::Future>(future: F) -> (F::Output, BTreeMap<String, f64>) {
-    let stages = Arc::new(Mutex::new(BTreeMap::from([
-        ("quota_refresh_lock".into(), 0.0),
-    ])));
+    let stages = Arc::new(Mutex::new(BTreeMap::from([(
+        "quota_refresh_lock".into(),
+        0.0,
+    )])));
     let output = STAGES.scope(stages.clone(), future).await;
     let snapshot = stages.lock().unwrap().clone();
     (output, snapshot)
@@ -30,25 +35,51 @@ pub async fn observe<F: std::future::Future>(future: F) -> (F::Output, BTreeMap<
 /// separate process with an empty HOME so no user skills or credentials load.
 #[cfg(not(test))]
 pub async fn measure() -> anyhow::Result<serde_json::Value> {
-    use super::{AgentLoop, AgentMode};
     use super::events::{CollectingEventSink, EventSink};
+    use super::{AgentLoop, AgentMode};
     use crate::config::settings::{ApiStyle, Endpoint, Settings};
     use crate::mcp::McpManager;
-    use anyhow::{anyhow, ensure};
     use crate::util::no_window::NoWindow;
+    use anyhow::{anyhow, ensure};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
     use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
     let home = std::env::var("CODEFACTORY_LATENCY_FIXTURE_HOME")?;
-    ensure!(std::env::var("HOME")? == home, "measurement requires isolated HOME");
-    ensure!(std::path::Path::new(&home).join("synthetic-only").is_file(), "missing synthetic HOME marker");
+    ensure!(
+        std::env::var("HOME")? == home,
+        "measurement requires isolated HOME"
+    );
+    ensure!(
+        std::path::Path::new(&home).join("synthetic-only").is_file(),
+        "missing synthetic HOME marker"
+    );
     let root = tempfile::tempdir()?;
     let project = root.path().join("project");
     std::fs::create_dir(&project)?;
-    for args in [vec!["init", "-q"], vec!["-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "commit", "--allow-empty", "-qm", "synthetic"]] {
-        ensure!(std::process::Command::new("git").no_window().args(args).current_dir(&project).status()?.success(), "fixture git failed");
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=Synthetic",
+            "-c",
+            "user.email=synthetic@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "synthetic",
+        ],
+    ] {
+        ensure!(
+            std::process::Command::new("git")
+                .no_window()
+                .args(args)
+                .current_dir(&project)
+                .status()?
+                .success(),
+            "fixture git failed"
+        );
     }
     std::fs::write(project.join("README.md"), "# Synthetic latency fixture\n")?;
     let db_url = format!("sqlite:{}", root.path().join("fixture.db").display());
@@ -84,15 +115,34 @@ pub async fn measure() -> anyhow::Result<serde_json::Value> {
                 ensure!(bytes.len() < 4 * 1024 * 1024, "fixture request too large");
                 if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
                     let header = std::str::from_utf8(&bytes[..end])?;
-                    ensure!(header.starts_with("POST /chat/completions "), "unexpected provider route");
-                    let length: usize = header.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(str::trim).map(str::to_string)).ok_or_else(|| anyhow!("missing content length"))?.parse()?;
+                    ensure!(
+                        header.starts_with("POST /chat/completions "),
+                        "unexpected provider route"
+                    );
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(str::trim)
+                                .map(str::to_string)
+                        })
+                        .ok_or_else(|| anyhow!("missing content length"))?
+                        .parse()?;
                     if bytes.len() >= end + 4 + length {
-                        break serde_json::from_slice::<serde_json::Value>(&bytes[end + 4..end + 4 + length])?;
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &bytes[end + 4..end + 4 + length],
+                        )?;
                     }
                 }
             };
             ensure!(body["model"] == "synthetic-model", "wrong model");
-            ensure!(body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "user")), "missing admitted user message");
+            ensure!(
+                body["messages"]
+                    .as_array()
+                    .is_some_and(|messages| messages.iter().any(|m| m["role"] == "user")),
+                "missing admitted user message"
+            );
             ensure!(body["stream"] == true, "stream protocol changed");
             let response = "data: {\"choices\":[{\"delta\":{\"content\":\"synthetic\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response)?;
@@ -106,10 +156,16 @@ pub async fn measure() -> anyhow::Result<serde_json::Value> {
         settings.endpoints.clear();
         settings.default_endpoint = "synthetic".into();
         settings.default_model = "synthetic-model".into();
-        settings.endpoints.insert("synthetic".into(), Endpoint {
-            base_url: base_url.clone(), key_ref: None, api_style: ApiStyle::Openai,
-            custom_models: Vec::new(), active_model: Some("synthetic-model".into()),
-        });
+        settings.endpoints.insert(
+            "synthetic".into(),
+            Endpoint {
+                base_url: base_url.clone(),
+                key_ref: None,
+                api_style: ApiStyle::Openai,
+                custom_models: Vec::new(),
+                active_model: Some("synthetic-model".into()),
+            },
+        );
         let (result, mut stages) = observe(async {
             let started = Instant::now();
             crate::commands::chat::admit_headless_chat_turn(&pool, &session, "Explain the synthetic fixture; do not change files.").await?;
@@ -133,10 +189,18 @@ pub async fn measure() -> anyhow::Result<serde_json::Value> {
                 outcome = agent.run(history) => Err(anyhow!("agent ended before first HTTP receipt: {outcome:?}")),
             }
         }).await;
-        server.join().map_err(|_| anyhow!("fixture server panicked"))??;
+        server
+            .join()
+            .map_err(|_| anyhow!("fixture server panicked"))??;
         stages.insert("admission_to_http".into(), result?);
-        ensure!(stages.contains_key("skills_memory"), "skills/memory stage missing");
-        ensure!(stages.contains_key("provider_post"), "provider admission stage missing");
+        ensure!(
+            stages.contains_key("skills_memory"),
+            "skills/memory stage missing"
+        );
+        ensure!(
+            stages.contains_key("provider_post"),
+            "provider admission stage missing"
+        );
         samples.push(stages);
     }
     crate::storage::db::close_and_release_files(pool).await;

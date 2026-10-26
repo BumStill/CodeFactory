@@ -58,24 +58,41 @@ pub(crate) fn delivery_ceiling_is_upgrade(previous: &str, requested: &str) -> bo
     )
 }
 
-fn delivery_identity_conflict(existing: &sqlx::sqlite::SqliteRow, run: &NewDeliveryRun) -> Result<String> {
+fn delivery_identity_conflict(
+    existing: &sqlx::sqlite::SqliteRow,
+    run: &NewDeliveryRun,
+) -> Result<String> {
     let mut fields = Vec::new();
     for (field, value, label) in [
-        ("objective_id", &run.objective_id, "任务"), ("workspace_path", &run.workspace_path, "工作区路径"),
-        ("worktree_identity", &run.worktree_identity, "工作树"), ("repo_identity", &run.repo_identity, "仓库"),
-        ("base_branch", &run.base_branch, "基础分支"), ("head_branch", &run.head_branch, "交付分支"),
-        ("run_kind", &run.run_kind, "任务类型"), ("expected_head_sha", &run.expected_head_sha, "提交（不是已验证的前进）"),
+        ("objective_id", &run.objective_id, "任务"),
+        ("workspace_path", &run.workspace_path, "工作区路径"),
+        ("worktree_identity", &run.worktree_identity, "工作树"),
+        ("repo_identity", &run.repo_identity, "仓库"),
+        ("base_branch", &run.base_branch, "基础分支"),
+        ("head_branch", &run.head_branch, "交付分支"),
+        ("run_kind", &run.run_kind, "任务类型"),
+        (
+            "expected_head_sha",
+            &run.expected_head_sha,
+            "提交（不是已验证的前进）",
+        ),
         ("change_set_digest", &run.change_set_digest, "改动摘要"),
     ] {
-        if existing.try_get::<String, _>(field)? != *value { fields.push(label); }
+        if existing.try_get::<String, _>(field)? != *value {
+            fields.push(label);
+        }
     }
     if existing.try_get::<Option<String>, _>("session_id")? != run.session_id
-        || existing.try_get::<Option<String>, _>("task_id")? != run.task_id { fields.push("任务来源"); }
+        || existing.try_get::<Option<String>, _>("task_id")? != run.task_id
+    {
+        fields.push("任务来源");
+    }
     let recorded_ceiling: String = existing.try_get("requested_ceiling")?;
     if !delivery_ceiling_allows_resume(&recorded_ceiling, &run.requested_ceiling) {
-        if let (Some(previous), Some(requested)) =
-            (delivery_ceiling_rank(&recorded_ceiling), delivery_ceiling_rank(&run.requested_ceiling))
-        {
+        if let (Some(previous), Some(requested)) = (
+            delivery_ceiling_rank(&recorded_ceiling),
+            delivery_ceiling_rank(&run.requested_ceiling),
+        ) {
             if requested < previous {
                 return Ok(format!(
                     "本次交付上限 {} 低于同一交付已记录的上限 {}；不允许降低交付上限，未执行提交、推送或 PR 操作。请沿用已记录的上限继续同一交付。",
@@ -634,7 +651,8 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
     }
     // M116: historical installations still have the immutable trigger.
     sqlx::query("DROP TRIGGER IF EXISTS trg_delivery_runs_requested_ceiling_immutable")
-        .execute(pool).await?;
+        .execute(pool)
+        .await?;
     // M116-R3: keep parity with `migrations/0021_delivery_ceiling_upgrade.sql` —
     // the recorded ceiling may only move UP inside the same delivery.
     sqlx::query(
@@ -689,7 +707,10 @@ async fn rebind_stale_workspace_identity(
         return Ok(false);
     };
     let status: String = existing.try_get("status")?;
-    if matches!(status.as_str(), "completed" | "failed" | "cancelled" | "rejected") {
+    if matches!(
+        status.as_str(),
+        "completed" | "failed" | "cancelled" | "rejected"
+    ) {
         return Ok(false);
     }
     let scope_matches = existing.try_get::<String, _>("objective_id")? == run.objective_id
@@ -699,15 +720,18 @@ async fn rebind_stale_workspace_identity(
         && existing.try_get::<String, _>("repo_identity")? == run.repo_identity
         && existing.try_get::<String, _>("base_branch")? == run.base_branch
         && existing.try_get::<String, _>("head_branch")? == run.head_branch
-        && delivery_ceiling_allows_resume(&existing.try_get::<String, _>("requested_ceiling")?, &run.requested_ceiling);
+        && delivery_ceiling_allows_resume(
+            &existing.try_get::<String, _>("requested_ceiling")?,
+            &run.requested_ceiling,
+        );
     let previous_workspace: String = existing.try_get("workspace_path")?;
     let previous_worktree: String = existing.try_get("worktree_identity")?;
     let previous_head: String = existing.try_get("expected_head_sha")?;
     let previous_digest: String = existing.try_get("change_set_digest")?;
-    let workspace_moved = previous_workspace != run.workspace_path
-        || previous_worktree != run.worktree_identity;
-    let change_set_moved = previous_head == run.expected_head_sha
-        && previous_digest != run.change_set_digest;
+    let workspace_moved =
+        previous_workspace != run.workspace_path || previous_worktree != run.worktree_identity;
+    let change_set_moved =
+        previous_head == run.expected_head_sha && previous_digest != run.change_set_digest;
     if !scope_matches || !(workspace_moved || change_set_moved) {
         return Ok(false);
     }
@@ -964,11 +988,14 @@ pub async fn create_delivery_run(
             && existing.try_get::<String, _>("head_branch")? == run.head_branch
             && existing.try_get::<String, _>("change_set_digest")? == run.change_set_digest
             && existing.try_get::<String, _>("expected_head_sha")? == run.expected_head_sha
-            && delivery_ceiling_allows_resume(&existing.try_get::<String, _>("requested_ceiling")?, &run.requested_ceiling);
+            && delivery_ceiling_allows_resume(
+                &existing.try_get::<String, _>("requested_ceiling")?,
+                &run.requested_ceiling,
+            );
         if !identity_matches {
-            return Err(crate::errors::AppError::Other(
-                delivery_identity_conflict(&existing, run)?,
-            ));
+            return Err(crate::errors::AppError::Other(delivery_identity_conflict(
+                &existing, run,
+            )?));
         }
         // M116-R3: the same delivery asked for a higher ceiling (pr_only →
         // through_merge) after the user's own dispatch/steer message raised the
@@ -977,14 +1004,12 @@ pub async fn create_delivery_run(
         // any downward rewrite (M69 / CF-TRUTH-R5).
         let recorded_ceiling: String = existing.try_get("requested_ceiling")?;
         if delivery_ceiling_is_upgrade(&recorded_ceiling, &run.requested_ceiling) {
-            sqlx::query(
-                "UPDATE delivery_runs SET requested_ceiling=?, updated_at=? WHERE id=?",
-            )
-            .bind(&run.requested_ceiling)
-            .bind(now)
-            .bind(&run.id)
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query("UPDATE delivery_runs SET requested_ceiling=?, updated_at=? WHERE id=?")
+                .bind(&run.requested_ceiling)
+                .bind(now)
+                .bind(&run.id)
+                .execute(&mut *tx)
+                .await?;
         }
         let existing_owner = existing.try_get::<Option<String>, _>("lease_owner")?;
         let existing_lease_expires_at = existing.try_get::<Option<i64>, _>("lease_expires_at")?;
@@ -1013,14 +1038,18 @@ pub async fn create_delivery_run(
         // (canonical identity is preserved) instead of attaching forever.
         // M91: the validated identity may reclaim a run explicitly parked for
         // agent repair. Advancing the epoch fences the previous invocation.
-        let agent_action_handoff = existing.try_get::<String, _>("status")? == "agent_action_required";
-        let stale_waiting_holder = agent_action_handoff || existing_owner.is_some()
-            && existing_owner.as_deref() != Some(process.instance_id.as_str())
-            && existing.try_get::<String, _>("status")? == "waiting"
-            && (existing_lease_expires_at.is_some_and(|expires_at| expires_at <= now)
-                || existing
-                    .try_get::<Option<i64>, _>("last_progress_at")?
-                    .is_some_and(|progressed_at| now.saturating_sub(progressed_at) >= lease_ttl));
+        let agent_action_handoff =
+            existing.try_get::<String, _>("status")? == "agent_action_required";
+        let stale_waiting_holder = agent_action_handoff
+            || existing_owner.is_some()
+                && existing_owner.as_deref() != Some(process.instance_id.as_str())
+                && existing.try_get::<String, _>("status")? == "waiting"
+                && (existing_lease_expires_at.is_some_and(|expires_at| expires_at <= now)
+                    || existing
+                        .try_get::<Option<i64>, _>("last_progress_at")?
+                        .is_some_and(|progressed_at| {
+                            now.saturating_sub(progressed_at) >= lease_ttl
+                        }));
         if live_foreign_lease
             && lease_authorizes_mutation(current_claim_epoch, existing_reconciled_claim_epoch)
             && !stale_waiting_holder
@@ -1083,29 +1112,29 @@ pub async fn create_delivery_run(
             LEASE_MUTATION_CAPABLE_SQL
         );
         let renewed = sqlx::query(&renewal)
-        .bind(&process.instance_id)
-        .bind(now.saturating_add(lease_ttl))
-        .bind(&process.instance_id)
-        .bind(&process.app_version)
-        .bind(&process.app_build)
-        .bind(next_claim_epoch)
-        .bind(&run.root_turn_id)
-        .bind(&run.task_segment_id)
-        .bind(&process.app_version)
-        .bind(&process.app_build)
-        .bind(&process.instance_id)
-        .bind(i64::from(run.next_action_authorized))
-        .bind(i64::from(run.autonomous_completion))
-        .bind(now)
-        .bind(&run.id)
-        .bind(&run.objective_id)
-        .bind(&run.repo_identity)
-        .bind(&process.instance_id)
-        .bind(now)
-        .bind(i64::from(stale_waiting_holder))
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+            .bind(&process.instance_id)
+            .bind(now.saturating_add(lease_ttl))
+            .bind(&process.instance_id)
+            .bind(&process.app_version)
+            .bind(&process.app_build)
+            .bind(next_claim_epoch)
+            .bind(&run.root_turn_id)
+            .bind(&run.task_segment_id)
+            .bind(&process.app_version)
+            .bind(&process.app_build)
+            .bind(&process.instance_id)
+            .bind(i64::from(run.next_action_authorized))
+            .bind(i64::from(run.autonomous_completion))
+            .bind(now)
+            .bind(&run.id)
+            .bind(&run.objective_id)
+            .bind(&run.repo_identity)
+            .bind(&process.instance_id)
+            .bind(now)
+            .bind(i64::from(stale_waiting_holder))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         if renewed == 0 {
             return Err(crate::errors::AppError::Other(
                 "delivery run id collision or source identity changed".into(),
@@ -1317,7 +1346,10 @@ pub async fn reconcile_delivery_run_identity(
         || existing.try_get::<String, _>("repo_identity")? != run.repo_identity
         || existing.try_get::<String, _>("base_branch")? != run.base_branch
         || existing.try_get::<String, _>("head_branch")? != run.head_branch
-        || !delivery_ceiling_allows_resume(&existing.try_get::<String, _>("requested_ceiling")?, &run.requested_ceiling)
+        || !delivery_ceiling_allows_resume(
+            &existing.try_get::<String, _>("requested_ceiling")?,
+            &run.requested_ceiling,
+        )
     {
         return Err(crate::errors::AppError::Other(
             "delivery run identity collision: objective/worktree/change-set changed; refused before side effects"
@@ -1327,8 +1359,8 @@ pub async fn reconcile_delivery_run_identity(
 
     let previous_head: String = existing.try_get("expected_head_sha")?;
     let previous_digest: String = existing.try_get("change_set_digest")?;
-    let identity_already_current = previous_head == run.expected_head_sha
-        && previous_digest == run.change_set_digest;
+    let identity_already_current =
+        previous_head == run.expected_head_sha && previous_digest == run.change_set_digest;
     if identity_already_current && !previous_terminal {
         // Already reconciled; idempotent no-op. A *terminal* row with the same
         // identity still has to reopen below, otherwise the caller leaves with
@@ -1454,8 +1486,12 @@ pub async fn reconcile_delivery_run_identity(
 
 /// Release only this invocation's fenced claim, including terminal outcomes.
 pub async fn release_delivery_lease(
-    pool: &SqlitePool, run_id: &str, process: &ProcessIdentity,
-    claim_epoch: i64, now: i64, reason: &str,
+    pool: &SqlitePool,
+    run_id: &str,
+    process: &ProcessIdentity,
+    claim_epoch: i64,
+    now: i64,
+    reason: &str,
 ) -> Result<bool> {
     let mut tx = crate::storage::db::begin_write(pool).await?;
     let changed = sqlx::query("UPDATE delivery_runs SET lease_owner=NULL, lease_expires_at=NULL WHERE id=? AND lease_owner=? AND claim_epoch=?")
@@ -1615,9 +1651,7 @@ fn validated_positive_mutation_reconciliation_evidence(
                 && non_empty("head_sha")
         }
         "release_observed" => non_empty("head_sha") && non_empty("detail_digest"),
-        "committed_result_receipt" => {
-            intent.status == "committed" && non_empty("result_digest")
-        }
+        "committed_result_receipt" => intent.status == "committed" && non_empty("result_digest"),
         _ => false,
     };
     if !positive {
@@ -2143,8 +2177,7 @@ where
             "receipted local commit CAS requires the authoritative Objective schema".into(),
         ));
     }
-    let authority_sql =
-        "UPDATE delivery_runs SET last_observed_at=last_observed_at
+    let authority_sql = "UPDATE delivery_runs SET last_observed_at=last_observed_at
          WHERE id=? AND lease_owner=? AND claim_epoch=? AND lease_expires_at>?
            AND next_action_authorized=1
            AND status IN ('running','waiting','platform_incident','agent_action_required',
@@ -2438,11 +2471,23 @@ impl ActiveDeliveryLease {
                 .get("progress_revision")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0),
-            stage: value.get("stage").and_then(|v| v.as_str()).map(String::from),
-            status: value.get("status").and_then(|v| v.as_str()).map(String::from),
+            stage: value
+                .get("stage")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            status: value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             canonical_pr_number: value.get("canonical_pr_number").and_then(|v| v.as_i64()),
-            canonical_pr_url: value.get("canonical_pr_url").and_then(|v| v.as_str()).map(String::from),
-            wait_class: value.get("wait_class").and_then(|v| v.as_str()).map(String::from),
+            canonical_pr_url: value
+                .get("canonical_pr_url")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            wait_class: value
+                .get("wait_class")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             lease_expires_at: value
                 .get("lease_expires_at")
                 .and_then(serde_json::Value::as_i64),
@@ -2637,8 +2682,10 @@ pub async fn record_delivery_observation(
     let previous_expected_head_sha = previous.try_get::<String, _>("expected_head_sha")?;
     let previous_change_set_digest = previous.try_get::<String, _>("change_set_digest")?;
     let head_changed = previous_expected_head_sha != observation.expected_head_sha;
-    let revision_changed = observation.identity_revision.as_ref().is_some_and(|revision|
-        revision.next_change_set_digest != previous_change_set_digest);
+    let revision_changed = observation
+        .identity_revision
+        .as_ref()
+        .is_some_and(|revision| revision.next_change_set_digest != previous_change_set_digest);
     let next_change_set_digest = if head_changed || revision_changed {
         let revision = observation.identity_revision.as_ref().ok_or_else(|| {
             crate::errors::AppError::Other(
@@ -2913,10 +2960,7 @@ async fn park_delivery_runs_for_stopped_sessions(
              WHERE fence.session_id = delivery_runs.session_id
            )"
     );
-    sqlx::query(&park_sql)
-        .bind(now)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(&park_sql).bind(now).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -3184,7 +3228,9 @@ mod tests {
         ensure_schema(&pool).await.unwrap();
         // CF-STOP：生产里这张表由 `storage::db` 建；这里补一次，让恢复用例能写下
         // 停止栅栏（与 `plan_startup_recovery` 的幂等建表是同一份 DDL）。
-        crate::agent::stop_fence::ensure_schema(&pool).await.unwrap();
+        crate::agent::stop_fence::ensure_schema(&pool)
+            .await
+            .unwrap();
         pool
     }
 
@@ -3233,7 +3279,9 @@ mod tests {
         .unwrap();
 
         assert!(
-            plan.claimed.iter().all(|run| run.run_id != "stopped-session"),
+            plan.claimed
+                .iter()
+                .all(|run| run.run_id != "stopped-session"),
             "停止过的会话不得被恢复回路接手: {:?}",
             plan.claimed
                 .iter()
@@ -3286,7 +3334,9 @@ mod tests {
         .await
         .unwrap();
         // A later call that carries no intent must not erase the recorded one.
-        record_delivery_pr_intent(&pool, "pr-intent-run", None, None, now).await.unwrap();
+        record_delivery_pr_intent(&pool, "pr-intent-run", None, None, now)
+            .await
+            .unwrap();
 
         sqlx::query("UPDATE delivery_runs SET lease_expires_at=0 WHERE id='pr-intent-run'")
             .execute(&pool)
@@ -3323,15 +3373,7 @@ mod tests {
             99,
         )
         .await;
-        insert_recovery_fixture(
-            &pool,
-            "live",
-            Some("session"),
-            Some("turn"),
-            "waiting",
-            101,
-        )
-        .await;
+        insert_recovery_fixture(&pool, "live", Some("session"), Some("turn"), "waiting", 101).await;
         insert_recovery_fixture(
             &pool,
             "terminal",
@@ -3478,13 +3520,14 @@ mod tests {
         .await
         .expect("continuing in a fresh workspace must re-reconcile, not refuse delivery");
         assert!(claim_epoch >= 1, "the continued run gets a live claim");
-        let (workspace, worktree, digest, owner): (String, String, String, String) = sqlx::query_as(
-            "SELECT workspace_path, worktree_identity, change_set_digest, lease_owner
+        let (workspace, worktree, digest, owner): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT workspace_path, worktree_identity, change_set_digest, lease_owner
              FROM delivery_runs WHERE id='delivery-continued'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(workspace, "/workspaces/continued");
         assert_eq!(worktree, "worktree:continued");
         assert_eq!(digest, "digest-continued");
@@ -3557,15 +3600,9 @@ mod tests {
         create_delivery_run(&pool, &run("digest-before"), &same_process, 100, 90_000)
             .await
             .unwrap();
-        create_delivery_run(
-            &pool,
-            &run("digest-after"),
-            &same_process,
-            200_000,
-            90_000,
-        )
-        .await
-        .expect("an advanced in-progress change set must re-reconcile, not refuse delivery");
+        create_delivery_run(&pool, &run("digest-after"), &same_process, 200_000, 90_000)
+            .await
+            .expect("an advanced in-progress change set must re-reconcile, not refuse delivery");
         let (digest, head): (String, String) = sqlx::query_as(
             "SELECT change_set_digest, expected_head_sha FROM delivery_runs
              WHERE id='delivery-digest'",
@@ -4278,7 +4315,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(head, "aaa", "the same-worktree advance keeps the durable head");
+        assert_eq!(
+            head, "aaa",
+            "the same-worktree advance keeps the durable head"
+        );
         assert_eq!(digest, "digest-b");
 
         // The safety boundary is unchanged: a foreign worktree is still refused.
@@ -4297,9 +4337,10 @@ mod tests {
         };
         foreign_revision.receipt_id =
             delivery_identity_revision_receipt_id(&foreign.id, &foreign_revision);
-        let error = reconcile_delivery_run_identity(&pool, &foreign, &process, 300, &foreign_revision)
-            .await
-            .expect_err("a foreign worktree must stay a collision");
+        let error =
+            reconcile_delivery_run_identity(&pool, &foreign, &process, 300, &foreign_revision)
+                .await
+                .expect_err("a foreign worktree must stay a collision");
         assert!(error.to_string().contains("identity collision"), "{error}");
     }
 
@@ -6313,12 +6354,20 @@ mod tests {
         let mut run: NewDeliveryRun = truth_run("truth-ceiling");
         run.requested_ceiling = "through_ci_green".into();
         let error = create_delivery_run(&pool, &run, &owner, 110, 90)
-            .await.expect_err("M116-R3 rejects lowering the delivery ceiling");
+            .await
+            .expect_err("M116-R3 rejects lowering the delivery ceiling");
         assert!(error.to_string().contains("不允许降低交付上限"), "{error}");
         assert!(!error.to_string().contains("请回到原任务的原工作区"));
-        let ceiling: String = sqlx::query_scalar("SELECT requested_ceiling FROM delivery_runs WHERE id='truth-ceiling'")
-            .fetch_one(&pool).await.unwrap();
-        assert_eq!(ceiling, "through_release", "a lowered call cannot rewrite durable authorization");
+        let ceiling: String = sqlx::query_scalar(
+            "SELECT requested_ceiling FROM delivery_runs WHERE id='truth-ceiling'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            ceiling, "through_release",
+            "a lowered call cannot rewrite durable authorization"
+        );
     }
 
     /// M116-R3/R4: the first delivery recorded `pr_only` (the global default at
@@ -6342,11 +6391,12 @@ mod tests {
             .await
             .expect("M116: raising the ceiling inside the same identity is the same delivery");
 
-        let ceiling: String =
-            sqlx::query_scalar("SELECT requested_ceiling FROM delivery_runs WHERE id='m116-upgrade'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let ceiling: String = sqlx::query_scalar(
+            "SELECT requested_ceiling FROM delivery_runs WHERE id='m116-upgrade'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             ceiling, "through_merge",
             "the durable record follows the authorized upgrade"
@@ -6372,10 +6422,7 @@ mod tests {
         .execute(&pool)
         .await;
         let error = lowered.expect_err("the recorded ceiling may only be raised");
-        assert!(
-            error.to_string().contains("may only be raised"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("may only be raised"), "{error}");
     }
 
     #[tokio::test]
@@ -6388,35 +6435,63 @@ mod tests {
         let owner = ProcessIdentity::new("synthetic-owner", "test", "test");
         let mut run = truth_run("m116-historical");
         run.requested_ceiling = "pr_only".into();
-        create_delivery_run(&pool, &run, &owner, 100, 90).await.unwrap();
+        create_delivery_run(&pool, &run, &owner, 100, 90)
+            .await
+            .unwrap();
         run.requested_ceiling = "through_ci_green".into();
-        create_delivery_run(&pool, &run, &owner, 110, 90).await.unwrap();
+        create_delivery_run(&pool, &run, &owner, 110, 90)
+            .await
+            .unwrap();
         run.requested_ceiling = "through_merge".into();
-        create_delivery_run(&pool, &run, &owner, 120, 90).await.unwrap();
+        create_delivery_run(&pool, &run, &owner, 120, 90)
+            .await
+            .unwrap();
         let (count, ceiling): (i64, String) = sqlx::query_as(
-            "SELECT COUNT(*), requested_ceiling FROM delivery_runs WHERE id='m116-historical'")
-            .fetch_one(&pool).await.unwrap();
+            "SELECT COUNT(*), requested_ceiling FROM delivery_runs WHERE id='m116-historical'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!((count, ceiling.as_str()), (1, "through_merge"));
     }
 
     fn truth_run(id: &str) -> NewDeliveryRun {
         NewDeliveryRun {
-            id: id.into(), objective_id: format!("objective-opaque-{id}"),
-            run_kind: "deliver_changes".into(), session_id: Some(format!("session-{id}")),
-            root_turn_id: Some(format!("turn-{id}")), task_segment_id: Some(format!("segment-{id}")),
-            task_id: None, workspace_path: "/workspace".into(), worktree_identity: format!("worktree:{id}"),
-            repo_identity: format!("repo:{id}"), base_branch: "main".into(), head_branch: "feature".into(),
-            change_set_digest: "digest".into(), expected_head_sha: "abc".into(),
-            canonical_pr_number: None, canonical_pr_url: None, canonical_head_sha: None,
-            requested_ceiling: "through_release".into(), reached_ceiling: "local".into(),
-            stage: "delivery".into(), status: "waiting".into(), wait_class: Some("wait_retryable".into()),
-            next_action: Some("observe_ci".into()), next_action_authorized: true, autonomous_completion: true,
+            id: id.into(),
+            objective_id: format!("objective-opaque-{id}"),
+            run_kind: "deliver_changes".into(),
+            session_id: Some(format!("session-{id}")),
+            root_turn_id: Some(format!("turn-{id}")),
+            task_segment_id: Some(format!("segment-{id}")),
+            task_id: None,
+            workspace_path: "/workspace".into(),
+            worktree_identity: format!("worktree:{id}"),
+            repo_identity: format!("repo:{id}"),
+            base_branch: "main".into(),
+            head_branch: "feature".into(),
+            change_set_digest: "digest".into(),
+            expected_head_sha: "abc".into(),
+            canonical_pr_number: None,
+            canonical_pr_url: None,
+            canonical_head_sha: None,
+            requested_ceiling: "through_release".into(),
+            reached_ceiling: "local".into(),
+            stage: "delivery".into(),
+            status: "waiting".into(),
+            wait_class: Some("wait_retryable".into()),
+            next_action: Some("observe_ci".into()),
+            next_action_authorized: true,
+            autonomous_completion: true,
         }
     }
 
     #[tokio::test]
     async fn cf_truth_r6_foreign_task_and_workspace_explain_the_changed_field() {
-        for (field, label) in [("objective", "任务"), ("workspace", "工作区"), ("worktree", "工作树")] {
+        for (field, label) in [
+            ("objective", "任务"),
+            ("workspace", "工作区"),
+            ("worktree", "工作树"),
+        ] {
             let pool = pool().await;
             let owner = ProcessIdentity::new("fixture-owner", "test", "test");
             create_mutation_test_run(&pool, "truth-conflict", &owner, 100, 90).await;
@@ -6426,11 +6501,21 @@ mod tests {
                 "workspace" => run.workspace_path = "/foreign-workspace".into(),
                 _ => run.worktree_identity = "foreign-worktree".into(),
             }
-            let error = create_delivery_run(&pool, &run, &owner, 110, 90).await.unwrap_err().to_string();
+            let error = create_delivery_run(&pool, &run, &owner, 110, 90)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(error.contains(label), "must identify {label}: {error}");
-            assert!(error.contains("原任务") && error.contains("未执行"), "must explain remedy and safety: {error}");
-            let workspace: String = sqlx::query_scalar("SELECT workspace_path FROM delivery_runs WHERE id='truth-conflict'")
-                .fetch_one(&pool).await.unwrap();
+            assert!(
+                error.contains("原任务") && error.contains("未执行"),
+                "must explain remedy and safety: {error}"
+            );
+            let workspace: String = sqlx::query_scalar(
+                "SELECT workspace_path FROM delivery_runs WHERE id='truth-conflict'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             assert_eq!(workspace, "/workspace");
         }
     }
@@ -6441,24 +6526,71 @@ mod tests {
         for status in ["running", "waiting", "failed", "completed"] {
             let run = foreground_admission_fixture(&format!("lease-{status}"));
             let owner = ProcessIdentity::new("synthetic-owner", "test", "test");
-            let epoch = create_delivery_run(&pool, &run, &owner, 100, 90).await.unwrap();
+            let epoch = create_delivery_run(&pool, &run, &owner, 100, 90)
+                .await
+                .unwrap();
             sqlx::query("UPDATE delivery_runs SET status=? WHERE id=?")
-                .bind(status).bind(&run.id).execute(&pool).await.unwrap();
-            assert!(release_delivery_lease(&pool, &run.id, &owner, epoch, 110, "invocation_return").await.unwrap());
-            let lease: Option<String> = sqlx::query_scalar("SELECT lease_owner FROM delivery_runs WHERE id=?")
-                .bind(&run.id).fetch_one(&pool).await.unwrap();
+                .bind(status)
+                .bind(&run.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(release_delivery_lease(
+                &pool,
+                &run.id,
+                &owner,
+                epoch,
+                110,
+                "invocation_return"
+            )
+            .await
+            .unwrap());
+            let lease: Option<String> =
+                sqlx::query_scalar("SELECT lease_owner FROM delivery_runs WHERE id=?")
+                    .bind(&run.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert!(lease.is_none());
             let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_run_events WHERE run_id=? AND event_kind='lease_release'")
                 .bind(&run.id).fetch_one(&pool).await.unwrap();
             assert_eq!(events, 1);
-            assert!(!release_delivery_lease(&pool, &run.id, &owner, epoch, 111, "duplicate").await.unwrap());
+            assert!(
+                !release_delivery_lease(&pool, &run.id, &owner, epoch, 111, "duplicate")
+                    .await
+                    .unwrap()
+            );
             if status == "running" || status == "waiting" {
-                create_delivery_run(&pool, &run, &ProcessIdentity::new("next-invocation", "test", "test"), 112, 90).await.unwrap();
+                create_delivery_run(
+                    &pool,
+                    &run,
+                    &ProcessIdentity::new("next-invocation", "test", "test"),
+                    112,
+                    90,
+                )
+                .await
+                .unwrap();
             }
         }
         let run = foreground_admission_fixture("residual-lock");
-        create_delivery_run(&pool, &run, &ProcessIdentity::new("dead-owner", "test", "test"), 100, 90).await.unwrap();
-        create_delivery_run(&pool, &run, &ProcessIdentity::new("replacement", "test", "test"), 191, 90).await.unwrap();
+        create_delivery_run(
+            &pool,
+            &run,
+            &ProcessIdentity::new("dead-owner", "test", "test"),
+            100,
+            90,
+        )
+        .await
+        .unwrap();
+        create_delivery_run(
+            &pool,
+            &run,
+            &ProcessIdentity::new("replacement", "test", "test"),
+            191,
+            90,
+        )
+        .await
+        .unwrap();
         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_run_events WHERE run_id=? AND event_kind='lease_takeover'")
             .bind(&run.id).fetch_one(&pool).await.unwrap();
         assert_eq!(events, 1);
@@ -6508,17 +6640,26 @@ mod tests {
         let pool = pool().await;
         let run = foreground_admission_fixture("m91-reentry");
         let old = ProcessIdentity::new("synthetic-old", "test", "test");
-        let epoch = create_delivery_run(&pool, &run, &old, 100, 90_000).await.unwrap();
+        let epoch = create_delivery_run(&pool, &run, &old, 100, 90_000)
+            .await
+            .unwrap();
         sqlx::query("UPDATE delivery_runs SET status='agent_action_required', stage='pr_body', reconciled_claim_epoch=claim_epoch WHERE id=?")
             .bind(&run.id).execute(&pool).await.unwrap();
         let mut foreign = run.clone();
         foreign.objective_id = "synthetic-foreign".into();
         let next = ProcessIdentity::new("synthetic-next", "test", "test");
-        assert!(create_delivery_run(&pool, &foreign, &next, 110, 90_000).await.is_err());
-        let claimed = create_delivery_run(&pool, &run, &next, 110, 90_000).await
+        assert!(create_delivery_run(&pool, &foreign, &next, 110, 90_000)
+            .await
+            .is_err());
+        let claimed = create_delivery_run(&pool, &run, &next, 110, 90_000)
+            .await
             .expect("M91: agent must resume its own action-required delivery");
         assert_eq!(claimed, epoch + 1);
-        assert!(!verify_delivery_mutation_permit(&pool, &run.id, &old, epoch, 111).await.unwrap());
+        assert!(
+            !verify_delivery_mutation_permit(&pool, &run.id, &old, epoch, 111)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -6526,16 +6667,33 @@ mod tests {
         let pool = pool().await;
         let run = foreground_admission_fixture("stalled-ci");
         let old = ProcessIdentity::new("old-ci-observer", "test", "test");
-        let epoch = create_delivery_run(&pool, &run, &old, 100, 90_000).await.unwrap();
+        let epoch = create_delivery_run(&pool, &run, &old, 100, 90_000)
+            .await
+            .unwrap();
         sqlx::query("UPDATE delivery_runs SET stage='ci_observation', status='waiting', reached_ceiling='pr_open', canonical_pr_number=42, canonical_pr_url='https://example.invalid/pr/42', lease_expires_at=200000 WHERE id='stalled-ci'")
             .execute(&pool).await.unwrap();
         let next = ProcessIdentity::new("new-ci-observer", "test", "test");
-        assert!(create_delivery_run(&pool, &run, &next, 200, 90_000).await.is_err(), "live wait is not immediately stolen");
-        let claimed = create_delivery_run(&pool, &run, &next, 100_100, 90_000).await
+        assert!(
+            create_delivery_run(&pool, &run, &next, 200, 90_000)
+                .await
+                .is_err(),
+            "live wait is not immediately stolen"
+        );
+        let claimed = create_delivery_run(&pool, &run, &next, 100_100, 90_000)
+            .await
             .expect("a CI wait with no progress for one lease window must be reclaimed");
         assert_eq!(claimed, epoch + 1);
-        assert!(!verify_delivery_mutation_permit(&pool, &run.id, &old, epoch, 100_101).await.unwrap());
-        let pr: i64 = sqlx::query_scalar("SELECT canonical_pr_number FROM delivery_runs WHERE id='stalled-ci'").fetch_one(&pool).await.unwrap();
+        assert!(
+            !verify_delivery_mutation_permit(&pool, &run.id, &old, epoch, 100_101)
+                .await
+                .unwrap()
+        );
+        let pr: i64 = sqlx::query_scalar(
+            "SELECT canonical_pr_number FROM delivery_runs WHERE id='stalled-ci'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(pr, 42, "takeover resumes the same PR");
     }
 

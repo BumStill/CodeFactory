@@ -2,9 +2,16 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCommandPolicy {
-    Allow { risk: ShellRisk },
-    Ask { risk: ShellRisk, reason: &'static str },
-    Deny { reason: &'static str },
+    Allow {
+        risk: ShellRisk,
+    },
+    Ask {
+        risk: ShellRisk,
+        reason: &'static str,
+    },
+    Deny {
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +71,15 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
         &[
             ("rm -rf /", "matches permanent deny 'rm -rf /'"),
             ("format ", "matches permanent deny 'format'"),
-            ("del /f /s /q c:\\", "matches permanent deny 'del /f /s /q c:\\'"),
+            (
+                "del /f /s /q c:\\",
+                "matches permanent deny 'del /f /s /q c:\\'",
+            ),
             ("rd /s /q c:\\", "matches permanent deny 'rd /s /q c:\\'"),
-            ("reg delete hklm", "matches permanent deny 'reg delete hklm'"),
+            (
+                "reg delete hklm",
+                "matches permanent deny 'reg delete hklm'",
+            ),
             ("shutdown", "matches permanent deny 'shutdown'"),
         ],
     ) {
@@ -82,19 +95,31 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
     if let Some(reason) = contains_any(
         &normalized,
         &[
-            ("git reset --hard", "high risk shell command: git reset --hard"),
+            (
+                "git reset --hard",
+                "high risk shell command: git reset --hard",
+            ),
             ("git clean -", "high risk shell command: git clean"),
             ("rm -rf", "high risk shell command: recursive rm"),
             ("rd /s", "high risk shell command: recursive rd"),
             ("rmdir /s", "high risk shell command: recursive rmdir"),
             ("del /s", "high risk shell command: recursive del"),
             ("reg delete", "high risk shell command: registry delete"),
-            ("set-executionpolicy", "high risk shell command: execution policy change"),
-            ("invoke-expression", "high risk shell command: invoke-expression"),
+            (
+                "set-executionpolicy",
+                "high risk shell command: execution policy change",
+            ),
+            (
+                "invoke-expression",
+                "high risk shell command: invoke-expression",
+            ),
             ("| iex", "high risk shell command: pipe to iex"),
             ("|iex", "high risk shell command: pipe to iex"),
             ("diskpart", "high risk shell command: diskpart"),
-            ("bcdedit", "high risk shell command: boot configuration edit"),
+            (
+                "bcdedit",
+                "high risk shell command: boot configuration edit",
+            ),
         ],
     ) {
         return ask(reason);
@@ -108,11 +133,26 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
     if let Some(reason) = contains_any(
         &normalized,
         &[
-            ("--show-token", "credential exposure: `--show-token` prints the account token"),
-            ("gh auth token", "credential exposure: `gh auth token` prints the account token"),
-            ("gh auth login", "credential change: `gh auth login` replaces the stored credential"),
-            ("gh auth logout", "credential change: `gh auth logout` removes the stored credential"),
-            ("gh auth refresh", "credential change: `gh auth refresh` rewrites the stored credential"),
+            (
+                "--show-token",
+                "credential exposure: `--show-token` prints the account token",
+            ),
+            (
+                "gh auth token",
+                "credential exposure: `gh auth token` prints the account token",
+            ),
+            (
+                "gh auth login",
+                "credential change: `gh auth login` replaces the stored credential",
+            ),
+            (
+                "gh auth logout",
+                "credential change: `gh auth logout` removes the stored credential",
+            ),
+            (
+                "gh auth refresh",
+                "credential change: `gh auth refresh` rewrites the stored credential",
+            ),
             ("gh secret", "repository credential change: `gh secret`"),
             ("gh variable", "repository settings change: `gh variable`"),
             ("gh ruleset", "repository protection change: `gh ruleset`"),
@@ -354,7 +394,9 @@ mod tests {
     #[test]
     fn rejects_direct_playwright_cli_in_favor_of_managed_sessions() {
         assert!(matches!(
-            classify_command("npx --package @playwright/cli playwright-cli open https://example.com"),
+            classify_command(
+                "npx --package @playwright/cli playwright-cli open https://example.com"
+            ),
             ShellCommandPolicy::Deny { .. }
         ));
     }
@@ -437,16 +479,25 @@ mod tests {
             cwd,
             Some(0),
             ShellRisk::Low,
-            Some(GithubQuota { remaining: 4800, limit: 5000 }),
+            Some(GithubQuota {
+                remaining: 4800,
+                limit: 5000,
+            }),
         );
         assert!(healthy.contains("4800/5000 remaining"));
-        assert!(!healthy.contains("running low"), "no false alarm: {healthy}");
+        assert!(
+            !healthy.contains("running low"),
+            "no false alarm: {healthy}"
+        );
 
         let low = audit_footer_with_quota(
             cwd,
             Some(0),
             ShellRisk::Low,
-            Some(GithubQuota { remaining: 400, limit: 5000 }),
+            Some(GithubQuota {
+                remaining: 400,
+                limit: 5000,
+            }),
         );
         assert!(low.contains("running low"));
         assert!(low.contains("deliver_changes"), "say what to do instead");

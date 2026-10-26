@@ -38,7 +38,6 @@ impl From<CheckpointRow> for CheckpointInfo {
     }
 }
 
-
 #[tauri::command]
 pub async fn list_checkpoints(
     session_id: String,
@@ -69,8 +68,7 @@ pub async fn checkpoint_changeset(
     .bind(&checkpoint_id)
     .fetch_one(&*pool)
     .await?;
-    checkpoint::changeset(Path::new(&row.cwd), &row.git_sha)
-        .map_err(|e| AppError::Other(e))
+    checkpoint::changeset(Path::new(&row.cwd), &row.git_sha).map_err(|e| AppError::Other(e))
 }
 
 #[tauri::command]

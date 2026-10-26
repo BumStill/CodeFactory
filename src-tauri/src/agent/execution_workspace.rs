@@ -148,7 +148,9 @@ enum CandidateDisposition {
 /// `ClosedUnmerged` keeps everything and reports it in plain language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CanonicalPrState {
-    Merged { merge_sha: String },
+    Merged {
+        merge_sha: String,
+    },
     ClosedUnmerged,
     Open,
     Queued,
@@ -158,7 +160,10 @@ pub(crate) enum CanonicalPrState {
     /// update-branch and the merge queue rewrite the head into a merge commit
     /// whose parents are the session's head plus the default branch, which is
     /// exactly the same work under a new SHA.
-    HeadAdvanced { head_sha: String, queued: bool },
+    HeadAdvanced {
+        head_sha: String,
+        queued: bool,
+    },
     /// The observer could not establish the truth (no remote, network, schema).
     /// This is never a reason to delete or to claim the work is done.
     Unknown(String),
@@ -294,24 +299,41 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         // A cleaned-up workspace must not make the read-only observation fail:
         // resolve the delivery remote from the recorded repository, and fall
         // back to the process directory, which is enough with `-R owner/repo`.
-        let remote = gh_remote_for(repo_root)
-            .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)));
+        let remote = gh_remote_for(repo_root).or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| gh_remote_for(&cwd))
+        });
         let Some(remote) = remote else {
             return Ok(CanonicalPrState::Unknown(
                 "no delivery remote is resolvable for this repository".into(),
             ));
         };
-        match remote.observe_merge(pr_number as u64, expected_head_sha).await {
-            Ok(MergeObservation::Merged { merge_sha }) => Ok(CanonicalPrState::Merged { merge_sha }),
+        match remote
+            .observe_merge(pr_number as u64, expected_head_sha)
+            .await
+        {
+            Ok(MergeObservation::Merged { merge_sha }) => {
+                Ok(CanonicalPrState::Merged { merge_sha })
+            }
             Ok(MergeObservation::ClosedUnmerged) => Ok(CanonicalPrState::ClosedUnmerged),
             Ok(MergeObservation::OpenSameHead { .. }) => remote
                 .observed_queue_arm(pr_number as u64, expected_head_sha)
-                .map(|armed| if armed { CanonicalPrState::Queued } else { CanonicalPrState::Open })
+                .map(|armed| {
+                    if armed {
+                        CanonicalPrState::Queued
+                    } else {
+                        CanonicalPrState::Open
+                    }
+                })
                 .map_err(|error| anyhow!(error)),
             // M115/R2: a moved head is not a conclusion by itself; the caller
             // asks `observe_updated_head` whether it is the same delivery.
             Ok(MergeObservation::HeadChanged { actual_head }) => {
-                Ok(CanonicalPrState::HeadAdvanced { head_sha: actual_head, queued: false })
+                Ok(CanonicalPrState::HeadAdvanced {
+                    head_sha: actual_head,
+                    queued: false,
+                })
             }
             Ok(MergeObservation::Unsupported) => Ok(CanonicalPrState::Unknown(
                 "provider cannot report merge state".into(),
@@ -326,8 +348,11 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         expected_head_sha: &str,
     ) -> Option<Vec<crate::agent::objective::CiCheckState>> {
         use crate::agent::delivery::gh_remote_for;
-        let remote = gh_remote_for(repo_root)
-            .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)))?;
+        let remote = gh_remote_for(repo_root).or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| gh_remote_for(&cwd))
+        })?;
         remote.observed_ci_checks(expected_head_sha).await.ok()
     }
 
@@ -342,16 +367,22 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         actual_head_sha: &str,
     ) -> UpdatedHeadVerdict {
         use crate::agent::delivery::gh_remote_for;
-        let Some(remote) = gh_remote_for(repo_root)
-            .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)))
-        else {
+        let Some(remote) = gh_remote_for(repo_root).or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| gh_remote_for(&cwd))
+        }) else {
             return UpdatedHeadVerdict::Foreign("no delivery remote is resolvable".into());
         };
         use crate::agent::delivery::DeliveryRemote;
         if remote.head_is_explained(known_head_sha, actual_head_sha) {
-            UpdatedHeadVerdict::SameDelivery { synced_from_default_branch: "default branch / known delivery history".into() }
+            UpdatedHeadVerdict::SameDelivery {
+                synced_from_default_branch: "default branch / known delivery history".into(),
+            }
         } else {
-            UpdatedHeadVerdict::Foreign(format!("cannot explain {actual_head_sha} from delivery head {known_head_sha}"))
+            UpdatedHeadVerdict::Foreign(format!(
+                "cannot explain {actual_head_sha} from delivery head {known_head_sha}"
+            ))
         }
     }
 
@@ -366,8 +397,11 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
         use crate::agent::delivery::gh_remote_for;
         use std::collections::HashSet;
         let mut out = std::collections::HashMap::new();
-        let remote = gh_remote_for(repo_root)
-            .or_else(|| std::env::current_dir().ok().and_then(|cwd| gh_remote_for(&cwd)));
+        let remote = gh_remote_for(repo_root).or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| gh_remote_for(&cwd))
+        });
         let Some(remote) = remote else {
             let detail = "no delivery remote is resolvable for this repository".to_string();
             for request in requests {
@@ -391,7 +425,9 @@ impl CanonicalPrObserver for RemoteCanonicalPrObserver {
                         continue;
                     }
                     let state = match states.get(&request.pr_number) {
-                        Some(summary) => canonical_state_from_batch(summary, &request.expected_head_sha),
+                        Some(summary) => {
+                            canonical_state_from_batch(summary, &request.expected_head_sha)
+                        }
                         None => CanonicalPrState::Unknown(format!(
                             "PR #{} was not returned by the batched listing",
                             request.pr_number
@@ -722,7 +758,11 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
 /// M161 R1/R2: preserve Git's complete stash object (index + worktree +
 /// untracked parent) under a permanent ref before restoring the registered branch.
 /// The journal also makes an interrupted repair discoverable on the next attach.
-async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktree: &Path) -> Result<()> {
+async fn restore_registered_branch(
+    pool: &SqlitePool,
+    row: &WorkspaceRow,
+    worktree: &Path,
+) -> Result<()> {
     let (repo, identity, _) = workspace_identity(worktree)?;
     if repo != row.repo_identity || row.worktree_identity.as_deref() != Some(identity.as_str()) {
         bail!("managed workspace identity mismatch: repo or gitdir changed before repair");
@@ -731,22 +771,39 @@ async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktr
         "SELECT rescue_ref, phase FROM execution_workspace_rescues WHERE objective_id=? AND phase NOT IN ('applied','conflict') ORDER BY created_at DESC LIMIT 1",
     ).bind(&row.objective_id).fetch_optional(pool).await?;
     let current = git(worktree, &["branch", "--show-current"])?;
-    if current == row.branch_name && pending.is_none() { return Ok(()); }
+    if current == row.branch_name && pending.is_none() {
+        return Ok(());
+    }
     if !branch_exists(worktree, &row.branch_name) {
         bail!("registered branch is missing; system will retry workspace self-healing");
     }
-    let status = git(worktree, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let status = git(
+        worktree,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
     if status.is_empty() && pending.is_none() {
         git(worktree, &["checkout", &row.branch_name])?;
         return Ok(());
     }
-    let (rescue_ref, mut phase) = if let Some(pending) = pending { pending } else {
+    let (rescue_ref, mut phase) = if let Some(pending) = pending {
+        pending
+    } else {
         // Objective IDs are normally UUIDs, but never let an arbitrary ID form
         // a Git ref or option. Preserve the familiar ID when it is ref-safe.
-        let objective = if row.objective_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        let objective = if row
+            .objective_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
             row.objective_id.clone()
-        } else { digest("workspace-rescue", &[&row.objective_id]) };
-        let reference = format!("refs/codefactory/rescue/{objective}/{}-{}", Utc::now().timestamp_millis(), uuid::Uuid::new_v4().simple());
+        } else {
+            digest("workspace-rescue", &[&row.objective_id])
+        };
+        let reference = format!(
+            "refs/codefactory/rescue/{objective}/{}-{}",
+            Utc::now().timestamp_millis(),
+            uuid::Uuid::new_v4().simple()
+        );
         sqlx::query("INSERT INTO execution_workspace_rescues(rescue_ref,objective_id,phase,created_at,updated_at) VALUES (?,?,'preparing',?,?)")
             .bind(&reference).bind(&row.objective_id).bind(Utc::now().timestamp_millis()).bind(Utc::now().timestamp_millis()).execute(pool).await?;
         (reference, "preparing".into())
@@ -757,14 +814,31 @@ async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktr
         let marker = format!("codefactory-rescue:{rescue_ref}");
         let find_stash = || -> Result<Option<String>> {
             Ok(git(worktree, &["stash", "list", "--format=%H %gs"])?
-                .lines().find(|line| line.ends_with(&marker))
-                .and_then(|line| line.split_whitespace().next()).map(str::to_owned))
+                .lines()
+                .find(|line| line.ends_with(&marker))
+                .and_then(|line| line.split_whitespace().next())
+                .map(str::to_owned))
         };
         let stash = match find_stash()? {
             Some(sha) => sha,
             None => {
-                git(worktree, &["-c", "user.name=CodeFactory Rescue", "-c", "user.email=rescue@codefactory.invalid", "stash", "push", "--include-untracked", "-m", &marker])?;
-                find_stash()?.ok_or_else(|| anyhow!("rescue snapshot was not created; system will retry self-healing"))?
+                git(
+                    worktree,
+                    &[
+                        "-c",
+                        "user.name=CodeFactory Rescue",
+                        "-c",
+                        "user.email=rescue@codefactory.invalid",
+                        "stash",
+                        "push",
+                        "--include-untracked",
+                        "-m",
+                        &marker,
+                    ],
+                )?;
+                find_stash()?.ok_or_else(|| {
+                    anyhow!("rescue snapshot was not created; system will retry self-healing")
+                })?
             }
         };
         git(worktree, &["update-ref", &rescue_ref, &stash])?;
@@ -789,16 +863,32 @@ async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktr
         // untracked tree, never broad `git clean` or ignored user files.
         git(worktree, &["reset", "--hard", "HEAD"])?;
         let mut command = Command::new("git");
-        let output = command.no_window().arg("-C").arg(external_path(worktree))
-            .args(["ls-tree", "-rz", "--name-only", &format!("{rescue_ref}^3")]).output()?;
+        let output = command
+            .no_window()
+            .arg("-C")
+            .arg(external_path(worktree))
+            .args(["ls-tree", "-rz", "--name-only", &format!("{rescue_ref}^3")])
+            .output()?;
         if output.status.success() {
-            for name in output.stdout.split(|byte| *byte == 0).filter(|name| !name.is_empty()) {
+            for name in output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+            {
                 let name = std::str::from_utf8(name).context("rescue filename is not UTF-8")?;
                 // Git handles literal pathspecs and won't remove tracked or
                 // ignored files. Every removed file is already in rescue^3.
-                git(worktree, &["--literal-pathspecs", "clean", "-f", "--", name])?;
+                git(
+                    worktree,
+                    &["--literal-pathspecs", "clean", "-f", "--", name],
+                )?;
             }
-        } else if git(worktree, &["rev-parse", "--verify", &format!("{rescue_ref}^3")]).is_ok() {
+        } else if git(
+            worktree,
+            &["rev-parse", "--verify", &format!("{rescue_ref}^3")],
+        )
+        .is_ok()
+        {
             bail!("cannot enumerate rescued files; system will retry self-healing");
         }
         phase = "conflict".into();
@@ -812,8 +902,11 @@ async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktr
     sqlx::query("UPDATE execution_workspaces SET failure_code='workspace_rescued', failure_detail=? WHERE objective_id=?")
         .bind(&detail).bind(&row.objective_id).execute(&mut *tx).await?;
     // Minimal test schemas and non-chat objectives need no messages table.
-    let has_messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'")
-        .fetch_one(&mut *tx).await?;
+    let has_messages: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
     if has_messages != 0 {
         if let Some(session) = row.session_id.as_deref() {
             sqlx::query("INSERT OR IGNORE INTO messages(id,session_id,role,content,created_at) VALUES (?,?,'assistant',?,?)")
@@ -822,7 +915,11 @@ async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktr
         }
     }
     sqlx::query("UPDATE execution_workspace_rescues SET phase=?,updated_at=? WHERE rescue_ref=?")
-        .bind(&phase).bind(Utc::now().timestamp_millis()).bind(&rescue_ref).execute(&mut *tx).await?;
+        .bind(&phase)
+        .bind(Utc::now().timestamp_millis())
+        .bind(&rescue_ref)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     tracing::info!(objective_id=%row.objective_id, %rescue_ref, %phase, "managed workspace rescue completed");
     Ok(())
@@ -830,8 +927,16 @@ async fn restore_registered_branch(pool: &SqlitePool, row: &WorkspaceRow, worktr
 
 async fn rescue_phase(pool: &SqlitePool, reference: &str, phase: &str) -> Result<()> {
     sqlx::query("UPDATE execution_workspace_rescues SET phase=?,updated_at=? WHERE rescue_ref=?")
-        .bind(phase).bind(Utc::now().timestamp_millis()).bind(reference).execute(pool).await?;
-    tracing::info!(rescue_ref=reference, phase, "managed workspace rescue checkpoint");
+        .bind(phase)
+        .bind(Utc::now().timestamp_millis())
+        .bind(reference)
+        .execute(pool)
+        .await?;
+    tracing::info!(
+        rescue_ref = reference,
+        phase,
+        "managed workspace rescue checkpoint"
+    );
     Ok(())
 }
 
@@ -840,7 +945,10 @@ fn rebuild_missing_worktree(row: &WorkspaceRow) -> Result<PathBuf> {
     let repo_root = PathBuf::from(&row.repo_root);
     let path = PathBuf::from(&row.worktree_path);
     if !is_git_repository(&repo_root) {
-        bail!("repository root {} is no longer a git repository", repo_root.display());
+        bail!(
+            "repository root {} is no longer a git repository",
+            repo_root.display()
+        );
     }
     if !branch_exists(&repo_root, &row.branch_name) {
         bail!(
@@ -1079,12 +1187,13 @@ async fn load_canonical_pr_reference_with_identity(
     .await?;
 
     for row in rows {
-        if (require_local_identity && (row.workspace_path != candidate.worktree_path
-            || row.worktree_identity != candidate.worktree_identity
-            || row.repo_identity != candidate.repo_identity
-            || row.head_branch != candidate.branch_name
-            || row.expected_head_sha != candidate.head_sha
-            || row.canonical_head_sha != candidate.head_sha))
+        if (require_local_identity
+            && (row.workspace_path != candidate.worktree_path
+                || row.worktree_identity != candidate.worktree_identity
+                || row.repo_identity != candidate.repo_identity
+                || row.head_branch != candidate.branch_name
+                || row.expected_head_sha != candidate.head_sha
+                || row.canonical_head_sha != candidate.head_sha))
             || row.canonical_pr_number <= 0
             || row.canonical_pr_url.trim().is_empty()
         {
@@ -1221,7 +1330,11 @@ async fn conclude_or_schedule(
     policy: crate::agent::delivery::github_api_budget::RateLimitPolicy,
 ) -> Result<()> {
     let unchanged = previous.last_state.as_deref() == Some(state_label);
-    let stable = if unchanged { previous.stable_count + 1 } else { 0 };
+    let stable = if unchanged {
+        previous.stable_count + 1
+    } else {
+        0
+    };
     let concluded_at = if conclude { Some(now) } else { None };
     let next_at = if conclude {
         None
@@ -1261,12 +1374,11 @@ pub(crate) async fn pr_observation_concluded(pool: &SqlitePool, run_id: &str) ->
     if !ensure_pr_observation_columns(pool).await? {
         return Ok(false);
     }
-    let concluded: Option<Option<i64>> = sqlx::query_scalar(
-        "SELECT pr_observation_concluded_at FROM delivery_runs WHERE id=?",
-    )
-    .bind(run_id)
-    .fetch_optional(pool)
-    .await?;
+    let concluded: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT pr_observation_concluded_at FROM delivery_runs WHERE id=?")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(concluded.flatten().is_some())
 }
 
@@ -1414,10 +1526,12 @@ async fn resolve_unrecorded_merge(
             code: "workspace_cleanup_pr_closed_unmerged",
             detail: plain_keep_message(pr_number, &candidate.worktree_path, "已关闭但未合并"),
         }),
-        Ok(CanonicalPrState::Open | CanonicalPrState::Queued) => Ok(CandidateDisposition::Preserved {
-            code: "workspace_cleanup_merge_pending",
-            detail: plain_keep_message(pr_number, &candidate.worktree_path, "尚未合并"),
-        }),
+        Ok(CanonicalPrState::Open | CanonicalPrState::Queued) => {
+            Ok(CandidateDisposition::Preserved {
+                code: "workspace_cleanup_merge_pending",
+                detail: plain_keep_message(pr_number, &candidate.worktree_path, "尚未合并"),
+            })
+        }
         // M115/R2: a moved head proves nothing about the merge, so the cleanup
         // pass keeps the workspace exactly as it does for an unknown state.
         Ok(CanonicalPrState::HeadAdvanced { head_sha, .. }) => {
@@ -1752,10 +1866,7 @@ fn inspect_and_remove_candidate(
                 ) {
                     return Ok(CandidateDisposition::Preserved {
                         code: "workspace_cleanup_remote_branch_failed",
-                        detail: format!(
-                            "远端分支 {} 删除失败: {error}",
-                            candidate.branch_name
-                        ),
+                        detail: format!("远端分支 {} 删除失败: {error}", candidate.branch_name),
                     });
                 }
                 if remote_branch_exists(&canonical_repo_root, &remote, &candidate.branch_name)
@@ -1763,10 +1874,7 @@ fn inspect_and_remove_candidate(
                 {
                     return Ok(CandidateDisposition::Preserved {
                         code: "workspace_cleanup_remote_branch_failed",
-                        detail: format!(
-                            "远端分支 {} 在删除后仍然存在",
-                            candidate.branch_name
-                        ),
+                        detail: format!("远端分支 {} 在删除后仍然存在", candidate.branch_name),
                     });
                 }
             }
@@ -1824,8 +1932,12 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
 ) -> Result<()> {
     let has_runs: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
-    ).fetch_one(pool).await?;
-    if has_runs == 0 { return Ok(()); }
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_runs == 0 {
+        return Ok(());
+    }
     let observation_columns = ensure_pr_observation_columns(pool).await?;
     // R6: one free `gh api rate_limit` reading at most every five minutes. The
     // endpoint consumes no core quota, so quota awareness cannot itself become
@@ -1850,8 +1962,9 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         // entirely. No conclusion changes; the question is only deferred.
         return Ok(());
     }
-    let terminal_cutoff = now
-        .saturating_sub(crate::agent::delivery::github_api_budget::terminal_observation_window_ms());
+    let terminal_cutoff = now.saturating_sub(
+        crate::agent::delivery::github_api_budget::terminal_observation_window_ms(),
+    );
     if observation_columns {
         // R2: persist the conclusion for terminal deliveries outside the
         // observation window, so they stop consuming candidate slots and are
@@ -1863,7 +1976,11 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
                AND COALESCE(last_observed_at,0) < ?
                AND objective_id IN (
                    SELECT id FROM objectives WHERE status IN ('failed','cancelled','completed'))",
-        ).bind(now).bind(terminal_cutoff).execute(pool).await?;
+        )
+        .bind(now)
+        .bind(terminal_cutoff)
+        .execute(pool)
+        .await?;
     }
     let candidates = if observation_columns {
         sqlx::query_as::<_, CleanupCandidate>(
@@ -1905,8 +2022,10 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
              ORDER BY w.updated_at LIMIT 64",
         ).bind(now).fetch_all(pool).await?
     };
-    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('objectives')")
-        .fetch_all(pool).await?;
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('objectives')")
+            .fetch_all(pool)
+            .await?;
     // R4: resolve every due reference first, then ask the provider once per
     // repository instead of once per record.
     let mut pending: Vec<(CleanupCandidate, CanonicalPrReference)> = Vec::new();
@@ -1923,7 +2042,10 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         let mut by_root: std::collections::BTreeMap<String, Vec<usize>> =
             std::collections::BTreeMap::new();
         for (index, (candidate, _)) in pending.iter().enumerate() {
-            by_root.entry(candidate.repo_root.clone()).or_default().push(index);
+            by_root
+                .entry(candidate.repo_root.clone())
+                .or_default()
+                .push(index);
         }
         for (repo_root, indexes) in by_root {
             let requests: Vec<PrObservationRequest> = indexes
@@ -1933,7 +2055,9 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
                     expected_head_sha: pending[*index].1.canonical_head_sha.clone(),
                 })
                 .collect();
-            let observed = observer.observe_many(Path::new(&repo_root), &requests).await;
+            let observed = observer
+                .observe_many(Path::new(&repo_root), &requests)
+                .await;
             crate::agent::delivery::github_api_budget::record_gh_call(
                 crate::agent::delivery::github_api_budget::CALLER_OBSERVE,
             );
@@ -2048,8 +2172,11 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         if previous.concluded_at.is_some() {
             continue;
         }
-        let objective_status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
-            .bind(&candidate.objective_id).fetch_one(pool).await?;
+        let objective_status: String =
+            sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
+                .bind(&candidate.objective_id)
+                .fetch_one(pool)
+                .await?;
         // R2: durable second guard — outside every window in which the
         // conclusion could still change, record the conclusion instead of
         // asking again.
@@ -2086,7 +2213,11 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
             .last_state
             .as_deref()
             .is_some_and(|last| last == state_label);
-        let stable_now = if unchanged { previous.stable_count + 1 } else { 0 };
+        let stable_now = if unchanged {
+            previous.stable_count + 1
+        } else {
+            0
+        };
         // R2: a merged PR is a conclusion. A *closed* PR is too, but only for a
         // terminal objective — a live wait can still see its PR reopened and
         // merged, so that path keeps the (bounded) backoff and concludes at the
@@ -2096,12 +2227,14 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
                 && (crate::agent::delivery::github_api_budget::is_terminal_objective_status(
                     &objective_status,
                 ) || previous.min_delay_ms > 0))
-            || stable_now >= crate::agent::delivery::github_api_budget::OBSERVATION_STABLE_LIMIT as i64;
+            || stable_now
+                >= crate::agent::delivery::github_api_budget::OBSERVATION_STABLE_LIMIT as i64;
         let (stage, status, reached, merged) = match &state {
             Ok(CanonicalPrState::Open) => ("pr_open", "waiting", "pr_open", false),
             Ok(CanonicalPrState::Queued) => ("merge_queued", "waiting", "merge_queued", false),
-            Ok(CanonicalPrState::Merged { merge_sha }) if !merge_sha.trim().is_empty() =>
-                ("complete", "completed", "merged", true),
+            Ok(CanonicalPrState::Merged { merge_sha }) if !merge_sha.trim().is_empty() => {
+                ("complete", "completed", "merged", true)
+            }
             _ => {
                 // Unknown/closed/head drift never proves success or authorises
                 // deletion; it is remembered and revisited on a backoff.
@@ -2159,8 +2292,10 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         // the extra REST call is skipped.
         let ci_decision = if (matches!(&state, Ok(CanonicalPrState::Open))
             || (head_advanced && matches!(&state, Ok(CanonicalPrState::Queued))))
-            && matches!(objective_status.as_str(), "running" | "active" | "waiting_system")
-        {
+            && matches!(
+                objective_status.as_str(),
+                "running" | "active" | "waiting_system"
+            ) {
             let reference_label = format!("PR #{}", reference.canonical_pr_number);
             crate::agent::delivery::github_api_budget::record_gh_call(
                 crate::agent::delivery::github_api_budget::CALLER_OBSERVE_CI,
@@ -2226,8 +2361,10 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         // Positive merge evidence settles delivery-only acceptance even after
         // a real stop. This read-only settlement never resumes stopped work or
         // removes its durable stop fence.
-        let run_columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('delivery_runs')")
-            .fetch_all(pool).await?;
+        let run_columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('delivery_runs')")
+                .fetch_all(pool)
+                .await?;
         let has = |column: &str| run_columns.iter().any(|name| name == column);
         // Historical live inference can be corrected only from the original
         // authorized merged request, never from merge evidence alone.
@@ -2239,27 +2376,51 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
                  WHERE o.id=? AND o.kind='live' AND o.requested_acceptance='live_verification'
                    AND s.delivery_authorized=1 AND m.role='user'
                    AND r.requested_ceiling='through_merge'",
-            ).bind(&candidate.objective_id).fetch_optional(pool).await?
-        } else { None };
+            )
+            .bind(&candidate.objective_id)
+            .fetch_optional(pool)
+            .await?
+        } else {
+            None
+        };
         let repair = request.as_deref().is_some_and(|content| {
             content.to_ascii_lowercase().contains("ceiling: merged")
                 && !crate::commands::chat::explicitly_requests_live_acceptance(content)
         });
-        let complete = merged && if columns.iter().any(|c| c == "kind") {
-            let kind: String = sqlx::query_scalar("SELECT kind FROM objectives WHERE id=?")
-                .bind(&candidate.objective_id).fetch_one(pool).await?;
-            let requested: String = sqlx::query_scalar(
-                "SELECT requested_ceiling FROM delivery_runs WHERE id=?",
-            ).bind(&reference.run_id).fetch_one(pool).await?;
-            let merged_target: bool = if columns.iter().any(|c| c == "requested_acceptance") {
-                let target: String = sqlx::query_scalar("SELECT requested_acceptance FROM objectives WHERE id=?")
-                    .bind(&candidate.objective_id).fetch_one(pool).await?;
-                target == "merged"
-            } else { false };
-            (repair || matches!(kind.as_str(), "delivery" | "local_mutation"))
-                && (merged_target || matches!(requested.as_str(), "pr_only" | "through_ci_green" | "through_merge"))
-        } else { true };
-        if matches!(objective_status.as_str(), "failed" | "cancelled") && !complete { continue; }
+        let complete = merged
+            && if columns.iter().any(|c| c == "kind") {
+                let kind: String = sqlx::query_scalar("SELECT kind FROM objectives WHERE id=?")
+                    .bind(&candidate.objective_id)
+                    .fetch_one(pool)
+                    .await?;
+                let requested: String =
+                    sqlx::query_scalar("SELECT requested_ceiling FROM delivery_runs WHERE id=?")
+                        .bind(&reference.run_id)
+                        .fetch_one(pool)
+                        .await?;
+                let merged_target: bool = if columns.iter().any(|c| c == "requested_acceptance") {
+                    let target: String = sqlx::query_scalar(
+                        "SELECT requested_acceptance FROM objectives WHERE id=?",
+                    )
+                    .bind(&candidate.objective_id)
+                    .fetch_one(pool)
+                    .await?;
+                    target == "merged"
+                } else {
+                    false
+                };
+                (repair || matches!(kind.as_str(), "delivery" | "local_mutation"))
+                    && (merged_target
+                        || matches!(
+                            requested.as_str(),
+                            "pr_only" | "through_ci_green" | "through_merge"
+                        ))
+            } else {
+                true
+            };
+        if matches!(objective_status.as_str(), "failed" | "cancelled") && !complete {
+            continue;
+        }
         let settle_merged = i32::from(complete);
         // M115/R2: a queue-synced head is genuinely new progress, so it must not
         // be swallowed by the "same stage/status twice" idempotence fence that
@@ -2281,7 +2442,9 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
             if has("status") { format!(", status=?, wait_class=?, next_action=NULL, failure_signature=NULL{}{}{}", if has("failure_code") { ", failure_code=NULL" } else { "" }, if has("failure_class") { ", failure_class=NULL" } else { "" }, if has("next_action_authorized") && merged { ", next_action_authorized=0" } else { "" }) } else { String::new() },
         );
         let mut run_query = sqlx::query(&run_statement).bind(reached);
-        if has("stage") { run_query = run_query.bind(stage); }
+        if has("stage") {
+            run_query = run_query.bind(stage);
+        }
         if has("status") {
             run_query = run_query
                 .bind(if complete { "completed" } else { "waiting" })
@@ -2290,14 +2453,22 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         let mut tx = pool.begin().await?;
         // Fence observations against a takeover that acquired a lease while we
         // were reading the provider; this path never grants mutation authority.
-        let mut changed_query = run_query.bind(&reference.run_id).bind(reference.claim_epoch)
-            .bind(&reference.expected_head_sha).bind(&reference.canonical_head_sha)
-            .bind(reference.canonical_pr_number).bind(now);
+        let mut changed_query = run_query
+            .bind(&reference.run_id)
+            .bind(reference.claim_epoch)
+            .bind(&reference.expected_head_sha)
+            .bind(&reference.canonical_head_sha)
+            .bind(reference.canonical_pr_number)
+            .bind(now);
         if !head_advanced {
             changed_query = changed_query.bind(stage).bind(reached);
         }
-        let changed = changed_query.bind(reached).bind(reached).bind(reached)
-            .execute(&mut *tx).await?;
+        let changed = changed_query
+            .bind(reached)
+            .bind(reached)
+            .bind(reached)
+            .execute(&mut *tx)
+            .await?;
         if changed.rows_affected() == 0 {
             if !repair && !merged {
                 // M114b/R2: nothing new to write, but this observation must
@@ -2321,7 +2492,9 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
                 .bind(&reference.run_id).bind(reference.claim_epoch).bind(&reference.expected_head_sha)
                 .bind(&reference.canonical_head_sha).bind(reference.canonical_pr_number).bind(now)
                 .fetch_one(&mut *tx).await?;
-            if fenced != 1 { continue; }
+            if fenced != 1 {
+                continue;
+            }
         }
         let evidence = serde_json::json!({"pr_number": reference.canonical_pr_number,
             "pr_url": reference.canonical_pr_url, "head_sha": reference.canonical_head_sha,
@@ -2337,34 +2510,82 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         // Live/release objectives are not completed from merge evidence alone.
         // Delivery tool ceilings are not objective acceptance requirements.
         // Reuse the fenced observation's decision rather than classifying twice.
-        let mut sets = vec![format!("status='{}'", if complete { "completed" } else { "waiting_system" })];
+        let mut sets = vec![format!(
+            "status='{}'",
+            if complete {
+                "completed"
+            } else {
+                "waiting_system"
+            }
+        )];
         if repair {
             sets.push("kind='delivery'".into());
             sets.push("requested_acceptance='merged'".into());
         }
         for (column, expression) in [
             ("revision", "revision+1".to_string()),
-            ("decision_type", format!("'{}'", if complete { "complete" } else { "waiting" })),
+            (
+                "decision_type",
+                format!("'{}'", if complete { "complete" } else { "waiting" }),
+            ),
             ("reached_acceptance", format!("'{reached}'")),
-            ("failure_code", if complete { "NULL".into() } else { sql_text(wait_failure_code) }),
+            (
+                "failure_code",
+                if complete {
+                    "NULL".into()
+                } else {
+                    sql_text(wait_failure_code)
+                },
+            ),
             ("cancellation_provenance", "NULL".into()),
-            ("failure_signature", "NULL".into()), ("recovery_owner", "NULL".into()),
-            ("remediation_id", "NULL".into()), ("lease_owner", "NULL".into()),
+            ("failure_signature", "NULL".into()),
+            ("recovery_owner", "NULL".into()),
+            ("remediation_id", "NULL".into()),
+            ("lease_owner", "NULL".into()),
             ("lease_expires_at", "NULL".into()),
-            ("next_observation_at", if complete { "NULL".into() } else { wait_next_observation_at.to_string() }),
-            ("attention_request_json", if complete { "NULL".into() } else { wait_attention.as_deref().map(sql_text).unwrap_or_else(|| "NULL".into()) }),
+            (
+                "next_observation_at",
+                if complete {
+                    "NULL".into()
+                } else {
+                    wait_next_observation_at.to_string()
+                },
+            ),
+            (
+                "attention_request_json",
+                if complete {
+                    "NULL".into()
+                } else {
+                    wait_attention
+                        .as_deref()
+                        .map(sql_text)
+                        .unwrap_or_else(|| "NULL".into())
+                },
+            ),
             ("evidence_ref", format!("'delivery_run_events:{event_id}'")),
-            ("completed_at", if complete { now.to_string() } else { "NULL".into() }),
-            ("updated_at", now.to_string()), ("last_progress_at", now.to_string()),
+            (
+                "completed_at",
+                if complete {
+                    now.to_string()
+                } else {
+                    "NULL".into()
+                },
+            ),
+            ("updated_at", now.to_string()),
+            ("last_progress_at", now.to_string()),
         ] {
-            if columns.iter().any(|c| c == column) { sets.push(format!("{column}={expression}")); }
+            if columns.iter().any(|c| c == column) {
+                sets.push(format!("{column}={expression}"));
+            }
         }
         let pointer = if columns.iter().any(|c| c == "delivery_run_id") {
             // Adopt only the still-latest canonical run for this objective.
             // A concurrent delivery or active executor must fence settlement.
             sets.push("delivery_run_id=?".into());
             " AND ?=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id AND canonical_pr_number IS NOT NULL AND canonical_pr_url IS NOT NULL AND canonical_head_sha IS NOT NULL ORDER BY updated_at DESC, rowid DESC LIMIT 1) AND (lease_expires_at IS NULL OR lease_expires_at<=?) AND NOT COALESCE((delivery_run_id=? AND status=? AND reached_acceptance=? AND failure_code IS NULL),0)"
-        } else { "" };
+        } else {
+            ""
+        };
         if objective_status == "completed" {
             tx.commit().await?;
             // Acceptance is immutable; only delivery evidence may advance — but
@@ -2387,13 +2608,26 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
         } else {
             "'running','active','waiting_system'"
         };
-        let statement = format!("UPDATE objectives SET {} WHERE id=? AND status IN ({eligible_statuses}){pointer}", sets.join(","));
+        let statement = format!(
+            "UPDATE objectives SET {} WHERE id=? AND status IN ({eligible_statuses}){pointer}",
+            sets.join(",")
+        );
         let mut query = sqlx::query(&statement);
-        if !pointer.is_empty() { query = query.bind(&reference.run_id); }
+        if !pointer.is_empty() {
+            query = query.bind(&reference.run_id);
+        }
         query = query.bind(&candidate.objective_id);
         if !pointer.is_empty() {
-            query = query.bind(&reference.run_id).bind(now).bind(&reference.run_id)
-                .bind(if complete { "completed" } else { "waiting_system" }).bind(reached);
+            query = query
+                .bind(&reference.run_id)
+                .bind(now)
+                .bind(&reference.run_id)
+                .bind(if complete {
+                    "completed"
+                } else {
+                    "waiting_system"
+                })
+                .bind(reached);
         }
         if query.execute(&mut *tx).await?.rows_affected() != 1 {
             // M114b/R2: an objective that cannot adopt this progress right now
@@ -2416,9 +2650,14 @@ pub(crate) async fn reconcile_parked_delivery_progress_at(
             .await?;
             continue;
         }
-        if complete { mark_objective_terminal_in_tx(&mut tx, &candidate.objective_id, now).await?; }
-        let has_objective_events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objective_events'")
-            .fetch_one(&mut *tx).await?;
+        if complete {
+            mark_objective_terminal_in_tx(&mut tx, &candidate.objective_id, now).await?;
+        }
+        let has_objective_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objective_events'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         if has_objective_events != 0 {
             sqlx::query("INSERT INTO objective_events (id,objective_id,revision,event_type,status,decision_type,domain,failure_code,detail_json,created_at)
                 SELECT ?,id,revision,'canonical_pr_progress',status,decision_type,domain,failure_code,?,? FROM objectives WHERE id=?")
@@ -2567,10 +2806,15 @@ pub(crate) fn spawn_cleanup_supervisor(
                 "SELECT session_id FROM execution_workspaces
                  WHERE session_id IS NOT NULL AND state IN ('active','allocating','delivering')
                  GROUP BY session_id HAVING COUNT(*)>1",
-            ).fetch_all(&pool).await;
+            )
+            .fetch_all(&pool)
+            .await;
             if let Ok(sessions) = sessions {
                 for session in sessions {
-                    if let Err(error) = repair_session_split_under_repo_lock(&pool, &session, &process_instance).await {
+                    if let Err(error) =
+                        repair_session_split_under_repo_lock(&pool, &session, &process_instance)
+                            .await
+                    {
                         tracing::warn!(%error, "split workspace recovery preserved originals; retrying later");
                     }
                 }
@@ -2649,7 +2893,10 @@ pub async fn cache_ownership(
         };
         if objective_status.as_deref() == Some("failed") {
             if crate::build_cache::failed_cache_is_idle(
-                objective_status.as_deref(), row.get("last_activity_ms"), now_ms, idle_ms,
+                objective_status.as_deref(),
+                row.get("last_activity_ms"),
+                now_ms,
+                idle_ms,
             ) {
                 failed_idle.push(owner);
             } else {
@@ -2667,7 +2914,9 @@ pub async fn cache_ownership(
     // ids line up on the nested layout too.
     let orphans = crate::build_cache::workspace_cache_owners(container)
         .into_iter()
-        .filter(|owner| !alive.contains(owner) && !ended.contains(owner) && !failed_idle.contains(owner))
+        .filter(|owner| {
+            !alive.contains(owner) && !ended.contains(owner) && !failed_idle.contains(owner)
+        })
         .collect();
     Ok((ended, orphans, alive, failed_idle))
 }
@@ -2700,7 +2949,8 @@ pub(crate) fn spawn_build_cache_supervisor(pool: SqlitePool, container: PathBuf)
                                 failed_idle_owners: &failed_idle,
                                 orphan_owners: &orphans,
                                 protected_owners: &alive,
-                                idle_before_unix: crate::build_cache::now_unix().saturating_sub(crate::build_cache::ORPHAN_IDLE_SECS),
+                                idle_before_unix: crate::build_cache::now_unix()
+                                    .saturating_sub(crate::build_cache::ORPHAN_IDLE_SECS),
                                 limit_bytes: crate::build_cache::configured_budget_bytes(),
                                 trigger,
                             },
@@ -3661,15 +3911,13 @@ impl ContinuationNotice {
     /// A stored path that would itself trip the vocabulary guard is replaced
     /// rather than shown, so this can never leak an internal word.
     fn detail(&self) -> String {
-        let location = if crate::agent::failure_summary::assert_no_internal_vocabulary(
-            &self.location,
-        )
-        .is_ok()
-        {
-            self.location.clone()
-        } else {
-            "上一次任务留下的目录".to_string()
-        };
+        let location =
+            if crate::agent::failure_summary::assert_no_internal_vocabulary(&self.location).is_ok()
+            {
+                self.location.clone()
+            } else {
+                "上一次任务留下的目录".to_string()
+            };
         format!(
             "上一条消息留下的改动还在 {location}，这一次没能接着用（{}）。现在用的是基于最新主线开出的新目录，那些改动没有被删除；想接着用它们，说一声就行。",
             self.reason
@@ -3771,10 +4019,7 @@ async fn inherit_predecessor_locked(
         // pretend it was empty and never start again without a word.
         if !worktree_path.is_dir() {
             not_carried_forward.get_or_insert_with(|| {
-                ContinuationNotice::new(
-                    &row.worktree_path,
-                    "那个目录已经不在磁盘上了",
-                )
+                ContinuationNotice::new(&row.worktree_path, "那个目录已经不在磁盘上了")
             });
             continue;
         }
@@ -3816,10 +4061,7 @@ async fn inherit_predecessor_locked(
             // attach to a workspace somebody else owns, but say so plainly
             // instead of quietly starting over (CF-WSC-R4).
             not_carried_forward.get_or_insert_with(|| {
-                ContinuationNotice::new(
-                    &row.worktree_path,
-                    "那个目录刚刚被别的步骤接管了",
-                )
+                ContinuationNotice::new(&row.worktree_path, "那个目录刚刚被别的步骤接管了")
             });
             continue;
         }
@@ -3972,7 +4214,10 @@ fn rescue_snapshot(row: &WorkspaceRow) -> Result<String> {
     let index = tempfile::tempdir()?;
     let index_path = index.path().join("index");
     let run = |args: &[&str]| -> Result<String> {
-        let output = Command::new("git").no_window().args(args).current_dir(path)
+        let output = Command::new("git")
+            .no_window()
+            .args(args)
+            .current_dir(path)
             .env("GIT_INDEX_FILE", &index_path)
             .env("GIT_AUTHOR_NAME", "CodeFactory Recovery")
             .env("GIT_AUTHOR_EMAIL", "recovery@codefactory.invalid")
@@ -3980,7 +4225,10 @@ fn rescue_snapshot(row: &WorkspaceRow) -> Result<String> {
             .env("GIT_COMMITTER_EMAIL", "recovery@codefactory.invalid")
             .output()?;
         if !output.status.success() {
-            bail!("workspace rescue failed: {}", String::from_utf8_lossy(&output.stderr));
+            bail!(
+                "workspace rescue failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
     };
@@ -3988,7 +4236,14 @@ fn rescue_snapshot(row: &WorkspaceRow) -> Result<String> {
     run(&["add", "-A"])?;
     let tree = run(&["write-tree"])?;
     let head = git(path, &["rev-parse", "HEAD"])?;
-    let snapshot = run(&["commit-tree", &tree, "-p", &head, "-m", "preserve split workspace"])?;
+    let snapshot = run(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        &head,
+        "-m",
+        "preserve split workspace",
+    ])?;
     // Never overwrite the first rescue point on retry.
     let rescue = format!("refs/codefactory/rescue/{}", row.id);
     if git(path, &["rev-parse", "--verify", &rescue]).is_err() {
@@ -4006,24 +4261,37 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
                 head_sha, state, lease_owner FROM execution_workspaces
          WHERE session_id=? AND state IN ('active','allocating','delivering')
          ORDER BY created_at ASC, id ASC",
-    ).bind(session).fetch_all(pool).await?;
-    if rows.len() < 2 { return Ok(()); }
+    )
+    .bind(session)
+    .fetch_all(pool)
+    .await?;
+    if rows.len() < 2 {
+        return Ok(());
+    }
     let repo = rows[0].repo_identity.clone();
     for row in &rows {
         let path = Path::new(&row.worktree_path);
         let (actual_repo, identity, _) = workspace_identity(path)?;
-        if actual_repo != row.repo_identity || row.worktree_identity.as_deref() != Some(identity.as_str())
-            || git(path, &["branch", "--show-current"])? != row.branch_name {
+        if actual_repo != row.repo_identity
+            || row.worktree_identity.as_deref() != Some(identity.as_str())
+            || git(path, &["branch", "--show-current"])? != row.branch_name
+        {
             bail!("split workspace identity changed; preserving originals");
         }
     }
     if rows.iter().any(|row| row.repo_identity != repo) {
         bail!("split session spans repositories; preserving every workspace");
     }
-    let dirty: Vec<usize> = rows.iter().enumerate().filter_map(|(i, row)| {
-        let path = Path::new(&row.worktree_path);
-        (workspace_has_uncommitted_changes(path) || workspace_has_commits_beyond_base(path, &row.base_sha)).then_some(i)
-    }).collect();
+    let dirty: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            let path = Path::new(&row.worktree_path);
+            (workspace_has_uncommitted_changes(path)
+                || workspace_has_commits_beyond_base(path, &row.base_sha))
+            .then_some(i)
+        })
+        .collect();
     let keep = match dirty.first().copied() {
         Some(index) => index,
         None => {
@@ -4049,17 +4317,38 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
     let mut snapshot = rescue_snapshot(&keeper)?;
     // Capture all branches before changing any files or durable state.
     let mut snapshots = Vec::new();
-    for row in &rows { snapshots.push(rescue_snapshot(row)?); }
+    for row in &rows {
+        snapshots.push(rescue_snapshot(row)?);
+    }
     let path = Path::new(&keeper.worktree_path);
     for donor in &snapshots {
         let tree = git(path, &["merge-tree", "--write-tree", &snapshot, donor])?;
-        let tree = tree.lines().next().ok_or_else(|| anyhow!("missing recovered tree"))?;
+        let tree = tree
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow!("missing recovered tree"))?;
         // Use commit-tree solely as a merge input; the managed branch is unchanged.
-        let output = Command::new("git").no_window().current_dir(path)
-            .args(["-c", "user.name=CodeFactory Recovery", "-c", "user.email=recovery@codefactory.invalid",
-                "commit-tree", tree, "-p", &snapshot, "-p", donor, "-m", "combine split workspace rescue"])
+        let output = Command::new("git")
+            .no_window()
+            .current_dir(path)
+            .args([
+                "-c",
+                "user.name=CodeFactory Recovery",
+                "-c",
+                "user.email=recovery@codefactory.invalid",
+                "commit-tree",
+                tree,
+                "-p",
+                &snapshot,
+                "-p",
+                donor,
+                "-m",
+                "combine split workspace rescue",
+            ])
             .output()?;
-        if !output.status.success() { bail!("cannot create recovered merge snapshot"); }
+        if !output.status.success() {
+            bail!("cannot create recovered merge snapshot");
+        }
         snapshot = String::from_utf8(output.stdout)?.trim().to_string();
     }
     // A clean donor must not erase a keeper's untracked edits when checking
@@ -4071,10 +4360,20 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
     for row in &rows {
         sqlx::query("UPDATE execution_workspaces SET state='closed', lease_owner=NULL, lease_expires_at=NULL, closed_at=?, updated_at=? WHERE id=?")
             .bind(Utc::now().timestamp_millis()).bind(Utc::now().timestamp_millis()).bind(&row.id).execute(&mut *tx).await?;
-        let has_turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_turn_state'").fetch_one(&mut *tx).await?;
+        let has_turns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_turn_state'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         if has_turns > 0 {
-            sqlx::query("UPDATE chat_turn_state SET objective_id=? WHERE objective_id=? AND session_id=?")
-                .bind(&keeper.objective_id).bind(&row.objective_id).bind(session).execute(&mut *tx).await?;
+            sqlx::query(
+                "UPDATE chat_turn_state SET objective_id=? WHERE objective_id=? AND session_id=?",
+            )
+            .bind(&keeper.objective_id)
+            .bind(&row.objective_id)
+            .bind(session)
+            .execute(&mut *tx)
+            .await?;
         }
         let full_objectives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='requires_user_action'")
             .fetch_one(&mut *tx).await?;
@@ -4086,7 +4385,9 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
                 .bind(&row.objective_id).execute(&mut *tx).await?;
         } else {
             sqlx::query("UPDATE objectives SET status='legacy_orphan' WHERE id=?")
-                .bind(&row.objective_id).execute(&mut *tx).await?;
+                .bind(&row.objective_id)
+                .execute(&mut *tx)
+                .await?;
         }
     }
     tx.commit().await?;
@@ -4109,7 +4410,11 @@ async fn repair_session_split_under_repo_lock(
     Ok(())
 }
 
-pub(crate) async fn repair_session_split(pool: &SqlitePool, session: &str, process: &str) -> Result<()> {
+pub(crate) async fn repair_session_split(
+    pool: &SqlitePool,
+    session: &str,
+    process: &str,
+) -> Result<()> {
     // Cheap gate first: admission runs this on every turn, so a normal session
     // must not pay for schema work or a write transaction.
     let active: i64 = sqlx::query_scalar(
@@ -4224,10 +4529,9 @@ pub async fn verify_objective_workspace(
 mod tests {
     use super::{
         acquire_repo_allocation_lock, allocate_or_attach, attach_existing, ensure_schema,
-        external_path, external_path_str, heal_incident_workspaces,
-        latest_for_session, mark_objective_terminal_in_tx, release_repo_allocation_lock,
-        run_cleanup_pass, verify_objective_workspace, ExecutionWorkspaceRequest,
-        PREVIOUS_WORK_NOT_CARRIED_FORWARD,
+        external_path, external_path_str, heal_incident_workspaces, latest_for_session,
+        mark_objective_terminal_in_tx, release_repo_allocation_lock, run_cleanup_pass,
+        verify_objective_workspace, ExecutionWorkspaceRequest, PREVIOUS_WORK_NOT_CARRIED_FORWARD,
     };
     use crate::util::no_window::NoWindow;
     use sqlx::SqlitePool;
@@ -4249,39 +4553,81 @@ mod tests {
         let workspace = temp.path().join("repo/task");
         std::fs::create_dir_all(workspace.join(".codefactory-cache/cargo-target-test")).unwrap();
         sqlx::query("INSERT INTO execution_workspaces VALUES (?, 'active', 'obj')")
-            .bind(workspace.to_string_lossy().as_ref()).execute(&pool).await.unwrap();
+            .bind(workspace.to_string_lossy().as_ref())
+            .execute(&pool)
+            .await
+            .unwrap();
         let old = chrono::Utc::now().timestamp_millis() - 25 * 3_600_000;
         sqlx::query("INSERT INTO objectives VALUES ('obj', 'session', 'failed', ?, NULL)")
-            .bind(old).execute(&pool).await.unwrap();
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
         let ownership = super::cache_ownership(&pool, temp.path()).await.unwrap();
         assert_eq!(ownership.3, vec!["repo/task"]);
         assert!(ownership.1.is_empty());
         sqlx::query("INSERT INTO messages VALUES ('message', 'session', ?)")
-            .bind(old).execute(&pool).await.unwrap();
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
         for activity in [
             "UPDATE messages SET created_at = ?",
             "INSERT INTO tool_calls VALUES ('message', ?)",
             "INSERT INTO chat_turn_state VALUES ('session', ?)",
             "UPDATE objectives SET last_progress_at = ?",
         ] {
-            sqlx::query(activity).bind(chrono::Utc::now().timestamp_millis()).execute(&pool).await.unwrap();
+            sqlx::query(activity)
+                .bind(chrono::Utc::now().timestamp_millis())
+                .execute(&pool)
+                .await
+                .unwrap();
             let ownership = super::cache_ownership(&pool, temp.path()).await.unwrap();
             assert!(ownership.3.is_empty(), "{activity}");
             assert_eq!(ownership.2, vec!["repo/task"]);
-            sqlx::query("UPDATE messages SET created_at = ?").bind(old).execute(&pool).await.unwrap();
-            sqlx::query("DELETE FROM tool_calls").execute(&pool).await.unwrap();
-            sqlx::query("DELETE FROM chat_turn_state").execute(&pool).await.unwrap();
-            sqlx::query("UPDATE objectives SET last_progress_at = NULL").execute(&pool).await.unwrap();
+            sqlx::query("UPDATE messages SET created_at = ?")
+                .bind(old)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM tool_calls")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM chat_turn_state")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE objectives SET last_progress_at = NULL")
+                .execute(&pool)
+                .await
+                .unwrap();
         }
         sqlx::query("INSERT INTO model_usage_events VALUES ('session', ?)")
-            .bind(chrono::Utc::now().to_rfc3339()).execute(&pool).await.unwrap();
-        assert!(super::cache_ownership(&pool, temp.path()).await.unwrap().3.is_empty());
-        sqlx::query("DELETE FROM model_usage_events").execute(&pool).await.unwrap();
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(super::cache_ownership(&pool, temp.path())
+            .await
+            .unwrap()
+            .3
+            .is_empty());
+        sqlx::query("DELETE FROM model_usage_events")
+            .execute(&pool)
+            .await
+            .unwrap();
         for status in ["active", "completed", "cancelled"] {
-            sqlx::query("UPDATE objectives SET status = ?").bind(status).execute(&pool).await.unwrap();
+            sqlx::query("UPDATE objectives SET status = ?")
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
             let ownership = super::cache_ownership(&pool, temp.path()).await.unwrap();
             assert!(ownership.3.is_empty());
-            if status == "active" { assert_eq!(ownership.2, vec!["repo/task"]); }
+            if status == "active" {
+                assert_eq!(ownership.2, vec!["repo/task"]);
+            }
         }
     }
 
@@ -4412,11 +4758,18 @@ mod tests {
             .unwrap();
         let head_sha = git(&workspace.worktree_path, &["rev-parse", "HEAD"]);
         let now = chrono::Utc::now().timestamp_millis();
-        let has_revision: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='revision'")
-            .fetch_one(pool).await.unwrap();
+        let has_revision: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='revision'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
         if has_revision == 0 {
             sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
-                .bind(&workspace.objective_id).execute(pool).await.unwrap();
+                .bind(&workspace.objective_id)
+                .execute(pool)
+                .await
+                .unwrap();
         }
         sqlx::query(
             "UPDATE execution_workspaces
@@ -4491,7 +4844,12 @@ mod tests {
         let pool = pool_with_objective("objective-incident-recovers").await;
         let workspace = allocate_or_attach(
             &pool,
-            request_for(&root, &container, "objective-incident-recovers", "process-a"),
+            request_for(
+                &root,
+                &container,
+                "objective-incident-recovers",
+                "process-a",
+            ),
         )
         .await
         .unwrap();
@@ -4505,13 +4863,12 @@ mod tests {
             .expect("a workspace whose identity is whole again must return to service")
             .expect("the recovered workspace must be handed back");
         assert_eq!(recovered.branch_name, workspace.branch_name);
-        let state: String = sqlx::query_scalar(
-            "SELECT state FROM execution_workspaces WHERE objective_id=?",
-        )
-        .bind("objective-incident-recovers")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM execution_workspaces WHERE objective_id=?")
+                .bind("objective-incident-recovers")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(state, "active");
     }
 
@@ -4522,7 +4879,9 @@ mod tests {
         let workspace = allocate_or_attach(
             &pool,
             request_for(&root, &container, "objective-incident-stays", "process-a"),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let path = &workspace.worktree_path;
         // Byte-preservation assertions must not inherit host Git CRLF conversion.
         git(path, &["config", "core.autocrlf", "false"]);
@@ -4535,27 +4894,61 @@ mod tests {
         std::fs::remove_file(path.join("latest.txt")).unwrap();
         park_as_incident(&pool, &workspace.objective_id, "branch changed").await;
         let recovered = attach_existing(&pool, &workspace.objective_id, "process-b")
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(recovered.state, "active");
-        assert_eq!(git(path, &["branch", "--show-current"]), workspace.branch_name);
+        assert_eq!(
+            git(path, &["branch", "--show-current"]),
+            workspace.branch_name
+        );
         assert_eq!(git(path, &["rev-parse", "HEAD"]), registered_head);
         assert_eq!(git(path, &["show", ":base.txt"]), "staged");
         assert_eq!(std::fs::read(path.join("base.txt")).unwrap(), b"unstaged\n");
-        assert_eq!(std::fs::read(path.join("half-done.txt")).unwrap(), [0, 255, 3]);
+        assert_eq!(
+            std::fs::read(path.join("half-done.txt")).unwrap(),
+            [0, 255, 3]
+        );
         assert!(!path.join("latest.txt").exists());
-        let refs = git(path, &["for-each-ref", "--format=%(refname)", "refs/codefactory/rescue/"]);
+        let refs = git(
+            path,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/codefactory/rescue/",
+            ],
+        );
         assert!(refs.starts_with("refs/codefactory/rescue/objective-incident-stays/"));
-        assert_eq!(git(path, &["show", &format!("{refs}^3:half-done.txt")]).as_bytes(), &[0, 239, 191, 189, 3]);
-        attach_existing(&pool, &workspace.objective_id, "process-c").await.unwrap();
-        assert_eq!(git(path, &["for-each-ref", "--format=%(refname)", "refs/codefactory/rescue/"]), refs);
+        assert_eq!(
+            git(path, &["show", &format!("{refs}^3:half-done.txt")]).as_bytes(),
+            &[0, 239, 191, 189, 3]
+        );
+        attach_existing(&pool, &workspace.objective_id, "process-c")
+            .await
+            .unwrap();
+        assert_eq!(
+            git(
+                path,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/codefactory/rescue/"
+                ]
+            ),
+            refs
+        );
     }
 
     #[tokio::test]
     async fn m161_conflict_preserves_rescue_and_registered_branch() {
         let (_temp, root, _remote, container) = init_repo();
         let pool = pool_with_objective("objective-conflict").await;
-        let workspace = allocate_or_attach(&pool,
-            request_for(&root, &container, "objective-conflict", "process-a")).await.unwrap();
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-conflict", "process-a"),
+        )
+        .await
+        .unwrap();
         sqlx::query("CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, created_at INTEGER)").execute(&pool).await.unwrap();
         let path = &workspace.worktree_path;
         git(path, &["config", "core.autocrlf", "false"]);
@@ -4568,23 +4961,61 @@ mod tests {
         std::fs::write(path.join("untracked.txt"), "precious\n").unwrap();
         park_as_incident(&pool, &workspace.objective_id, "branch changed").await;
         assert!(heal_incident_workspaces(&pool).await.is_empty());
-        assert_eq!(workspace_state(&pool, &workspace.objective_id).await, "active");
-        assert_eq!(git(path, &["branch", "--show-current"]), workspace.branch_name);
+        assert_eq!(
+            workspace_state(&pool, &workspace.objective_id).await,
+            "active"
+        );
+        assert_eq!(
+            git(path, &["branch", "--show-current"]),
+            workspace.branch_name
+        );
         assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
-        assert_eq!(std::fs::read(path.join("base.txt")).unwrap(), b"registered\n");
+        assert_eq!(
+            std::fs::read(path.join("base.txt")).unwrap(),
+            b"registered\n"
+        );
         assert!(git(path, &["status", "--porcelain"]).is_empty());
-        let rescue = git(path, &["for-each-ref", "--format=%(refname)", "refs/codefactory/rescue/"]);
-        assert_eq!(git(path, &["show", &format!("{rescue}:base.txt")]), "foreign edit");
-        assert_eq!(git(path, &["show", &format!("{rescue}^3:untracked.txt")]), "precious");
-        let notice: String = sqlx::query_scalar("SELECT failure_detail FROM execution_workspaces WHERE objective_id=?")
-            .bind(&workspace.objective_id).fetch_one(&pool).await.unwrap();
+        let rescue = git(
+            path,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/codefactory/rescue/",
+            ],
+        );
+        assert_eq!(
+            git(path, &["show", &format!("{rescue}:base.txt")]),
+            "foreign edit"
+        );
+        assert_eq!(
+            git(path, &["show", &format!("{rescue}^3:untracked.txt")]),
+            "precious"
+        );
+        let notice: String = sqlx::query_scalar(
+            "SELECT failure_detail FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind(&workspace.objective_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(notice.contains(&rescue), "{notice}");
         assert!(notice.contains("可以继续"), "{notice}");
-        attach_existing(&pool, &workspace.objective_id, "process-c").await.unwrap();
-        let again: String = sqlx::query_scalar("SELECT failure_detail FROM execution_workspaces WHERE objective_id=?")
-            .bind(&workspace.objective_id).fetch_one(&pool).await.unwrap();
+        attach_existing(&pool, &workspace.objective_id, "process-c")
+            .await
+            .unwrap();
+        let again: String = sqlx::query_scalar(
+            "SELECT failure_detail FROM execution_workspaces WHERE objective_id=?",
+        )
+        .bind(&workspace.objective_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(again, notice);
-        let messages: Vec<String> = sqlx::query_scalar("SELECT content FROM messages WHERE role='assistant'").fetch_all(&pool).await.unwrap();
+        let messages: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM messages WHERE role='assistant'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(messages, vec![notice]);
     }
 
@@ -4592,20 +5023,48 @@ mod tests {
     async fn m161_interrupted_saved_rescue_resumes_without_new_snapshot() {
         let (_temp, root, _remote, container) = init_repo();
         let pool = pool_with_objective("objective-interrupted").await;
-        let workspace = allocate_or_attach(&pool, request_for(&root, &container, "objective-interrupted", "process-a")).await.unwrap();
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "objective-interrupted", "process-a"),
+        )
+        .await
+        .unwrap();
         let path = &workspace.worktree_path;
         git(path, &["config", "core.autocrlf", "false"]);
         git(path, &["checkout", "-b", "foreign-interrupted"]);
         std::fs::write(path.join("new.txt"), "retained\n").unwrap();
         let reference = "refs/codefactory/rescue/objective-interrupted/synthetic";
-        git(path, &["stash", "push", "-u", "-m", &format!("codefactory-rescue:{reference}")]);
+        git(
+            path,
+            &[
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                &format!("codefactory-rescue:{reference}"),
+            ],
+        );
         git(path, &["update-ref", reference, "refs/stash"]);
-        sqlx::query("INSERT INTO execution_workspace_rescues VALUES (?,?,'saved',1,1)").bind(reference).bind(&workspace.objective_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO execution_workspace_rescues VALUES (?,?,'saved',1,1)")
+            .bind(reference)
+            .bind(&workspace.objective_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         park_as_incident(&pool, &workspace.objective_id, "interrupted repair").await;
-        attach_existing(&pool, &workspace.objective_id, "process-b").await.unwrap();
+        attach_existing(&pool, &workspace.objective_id, "process-b")
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(path.join("new.txt")).unwrap(), b"retained\n");
-        assert_eq!(git(path, &["branch", "--show-current"]), workspace.branch_name);
-        let phases: Vec<String> = sqlx::query_scalar("SELECT phase FROM execution_workspace_rescues").fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            git(path, &["branch", "--show-current"]),
+            workspace.branch_name
+        );
+        let phases: Vec<String> =
+            sqlx::query_scalar("SELECT phase FROM execution_workspace_rescues")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(phases, vec!["applied"]);
     }
 
@@ -4959,11 +5418,19 @@ mod tests {
         std::fs::write(&dirty, "keep me").unwrap();
 
         let recovered = attach_existing(&pool, "objective-dirty-root", "process-b")
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(recovered.state, "active");
         assert_eq!(std::fs::read(&dirty).unwrap(), b"keep me");
-        assert_eq!(git(&workspace.worktree_path, &["branch", "--show-current"]), workspace.branch_name);
-        assert_eq!(workspace_state(&pool, "objective-dirty-root").await, "active");
+        assert_eq!(
+            git(&workspace.worktree_path, &["branch", "--show-current"]),
+            workspace.branch_name
+        );
+        assert_eq!(
+            workspace_state(&pool, "objective-dirty-root").await,
+            "active"
+        );
     }
 
     #[tokio::test]
@@ -5027,23 +5494,55 @@ mod tests {
         for index in 0..7 {
             let objective = format!("synthetic-startup-{index}");
             if index != 0 {
-                sqlx::query("INSERT INTO objectives(id) VALUES (?)").bind(&objective).execute(&pool).await.unwrap();
+                sqlx::query("INSERT INTO objectives(id) VALUES (?)")
+                    .bind(&objective)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
-            let workspace = allocate_or_attach(&pool, request_for(&root, &container, &objective, "process-a")).await.unwrap();
-            git(&workspace.worktree_path, &["checkout", "-b", &format!("foreign-{index}")]);
-            std::fs::write(workspace.worktree_path.join("uncommitted.txt"), format!("keep {index}")).unwrap();
+            let workspace = allocate_or_attach(
+                &pool,
+                request_for(&root, &container, &objective, "process-a"),
+            )
+            .await
+            .unwrap();
+            git(
+                &workspace.worktree_path,
+                &["checkout", "-b", &format!("foreign-{index}")],
+            );
+            std::fs::write(
+                workspace.worktree_path.join("uncommitted.txt"),
+                format!("keep {index}"),
+            )
+            .unwrap();
             park_as_incident(&pool, &objective, "branch changed with uncommitted changes").await;
             workspaces.push(workspace);
         }
         assert!(heal_incident_workspaces(&pool).await.is_empty());
         for (index, workspace) in workspaces.iter().enumerate() {
-            assert_eq!(workspace_state(&pool, &workspace.objective_id).await, "active");
-            assert_eq!(git(&workspace.worktree_path, &["branch", "--show-current"]), workspace.branch_name);
-            assert_eq!(std::fs::read_to_string(workspace.worktree_path.join("uncommitted.txt")).unwrap(), format!("keep {index}"));
-            attach_existing(&pool, &workspace.objective_id, "process-b").await.unwrap();
+            assert_eq!(
+                workspace_state(&pool, &workspace.objective_id).await,
+                "active"
+            );
+            assert_eq!(
+                git(&workspace.worktree_path, &["branch", "--show-current"]),
+                workspace.branch_name
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.worktree_path.join("uncommitted.txt")).unwrap(),
+                format!("keep {index}")
+            );
+            attach_existing(&pool, &workspace.objective_id, "process-b")
+                .await
+                .unwrap();
         }
         assert!(heal_incident_workspaces(&pool).await.is_empty());
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_workspace_rescues WHERE phase='applied'").fetch_one(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_workspace_rescues WHERE phase='applied'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 7);
     }
 
@@ -5406,13 +5905,9 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        mark_objective_terminal_in_tx(
-            &mut tx,
-            objective_id,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .await
-        .unwrap();
+        mark_objective_terminal_in_tx(&mut tx, objective_id, chrono::Utc::now().timestamp_millis())
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -5434,13 +5929,9 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        mark_objective_terminal_in_tx(
-            &mut tx,
-            objective_id,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .await
-        .unwrap();
+        mark_objective_terminal_in_tx(&mut tx, objective_id, chrono::Utc::now().timestamp_millis())
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -5501,17 +5992,36 @@ mod tests {
     async fn m163_split_recovery_preserves_both_dirty_workspaces() {
         let (_temp, root, _remote, container) = init_repo();
         let pool = pool_with_objectives(&["split-a", "split-b"]).await;
-        let a = allocate_or_attach(&pool, request_for_session(&root, &container, "split-a", "split-session", "old-a")).await.unwrap();
+        let a = allocate_or_attach(
+            &pool,
+            request_for_session(&root, &container, "split-a", "split-session", "old-a"),
+        )
+        .await
+        .unwrap();
         // Simulate a historical second admission: allocate under another session,
         // then restore the persisted split shape before startup recovery.
-        let b = allocate_or_attach(&pool, request_for_session(&root, &container, "split-b", "other-session", "old-b")).await.unwrap();
+        let b = allocate_or_attach(
+            &pool,
+            request_for_session(&root, &container, "split-b", "other-session", "old-b"),
+        )
+        .await
+        .unwrap();
         std::fs::write(a.worktree_path.join("first.txt"), "first edit\n").unwrap();
         std::fs::write(b.worktree_path.join("second.txt"), "second edit\n").unwrap();
         sqlx::query("UPDATE execution_workspaces SET session_id='split-session', created_at=CASE objective_id WHEN 'split-a' THEN 1 ELSE 2 END")
             .execute(&pool).await.unwrap();
-        super::repair_session_split(&pool, "split-session", "restart").await.unwrap();
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces WHERE state='active'")
-            .fetch_one(&pool).await.unwrap(), 1);
+        super::repair_session_split(&pool, "split-session", "restart")
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM execution_workspaces WHERE state='active'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
         // Windows CI checks these worktrees out with core.autocrlf, so a dirty
         // file's line endings legitimately come back as CRLF. The property under
         // test is that the edit survives recovery, not that git kept LF bytes,
@@ -5523,8 +6033,13 @@ mod tests {
             git(&root, &["show", &format!("{rescue}:second.txt")]).replace("\r\n", "\n"),
             "second edit"
         );
-        super::repair_session_split(&pool, "split-session", "restart").await.unwrap();
-        assert_eq!(workspace_state_of(&pool, "split-b").await.as_deref(), Some("closed"));
+        super::repair_session_split(&pool, "split-session", "restart")
+            .await
+            .unwrap();
+        assert_eq!(
+            workspace_state_of(&pool, "split-b").await.as_deref(),
+            Some("closed")
+        );
     }
 
     /// M169/R3: a session that already split keeps the workspace its PR lives
@@ -5615,7 +6130,9 @@ mod tests {
             "the uncommitted change must be inside the continued workspace"
         );
         assert_eq!(
-            workspace_state_of(&pool, "objective-stop-b").await.as_deref(),
+            workspace_state_of(&pool, "objective-stop-b")
+                .await
+                .as_deref(),
             Some("active")
         );
         assert_eq!(
@@ -5632,15 +6149,24 @@ mod tests {
     #[tokio::test]
     async fn a_legacy_orphan_with_an_open_delivery_hands_its_workspace_forward() {
         let (_temp, root, _remote, container) = init_repo();
-        let pool =
-            pool_with_objectives(&["objective-orphan-a", "objective-orphan-b"]).await;
+        let pool = pool_with_objectives(&["objective-orphan-a", "objective-orphan-b"]).await;
         let workspace_a = allocate_or_attach(
             &pool,
-            request_for_session(&root, &container, "objective-orphan-a", "orphan-session", "p-a"),
+            request_for_session(
+                &root,
+                &container,
+                "objective-orphan-a",
+                "orphan-session",
+                "p-a",
+            ),
         )
         .await
         .unwrap();
-        std::fs::write(workspace_a.worktree_path.join("draft.txt"), "unfinished fix\n").unwrap();
+        std::fs::write(
+            workspace_a.worktree_path.join("draft.txt"),
+            "unfinished fix\n",
+        )
+        .unwrap();
         record_open_pr(&pool, "objective-orphan-a", 861).await;
 
         // Exactly what the settled chat turn does.
@@ -5660,7 +6186,13 @@ mod tests {
 
         let workspace_b = allocate_or_attach(
             &pool,
-            request_for_session(&root, &container, "objective-orphan-b", "orphan-session", "p-b"),
+            request_for_session(
+                &root,
+                &container,
+                "objective-orphan-b",
+                "orphan-session",
+                "p-b",
+            ),
         )
         .await
         .unwrap();
@@ -5695,7 +6227,11 @@ mod tests {
         )
         .await
         .unwrap();
-        std::fs::write(workspace_a.worktree_path.join("draft.txt"), "failed mid-flight\n").unwrap();
+        std::fs::write(
+            workspace_a.worktree_path.join("draft.txt"),
+            "failed mid-flight\n",
+        )
+        .unwrap();
         sqlx::query("UPDATE objectives SET status='failed' WHERE id='objective-failed-a'")
             .execute(&pool)
             .await
@@ -5758,7 +6294,6 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(workspace_b.worktree_path, workspace_a.worktree_path);
-
     }
 
     /// U26 / CF-WSC-R1 + R3. This case deliberately replaces the U24 assertion
@@ -5869,7 +6404,9 @@ mod tests {
 
         assert_ne!(workspace_b.worktree_path, workspace_a.worktree_path);
         assert_eq!(
-            workspace_state_of(&pool, "objective-clean-a").await.as_deref(),
+            workspace_state_of(&pool, "objective-clean-a")
+                .await
+                .as_deref(),
             Some("cleanup_pending"),
             "an empty stopped workspace stays with the closeout lifecycle"
         );
@@ -5899,7 +6436,9 @@ mod tests {
         .unwrap();
         assert_eq!(workspace_b.worktree_path, workspace_a.worktree_path);
 
-        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process").await.unwrap();
+        let outcome = run_cleanup_pass(&pool, &container, "cleanup-process")
+            .await
+            .unwrap();
 
         assert_eq!(outcome.scanned, 0);
         assert_eq!(outcome.closed, 0);
@@ -5907,7 +6446,9 @@ mod tests {
         assert!(workspace_b.worktree_path.join("draft.txt").is_file());
         assert_eq!(std::fs::read_to_string(&draft).unwrap(), "still working\n");
         assert_eq!(
-            workspace_state_of(&pool, "objective-hand-b").await.as_deref(),
+            workspace_state_of(&pool, "objective-hand-b")
+                .await
+                .as_deref(),
             Some("active")
         );
     }
@@ -5926,18 +6467,38 @@ mod tests {
         .await;
         let workspace_one_a = allocate_or_attach(
             &pool,
-            request_for_session(&root, &container, "objective-one-a", "session-one", "process-a"),
+            request_for_session(
+                &root,
+                &container,
+                "objective-one-a",
+                "session-one",
+                "process-a",
+            ),
         )
         .await
         .unwrap();
         let workspace_two_a = allocate_or_attach(
             &pool,
-            request_for_session(&root, &container, "objective-two-a", "session-two", "process-b"),
+            request_for_session(
+                &root,
+                &container,
+                "objective-two-a",
+                "session-two",
+                "process-b",
+            ),
         )
         .await
         .unwrap();
-        std::fs::write(workspace_one_a.worktree_path.join("one.txt"), "session one\n").unwrap();
-        std::fs::write(workspace_two_a.worktree_path.join("two.txt"), "session two\n").unwrap();
+        std::fs::write(
+            workspace_one_a.worktree_path.join("one.txt"),
+            "session one\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_two_a.worktree_path.join("two.txt"),
+            "session two\n",
+        )
+        .unwrap();
         cancel_objective(&pool, "objective-one-a").await;
         cancel_objective(&pool, "objective-two-a").await;
 
@@ -6017,7 +6578,11 @@ mod tests {
                         git(&workspace_a.worktree_path, &["add", "staged.rs"]);
                     }
                     "unpushed" => {
-                        commit_file(&workspace_a.worktree_path, "unpushed.rs", "// never pushed\n");
+                        commit_file(
+                            &workspace_a.worktree_path,
+                            "unpushed.rs",
+                            "// never pushed\n",
+                        );
                     }
                     _ => {
                         commit_file(&workspace_a.worktree_path, "on-pr.rs", "// on an open PR\n");
@@ -6030,12 +6595,10 @@ mod tests {
                     _ => cancel_objective(&pool, &previous).await,
                 }
 
-                let workspace_b = allocate_or_attach(
-                    &pool,
-                    request_for(&root, &container, &next, "process-b"),
-                )
-                .await
-                .unwrap();
+                let workspace_b =
+                    allocate_or_attach(&pool, request_for(&root, &container, &next, "process-b"))
+                        .await
+                        .unwrap();
 
                 assert_eq!(
                     workspace_b.worktree_path, workspace_a.worktree_path,
@@ -6053,10 +6616,8 @@ mod tests {
                 match work {
                     "staged" => {
                         assert_eq!(
-                            std::fs::read_to_string(
-                                workspace_b.worktree_path.join("staged.rs")
-                            )
-                            .unwrap(),
+                            std::fs::read_to_string(workspace_b.worktree_path.join("staged.rs"))
+                                .unwrap(),
                             "// staged but not committed\n",
                             "{ending}: the staged change is still inside the continued workspace"
                         );
@@ -6094,13 +6655,9 @@ mod tests {
             _pr_url: &str,
             _expected_head_sha: &str,
         ) -> anyhow::Result<super::CanonicalPrState> {
-            self.answers
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Ok(super::CanonicalPrState::Unknown(
-                    "scripted observer exhausted".into(),
-                )))
+            self.answers.lock().unwrap().pop_front().unwrap_or(Ok(
+                super::CanonicalPrState::Unknown("scripted observer exhausted".into()),
+            ))
         }
     }
 
@@ -6118,11 +6675,18 @@ mod tests {
             .unwrap();
         let head_sha = git(&workspace.worktree_path, &["rev-parse", "HEAD"]);
         let now = chrono::Utc::now().timestamp_millis();
-        let has_revision: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='revision'")
-            .fetch_one(pool).await.unwrap();
+        let has_revision: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('objectives') WHERE name='revision'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
         if has_revision == 0 {
             sqlx::query("UPDATE objectives SET status='completed' WHERE id=?")
-                .bind(&workspace.objective_id).execute(pool).await.unwrap();
+                .bind(&workspace.objective_id)
+                .execute(pool)
+                .await
+                .unwrap();
         }
         sqlx::query(
             "UPDATE execution_workspaces
@@ -6208,8 +6772,8 @@ mod tests {
             &pool,
             request_for(&root, &container, "objective-external-merge", "process-a"),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
         git(&workspace.worktree_path, &["add", "change.txt"]);
         git(
@@ -6278,31 +6842,70 @@ mod tests {
             for merged in [false, true] {
                 for reached in ["pr_open", "release_triggered"] {
                     let (_temp, root, _remote, container) = init_repo();
-                    let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
-                    crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
-                        crate::agent::objective::CreateObjective {
-                            id: "synthetic-m102".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
-                            session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
-                            requested_acceptance: "merged".into(), created_surface: "synthetic-test".into(),
-                        },
-                    ).await.unwrap();
-                    let workspace = allocate_or_attach(&pool, request_for(&root, &container, "synthetic-m102", "process-a")).await.unwrap();
+                    let pool = crate::storage::db::connect("sqlite::memory:")
+                        .await
+                        .unwrap();
+                    crate::agent::objective::ObjectiveStore::new(pool.clone())
+                        .create(crate::agent::objective::CreateObjective {
+                            id: "synthetic-m102".into(),
+                            kind: crate::agent::objective::ObjectiveKind::Delivery,
+                            session_id: None,
+                            root_turn_id: None,
+                            domain: crate::agent::objective::RecoveryDomain::Delivery,
+                            requested_acceptance: "merged".into(),
+                            created_surface: "synthetic-test".into(),
+                        })
+                        .await
+                        .unwrap();
+                    let workspace = allocate_or_attach(
+                        &pool,
+                        request_for(&root, &container, "synthetic-m102", "process-a"),
+                    )
+                    .await
+                    .unwrap();
                     record_open_canonical_pr(&pool, &workspace, 102, "through_release").await;
                     sqlx::query("UPDATE objectives SET recovery_owner=NULL, remediation_id=NULL, lease_owner=NULL, lease_expires_at=NULL, status=?, decision_type=?, completed_at=1, evidence_ref='synthetic-acceptance', reached_acceptance='merged', cancellation_provenance=?, delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
                         .bind(initial).bind(match initial { "completed" => "complete", "cancelled" => "cancelled", "failed" => "failed_internal", _ => "waiting" })
                         .bind(if initial == "cancelled" { Some("explicit_cancel") } else { None }).execute(&pool).await.unwrap();
                     sqlx::query("UPDATE delivery_runs SET reached_ceiling=?, stage='live', status='failed', lease_owner=NULL, lease_expires_at=NULL").bind(reached).execute(&pool).await.unwrap();
-                    let before: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
+                    let before: i64 = sqlx::query_scalar("SELECT revision FROM objectives")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
                     for _ in 0..2 {
-                        let state = if merged { super::CanonicalPrState::Merged { merge_sha: "synthetic-m102-merge".into() } } else { super::CanonicalPrState::Open };
-                        reconcile_next_poll(&pool, &ScriptedPrObserver::new(vec![Ok(state)]), "m102").await.unwrap();
-                        let (status, revision): (String, i64) = sqlx::query_as("SELECT status,revision FROM objectives").fetch_one(&pool).await.unwrap();
+                        let state = if merged {
+                            super::CanonicalPrState::Merged {
+                                merge_sha: "synthetic-m102-merge".into(),
+                            }
+                        } else {
+                            super::CanonicalPrState::Open
+                        };
+                        reconcile_next_poll(
+                            &pool,
+                            &ScriptedPrObserver::new(vec![Ok(state)]),
+                            "m102",
+                        )
+                        .await
+                        .unwrap();
+                        let (status, revision): (String, i64) =
+                            sqlx::query_as("SELECT status,revision FROM objectives")
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
                         let advances = (merged && initial != "completed")
                             || (!merged && initial == "waiting_system" && reached == "pr_open");
-                        assert_eq!(status, if merged { "completed" } else { initial }, "initial={initial} merged={merged} reached={reached}");
+                        assert_eq!(
+                            status,
+                            if merged { "completed" } else { initial },
+                            "initial={initial} merged={merged} reached={reached}"
+                        );
                         assert_eq!(revision, before + i64::from(advances));
                         let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objective_events WHERE event_type='canonical_pr_progress'").fetch_one(&pool).await.unwrap();
-                        assert_eq!(events, i64::from(advances), "every state transition needs exactly one event");
+                        assert_eq!(
+                            events,
+                            i64::from(advances),
+                            "every state transition needs exactly one event"
+                        );
                     }
                 }
             }
@@ -6342,7 +6945,8 @@ mod tests {
                 &self,
                 _repo_root: &Path,
                 requests: &[super::PrObservationRequest],
-            ) -> std::collections::HashMap<i64, anyhow::Result<super::CanonicalPrState>> {
+            ) -> std::collections::HashMap<i64, anyhow::Result<super::CanonicalPrState>>
+            {
                 self.batches
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mut out = std::collections::HashMap::new();
@@ -6355,7 +6959,9 @@ mod tests {
         }
 
         let (_temp, root, _remote, container) = init_repo();
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         ensure_schema(&pool).await.unwrap();
         crate::agent::objective::ObjectiveStore::new(pool.clone())
             .create(crate::agent::objective::CreateObjective {
@@ -6386,12 +6992,11 @@ mod tests {
             source_id: &str,
             replacements: &[(&str, String)],
         ) {
-            let cols: Vec<String> = sqlx::query_scalar(&format!(
-                "SELECT name FROM pragma_table_info('{table}')"
-            ))
-            .fetch_all(pool)
-            .await
-            .unwrap();
+            let cols: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
             let projections: Vec<String> = cols
                 .iter()
                 .map(|col| {
@@ -6412,7 +7017,8 @@ mod tests {
             );
             let mut query = sqlx::query(&statement);
             for col in &cols {
-                if let Some((_, value)) = replacements.iter().find(|(name, _)| *name == col.as_str())
+                if let Some((_, value)) =
+                    replacements.iter().find(|(name, _)| *name == col.as_str())
                 {
                     query = query.bind(value.clone());
                 }
@@ -6449,7 +7055,12 @@ mod tests {
                     ("objective_id", objective_id.clone()),
                     ("branch_name", format!("m114-branch-{index}")),
                     ("worktree_identity", format!("m114-worktree-{index}")),
-                    ("worktree_path", root.join(format!("m114-{index}")).to_string_lossy().into_owned()),
+                    (
+                        "worktree_path",
+                        root.join(format!("m114-{index}"))
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
                     ("state", "active".into()),
                     ("updated_at", now.to_string()),
                 ],
@@ -6469,7 +7080,11 @@ mod tests {
             )
             .await;
             if index < 20 {
-                let status = if index % 2 == 0 { "failed" } else { "cancelled" };
+                let status = if index % 2 == 0 {
+                    "failed"
+                } else {
+                    "cancelled"
+                };
                 if status == "cancelled" {
                     sqlx::query(
                         "UPDATE objectives SET status='cancelled', decision_type='cancelled',
@@ -6519,9 +7134,7 @@ mod tests {
 
         // R4: one batched lookup per repository per due round — not one call
         // per candidate, and never a second per-PR lookup.
-        let batches = observer
-            .batches
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let batches = observer.batches.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             batches <= 8,
             "60 ticks must batch the due candidates (1m→2m→4m→…), made {batches} batched lookups"
@@ -6604,7 +7217,8 @@ mod tests {
                 &self,
                 _repo_root: &Path,
                 requests: &[super::PrObservationRequest],
-            ) -> std::collections::HashMap<i64, anyhow::Result<super::CanonicalPrState>> {
+            ) -> std::collections::HashMap<i64, anyhow::Result<super::CanonicalPrState>>
+            {
                 let mut out = std::collections::HashMap::new();
                 for request in requests {
                     self.calls.fetch_add(1, Ordering::SeqCst);
@@ -6622,12 +7236,11 @@ mod tests {
             replacements: &[(&str, String)],
             id_column: &str,
         ) -> Vec<String> {
-            let cols: Vec<String> = sqlx::query_scalar(&format!(
-                "SELECT name FROM pragma_table_info('{table}')"
-            ))
-            .fetch_all(pool)
-            .await
-            .unwrap();
+            let cols: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
             let projections: Vec<String> = cols
                 .iter()
                 .map(|col| {
@@ -6648,7 +7261,8 @@ mod tests {
             );
             let mut query = sqlx::query(&statement);
             for col in &cols {
-                if let Some((_, value)) = replacements.iter().find(|(name, _)| *name == col.as_str())
+                if let Some((_, value)) =
+                    replacements.iter().find(|(name, _)| *name == col.as_str())
                 {
                     query = query.bind(value.clone());
                 }
@@ -6658,7 +7272,9 @@ mod tests {
         }
 
         let (_temp, root, _remote, container) = init_repo();
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         ensure_schema(&pool).await.unwrap();
         crate::agent::objective::ObjectiveStore::new(pool.clone())
             .create(crate::agent::objective::CreateObjective {
@@ -6684,11 +7300,39 @@ mod tests {
         // (pr, objective status, run stage, run status, run wait_class,
         //  objective requires_user_action)
         let states: [(i64, &str, &str, &str, &str, i64); 5] = [
-            (2000, "waiting_core_input", "mutation_permit", "waiting", "external_wait", 1),
-            (2001, "waiting_core_input", "base_sync", "agent_action_required", "external_wait", 1),
-            (2002, "waiting_core_input", "takeover_reconciliation", "platform_incident", "delivery_identity_conflict", 1),
+            (
+                2000,
+                "waiting_core_input",
+                "mutation_permit",
+                "waiting",
+                "external_wait",
+                1,
+            ),
+            (
+                2001,
+                "waiting_core_input",
+                "base_sync",
+                "agent_action_required",
+                "external_wait",
+                1,
+            ),
+            (
+                2002,
+                "waiting_core_input",
+                "takeover_reconciliation",
+                "platform_incident",
+                "delivery_identity_conflict",
+                1,
+            ),
             (2003, "active", "pr_open", "waiting", "external_wait", 0),
-            (2004, "waiting_core_input", "pr_open", "waiting", "external_wait", 1),
+            (
+                2004,
+                "waiting_core_input",
+                "pr_open",
+                "waiting",
+                "external_wait",
+                1,
+            ),
         ];
         for (index, (pr_number, objective_status, stage, run_status, wait_class, user_action)) in
             states.iter().enumerate()
@@ -6716,7 +7360,12 @@ mod tests {
                     ("objective_id", objective_id.clone()),
                     ("branch_name", format!("m114b-branch-{index}")),
                     ("worktree_identity", format!("m114b-worktree-{index}")),
-                    ("worktree_path", root.join(format!("m114b-{index}")).to_string_lossy().into_owned()),
+                    (
+                        "worktree_path",
+                        root.join(format!("m114b-{index}"))
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
                     ("state", "active".into()),
                     ("updated_at", now.to_string()),
                 ],
@@ -6765,7 +7414,9 @@ mod tests {
         };
         let started = chrono::Utc::now().timestamp_millis();
         for _ in 0..60 {
-            reconcile_next_poll(&pool, &observer, "m114b").await.unwrap();
+            reconcile_next_poll(&pool, &observer, "m114b")
+                .await
+                .unwrap();
         }
 
         // R3: a concluded PR is asked once, then never again — and the four
@@ -6773,7 +7424,10 @@ mod tests {
         let observed = observer.observed.lock().unwrap().clone();
         for pr_number in [2000i64, 2001, 2002] {
             let count = observed.iter().filter(|seen| **seen == pr_number).count();
-            assert_eq!(count, 1, "PR #{pr_number} must be queried exactly once, saw {count}");
+            assert_eq!(
+                count, 1,
+                "PR #{pr_number} must be queried exactly once, saw {count}"
+            );
         }
         // A closed PR on a *live* objective keeps the M114 backoff (a reopen can
         // still change the answer), but must stay far below one call per tick.
@@ -6821,51 +7475,98 @@ mod tests {
     #[tokio::test]
     async fn m84_historical_misclassified_live_settles_once_at_merged() {
         let (_temp, root, _remote, container) = init_repo();
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
-        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
-            crate::agent::objective::CreateObjective {
-                id: "synthetic-m84".into(), kind: crate::agent::objective::ObjectiveKind::Live,
-                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
-                requested_acceptance: "live_verification".into(), created_surface: "synthetic-test".into(),
-            },
-        ).await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone())
+            .create(crate::agent::objective::CreateObjective {
+                id: "synthetic-m84".into(),
+                kind: crate::agent::objective::ObjectiveKind::Live,
+                session_id: None,
+                root_turn_id: None,
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "live_verification".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_authorized) VALUES ('synthetic-m84-session','synthetic','/synthetic','synthetic',1,1,1)").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO messages (id,session_id,role,content,created_at) VALUES ('synthetic-m84-root','synthetic-m84-session','user','授权交付（ceiling: merged）：按 truthful-delivery-state.md 修复',1)").execute(&pool).await.unwrap();
         sqlx::query("UPDATE objectives SET session_id='synthetic-m84-session', root_turn_id='synthetic-m84-root' WHERE id='synthetic-m84'").execute(&pool).await.unwrap();
-        let workspace = allocate_or_attach(&pool, request_for(&root, &container, "synthetic-m84", "process-a")).await.unwrap();
+        let workspace = allocate_or_attach(
+            &pool,
+            request_for(&root, &container, "synthetic-m84", "process-a"),
+        )
+        .await
+        .unwrap();
         record_open_canonical_pr(&pool, &workspace, 184, "through_merge").await;
         sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)").execute(&pool).await.unwrap();
-        sqlx::query("UPDATE execution_workspaces SET lease_owner=NULL, lease_expires_at=NULL").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE execution_workspaces SET lease_owner=NULL, lease_expires_at=NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("UPDATE delivery_runs SET stage='complete',reached_ceiling='merged',status='waiting' WHERE objective_id='synthetic-m84'").execute(&pool).await.unwrap();
-        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m84-merge".into() })]);
-        reconcile_next_poll(&pool, &observer, "synthetic-observer").await.unwrap();
-        let settled: (String, String, String, i64) = sqlx::query_as("SELECT status,kind,requested_acceptance,revision FROM objectives").fetch_one(&pool).await.unwrap();
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+            merge_sha: "synthetic-m84-merge".into(),
+        })]);
+        reconcile_next_poll(&pool, &observer, "synthetic-observer")
+            .await
+            .unwrap();
+        let settled: (String, String, String, i64) =
+            sqlx::query_as("SELECT status,kind,requested_acceptance,revision FROM objectives")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(settled.0, "completed");
         assert_eq!(settled.1, "delivery");
         assert_eq!(settled.2, "merged");
-        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m84-merge".into() })]);
-        reconcile_next_poll(&pool, &observer, "synthetic-observer").await.unwrap();
-        let revision: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+            merge_sha: "synthetic-m84-merge".into(),
+        })]);
+        reconcile_next_poll(&pool, &observer, "synthetic-observer")
+            .await
+            .unwrap();
+        let revision: i64 = sqlx::query_scalar("SELECT revision FROM objectives")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(revision, settled.3);
     }
 
     #[tokio::test]
     async fn m72_misclassified_cancel_with_merged_pr_is_completed() {
         let (_temp, root, remote, container) = init_repo();
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
-        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
-            crate::agent::objective::CreateObjective {
-                id: "synthetic-m72-merged".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
-                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
-                requested_acceptance: "delivery_receipt".into(), created_surface: "synthetic-test".into(),
-            },
-        ).await.unwrap();
-        let workspace = allocate_or_attach(&pool,
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone())
+            .create(crate::agent::objective::CreateObjective {
+                id: "synthetic-m72-merged".into(),
+                kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None,
+                root_turn_id: None,
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "delivery_receipt".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        let workspace = allocate_or_attach(
+            &pool,
             request_for(&root, &container, "synthetic-m72-merged", "process-a"),
-        ).await.unwrap();
-        std::fs::write(workspace.worktree_path.join("change.txt"), "synthetic delivery\n").unwrap();
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            workspace.worktree_path.join("change.txt"),
+            "synthetic delivery\n",
+        )
+        .unwrap();
         git(&workspace.worktree_path, &["add", "change.txt"]);
-        git(&workspace.worktree_path, &["commit", "-m", "fix: synthetic M72"]);
+        git(
+            &workspace.worktree_path,
+            &["commit", "-m", "fix: synthetic M72"],
+        );
         publish_workspace_branch(&root, &remote, &workspace.branch_name);
         record_open_canonical_pr(&pool, &workspace, 92, "through_merge").await;
         sqlx::query("UPDATE objectives SET status='cancelled', decision_type='cancelled', completed_at=1, cancellation_provenance='explicit_cancel', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
@@ -6875,10 +7576,16 @@ mod tests {
         let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
             merge_sha: "synthetic-m72-merge".into(),
         })]);
-        let outcome = super::run_cleanup_pass_with(&pool, &container, "m72-observer", &observer).await.unwrap();
-        let (status, provenance, acceptance): (String, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT status, cancellation_provenance, reached_acceptance FROM objectives",
-        ).fetch_one(&pool).await.unwrap();
+        let outcome = super::run_cleanup_pass_with(&pool, &container, "m72-observer", &observer)
+            .await
+            .unwrap();
+        let (status, provenance, acceptance): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, cancellation_provenance, reached_acceptance FROM objectives",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(status, "completed");
         assert!(provenance.is_none());
         assert_eq!(acceptance.as_deref(), Some("merged"));
@@ -6888,19 +7595,39 @@ mod tests {
 
     #[tokio::test]
     async fn m74_remote_merge_repairs_failed_cancelled_and_incident_with_stale_workspace() {
-        for (index, (status, reached)) in [("failed", "pr_open"), ("cancelled", "ci_green"), ("platform_incident", "pr_open"), ("failed", "merged"), ("cancelled", "merged"), ("stopped", "pr_open")].iter().enumerate() {
+        for (index, (status, reached)) in [
+            ("failed", "pr_open"),
+            ("cancelled", "ci_green"),
+            ("platform_incident", "pr_open"),
+            ("failed", "merged"),
+            ("cancelled", "merged"),
+            ("stopped", "pr_open"),
+        ]
+        .iter()
+        .enumerate()
+        {
             let (_temp, root, _remote, container) = init_repo();
-            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
-            crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
-                crate::agent::objective::CreateObjective {
-                    id: "synthetic-m74".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
-                    session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
-                    requested_acceptance: "delivery_receipt".into(), created_surface: "synthetic-test".into(),
-                },
-            ).await.unwrap();
-            let workspace = allocate_or_attach(&pool,
+            let pool = crate::storage::db::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            crate::agent::objective::ObjectiveStore::new(pool.clone())
+                .create(crate::agent::objective::CreateObjective {
+                    id: "synthetic-m74".into(),
+                    kind: crate::agent::objective::ObjectiveKind::Delivery,
+                    session_id: None,
+                    root_turn_id: None,
+                    domain: crate::agent::objective::RecoveryDomain::Delivery,
+                    requested_acceptance: "delivery_receipt".into(),
+                    created_surface: "synthetic-test".into(),
+                })
+                .await
+                .unwrap();
+            let workspace = allocate_or_attach(
+                &pool,
                 request_for(&root, &container, "synthetic-m74", "process-a"),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             record_open_canonical_pr(&pool, &workspace, 174 + index as i64, "through_merge").await;
             sqlx::query("UPDATE delivery_runs SET status=?, stage='takeover_reconciliation', reached_ceiling=?, failure_signature='takeover_reconciliation:delivery_identity_conflict', lease_owner=NULL, lease_expires_at=NULL")
                 .bind(status).bind(reached).execute(&pool).await.unwrap();
@@ -6910,47 +7637,104 @@ mod tests {
                 .bind(if index == 5 { "cancelled" } else { "failed" }).execute(&pool).await.unwrap();
             if index == 5 {
                 sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-stopped-session','synthetic','/tmp/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
-                sqlx::query("UPDATE objectives SET session_id='synthetic-stopped-session'").execute(&pool).await.unwrap();
+                sqlx::query("UPDATE objectives SET session_id='synthetic-stopped-session'")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
                 sqlx::query("INSERT INTO chat_session_cancel_intents (session_id,status,requested_at,updated_at) VALUES ('synthetic-stopped-session','requested',1,1)").execute(&pool).await.unwrap();
-                crate::agent::stop_fence::record_stop(&pool, "synthetic-stopped-session", "orchestrator_stop", Some(179)).await.unwrap();
+                crate::agent::stop_fence::record_stop(
+                    &pool,
+                    "synthetic-stopped-session",
+                    "orchestrator_stop",
+                    Some(179),
+                )
+                .await
+                .unwrap();
             }
             // Local identity is no longer suitable for mutation replay. In the
             // last case closeout has already removed the worktree altogether.
             sqlx::query("UPDATE execution_workspaces SET head_sha='stale-local-head', worktree_identity='stale-local-identity', state=?, lease_owner=NULL, lease_expires_at=NULL")
                 .bind(if index == 2 { "closed" } else { "delivering" }).execute(&pool).await.unwrap();
             if index == 2 {
-                git(&root, &["worktree", "remove", workspace.worktree_path.to_str().unwrap()]);
+                git(
+                    &root,
+                    &[
+                        "worktree",
+                        "remove",
+                        workspace.worktree_path.to_str().unwrap(),
+                    ],
+                );
             }
             let before: (String, String, i64) = sqlx::query_as(
                 "SELECT o.status,r.status,o.revision FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
             ).fetch_one(&pool).await.unwrap();
-            reconcile_next_poll(&pool,
-                &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Unknown("offline".into()))]), "m74-restart",
-            ).await.unwrap();
+            reconcile_next_poll(
+                &pool,
+                &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Unknown(
+                    "offline".into(),
+                ))]),
+                "m74-restart",
+            )
+            .await
+            .unwrap();
             let unknown: (String, String, i64) = sqlx::query_as(
                 "SELECT o.status,r.status,o.revision FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
             ).fetch_one(&pool).await.unwrap();
-            assert_eq!(unknown, before, "R9: uncertainty must leave history unchanged");
+            assert_eq!(
+                unknown, before,
+                "R9: uncertainty must leave history unchanged"
+            );
             for _ in 0..2 {
-                reconcile_next_poll(&pool,
-                    &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m74-merge".into() })]), "m74-restart",
-                ).await.unwrap();
+                reconcile_next_poll(
+                    &pool,
+                    &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+                        merge_sha: "synthetic-m74-merge".into(),
+                    })]),
+                    "m74-restart",
+                )
+                .await
+                .unwrap();
                 let repaired: (String, Option<String>, String, String, Option<String>, i64) = sqlx::query_as(
                     "SELECT o.status,o.failure_code,r.status,r.reached_ceiling,r.failure_signature,o.revision FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
                 ).fetch_one(&pool).await.unwrap();
-                assert_eq!(repaired.0, "completed", "R8: repair historical objective failure");
+                assert_eq!(
+                    repaired.0, "completed",
+                    "R8: repair historical objective failure"
+                );
                 assert_eq!(repaired.1, None);
-                assert_eq!(repaired.2, "completed", "R7: local drift is not a platform incident");
+                assert_eq!(
+                    repaired.2, "completed",
+                    "R7: local drift is not a platform incident"
+                );
                 assert_eq!(repaired.3, "merged");
                 assert_eq!(repaired.4, None);
-                assert_eq!(repaired.5, before.2 + 1, "R9: repeated merge observation is idempotent");
-                let plan = crate::agent::delivery_run::plan_startup_recovery(&pool,
-                    &crate::agent::delivery_run::ProcessIdentity::new("m74b-recovery", "test", "test"),
-                    chrono::Utc::now().timestamp_millis(), 60_000).await.unwrap();
-                assert!(plan.claimed.is_empty(), "R7: merged settlement must bypass mutation takeover");
+                assert_eq!(
+                    repaired.5,
+                    before.2 + 1,
+                    "R9: repeated merge observation is idempotent"
+                );
+                let plan = crate::agent::delivery_run::plan_startup_recovery(
+                    &pool,
+                    &crate::agent::delivery_run::ProcessIdentity::new(
+                        "m74b-recovery",
+                        "test",
+                        "test",
+                    ),
+                    chrono::Utc::now().timestamp_millis(),
+                    60_000,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    plan.claimed.is_empty(),
+                    "R7: merged settlement must bypass mutation takeover"
+                );
                 if index == 5 {
                     let fences: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_stop_fences WHERE session_id='synthetic-stopped-session'").fetch_one(&pool).await.unwrap();
-                    assert_eq!(fences, 1, "read-only settlement must preserve the stop fence");
+                    assert_eq!(
+                        fences, 1,
+                        "read-only settlement must preserve the stop fence"
+                    );
                 }
             }
         }
@@ -6959,17 +7743,27 @@ mod tests {
     #[tokio::test]
     async fn m74c_settles_merged_pr_after_the_queue_moved_the_head_and_the_workspace_is_gone() {
         let (_temp, root, _remote, container) = init_repo();
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
-        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
-            crate::agent::objective::CreateObjective {
-                id: "synthetic-m74c".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
-                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
-                requested_acceptance: "delivery_receipt".into(), created_surface: "synthetic-test".into(),
-            },
-        ).await.unwrap();
-        let workspace = allocate_or_attach(&pool,
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone())
+            .create(crate::agent::objective::CreateObjective {
+                id: "synthetic-m74c".into(),
+                kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None,
+                root_turn_id: None,
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "delivery_receipt".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        let workspace = allocate_or_attach(
+            &pool,
             request_for(&root, &container, "synthetic-m74c", "process-a"),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         record_open_canonical_pr(&pool, &workspace, 644, "through_merge").await;
         // The merge queue synced the branch before merging and closeout already
         // removed the worktree, so the local head is no longer the PR head.
@@ -6980,13 +7774,22 @@ mod tests {
         sqlx::query("UPDATE objectives SET status='failed', decision_type='failed_internal', completed_at=1, failure_code='technical_recovery_exhausted', delivery_run_id=(SELECT id FROM delivery_runs WHERE objective_id=objectives.id)")
             .execute(&pool).await.unwrap();
         // The remote is authoritative: GitHub already merged PR #644.
-        reconcile_next_poll(&pool,
-            &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-m74c-merge".into() })]), "m74c-restart",
-        ).await.unwrap();
+        reconcile_next_poll(
+            &pool,
+            &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+                merge_sha: "synthetic-m74c-merge".into(),
+            })]),
+            "m74c-restart",
+        )
+        .await
+        .unwrap();
         let settled: (String, Option<String>, String, String) = sqlx::query_as(
             "SELECT o.status,o.failure_code,r.status,r.reached_ceiling FROM objectives o JOIN delivery_runs r ON r.objective_id=o.id",
         ).fetch_one(&pool).await.unwrap();
-        assert_eq!(settled.0, "completed", "a merged PR settles even after the queue moved the head");
+        assert_eq!(
+            settled.0, "completed",
+            "a merged PR settles even after the queue moved the head"
+        );
         assert_eq!(settled.1, None);
         assert_eq!(settled.2, "completed");
         assert_eq!(settled.3, "merged");
@@ -7078,7 +7881,9 @@ mod tests {
         ];
         for (checks, expected_code, expected_prompt) in cases {
             let (_temp, root, _remote, container) = init_repo();
-            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+            let pool = crate::storage::db::connect("sqlite::memory:")
+                .await
+                .unwrap();
             crate::agent::objective::ObjectiveStore::new(pool.clone())
                 .create(crate::agent::objective::CreateObjective {
                     id: "synthetic-m108".into(),
@@ -7101,13 +7906,9 @@ mod tests {
             // The session is parked exactly as the field incident left it.
             sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', failure_code='delivered_awaiting_ci', next_observation_at=NULL, attention_request_json=NULL")
                 .execute(&pool).await.unwrap();
-            reconcile_next_poll(
-                &pool,
-                &SyntheticCiObserver { checks },
-                "m108-observer",
-            )
-            .await
-            .unwrap();
+            reconcile_next_poll(&pool, &SyntheticCiObserver { checks }, "m108-observer")
+                .await
+                .unwrap();
             let (code, next, attention): (Option<String>, Option<i64>, Option<String>) =
                 sqlx::query_as(
                     "SELECT failure_code,next_observation_at,attention_request_json FROM objectives WHERE id='synthetic-m108'",
@@ -7181,9 +7982,7 @@ mod tests {
                     synced_from_default_branch: "main".into(),
                 }
             } else {
-                super::UpdatedHeadVerdict::Foreign(
-                    "parents do not include the session head".into(),
-                )
+                super::UpdatedHeadVerdict::Foreign("parents do not include the session head".into())
             }
         }
 
@@ -7202,7 +8001,9 @@ mod tests {
         use crate::agent::objective::DELIVERED_CI_FAILED;
         for same_delivery in [true, false] {
             let (_temp, root, _remote, container) = init_repo();
-            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+            let pool = crate::storage::db::connect("sqlite::memory:")
+                .await
+                .unwrap();
             crate::agent::objective::ObjectiveStore::new(pool.clone())
                 .create(crate::agent::objective::CreateObjective {
                     id: "synthetic-m115".into(),
@@ -7309,36 +8110,85 @@ mod tests {
     async fn lagged_latest_delivery_run_settles_remote_merge() {
         for reached in ["pr_open", "ci_green", "merged"] {
             let (_temp, root, _remote, container) = init_repo();
-            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
-            crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
-                crate::agent::objective::CreateObjective {
-                    id: "synthetic-lagged".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
-                    session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
-                    requested_acceptance: "merged".into(), created_surface: "synthetic-test".into(),
-                },
-            ).await.unwrap();
-            let workspace = allocate_or_attach(&pool,
+            let pool = crate::storage::db::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            crate::agent::objective::ObjectiveStore::new(pool.clone())
+                .create(crate::agent::objective::CreateObjective {
+                    id: "synthetic-lagged".into(),
+                    kind: crate::agent::objective::ObjectiveKind::Delivery,
+                    session_id: None,
+                    root_turn_id: None,
+                    domain: crate::agent::objective::RecoveryDomain::Delivery,
+                    requested_acceptance: "merged".into(),
+                    created_surface: "synthetic-test".into(),
+                })
+                .await
+                .unwrap();
+            let workspace = allocate_or_attach(
+                &pool,
                 request_for(&root, &container, "synthetic-lagged", "process-a"),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             record_open_canonical_pr(&pool, &workspace, 755, "through_merge").await;
-            sqlx::query("UPDATE delivery_runs SET id='older-run', status='completed', updated_at=1")
-                .execute(&pool).await.unwrap();
+            sqlx::query(
+                "UPDATE delivery_runs SET id='older-run', status='completed', updated_at=1",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             sqlx::query("UPDATE objectives SET status='waiting_system', decision_type='waiting', failure_code='delivered_awaiting_ci', delivery_run_id='older-run'")
                 .execute(&pool).await.unwrap();
             record_open_canonical_pr(&pool, &workspace, 755, "through_merge").await;
             sqlx::query("UPDATE delivery_runs SET reached_ceiling=?, stage=CASE WHEN ?='merged' THEN 'complete' ELSE 'pr_open' END, status=CASE WHEN ?='merged' THEN 'completed' ELSE 'waiting' END WHERE id<>'older-run'")
                 .bind(reached).bind(reached).bind(reached).execute(&pool).await.unwrap();
-            for state in [super::CanonicalPrState::Unknown("offline".into()), super::CanonicalPrState::ClosedUnmerged] {
-                reconcile_next_poll(&pool, &ScriptedPrObserver::new(vec![Ok(state)]), "lagged-test").await.unwrap();
-                let status: String = sqlx::query_scalar("SELECT status FROM objectives").fetch_one(&pool).await.unwrap();
-                assert_eq!(status, "waiting_system", "only positive merge evidence settles");
+            for state in [
+                super::CanonicalPrState::Unknown("offline".into()),
+                super::CanonicalPrState::ClosedUnmerged,
+            ] {
+                reconcile_next_poll(
+                    &pool,
+                    &ScriptedPrObserver::new(vec![Ok(state)]),
+                    "lagged-test",
+                )
+                .await
+                .unwrap();
+                let status: String = sqlx::query_scalar("SELECT status FROM objectives")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    status, "waiting_system",
+                    "only positive merge evidence settles"
+                );
             }
-            let before: i64 = sqlx::query_scalar("SELECT revision FROM objectives").fetch_one(&pool).await.unwrap();
+            let before: i64 = sqlx::query_scalar("SELECT revision FROM objectives")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             for _ in 0..2 {
-                reconcile_next_poll(&pool, &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged { merge_sha: "synthetic-merge".into() })]), "lagged-test").await.unwrap();
+                reconcile_next_poll(
+                    &pool,
+                    &ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
+                        merge_sha: "synthetic-merge".into(),
+                    })]),
+                    "lagged-test",
+                )
+                .await
+                .unwrap();
                 let actual: (String, String, String, i64) = sqlx::query_as("SELECT o.status,o.reached_acceptance,r.reached_ceiling,o.revision FROM objectives o JOIN delivery_runs r ON r.id=o.delivery_run_id")
                     .fetch_one(&pool).await.unwrap();
-                assert_eq!(actual, ("completed".into(), "merged".into(), "merged".into(), before + 1), "latest {reached} run must settle once despite a stale objective pointer");
+                assert_eq!(
+                    actual,
+                    (
+                        "completed".into(),
+                        "merged".into(),
+                        "merged".into(),
+                        before + 1
+                    ),
+                    "latest {reached} run must settle once despite a stale objective pointer"
+                );
             }
         }
     }
@@ -7346,20 +8196,33 @@ mod tests {
     #[tokio::test]
     async fn m71_failed_takeover_tracks_open_queued_and_external_merge() {
         let (_temp, root, remote, container) = init_repo();
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
-        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
-            crate::agent::objective::CreateObjective {
-                id: "synthetic-m71".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
-                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
-                requested_acceptance: "delivery_receipt".into(), created_surface: "synthetic-test".into(),
-            },
-        ).await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone())
+            .create(crate::agent::objective::CreateObjective {
+                id: "synthetic-m71".into(),
+                kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None,
+                root_turn_id: None,
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "delivery_receipt".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
         let workspace = allocate_or_attach(
-            &pool, request_for(&root, &container, "synthetic-m71", "process-a"),
-        ).await.unwrap();
+            &pool,
+            request_for(&root, &container, "synthetic-m71", "process-a"),
+        )
+        .await
+        .unwrap();
         std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
         git(&workspace.worktree_path, &["add", "change.txt"]);
-        git(&workspace.worktree_path, &["commit", "-m", "fix: synthetic delivery"]);
+        git(
+            &workspace.worktree_path,
+            &["commit", "-m", "fix: synthetic delivery"],
+        );
         publish_workspace_branch(&root, &remote, &workspace.branch_name);
         record_open_canonical_pr(&pool, &workspace, 91, "pr_only").await;
         // The old takeover failed before other session steps opened and armed the PR.
@@ -7378,17 +8241,27 @@ mod tests {
             // M114/R3: represent the next scheduled poll (the pass itself now
             // refuses to re-ask inside the backoff window).
             sqlx::query("UPDATE delivery_runs SET pr_observation_next_at=NULL")
-                .execute(&pool).await.unwrap();
-            super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer).await.unwrap();
-            let (stage, status, reached): (String, String, String) = sqlx::query_as(
-                "SELECT stage, status, reached_ceiling FROM delivery_runs",
-            ).fetch_one(&pool).await.unwrap();
+                .execute(&pool)
+                .await
+                .unwrap();
+            super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer)
+                .await
+                .unwrap();
+            let (stage, status, reached): (String, String, String) =
+                sqlx::query_as("SELECT stage, status, reached_ceiling FROM delivery_runs")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(stage, expected);
             assert_eq!(status, "waiting");
             assert_eq!(reached, expected);
-            let (decision, failure, acceptance): (String, Option<String>, Option<String>) = sqlx::query_as(
-                "SELECT decision_type, failure_code, reached_acceptance FROM objectives",
-            ).fetch_one(&pool).await.unwrap();
+            let (decision, failure, acceptance): (String, Option<String>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT decision_type, failure_code, reached_acceptance FROM objectives",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             assert_eq!(decision, "waiting");
             assert_eq!(failure.as_deref(), Some("delivered_awaiting_ci"));
             assert_eq!(acceptance.as_deref(), Some(expected));
@@ -7396,12 +8269,27 @@ mod tests {
         }
         // An identical observation is not new progress; head drift / offline
         // uncertainty cannot erase the queue handoff or manufacture incidents.
-        let revision: i64 = sqlx::query_scalar("SELECT progress_revision FROM delivery_runs").fetch_one(&pool).await.unwrap();
-        for state in [super::CanonicalPrState::Queued, super::CanonicalPrState::Open,
-            super::CanonicalPrState::Unknown("synthetic network outage".into())] {
-            super::run_cleanup_pass_with(&pool, &container, "m71-observer", &ScriptedPrObserver::new(vec![Ok(state)]))
-                .await.unwrap();
-            let actual: i64 = sqlx::query_scalar("SELECT progress_revision FROM delivery_runs").fetch_one(&pool).await.unwrap();
+        let revision: i64 = sqlx::query_scalar("SELECT progress_revision FROM delivery_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        for state in [
+            super::CanonicalPrState::Queued,
+            super::CanonicalPrState::Open,
+            super::CanonicalPrState::Unknown("synthetic network outage".into()),
+        ] {
+            super::run_cleanup_pass_with(
+                &pool,
+                &container,
+                "m71-observer",
+                &ScriptedPrObserver::new(vec![Ok(state)]),
+            )
+            .await
+            .unwrap();
+            let actual: i64 = sqlx::query_scalar("SELECT progress_revision FROM delivery_runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             assert_eq!(actual, revision);
         }
         let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Merged {
@@ -7409,15 +8297,27 @@ mod tests {
         })]);
         // M114/R3: the next scheduled poll (outside the backoff window).
         sqlx::query("UPDATE delivery_runs SET pr_observation_next_at=NULL")
-            .execute(&pool).await.unwrap();
-        let outcome = super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer).await.unwrap();
+            .execute(&pool)
+            .await
+            .unwrap();
+        let outcome = super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer)
+            .await
+            .unwrap();
         assert_eq!(outcome.closed, 1);
-        let status: String = sqlx::query_scalar("SELECT status FROM objectives").fetch_one(&pool).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(status, "completed");
-        let (stage, status, reached): (String, String, String) = sqlx::query_as(
-            "SELECT stage, status, reached_ceiling FROM delivery_runs",
-        ).fetch_one(&pool).await.unwrap();
-        assert_eq!((stage.as_str(), status.as_str(), reached.as_str()), ("complete", "completed", "merged"));
+        let (stage, status, reached): (String, String, String) =
+            sqlx::query_as("SELECT stage, status, reached_ceiling FROM delivery_runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (stage.as_str(), status.as_str(), reached.as_str()),
+            ("complete", "completed", "merged")
+        );
         assert!(!workspace.worktree_path.exists());
         assert!(!super::branch_exists(&root, &workspace.branch_name));
         assert!(!super::remote_branch_exists(&root, "origin", &workspace.branch_name).unwrap());
@@ -7429,20 +8329,33 @@ mod tests {
     #[tokio::test]
     async fn m71_external_merge_never_fakes_live_acceptance() {
         let (_temp, root, remote, container) = init_repo();
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
-        crate::agent::objective::ObjectiveStore::new(pool.clone()).create(
-            crate::agent::objective::CreateObjective {
-                id: "synthetic-m71-live".into(), kind: crate::agent::objective::ObjectiveKind::Delivery,
-                session_id: None, root_turn_id: None, domain: crate::agent::objective::RecoveryDomain::Delivery,
-                requested_acceptance: "live_verified".into(), created_surface: "synthetic-test".into(),
-            },
-        ).await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::agent::objective::ObjectiveStore::new(pool.clone())
+            .create(crate::agent::objective::CreateObjective {
+                id: "synthetic-m71-live".into(),
+                kind: crate::agent::objective::ObjectiveKind::Delivery,
+                session_id: None,
+                root_turn_id: None,
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "live_verified".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
         let workspace = allocate_or_attach(
-            &pool, request_for(&root, &container, "synthetic-m71-live", "process-a"),
-        ).await.unwrap();
+            &pool,
+            request_for(&root, &container, "synthetic-m71-live", "process-a"),
+        )
+        .await
+        .unwrap();
         std::fs::write(workspace.worktree_path.join("live.txt"), "delivered\n").unwrap();
         git(&workspace.worktree_path, &["add", "live.txt"]);
-        git(&workspace.worktree_path, &["commit", "-m", "fix: synthetic live delivery"]);
+        git(
+            &workspace.worktree_path,
+            &["commit", "-m", "fix: synthetic live delivery"],
+        );
         publish_workspace_branch(&root, &remote, &workspace.branch_name);
         record_open_canonical_pr(&pool, &workspace, 92, "through_release").await;
         sqlx::query("UPDATE delivery_runs SET status='platform_incident', stage='takeover_mutation_reconciliation', lease_owner=NULL, lease_expires_at=NULL")
@@ -7456,20 +8369,37 @@ mod tests {
             merge_sha: "synthetic-m71-live-merge".into(),
         })]);
         let outcome = super::run_cleanup_pass_with(&pool, &container, "m71-observer", &observer)
-            .await.unwrap();
+            .await
+            .unwrap();
         let probe: (String, String, String) = sqlx::query_as(
             "SELECT objectives.status, delivery_runs.status, delivery_runs.requested_ceiling
              FROM objectives JOIN delivery_runs ON delivery_runs.objective_id=objectives.id",
-        ).fetch_one(&pool).await.unwrap();
-        assert_eq!((outcome.closed, probe.0.as_str(), probe.1.as_str(), probe.2.as_str()),
-            (0, "waiting_system", "waiting", "through_release"));
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                outcome.closed,
+                probe.0.as_str(),
+                probe.1.as_str(),
+                probe.2.as_str()
+            ),
+            (0, "waiting_system", "waiting", "through_release")
+        );
         let (status, reached): (String, String) = sqlx::query_as(
             "SELECT objectives.status, delivery_runs.reached_ceiling FROM objectives
              JOIN delivery_runs ON delivery_runs.objective_id=objectives.id",
-        ).fetch_one(&pool).await.unwrap();
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(status, "waiting_system", "a merge is not live acceptance");
         assert_eq!(reached, "merged");
-        assert!(workspace.worktree_path.exists(), "nothing is deleted without live acceptance");
+        assert!(
+            workspace.worktree_path.exists(),
+            "nothing is deleted without live acceptance"
+        );
         assert!(super::branch_exists(&root, &workspace.branch_name));
     }
 
@@ -7483,8 +8413,8 @@ mod tests {
             &pool,
             request_for(&root, &container, "objective-closed-pr", "process-a"),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
         git(&workspace.worktree_path, &["add", "change.txt"]);
         git(
@@ -7494,12 +8424,10 @@ mod tests {
         publish_workspace_branch(&root, &remote, &workspace.branch_name);
         record_open_canonical_pr(&pool, &workspace, 88, "through_merge").await;
 
-        let observer =
-            ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::ClosedUnmerged)]);
-        let outcome =
-            super::run_cleanup_pass_with(&pool, &container, "cleanup-a", &observer)
-                .await
-                .unwrap();
+        let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::ClosedUnmerged)]);
+        let outcome = super::run_cleanup_pass_with(&pool, &container, "cleanup-a", &observer)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.closed, 0);
         assert_eq!(outcome.preserved, 1);
@@ -7513,7 +8441,10 @@ mod tests {
         );
         let (state, code, detail) = workspace_cleanup_cell(&pool, &workspace.objective_id).await;
         assert_eq!(state, "cleanup_pending");
-        assert_eq!(code.as_deref(), Some("workspace_cleanup_pr_closed_unmerged"));
+        assert_eq!(
+            code.as_deref(),
+            Some("workspace_cleanup_pr_closed_unmerged")
+        );
         let detail = detail.unwrap();
         assert!(detail.contains("PR #88 已关闭但未合并"), "{detail}");
         assert!(
@@ -7531,17 +8462,16 @@ mod tests {
             &pool,
             request_for(&root, &container, "objective-unknown-pr", "process-a"),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         record_open_canonical_pr(&pool, &workspace, 99, "through_merge").await;
 
         let observer = ScriptedPrObserver::new(vec![Ok(super::CanonicalPrState::Unknown(
             "network down".into(),
         ))]);
-        let outcome =
-            super::run_cleanup_pass_with(&pool, &container, "cleanup-a", &observer)
-                .await
-                .unwrap();
+        let outcome = super::run_cleanup_pass_with(&pool, &container, "cleanup-a", &observer)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.closed, 0);
         assert_eq!(outcome.preserved, 1);
@@ -7562,8 +8492,8 @@ mod tests {
             &pool,
             request_for(&root, &container, "objective-interrupted", "process-a"),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         std::fs::write(workspace.worktree_path.join("change.txt"), "delivered\n").unwrap();
         git(&workspace.worktree_path, &["add", "change.txt"]);
         git(
@@ -7588,11 +8518,12 @@ mod tests {
         assert_eq!(interrupted.preserved, 1);
         assert!(workspace.worktree_path.is_dir());
         assert!(super::branch_exists(&root, &workspace.branch_name));
-        let (state, code, detail) =
-            workspace_cleanup_cell(&pool, &workspace.objective_id).await;
+        let (state, code, detail) = workspace_cleanup_cell(&pool, &workspace.objective_id).await;
         assert_eq!(state, "cleanup_pending");
         assert_eq!(code.as_deref(), Some("workspace_cleanup_merge_unproven"));
-        assert!(detail.unwrap().contains("network outage during observation"));
+        assert!(detail
+            .unwrap()
+            .contains("network outage during observation"));
 
         // Simulate the next scheduled poll after the retry backoff: the same
         // pass resumes and completes, with no manual repair.

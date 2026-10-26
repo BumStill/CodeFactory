@@ -175,9 +175,7 @@ pub fn is_contention_anyhow(error: &anyhow::Error) -> bool {
 /// one that happened to run a startup `PRAGMA`. `SqliteConnectOptions` is
 /// applied by sqlx on each new connection, which is the only way to guarantee
 /// that.
-fn pool_connect_options(
-    db_path: &str,
-) -> std::result::Result<SqliteConnectOptions, sqlx::Error> {
+fn pool_connect_options(db_path: &str) -> std::result::Result<SqliteConnectOptions, sqlx::Error> {
     Ok(SqliteConnectOptions::from_str(db_path)?
         .create_if_missing(true)
         // WAL: readers never block the writer and the writer never blocks
@@ -310,7 +308,13 @@ async fn table_exists(pool: &SqlitePool, table: &str) -> crate::errors::Result<b
 }
 
 async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
-    ensure_column(pool, "sessions", "delivery_mode", "TEXT NOT NULL DEFAULT 'legacy' CHECK (delivery_mode IN ('thin', 'legacy'))").await?;
+    ensure_column(
+        pool,
+        "sessions",
+        "delivery_mode",
+        "TEXT NOT NULL DEFAULT 'legacy' CHECK (delivery_mode IN ('thin', 'legacy'))",
+    )
+    .await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS thin_delivery_refs (session_id TEXT PRIMARY KEY, branch TEXT NOT NULL, pr_number INTEGER NOT NULL, ceiling TEXT NOT NULL)")
         .execute(pool).await?;
     // Session → PR is durable product intent: the workspace may return to main
@@ -1421,7 +1425,13 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
-    ensure_column(pool, "sessions", "release_urgency", "TEXT NOT NULL DEFAULT 'default'").await?;
+    ensure_column(
+        pool,
+        "sessions",
+        "release_urgency",
+        "TEXT NOT NULL DEFAULT 'default'",
+    )
+    .await?;
     ensure_column(pool, "sessions", "delivery_ceiling", "TEXT").await?;
     // Per-session permission preset. Existing sessions get standard so old
     // global allow/ask/deny details no longer leak into the primary UX.
@@ -1807,23 +1817,44 @@ mod tests {
         let url = format!("sqlite://{}", path.display());
         let pool = super::connect(&url).await.unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic','Synthetic','/synthetic','model',1,1)").execute(&pool).await.unwrap();
-        let initial: String = sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id='synthetic'").fetch_one(&pool).await.unwrap();
+        let initial: String =
+            sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id='synthetic'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(initial, "default");
         for policy in ["immediate", "default", "hold"] {
             for operation in ["send", "create_and_send"] {
                 let mut payload = serde_json::json!({"operation":operation,"message":"Synthetic message","delivery_authorized":true,"release_urgency":policy});
-                if operation == "send" { payload["session_id"] = "synthetic".into(); }
-                else { payload["project"] = "/synthetic".into(); }
+                if operation == "send" {
+                    payload["session_id"] = "synthetic".into();
+                } else {
+                    payload["project"] = "/synthetic".into();
+                }
                 let request = parse_request(&payload.to_string()).unwrap();
-                assert_eq!(serde_json::to_value(request).unwrap()["release_urgency"], policy);
-                sqlx::query("UPDATE sessions SET release_urgency=? WHERE id='synthetic'").bind(policy).execute(&pool).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(request).unwrap()["release_urgency"],
+                    policy
+                );
+                sqlx::query("UPDATE sessions SET release_urgency=? WHERE id='synthetic'")
+                    .bind(policy)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
         }
         pool.close().await;
         let pool = super::connect(&url).await.unwrap();
         let followup = parse_request(r#"{"operation":"send","session_id":"synthetic","message":"next","delivery_authorized":true}"#).unwrap();
-        assert!(serde_json::to_value(followup).unwrap().get("release_urgency").is_none());
-        let persisted: String = sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id='synthetic'").fetch_one(&pool).await.unwrap();
+        assert!(serde_json::to_value(followup)
+            .unwrap()
+            .get("release_urgency")
+            .is_none());
+        let persisted: String =
+            sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id='synthetic'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(persisted, "hold");
         pool.close().await;
     }
@@ -1835,21 +1866,39 @@ mod tests {
         for version in [1, 6, 10, 19] {
             let root = tempfile::tempdir().unwrap();
             let url = format!("sqlite:{}", root.path().join("synthetic.db").display());
-            let pool = SqlitePoolOptions::new().max_connections(1)
-                .connect_with(url.parse::<SqliteConnectOptions>().unwrap().create_if_missing(true))
-                .await.unwrap();
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    url.parse::<SqliteConnectOptions>()
+                        .unwrap()
+                        .create_if_missing(true),
+                )
+                .await
+                .unwrap();
             let all = sqlx::migrate!("./migrations");
             let prefix = sqlx::migrate::Migrator {
-                migrations: std::borrow::Cow::Owned(all.iter().filter(|m| m.version <= version).cloned().collect()),
+                migrations: std::borrow::Cow::Owned(
+                    all.iter()
+                        .filter(|m| m.version <= version)
+                        .cloned()
+                        .collect(),
+                ),
                 ..sqlx::migrate::Migrator::DEFAULT
             };
             prefix.run(&pool).await.unwrap();
             sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-schema-session','synthetic','.','synthetic',1,1)").execute(&pool).await.unwrap();
             close_and_release_files(pool).await;
             let pool = connect(&url).await.unwrap();
-            let ledger: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success=1").fetch_one(&pool).await.unwrap();
+            let ledger: i64 =
+                sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations WHERE success=1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(ledger, all.iter().map(|m| m.version).max().unwrap());
-            let identity: String = sqlx::query_scalar("SELECT id FROM sessions").fetch_one(&pool).await.unwrap();
+            let identity: String = sqlx::query_scalar("SELECT id FROM sessions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             assert_eq!(identity, "synthetic-schema-session");
             close_and_release_files(pool).await;
         }
@@ -3076,13 +3125,11 @@ mod tests {
         const ROUNDS: i64 = 25;
 
         let (pool, root) = temp_file_pool().await;
-        let observer = SqliteConnectOptions::from_str(&format!(
-            "sqlite:{}",
-            root.join("u23.db").display()
-        ))
-        .unwrap()
-        .read_only(true)
-        .busy_timeout(Duration::from_secs(2));
+        let observer =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", root.join("u23.db").display()))
+                .unwrap()
+                .read_only(true)
+                .busy_timeout(Duration::from_secs(2));
 
         let observer_task = tokio::spawn(async move {
             let mut connection = observer.connect().await.unwrap();
@@ -3109,7 +3156,9 @@ mod tests {
                 .execute(&mut *tx)
                 .await
                 .expect("write while a reader holds a snapshot");
-            tx.commit().await.expect("commit while a reader holds a snapshot");
+            tx.commit()
+                .await
+                .expect("commit while a reader holds a snapshot");
             tokio::time::sleep(Duration::from_millis(3)).await;
         }
         observer_task.await.unwrap();
@@ -3128,21 +3177,41 @@ mod tests {
             .connect_with(pool_connect_options(path.to_str().unwrap()).unwrap())
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE synthetic_lock_test (n INTEGER)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE synthetic_lock_test (n INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let mut connection = pool.acquire().await.unwrap();
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await.unwrap();
-        sqlx::query("INSERT INTO synthetic_lock_test VALUES (99)").execute(&mut *connection).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO synthetic_lock_test VALUES (99)")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
         // Simulate a failed COMMIT / cancelled bare-SQL transaction owner.
         // sqlx cannot track BEGIN issued as a query, unlike Transaction RAII.
         drop(connection);
         let attempt = tokio::time::timeout(Duration::from_secs(2), async {
             let mut tx = begin_write(&pool).await?;
-            sqlx::query("INSERT INTO synthetic_lock_test VALUES (1)").execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO synthetic_lock_test VALUES (1)")
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await
-        }).await.expect("a returned connection must not retain a permanent write lock");
+        })
+        .await
+        .expect("a returned connection must not retain a permanent write lock");
         attempt.expect("later writes must recover without restarting the app");
-        let values: Vec<i64> = sqlx::query_scalar("SELECT n FROM synthetic_lock_test").fetch_all(&pool).await.unwrap();
-        assert_eq!(values, vec![1], "uncommitted abandoned write must be rolled back");
+        let values: Vec<i64> = sqlx::query_scalar("SELECT n FROM synthetic_lock_test")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            values,
+            vec![1],
+            "uncommitted abandoned write must be rolled back"
+        );
         pool.close().await;
     }
 
@@ -3164,9 +3233,15 @@ mod tests {
             )
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE control (n INTEGER)").execute(&bare).await.unwrap();
+        sqlx::query("CREATE TABLE control (n INTEGER)")
+            .execute(&bare)
+            .await
+            .unwrap();
         let mut connection = bare.acquire().await.unwrap();
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
         drop(connection);
         let second = bare.begin_with("BEGIN IMMEDIATE").await;
         assert!(
@@ -3209,12 +3284,17 @@ mod tests {
             .unwrap();
 
         let mut holder = pool.acquire().await.unwrap();
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *holder).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO synthetic_send_test VALUES (0)")
             .execute(&mut *holder)
             .await
             .unwrap();
-        let failed = begin_write(&pool).await.expect_err("a zero-timeout contender must see code 5");
+        let failed = begin_write(&pool)
+            .await
+            .expect_err("a zero-timeout contender must see code 5");
         assert!(
             is_lock_contention(&failed),
             "the first attempt must fail as documented contention: {failed}"
@@ -3268,7 +3348,10 @@ mod tests {
             }));
         }
         for writer in writers {
-            writer.await.unwrap().expect("every concurrent writer must commit");
+            writer
+                .await
+                .unwrap()
+                .expect("every concurrent writer must commit");
         }
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM synthetic_parallel")
             .fetch_one(&pool)
@@ -3439,7 +3522,8 @@ mod tests {
     /// which is exactly how a wrapped store error arrives.
     #[tokio::test]
     async fn retry_write_retries_a_contended_operation_in_place() {
-        let contended = || sqlx::Error::Protocol("error returned from database: database is locked".into());
+        let contended =
+            || sqlx::Error::Protocol("error returned from database: database is locked".into());
         assert!(
             is_lock_contention(&contended()),
             "the injected error must be recognised as contention"
@@ -3526,7 +3610,8 @@ mod tests {
         const SESSIONS: i64 = 8;
         const ROUNDS: i64 = 12;
 
-        let root = std::env::temp_dir().join(format!("codefactory-u23-before-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("codefactory-u23-before-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let url = format!("sqlite:{}", root.join("u23.db").display());
         // The pre-fix production configuration, verbatim: sqlx's own defaults

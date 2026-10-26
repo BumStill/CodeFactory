@@ -258,7 +258,6 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-
     #[test]
     fn angle_wrapped_file_urls_with_spaces_parse() {
         let parsed = find_file_image_links(
@@ -293,5 +292,4 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].2, "/var/x.png");
     }
-
 }

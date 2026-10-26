@@ -113,11 +113,15 @@ impl WindowUsage {
     }
 
     pub fn has_reset(&self, now_ms: i64) -> bool {
-        self.resets_at_ms.map(|reset| reset <= now_ms).unwrap_or(false)
+        self.resets_at_ms
+            .map(|reset| reset <= now_ms)
+            .unwrap_or(false)
     }
 
     pub fn used_percent(&self, now_ms: i64) -> u8 {
-        (self.effective_ratio(now_ms) * 100.0).round().clamp(0.0, 100.0) as u8
+        (self.effective_ratio(now_ms) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8
     }
 }
 
@@ -268,10 +272,13 @@ pub fn evaluate_cap(quota: &EndpointQuota, cap: QuotaCap, now_ms: i64) -> Option
         .filter_map(|kind| {
             let window = quota.window(kind);
             let cap_percent = cap.for_window(kind);
-            let used_percent = if window.has_reset(now_ms) && quota.source != UsageSource::Estimated {
+            let used_percent = if window.has_reset(now_ms) && quota.source != UsageSource::Estimated
+            {
                 // A reset timestamp is not evidence of available subscription quota.
                 100
-            } else { window.used_percent(now_ms) };
+            } else {
+                window.used_percent(now_ms)
+            };
             if used_percent >= cap_percent {
                 Some(CapBreach {
                     window: kind,
@@ -559,7 +566,9 @@ impl QuotaLedger {
             // next key instead of treating silence as a 0% reading. A stale
             // reading whose windows have all reset is different — those windows
             // are genuinely back to zero, and that is what we report.
-            if !had_reading && entry.five_hour.consumed_units <= 0.0 && entry.weekly.consumed_units <= 0.0
+            if !had_reading
+                && entry.five_hour.consumed_units <= 0.0
+                && entry.weekly.consumed_units <= 0.0
             {
                 return None;
             }
@@ -815,7 +824,14 @@ mod tests {
         let mut fresh = server_quota(0.12, 0.24);
         fresh.source = UsageSource::LiveQuery;
         ledger.record_server_usage("chatgpt", fresh);
-        assert!(ledger.evaluate("chatgpt", QuotaCap::default(), SubscriptionBudget::default(), NOW).is_none());
+        assert!(ledger
+            .evaluate(
+                "chatgpt",
+                QuotaCap::default(),
+                SubscriptionBudget::default(),
+                NOW
+            )
+            .is_none());
     }
 
     // CF-QUOTA-R5: only the subscription endpoint carries quota; a pay-per-token
@@ -841,7 +857,10 @@ mod tests {
         let notice = breach.handover_notice("DeepSeek", NOW);
         assert!(notice.contains("已用 80%"), "{notice}");
         assert!(notice.contains("已切到 DeepSeek"), "{notice}");
-        assert!(notice.contains("约 ") && notice.contains(" 恢复"), "{notice}");
+        assert!(
+            notice.contains("约 ") && notice.contains(" 恢复"),
+            "{notice}"
+        );
         assert!(!notice.contains("（本地估算）"), "{notice}");
 
         let mut estimated = server_quota(0.90, 0.10);
@@ -859,7 +878,9 @@ mod tests {
         // The five-hour window has reset (and would fault), so the still-open
         // weekly window is the one that binds.
         assert_eq!(
-            evaluate_cap(&quota, QuotaCap::default(), NOW).unwrap().window,
+            evaluate_cap(&quota, QuotaCap::default(), NOW)
+                .unwrap()
+                .window,
             QuotaWindowKind::Weekly
         );
         let breach = CapBreach {

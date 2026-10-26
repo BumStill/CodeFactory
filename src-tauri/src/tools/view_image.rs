@@ -110,10 +110,8 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> ToolOutput {
             Err(error) => return ToolOutput::err(format!("IMAGE_READ_FAILED: {error}")),
         }
     } else if matches!(extension.as_str(), "pptx" | "ppt" | "pdf") {
-        let out_dir = std::env::temp_dir().join(format!(
-            "codefactory-vision-{}",
-            std::process::id()
-        ));
+        let out_dir =
+            std::env::temp_dir().join(format!("codefactory-vision-{}", std::process::id()));
         match render::render_page(&path, page, &out_dir).await {
             Ok(rendered) => {
                 renderer = Some(rendered.renderer);
@@ -148,7 +146,10 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> ToolOutput {
     }
 
     let image = ImageInput::new(bytes, mime, label);
-    let session_id = ctx.session_id.clone().unwrap_or_else(|| "no-session".to_string());
+    let session_id = ctx
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "no-session".to_string());
     let db = ctx.db.as_ref();
     let routes = ctx
         .settings
@@ -167,7 +168,15 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> ToolOutput {
         match outcome {
             Ok((answer, hit)) => {
                 let cache_hit = hit;
-                return finish(answer, &image, &question, renderer, render_note, cache_hit, attempts);
+                return finish(
+                    answer,
+                    &image,
+                    &question,
+                    renderer,
+                    render_note,
+                    cache_hit,
+                    attempts,
+                );
             }
             Err(error) => attempts.push(format!("{route_label}: {error}")),
         }
@@ -177,12 +186,28 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> ToolOutput {
     let ocr_error = match local_ocr(&path, &extension, page).await {
         Ok(result) => {
             let answer = vision::local_ocr_answer(result, &question);
-            return finish(answer, &image, &question, renderer, render_note, false, attempts);
+            return finish(
+                answer,
+                &image,
+                &question,
+                renderer,
+                render_note,
+                false,
+                attempts,
+            );
         }
         Err(error) => Some(error),
     };
     let answer = vision::no_backend_answer(&image, &question, ocr_error);
-    finish(answer, &image, &question, renderer, render_note, false, attempts)
+    finish(
+        answer,
+        &image,
+        &question,
+        renderer,
+        render_note,
+        false,
+        attempts,
+    )
 }
 
 /// 文档走"渲染后的 PNG 再 OCR"，图片直接 OCR；这样两条路径看到的是同一张图。
@@ -194,7 +219,8 @@ async fn local_ocr(
     if IMAGE_EXTENSIONS.contains(&extension) {
         return ocr::recognize(path).await;
     }
-    let out_dir = std::env::temp_dir().join(format!("codefactory-vision-ocr-{}", std::process::id()));
+    let out_dir =
+        std::env::temp_dir().join(format!("codefactory-vision-ocr-{}", std::process::id()));
     let rendered = render::render_page(path, page, &out_dir).await?;
     ocr::recognize(&rendered.png_path).await
 }
@@ -298,7 +324,11 @@ mod tests {
         )
         .await;
         assert!(out.is_error);
-        assert!(out.content.contains("UNSUPPORTED_IMAGE_TYPE"), "{}", out.content);
+        assert!(
+            out.content.contains("UNSUPPORTED_IMAGE_TYPE"),
+            "{}",
+            out.content
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -312,9 +342,9 @@ mod tests {
             &png,
             [
                 0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D',
-                b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0,
-                0x0A, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0,
-                0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+                b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0, 0x0A,
+                b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0, 0, b'I',
+                b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
             ],
         )
         .unwrap();

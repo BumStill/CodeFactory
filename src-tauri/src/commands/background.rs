@@ -34,7 +34,11 @@ pub async fn list_session_background_activity(
         .map_err(AppError::Other)?;
     wakeups.retain(|wakeup| wakeup.is_pending());
     let commands = crate::util::command_activity::command_activity(&session_id);
-    Ok(SessionBackgroundActivity { tasks, wakeups, commands })
+    Ok(SessionBackgroundActivity {
+        tasks,
+        wakeups,
+        commands,
+    })
 }
 
 #[tauri::command]

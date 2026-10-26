@@ -26,8 +26,11 @@ pub(crate) async fn running_without_executor(
 ) -> sqlx::Result<Vec<String>> {
     let grace_ms = grace_ms.max(RUNNING_WITHOUT_EXECUTOR_GRACE_MS);
     crate::agent::thin_state::ensure(db).await?;
-    let has_controls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_run_controls'")
-        .fetch_one(db).await?;
+    let has_controls: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chat_run_controls'",
+    )
+    .fetch_one(db)
+    .await?;
     if has_controls == 1 {
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT session.id FROM sessions session
@@ -54,7 +57,10 @@ pub(crate) async fn running_without_executor(
             .bind(now_ms.saturating_sub(grace_ms))
             .bind(now_ms.saturating_sub(grace_ms))
             .bind(now_ms.saturating_sub(grace_ms)).fetch_all(db).await?;
-        return Ok(rows.into_iter().filter(|session| !has_live_executor(session)).collect());
+        return Ok(rows
+            .into_iter()
+            .filter(|session| !has_live_executor(session))
+            .collect());
     }
     crate::agent::thin_state::ensure(db).await?;
     let rows: Vec<String> = sqlx::query_scalar(
@@ -202,11 +208,9 @@ pub(crate) async fn resume_running_without_executor(
         .cloned()
         .collect();
     let candidates = match origin
-        .candidates(
-            pool,
-            chrono::Utc::now().timestamp_millis(),
-            |session| live.contains(session) || crate::session_executor_alive(session) != Some(false),
-        )
+        .candidates(pool, chrono::Utc::now().timestamp_millis(), |session| {
+            live.contains(session) || crate::session_executor_alive(session) != Some(false)
+        })
         .await
     {
         Ok(candidates) => candidates,
@@ -302,40 +306,66 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_never_reopens_ended_even_with_stale_unfinished_controls() {
-        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let db = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('ended-recovery','synthetic','/synthetic','model',1,1,'thin')")
             .execute(&db).await.unwrap();
-        crate::agent::thin_state::save(&db, "ended-recovery", &crate::agent::thin_state::ThinState::ended("cancelled", "synthetic")).await.unwrap();
+        crate::agent::thin_state::save(
+            &db,
+            "ended-recovery",
+            &crate::agent::thin_state::ThinState::ended("cancelled", "synthetic"),
+        )
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('old-root','ended-recovery','running','running',1,1)")
             .execute(&db).await.unwrap();
         sqlx::query("INSERT INTO chat_run_controls(run_instance_id,session_id,root_turn_id,status,created_process_instance,created_at,updated_at) VALUES ('old-run','ended-recovery','old-root','active','old-process',1,1)")
             .execute(&db).await.unwrap();
         for grace in [0, RUNNING_WITHOUT_EXECUTOR_GRACE_MS] {
-            assert!(running_without_executor(&db, 10_000_000, grace, |_| false).await.unwrap().is_empty());
+            assert!(running_without_executor(&db, 10_000_000, grace, |_| false)
+                .await
+                .unwrap()
+                .is_empty());
         }
     }
 
     #[tokio::test]
     async fn recovery_uses_latest_user_activity_not_an_old_control() {
-        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let db = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('recent-user','synthetic','/synthetic','model',1,1,'thin')")
             .execute(&db).await.unwrap();
         let mut state = crate::agent::thin_state::ThinState::running();
         state.updated_at = 1;
-        crate::agent::thin_state::save(&db, "recent-user", &state).await.unwrap();
+        crate::agent::thin_state::save(&db, "recent-user", &state)
+            .await
+            .unwrap();
         sqlx::raw_sql("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('recent-root','recent-user','running','running',1,1);
             INSERT INTO chat_run_controls(run_instance_id,session_id,root_turn_id,status,created_process_instance,created_at,updated_at) VALUES ('recent-run','recent-user','recent-root','active','old-process',1,1);
             INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('recent-message','recent-user','user','synthetic new task',9999000);")
             .execute(&db).await.unwrap();
-        assert!(running_without_executor(&db, 10_000_000, 0, |_| false).await.unwrap().is_empty());
-        assert_eq!(running_without_executor(&db, 10_600_001, 0, |_| false).await.unwrap(), vec!["recent-user"]);
+        assert!(running_without_executor(&db, 10_000_000, 0, |_| false)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            running_without_executor(&db, 10_600_001, 0, |_| false)
+                .await
+                .unwrap(),
+            vec!["recent-user"]
+        );
     }
 
     #[tokio::test]
     async fn recovery_protects_fresh_session_even_when_startup_passes_zero_grace() {
         let db = fixture().await;
         session(&db, "fresh", "running", 9_999_000).await;
-        assert!(running_without_executor(&db, 10_000_000, 0, |_| false).await.unwrap().is_empty());
+        assert!(running_without_executor(&db, 10_000_000, 0, |_| false)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -488,16 +518,20 @@ mod tests {
             .unwrap();
         assert_eq!(selected, vec!["interrupted".to_string()]);
         // 同一个会话在心跳口径下仍然守宽限，不会被重复接管。
-        assert!(running_without_executor(&db, now, RUNNING_WITHOUT_EXECUTOR_GRACE_MS, |_| false)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            running_without_executor(&db, now, RUNNING_WITHOUT_EXECUTOR_GRACE_MS, |_| false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// R2：有活执行者、用户已要求停止、已经结束的会话都不在启动扫描里。
     #[tokio::test]
     async fn restart_skips_live_executors_stops_and_finished_sessions() {
-        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let db = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::raw_sql(
             "INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES
                ('live','s','/s','m',1,1,'thin'),
@@ -533,7 +567,9 @@ mod tests {
     /// 而不是一直挂在 `pending` 上让界面显示“正在执行”。
     #[tokio::test]
     async fn restart_marks_pending_tool_calls_as_interrupted() {
-        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let db = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::raw_sql(
             "INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode)
                VALUES ('s','s','/s','m',1,1,'thin');
@@ -567,14 +603,20 @@ mod tests {
     /// R1：终态目标不关闭 thin 的活跃回合（启动收敛形态 2 必须跳过 thin）。
     #[tokio::test]
     async fn reconcile_never_closes_a_thin_turn_because_its_objective_is_terminal() {
-        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let db = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('session-thin-live','t','/t','m',1,1,'thin')")
             .execute(&db)
             .await
             .unwrap();
-        crate::agent::thin_state::save(&db, "session-thin-live", &crate::agent::thin_state::ThinState::running())
-            .await
-            .unwrap();
+        crate::agent::thin_state::save(
+            &db,
+            "session-thin-live",
+            &crate::agent::thin_state::ThinState::running(),
+        )
+        .await
+        .unwrap();
         let store = crate::agent::objective::ObjectiveStore::new(db.clone());
         let objective = store
             .create(crate::agent::objective::CreateObjective {

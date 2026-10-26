@@ -35,8 +35,14 @@ impl RouteCandidate {
     /// 过滤掉的端点反而看不见。现在它是一步**记录在案**的预过滤。
     pub fn has_usable_credential(&self) -> bool {
         matches!(self.api_style, ApiStyle::Chatgpt)
-            || self.legacy_inline_api_key.as_ref().is_some_and(|key| !key.trim().is_empty())
-            || self.credential_ref.as_deref().is_some_and(|reference| !reference.trim().is_empty())
+            || self
+                .legacy_inline_api_key
+                .as_ref()
+                .is_some_and(|key| !key.trim().is_empty())
+            || self
+                .credential_ref
+                .as_deref()
+                .is_some_and(|reference| !reference.trim().is_empty())
     }
 }
 
@@ -130,11 +136,10 @@ impl RouteCandidatePlan {
     }
 
     pub fn push_fallback(&mut self, candidate: RouteCandidate) {
-        if self
-            .candidates
-            .iter()
-            .all(|existing| existing.endpoint_name != candidate.endpoint_name || existing.model_id != candidate.model_id)
-        {
+        if self.candidates.iter().all(|existing| {
+            existing.endpoint_name != candidate.endpoint_name
+                || existing.model_id != candidate.model_id
+        }) {
             self.candidates.push(candidate);
         }
     }
@@ -445,7 +450,12 @@ impl ModelUnavailable {
     const MARKER: &'static str = "MODEL_UNAVAILABLE:";
 
     pub fn from_decision(decision: super::usage_windows::AvailabilityDecision) -> Self {
-        let reasons = decision.causes.iter().map(|cause| cause.sentence()).collect::<Vec<_>>().join("；");
+        let reasons = decision
+            .causes
+            .iter()
+            .map(|cause| cause.sentence())
+            .collect::<Vec<_>>()
+            .join("；");
         Self {
             resume_at_ms: decision.earliest_ms.map(|at| at.saturating_add(250)),
             notice: if decision.waitable {
@@ -457,22 +467,38 @@ impl ModelUnavailable {
     }
 
     pub fn encode(&self) -> String {
-        format!("{}{}", Self::MARKER, serde_json::to_string(self).expect("availability serializes"))
+        format!(
+            "{}{}",
+            Self::MARKER,
+            serde_json::to_string(self).expect("availability serializes")
+        )
     }
 
     pub fn parse(text: &str) -> Option<Self> {
         let (_, payload) = text.split_once(Self::MARKER)?;
-        serde_json::Deserializer::from_str(payload).into_iter::<Self>().next()?.ok()
+        serde_json::Deserializer::from_str(payload)
+            .into_iter::<Self>()
+            .next()?
+            .ok()
     }
 
-    pub fn decision(&self, current: &super::objective::ObjectiveSnapshot, root: &str) -> anyhow::Result<super::objective::DecisionEnvelope> {
-        use super::objective::{DecisionRouter, RouteSignal, RecoveryDomain, DecisionType, ObjectiveStatus};
-        let mut decision = DecisionRouter::route(current, RouteSignal::CapabilityRestored {
-            domain: RecoveryDomain::Chat,
-            reason: "no_model_available".into(),
-            next_observation_at: self.resume_at_ms.unwrap_or_default(),
-            resume_cursor: Some(root.into()),
-        })?;
+    pub fn decision(
+        &self,
+        current: &super::objective::ObjectiveSnapshot,
+        root: &str,
+    ) -> anyhow::Result<super::objective::DecisionEnvelope> {
+        use super::objective::{
+            DecisionRouter, DecisionType, ObjectiveStatus, RecoveryDomain, RouteSignal,
+        };
+        let mut decision = DecisionRouter::route(
+            current,
+            RouteSignal::CapabilityRestored {
+                domain: RecoveryDomain::Chat,
+                reason: "no_model_available".into(),
+                next_observation_at: self.resume_at_ms.unwrap_or_default(),
+                resume_cursor: Some(root.into()),
+            },
+        )?;
         decision.failure_signature = None;
         if self.resume_at_ms.is_none() {
             decision.status = ObjectiveStatus::Failed;
@@ -577,40 +603,84 @@ impl ActiveRouteState {
         }
     }
 
-    pub fn attach_usage_settings(&self, settings: Arc<tokio::sync::RwLock<crate::config::settings::Settings>>) {
-        self.inner.lock().expect("active route mutex poisoned").usage_settings = Some(settings);
+    pub fn attach_usage_settings(
+        &self,
+        settings: Arc<tokio::sync::RwLock<crate::config::settings::Settings>>,
+    ) {
+        self.inner
+            .lock()
+            .expect("active route mutex poisoned")
+            .usage_settings = Some(settings);
     }
 
     /// Called before every POST, including retries; waits are not failures.
-    pub async fn admit_usage_window(&self, cancel: Option<&AtomicBool>, ignore_windows: bool, events: Option<&dyn crate::agent::events::EventSink>) -> Result<Option<RouteChange>, String> {
-        self.admit_availability(cancel, ignore_windows, events, false).await
+    pub async fn admit_usage_window(
+        &self,
+        cancel: Option<&AtomicBool>,
+        ignore_windows: bool,
+        events: Option<&dyn crate::agent::events::EventSink>,
+    ) -> Result<Option<RouteChange>, String> {
+        self.admit_availability(cancel, ignore_windows, events, false)
+            .await
     }
 
-    pub(crate) async fn admit_model_availability(&self, cancel: Option<&AtomicBool>, ignore_windows: bool, events: Option<&dyn crate::agent::events::EventSink>) -> Result<Option<RouteChange>, String> {
-        self.admit_availability(cancel, ignore_windows, events, true).await
+    pub(crate) async fn admit_model_availability(
+        &self,
+        cancel: Option<&AtomicBool>,
+        ignore_windows: bool,
+        events: Option<&dyn crate::agent::events::EventSink>,
+    ) -> Result<Option<RouteChange>, String> {
+        self.admit_availability(cancel, ignore_windows, events, true)
+            .await
     }
 
-    async fn admit_availability(&self, cancel: Option<&AtomicBool>, ignore_windows: bool, events: Option<&dyn crate::agent::events::EventSink>, durable_wait: bool) -> Result<Option<RouteChange>, String> {
-        let settings = self.inner.lock().expect("active route mutex poisoned").usage_settings.clone();
-        let Some(settings) = settings else { return Ok(None); };
+    async fn admit_availability(
+        &self,
+        cancel: Option<&AtomicBool>,
+        ignore_windows: bool,
+        events: Option<&dyn crate::agent::events::EventSink>,
+        durable_wait: bool,
+    ) -> Result<Option<RouteChange>, String> {
+        let settings = self
+            .inner
+            .lock()
+            .expect("active route mutex poisoned")
+            .usage_settings
+            .clone();
+        let Some(settings) = settings else {
+            return Ok(None);
+        };
         let mut wait_notified = false;
         loop {
-            if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) { return Err("cancelled".into()); }
+            if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Err("cancelled".into());
+            }
             let now = super::usage_windows::now_ms();
             let config = settings.read().await;
-            if !durable_wait && config.model_usage_windows.is_empty() && config.endpoint_usage_windows.is_empty()
-                && !self.inner.lock().expect("active route mutex poisoned").candidates.iter().any(|route| config.endpoint_is_subscription(&route.endpoint_name)) { return Ok(None); }
+            if !durable_wait
+                && config.model_usage_windows.is_empty()
+                && config.endpoint_usage_windows.is_empty()
+                && !self
+                    .inner
+                    .lock()
+                    .expect("active route mutex poisoned")
+                    .candidates
+                    .iter()
+                    .any(|route| config.endpoint_is_subscription(&route.endpoint_name))
+            {
+                return Ok(None);
+            }
             let delay = {
-            let mut inner = self.inner.lock().expect("active route mutex poisoned");
-            let from = inner.candidates[inner.current_index].clone();
-            let mut next_available = None;
-            let mut skipped = Vec::new();
-            // CF-WINDOW-R4/R5：换模型和等待都要如实说出原因，所以分开记两类。
-            let mut window_blocked: Vec<String> = Vec::new();
-            let mut quota_blocked: Vec<String> = Vec::new();
-            // M86：等待说明要列出**全部**原因（时段、额度、缺凭据）与最早可用时间。
-            let mut causes: Vec<super::usage_windows::WaitCause> = Vec::new();
-            let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
+                let mut inner = self.inner.lock().expect("active route mutex poisoned");
+                let from = inner.candidates[inner.current_index].clone();
+                let mut next_available = None;
+                let mut skipped = Vec::new();
+                // CF-WINDOW-R4/R5：换模型和等待都要如实说出原因，所以分开记两类。
+                let mut window_blocked: Vec<String> = Vec::new();
+                let mut quota_blocked: Vec<String> = Vec::new();
+                // M86：等待说明要列出**全部**原因（时段、额度、缺凭据）与最早可用时间。
+                let mut causes: Vec<super::usage_windows::WaitCause> = Vec::new();
+                let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
                 let label = endpoint_label(&route.endpoint_name);
                 if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name) { return None; }
                 // M164：忽略使用时段不是绕过凭据的授权；缺凭据端点也不贡献唤醒时间。
@@ -636,7 +706,7 @@ impl ActiveRouteState {
                     if let Some(breach) = ledger.evaluate(&route.endpoint_name, cap, budget, now).or_else(|| ledger.evaluate(&route.base_url, cap, budget, now)) {
                         // M152/R2：没有凭据的端点先被排除，绝不能让"留余量"把
                         // 这一轮交给一个只会在传输层变成 AUTH_MISSING 的路由。
-                        if !route.has_usable_credential() && !ignore_windows {
+                        if !route.has_usable_credential() {
                             skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some("route_prefilter:missing_credential".into()) });
                             causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
                             return None;
@@ -652,83 +722,125 @@ impl ActiveRouteState {
                 }
                 // M86：没有凭据的端点在这里就被挡下，并且留下记录——而不是
                 // 被"选中"后在传输层变成 AUTH_MISSING，让失败说明只剩它一条。
-                if !route.has_usable_credential() && !ignore_windows {
+                if !route.has_usable_credential() {
                     skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some("route_prefilter:missing_credential".into()) });
                     causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
                     return None;
                 }
                 Some(index)
             });
-            for skip in skipped {
-                if !inner.usage_skips.iter().any(|old| old == &skip) { inner.usage_skips.push(skip); }
-            }
-            let blocked_causes = |window_blocked: &[String], quota_blocked: &[String], next_available: Option<i64>| {
-                let resume = next_available
-                    .and_then(chrono::DateTime::from_timestamp_millis)
-                    .map(|at| at.with_timezone(&chrono_tz::Asia::Shanghai).format("%m-%d %H:%M").to_string());
-                let mut causes: Vec<String> = Vec::new();
-                if !window_blocked.is_empty() {
-                    causes.push(format!(
-                        "{} 不在允许使用时段{}",
-                        window_blocked.join("、"),
-                        resume.as_deref().map(|clock| format!("，{clock} 起可用")).unwrap_or_default()
-                    ));
+                for skip in skipped {
+                    if !inner.usage_skips.iter().any(|old| old == &skip) {
+                        inner.usage_skips.push(skip);
+                    }
                 }
-                if !quota_blocked.is_empty() {
-                    causes.push(format!("{} 已达订阅用量上限", quota_blocked.join("、")));
+                let blocked_causes =
+                    |window_blocked: &[String],
+                     quota_blocked: &[String],
+                     next_available: Option<i64>| {
+                        let resume = next_available
+                            .and_then(chrono::DateTime::from_timestamp_millis)
+                            .map(|at| {
+                                at.with_timezone(&chrono_tz::Asia::Shanghai)
+                                    .format("%m-%d %H:%M")
+                                    .to_string()
+                            });
+                        let mut causes: Vec<String> = Vec::new();
+                        if !window_blocked.is_empty() {
+                            causes.push(format!(
+                                "{} 不在允许使用时段{}",
+                                window_blocked.join("、"),
+                                resume
+                                    .as_deref()
+                                    .map(|clock| format!("，{clock} 起可用"))
+                                    .unwrap_or_default()
+                            ));
+                        }
+                        if !quota_blocked.is_empty() {
+                            causes.push(format!("{} 已达订阅用量上限", quota_blocked.join("、")));
+                        }
+                        causes
+                    };
+                if let Some(index) = selected {
+                    inner.current_index = index;
+                    let to = inner.candidates[index].clone();
+                    return Ok((from.endpoint_name != to.endpoint_name
+                        || from.model_id != to.model_id)
+                        .then(|| RouteChange {
+                            from_endpoint: from.endpoint_name.clone(),
+                            from_model: from.model_id,
+                            to_endpoint: to.endpoint_name.clone(),
+                            to_model: to.model_id.clone(),
+                            reason: format!(
+                                "已切到 {}{}",
+                                to.model_id,
+                                blocked_causes(&window_blocked, &quota_blocked, next_available)
+                                    .first()
+                                    .map(|cause| format!("：{cause}"))
+                                    .unwrap_or_default()
+                            ),
+                            kind: RouteChangeKind::QuotaCap,
+                        }));
                 }
-                causes
-            };
-            if let Some(index) = selected {
-                inner.current_index = index;
-                let to = inner.candidates[index].clone();
-                return Ok((from.endpoint_name != to.endpoint_name || from.model_id != to.model_id).then(|| RouteChange {
-                    from_endpoint: from.endpoint_name.clone(), from_model: from.model_id,
-                    to_endpoint: to.endpoint_name.clone(), to_model: to.model_id.clone(),
-                    reason: format!(
-                        "已切到 {}{}",
-                        to.model_id,
-                        blocked_causes(&window_blocked, &quota_blocked, next_available)
-                            .first()
-                            .map(|cause| format!("：{cause}"))
-                            .unwrap_or_default()
-                    ),
-                    kind: RouteChangeKind::QuotaCap,
-                }));
-            }
-            // CF-WINDOW-R5 / M86：判定"该等"还是"该报错"。时间会让时段到点、
-            // 让额度重置；缺凭据不会自己好，所以它只作为原因出现，不构成等待。
-            let decision = super::usage_windows::availability_decision(causes);
-            if durable_wait && !decision.causes.is_empty() {
-                let unavailable = ModelUnavailable::from_decision(decision);
-                if let Some(events) = events {
-                    events.emit(crate::openrouter::types::StreamEvent::TransportRetry {
-                        label: "等唤醒".into(), attempt: 0, max_attempts: 0,
-                        delay_ms: unavailable.resume_at_ms.map(|at| at.saturating_sub(now).max(0) as u64).unwrap_or(0),
-                        reason: unavailable.notice.clone(),
-                    });
+                // CF-WINDOW-R5 / M86：判定"该等"还是"该报错"。时间会让时段到点、
+                // 让额度重置；缺凭据不会自己好，所以它只作为原因出现，不构成等待。
+                let decision = super::usage_windows::availability_decision(causes);
+                if durable_wait && !decision.causes.is_empty() {
+                    let unavailable = ModelUnavailable::from_decision(decision);
+                    if let Some(events) = events {
+                        events.emit(crate::openrouter::types::StreamEvent::TransportRetry {
+                            label: "等唤醒".into(),
+                            attempt: 0,
+                            max_attempts: 0,
+                            delay_ms: unavailable
+                                .resume_at_ms
+                                .map(|at| at.saturating_sub(now).max(0) as u64)
+                                .unwrap_or(0),
+                            reason: unavailable.notice.clone(),
+                        });
+                    }
+                    return Err(unavailable.encode());
                 }
-                return Err(unavailable.encode());
-            }
-            if !decision.causes.is_empty() && decision.causes.iter().all(|cause| cause.kind == super::usage_windows::WaitCauseKind::MissingCredential) {
-                // 例如全部候选都没配凭据：等也不会变好，交给原有的传输层错误
-                // 与失败说明，不在这里空转。
-                return Ok(None);
-            }
-            if !wait_notified {
-                if let Some(events) = events {
-                    let mut origins: Vec<&str> = Vec::new();
-                    if !window_blocked.is_empty() { origins.push("outside_usage_window"); }
-                    if !quota_blocked.is_empty() { origins.push("subscription_quota_cap"); }
-                    if decision.causes.iter().any(|cause| cause.kind == super::usage_windows::WaitCauseKind::MissingCredential) { origins.push("missing_credential"); }
-                    // 会话里显示的就是 reason：全部原因 + 最早可用时间 + 这不
-                    // 是技术失败。label 是短标签，界面用 reason 那一行。
-                    let _ = &from;
-                    events.emit(crate::openrouter::types::StreamEvent::TransportRetry { label: "模型使用时段等待".into(), attempt: 0, max_attempts: 0, delay_ms: 1000, reason: format!("{}（来源：{}）", decision.notice, origins.join(" + ")) });
+                if !decision.causes.is_empty()
+                    && decision.causes.iter().all(|cause| {
+                        cause.kind == super::usage_windows::WaitCauseKind::MissingCredential
+                    })
+                {
+                    // 例如全部候选都没配凭据：等也不会变好，交给原有的传输层错误
+                    // 与失败说明，不在这里空转。
+                    return Ok(None);
                 }
-                wait_notified = true;
-            }
-            decision.earliest_ms.map(|next| (next - now).clamp(1, 1000) as u64).unwrap_or(1000)
+                if !wait_notified {
+                    if let Some(events) = events {
+                        let mut origins: Vec<&str> = Vec::new();
+                        if !window_blocked.is_empty() {
+                            origins.push("outside_usage_window");
+                        }
+                        if !quota_blocked.is_empty() {
+                            origins.push("subscription_quota_cap");
+                        }
+                        if decision.causes.iter().any(|cause| {
+                            cause.kind == super::usage_windows::WaitCauseKind::MissingCredential
+                        }) {
+                            origins.push("missing_credential");
+                        }
+                        // 会话里显示的就是 reason：全部原因 + 最早可用时间 + 这不
+                        // 是技术失败。label 是短标签，界面用 reason 那一行。
+                        let _ = &from;
+                        events.emit(crate::openrouter::types::StreamEvent::TransportRetry {
+                            label: "模型使用时段等待".into(),
+                            attempt: 0,
+                            max_attempts: 0,
+                            delay_ms: 1000,
+                            reason: format!("{}（来源：{}）", decision.notice, origins.join(" + ")),
+                        });
+                    }
+                    wait_notified = true;
+                }
+                decision
+                    .earliest_ms
+                    .map(|next| (next - now).clamp(1, 1000) as u64)
+                    .unwrap_or(1000)
             };
             drop(config);
             tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -760,20 +872,36 @@ impl ActiveRouteState {
     /// pinned, so this is `false` there and a pinned model is never swapped out.
     fn candidate_available(&self, inner: &ActiveRouteInner, index: usize) -> bool {
         let route = &inner.candidates[index];
-        if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name)
-            || !route.has_usable_credential() { return false; }
-        let Some(settings) = &inner.usage_settings else { return true; };
+        if inner.failed_indices.contains(&index)
+            || !self.health.is_available(&route.endpoint_name)
+            || !route.has_usable_credential()
+        {
+            return false;
+        }
+        let Some(settings) = &inner.usage_settings else {
+            return true;
+        };
         // Fail closed while settings are being edited; admission rechecks before POST.
-        let Ok(config) = settings.try_read() else { return false; };
+        let Ok(config) = settings.try_read() else {
+            return false;
+        };
         let now = super::usage_windows::now_ms();
         if super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id)
-            .is_some_and(|rule| !rule.evaluate(now).available) { return false; }
+            .is_some_and(|rule| !rule.evaluate(now).available)
+        {
+            return false;
+        }
         if config.endpoint_is_subscription(&route.endpoint_name) {
             let ledger = super::quota_cap::shared_quota_ledger();
             let cap = config.quota_cap_for(&route.endpoint_name);
             let budget = super::quota_cap::SubscriptionBudget::default();
-            if ledger.evaluate(&route.endpoint_name, cap, budget, now)
-                .or_else(|| ledger.evaluate(&route.base_url, cap, budget, now)).is_some() { return false; }
+            if ledger
+                .evaluate(&route.endpoint_name, cap, budget, now)
+                .or_else(|| ledger.evaluate(&route.base_url, cap, budget, now))
+                .is_some()
+            {
+                return false;
+            }
         }
         true
     }
@@ -789,7 +917,8 @@ impl ActiveRouteState {
         let lower = reason.to_ascii_lowercase();
         !super::model_transport::is_quota_exhausted(reason)
             && !lower.contains("circuit_open")
-            && (lower.contains("overloaded") || lower.contains("http 529")
+            && (lower.contains("overloaded")
+                || lower.contains("http 529")
                 || lower.contains("http 503"))
     }
 
@@ -848,7 +977,9 @@ impl ActiveRouteState {
     pub fn record_current_failure(&self, reason: &str) {
         // A recoverable saturation is not an exhausted candidate. The durable
         // provider episode already owns the retry time; keep preflight eligible.
-        if Self::is_overload(reason) { return; }
+        if Self::is_overload(reason) {
+            return;
+        }
         let mut inner = self.inner.lock().expect("active route mutex poisoned");
         let current_index = inner.current_index;
         let current = inner.candidates[current_index].clone();
@@ -870,7 +1001,10 @@ impl ActiveRouteState {
     }
 
     pub fn mark_current_success(&self) {
-        self.inner.lock().expect("active route mutex poisoned").overload_streak = 0;
+        self.inner
+            .lock()
+            .expect("active route mutex poisoned")
+            .overload_streak = 0;
         let current = self.current();
         self.health.mark_success(&current.endpoint_name);
     }
@@ -901,8 +1035,12 @@ impl ActiveRouteState {
     }
 
     pub fn primary_failure_reason(&self) -> Option<String> {
-        self.inner.lock().expect("active route mutex poisoned")
-            .failures.first().map(|(_, _, reason)| reason.clone())
+        self.inner
+            .lock()
+            .expect("active route mutex poisoned")
+            .failures
+            .first()
+            .map(|(_, _, reason)| reason.clone())
     }
 
     pub fn exhausted_error(&self, final_reason: &str) -> String {
@@ -919,29 +1057,181 @@ impl ActiveRouteState {
                 final_reason.to_string(),
             ));
         }
-        let primary = inner.failures.first().map(|(_, _, reason)| concise_reason(reason))
+        let primary = inner
+            .failures
+            .first()
+            .map(|(_, _, reason)| concise_reason(reason))
             .unwrap_or_else(|| concise_reason(final_reason));
-        let attempts = inner.candidates.iter().filter_map(|candidate| {
-            let label = format!("{} / {}", endpoint_label(&candidate.endpoint_name), candidate.model_id);
-            if let Some((_, _, reason)) = inner.failures.iter().find(|(endpoint, model, _)|
-                endpoint == &candidate.endpoint_name && model == &candidate.model_id) {
-                return Some(format!("{label}（{}）", concise_reason(reason)));
-            }
-            inner.usage_skips.iter().find(|skip| skip.endpoint == candidate.endpoint_name
-                && skip.model == candidate.model_id).map(|skip| {
-                let next = skip.failure_code.as_deref()
-                    .and_then(|code| code.strip_prefix("outside_usage_window:"))
-                    .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-                    .and_then(|data| data["next_available_ms"].as_i64())
-                    .and_then(chrono::DateTime::from_timestamp_millis)
-                    .map(|at| at.with_timezone(&chrono_tz::Asia::Shanghai).format("%m-%d %H:%M").to_string());
-                format!("{label}（不在允许使用时段，已跳过{}）",
-                    next.map(|clock| format!("，{clock} 起可用")).unwrap_or_default())
+        let attempts = inner
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                let label = format!(
+                    "{} / {}",
+                    endpoint_label(&candidate.endpoint_name),
+                    candidate.model_id
+                );
+                if let Some((_, _, reason)) = inner.failures.iter().find(|(endpoint, model, _)| {
+                    endpoint == &candidate.endpoint_name && model == &candidate.model_id
+                }) {
+                    return Some(format!("{label}（{}）", concise_reason(reason)));
+                }
+                inner
+                    .usage_skips
+                    .iter()
+                    .find(|skip| {
+                        skip.endpoint == candidate.endpoint_name && skip.model == candidate.model_id
+                    })
+                    .map(|skip| {
+                        let next = skip
+                            .failure_code
+                            .as_deref()
+                            .and_then(|code| code.strip_prefix("outside_usage_window:"))
+                            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                            .and_then(|data| data["next_available_ms"].as_i64())
+                            .and_then(chrono::DateTime::from_timestamp_millis)
+                            .map(|at| {
+                                at.with_timezone(&chrono_tz::Asia::Shanghai)
+                                    .format("%m-%d %H:%M")
+                                    .to_string()
+                            });
+                        format!(
+                            "{label}（不在允许使用时段，已跳过{}）",
+                            next.map(|clock| format!("，{clock} 起可用"))
+                                .unwrap_or_default()
+                        )
+                    })
             })
-        }).collect::<Vec<_>>().join("；");
+            .collect::<Vec<_>>()
+            .join("；");
         format!(
             "首选端点失败：{primary}\n所有可用模型端点均不可用：{attempts}。目标与失败证据已保留；系统将按退避策略重新观测可用路由。"
         )
+    }
+
+    /// M178/R1: why the turn has no route left, in the shape a *user* can act on.
+    ///
+    /// Only availability reasons are collected here — a missing credential, being
+    /// outside a usage window, or sitting on the subscription cap. A provider that
+    /// simply kept failing (503/429/timeout) is not an availability reason and
+    /// keeps the transport wording from [`Self::exhausted_error`].
+    fn availability_causes(&self, final_reason: &str) -> (Vec<String>, Option<i64>) {
+        let inner = self.inner.lock().expect("active route mutex poisoned");
+        let mut causes: Vec<String> = Vec::new();
+        let mut resume_at: Option<i64> = None;
+        let current = inner.candidates[inner.current_index].clone();
+        let mut remember = |at: Option<i64>| {
+            if let Some(at) = at {
+                resume_at = Some(resume_at.map_or(at, |old: i64| old.min(at)));
+            }
+        };
+        let clock = |at: i64| {
+            chrono::DateTime::from_timestamp_millis(at)
+                .map(|at| {
+                    at.with_timezone(&chrono_tz::Asia::Shanghai)
+                        .format("%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "稍后".to_string())
+        };
+        for candidate in inner.candidates.iter() {
+            let label = format!(
+                "{} / {}",
+                endpoint_label(&candidate.endpoint_name),
+                candidate.model_id
+            );
+            // A credential failure is final for this plan: the endpoint cannot
+            // become usable by waiting a few seconds.
+            let credential_failure = inner
+                .failures
+                .iter()
+                .find(|(endpoint, model, _)| {
+                    endpoint == &candidate.endpoint_name && model == &candidate.model_id
+                })
+                .map(|(_, _, reason)| reason.clone())
+                .or_else(|| {
+                    (candidate.endpoint_name == current.endpoint_name
+                        && candidate.model_id == current.model_id)
+                        .then(|| final_reason.to_string())
+                })
+                .filter(|reason| {
+                    reason.contains("AUTH_MISSING") || reason.contains("CREDENTIAL_ACCESS_REQUIRED")
+                });
+            if credential_failure.is_some() {
+                causes.push(format!(
+                    "{label} 还没有保存凭据（在模型设置里保存后立刻恢复）"
+                ));
+                continue;
+            }
+            let Some(skip) = inner.usage_skips.iter().find(|skip| {
+                skip.endpoint == candidate.endpoint_name && skip.model == candidate.model_id
+            }) else {
+                continue;
+            };
+            let code = skip.failure_code.clone().unwrap_or_default();
+            if let Some(data) = code.strip_prefix("outside_usage_window:") {
+                let next = serde_json::from_str::<serde_json::Value>(data)
+                    .ok()
+                    .and_then(|data| data["next_available_ms"].as_i64());
+                remember(next);
+                match next {
+                    Some(at) => {
+                        causes.push(format!("{label} 不在允许使用时段，{} 起可用", clock(at)))
+                    }
+                    None => causes.push(format!("{label} 不在允许使用时段")),
+                }
+            } else if let Some(data) = code.strip_prefix("subscription_quota_cap:") {
+                let resets = serde_json::from_str::<serde_json::Value>(data)
+                    .ok()
+                    .and_then(|data| data["resets_at_ms"].as_i64());
+                remember(resets);
+                match resets {
+                    Some(at) => {
+                        causes.push(format!("{label} 已到你设的用量上限，{} 重置", clock(at)))
+                    }
+                    None => causes.push(format!("{label} 已到你设的用量上限")),
+                }
+            }
+        }
+        (causes, resume_at)
+    }
+
+    /// M178/R2: the error a turn surfaces once the plan is exhausted.
+    ///
+    /// Availability exhaustion becomes a structured [`ModelUnavailable`] — the
+    /// same encoding `M123` already turns into a durable `waiting_wake` — so the
+    /// turn waits for the earliest candidate instead of counting a third
+    /// identical "technical failure" and ending the session.
+    pub fn exhaustion_availability_error(&self, final_reason: &str) -> Option<String> {
+        let (causes, resume_at) = self.availability_causes(final_reason);
+        if causes.is_empty() {
+            return None;
+        }
+        let mut notice = format!("当前没有可用模型：{}。", causes.join("；"));
+        match resume_at.and_then(chrono::DateTime::from_timestamp_millis) {
+            Some(at) => notice.push_str(&format!(
+                "{} 起自动继续，不需要你操作。",
+                at.with_timezone(&chrono_tz::Asia::Shanghai)
+                    .format("%m-%d %H:%M")
+            )),
+            None => notice.push_str("系统会在约 1 分钟后自动再试，不需要你操作。"),
+        }
+        Some(
+            ModelUnavailable {
+                resume_at_ms: resume_at,
+                notice,
+            }
+            .encode(),
+        )
+    }
+
+    /// M178: availability exhaustion waits; a provider that kept failing keeps
+    /// the transport wording.
+    pub fn exhaustion_error(&self, final_reason: &str) -> String {
+        match self.exhaustion_availability_error(final_reason) {
+            Some(encoded) => encoded,
+            None => self.exhausted_error(final_reason),
+        }
     }
 }
 
@@ -980,40 +1270,90 @@ mod tests {
     async fn usage_windows_same_endpoint_models_route_independently_and_audit_skip() {
         let mut plan = RouteCandidatePlan::new(route("synthetic", "pro"));
         plan.push_fallback(route("synthetic", "flash"));
-        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut settings = crate::config::settings::Settings::default();
         let blocked = super::super::usage_windows::UsageWindow {
-            mode: "custom".into(), timezone: Some("UTC".into()), weekdays: vec![], periods: vec![],
-            exclude_holidays: false, invert: false, calendar: Default::default(),
+            mode: "custom".into(),
+            timezone: Some("UTC".into()),
+            weekdays: vec![],
+            periods: vec![],
+            exclude_holidays: false,
+            invert: false,
+            calendar: Default::default(),
         };
-        settings.model_usage_windows.insert(super::super::usage_windows::model_key("synthetic", "pro"), blocked);
+        settings.model_usage_windows.insert(
+            super::super::usage_windows::model_key("synthetic", "pro"),
+            blocked,
+        );
         let live = Arc::new(tokio::sync::RwLock::new(settings));
         state.attach_usage_settings(live.clone());
-        let change = state.admit_usage_window(None, false, None).await.unwrap().unwrap();
+        let change = state
+            .admit_usage_window(None, false, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(change.to_model, "flash");
         assert_eq!(state.current().model_id, "flash");
-        assert!(state.attempt_snapshots(true).iter().any(|attempt| attempt.status == "skipped" && attempt.model == "pro" && attempt.failure_code.as_deref().unwrap().starts_with("outside_usage_window:")));
-        live.write().await.model_usage_windows.get_mut(&super::super::usage_windows::model_key("synthetic", "pro")).unwrap().mode = "anytime".into();
+        assert!(state
+            .attempt_snapshots(true)
+            .iter()
+            .any(|attempt| attempt.status == "skipped"
+                && attempt.model == "pro"
+                && attempt
+                    .failure_code
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("outside_usage_window:")));
+        live.write()
+            .await
+            .model_usage_windows
+            .get_mut(&super::super::usage_windows::model_key("synthetic", "pro"))
+            .unwrap()
+            .mode = "anytime".into();
         state.admit_usage_window(None, false, None).await.unwrap();
-        assert_eq!(state.current().model_id, "pro", "restored preference on next request");
+        assert_eq!(
+            state.current().model_id,
+            "pro",
+            "restored preference on next request"
+        );
     }
 
     #[tokio::test]
     async fn usage_windows_wait_observes_live_config_without_health_failure() {
-        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route("synthetic", "pro")), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            RouteCandidatePlan::new(route("synthetic", "pro")),
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut settings = crate::config::settings::Settings::default();
         let key = super::super::usage_windows::model_key("synthetic", "pro");
-        let mut blocked = super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap();
-        blocked.mode = "custom".into(); blocked.weekdays.clear(); blocked.invert = false;
+        let mut blocked = super::super::usage_windows::presets()
+            .remove("deepseek_off_peak")
+            .unwrap();
+        blocked.mode = "custom".into();
+        blocked.weekdays.clear();
+        blocked.invert = false;
         settings.model_usage_windows.insert(key.clone(), blocked);
         let live = Arc::new(tokio::sync::RwLock::new(settings));
         state.attach_usage_settings(live.clone());
         let cloned = state.clone();
-        let waiter = tokio::spawn(async move { cloned.admit_usage_window(None, false, None).await });
+        let waiter =
+            tokio::spawn(async move { cloned.admit_usage_window(None, false, None).await });
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!waiter.is_finished(), "blocked request must wait");
-        live.write().await.model_usage_windows.get_mut(&key).unwrap().mode = "anytime".into();
-        assert!(tokio::time::timeout(Duration::from_secs(3), waiter).await.unwrap().unwrap().is_ok());
+        live.write()
+            .await
+            .model_usage_windows
+            .get_mut(&key)
+            .unwrap()
+            .mode = "anytime".into();
+        assert!(tokio::time::timeout(Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
         assert!(state.health.is_available("synthetic"));
         assert!(state.inner.lock().unwrap().failed_indices.is_empty());
     }
@@ -1032,28 +1372,63 @@ mod tests {
         };
         let mut plan = RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro"));
         plan.push_fallback(route("deepseek", "deepseek-flash"));
-        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut settings = crate::config::settings::Settings::default();
         let pro = crate::agent::usage_windows::model_key("deepseek", "deepseek-v4-pro");
-        settings.model_usage_windows.insert(pro.clone(), crate::agent::usage_windows::presets().remove("deepseek_off_peak").unwrap());
+        settings.model_usage_windows.insert(
+            pro.clone(),
+            crate::agent::usage_windows::presets()
+                .remove("deepseek_off_peak")
+                .unwrap(),
+        );
         // 同一端点、同一供应商下的另一个模型任何时候都可用。
         settings.model_usage_windows.insert(
             crate::agent::usage_windows::model_key("deepseek", "deepseek-flash"),
-            crate::agent::usage_windows::UsageWindow { mode: "anytime".into(), timezone: None, weekdays: vec![], periods: vec![], exclude_holidays: false, invert: false, calendar: Default::default() },
+            crate::agent::usage_windows::UsageWindow {
+                mode: "anytime".into(),
+                timezone: None,
+                weekdays: vec![],
+                periods: vec![],
+                exclude_holidays: false,
+                invert: false,
+                calendar: Default::default(),
+            },
         );
         let live = Arc::new(tokio::sync::RwLock::new(settings));
         state.attach_usage_settings(live.clone());
 
         crate::agent::usage_windows::set_clock_override_ms(Some(clock("08:59")));
-        assert!(state.admit_usage_window(None, false, None).await.unwrap().is_none(), "官方闲时不该换模型");
+        assert!(
+            state
+                .admit_usage_window(None, false, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "官方闲时不该换模型"
+        );
         assert_eq!(state.current().model_id, "deepseek-v4-pro");
 
         crate::agent::usage_windows::set_clock_override_ms(Some(clock("09:00")));
-        let change = state.admit_usage_window(None, false, None).await.unwrap().expect("跨过边界后必须换模型");
+        let change = state
+            .admit_usage_window(None, false, None)
+            .await
+            .unwrap()
+            .expect("跨过边界后必须换模型");
         assert_eq!(change.from_model, "deepseek-v4-pro");
         assert_eq!(change.to_model, "deepseek-flash");
-        assert_eq!(state.current().endpoint_name, "deepseek", "只换模型，不换会话/端点");
-        assert!(change.reason.contains("deepseek-v4-pro") && change.reason.contains("deepseek-flash"), "{}", change.reason);
+        assert_eq!(
+            state.current().endpoint_name,
+            "deepseek",
+            "只换模型，不换会话/端点"
+        );
+        assert!(
+            change.reason.contains("deepseek-v4-pro") && change.reason.contains("deepseek-flash"),
+            "{}",
+            change.reason
+        );
 
         let journal = state.attempt_snapshots(false);
         let skip = journal
@@ -1062,7 +1437,10 @@ mod tests {
             .expect("被时段挡下的模型必须有记录");
         let code = skip.failure_code.clone().unwrap_or_default();
         assert!(code.starts_with("outside_usage_window:"), "{code}");
-        assert!(code.contains("next_available_ms") && code.contains("\"mode\":\"official_off_peak\""), "记录要带上所用规则与下一个可用时间：{code}");
+        assert!(
+            code.contains("next_available_ms") && code.contains("\"mode\":\"official_off_peak\""),
+            "记录要带上所用规则与下一个可用时间：{code}"
+        );
         crate::agent::usage_windows::set_clock_override_ms(None);
     }
 
@@ -1076,11 +1454,16 @@ mod tests {
                 .unwrap()
                 .timestamp_millis()
         };
-        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro")), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro")),
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut settings = crate::config::settings::Settings::default();
         settings.model_usage_windows.insert(
             crate::agent::usage_windows::model_key("deepseek", "deepseek-v4-pro"),
-            crate::agent::usage_windows::presets().remove("deepseek_off_peak").unwrap(),
+            crate::agent::usage_windows::presets()
+                .remove("deepseek_off_peak")
+                .unwrap(),
         );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
 
@@ -1103,9 +1486,18 @@ mod tests {
         // 等待不是技术失败：健康状态不变、失败索引为空、记录里没有 failed。
         assert!(state.health.is_available("deepseek"));
         assert!(state.inner.lock().unwrap().failed_indices.is_empty());
-        assert!(state.attempt_snapshots(false).iter().all(|attempt| attempt.status != "failed"), "等待不得写入技术失败");
+        assert!(
+            state
+                .attempt_snapshots(false)
+                .iter()
+                .all(|attempt| attempt.status != "failed"),
+            "等待不得写入技术失败"
+        );
         assert_eq!(
-            crate::agent::usage_windows::wait_notice(&endpoint_label("deepseek"), Some(clock("18:00"))),
+            crate::agent::usage_windows::wait_notice(
+                &endpoint_label("deepseek"),
+                Some(clock("18:00"))
+            ),
             "等 DeepSeek 闲时（10-13 18:00 开始）后继续；可在设置里放开时段，或换一个模型"
         );
         crate::agent::usage_windows::set_clock_override_ms(None);
@@ -1118,13 +1510,30 @@ mod tests {
         let _serial = crate::agent::usage_windows::clock_test_lock();
         // 把时钟顶到高峰时刻：如果未配置也会被拦，这条就会红。
         crate::agent::usage_windows::set_clock_override_ms(Some(
-            chrono::DateTime::parse_from_rfc3339("2026-10-13T10:00:00+08:00").unwrap().timestamp_millis(),
+            chrono::DateTime::parse_from_rfc3339("2026-10-13T10:00:00+08:00")
+                .unwrap()
+                .timestamp_millis(),
         ));
-        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro")), EndpointHealthRegistry::new(Duration::from_secs(120)));
-        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(crate::config::settings::Settings::default())));
-        assert!(state.admit_usage_window(None, false, None).await.unwrap().is_none(), "未配置时段不得改变选路");
+        let state = ActiveRouteState::from_plan_with_health(
+            RouteCandidatePlan::new(route("deepseek", "deepseek-v4-pro")),
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(
+            crate::config::settings::Settings::default(),
+        )));
+        assert!(
+            state
+                .admit_usage_window(None, false, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "未配置时段不得改变选路"
+        );
         assert_eq!(state.current().model_id, "deepseek-v4-pro");
-        assert!(state.attempt_snapshots(false).is_empty(), "未配置时段不得写任何记录");
+        assert!(
+            state.attempt_snapshots(false).is_empty(),
+            "未配置时段不得写任何记录"
+        );
         assert!(state.inner.lock().unwrap().failed_indices.is_empty());
         crate::agent::usage_windows::set_clock_override_ms(None);
     }
@@ -1135,24 +1544,56 @@ mod tests {
     /// 最早可用时间。
     #[test]
     fn quota_cap_plus_peak_plus_missing_credential_is_a_wait_not_a_failure() {
-        let at = |stamp: &str| chrono::DateTime::parse_from_rfc3339(stamp).unwrap().timestamp_millis();
+        let at = |stamp: &str| {
+            chrono::DateTime::parse_from_rfc3339(stamp)
+                .unwrap()
+                .timestamp_millis()
+        };
         let reset = at("2026-10-14T14:05:00+08:00");
         let resume = at("2026-10-14T12:00:00+08:00");
         let decision = crate::agent::usage_windows::availability_decision(vec![
-            crate::agent::usage_windows::WaitCause::new("ChatGPT", crate::agent::usage_windows::WaitCauseKind::QuotaCap, Some(reset)),
-            crate::agent::usage_windows::WaitCause::new("DeepSeek", crate::agent::usage_windows::WaitCauseKind::UsageWindow, Some(resume)),
-            crate::agent::usage_windows::WaitCause::new("OpenRouter", crate::agent::usage_windows::WaitCauseKind::MissingCredential, None),
+            crate::agent::usage_windows::WaitCause::new(
+                "ChatGPT",
+                crate::agent::usage_windows::WaitCauseKind::QuotaCap,
+                Some(reset),
+            ),
+            crate::agent::usage_windows::WaitCause::new(
+                "DeepSeek",
+                crate::agent::usage_windows::WaitCauseKind::UsageWindow,
+                Some(resume),
+            ),
+            crate::agent::usage_windows::WaitCause::new(
+                "OpenRouter",
+                crate::agent::usage_windows::WaitCauseKind::MissingCredential,
+                None,
+            ),
         ]);
-        assert!(decision.waitable, "时间会让额度重置、让时段到点，所以这是等待而不是失败");
-        assert_eq!(decision.earliest_ms, Some(resume), "最早可用时间取两个恢复时间里较早的那个");
+        assert!(
+            decision.waitable,
+            "时间会让额度重置、让时段到点，所以这是等待而不是失败"
+        );
+        assert_eq!(
+            decision.earliest_ms,
+            Some(resume),
+            "最早可用时间取两个恢复时间里较早的那个"
+        );
         assert_eq!(decision.causes.len(), 3, "三条原因都要在案");
         for expected in [
-            "ChatGPT", "已达订阅用量上限", "14:05",
-            "DeepSeek", "高峰时段", "12:00",
-            "OpenRouter", "尚未配置凭据",
+            "ChatGPT",
+            "已达订阅用量上限",
+            "14:05",
+            "DeepSeek",
+            "高峰时段",
+            "12:00",
+            "OpenRouter",
+            "尚未配置凭据",
             "不计入技术恢复次数",
         ] {
-            assert!(decision.notice.contains(expected), "等待说明缺少「{expected}」：{}", decision.notice);
+            assert!(
+                decision.notice.contains(expected),
+                "等待说明缺少「{expected}」：{}",
+                decision.notice
+            );
         }
     }
 
@@ -1160,7 +1601,8 @@ mod tests {
     /// 失败说明于是只剩链上真正尝试过的那一条。现在预过滤本身就是记录在案的
     /// 一步，并且三者都不可用时是等待。
     #[tokio::test]
-    async fn a_fleet_blocked_by_window_and_a_credential_less_endpoint_waits_and_records_every_prefilter_step() {
+    async fn a_fleet_blocked_by_window_and_a_credential_less_endpoint_waits_and_records_every_prefilter_step(
+    ) {
         let _serial = crate::agent::usage_windows::clock_test_lock();
         let clock = |at: &str| {
             chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{at}:00+08:00"))
@@ -1177,11 +1619,16 @@ mod tests {
             supports_vision: true,
             api_style: ApiStyle::Openai,
         });
-        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut settings = crate::config::settings::Settings::default();
         settings.model_usage_windows.insert(
             crate::agent::usage_windows::model_key("deepseek", "deepseek-v4-pro"),
-            crate::agent::usage_windows::presets().remove("deepseek_off_peak").unwrap(),
+            crate::agent::usage_windows::presets()
+                .remove("deepseek_off_peak")
+                .unwrap(),
         );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
 
@@ -1191,7 +1638,10 @@ mod tests {
             tokio::spawn(async move { cloned.admit_usage_window(None, false, None).await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!waiter.is_finished(), "时段高峰 + 无凭据同时存在时，任务必须等待而不是失败");
+        assert!(
+            !waiter.is_finished(),
+            "时段高峰 + 无凭据同时存在时，任务必须等待而不是失败"
+        );
 
         crate::agent::usage_windows::set_clock_override_ms(Some(clock("12:00")));
         let resumed = tokio::time::timeout(Duration::from_secs(5), waiter)
@@ -1203,16 +1653,33 @@ mod tests {
 
         // 等待不是技术失败：健康不变、没有失败索引、记录里没有 failed。
         assert!(state.health.is_available("deepseek"));
-        assert!(state.inner.lock().unwrap().failed_indices.is_empty(), "等待不得消耗技术恢复次数");
+        assert!(
+            state.inner.lock().unwrap().failed_indices.is_empty(),
+            "等待不得消耗技术恢复次数"
+        );
         let journal = state.attempt_snapshots(false);
-        assert!(journal.iter().all(|attempt| attempt.status != "failed"), "等待不得写入技术失败");
+        assert!(
+            journal.iter().all(|attempt| attempt.status != "failed"),
+            "等待不得写入技术失败"
+        );
         // M86：两步预过滤都要写进路由记录。
         assert!(
-            journal.iter().any(|attempt| attempt.model == "deepseek-v4-pro" && attempt.failure_code.as_deref().unwrap_or_default().starts_with("outside_usage_window:")),
+            journal
+                .iter()
+                .any(|attempt| attempt.model == "deepseek-v4-pro"
+                    && attempt
+                        .failure_code
+                        .as_deref()
+                        .unwrap_or_default()
+                        .starts_with("outside_usage_window:")),
             "时段跳过必须有记录：{journal:?}"
         );
         assert!(
-            journal.iter().any(|attempt| attempt.model == "synthetic-model" && attempt.failure_code.as_deref() == Some("route_prefilter:missing_credential")),
+            journal
+                .iter()
+                .any(|attempt| attempt.model == "synthetic-model"
+                    && attempt.failure_code.as_deref()
+                        == Some("route_prefilter:missing_credential")),
             "无凭据的候选作为预过滤的一步必须有记录：{journal:?}"
         );
         crate::agent::usage_windows::set_clock_override_ms(None);
@@ -1235,20 +1702,31 @@ mod tests {
         unconfigured.credential_ref = None;
         unconfigured.legacy_inline_api_key = None;
         plan.push_fallback(unconfigured);
-        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut settings = crate::config::settings::Settings::default();
         // 让准入循环真的跑起来（配了时段就不再是纯直通），但这条时段不属于任何候选。
         settings.model_usage_windows.insert(
             crate::agent::usage_windows::model_key("elsewhere", "other-model"),
-            crate::agent::usage_windows::presets().remove("deepseek_off_peak").unwrap(),
+            crate::agent::usage_windows::presets()
+                .remove("deepseek_off_peak")
+                .unwrap(),
         );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
-        let admitted = tokio::time::timeout(Duration::from_millis(500), state.admit_usage_window(None, false, None))
-            .await
-            .expect("没有可等待的原因时不得空转")
-            .unwrap();
+        let admitted = tokio::time::timeout(
+            Duration::from_millis(500),
+            state.admit_usage_window(None, false, None),
+        )
+        .await
+        .expect("没有可等待的原因时不得空转")
+        .unwrap();
         assert!(admitted.is_none(), "缺凭据需要用户动作，不能靠等");
-        assert!(state.inner.lock().unwrap().failed_indices.is_empty(), "预过滤不是技术失败");
+        assert!(
+            state.inner.lock().unwrap().failed_indices.is_empty(),
+            "预过滤不是技术失败"
+        );
     }
 
     #[tokio::test]
@@ -1256,9 +1734,15 @@ mod tests {
         let mut candidate = route("openrouter", "synthetic");
         candidate.credential_ref = None;
         candidate.legacy_inline_api_key = None;
-        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(candidate), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            RouteCandidatePlan::new(candidate),
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(Default::default())));
-        let error = state.admit_model_availability(None, false, None).await.unwrap_err();
+        let error = state
+            .admit_model_availability(None, false, None)
+            .await
+            .unwrap_err();
         let unavailable = ModelUnavailable::parse(&error).unwrap();
         assert_eq!(unavailable.resume_at_ms, None);
         assert!(unavailable.notice.contains("凭据"));
@@ -1267,10 +1751,15 @@ mod tests {
 
     #[tokio::test]
     async fn m123_waits_durably_then_admits_restored_route() {
-        let state = ActiveRouteState::from_plan_with_health(RouteCandidatePlan::new(route("synthetic", "pro")), EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            RouteCandidatePlan::new(route("synthetic", "pro")),
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut settings = crate::config::settings::Settings::default();
         let key = super::super::usage_windows::model_key("synthetic", "pro");
-        let mut blocked = super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap();
+        let mut blocked = super::super::usage_windows::presets()
+            .remove("deepseek_off_peak")
+            .unwrap();
         blocked.mode = "custom".into();
         blocked.weekdays.clear();
         blocked.periods = vec![];
@@ -1278,18 +1767,35 @@ mod tests {
         settings.model_usage_windows.insert(key.clone(), blocked);
         let live = Arc::new(tokio::sync::RwLock::new(settings));
         state.attach_usage_settings(live.clone());
-        let result = tokio::time::timeout(Duration::from_millis(100), state.admit_model_availability(None, false, None)).await.expect("must release runner, not sleep");
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            state.admit_model_availability(None, false, None),
+        )
+        .await
+        .expect("must release runner, not sleep");
         let unavailable = ModelUnavailable::parse(&result.unwrap_err()).unwrap();
         assert!(unavailable.notice.contains("没有可用模型"));
-        live.write().await.model_usage_windows.get_mut(&key).unwrap().mode = "anytime".into();
-        assert!(state.admit_model_availability(None, false, None).await.unwrap().is_none());
+        live.write()
+            .await
+            .model_usage_windows
+            .get_mut(&key)
+            .unwrap()
+            .mode = "anytime".into();
+        assert!(state
+            .admit_model_availability(None, false, None)
+            .await
+            .unwrap()
+            .is_none());
         assert!(state.inner.lock().unwrap().failures.is_empty());
     }
 
     #[test]
     fn m123_earliest_recovery_across_window_quota_and_credentials() {
-        use super::super::usage_windows::{WaitCause, WaitCauseKind, availability_decision};
-        for (window, quota) in [(1800000000000, 1800001140000), (1900000000000, 1800000000000)] {
+        use super::super::usage_windows::{availability_decision, WaitCause, WaitCauseKind};
+        for (window, quota) in [
+            (1800000000000, 1800001140000),
+            (1900000000000, 1800000000000),
+        ] {
             let decision = availability_decision(vec![
                 WaitCause::new("DeepSeek", WaitCauseKind::UsageWindow, Some(window)),
                 WaitCause::new("ChatGPT", WaitCauseKind::QuotaCap, Some(quota)),
@@ -1297,33 +1803,73 @@ mod tests {
             ]);
             let unavailable = ModelUnavailable::from_decision(decision);
             assert_eq!(unavailable.resume_at_ms, Some(window.min(quota) + 250));
-            assert!(unavailable.notice.contains("DeepSeek") && unavailable.notice.contains("ChatGPT") && unavailable.notice.contains("OpenRouter"));
-            assert_eq!(ModelUnavailable::parse(&unavailable.encode()).unwrap().resume_at_ms, unavailable.resume_at_ms);
+            assert!(
+                unavailable.notice.contains("DeepSeek")
+                    && unavailable.notice.contains("ChatGPT")
+                    && unavailable.notice.contains("OpenRouter")
+            );
+            assert_eq!(
+                ModelUnavailable::parse(&unavailable.encode())
+                    .unwrap()
+                    .resume_at_ms,
+                unavailable.resume_at_ms
+            );
         }
     }
 
     #[tokio::test]
     async fn m123_boundary_wake_and_mixed_available_route() {
         let _serial = super::super::usage_windows::clock_test_lock();
-        let clock = |time: &str| chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{time}:00+08:00")).unwrap().timestamp_millis();
+        let clock = |time: &str| {
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{time}:00+08:00"))
+                .unwrap()
+                .timestamp_millis()
+        };
         let mut plan = RouteCandidatePlan::new(route("deepseek", "pro"));
         let mut missing = route("openrouter", "synthetic");
         missing.credential_ref = None;
         missing.legacy_inline_api_key = None;
         plan.push_fallback(missing);
-        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut settings = crate::config::settings::Settings::default();
-        settings.model_usage_windows.insert(super::super::usage_windows::model_key("deepseek", "pro"), super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap());
+        settings.model_usage_windows.insert(
+            super::super::usage_windows::model_key("deepseek", "pro"),
+            super::super::usage_windows::presets()
+                .remove("deepseek_off_peak")
+                .unwrap(),
+        );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
         super::super::usage_windows::set_clock_override_ms(Some(clock("17:59")));
-        let error = state.admit_model_availability(None, false, None).await.unwrap_err();
-        assert_eq!(ModelUnavailable::parse(&error).unwrap().resume_at_ms, Some(clock("18:00") + 250));
+        let error = state
+            .admit_model_availability(None, false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            ModelUnavailable::parse(&error).unwrap().resume_at_ms,
+            Some(clock("18:00") + 250)
+        );
         super::super::usage_windows::set_clock_override_ms(Some(clock("18:00")));
-        assert!(state.admit_model_availability(None, false, None).await.unwrap().is_none());
+        assert!(state
+            .admit_model_availability(None, false, None)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(state.current().endpoint_name, "deepseek");
         super::super::usage_windows::set_clock_override_ms(Some(clock("17:59")));
-        state.inner.lock().unwrap().candidates.push(route("available", "fallback"));
-        let change = state.admit_model_availability(None, false, None).await.unwrap().unwrap();
+        state
+            .inner
+            .lock()
+            .unwrap()
+            .candidates
+            .push(route("available", "fallback"));
+        let change = state
+            .admit_model_availability(None, false, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(change.to_endpoint, "available");
         assert!(state.inner.lock().unwrap().failed_indices.is_empty());
         super::super::usage_windows::set_clock_override_ms(None);
@@ -1430,7 +1976,8 @@ mod tests {
     /// silently; automatic routing may use a second route it was given.
     #[test]
     fn an_outage_switches_routes_only_when_the_policy_offered_another_one() {
-        let outage = "HTTP error: error sending request for url (https://api.deepseek.com/chat/completions)";
+        let outage =
+            "HTTP error: error sending request for url (https://api.deepseek.com/chat/completions)";
 
         // `fixed`: the plan holds exactly the model the user chose.
         let pinned = ActiveRouteState::from_plan_with_health(
@@ -1583,15 +2130,19 @@ mod tests {
         plan.push_fallback(route("deepseek", "deepseek-synthetic"));
         plan.push_fallback(route("openrouter", "router-synthetic"));
         let state = ActiveRouteState::from_plan_with_health(
-            plan, EndpointHealthRegistry::new(Duration::from_secs(120)),
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
         );
         state.advance_after_failure("error sending request: connection refused");
         {
             let mut inner = state.inner.lock().unwrap();
             inner.usage_skips.push(RouteAttemptSnapshot {
-                endpoint: "deepseek".into(), model: "deepseek-synthetic".into(),
+                endpoint: "deepseek".into(),
+                model: "deepseek-synthetic".into(),
                 status: "skipped".into(),
-                failure_code: Some("outside_usage_window:{\"next_available_ms\":1791950400000}".into()),
+                failure_code: Some(
+                    "outside_usage_window:{\"next_available_ms\":1791950400000}".into(),
+                ),
             });
             inner.current_index = 2;
         }
@@ -1601,7 +2152,190 @@ mod tests {
         assert!(message.contains("可用"), "{message}");
         assert!(message.find("ChatGPT").unwrap() < message.find("DeepSeek").unwrap());
         assert!(message.find("DeepSeek").unwrap() < message.find("OpenRouter").unwrap());
-        assert_eq!(classify_provider_failure(&message), ProviderFailureClass::TransportUnreachable);
+        assert_eq!(
+            classify_provider_failure(&message),
+            ProviderFailureClass::TransportUnreachable
+        );
+    }
+
+    /// M178/R2 replay of the 17:42 incident: ChatGPT at its cap, DeepSeek
+    /// outside its window, OpenRouter without credentials. The turn must wait
+    /// for the earliest real availability instead of surfacing AUTH_MISSING as
+    /// the third identical technical failure.
+    #[test]
+    fn m178_midturn_exhaustion_waits_for_the_earliest_window() {
+        let window_at = chrono::DateTime::parse_from_rfc3339("2026-10-13T18:00:00+08:00")
+            .unwrap()
+            .timestamp_millis();
+        let cap_at = window_at + 5 * 3_600_000;
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-6.1"));
+        plan.push_fallback(route("deepseek", "deepseek-v4-pro"));
+        plan.push_fallback(route("openrouter", "openai/gpt-5.5"));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        {
+            let mut inner = state.inner.lock().unwrap();
+            inner.usage_skips.push(RouteAttemptSnapshot {
+                endpoint: "chatgpt".into(),
+                model: "gpt-6.1".into(),
+                status: "skipped".into(),
+                failure_code: Some(format!(
+                    "subscription_quota_cap:{}",
+                    serde_json::json!({"resets_at_ms": cap_at})
+                )),
+            });
+            inner.usage_skips.push(RouteAttemptSnapshot {
+                endpoint: "deepseek".into(),
+                model: "deepseek-v4-pro".into(),
+                status: "skipped".into(),
+                failure_code: Some(format!(
+                    "outside_usage_window:{}",
+                    serde_json::json!({"next_available_ms": window_at})
+                )),
+            });
+            inner.current_index = 2;
+        }
+        let error = state.exhaustion_error("AUTH_MISSING: openrouter 尚未配置凭据");
+        let unavailable = ModelUnavailable::parse(&error)
+            .expect("availability exhaustion must be a durable wait, not a transport failure");
+        assert_eq!(
+            unavailable.resume_at_ms,
+            Some(window_at),
+            "唤醒时间必须是最早可用：{}",
+            unavailable.notice
+        );
+        assert!(
+            unavailable.notice.contains("18:00"),
+            "{}",
+            unavailable.notice
+        );
+        assert!(
+            unavailable.notice.contains("还没有保存凭据"),
+            "{}",
+            unavailable.notice
+        );
+        assert!(
+            unavailable.notice.contains("允许使用时段"),
+            "{}",
+            unavailable.notice
+        );
+        assert!(
+            unavailable.notice.contains("自动继续"),
+            "{}",
+            unavailable.notice
+        );
+        assert!(
+            !unavailable.notice.contains("AUTH_MISSING"),
+            "内部错误码不得进界面：{}",
+            unavailable.notice
+        );
+        assert!(
+            !unavailable.notice.contains("首选端点失败"),
+            "{}",
+            unavailable.notice
+        );
+    }
+
+    #[test]
+    fn m178_missing_credential_alone_still_waits_with_a_bounded_retry() {
+        let mut plan = RouteCandidatePlan::new(route("chatgpt", "gpt-6.1"));
+        plan.push_fallback(route("openrouter", "openai/gpt-5.5"));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
+        state.advance_after_failure("HTTP 429 Too Many Requests");
+        let error = state.exhaustion_error("AUTH_MISSING: openrouter 尚未配置凭据");
+        let unavailable =
+            ModelUnavailable::parse(&error).expect("credential exhaustion is an availability wait");
+        assert_eq!(
+            unavailable.resume_at_ms, None,
+            "没有已知恢复时间时不得编造时间"
+        );
+        assert!(
+            unavailable.notice.contains("还没有保存凭据"),
+            "{}",
+            unavailable.notice
+        );
+        assert!(
+            unavailable.notice.contains("1 分钟"),
+            "{}",
+            unavailable.notice
+        );
+        assert!(
+            !unavailable.notice.contains("AUTH_MISSING"),
+            "{}",
+            unavailable.notice
+        );
+    }
+
+    /// M178/R1: one filter, one place. A failover chain (`push_fallback`) may
+    /// only be built by the canonical resolver in `commands/chat.rs`, which
+    /// drops every endpoint without a usable credential. A new entry point that
+    /// pushes a fallback elsewhere fails this check instead of reaching
+    /// production as the next mid-turn AUTH_MISSING.
+    #[test]
+    fn m178_failover_chains_are_only_built_by_the_canonical_resolver() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("source dir readable") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        assert!(
+            files.len() > 50,
+            "source scan found no crate sources: {}",
+            files.len()
+        );
+        let allowed = ["agent/failover.rs", "commands/chat.rs"];
+        let mut offenders = Vec::new();
+        for file in &files {
+            let rel = file
+                .strip_prefix(&root)
+                .expect("relative source path")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(file).expect("source readable");
+            let test_module = text
+                .lines()
+                .position(|line| line.trim_start().starts_with("#[cfg(test)]"))
+                .unwrap_or(usize::MAX);
+            for (index, line) in text.lines().enumerate() {
+                if index >= test_module {
+                    break;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("push_fallback(")
+                    && code.contains('.')
+                    && !allowed.contains(&rel.as_str())
+                {
+                    offenders.push(format!("{rel}:{}", index + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "故障切换链只能由规范候选解析器构造，其他入口必须先过凭据过滤：{offenders:?}"
+        );
+        let chat =
+            std::fs::read_to_string(root.join("commands/chat.rs")).expect("chat.rs readable");
+        assert!(
+            chat.contains("fn resolve_route_candidates"),
+            "规范候选解析器必须存在"
+        );
+        assert!(
+            chat.contains("has_usable_credential"),
+            "规范候选解析器必须丢弃没有凭据的端点"
+        );
     }
 
     #[test]
@@ -1718,7 +2452,9 @@ mod tests {
             "every endpoint was tried and cooled down"
         );
         assert!(
-            state.advance_after_failure("HTTP 503 Service Unavailable").is_none(),
+            state
+                .advance_after_failure("HTTP 503 Service Unavailable")
+                .is_none(),
             "an exhausted fleet waits for recovery instead of looping"
         );
 
@@ -1749,8 +2485,15 @@ mod tests {
         );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(Default::default())));
         state.record_current_failure("HTTP 529 overloaded");
-        assert!(state.inner.lock().unwrap().failed_indices.is_empty(), "M125: overload waiting is not an exhausted route");
-        assert!(state.admit_model_availability(None, false, None).await.unwrap().is_none());
+        assert!(
+            state.inner.lock().unwrap().failed_indices.is_empty(),
+            "M125: overload waiting is not an exhausted route"
+        );
+        assert!(state
+            .admit_model_availability(None, false, None)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(state.current().endpoint_name, "pinned");
     }
 
@@ -1761,9 +2504,15 @@ mod tests {
         missing.credential_ref = None;
         missing.legacy_inline_api_key = None;
         plan.push_fallback(missing);
-        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(Default::default())));
-        assert!(!state.has_available_fallback(), "M125: credentials are required for a usable fallback");
+        assert!(
+            !state.has_available_fallback(),
+            "M125: credentials are required for a usable fallback"
+        );
     }
 
     /// M152/R1：留余量是软偏好。备选端点没有凭据就不算"可用备选"，被跳过的
@@ -1784,7 +2533,8 @@ mod tests {
             EndpointHealthRegistry::new(Duration::from_secs(120)),
         );
         assert_eq!(
-            state.current().endpoint_name, "chatgpt",
+            state.current().endpoint_name,
+            "chatgpt",
             "M152: 缺凭据的备选不能被当成留余量的落点"
         );
         assert!(state.take_initial_route_change().is_none());
@@ -1844,7 +2594,10 @@ mod tests {
         );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(settings)));
 
-        let error = state.admit_model_availability(None, false, None).await.unwrap_err();
+        let error = state
+            .admit_model_availability(None, false, None)
+            .await
+            .unwrap_err();
         let unavailable = ModelUnavailable::parse(&error).unwrap();
         assert_eq!(unavailable.resume_at_ms, Some(now + 1_800_000 + 250));
         assert!(!unavailable.notice.contains("继续使用"));
@@ -1857,7 +2610,11 @@ mod tests {
     #[tokio::test]
     async fn m164_hard_cap_matrix_and_deepseek_boundary() {
         let _serial = super::super::usage_windows::clock_test_lock();
-        let clock = |time: &str| chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{time}:00+08:00")).unwrap().timestamp_millis();
+        let clock = |time: &str| {
+            chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{time}:00+08:00"))
+                .unwrap()
+                .timestamp_millis()
+        };
         let now = clock("10:00");
         super::super::usage_windows::set_clock_override_ms(Some(now));
         let mut gpt = route("m164-gpt", "gpt");
@@ -1869,21 +2626,51 @@ mod tests {
         missing.credential_ref = None;
         missing.legacy_inline_api_key = None;
         plan.push_fallback(missing);
-        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let state = ActiveRouteState::from_plan_with_health(
+            plan,
+            EndpointHealthRegistry::new(Duration::from_secs(120)),
+        );
         let mut config = crate::config::settings::Settings::default();
-        config.endpoints.insert("m164-gpt".into(), crate::config::settings::Endpoint {
-            base_url: gpt.base_url.clone(), key_ref: None, api_style: ApiStyle::Chatgpt,
-            custom_models: vec![], active_model: None,
-        });
-        config.model_usage_windows.insert(super::super::usage_windows::model_key("deepseek", "pro"), super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap());
+        config.endpoints.insert(
+            "m164-gpt".into(),
+            crate::config::settings::Endpoint {
+                base_url: gpt.base_url.clone(),
+                key_ref: None,
+                api_style: ApiStyle::Chatgpt,
+                custom_models: vec![],
+                active_model: None,
+            },
+        );
+        config.model_usage_windows.insert(
+            super::super::usage_windows::model_key("deepseek", "pro"),
+            super::super::usage_windows::presets()
+                .remove("deepseek_off_peak")
+                .unwrap(),
+        );
         state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(config)));
         let ledger = super::super::quota_cap::shared_quota_ledger();
-        for (five, week, blocked) in [(0.81, 0.1, true), (0.80, 0.1, true), (0.79, 0.1, false), (0.21, 0.83, true), (0.37, 0.23, false)] {
-            ledger.record_server_usage(&gpt.base_url, super::super::quota_cap::EndpointQuota {
-                source: super::super::quota_cap::UsageSource::ServerReported,
-                five_hour: super::super::quota_cap::WindowUsage { used_ratio: five, resets_at_ms: Some(clock("14:00")) },
-                weekly: super::super::quota_cap::WindowUsage { used_ratio: week, resets_at_ms: Some(clock("16:00")) }, observed_at_ms: now,
-            });
+        for (five, week, blocked) in [
+            (0.81, 0.1, true),
+            (0.80, 0.1, true),
+            (0.79, 0.1, false),
+            (0.21, 0.83, true),
+            (0.37, 0.23, false),
+        ] {
+            ledger.record_server_usage(
+                &gpt.base_url,
+                super::super::quota_cap::EndpointQuota {
+                    source: super::super::quota_cap::UsageSource::ServerReported,
+                    five_hour: super::super::quota_cap::WindowUsage {
+                        used_ratio: five,
+                        resets_at_ms: Some(clock("14:00")),
+                    },
+                    weekly: super::super::quota_cap::WindowUsage {
+                        used_ratio: week,
+                        resets_at_ms: Some(clock("16:00")),
+                    },
+                    observed_at_ms: now,
+                },
+            );
             let result = state.admit_model_availability(None, false, None).await;
             if blocked {
                 let unavailable = ModelUnavailable::parse(&result.unwrap_err()).unwrap();
@@ -1894,19 +2681,35 @@ mod tests {
                 assert_eq!(state.current().endpoint_name, "m164-gpt");
             }
         }
-        ledger.record_server_usage(&gpt.base_url, super::super::quota_cap::EndpointQuota {
-            source: super::super::quota_cap::UsageSource::ServerReported,
-            five_hour: super::super::quota_cap::WindowUsage { used_ratio: 0.81, resets_at_ms: Some(clock("14:00")) },
-            weekly: super::super::quota_cap::WindowUsage::empty(), observed_at_ms: now,
-        });
+        ledger.record_server_usage(
+            &gpt.base_url,
+            super::super::quota_cap::EndpointQuota {
+                source: super::super::quota_cap::UsageSource::ServerReported,
+                five_hour: super::super::quota_cap::WindowUsage {
+                    used_ratio: 0.81,
+                    resets_at_ms: Some(clock("14:00")),
+                },
+                weekly: super::super::quota_cap::WindowUsage::empty(),
+                observed_at_ms: now,
+            },
+        );
         // 忽略时段只放行 DeepSeek，绝不能放行已达硬上限的 GPT。
-        state.admit_model_availability(None, true, None).await.unwrap();
+        state
+            .admit_model_availability(None, true, None)
+            .await
+            .unwrap();
         assert_eq!(state.current().endpoint_name, "deepseek");
         super::super::usage_windows::set_clock_override_ms(Some(clock("12:00")));
-        state.admit_model_availability(None, false, None).await.unwrap();
+        state
+            .admit_model_availability(None, false, None)
+            .await
+            .unwrap();
         assert_eq!(state.current().endpoint_name, "deepseek");
         assert!(state.inner.lock().unwrap().failures.is_empty());
-        assert!(state.attempt_snapshots(false).iter().all(|attempt| attempt.status != "failed"));
+        assert!(state
+            .attempt_snapshots(false)
+            .iter()
+            .all(|attempt| attempt.status != "failed"));
         ledger.clear(&gpt.base_url);
         super::super::usage_windows::set_clock_override_ms(None);
     }

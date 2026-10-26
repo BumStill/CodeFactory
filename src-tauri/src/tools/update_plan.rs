@@ -181,7 +181,9 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
     #[cfg(not(test))]
     let Some(app) = ctx.app.clone() else {
-        return Ok(ToolOutput::err("update_plan is unavailable in this runtime"));
+        return Ok(ToolOutput::err(
+            "update_plan is unavailable in this runtime",
+        ));
     };
 
     sanitize(&mut args);

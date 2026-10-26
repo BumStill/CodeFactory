@@ -34,11 +34,21 @@ fn scratch_dir(name: &str) -> PathBuf {
 }
 
 fn main_display() -> MonitorRect {
-    MonitorRect { x: 0, y: 0, width: 1440, height: 900 }
+    MonitorRect {
+        x: 0,
+        y: 0,
+        width: 1440,
+        height: 900,
+    }
 }
 
 fn secondary_display() -> MonitorRect {
-    MonitorRect { x: 1440, y: 0, width: 1920, height: 1080 }
+    MonitorRect {
+        x: 1440,
+        y: 0,
+        width: 1920,
+        height: 1080,
+    }
 }
 
 /// A rectangle is "fully visible" when one connected display contains all of it.
@@ -58,15 +68,26 @@ fn cf_win_r1_a_moved_window_survives_a_save_load_round_trip() {
     let dir = scratch_dir("round-trip");
     let path = window_state_path(&dir);
     // The user dragged the window to the main display (x≈108–153 in the report).
-    let dragged = SavedWindowState { x: 128, y: 96, width: 1180, height: 740 };
+    let dragged = SavedWindowState {
+        x: 128,
+        y: 96,
+        width: 1180,
+        height: 740,
+    };
 
     save_saved_state(&path, dragged).expect("save");
     let reloaded = load_saved_state(&path).expect("saved state is readable");
 
-    assert_eq!(reloaded, dragged, "restart must reopen at the exact saved rect");
+    assert_eq!(
+        reloaded, dragged,
+        "restart must reopen at the exact saved rect"
+    );
     // Atomic write: the temporary file must not survive, and both display
     // metrics (origin + size) must be preserved, not just the size.
-    assert_eq!(window_state_path(&dir).with_extension("json.tmp").exists(), false);
+    assert_eq!(
+        window_state_path(&dir).with_extension("json.tmp").exists(),
+        false
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -74,19 +95,37 @@ fn cf_win_r1_a_moved_window_survives_a_save_load_round_trip() {
 fn cf_win_r1_placement_follows_the_saved_display_not_the_primary_one() {
     let displays = [main_display(), secondary_display()];
     // The user's real case: window parked on the secondary display at x≈1900.
-    let saved = SavedWindowState { x: 1900, y: 120, width: 1100, height: 700 };
+    let saved = SavedWindowState {
+        x: 1900,
+        y: 120,
+        width: 1100,
+        height: 700,
+    };
 
     let placed = resolve_start_state(Some(saved), &displays, Some(main_display()));
 
-    assert_eq!(placed, saved, "a window on a connected display is restored as-is");
+    assert_eq!(
+        placed, saved,
+        "a window on a connected display is restored as-is"
+    );
 }
 
 #[test]
 fn cf_win_r1_the_latest_position_wins_after_a_second_move() {
     let dir = scratch_dir("latest-wins");
     let path = window_state_path(&dir);
-    let first = SavedWindowState { x: 40, y: 40, width: 1000, height: 700 };
-    let second = SavedWindowState { x: 300, y: 220, width: 1024, height: 768 };
+    let first = SavedWindowState {
+        x: 40,
+        y: 40,
+        width: 1000,
+        height: 700,
+    };
+    let second = SavedWindowState {
+        x: 300,
+        y: 220,
+        width: 1024,
+        height: 768,
+    };
 
     save_saved_state(&path, first).expect("save first");
     save_saved_state(&path, second).expect("save second");
@@ -104,8 +143,12 @@ const RESTART_DIR_ENV: &str = "CODEFACTORY_WINDOW_STATE_RESTART_DIR";
 /// resolves it to the same window on the same display.
 #[test]
 fn cf_win_r1_the_window_position_survives_a_real_process_restart() {
-    const DRAGGED: SavedWindowState =
-        SavedWindowState { x: 137, y: 96, width: 1234, height: 740 };
+    const DRAGGED: SavedWindowState = SavedWindowState {
+        x: 137,
+        y: 96,
+        width: 1234,
+        height: 740,
+    };
 
     if let Ok(child_dir) = std::env::var(RESTART_DIR_ENV) {
         // Child process: the user drags the window, then quits.
@@ -136,9 +179,16 @@ fn cf_win_r1_the_window_position_survives_a_real_process_restart() {
     );
 
     let restored = load_saved_state(&path).expect("the reopened app finds the saved geometry");
-    assert_eq!(restored, DRAGGED, "reopening must land on the same rectangle");
     assert_eq!(
-        resolve_start_state(Some(restored), &[main_display(), secondary_display()], Some(main_display())),
+        restored, DRAGGED,
+        "reopening must land on the same rectangle"
+    );
+    assert_eq!(
+        resolve_start_state(
+            Some(restored),
+            &[main_display(), secondary_display()],
+            Some(main_display())
+        ),
         DRAGGED,
         "and on the same display it was left on"
     );
@@ -151,7 +201,12 @@ fn cf_win_r1_the_window_position_survives_a_real_process_restart() {
 fn cf_win_r2_unplugged_display_falls_back_to_a_visible_primary_position() {
     let remaining = [main_display()];
     // Saved while the secondary display existed (x≈1900), then unplugged.
-    let saved = SavedWindowState { x: 1900, y: 120, width: 1100, height: 700 };
+    let saved = SavedWindowState {
+        x: 1900,
+        y: 120,
+        width: 1100,
+        height: 700,
+    };
 
     let placed = resolve_start_state(Some(saved), &remaining, Some(main_display()));
 
@@ -166,11 +221,19 @@ fn cf_win_r2_unplugged_display_falls_back_to_a_visible_primary_position() {
 #[test]
 fn cf_win_r2_off_screen_position_is_replaced_but_keeps_a_sane_size() {
     let displays = [main_display()];
-    let saved = SavedWindowState { x: 5000, y: -400, width: 1024, height: 768 };
+    let saved = SavedWindowState {
+        x: 5000,
+        y: -400,
+        width: 1024,
+        height: 768,
+    };
 
     let placed = resolve_start_state(Some(saved), &displays, Some(main_display()));
 
-    assert!(fully_visible(placed, &displays), "must be fully on screen: {placed:?}");
+    assert!(
+        fully_visible(placed, &displays),
+        "must be fully on screen: {placed:?}"
+    );
     assert!(placed.width <= main_display().width && placed.height <= main_display().height);
 }
 
@@ -178,30 +241,54 @@ fn cf_win_r2_off_screen_position_is_replaced_but_keeps_a_sane_size() {
 fn cf_win_r2_a_window_straddling_two_displays_is_not_restored() {
     let displays = [main_display(), secondary_display()];
     // Starts on the main display but hangs 540px over the secondary one.
-    let straddling = SavedWindowState { x: 900, y: 100, width: 1080, height: 700 };
+    let straddling = SavedWindowState {
+        x: 900,
+        y: 100,
+        width: 1080,
+        height: 700,
+    };
 
     let placed = resolve_start_state(Some(straddling), &displays, Some(main_display()));
 
-    assert!(fully_visible(placed, &displays), "never reopen across displays: {placed:?}");
+    assert!(
+        fully_visible(placed, &displays),
+        "never reopen across displays: {placed:?}"
+    );
     assert_ne!(placed, straddling);
 }
 
 #[test]
 fn cf_win_r2_window_larger_than_the_only_display_is_shrunk_into_view() {
-    let laptop = [MonitorRect { x: 0, y: 0, width: 1280, height: 800 }];
+    let laptop = [MonitorRect {
+        x: 0,
+        y: 0,
+        width: 1280,
+        height: 800,
+    }];
     // Saved on a 4K display that is no longer attached.
-    let saved = SavedWindowState { x: 0, y: 0, width: 3200, height: 1800 };
+    let saved = SavedWindowState {
+        x: 0,
+        y: 0,
+        width: 3200,
+        height: 1800,
+    };
 
     let placed = resolve_start_state(Some(saved), &laptop, Some(laptop[0]));
 
-    assert!(fully_visible(placed, &laptop), "must fit the remaining display: {placed:?}");
+    assert!(
+        fully_visible(placed, &laptop),
+        "must fit the remaining display: {placed:?}"
+    );
 }
 
 #[test]
 fn cf_win_r2_fallback_without_any_monitor_still_returns_a_usable_rect() {
     let displays: [MonitorRect; 0] = [];
     let placed = fallback_state(None, None);
-    assert!(placed.width > 0 && placed.height > 0, "never a zero-sized window");
+    assert!(
+        placed.width > 0 && placed.height > 0,
+        "never a zero-sized window"
+    );
     assert!(!fully_visible(placed, &displays));
 }
 
@@ -229,7 +316,12 @@ fn compatibility_a_corrupt_state_file_is_ignored_instead_of_panicking() {
     assert_eq!(load_saved_state(&path), None);
 
     // A later good save must still work over the corrupt file.
-    let good = SavedWindowState { x: 60, y: 60, width: 1200, height: 800 };
+    let good = SavedWindowState {
+        x: 60,
+        y: 60,
+        width: 1200,
+        height: 800,
+    };
     save_saved_state(&path, good).expect("save over corrupt file");
     assert_eq!(load_saved_state(&path), Some(good));
     let _ = std::fs::remove_dir_all(&dir);

@@ -70,7 +70,9 @@ pub async fn benchmark_consistency_report(
     request: ConsistencyReportRequest,
     state: State<'_, AppState>,
 ) -> Result<crate::benchmark_consistency::ConsistencyReport, AppError> {
-    use crate::benchmark_consistency::{build_report, RunWithTrials, TrialRow, DEFAULT_PASS_THRESHOLD};
+    use crate::benchmark_consistency::{
+        build_report, RunWithTrials, TrialRow, DEFAULT_PASS_THRESHOLD,
+    };
     let pool = state.db.read().await.clone();
 
     // Resolve dataset_version: explicit, else the newest present for a
@@ -125,5 +127,10 @@ pub async fn benchmark_consistency_report(
         });
     }
 
-    Ok(build_report(&request.dataset, &version, &runs, DEFAULT_PASS_THRESHOLD))
+    Ok(build_report(
+        &request.dataset,
+        &version,
+        &runs,
+        DEFAULT_PASS_THRESHOLD,
+    ))
 }

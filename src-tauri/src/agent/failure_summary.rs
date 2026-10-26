@@ -289,7 +289,11 @@ fn render_change_list(work: &PreservedWork) -> Vec<String> {
     let mut lines = Vec::new();
     let listed = work.changes.len().min(MAX_LISTED_FILES);
     for change in work.changes.iter().take(listed) {
-        let suffix = if change.untracked { "（新文件）" } else { "" };
+        let suffix = if change.untracked {
+            "（新文件）"
+        } else {
+            ""
+        };
         lines.push(format!(
             "- {}：新增 {} 行，删除 {} 行{}",
             change.path, change.added, change.removed, suffix
@@ -306,7 +310,11 @@ fn render_change_list(work: &PreservedWork) -> Vec<String> {
 pub fn render_failure_report(report: &FailureReport) -> String {
     let mut out = String::new();
     let goal = report.goal.trim();
-    let goal = if goal.is_empty() { "你交代的这件事" } else { goal };
+    let goal = if goal.is_empty() {
+        "你交代的这件事"
+    } else {
+        goal
+    };
     let _ = writeln!(out, "这件事没做成：{goal}");
     let _ = writeln!(out);
 
@@ -322,11 +330,7 @@ pub fn render_failure_report(report: &FailureReport) -> String {
                     attempt.approach, attempt.attempts, attempt.reason
                 );
             } else {
-                let _ = writeln!(
-                    out,
-                    "- {}，没成：{}。",
-                    attempt.approach, attempt.reason
-                );
+                let _ = writeln!(out, "- {}，没成：{}。", attempt.approach, attempt.reason);
             }
         }
     }
@@ -383,14 +387,8 @@ pub fn render_failure_report(report: &FailureReport) -> String {
     let _ = writeln!(out);
 
     let _ = writeln!(out, "下一步：");
-    let _ = writeln!(
-        out,
-        "- 直接回一句「继续」，我会在这些改动上接着做；"
-    );
-    let _ = writeln!(
-        out,
-        "- 回「换个办法」，我会换一条路重新试；"
-    );
+    let _ = writeln!(out, "- 直接回一句「继续」，我会在这些改动上接着做；");
+    let _ = writeln!(out, "- 回「换个办法」，我会换一条路重新试；");
     let _ = writeln!(out, "- 回「把这些改动交付」，我会把它们提交并开好 PR。");
     out.trim_end().to_string()
 }
@@ -471,7 +469,10 @@ fn render_delivered_unverified_report(
             "；系统未能确认下面这些检查已重跑并通过：",
         )
     } else {
-        format!("{}；系统未能确认下面这些检查已重跑并通过：", work.change_status())
+        format!(
+            "{}；系统未能确认下面这些检查已重跑并通过：",
+            work.change_status()
+        )
     };
     let _ = writeln!(out, "{headline}");
     match detail {
@@ -535,7 +536,10 @@ fn render_delivered_unverified_report(
         "- {}",
         join_reference("在", reference, "里核对上面这些检查，确认通过后合并；")
     );
-    let _ = writeln!(out, "- 直接回一句「继续」，我会重新跑这些检查并把结果写给你。");
+    let _ = writeln!(
+        out,
+        "- 直接回一句「继续」，我会重新跑这些检查并把结果写给你。"
+    );
     out.trim_end().to_string()
 }
 
@@ -586,9 +590,10 @@ pub fn build_failure_report(
 pub fn merge_attempts(attempts: Vec<AttemptSummary>) -> Vec<AttemptSummary> {
     let mut merged: Vec<AttemptSummary> = Vec::new();
     for attempt in attempts {
-        if let Some(existing) = merged.iter_mut().find(|item| {
-            item.approach == attempt.approach && item.reason == attempt.reason
-        }) {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|item| item.approach == attempt.approach && item.reason == attempt.reason)
+        {
             existing.attempts += attempt.attempts.max(1);
         } else {
             merged.push(AttemptSummary {
@@ -741,8 +746,15 @@ mod tests {
 
     #[test]
     fn cf_gate_unobserved_git_state_never_claims_a_commit() {
-        let work = PreservedWork { branch: Some("synthetic-branch".into()), total_changed_files: 1, ..Default::default() };
-        let delivered = DeliveredUnverified { reference: "分支 synthetic-branch".into(), ..Default::default() };
+        let work = PreservedWork {
+            branch: Some("synthetic-branch".into()),
+            total_changed_files: 1,
+            ..Default::default()
+        };
+        let delivered = DeliveredUnverified {
+            reference: "分支 synthetic-branch".into(),
+            ..Default::default()
+        };
         let text = build_delivered_unverified_report("合成任务", &work, &delivered);
         assert!(!text.contains("已经提交"), "{text}");
         assert!(text.contains("无法确认"), "{text}");
@@ -757,16 +769,28 @@ mod tests {
             (1, 0, true, "已开 PR"),
         ] {
             let work = PreservedWork {
-                commits_ahead: Some(commits), unpushed_commits: Some(unpushed),
+                commits_ahead: Some(commits),
+                unpushed_commits: Some(unpushed),
                 total_changed_files: 1,
                 pr_url: pr.then(|| "https://example.test/pull/42".into()),
                 ..Default::default()
             };
             let failure = build_failure_report("合成任务", vec![], work.clone()).unwrap();
             assert!(failure.contains(expected), "{failure}");
-            let delivery = DeliveredUnverified { reference: "PR #42".into(), on_pull_request: pr, ..Default::default() };
+            let delivery = DeliveredUnverified {
+                reference: "PR #42".into(),
+                on_pull_request: pr,
+                ..Default::default()
+            };
             let summary = build_delivered_unverified_report("合成任务", &work, &delivery);
-            assert!(summary.contains(if pr { "改动已交付到 PR #42" } else { expected }), "{summary}");
+            assert!(
+                summary.contains(if pr {
+                    "改动已交付到 PR #42"
+                } else {
+                    expected
+                }),
+                "{summary}"
+            );
             assert_no_internal_vocabulary(&summary).unwrap();
         }
     }
@@ -868,9 +892,8 @@ mod tests {
             crate::agent::objective::MAX_SIGNATURE_RECOVERY_ATTEMPTS,
             "the tool side may still reconcile the receipt, so the fence keeps the ladder"
         );
-        let reason = plain_failure_reason(Some(
-            crate::agent::objective::PROVIDER_EPISODE_UNRECONCILED,
-        ));
+        let reason =
+            plain_failure_reason(Some(crate::agent::objective::PROVIDER_EPISODE_UNRECONCILED));
         assert_ne!(
             reason,
             plain_failure_reason(None),
@@ -956,7 +979,10 @@ mod tests {
         assert!(text.contains("https://example.test/pull/46"), "{text}");
         assert!(text.contains("还有 2 个文件改了还没提交"), "{text}");
         assert!(text.contains("清理工作区就会丢失"), "{text}");
-        assert!(text.contains("它们就在工作区 /tmp/synthetic-workspace"), "{text}");
+        assert!(
+            text.contains("它们就在工作区 /tmp/synthetic-workspace"),
+            "{text}"
+        );
         assert_no_internal_vocabulary(&text).unwrap();
     }
 
@@ -1035,7 +1061,12 @@ mod tests {
         m46_git(&root, &["add", "."]);
         m46_git(
             &root,
-            &["commit", "-q", "-m", "synthetic: keep the export stream open"],
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "synthetic: keep the export stream open",
+            ],
         );
         assert_eq!(
             crate::agent::objective::workspace_git_count(&root, &range, false),

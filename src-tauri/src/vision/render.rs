@@ -24,7 +24,11 @@ pub struct RenderedPage {
 }
 
 fn command_exists(name: &str) -> bool {
-    let probe = if cfg!(target_os = "windows") { "where" } else { "which" };
+    let probe = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
     std::process::Command::new(probe)
         .no_window()
         .arg(name)
@@ -51,7 +55,11 @@ pub fn available_renderers() -> Vec<&'static str> {
 }
 
 /// 渲染 `document` 的第 `page` 页（1 起）到 `out_dir`。
-pub async fn render_page(document: &Path, page: u32, out_dir: &Path) -> Result<RenderedPage, String> {
+pub async fn render_page(
+    document: &Path,
+    page: u32,
+    out_dir: &Path,
+) -> Result<RenderedPage, String> {
     if page == 0 {
         return Err("PAGE_OUT_OF_RANGE: 页码从 1 开始".to_string());
     }
@@ -132,7 +140,11 @@ pub async fn render_page(document: &Path, page: u32, out_dir: &Path) -> Result<R
 }
 
 /// QuickLook 缩略图。只对"第 1 页/整文件预览"成立。
-pub async fn quicklook_thumbnail(source: &Path, out_dir: &Path, size: u32) -> Result<PathBuf, String> {
+pub async fn quicklook_thumbnail(
+    source: &Path,
+    out_dir: &Path,
+    size: u32,
+) -> Result<PathBuf, String> {
     if !cfg!(target_os = "macos") {
         return Err("QUICKLOOK_UNAVAILABLE: 仅 macOS 有 qlmanage".to_string());
     }
@@ -173,7 +185,11 @@ fn newest_png(dir: &Path) -> Option<PathBuf> {
             .metadata()
             .and_then(|meta| meta.modified())
             .unwrap_or(std::time::UNIX_EPOCH);
-        if best.as_ref().map(|(time, _)| modified >= *time).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|(time, _)| modified >= *time)
+            .unwrap_or(true)
+        {
             best = Some((modified, path));
         }
     }
@@ -199,7 +215,11 @@ try {
 } finally { $app.Quit() }
 "#;
 
-    pub async fn export_slide(document: &Path, page: u32, out_dir: &Path) -> Result<PathBuf, String> {
+    pub async fn export_slide(
+        document: &Path,
+        page: u32,
+        out_dir: &Path,
+    ) -> Result<PathBuf, String> {
         let script = out_dir.join("export-slide.ps1");
         std::fs::write(&script, SCRIPT).map_err(|error| format!("PPT_SCRIPT: {error}"))?;
         let output = Command::new("powershell")
@@ -234,7 +254,12 @@ try {
 mod libreoffice {
     use super::*;
 
-    pub async fn render(document: &Path, page: u32, out_dir: &Path, is_pdf: bool) -> Result<PathBuf, String> {
+    pub async fn render(
+        document: &Path,
+        page: u32,
+        out_dir: &Path,
+        is_pdf: bool,
+    ) -> Result<PathBuf, String> {
         let pdf = if is_pdf {
             document.to_path_buf()
         } else {
@@ -373,7 +398,10 @@ mod tests {
         match quicklook_thumbnail(&doc, &dir, 900).await {
             Ok(png) => {
                 let bytes = std::fs::read(&png).unwrap();
-                assert!(crate::vision::ocr::png_dimensions(&bytes).is_some(), "thumbnail is not a PNG");
+                assert!(
+                    crate::vision::ocr::png_dimensions(&bytes).is_some(),
+                    "thumbnail is not a PNG"
+                );
             }
             Err(error) => {
                 // 无窗口会话时不强制失败，但必须打印原因。

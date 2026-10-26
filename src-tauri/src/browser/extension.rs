@@ -138,7 +138,11 @@ impl ExtensionBridge {
             .map_err(|error| AppError::Other(format!("Could not read the bridge port: {error}")))?
             .port();
         *self.port.lock().await = Some(port);
-        self.event("listening", serde_json::json!({"port": port, "preferred_port": PREFERRED_PORT})).await;
+        self.event(
+            "listening",
+            serde_json::json!({"port": port, "preferred_port": PREFERRED_PORT}),
+        )
+        .await;
         let holds_stable_port = port == PREFERRED_PORT;
 
         let bridge = Arc::clone(self);
@@ -173,13 +177,18 @@ impl ExtensionBridge {
 
     async fn event(&self, event: &str, fields: serde_json::Value) {
         let mut entry = fields;
-        entry["at"] = serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64);
+        entry["at"] = serde_json::json!(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64);
         entry["side"] = serde_json::json!("app");
         entry["event"] = serde_json::json!(event);
         tracing::info!(event, "browser bridge lifecycle");
         let mut events = self.events.lock().await;
         events.push(entry);
-        if events.len() > 50 { events.remove(0); }
+        if events.len() > 50 {
+            events.remove(0);
+        }
     }
 
     pub async fn diagnostics(&self) -> serde_json::Value {
@@ -187,7 +196,9 @@ impl ExtensionBridge {
         let mut events = self.events.lock().await.clone();
         events.extend(self.extension_events.lock().await.clone());
         events.sort_by_key(|e| e["at"].as_u64().unwrap_or_default());
-        if events.len() > 50 { events.drain(..events.len() - 50); }
+        if events.len() > 50 {
+            events.drain(..events.len() - 50);
+        }
         serde_json::json!({ "connected": self.connected().await, "port": *self.port.lock().await,
             "fingerprint": format!("{:x}", Sha256::digest(self.token.as_bytes()))[..12], "events": events })
     }
@@ -197,7 +208,8 @@ impl ExtensionBridge {
         if let Some(active) = active {
             self.clear_connection(active.id).await;
         }
-        self.event("reconnect_requested", serde_json::json!({})).await;
+        self.event("reconnect_requested", serde_json::json!({}))
+            .await;
     }
 
     /// Whether an extension is currently connected.
@@ -336,7 +348,11 @@ impl ExtensionBridge {
             }
         });
 
-        let idle_deadline = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(45) };
+        let idle_deadline = if cfg!(test) {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(45)
+        };
         let idle = tokio::time::sleep(idle_deadline);
         tokio::pin!(idle);
         loop {
@@ -363,13 +379,23 @@ impl ExtensionBridge {
                 })).await;
                 break;
             }
-            let Message::Text(text) = message else { continue };
+            let Message::Text(text) = message else {
+                continue;
+            };
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };
             if let Some(events) = value.get("diagnostics").and_then(|v| v.as_array()) {
                 // Never retain arbitrary frames or caller-supplied fields.
-                let allowed = ["worker_wake", "worker_suspend", "pairing", "connecting", "connected", "disconnected", "heartbeat_timeout"];
+                let allowed = [
+                    "worker_wake",
+                    "worker_suspend",
+                    "pairing",
+                    "connecting",
+                    "connected",
+                    "disconnected",
+                    "heartbeat_timeout",
+                ];
                 let sanitized = events.iter().rev().take(50).filter(|e| allowed.contains(&e["event"].as_str().unwrap_or(""))).map(|e| {
                     let mut entry = serde_json::json!({"side": "extension", "at": e["at"].as_u64().unwrap_or_default(), "event": e["event"]});
                     for key in ["port", "code", "retry_ms"] {
@@ -386,7 +412,8 @@ impl ExtensionBridge {
                 continue;
             }
             if value.get("heartbeat").and_then(serde_json::Value::as_bool) == Some(true) {
-                idle.as_mut().reset(tokio::time::Instant::now() + idle_deadline);
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + idle_deadline);
                 let current = self.outbound.lock().await.clone();
                 if let Some(current) = current.filter(|active| active.id == connection_id) {
                     if current
@@ -1149,15 +1176,23 @@ mod tests {
         let mut socket = connect_test_extension(&bridge, &pairing).await;
         let close = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(Ok(Message::Close(frame))) = socket.next().await { break frame; }
+                if let Some(Ok(Message::Close(frame))) = socket.next().await {
+                    break frame;
+                }
             }
-        }).await.expect("silent peer must be evicted");
+        })
+        .await
+        .expect("silent peer must be evicted");
         assert_eq!(close.expect("reasoned close").reason, "heartbeat timeout");
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!bridge.connected().await);
         let diagnostics = bridge.diagnostics().await;
         assert!(!diagnostics.to_string().contains(&pairing.token));
-        assert!(diagnostics["events"].as_array().unwrap().iter().any(|e| e["event"] == "heartbeat_timeout"));
+        assert!(diagnostics["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["event"] == "heartbeat_timeout"));
     }
 
     #[tokio::test]

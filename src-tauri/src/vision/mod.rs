@@ -98,7 +98,12 @@ pub struct VisionAnswer {
 }
 
 impl VisionAnswer {
-    fn model_answer(text: String, route: &RouteCandidate, input_tokens: u64, output_tokens: u64) -> Self {
+    fn model_answer(
+        text: String,
+        route: &RouteCandidate,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Self {
         Self {
             text,
             backend: Backend::VisionModel,
@@ -130,7 +135,11 @@ impl VisionAnswer {
                 ));
             }
         }
-        out.push_str(&format!("图片：{}（{} 字节）\n", image.label, image.bytes.len()));
+        out.push_str(&format!(
+            "图片：{}（{} 字节）\n",
+            image.label,
+            image.bytes.len()
+        ));
         out.push_str(&format!("问题：{question}\n\n"));
         if let Some(note) = self.degraded_note.as_deref() {
             out.push_str(&format!("注意：{note}\n\n"));
@@ -155,10 +164,18 @@ impl VisionAnswer {
 /// 其余端点需要 `key_ref`。
 pub fn vision_routes(settings: &Settings) -> Vec<RouteCandidate> {
     let mut routes: Vec<(u8, RouteCandidate)> = Vec::new();
-    let preferred = settings.vision_assistant.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let preferred = settings
+        .vision_assistant
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
 
     for (name, endpoint) in &settings.endpoints {
-        let mut models: Vec<String> = endpoint.custom_models.iter().map(|m| m.id.clone()).collect();
+        let mut models: Vec<String> = endpoint
+            .custom_models
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
         if let Some(active) = endpoint.active_model.as_ref() {
             if !models.iter().any(|m| m == active) {
                 models.push(active.clone());
@@ -284,7 +301,12 @@ pub async fn ask_vision_route(
         .as_ref()
         .map(|usage| (usage.prompt_tokens as u64, usage.completion_tokens as u64))
         .unwrap_or((0, 0));
-    Ok(VisionAnswer::model_answer(text, &route, input_tokens, output_tokens))
+    Ok(VisionAnswer::model_answer(
+        text,
+        &route,
+        input_tokens,
+        output_tokens,
+    ))
 }
 
 /// 视觉桥缓存表。以（会话, 图片哈希, 问题哈希）为键。
@@ -334,18 +356,23 @@ where
 
     if let Some(pool) = db {
         if ensure_cache_table(pool).await.is_ok() {
-            let row: Option<(String, Option<String>, Option<String>, String, Option<String>)> =
-                sqlx::query_as(
-                    "SELECT backend, endpoint, model, text, degraded_note
+            let row: Option<(
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+                Option<String>,
+            )> = sqlx::query_as(
+                "SELECT backend, endpoint, model, text, degraded_note
                      FROM vision_descriptions
                      WHERE session_id = ? AND image_sha = ? AND question_sha = ?",
-                )
-                .bind(session_id)
-                .bind(&image_sha)
-                .bind(&question_sha)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
+            )
+            .bind(session_id)
+            .bind(&image_sha)
+            .bind(&question_sha)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
             if let Some((backend, endpoint, model, text, degraded_note)) = row {
                 let backend = if backend == Backend::LocalOcr.as_str() {
                     Backend::LocalOcr
@@ -423,7 +450,11 @@ pub fn local_ocr_answer(result: ocr::OcrResult, question: &str) -> VisionAnswer 
 }
 
 /// 两条路径都没有时的最终说明。回合不因此失败。
-pub fn no_backend_answer(image: &ImageInput, question: &str, ocr_error: Option<String>) -> VisionAnswer {
+pub fn no_backend_answer(
+    image: &ImageInput,
+    question: &str,
+    ocr_error: Option<String>,
+) -> VisionAnswer {
     let detail = ocr_error
         .map(|error| format!("\n本地 OCR 失败原因：{error}"))
         .unwrap_or_default();
@@ -522,10 +553,16 @@ mod tests {
         settings.endpoints.clear();
         settings.default_endpoint = "c-endpoint".into();
         settings.vision_assistant = Some("a-endpoint::a-vl".into());
-        settings.endpoints.insert("a-endpoint".into(), endpoint("a-endpoint", "a-vl"));
-        settings.endpoints.insert("c-endpoint".into(), endpoint("c-endpoint", "c-vl"));
+        settings
+            .endpoints
+            .insert("a-endpoint".into(), endpoint("a-endpoint", "a-vl"));
+        settings
+            .endpoints
+            .insert("c-endpoint".into(), endpoint("c-endpoint", "c-vl"));
         // 纯文本模型（deepseek 无 vl）必须被排除：它不能当视觉助手。
-        settings.endpoints.insert("b-endpoint".into(), endpoint("b-endpoint", "deepseek-chat"));
+        settings
+            .endpoints
+            .insert("b-endpoint".into(), endpoint("b-endpoint", "deepseek-chat"));
 
         let routes = vision_routes(&settings);
         let names: Vec<(String, String)> = routes
@@ -570,12 +607,14 @@ mod tests {
             }
         };
 
-        let (first, hit1) = describe_cached(Some(&pool), "s1", &image, "问题", || answer(&mut calls))
-            .await
-            .unwrap();
-        let (second, hit2) = describe_cached(Some(&pool), "s1", &image, "问题", || answer(&mut calls))
-            .await
-            .unwrap();
+        let (first, hit1) =
+            describe_cached(Some(&pool), "s1", &image, "问题", || answer(&mut calls))
+                .await
+                .unwrap();
+        let (second, hit2) =
+            describe_cached(Some(&pool), "s1", &image, "问题", || answer(&mut calls))
+                .await
+                .unwrap();
 
         assert!(!hit1);
         assert!(hit2, "second identical request must hit the cache");

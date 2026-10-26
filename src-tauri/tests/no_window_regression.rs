@@ -33,7 +33,9 @@ fn allow_bare_command(_path: &Path, snippet: &str) -> bool {
     // spawning anything.
     if snippet.contains("production_gh_git_spawns_go_through_dev_command")
         || snippet.contains("\"Command::new(")
-        || snippet.lines().all(|line| line.trim_start().starts_with("//"))
+        || snippet
+            .lines()
+            .all(|line| line.trim_start().starts_with("//"))
     {
         return true;
     }

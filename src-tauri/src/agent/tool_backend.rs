@@ -183,12 +183,10 @@ async fn prepare_file_observation(
     }
     let workspace = match cwd.canonicalize() {
         Ok(workspace) => workspace,
-        Err(error) => {
-            return FileObservationAdmission::Refused(format!(
-                "工作目录 `{}` 无法解析（{error}），`{tool_name}` 未执行。请确认工作目录存在后再调用。",
-                cwd.display()
-            ))
-        }
+        Err(error) => return FileObservationAdmission::Refused(format!(
+            "工作目录 `{}` 无法解析（{error}），`{tool_name}` 未执行。请确认工作目录存在后再调用。",
+            cwd.display()
+        )),
     };
     let resolved = match tool_name {
         "write_file" => crate::tools::workspace_path::resolve_writable(&workspace, requested),
@@ -223,7 +221,10 @@ async fn prepare_file_observation(
             ))
         }
     };
-    let Some(relative) = relative.to_str().map(|relative| relative.replace('\\', "/")) else {
+    let Some(relative) = relative
+        .to_str()
+        .map(|relative| relative.replace('\\', "/"))
+    else {
         return FileObservationAdmission::Refused(format!(
             "`{tool_name}` 的目标 `{requested}` 含非 UTF-8 字符，无法在工作区里定位，未执行。"
         ));
@@ -243,66 +244,65 @@ async fn prepare_file_observation(
     } else {
         absent_file_digest()
     };
-    let expected = match tool_name {
-        "write_file" => match args.get("content").and_then(serde_json::Value::as_str) {
-            Some(content) => content.as_bytes().to_vec(),
-            None => {
-                return FileObservationAdmission::Refused(
+    let expected =
+        match tool_name {
+            "write_file" => match args.get("content").and_then(serde_json::Value::as_str) {
+                Some(content) => content.as_bytes().to_vec(),
+                None => return FileObservationAdmission::Refused(
                     "`write_file` 缺少字符串参数 `content`，未执行。请补上要写入的内容后再调用。"
                         .to_string(),
-                )
-            }
-        },
-        _ => {
-            let original = match String::from_utf8(before) {
-                Ok(original) => original,
-                Err(_) => {
-                    return FileObservationAdmission::Refused(format!(
-                        "`{relative}` 不是 UTF-8 文本，`edit_file` 无法安全改写，未执行。\
+                ),
+            },
+            _ => {
+                let original = match String::from_utf8(before) {
+                    Ok(original) => original,
+                    Err(_) => {
+                        return FileObservationAdmission::Refused(format!(
+                            "`{relative}` 不是 UTF-8 文本，`edit_file` 无法安全改写，未执行。\
 请改用能处理二进制文件的专用工具或脚本，并让改动结果可核对。"
-                    ))
-                }
-            };
-            let Some(old_string) = args.get("old_string").and_then(serde_json::Value::as_str)
-            else {
-                return FileObservationAdmission::Refused(
+                        ))
+                    }
+                };
+                let Some(old_string) = args.get("old_string").and_then(serde_json::Value::as_str)
+                else {
+                    return FileObservationAdmission::Refused(
                     "`edit_file` 缺少字符串参数 `old_string`，未执行。请补上要替换的原文后再调用。"
                         .to_string(),
                 );
-            };
-            let Some(new_string) = args.get("new_string").and_then(serde_json::Value::as_str)
-            else {
-                return FileObservationAdmission::Refused(
+                };
+                let Some(new_string) = args.get("new_string").and_then(serde_json::Value::as_str)
+                else {
+                    return FileObservationAdmission::Refused(
                     "`edit_file` 缺少字符串参数 `new_string`，未执行。请补上替换后的内容后再调用。"
                         .to_string(),
                 );
-            };
-            let replace_all = args
-                .get("replace_all")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if !replace_all {
-                let count = original.matches(old_string).count();
-                if count == 0 {
-                    return FileObservationAdmission::Refused(format!(
-                        "`{relative}` 里没有找到 `old_string`（出现 0 次）。\
+                };
+                let replace_all = args
+                    .get("replace_all")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if !replace_all {
+                    let count = original.matches(old_string).count();
+                    if count == 0 {
+                        return FileObservationAdmission::Refused(format!(
+                            "`{relative}` 里没有找到 `old_string`（出现 0 次）。\
 请先 read_file 核对这段原文，包括缩进和空白，再调用。"
-                    ));
-                }
-                if count > 1 {
-                    return FileObservationAdmission::Refused(format!(
-                        "`old_string` 在 `{relative}` 里出现了 {count} 次。\
+                        ));
+                    }
+                    if count > 1 {
+                        return FileObservationAdmission::Refused(format!(
+                            "`old_string` 在 `{relative}` 里出现了 {count} 次。\
 请加长它使其唯一，或设 `replace_all: true`。"
-                    ));
+                        ));
+                    }
+                }
+                if replace_all {
+                    original.replace(old_string, new_string).into_bytes()
+                } else {
+                    original.replacen(old_string, new_string, 1).into_bytes()
                 }
             }
-            if replace_all {
-                original.replace(old_string, new_string).into_bytes()
-            } else {
-                original.replacen(old_string, new_string, 1).into_bytes()
-            }
-        }
-    };
+        };
     FileObservationAdmission::Plan(FileObservationPlan {
         safe_locator_json: serde_json::json!({
             "workspace_relative_path": relative,
@@ -382,9 +382,19 @@ fn desktop_command_and_kind(tool_name: &str, args: &serde_json::Value) -> (Strin
         "bash" | "browser_session" => typed_kind,
         // This is an explicit read-only capability list. Every new native tool
         // defaults to Mutation until it receives an audited typed classifier.
-        "read_file" | "glob" | "grep" | "kb_search" | "kb_get_chunk" | "read_pptx"
-        | "skill_list" | "skill_search" | "read_xlsx" | "background_task_list"
-        | "background_task_output" | "wakeup_list" | "web_fetch" => ToolKind::ReadOnly,
+        "read_file"
+        | "glob"
+        | "grep"
+        | "kb_search"
+        | "kb_get_chunk"
+        | "read_pptx"
+        | "skill_list"
+        | "skill_search"
+        | "read_xlsx"
+        | "background_task_list"
+        | "background_task_output"
+        | "wakeup_list"
+        | "web_fetch" => ToolKind::ReadOnly,
         _ => ToolKind::Mutation,
     };
     (command, kind)
@@ -663,8 +673,10 @@ fn read_only_verb_flags_are_safe(segment: &str) -> bool {
     };
     if segment.starts_with("find") {
         return !flags().any(|token| {
-            matches!(token, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls")
-                || token.starts_with("-fprint")
+            matches!(
+                token,
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls"
+            ) || token.starts_with("-fprint")
         });
     }
     if segment.starts_with("sed") {
@@ -1216,18 +1228,29 @@ pub(super) struct DesktopToolBackend {
 
 /// M160: inspect only the current managed checkout, never the answer text.
 async fn pending_workspace_delivery(
-    db: &sqlx::SqlitePool, session_id: &str, cwd: &Path, ceiling_enabled: bool,
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    cwd: &Path,
+    ceiling_enabled: bool,
 ) -> Result<bool, ToolError> {
     if !ceiling_enabled || !super::fetch_session_delivery_authorized(db, session_id).await {
         return Ok(false);
     }
     let error = |e: String| ToolError { message: e };
-    let has_table: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='execution_workspaces'")
-        .fetch_one(db).await.map_err(|e| error(e.to_string()))?;
-    if has_table == 0 { return Ok(false); }
+    let has_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='execution_workspaces'",
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| error(e.to_string()))?;
+    if has_table == 0 {
+        return Ok(false);
+    }
     let workspace = sqlx::query("SELECT objective_id, worktree_path, base_sha FROM execution_workspaces WHERE session_id=? AND state IN ('active','delivering','cleanup_pending') AND worktree_path=? ORDER BY updated_at DESC LIMIT 1")
         .bind(session_id).bind(cwd.to_string_lossy().as_ref()).fetch_optional(db).await.map_err(|e| error(e.to_string()))?;
-    let Some(workspace) = workspace else { return Ok(false); };
+    let Some(workspace) = workspace else {
+        return Ok(false);
+    };
     let path: String = workspace.get("worktree_path");
     let base: String = workspace.get("base_sha");
     let objective: String = workspace.get("objective_id");
@@ -1238,37 +1261,67 @@ async fn pending_workspace_delivery(
         let diff = super::delivery::git(path, &["diff", "--name-only", &base, "HEAD", "--"])?;
         let head = super::delivery::git(path, &["rev-parse", "HEAD"])?;
         Ok::<_, String>((!status.trim().is_empty(), !diff.trim().is_empty(), head))
-    }).await.map_err(|e| error(e.to_string()))?.map_err(error)?;
-    if facts.0 { return Ok(true); } // PR cannot include uncommitted changes.
-    if !facts.1 { return Ok(false); }
-    let has_delivery: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'")
-        .fetch_one(db).await.map_err(|e| error(e.to_string()))?;
-    let delivered: i64 = if has_delivery == 0 { 0 } else { sqlx::query_scalar(
+    })
+    .await
+    .map_err(|e| error(e.to_string()))?
+    .map_err(error)?;
+    if facts.0 {
+        return Ok(true);
+    } // PR cannot include uncommitted changes.
+    if !facts.1 {
+        return Ok(false);
+    }
+    let has_delivery: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| error(e.to_string()))?;
+    let delivered: i64 = if has_delivery == 0 {
+        0
+    } else {
+        sqlx::query_scalar(
         "SELECT COUNT(*) FROM delivery_runs WHERE objective_id=? AND workspace_path=?
          AND canonical_head_sha=? AND canonical_pr_number IS NOT NULL AND canonical_pr_url IS NOT NULL
          AND reached_ceiling IN ('pr_open','ci_green','merged','release_triggered','deployment_succeeded','live_verified')
          AND status NOT IN ('cancelled','rejected')")
         .bind(objective).bind(cwd.to_string_lossy().as_ref()).bind(&facts.2)
-        .fetch_one(db).await.map_err(|e| error(e.to_string()))? };
-    if delivered > 0 { return Ok(false); }
+        .fetch_one(db).await.map_err(|e| error(e.to_string()))?
+    };
+    if delivered > 0 {
+        return Ok(false);
+    }
     // Thin delivery intentionally does not create legacy delivery_runs. Its PR
     // reference must be checked against live state/head, not mistaken for no PR.
-    let has_thin: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_delivery_refs'")
-        .fetch_one(db).await.map_err(|e| error(e.to_string()))?;
+    let has_thin: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_delivery_refs'",
+    )
+    .fetch_one(db)
+    .await
+    .map_err(|e| error(e.to_string()))?;
     if has_thin > 0 {
-        let number: Option<i64> = sqlx::query_scalar("SELECT pr_number FROM thin_delivery_refs WHERE session_id=?")
-            .bind(session_id).fetch_optional(db).await.map_err(|e| error(e.to_string()))?;
+        let number: Option<i64> =
+            sqlx::query_scalar("SELECT pr_number FROM thin_delivery_refs WHERE session_id=?")
+                .bind(session_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| error(e.to_string()))?;
         if let Some(number) = number {
             let cwd = cwd.to_path_buf();
             let observed = tokio::task::spawn_blocking(move || {
-                let remote = super::delivery::gh_remote_for(&cwd).ok_or_else(|| "无法读取 PR 所属仓库".to_string())?;
+                let remote = super::delivery::gh_remote_for(&cwd)
+                    .ok_or_else(|| "无法读取 PR 所属仓库".to_string())?;
                 remote.observed_pr_states(&[number])
-            }).await.map_err(|e| error(e.to_string()))?;
+            })
+            .await
+            .map_err(|e| error(e.to_string()))?;
             // A recorded open/merged PR for this session IS the corresponding
             // delivery. An unobservable GitHub must not block a finished task.
             if let Ok(states) = observed {
                 if let Some(pr) = states.get(&number) {
-                    if matches!(pr.state.as_str(), "OPEN" | "MERGED") { return Ok(false); }
+                    if matches!(pr.state.as_str(), "OPEN" | "MERGED") {
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -1312,7 +1365,10 @@ impl DesktopToolBackend {
         is_mcp_tool: bool,
     ) -> Result<MutationAdmission, ToolError> {
         if super::thin::is_thin(&self.db, ctx.session_id.as_deref().unwrap_or("")).await {
-            return Ok(MutationAdmission::Dispatch { receipt_id: None, browser_execution: None });
+            return Ok(MutationAdmission::Dispatch {
+                receipt_id: None,
+                browser_execution: None,
+            });
         }
         self.ensure_observation_schema().await?;
         if call.function.name == "browser_session" && !browser_has_observation_contract(args) {
@@ -2617,18 +2673,25 @@ async fn mark_side_effect_started_in_tx(
 #[async_trait::async_trait]
 impl ToolBackend for DesktopToolBackend {
     async fn pending_delivery(&self, session_id: &str, cwd: &Path) -> Result<bool, ToolError> {
-        let ceiling = super::fetch_session_delivery_ceiling(&self.db, session_id).await
+        let ceiling = super::fetch_session_delivery_ceiling(&self.db, session_id)
+            .await
             .unwrap_or(self.settings.read().await.delivery_ceiling);
         pending_workspace_delivery(&self.db, session_id, cwd, ceiling.rank() > 0).await
     }
-    async fn thin_mode(&self, session_id: &str) -> bool { super::thin::is_thin(&self.db, session_id).await }
+    async fn thin_mode(&self, session_id: &str) -> bool {
+        super::thin::is_thin(&self.db, session_id).await
+    }
     async fn external_wait_completion_hint(&self, session_id: &str) -> Option<String> {
         if super::thin::is_thin(&self.db, session_id).await {
             return super::thin::external_wait_hint(&self.db, session_id).await;
         }
         // Older/headless databases may not have delivery tables yet.
-        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'")
-            .fetch_one(&self.db).await.unwrap_or(0);
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='delivery_runs'",
+        )
+        .fetch_one(&self.db)
+        .await
+        .unwrap_or(0);
         if exists == 0 {
             return None;
         }
@@ -2636,9 +2699,19 @@ impl ToolBackend for DesktopToolBackend {
             "SELECT COUNT(*) FROM delivery_runs WHERE session_id=?
              AND status NOT IN ('completed','failed','cancelled','rejected')
              AND stage IN ('ci','ci_observation','merge','merge_queue','release')",
-        ).bind(session_id).fetch_one(&self.db).await;
+        )
+        .bind(session_id)
+        .fetch_one(&self.db)
+        .await;
         match pending {
-            Ok(count) => super::background_tasks::external_wait_completion_hint(&self.db, session_id, count > 0).await,
+            Ok(count) => {
+                super::background_tasks::external_wait_completion_hint(
+                    &self.db,
+                    session_id,
+                    count > 0,
+                )
+                .await
+            }
             Err(_) => Some("请重新检查交付等待状态，并为仍在进行的等待挂 schedule_wakeup。".into()),
         }
     }
@@ -2713,28 +2786,62 @@ impl ToolBackend for DesktopToolBackend {
         };
 
         let local_backup = if call.function.name == "bash"
-            && args.get("command").and_then(serde_json::Value::as_str).is_some_and(super::trusted_git::sensitive)
+            && args
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(super::trusted_git::sensitive)
         {
             let trusted = match ctx.session_id.as_deref() {
-                Some(session) => sqlx::query_scalar::<_, String>("SELECT permission_mode FROM sessions WHERE id=?")
-                    .bind(session).fetch_optional(&self.db).await.ok().flatten().as_deref() == Some("trusted"),
+                Some(session) => {
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT permission_mode FROM sessions WHERE id=?",
+                    )
+                    .bind(session)
+                    .fetch_optional(&self.db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                        == Some("trusted")
+                }
                 None => false,
             };
             if trusted {
                 let roots = match ctx.session_id.as_deref() {
-                    Some(session) => super::permission_gateway::registered_git_roots(&self.db, session).await,
+                    Some(session) => {
+                        super::permission_gateway::registered_git_roots(&self.db, session).await
+                    }
                     None => None,
                 };
                 match roots {
-                    Some(roots) if super::trusted_git::registered_rewrite(&roots, &ctx.working_directory, args["command"].as_str().unwrap_or_default()) => {
+                    Some(roots)
+                        if super::trusted_git::registered_rewrite(
+                            &roots,
+                            &ctx.working_directory,
+                            args["command"].as_str().unwrap_or_default(),
+                        ) =>
+                    {
                         // Repeat the same identity proof and snapshots at dispatch.
-                        Some(super::trusted_git::backup_registered(&roots, &ctx.working_directory, args["command"].as_str().unwrap_or_default())
-                            .ok_or_else(|| ToolError { message: "Workspace backup failed; local rewrite was not executed".into() })?)
+                        Some(
+                            super::trusted_git::backup_registered(
+                                &roots,
+                                &ctx.working_directory,
+                                args["command"].as_str().unwrap_or_default(),
+                            )
+                            .ok_or_else(|| ToolError {
+                                message: "Workspace backup failed; local rewrite was not executed"
+                                    .into(),
+                            })?,
+                        )
                     }
                     _ => None,
                 }
-            } else { None }
-        } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let exec_ctx = crate::tools::ExecCtx {
             cwd: ctx.working_directory.clone(),
             #[cfg(not(test))]
@@ -2787,17 +2894,27 @@ impl ToolBackend for DesktopToolBackend {
             metadata["backup_ref"] = serde_json::json!(reference);
         }
         if let Some(session) = ctx.session_id.as_deref() {
-            if super::thin::is_thin(&self.db, session).await && call.function.name == "deliver_changes" {
+            if super::thin::is_thin(&self.db, session).await
+                && call.function.name == "deliver_changes"
+            {
                 if let Some(hint) = super::thin::external_wait_hint(&self.db, session).await {
-                    super::thin::record_unwatched_wait(&self.db, session, "交付 PR / CI").await
-                        .map_err(|error| ToolError { message: error.to_string() })?;
+                    super::thin::record_unwatched_wait(&self.db, session, "交付 PR / CI")
+                        .await
+                        .map_err(|error| ToolError {
+                            message: error.to_string(),
+                        })?;
                     let hinted: Option<i64> = sqlx::query_scalar(
                         "UPDATE thin_wait_notes SET hinted=1,root_turn_id=? WHERE session_id=? AND (hinted=0 OR root_turn_id IS NOT ?) RETURNING hinted")
                         .bind(ctx.root_turn_id.as_deref()).bind(session).bind(ctx.root_turn_id.as_deref())
                         .fetch_optional(&self.db).await.map_err(|error| ToolError { message: error.to_string() })?;
-                    if hinted.is_some() { result.content.push_str(&format!("\n{hint}")); }
+                    if hinted.is_some() {
+                        result.content.push_str(&format!("\n{hint}"));
+                    }
                 } else {
-                    let _ = sqlx::query("DELETE FROM thin_wait_notes WHERE session_id=?").bind(session).execute(&self.db).await;
+                    let _ = sqlx::query("DELETE FROM thin_wait_notes WHERE session_id=?")
+                        .bind(session)
+                        .execute(&self.db)
+                        .await;
                 }
             }
         }
@@ -2836,7 +2953,9 @@ impl ToolBackend for DesktopToolBackend {
         args: &serde_json::Value,
         ctx: &ToolCtx,
     ) -> Option<String> {
-        if super::thin::is_thin(&self.db, ctx.session_id.as_deref().unwrap_or("")).await { return None; }
+        if super::thin::is_thin(&self.db, ctx.session_id.as_deref().unwrap_or("")).await {
+            return None;
+        }
         let (command, native_kind) = desktop_command_and_kind(&call.function.name, args);
         let is_mcp_tool = self
             .mcp_tool_names
@@ -2874,26 +2993,30 @@ impl ToolBackend for DesktopToolBackend {
         }
         // Specialized fences carry their own richer verdicts (browser pairing
         // recovery, delivery receipts); leave those to mutation_preflight.
-        if matches!(call.function.name.as_str(), "browser_session" | "deliver_changes") {
+        if matches!(
+            call.function.name.as_str(),
+            "browser_session" | "deliver_changes"
+        ) {
             return None;
         }
         // A generic observer (workspace file, browser, ...) means the contract
         // can be satisfied, so the call is admissible and the gateway decides.
-        let generic_observation = match super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
-            .prepare(
-                &call.function.name,
-                args,
-                &ctx.working_directory,
-                ctx.session_id.as_deref(),
-                ctx.root_turn_id.as_deref(),
-            )
-            .await
-        {
-            Ok(plan) => plan,
-            // A planner error must never masquerade as "no observation
-            // contract": this probe only decides whether to ASK.
-            Err(_) => return None,
-        };
+        let generic_observation =
+            match super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
+                .prepare(
+                    &call.function.name,
+                    args,
+                    &ctx.working_directory,
+                    ctx.session_id.as_deref(),
+                    ctx.root_turn_id.as_deref(),
+                )
+                .await
+            {
+                Ok(plan) => plan,
+                // A planner error must never masquerade as "no observation
+                // contract": this probe only decides whether to ASK.
+                Err(_) => return None,
+            };
         if generic_observation.is_some() {
             return None;
         }
@@ -2934,29 +3057,91 @@ mod tests {
         git(&["config", "user.name", "Synthetic"]);
         git(&["config", "user.email", "synthetic@example.invalid"]);
         std::fs::write(path.join("code.txt"), "base\n").unwrap();
-        git(&["add", "code.txt"]); git(&["commit", "-m", "base"]);
+        git(&["add", "code.txt"]);
+        git(&["commit", "-m", "base"]);
         let base = git(&["rev-parse", "HEAD"]);
-        sqlx::query("INSERT INTO execution_workspaces VALUES('objective','synthetic',?,?,'active',1)")
-            .bind(path.to_string_lossy().as_ref()).bind(&base).execute(db).await.unwrap();
-        assert!(!pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "read-only checkout ends normally");
+        sqlx::query(
+            "INSERT INTO execution_workspaces VALUES('objective','synthetic',?,?,'active',1)",
+        )
+        .bind(path.to_string_lossy().as_ref())
+        .bind(&base)
+        .execute(db)
+        .await
+        .unwrap();
+        assert!(
+            !pending_workspace_delivery(db, "synthetic", path, true)
+                .await
+                .unwrap(),
+            "read-only checkout ends normally"
+        );
         std::fs::write(path.join("code.txt"), "implemented\n").unwrap();
-        assert!(pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "dirty changes need delivery");
-        git(&["add", "code.txt"]); git(&["commit", "-m", "fix: synthetic"]);
-        assert!(pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "committed without PR must continue");
-        assert!(!pending_workspace_delivery(db, "synthetic", path, false).await.unwrap(), "ceiling off must not continue");
-        sqlx::query("UPDATE sessions SET delivery_authorized=0").execute(db).await.unwrap();
-        assert!(!pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "no authorization must not continue");
-        sqlx::query("UPDATE sessions SET delivery_authorized=1").execute(db).await.unwrap();
+        assert!(
+            pending_workspace_delivery(db, "synthetic", path, true)
+                .await
+                .unwrap(),
+            "dirty changes need delivery"
+        );
+        git(&["add", "code.txt"]);
+        git(&["commit", "-m", "fix: synthetic"]);
+        assert!(
+            pending_workspace_delivery(db, "synthetic", path, true)
+                .await
+                .unwrap(),
+            "committed without PR must continue"
+        );
+        assert!(
+            !pending_workspace_delivery(db, "synthetic", path, false)
+                .await
+                .unwrap(),
+            "ceiling off must not continue"
+        );
+        sqlx::query("UPDATE sessions SET delivery_authorized=0")
+            .execute(db)
+            .await
+            .unwrap();
+        assert!(
+            !pending_workspace_delivery(db, "synthetic", path, true)
+                .await
+                .unwrap(),
+            "no authorization must not continue"
+        );
+        sqlx::query("UPDATE sessions SET delivery_authorized=1")
+            .execute(db)
+            .await
+            .unwrap();
         let head = git(&["rev-parse", "HEAD"]);
         sqlx::query("INSERT INTO delivery_runs VALUES('objective',?,?,1,'https://example.invalid/pr/1','pr_open','waiting')")
             .bind(path.to_string_lossy().as_ref()).bind(&head).execute(db).await.unwrap();
-        assert!(!pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "exact PR head is already delivered");
-        sqlx::query("UPDATE delivery_runs SET canonical_head_sha='stale'").execute(db).await.unwrap();
-        assert!(pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "stale PR head must not cover new commit");
+        assert!(
+            !pending_workspace_delivery(db, "synthetic", path, true)
+                .await
+                .unwrap(),
+            "exact PR head is already delivered"
+        );
+        sqlx::query("UPDATE delivery_runs SET canonical_head_sha='stale'")
+            .execute(db)
+            .await
+            .unwrap();
+        assert!(
+            pending_workspace_delivery(db, "synthetic", path, true)
+                .await
+                .unwrap(),
+            "stale PR head must not cover new commit"
+        );
         sqlx::query("UPDATE delivery_runs SET canonical_head_sha=?, reached_ceiling='merged', status='merged'").bind(&head).execute(db).await.unwrap();
-        assert!(!pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "merged exact head is delivered");
+        assert!(
+            !pending_workspace_delivery(db, "synthetic", path, true)
+                .await
+                .unwrap(),
+            "merged exact head is delivered"
+        );
         std::fs::write(path.join("new.txt"), "not in PR").unwrap();
-        assert!(pending_workspace_delivery(db, "synthetic", path, true).await.unwrap(), "PR does not cover untracked changes");
+        assert!(
+            pending_workspace_delivery(db, "synthetic", path, true)
+                .await
+                .unwrap(),
+            "PR does not cover untracked changes"
+        );
     }
 
     async fn backend() -> DesktopToolBackend {
@@ -3143,23 +3328,54 @@ mod tests {
     async fn desktop_completion_guard_reads_real_ci_wait_and_requires_own_timer() {
         let backend = objective_backend(false).await;
         // Synthetic durable forge state; no production database or GitHub writes.
-        sqlx::query("CREATE TABLE IF NOT EXISTS delivery_runs (session_id TEXT, status TEXT, stage TEXT)")
-            .execute(&backend.db).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS delivery_runs (session_id TEXT, status TEXT, stage TEXT)",
+        )
+        .execute(&backend.db)
+        .await
+        .unwrap();
         // The normal fixture does not initialise the delivery coordinator schema.
         sqlx::query("INSERT INTO delivery_runs (session_id,status,stage) VALUES ('watch-session','waiting','ci')")
             .execute(&backend.db).await.unwrap();
-        assert!(backend.external_wait_completion_hint("other-session").await.is_none());
-        assert!(backend.external_wait_completion_hint("watch-session").await.unwrap().contains("schedule_wakeup"));
-        crate::agent::background_tasks::schedule_wakeup(&backend.db, crate::agent::background_tasks::WakeupRequest {
-            session_id: "watch-session".into(), root_turn_id: None, prompt: "Check synthetic CI and repair failures".into(),
-            source: crate::agent::background_tasks::TaskSource::AgentDecided, after_sec: Some(180), every_sec: None,
-        }).await.unwrap();
-        assert!(backend.external_wait_completion_hint("watch-session").await.is_none());
+        assert!(backend
+            .external_wait_completion_hint("other-session")
+            .await
+            .is_none());
+        assert!(backend
+            .external_wait_completion_hint("watch-session")
+            .await
+            .unwrap()
+            .contains("schedule_wakeup"));
+        crate::agent::background_tasks::schedule_wakeup(
+            &backend.db,
+            crate::agent::background_tasks::WakeupRequest {
+                session_id: "watch-session".into(),
+                root_turn_id: None,
+                prompt: "Check synthetic CI and repair failures".into(),
+                source: crate::agent::background_tasks::TaskSource::AgentDecided,
+                after_sec: Some(180),
+                every_sec: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(backend
+            .external_wait_completion_hint("watch-session")
+            .await
+            .is_none());
         crate::agent::background_tasks::reclaim_session(&backend.db, "watch-session").await;
-        assert!(backend.external_wait_completion_hint("watch-session").await.is_some());
+        assert!(backend
+            .external_wait_completion_hint("watch-session")
+            .await
+            .is_some());
         sqlx::query("UPDATE delivery_runs SET status='completed' WHERE session_id='watch-session'")
-            .execute(&backend.db).await.unwrap();
-        assert!(backend.external_wait_completion_hint("watch-session").await.is_none());
+            .execute(&backend.db)
+            .await
+            .unwrap();
+        assert!(backend
+            .external_wait_completion_hint("watch-session")
+            .await
+            .is_none());
     }
 
     fn call_with_args(id: &str, name: &str, args: &serde_json::Value) -> ToolCall {
@@ -3467,13 +3683,35 @@ mod tests {
     #[tokio::test]
     async fn thin_mutation_dispatches_without_any_receipt_even_with_unknown_legacy_effect() {
         let backend = objective_backend(true).await;
-        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'thin'").execute(&backend.db).await.unwrap();
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'thin'")
+            .execute(&backend.db)
+            .await
+            .unwrap();
         let args = serde_json::json!({"command":"synthetic-command"});
         let call = call_with_args("thin-bash", "bash", &args);
         let (command, kind) = backend.classify(&call, &args);
-        let admission = backend.mutation_preflight(&call, &args, &objective_ctx(Path::new(".")), &command, kind, false).await.unwrap();
-        assert!(matches!(admission, MutationAdmission::Dispatch { receipt_id: None, browser_execution: None }));
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts").fetch_one(&backend.db).await.unwrap();
+        let admission = backend
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(Path::new(".")),
+                &command,
+                kind,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            admission,
+            MutationAdmission::Dispatch {
+                receipt_id: None,
+                browser_execution: None
+            }
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts")
+            .fetch_one(&backend.db)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -3538,15 +3776,34 @@ mod tests {
         let args = serde_json::json!({"ceiling":"invalid"});
         let call = call_with_args("m117-invalid", "deliver_changes", &args);
         register_tool_call(&backend, &call, &args).await;
-        let result = backend.execute(&call, &args, &ctx).await.expect("ordinary tool result");
-        assert!(result.is_error && result.content.contains("无效 ceiling"), "{}", result.content);
+        let result = backend
+            .execute(&call, &args, &ctx)
+            .await
+            .expect("ordinary tool result");
+        assert!(
+            result.is_error && result.content.contains("无效 ceiling"),
+            "{}",
+            result.content
+        );
         let read_args = serde_json::json!({"path":"fixture.txt"});
-        tokio::fs::write(dir.path().join("fixture.txt"), "next round works").await.unwrap();
-        let result = backend.execute(&call_with_args("m117-next", "read_file", &read_args), &read_args, &ctx).await.unwrap();
+        tokio::fs::write(dir.path().join("fixture.txt"), "next round works")
+            .await
+            .unwrap();
+        let result = backend
+            .execute(
+                &call_with_args("m117-next", "read_file", &read_args),
+                &read_args,
+                &ctx,
+            )
+            .await
+            .unwrap();
         assert!(!result.is_error && result.content.contains("next round works"));
         let after: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(attempt_index), 0) FROM objective_remediations WHERE objective_id=?")
             .bind(TEST_OBJECTIVE_ID).fetch_one(&backend.db).await.unwrap();
-        assert_eq!(before, after, "argument errors must not spend objective recovery budget");
+        assert_eq!(
+            before, after,
+            "argument errors must not spend objective recovery budget"
+        );
     }
 
     #[tokio::test]
@@ -4176,13 +4433,12 @@ mod tests {
         assert!(output.is_error);
         assert!(output.content.contains("change_reason is required"));
 
-        let receipts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM side_effect_receipts WHERE objective_id=?",
-        )
-        .bind(TEST_OBJECTIVE_ID)
-        .fetch_one(&backend.db)
-        .await
-        .unwrap();
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM side_effect_receipts WHERE objective_id=?")
+                .bind(TEST_OBJECTIVE_ID)
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
         let plan_revisions: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM chat_plan_events WHERE session_id=? AND root_turn_id=?",
         )
@@ -4207,7 +4463,11 @@ mod tests {
         let audit_call = call_with_args("read-only-after-invalid-plan", "bash", &audit_args);
         register_tool_call(&backend, &audit_call, &audit_args).await;
         let audit = backend
-            .execute(&audit_call, &audit_args, &objective_ctx(std::path::Path::new(".")))
+            .execute(
+                &audit_call,
+                &audit_args,
+                &objective_ctx(std::path::Path::new(".")),
+            )
             .await
             .expect("read-only audit dispatches after a rejected plan");
         assert_eq!(audit.status, ToolExecutionStatus::Done);
@@ -4361,7 +4621,14 @@ mod tests {
             "new_string": "once",
         });
 
-        let outcome = refuse(&backend, "edit-ambiguous-old", "edit_file", &args, dir.path()).await;
+        let outcome = refuse(
+            &backend,
+            "edit-ambiguous-old",
+            "edit_file",
+            &args,
+            dir.path(),
+        )
+        .await;
 
         for expected in ["出现了 3 次", "target.rs", "replace_all"] {
             assert!(
@@ -4468,7 +4735,14 @@ mod tests {
         let _ = std::fs::remove_file(&escaped);
         let args = serde_json::json!({"command": "touch ../m9-outside-seeded.txt"});
 
-        let outcome = refuse(&backend, "bash-unobservable-local", "bash", &args, dir.path()).await;
+        let outcome = refuse(
+            &backend,
+            "bash-unobservable-local",
+            "bash",
+            &args,
+            dir.path(),
+        )
+        .await;
 
         for expected in ["改动文件", "无法核对", "edit_file", "write_file"] {
             assert!(
@@ -5695,12 +5969,7 @@ fs.writeFileSync('rerun-'+n+'-'+r+'.mark','x');console.log(n+'-'+r)\"";
         let markers = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("rerun-")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("rerun-"))
             .count();
         assert_eq!(
             markers, 2,
@@ -5751,19 +6020,25 @@ fs.writeFileSync('rerun-'+n+'-'+r+'.mark','x');console.log(n+'-'+r)\"";
         register_tool_call(&backend, &call, &args).await;
         let (classified, kind) = backend.classify(&call, &args);
         let admission = backend
-            .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &classified,
+                kind,
+                false,
+            )
             .await
             .unwrap();
         assert!(
             matches!(admission, MutationAdmission::Dispatch { .. }),
             "a local effect the workspace digest can observe must have a way through"
         );
-        let policy: String = sqlx::query_scalar(
-            "SELECT replay_policy FROM tool_recovery_contracts LIMIT 1",
-        )
-        .fetch_one(&backend.db)
-        .await
-        .unwrap();
+        let policy: String =
+            sqlx::query_scalar("SELECT replay_policy FROM tool_recovery_contracts LIMIT 1")
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
         assert_eq!(
             policy, "never_after_dispatch",
             "an imprecise observer must never authorise a replay"
@@ -5829,7 +6104,14 @@ fs.writeFileSync('rerun-'+n+'-'+r+'.mark','x');console.log(n+'-'+r)\"";
         let (classified, kind) = backend.classify(&call, &args);
         assert!(matches!(
             backend
-                .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
+                .mutation_preflight(
+                    &call,
+                    &args,
+                    &objective_ctx(dir.path()),
+                    &classified,
+                    kind,
+                    false
+                )
                 .await
                 .unwrap(),
             MutationAdmission::Dispatch { .. }
@@ -5841,7 +6123,14 @@ fs.writeFileSync('rerun-'+n+'-'+r+'.mark','x');console.log(n+'-'+r)\"";
         register_tool_call(&backend, &call, &args).await;
         let (classified, kind) = backend.classify(&call, &args);
         let admission = backend
-            .mutation_preflight(&call, &args, &objective_ctx(dir.path()), &classified, kind, false)
+            .mutation_preflight(
+                &call,
+                &args,
+                &objective_ctx(dir.path()),
+                &classified,
+                kind,
+                false,
+            )
             .await
             .unwrap();
         let MutationAdmission::Refused(outcome) = admission else {
@@ -6571,14 +6860,16 @@ fs.writeFileSync('rerun-'+n+'-'+r+'.mark','x');console.log(n+'-'+r)\"";
             .await
             .expect("uncertainty is a system-owned waiting result, not a fatal/user handoff");
         assert!(matches!(out.status, ToolExecutionStatus::Waiting));
-        let receipt_status: String = sqlx::query_scalar(
-            "SELECT status FROM side_effect_receipts WHERE objective_id=?",
-        )
-        .bind(TEST_OBJECTIVE_ID)
-        .fetch_one(&backend.db)
-        .await
-        .unwrap();
-        assert_eq!(receipt_status, "unknown", "uncertain receipt history must remain unchanged");
+        let receipt_status: String =
+            sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE objective_id=?")
+                .bind(TEST_OBJECTIVE_ID)
+                .fetch_one(&backend.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            receipt_status, "unknown",
+            "uncertain receipt history must remain unchanged"
+        );
         assert_eq!(
             out.metadata
                 .as_ref()

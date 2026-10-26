@@ -122,7 +122,11 @@ mod tests {
 
     #[test]
     fn generic_payload_is_machine_readable() {
-        let payload = build_payload(ImWebhookFormat::Generic, NotifyEvent::TurnError, "上下文超限");
+        let payload = build_payload(
+            ImWebhookFormat::Generic,
+            NotifyEvent::TurnError,
+            "上下文超限",
+        );
         assert_eq!(payload["source"], "codefactory");
         assert_eq!(payload["event"], "turn_error");
         assert_eq!(payload["detail"], "上下文超限");

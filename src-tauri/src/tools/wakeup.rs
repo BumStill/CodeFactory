@@ -264,7 +264,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduling_without_a_session_is_refused_with_a_readable_sentence() {
-        let dir = std::env::temp_dir().join(format!("cf-bg-wakeup-nosession-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cf-bg-wakeup-nosession-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ctx = ExecCtx::new(dir.clone(), None);
         let out = execute_schedule(json!({ "prompt": "检查状态", "every_sec": 300 }), &ctx)

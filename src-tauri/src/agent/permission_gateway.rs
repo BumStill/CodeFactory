@@ -74,7 +74,10 @@ pub(crate) struct DesktopPermissionGateway {
     pub(super) browser_act_granted: AtomicBool,
 }
 
-pub(super) async fn registered_git_roots(db: &SqlitePool, session: &str) -> Option<Vec<std::path::PathBuf>> {
+pub(super) async fn registered_git_roots(
+    db: &SqlitePool,
+    session: &str,
+) -> Option<Vec<std::path::PathBuf>> {
     super::execution_workspace::ensure_schema(db).await.ok()?;
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT objective_id, worktree_path FROM execution_workspaces WHERE session_id=? AND state IN ('active','delivering')",
@@ -82,7 +85,9 @@ pub(super) async fn registered_git_roots(db: &SqlitePool, session: &str) -> Opti
     let mut roots = Vec::new();
     for (objective, path) in rows {
         let path = std::path::PathBuf::from(path);
-        super::execution_workspace::verify_objective_workspace(db, &objective, &path).await.ok()?;
+        super::execution_workspace::verify_objective_workspace(db, &objective, &path)
+            .await
+            .ok()?;
         roots.push(path);
     }
     (!roots.is_empty()).then_some(roots)
@@ -121,8 +126,10 @@ impl PermissionGateway for DesktopPermissionGateway {
             .authorize_permission_recovery(tool_call, args, bash_command)
             .await
         {
-            if remote && matches!(outcome, PermissionOutcome::Allow)
-                && !super::fetch_session_delivery_authorized(&self.db, &self.session_id).await {
+            if remote
+                && matches!(outcome, PermissionOutcome::Allow)
+                && !super::fetch_session_delivery_authorized(&self.db, &self.session_id).await
+            {
                 return permission_recovery_rejected();
             }
             return outcome;
@@ -130,29 +137,40 @@ impl PermissionGateway for DesktopPermissionGateway {
         let policy = resolve_session_permission_policy(&self.db, &self.session_id).await;
         // M159: delivery authority is not authority to force-push, delete a
         // remote ref, or discard local work. Prove and snapshot first.
-        if policy.full_access && tool_call.function.name == "bash"
+        if policy.full_access
+            && tool_call.function.name == "bash"
             && bash_command.is_some_and(super::trusted_git::sensitive)
         {
             let key = format!("bash({})", bash_command.unwrap_or_default());
-            if policy.deny.iter().any(|pattern| super::glob_match(pattern, "bash") || super::glob_match(pattern, &key))
-                || matches!(crate::tools::shell_policy::classify_command(bash_command.unwrap_or_default()), crate::tools::shell_policy::ShellCommandPolicy::Deny { .. })
-            {
+            if policy.deny.iter().any(|pattern| {
+                super::glob_match(pattern, "bash") || super::glob_match(pattern, &key)
+            }) || matches!(
+                crate::tools::shell_policy::classify_command(bash_command.unwrap_or_default()),
+                crate::tools::shell_policy::ShellCommandPolicy::Deny { .. }
+            ) {
                 return permission_recovery_rejected();
             }
-            if let (Some(root), Some(command)) = (self.managed_workspace_root().await, bash_command) {
+            if let (Some(root), Some(command)) = (self.managed_workspace_root().await, bash_command)
+            {
                 if let Some(roots) = registered_git_roots(&self.db, &self.session_id).await {
                     if super::trusted_git::backup_registered(&roots, &root, command).is_some() {
                         return PermissionOutcome::Allow;
                     }
                 }
             }
-            return self.request_permission(tool_call, args.clone(), bash_command).await;
+            return self
+                .request_permission(tool_call, args.clone(), bash_command)
+                .await;
         }
         if remote {
             // The session switch never overrides an explicit per-tool deny.
             if let PermissionDecision::Deny(reason) = decide_permission_for_call(
-                &policy, &tool_call.function.name, args, bash_command,
-                self.browser_read_granted, None,
+                &policy,
+                &tool_call.function.name,
+                args,
+                bash_command,
+                self.browser_read_granted,
+                None,
             ) {
                 return PermissionOutcome::Deny(PermissionDenial {
                     content: format!("此操作被会话权限策略禁止：{reason}"),
@@ -168,17 +186,31 @@ impl PermissionGateway for DesktopPermissionGateway {
                 question: Some("允许向远端推送并创建 PR / MR 吗？".into()),
                 ..super::thin_state::ThinState::running()
             };
-            if super::thin_state::save(&self.db, &self.session_id, &waiting).await.is_err() {
+            if super::thin_state::save(&self.db, &self.session_id, &waiting)
+                .await
+                .is_err()
+            {
                 return permission_recovery_rejected();
             }
-            let outcome = self.request_permission(tool_call, args.clone(), bash_command).await;
-            if super::thin_state::save(&self.db, &self.session_id, &super::thin_state::ThinState::running()).await.is_err() {
+            let outcome = self
+                .request_permission(tool_call, args.clone(), bash_command)
+                .await;
+            if super::thin_state::save(
+                &self.db,
+                &self.session_id,
+                &super::thin_state::ThinState::running(),
+            )
+            .await
+            .is_err()
+            {
                 return permission_recovery_rejected();
             }
             return match outcome {
                 PermissionOutcome::Allow if self.anonymous => {
                     let saved = sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id=?")
-                        .bind(&self.session_id).execute(&self.db).await;
+                        .bind(&self.session_id)
+                        .execute(&self.db)
+                        .await;
                     if matches!(saved, Ok(ref result) if result.rows_affected() == 1) {
                         PermissionOutcome::Allow
                     } else {
@@ -190,7 +222,9 @@ impl PermissionGateway for DesktopPermissionGateway {
                     // Never reopen it here after a concurrent user revocation.
                     if super::fetch_session_delivery_authorized(&self.db, &self.session_id).await {
                         PermissionOutcome::Allow
-                    } else { permission_recovery_rejected() }
+                    } else {
+                        permission_recovery_rejected()
+                    }
                 }
                 PermissionOutcome::Deny(mut denial) => {
                     if denial.reason == PermissionDenialReason::DeniedByUser {
@@ -473,9 +507,12 @@ impl DesktopPermissionGateway {
                 ),
             );
             drop(settings);
-            response =
-                await_permission_response(&mut receiver, self.cancel.as_ref(), PERMISSION_LATE_WAIT)
-                    .await;
+            response = await_permission_response(
+                &mut receiver,
+                self.cancel.as_ref(),
+                PERMISSION_LATE_WAIT,
+            )
+            .await;
         }
         let duration_ms = started.elapsed().as_millis() as u64;
         self.pending_permissions.lock().await.remove(&intent_id);
@@ -536,11 +573,19 @@ impl DesktopPermissionGateway {
             .await
             .ok()
             .flatten()?;
-        if view.objective_id != scope.objective_id || !matches!(view.state.as_str(), "active" | "delivering") {
+        if view.objective_id != scope.objective_id
+            || !matches!(view.state.as_str(), "active" | "delivering")
+        {
             return None;
         }
         let path = std::path::PathBuf::from(view.worktree_path);
-        super::execution_workspace::verify_objective_workspace(&self.db, &scope.objective_id, &path).await.ok()?;
+        super::execution_workspace::verify_objective_workspace(
+            &self.db,
+            &scope.objective_id,
+            &path,
+        )
+        .await
+        .ok()?;
         path.is_dir().then_some(path)
     }
 
@@ -634,8 +679,21 @@ mod tests {
         for mode in ["trusted", "standard"] {
             let gateway = test_gateway(mode).await;
             let args = serde_json::json!({"command": command});
-            let call = ToolCall { id: "m139-read".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
-            assert!(matches!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow), "{mode}: readonly command must not prompt");
+            let call = ToolCall {
+                id: "m139-read".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "bash".into(),
+                    arguments: args.to_string(),
+                },
+            };
+            assert!(
+                matches!(
+                    gateway.authorize(&call, &args, Some(command)).await,
+                    PermissionOutcome::Allow
+                ),
+                "{mode}: readonly command must not prompt"
+            );
             assert!(gateway.pending_permissions.lock().await.is_empty());
         }
     }
@@ -647,20 +705,43 @@ mod tests {
         crate::register_session_executor(&gateway.session_id, &control);
         let command = "rm -rf generated";
         let args = serde_json::json!({"command": command});
-        let call = ToolCall { id: "m139-write".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let call = ToolCall {
+            id: "m139-write".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: args.to_string(),
+            },
+        };
         let task_gateway = gateway.clone();
-        let authorization = tokio::spawn(async move { task_gateway.authorize(&call, &args, Some(command)).await });
+        let authorization =
+            tokio::spawn(async move { task_gateway.authorize(&call, &args, Some(command)).await });
         let intent = wait_for_durable_intent(&gateway).await;
-        let state = super::super::thin_derive::refresh(&gateway.db, &gateway.session_id).await.unwrap();
-        assert_eq!(state.state, super::super::thin_state::SessionState::WaitingUser);
-        assert_eq!(state.question.as_deref(), Some("需要你批准执行：rm -rf generated"));
+        let state = super::super::thin_derive::refresh(&gateway.db, &gateway.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.state,
+            super::super::thin_state::SessionState::WaitingUser
+        );
+        assert_eq!(
+            state.question.as_deref(),
+            Some("需要你批准执行：rm -rf generated")
+        );
         assert!(!authorization.is_finished());
-        PermissionIntentStore::new(gateway.db.clone()).record_user_response(
-            &intent.prompt_key(), PermissionPromptResponse::Allow, chrono::Utc::now().timestamp_millis(),
-        ).await.unwrap();
+        PermissionIntentStore::new(gateway.db.clone())
+            .record_user_response(
+                &intent.prompt_key(),
+                PermissionPromptResponse::Allow,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .unwrap();
         take_pending_sender(&gateway).await.send(true).unwrap();
         assert_eq!(authorization.await.unwrap(), PermissionOutcome::Allow);
-        let state = super::super::thin_derive::refresh(&gateway.db, &gateway.session_id).await.unwrap();
+        let state = super::super::thin_derive::refresh(&gateway.db, &gateway.session_id)
+            .await
+            .unwrap();
         assert_eq!(state.state, super::super::thin_state::SessionState::Running);
         assert!(state.question.is_none());
         crate::unregister_session_executor(&gateway.session_id, &control);
@@ -756,28 +837,52 @@ mod tests {
     }
 
     fn m159_git(root: &std::path::Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git").current_dir(root).args(args).output().unwrap();
-        assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8(output.stdout).unwrap().trim().into()
     }
 
     #[tokio::test]
     async fn m159_gateway_session_identity_backup_and_remote_fence() {
         let gateway = durable_test_gateway().await;
-        sqlx::query("UPDATE sessions SET permission_mode='trusted'").execute(&gateway.db).await.unwrap();
-        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 1").execute(&gateway.db).await.unwrap();
+        sqlx::query("UPDATE sessions SET permission_mode='trusted'")
+            .execute(&gateway.db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 1",
+        )
+        .execute(&gateway.db)
+        .await
+        .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
         m159_git(&root, &["init", "-q"]);
         m159_git(&root, &["config", "user.name", "Synthetic"]);
-        m159_git(&root, &["config", "user.email", "synthetic@example.invalid"]);
+        m159_git(
+            &root,
+            &["config", "user.email", "synthetic@example.invalid"],
+        );
         std::fs::write(root.join("tracked.txt"), "base").unwrap();
         m159_git(&root, &["add", "."]);
         m159_git(&root, &["commit", "-qm", "synthetic"]);
-        super::super::execution_workspace::ensure_schema(&gateway.db).await.unwrap();
+        super::super::execution_workspace::ensure_schema(&gateway.db)
+            .await
+            .unwrap();
         // Register exact synthetic Git identity without invoking network allocation.
-        let common = m159_git(&root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        let common = m159_git(
+            &root,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
         let gitdir = m159_git(&root, &["rev-parse", "--absolute-git-dir"]);
         let branch = m159_git(&root, &["branch", "--show-current"]);
         let head = m159_git(&root, &["rev-parse", "HEAD"]);
@@ -785,37 +890,93 @@ mod tests {
         // obtain its ordinary digest inputs exactly as workspace allocation does.
         let repo = super::super::delivery::resolve_repo(&root, None).unwrap();
         let identity = super::super::delivery::capture_delivery_identity(&repo).unwrap();
-        let (repo_identity, worktree_identity) = (identity.repo_identity, identity.worktree_identity);
+        let (repo_identity, worktree_identity) =
+            (identity.repo_identity, identity.worktree_identity);
         sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('synthetic-workspace','5eea633e-59f9-42bc-91f8-0a19a5c49711','permission-test',?,?,?,?,?,?, 'HEAD',?,?,'active',1,1)")
             .bind(repo_identity).bind(root.to_string_lossy().as_ref()).bind(common).bind(root.to_string_lossy().as_ref()).bind(worktree_identity).bind(branch).bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
         assert!(!gitdir.is_empty());
         std::fs::write(root.join("tracked.txt"), "uncommitted").unwrap();
         let command = "git reset --hard HEAD";
         let args = serde_json::json!({"command": command});
-        let call = ToolCall { id: "m159-local".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
-        assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow);
-        let reference = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
-        assert_eq!(m159_git(&root, &["show", &format!("{reference}:tracked.txt")]), "uncommitted");
+        let call = ToolCall {
+            id: "m159-local".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: args.to_string(),
+            },
+        };
+        assert_eq!(
+            gateway.authorize(&call, &args, Some(command)).await,
+            PermissionOutcome::Allow
+        );
+        let reference = m159_git(
+            &root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/codefactory/backup/",
+            ],
+        );
+        assert_eq!(
+            m159_git(&root, &["show", &format!("{reference}:tracked.txt")]),
+            "uncommitted"
+        );
         assert!(gateway.pending_permissions.lock().await.is_empty());
         let compound = format!("cd \"{}\"; git stash push -m prefill; git fetch --prune origin main; git merge origin/main --no-edit; git stash pop; git status --porcelain | head", root.display());
         let compound_args = serde_json::json!({"command": compound});
-        let compound_call = ToolCall { id: "m166-compound".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: compound_args.to_string() } };
-        assert_eq!(gateway.authorize(&compound_call, &compound_args, Some(&compound)).await, PermissionOutcome::Allow);
+        let compound_call = ToolCall {
+            id: "m166-compound".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: compound_args.to_string(),
+            },
+        };
+        assert_eq!(
+            gateway
+                .authorize(&compound_call, &compound_args, Some(&compound))
+                .await,
+            PermissionOutcome::Allow
+        );
         assert!(gateway.pending_permissions.lock().await.is_empty());
-        for command in ["git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
+        for command in [
+            "git push --force origin main",
+            "git push origin :main",
+            "git checkout -- ../other",
+            "git reset --hard HEAD && rm -rf ../other",
+        ] {
             let args = serde_json::json!({"command":command});
-            let call = ToolCall { id: "m159-remote".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            let call = ToolCall {
+                id: "m159-remote".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "bash".into(),
+                    arguments: args.to_string(),
+                },
+            };
             let other = gateway.clone();
             let command = command.to_string();
-            let task = tokio::spawn(async move { other.authorize(&call, &args, Some(&command)).await });
+            let task =
+                tokio::spawn(async move { other.authorize(&call, &args, Some(&command)).await });
             let intent = wait_for_durable_intent(&gateway).await;
             assert!(!task.is_finished());
-            PermissionIntentStore::new(gateway.db.clone()).record_user_response(&intent.prompt_key(), PermissionPromptResponse::Deny, chrono::Utc::now().timestamp_millis()).await.unwrap();
+            PermissionIntentStore::new(gateway.db.clone())
+                .record_user_response(
+                    &intent.prompt_key(),
+                    PermissionPromptResponse::Deny,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .unwrap();
             take_pending_sender(&gateway).await.send(false).unwrap();
             assert!(matches!(task.await.unwrap(), PermissionOutcome::Deny(_)));
         }
         // Another session's registered workspace never establishes ownership.
-        sqlx::query("UPDATE execution_workspaces SET session_id='other-session'").execute(&gateway.db).await.unwrap();
+        sqlx::query("UPDATE execution_workspaces SET session_id='other-session'")
+            .execute(&gateway.db)
+            .await
+            .unwrap();
         assert!(gateway.managed_workspace_root().await.is_none());
     }
 
@@ -824,7 +985,14 @@ mod tests {
         let gateway = test_gateway("standard").await;
         let command = "git reset --hard HEAD";
         let args = serde_json::json!({"command":command});
-        let call = ToolCall { id: "m159-standard".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let call = ToolCall {
+            id: "m159-standard".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: args.to_string(),
+            },
+        };
         let other = gateway.clone();
         let task = tokio::spawn(async move { other.authorize(&call, &args, Some(command)).await });
         take_pending_sender(&gateway).await.send(false).unwrap();
@@ -909,69 +1077,163 @@ mod tests {
         let remote = dir.path().join("remote.git");
         fn git(cwd: &std::path::Path, args: &[&str]) -> String {
             use crate::util::no_window::NoWindow;
-            let output = std::process::Command::new("git").no_window().current_dir(cwd).args(args).output().unwrap();
-            assert!(output.status.success(), "{args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            let output = std::process::Command::new("git")
+                .no_window()
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             String::from_utf8(output.stdout).unwrap()
         }
         git(dir.path(), &["init", "--bare", remote.to_str().unwrap()]);
         git(dir.path(), &["init", repo.to_str().unwrap()]);
-        git(&repo, &["config", "user.email", "synthetic@example.invalid"]);
+        git(
+            &repo,
+            &["config", "user.email", "synthetic@example.invalid"],
+        );
         git(&repo, &["config", "user.name", "Synthetic"]);
-        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
-        let contract = super::super::resolve_turn_delivery_authorization(None, "实施", super::super::TurnIntent::default(), false).0;
-        assert!(codefactory_agent_loop::policy::capability_denial(contract.capability, "bash", "git commit -m synthetic", &codefactory_agent_core::ToolKind::Mutation, &serde_json::json!({})).is_none());
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let contract = super::super::resolve_turn_delivery_authorization(
+            None,
+            "实施",
+            super::super::TurnIntent::default(),
+            false,
+        )
+        .0;
+        assert!(codefactory_agent_loop::policy::capability_denial(
+            contract.capability,
+            "bash",
+            "git commit -m synthetic",
+            &codefactory_agent_core::ToolKind::Mutation,
+            &serde_json::json!({})
+        )
+        .is_none());
         git(&repo, &["commit", "--allow-empty", "-m", "synthetic"]);
         let head = git(&repo, &["rev-parse", "HEAD"]);
         assert!(git(&repo, &["ls-remote", "origin"]).is_empty());
         let gateway = test_gateway("trusted").await;
-        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0").execute(&gateway.db).await.unwrap();
+        sqlx::query(
+            "ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&gateway.db)
+        .await
+        .unwrap();
         let args = serde_json::json!({"command":"git push origin HEAD:refs/heads/synthetic"});
-        let call = ToolCall { id: "synthetic-push-real".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let call = ToolCall {
+            id: "synthetic-push-real".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: args.to_string(),
+            },
+        };
         let cloned = gateway.clone();
-        let handle = tokio::spawn(async move { cloned.authorize(&call, &args, Some("git push origin HEAD:refs/heads/synthetic")).await });
+        let handle = tokio::spawn(async move {
+            cloned
+                .authorize(
+                    &call,
+                    &args,
+                    Some("git push origin HEAD:refs/heads/synthetic"),
+                )
+                .await
+        });
         let sender = take_pending_sender(&gateway).await;
-        let waiting = super::super::thin_state::load(&gateway.db, "permission-test").await.unwrap().unwrap();
-        assert_eq!(waiting.state, super::super::thin_state::SessionState::WaitingUser);
+        let waiting = super::super::thin_state::load(&gateway.db, "permission-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            waiting.state,
+            super::super::thin_state::SessionState::WaitingUser
+        );
         assert!(waiting.question.unwrap().contains("允许"));
-        assert!(git(&repo, &["ls-remote", "origin"]).is_empty(), "no remote mutation before approval");
+        assert!(
+            git(&repo, &["ls-remote", "origin"]).is_empty(),
+            "no remote mutation before approval"
+        );
         sender.send(true).unwrap();
         assert_eq!(handle.await.unwrap(), PermissionOutcome::Allow);
         git(&repo, &["push", "origin", "HEAD:refs/heads/synthetic"]);
-        assert_eq!(git(&repo, &["ls-remote", "origin", "refs/heads/synthetic"]).split_whitespace().next(), Some(head.trim()));
+        assert_eq!(
+            git(&repo, &["ls-remote", "origin", "refs/heads/synthetic"])
+                .split_whitespace()
+                .next(),
+            Some(head.trim())
+        );
     }
 
     #[tokio::test]
     async fn m130_remote_approval_persists_and_resumes_same_call() {
         let gateway = test_gateway("trusted").await;
-        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0")
-            .execute(&gateway.db).await.unwrap();
+        sqlx::query(
+            "ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&gateway.db)
+        .await
+        .unwrap();
         let args = serde_json::json!({"command":"git push origin synthetic"});
-        let call = ToolCall { id: "synthetic-push".into(), r#type: "function".into(),
-            function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let call = ToolCall {
+            id: "synthetic-push".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: args.to_string(),
+            },
+        };
         let cloned = gateway.clone();
-        let handle = tokio::spawn(async move { cloned.authorize(&call, &args, Some("git push origin synthetic")).await });
-        assert!(!super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await);
+        let handle = tokio::spawn(async move {
+            cloned
+                .authorize(&call, &args, Some("git push origin synthetic"))
+                .await
+        });
+        assert!(
+            !super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await
+        );
         take_pending_sender(&gateway).await.send(true).unwrap();
         assert_eq!(handle.await.unwrap(), PermissionOutcome::Allow);
-        assert!(super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await);
+        assert!(
+            super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await
+        );
     }
 
     #[tokio::test]
     async fn m130_remote_denial_keeps_grant_off_and_names_user_decision() {
         let gateway = test_gateway("trusted").await;
-        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0")
-            .execute(&gateway.db).await.unwrap();
+        sqlx::query(
+            "ALTER TABLE sessions ADD COLUMN delivery_authorized INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&gateway.db)
+        .await
+        .unwrap();
         let args = serde_json::json!({"ceiling":"pr_only"});
-        let call = ToolCall { id: "synthetic-deliver".into(), r#type: "function".into(),
-            function: FunctionCall { name: "deliver_changes".into(), arguments: args.to_string() } };
+        let call = ToolCall {
+            id: "synthetic-deliver".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "deliver_changes".into(),
+                arguments: args.to_string(),
+            },
+        };
         let cloned = gateway.clone();
         let handle = tokio::spawn(async move { cloned.authorize(&call, &args, None).await });
         take_pending_sender(&gateway).await.send(false).unwrap();
         match handle.await.unwrap() {
-            PermissionOutcome::Deny(denial) => assert_eq!(denial.content, "用户不允许推送，请在本地完成并说明"),
+            PermissionOutcome::Deny(denial) => {
+                assert_eq!(denial.content, "用户不允许推送，请在本地完成并说明")
+            }
             other => panic!("expected denial, got {other:?}"),
         }
-        assert!(!super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await);
+        assert!(
+            !super::super::fetch_session_delivery_authorized(&gateway.db, "permission-test").await
+        );
     }
 
     #[tokio::test]
@@ -1145,11 +1407,12 @@ mod tests {
                 .contains_key(&intent.intent_id),
             "an unanswered request must stay owned and answerable, not be voided"
         );
-        let status: String = sqlx::query_scalar("SELECT status FROM permission_intents WHERE intent_id=?")
-            .bind(&intent.intent_id)
-            .fetch_one(&gateway.db)
-            .await
-            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM permission_intents WHERE intent_id=?")
+                .bind(&intent.intent_id)
+                .fetch_one(&gateway.db)
+                .await
+                .unwrap();
         assert_eq!(
             status, "pending",
             "an unanswered request stays pending — it is never recorded as a user decision"

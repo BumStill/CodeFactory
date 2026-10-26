@@ -25,7 +25,9 @@ pub struct SessionListItem {
 /// M130: structured session switch, never inferred from message text.
 #[tauri::command]
 pub async fn update_session_delivery_authorized(
-    state: State<'_, AppState>, session_id: String, authorized: bool,
+    state: State<'_, AppState>,
+    session_id: String,
+    authorized: bool,
 ) -> Result<(), AppError> {
     let db = state.db.read().await.clone();
     let mut tx = db.begin().await?;
@@ -36,31 +38,47 @@ pub async fn update_session_delivery_authorized(
     }
     if authorized {
         sqlx::query("DELETE FROM delivery_stop_fences WHERE session_id=?")
-            .bind(&session_id).execute(&mut *tx).await?;
+            .bind(&session_id)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn get_session_release_urgency(state: State<'_, AppState>, session_id: String) -> Result<String, AppError> {
+pub async fn get_session_release_urgency(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<String, AppError> {
     let db = state.db.read().await.clone();
-    Ok(sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id=?")
-        .bind(session_id).fetch_one(&db).await?)
+    Ok(
+        sqlx::query_scalar("SELECT release_urgency FROM sessions WHERE id=?")
+            .bind(session_id)
+            .fetch_one(&db)
+            .await?,
+    )
 }
 
 /// Persist the user-owned session release policy (shared GUI/dispatch entry).
 #[tauri::command]
 pub async fn update_session_release_urgency(
-    state: State<'_, AppState>, session_id: String, urgency: String,
+    state: State<'_, AppState>,
+    session_id: String,
+    urgency: String,
 ) -> Result<(), AppError> {
     if !matches!(urgency.as_str(), "default" | "immediate" | "hold") {
         return Err(AppError::Other("Unsupported release urgency".into()));
     }
     let db = state.db.read().await.clone();
     let changed = sqlx::query("UPDATE sessions SET release_urgency=? WHERE id=?")
-        .bind(&urgency).bind(&session_id).execute(&db).await?;
-    if changed.rows_affected() != 1 { return Err(AppError::Other("Unknown session".into())); }
+        .bind(&urgency)
+        .bind(&session_id)
+        .execute(&db)
+        .await?;
+    if changed.rows_affected() != 1 {
+        return Err(AppError::Other("Unknown session".into()));
+    }
     Ok(())
 }
 
@@ -492,8 +510,17 @@ pub async fn update_session_model_config(
         )));
     }
     if !crate::agent::usage_windows::session_ignores_windows(&session_id) {
-        if crate::agent::usage_windows::effective_rule(&settings, &endpoint_id, &model_id).is_some_and(|rule| !rule.evaluate(crate::agent::usage_windows::now_ms()).available) {
-            return Err(AppError::Other("OUTSIDE_USAGE_WINDOW: 当前模型不在允许时段；可选择本会话忽略时段限制，或换模型".into()));
+        if crate::agent::usage_windows::effective_rule(&settings, &endpoint_id, &model_id)
+            .is_some_and(|rule| {
+                !rule
+                    .evaluate(crate::agent::usage_windows::now_ms())
+                    .available
+            })
+        {
+            return Err(AppError::Other(
+                "OUTSIDE_USAGE_WINDOW: 当前模型不在允许时段；可选择本会话忽略时段限制，或换模型"
+                    .into(),
+            ));
         }
     }
     drop(settings);
@@ -941,23 +968,37 @@ async fn load_turn_activity_states(
         Ok(mut states) => {
             if crate::agent::thin::is_thin(pool, session_id).await {
                 let derived = crate::agent::thin_derive::refresh(pool, session_id).await?;
-                if let Some(turn) = states.iter_mut().filter(|turn| turn.is_current_objective_turn).max_by_key(|turn| turn.updated_at) {
+                if let Some(turn) = states
+                    .iter_mut()
+                    .filter(|turn| turn.is_current_objective_turn)
+                    .max_by_key(|turn| turn.updated_at)
+                {
                     use crate::agent::thin_state::SessionState;
                     let (phase, status) = match derived.state {
                         SessionState::Running => ("working", "active"),
-                        SessionState::WaitingWake | SessionState::WaitingUser => ("waiting", "waiting"),
+                        SessionState::WaitingWake | SessionState::WaitingUser => {
+                            ("waiting", "waiting")
+                        }
                         SessionState::Ended => ("finalizing", "completed"),
                     };
                     turn.phase = phase.into();
                     turn.status = status.into();
                     turn.recent_activity_kind = format!("thin_{}", derived.state.as_str());
-                    turn.recent_activity_label = derived.question.clone().or(derived.reason.clone()).unwrap_or_else(|| derived.state.as_str().into());
+                    turn.recent_activity_label = derived
+                        .question
+                        .clone()
+                        .or(derived.reason.clone())
+                        .unwrap_or_else(|| derived.state.as_str().into());
                     turn.waiting_reason = derived.question.or(derived.waiting_for);
-                    turn.terminal_reason = if derived.state == SessionState::Ended { derived.reason } else { None };
+                    turn.terminal_reason = if derived.state == SessionState::Ended {
+                        derived.reason
+                    } else {
+                        None
+                    };
                 }
             }
             Ok(states)
-        },
+        }
         Err(error) if error.to_string().contains("no such table: chat_turn_state") => {
             // Read-only compatibility for legacy/minimal databases. Normal app
             // startup creates the additive table before serving commands, but

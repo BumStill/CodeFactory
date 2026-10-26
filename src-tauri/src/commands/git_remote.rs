@@ -617,7 +617,9 @@ mod workspace_delivery_tests {
     // CI 结论上（#555 合并多日后仍显示「CI 失败」）。
     #[tokio::test]
     async fn m28_latest_delivery_run_supersedes_the_stale_session_pr_link() {
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO session_delivery_refs (session_id,branch,pr_number,pr_url,commit_sha,updated_at)
              VALUES ('synthetic-m28','feat/stale',999,'https://example.invalid/pull/999','stale-sha','2026-10-01T00:00:00Z')",
@@ -648,7 +650,9 @@ mod workspace_delivery_tests {
             .unwrap();
         }
         assert_eq!(
-            latest_delivery_pr_ref(&pool, "synthetic-m28").await.unwrap(),
+            latest_delivery_pr_ref(&pool, "synthetic-m28")
+                .await
+                .unwrap(),
             Some(("feat/merged".to_string(), 222)),
             "最新的 delivery run 必须压过旧的 session_delivery_refs 链接"
         );
@@ -663,7 +667,9 @@ mod workspace_delivery_tests {
         .unwrap();
         assert_eq!(stale, ("feat/stale".to_string(), 999));
         assert_eq!(
-            latest_delivery_pr_ref(&pool, "synthetic-m28-unrelated").await.unwrap(),
+            latest_delivery_pr_ref(&pool, "synthetic-m28-unrelated")
+                .await
+                .unwrap(),
             None
         );
     }

@@ -78,15 +78,22 @@ pub async fn collect_evidence_pack(
     }
 
     // 3. Query all messages for the session
-    let messages: Vec<(String, String, String, Option<String>, Option<i64>, Option<i64>, i64)> =
-        sqlx::query_as(
-            "SELECT id, role, content, tool_calls, input_tokens, output_tokens, created_at \
+    let messages: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT id, role, content, tool_calls, input_tokens, output_tokens, created_at \
              FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
-        )
-        .bind(session_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
 
     // 4. Extract tool calls from messages
     let mut tool_calls_out: Vec<serde_json::Value> = Vec::new();
@@ -299,12 +306,19 @@ pub async fn collect_evidence_pack(
     let mut files_changed_out: Vec<serde_json::Value> = Vec::new();
     for file_path in &changed_paths {
         // Try to get git diff for this file
-        let diff = Command::new("git").no_window()
+        let diff = Command::new("git")
+            .no_window()
             .current_dir(cwd)
             .args(["diff", "HEAD~1", "--", file_path])
             .output()
             .ok()
-            .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout).ok()
+                } else {
+                    None
+                }
+            })
             .unwrap_or_default();
 
         files_changed_out.push(serde_json::json!({
@@ -367,7 +381,8 @@ pub async fn collect_evidence_pack(
             .unwrap_or_default();
 
         if !dt.is_empty() {
-            let git_log_out = Command::new("git").no_window()
+            let git_log_out = Command::new("git")
+                .no_window()
                 .current_dir(cwd)
                 .args([
                     "log",
@@ -410,10 +425,14 @@ pub async fn collect_evidence_pack(
     // Gather assumptions from task descriptions
     let assumptions: Vec<String> = task_runs
         .iter()
-        .filter(|t| {
-            t.description.contains("assume") || t.description.contains("default")
+        .filter(|t| t.description.contains("assume") || t.description.contains("default"))
+        .map(|t| {
+            format!(
+                "[{}] {}",
+                t.title,
+                t.description.chars().take(120).collect::<String>()
+            )
         })
-        .map(|t| format!("[{}] {}", t.title, t.description.chars().take(120).collect::<String>()))
         .collect();
 
     let review_points: Vec<String> = task_runs
@@ -423,22 +442,26 @@ pub async fn collect_evidence_pack(
             format!(
                 "[{}] Failed: {}",
                 t.title,
-                t.error.as_deref().unwrap_or("unknown error").chars().take(120).collect::<String>()
+                t.error
+                    .as_deref()
+                    .unwrap_or("unknown error")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
             )
         })
         .collect();
 
     // Get the real model_id from the DB
-    let model_from_db: String = sqlx::query_as::<_, (String,)>(
-        "SELECT model_id FROM sessions WHERE id = ?",
-    )
-    .bind(session_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .map(|(m,)| m)
-    .unwrap_or(model);
+    let model_from_db: String =
+        sqlx::query_as::<_, (String,)>("SELECT model_id FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .map(|(m,)| m)
+            .unwrap_or(model);
 
     let ai_collab = serde_json::json!({
         "model": model_from_db,
@@ -561,47 +584,70 @@ fn build_summary_md(
     ai_collab: &serde_json::Value,
     knowledge_refs_count: usize,
 ) -> String {
-    let verif_str = if verification_passed { "PASSED" } else { "FAILED / NOT RUN" };
-    let model = ai_collab.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let assumptions = ai_collab.get("assumptions")
+    let verif_str = if verification_passed {
+        "PASSED"
+    } else {
+        "FAILED / NOT RUN"
+    };
+    let model = ai_collab
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let assumptions = ai_collab
+        .get("assumptions")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter()
-            .filter_map(|v| v.as_str())
-            .map(|s| format!("- {}", s))
-            .collect::<Vec<_>>()
-            .join("\n"))
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("- {}", s))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
         .unwrap_or_default();
-    let review_points = ai_collab.get("review_points")
+    let review_points = ai_collab
+        .get("review_points")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter()
-            .filter_map(|v| v.as_str())
-            .map(|s| format!("- {}", s))
-            .collect::<Vec<_>>()
-            .join("\n"))
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| format!("- {}", s))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
         .unwrap_or_default();
 
-    let tasks_section = task_runs.iter().map(|t| {
-        let verif = t.verification_results.as_deref()
-            .map(|_| "verified")
-            .unwrap_or("not verified");
-        format!(
-            "- **[{}]** {} — status: `{}` ({})",
-            t.id.chars().take(8).collect::<String>(),
-            t.title,
-            t.status,
-            verif
-        )
-    }).collect::<Vec<_>>().join("\n");
+    let tasks_section = task_runs
+        .iter()
+        .map(|t| {
+            let verif = t
+                .verification_results
+                .as_deref()
+                .map(|_| "verified")
+                .unwrap_or("not verified");
+            format!(
+                "- **[{}]** {} — status: `{}` ({})",
+                t.id.chars().take(8).collect::<String>(),
+                t.title,
+                t.status,
+                verif
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    let commits_section = git_commits.iter().map(|c| {
-        let hash = c.get("short_hash").and_then(|v| v.as_str()).unwrap_or("");
-        let msg = c.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let author = c.get("author").and_then(|v| v.as_str()).unwrap_or("");
-        format!("- `{}` {} ({})", hash, msg, author)
-    }).collect::<Vec<_>>().join("\n");
+    let commits_section = git_commits
+        .iter()
+        .map(|c| {
+            let hash = c.get("short_hash").and_then(|v| v.as_str()).unwrap_or("");
+            let msg = c.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let author = c.get("author").and_then(|v| v.as_str()).unwrap_or("");
+            format!("- `{}` {} ({})", hash, msg, author)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
-r#"# Evidence Pack — {spec_req_id}: {spec_title}
+        r#"# Evidence Pack — {spec_req_id}: {spec_title}
 
 ## Primary User Path
 
@@ -665,10 +711,22 @@ r#"# Evidence Pack — {spec_req_id}: {spec_title}
         total_tokens = total_tokens,
         verif_str = verif_str,
         verification_passed = verification_passed,
-        commits_section = if commits_section.is_empty() { "No commits recorded.".to_string() } else { commits_section },
+        commits_section = if commits_section.is_empty() {
+            "No commits recorded.".to_string()
+        } else {
+            commits_section
+        },
         model = model,
-        assumptions = if assumptions.is_empty() { "(none recorded)".to_string() } else { assumptions },
-        review_points = if review_points.is_empty() { "(none)".to_string() } else { review_points },
+        assumptions = if assumptions.is_empty() {
+            "(none recorded)".to_string()
+        } else {
+            assumptions
+        },
+        review_points = if review_points.is_empty() {
+            "(none)".to_string()
+        } else {
+            review_points
+        },
     )
 }
 
@@ -717,9 +775,8 @@ pub async fn list_evidence_packs(cwd: String) -> Result<Vec<EvidencePackMeta>, S
 pub async fn get_evidence_pack(path: String) -> Result<EvidencePack, String> {
     let dir = std::path::Path::new(&path);
 
-    let read_file = |name: &str| -> String {
-        std::fs::read_to_string(dir.join(name)).unwrap_or_default()
-    };
+    let read_file =
+        |name: &str| -> String { std::fs::read_to_string(dir.join(name)).unwrap_or_default() };
 
     let manifest_raw = read_file("manifest.json");
     let mut manifest: EvidencePackMeta =
@@ -771,7 +828,8 @@ pub async fn get_evidence_pack(path: String) -> Result<EvidencePack, String> {
 
 #[tauri::command]
 pub async fn open_evidence_pack_dir(path: String) -> Result<(), String> {
-    Command::new("explorer").no_window()
+    Command::new("explorer")
+        .no_window()
         .arg(&path)
         .spawn()
         .map_err(|e| e.to_string())?;
@@ -792,7 +850,8 @@ pub async fn auto_collect_and_emit(
     spec_title: &str,
     task_run_ids: &[String],
 ) {
-    match collect_evidence_pack(cwd, spec_req_id, spec_title, session_id, task_run_ids, pool).await {
+    match collect_evidence_pack(cwd, spec_req_id, spec_title, session_id, task_run_ids, pool).await
+    {
         Ok(pack_path) => {
             let event = format!("evidence_pack_ready:{}", session_id);
             let payload = serde_json::json!({
@@ -861,8 +920,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let tool_calls =
-            std::fs::read_to_string(format!("{pack_path}/tool_calls.jsonl")).unwrap();
+        let tool_calls = std::fs::read_to_string(format!("{pack_path}/tool_calls.jsonl")).unwrap();
 
         assert!(tool_calls.contains(r#""status":"done""#));
         assert!(tool_calls.contains(r#""duration_ms":42"#));

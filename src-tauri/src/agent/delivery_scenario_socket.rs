@@ -41,10 +41,12 @@ mod tests {
         let (mut socket, _) = loop {
             match listener.accept() {
                 Ok(accepted) => break accepted,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-                    && std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 Err(error) => panic!("fixture accept failed: {error}"),
             }
         };

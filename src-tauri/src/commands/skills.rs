@@ -2579,7 +2579,12 @@ mod tests {
         // host by SNI. Those addresses are local redirection tokens, not
         // destinations — refusing them blocks no SSRF, it only makes every URL
         // install fail on a machine running such a proxy.
-        for raw in ["198.18.0.93", "198.19.255.1", "100.64.0.1", "100.127.255.254"] {
+        for raw in [
+            "198.18.0.93",
+            "198.19.255.1",
+            "100.64.0.1",
+            "100.127.255.254",
+        ] {
             let ip: IpAddr = raw.parse().unwrap();
             assert!(
                 is_forbidden_remote_ip(ip),

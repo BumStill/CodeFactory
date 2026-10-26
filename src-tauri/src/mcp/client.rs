@@ -39,7 +39,10 @@ impl McpClient {
         }
 
         let mut child = cmd.spawn().map_err(|e| {
-            crate::errors::AppError::Other(format!("Failed to spawn MCP server '{}': {e}", config.command))
+            crate::errors::AppError::Other(format!(
+                "Failed to spawn MCP server '{}': {e}",
+                config.command
+            ))
         })?;
 
         let stdin = child
@@ -121,7 +124,11 @@ impl McpClient {
         }
     }
 
-    async fn send_notification(&mut self, method: &str, params: Value) -> crate::errors::Result<()> {
+    async fn send_notification(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> crate::errors::Result<()> {
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -216,7 +223,9 @@ impl McpClient {
                 .iter()
                 .filter_map(|c| {
                     if c.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        c.get("text").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        c.get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
                     } else {
                         Some(serde_json::to_string(c).unwrap_or_default())
                     }
@@ -230,7 +239,7 @@ impl McpClient {
 
     pub fn is_alive(&mut self) -> bool {
         match self.child.try_wait() {
-            Ok(None) => true,   // still running
+            Ok(None) => true,     // still running
             Ok(Some(_)) => false, // exited
             Err(_) => false,
         }

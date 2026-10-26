@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-pub mod bash;
 pub mod background_task;
-pub mod wakeup;
+pub mod bash;
 pub mod browser_session;
-pub mod web_fetch;
 pub mod delegate_tasks;
 pub mod delivery;
 mod delivery_thin;
@@ -23,6 +21,8 @@ pub mod skill_mgmt;
 pub mod test_path;
 pub mod update_plan;
 pub mod view_image;
+pub mod wakeup;
+pub mod web_fetch;
 pub mod workspace_path;
 pub mod write;
 pub mod xlsx;

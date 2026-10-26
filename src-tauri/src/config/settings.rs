@@ -250,9 +250,10 @@ impl Settings {
     /// back to the 80% / 80% default when the user has not customised them.
     pub fn quota_cap_for(&self, endpoint_name: &str) -> crate::agent::quota_cap::QuotaCap {
         match self.subscription_quota_caps.get(endpoint_name) {
-            Some(config) => {
-                crate::agent::quota_cap::QuotaCap::new(config.five_hour_percent, config.weekly_percent)
-            }
+            Some(config) => crate::agent::quota_cap::QuotaCap::new(
+                config.five_hour_percent,
+                config.weekly_percent,
+            ),
             None => crate::agent::quota_cap::QuotaCap::default(),
         }
     }
@@ -633,7 +634,9 @@ pub struct ShellConfig {
 fn default_shell_name() -> &'static str {
     #[cfg(windows)]
     {
-        crate::util::command_env::shell_invocation("").program.trim_end_matches(".exe")
+        crate::util::command_env::shell_invocation("")
+            .program
+            .trim_end_matches(".exe")
     }
     #[cfg(target_os = "macos")]
     {
@@ -1551,12 +1554,20 @@ pub fn force_max_completion_tokens_with_minimum(body: &mut serde_json::Value, mi
     }
 }
 
-fn migrate_usage_windows_at_path(path: &Path, settings: &mut Settings) -> crate::errors::Result<()> {
+fn migrate_usage_windows_at_path(
+    path: &Path,
+    settings: &mut Settings,
+) -> crate::errors::Result<()> {
     let mut candidate = settings.clone();
-    if !crate::agent::usage_windows::migrate_endpoint_defaults(&mut candidate) { return Ok(()); }
+    if !crate::agent::usage_windows::migrate_endpoint_defaults(&mut candidate) {
+        return Ok(());
+    }
     // A unique, durable pre-migration copy; never overwrite an earlier backup.
     let parent = path.parent().unwrap();
-    let mut backup = tempfile::Builder::new().prefix("settings.usage-windows-backup.").suffix(".json").tempfile_in(parent)?;
+    let mut backup = tempfile::Builder::new()
+        .prefix("settings.usage-windows-backup.")
+        .suffix(".json")
+        .tempfile_in(parent)?;
     backup.write_all(&std::fs::read(path)?)?;
     backup.as_file().sync_all()?;
     backup.keep().map_err(|error| error.error)?;

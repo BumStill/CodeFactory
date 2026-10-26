@@ -12,10 +12,19 @@ pub mod headless_dispatch;
 pub fn run_headless_dispatch_cli() -> bool {
     #[cfg(not(test))]
     if std::env::args().nth(1).as_deref() == Some("--measure-first-request-latency") {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("latency runtime");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("latency runtime");
         match runtime.block_on(agent::first_request_latency::measure()) {
-            Ok(receipt) => println!("{}", serde_json::to_string_pretty(&receipt).expect("latency receipt")),
-            Err(error) => { eprintln!("first request measurement failed: {error:#}"); std::process::exit(1); }
+            Ok(receipt) => println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt).expect("latency receipt")
+            ),
+            Err(error) => {
+                eprintln!("first request measurement failed: {error:#}");
+                std::process::exit(1);
+            }
         }
         return true;
     }
@@ -87,13 +96,14 @@ static CHAT_RUN_STOP_FLAGS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<AtomicBool>>>,
 > = std::sync::OnceLock::new();
 
-fn chat_run_stop_flags()
--> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<AtomicBool>>> {
+fn chat_run_stop_flags(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<AtomicBool>>> {
     CHAT_RUN_STOP_FLAGS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-fn lock_chat_run_stop_flags()
--> std::sync::MutexGuard<'static, std::collections::HashMap<String, std::sync::Weak<AtomicBool>>> {
+fn lock_chat_run_stop_flags(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, std::sync::Weak<AtomicBool>>>
+{
     // A poisoned registry must not turn recovery into a panic: the flags are a
     // best-effort cooperative signal and the durable `cancel_requested_at` is
     // the authority. Recover the guard and keep going.
@@ -129,13 +139,12 @@ static CHAT_RUN_INTERNAL_STOPS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::OnceLock::new();
 
-fn chat_run_internal_stops()
--> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+fn chat_run_internal_stops() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     CHAT_RUN_INTERNAL_STOPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
-fn lock_chat_run_internal_stops()
--> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+fn lock_chat_run_internal_stops(
+) -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
     chat_run_internal_stops()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -155,19 +164,33 @@ static CHAT_SESSION_EXECUTORS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<String, (String, std::sync::Weak<AtomicBool>)>>,
 > = std::sync::OnceLock::new();
 
-fn session_executors() -> &'static std::sync::Mutex<HashMap<String, (String, std::sync::Weak<AtomicBool>)>> {
+fn session_executors(
+) -> &'static std::sync::Mutex<HashMap<String, (String, std::sync::Weak<AtomicBool>)>> {
     CHAT_SESSION_EXECUTORS.get_or_init(Default::default)
 }
 
 pub(crate) fn register_session_executor(session: &str, control: &ChatRunControl) {
-    let mut live = session_executors().lock().unwrap_or_else(|error| error.into_inner());
+    let mut live = session_executors()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     live.retain(|_, (_, flag)| flag.strong_count() > 0);
-    live.insert(session.into(), (control.run_instance_id.clone(), Arc::downgrade(&control.cancel)));
+    live.insert(
+        session.into(),
+        (
+            control.run_instance_id.clone(),
+            Arc::downgrade(&control.cancel),
+        ),
+    );
 }
 
 pub(crate) fn unregister_session_executor(session: &str, control: &ChatRunControl) {
-    let mut live = session_executors().lock().unwrap_or_else(|error| error.into_inner());
-    if live.get(session).is_some_and(|(id, _)| id == &control.run_instance_id) {
+    let mut live = session_executors()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if live
+        .get(session)
+        .is_some_and(|(id, _)| id == &control.run_instance_id)
+    {
         live.remove(session);
     }
 }
@@ -175,11 +198,15 @@ pub(crate) fn unregister_session_executor(session: &str, control: &ChatRunContro
 /// None means the registry cannot be observed reliably: recovery must not act.
 pub(crate) fn session_executor_alive(session: &str) -> Option<bool> {
     let live = session_executors().lock().ok()?;
-    Some(live.get(session).is_some_and(|(_, flag)| flag.upgrade().is_some()))
+    Some(
+        live.get(session)
+            .is_some_and(|(_, flag)| flag.upgrade().is_some()),
+    )
 }
 
 pub(crate) fn chat_run_executor_alive(run_instance_id: &str) -> bool {
-    lock_chat_run_stop_flags().get(run_instance_id)
+    lock_chat_run_stop_flags()
+        .get(run_instance_id)
         .and_then(std::sync::Weak::upgrade)
         .is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::SeqCst))
 }
@@ -281,17 +308,23 @@ pub fn run_browser_extension_lifecycle_smoke_cli() -> bool {
         eprintln!("usage: CodeFactory --browser-extension-lifecycle-smoke <receipt.json>");
         std::process::exit(2);
     }
-    let result = tokio::runtime::Builder::new_multi_thread().enable_all().build()
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
         .map_err(|_| ())
         .and_then(|runtime| {
             if std::env::var_os("CODEFACTORY_LIFECYCLE_SMOKE_FAIL").is_some() {
                 return Err(());
             }
-            runtime.block_on(browser::extension::lifecycle_smoke::run()).map_err(|_| ())
+            runtime
+                .block_on(browser::extension::lifecycle_smoke::run())
+                .map_err(|_| ())
         });
-    let receipt = result.as_ref().cloned().unwrap_or_else(|_| serde_json::json!({
-        "ok": false, "scenario_id": "E2E-008", "failure_code": "lifecycle_probe_failed"
-    }));
+    let receipt = result.as_ref().cloned().unwrap_or_else(|_| {
+        serde_json::json!({
+            "ok": false, "scenario_id": "E2E-008", "failure_code": "lifecycle_probe_failed"
+        })
+    });
     // Transport errors may contain tokens or paths. Only serialize fixed codes.
     let rendered = serde_json::to_vec_pretty(&receipt).expect("receipt JSON");
     if std::fs::write(&args[2], rendered).is_err() || result.is_err() {
@@ -407,7 +440,9 @@ pub fn run_delivery_recovery_smoke_cli() -> bool {
             let result = runtime.block_on(async {
                 tokio::spawn(agent::delivery_recovery_smoke::run_parent())
                     .await
-                    .map_err(|error| anyhow::anyhow!("delivery recovery parent task failed: {error}"))?
+                    .map_err(|error| {
+                        anyhow::anyhow!("delivery recovery parent task failed: {error}")
+                    })?
             });
             match result {
                 Ok(receipt) => {
@@ -837,7 +872,11 @@ pub fn run_browser_session_smoke_cli() -> bool {
             .execute(&objective_pool)
             .await
             {
-                give_up!("objective_remediation_binding", &error.to_string(), attempts);
+                give_up!(
+                    "objective_remediation_binding",
+                    &error.to_string(),
+                    attempts
+                );
             }
 
             let mut first_claims = match objective_store
@@ -854,22 +893,20 @@ pub fn run_browser_session_smoke_cli() -> bool {
                     attempts
                 );
             };
-            if let Err(error) = sqlx::query(
-                "UPDATE objective_remediations SET lease_expires_at=? WHERE id=?",
-            )
-            .bind(now - 1)
-            .bind(&first_claim.remediation_id)
-            .execute(&objective_pool)
-            .await
+            if let Err(error) =
+                sqlx::query("UPDATE objective_remediations SET lease_expires_at=? WHERE id=?")
+                    .bind(now - 1)
+                    .bind(&first_claim.remediation_id)
+                    .execute(&objective_pool)
+                    .await
             {
                 give_up!("objective_expire_remediation", &error.to_string(), attempts);
             }
-            if let Err(error) =
-                sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
-                    .bind(now - 1)
-                    .bind(&objective_id)
-                    .execute(&objective_pool)
-                    .await
+            if let Err(error) = sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
+                .bind(now - 1)
+                .bind(&objective_id)
+                .execute(&objective_pool)
+                .await
             {
                 give_up!("objective_expire_lease", &error.to_string(), attempts);
             }
@@ -896,7 +933,10 @@ pub fn run_browser_session_smoke_cli() -> bool {
                 resource_generation: first_claim.resource_generation,
             };
             let recovery_lease_reclaimed = replacement_claim.claim_epoch > first_claim.claim_epoch
-                && matches!(objective_store.claim_is_current(&stale_permit).await, Ok(false));
+                && matches!(
+                    objective_store.claim_is_current(&stale_permit).await,
+                    Ok(false)
+                );
             let attempts_before_execute: i64 = match sqlx::query_scalar(
                 "SELECT execution_attempt_index FROM objective_remediations WHERE id=?",
             )
@@ -939,8 +979,8 @@ pub fn run_browser_session_smoke_cli() -> bool {
                 Ok(snapshot) => snapshot,
                 Err(error) => give_up!("replacement_snapshot", &error.to_string(), attempts),
             };
-            let replacement_session_is_new = replacement_session_id != session_id
-                && !replacement_snapshot.is_error;
+            let replacement_session_is_new =
+                replacement_session_id != session_id && !replacement_snapshot.is_error;
 
             let permit = codefactory_agent_loop::tool::MutationPermit {
                 objective_id: replacement_claim.objective.id.clone(),
@@ -995,11 +1035,7 @@ pub fn run_browser_session_smoke_cli() -> bool {
                 Err(error) => give_up!("objective_completion", &error.to_string(), attempts),
             };
             let completed = match objective_store
-                .apply_claimed_decision(
-                    replacement_claim.objective.revision,
-                    completion,
-                    &permit,
-                )
+                .apply_claimed_decision(replacement_claim.objective.revision, completion, &permit)
                 .await
             {
                 Ok(completed) => completed,
@@ -1552,8 +1588,11 @@ pub fn run_headless_smoke_cli() -> bool {
     if flag == "--thin-executor-liveness-smoke" {
         match runtime.block_on(commands::chat::thin_executor_liveness_smoke()) {
             Ok(receipt) => {
-                std::fs::write(&output, serde_json::to_vec_pretty(&receipt).expect("receipt JSON"))
-                    .expect("write liveness receipt");
+                std::fs::write(
+                    &output,
+                    serde_json::to_vec_pretty(&receipt).expect("receipt JSON"),
+                )
+                .expect("write liveness receipt");
                 println!("{receipt}");
                 return true;
             }

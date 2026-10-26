@@ -43,9 +43,7 @@ impl McpManager {
     ) -> crate::errors::Result<String> {
         let mut clients = self.clients.lock().await;
         let client = clients.get_mut(server_id).ok_or_else(|| {
-            crate::errors::AppError::Other(format!(
-                "MCP server '{server_id}' is not running"
-            ))
+            crate::errors::AppError::Other(format!("MCP server '{server_id}' is not running"))
         })?;
         client.call_tool(tool, args).await
     }
@@ -63,10 +61,7 @@ impl McpManager {
     // Not wired into live tool dispatch yet; this `#[allow]` cascades to keep
     // `McpClient::is_alive` and the `child` handle it inspects alive too.
     #[allow(dead_code)]
-    pub async fn restart_dead_servers(
-        &self,
-        configs: &[McpServerConfig],
-    ) -> Vec<String> {
+    pub async fn restart_dead_servers(&self, configs: &[McpServerConfig]) -> Vec<String> {
         let dead_ids: Vec<String> = {
             let mut clients = self.clients.lock().await;
             let mut dead = Vec::new();

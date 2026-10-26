@@ -168,7 +168,9 @@ impl Persistence for SqlitePersistence {
             crate::storage::db::current_process_start_token()
                 .unwrap_or_else(|| "unknown-start".into())
         );
-        let mut tx = crate::storage::db::begin_write(&self.db).await.map_err(perr)?;
+        let mut tx = crate::storage::db::begin_write(&self.db)
+            .await
+            .map_err(perr)?;
         sqlx::query(
             "UPDATE chat_turn_state
              SET recovery_attempt=recovery_attempt+1, updated_at=?
@@ -430,7 +432,9 @@ impl Persistence for SqlitePersistence {
             return Ok(false);
         }
         let marker_id = format!("notice-marker:{}:{marker}", self.session_id);
-        let mut tx = crate::storage::db::begin_write(&self.db).await.map_err(perr)?;
+        let mut tx = crate::storage::db::begin_write(&self.db)
+            .await
+            .map_err(perr)?;
         let inserted = if is_gate_control_state(state) {
             sqlx::query(
                 "INSERT OR IGNORE INTO gate_events \
@@ -570,7 +574,11 @@ impl Persistence for SqlitePersistence {
         .map_err(perr)
     }
 
-    async fn tool_execution_started_at_ms(&self, tool_call: &ToolCall, now_ms: u64) -> PersistResult<u64> {
+    async fn tool_execution_started_at_ms(
+        &self,
+        tool_call: &ToolCall,
+        now_ms: u64,
+    ) -> PersistResult<u64> {
         if self.anonymous {
             return Ok(now_ms);
         }
@@ -683,16 +691,43 @@ mod tests {
         let tool: ToolCall = serde_json::from_value(serde_json::json!({
             "id": "synthetic-m90", "type": "function",
             "function": {"name": "bash", "arguments": "{\"command\":\"cargo test\"}"}
-        })).unwrap();
-        let p = SqlitePersistence { db: db.clone(), session_id: "synthetic".into(), anonymous: false };
-        p.record_tool_call_started("synthetic-message", &tool).await.unwrap();
-        assert_eq!(p.tool_execution_started_at_ms(&tool, 1000).await.unwrap(), 1000);
+        }))
+        .unwrap();
+        let p = SqlitePersistence {
+            db: db.clone(),
+            session_id: "synthetic".into(),
+            anonymous: false,
+        };
+        p.record_tool_call_started("synthetic-message", &tool)
+            .await
+            .unwrap();
+        assert_eq!(
+            p.tool_execution_started_at_ms(&tool, 1000).await.unwrap(),
+            1000
+        );
         drop(p);
-        let restored = SqlitePersistence { db, session_id: "synthetic".into(), anonymous: false };
-        assert_eq!(restored.tool_execution_started_at_ms(&tool, 1_561_000).await.unwrap(), 1000);
+        let restored = SqlitePersistence {
+            db,
+            session_id: "synthetic".into(),
+            anonymous: false,
+        };
+        assert_eq!(
+            restored
+                .tool_execution_started_at_ms(&tool, 1_561_000)
+                .await
+                .unwrap(),
+            1000
+        );
         let timer = codefactory_agent_loop::command_activity::CommandActivityTimer::new(
-            restored.tool_execution_started_at_ms(&tool, 1_561_000).await.unwrap());
-        assert_eq!(timer.label(1_561_000, "命令", Some("cargo test")), "cargo test 已运行约 26 分钟");
+            restored
+                .tool_execution_started_at_ms(&tool, 1_561_000)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            timer.label(1_561_000, "命令", Some("cargo test")),
+            "cargo test 已运行约 26 分钟"
+        );
     }
 
     async fn pool() -> SqlitePool {

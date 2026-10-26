@@ -32,7 +32,11 @@ impl DispatchHost for RecordingHost {
             // CF-HDE-R1/R2: a project that does not exist is refused by the host,
             // not silently turned into "create a project somewhere".
             Request::CreateAndSend { project, .. } => {
-                if !self.projects_that_exist.iter().any(|known| known == project) {
+                if !self
+                    .projects_that_exist
+                    .iter()
+                    .any(|known| known == project)
+                {
                     return Err(ErrorBody::not_found("project not found".to_string()));
                 }
                 Ok(serde_json::json!({ "session_id": "created-1" }))
@@ -43,7 +47,9 @@ impl DispatchHost for RecordingHost {
                 "latest_reply": "working on it",
                 "pr_number": 590,
             })),
-            Request::ListApprovals {} => Ok(serde_json::json!([{ "approval_id": "a-1", "risk": "high" }])),
+            Request::ListApprovals {} => {
+                Ok(serde_json::json!([{ "approval_id": "a-1", "risk": "high" }]))
+            }
             _ => Ok(serde_json::json!({ "ok": true })),
         }
     }
@@ -99,11 +105,13 @@ fn normal_path_creates_sends_sets_permission_and_reads_state() {
     assert_eq!(created.result.unwrap()["session_id"], "created-1");
 
     // CF-HDE-R1: set the permission mode (trusted, so an unattended run proceeds).
-    assert!(send(
-        &h,
-        r#"{"operation":"set_permission","session_id":"s-1","permission_mode":"trusted"}"#
-    )
-    .ok);
+    assert!(
+        send(
+            &h,
+            r#"{"operation":"set_permission","session_id":"s-1","permission_mode":"trusted"}"#
+        )
+        .ok
+    );
 
     // CF-HDE-R1: query objective state / latest reply / PR number.
     let status = send(&h, r#"{"operation":"status","session_id":"s-1"}"#);
@@ -139,11 +147,13 @@ fn every_r6_capability_round_trips_over_the_real_socket() {
     // CF-HDE-R6: an approval is resolved one request at a time — never blanket.
     let listed = send(&h, r#"{"operation":"list_approvals"}"#);
     assert_eq!(listed.result.unwrap()[0]["approval_id"], "a-1");
-    assert!(send(
-        &h,
-        r#"{"operation":"resolve_approval","approval_id":"a-1","approve":false}"#
-    )
-    .ok);
+    assert!(
+        send(
+            &h,
+            r#"{"operation":"resolve_approval","approval_id":"a-1","approve":false}"#
+        )
+        .ok
+    );
 }
 
 #[test]
@@ -246,7 +256,8 @@ fn admission_is_identical_whether_delivery_was_requested_or_not() {
     )
     .unwrap();
     let Request::Send {
-        delivery_authorized, ..
+        delivery_authorized,
+        ..
     } = from_entry
     else {
         panic!("expected a send request");

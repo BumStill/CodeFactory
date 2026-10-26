@@ -86,5 +86,4 @@ mod tests {
         assert_eq!(m.content, "");
         let _ = std::fs::remove_dir_all(cwd);
     }
-
 }

@@ -356,9 +356,7 @@ pub(crate) async fn reconcile_provider_recovery_on_startup(
 
     let now = chrono::Utc::now().timestamp_millis();
     let provider = super::provider_recovery::ProviderRecoveryStore::new(pool.clone());
-    provider
-        .reconcile_stale_effect_free_in_flight(now)
-        .await?;
+    provider.reconcile_stale_effect_free_in_flight(now).await?;
     let candidates = provider.startup_recovery_candidates(now).await?;
     let store = ObjectiveStore::new(pool.clone());
     let mut reconciled = 0;
@@ -1434,12 +1432,15 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
             // R4: thin sessions are heartbeat-only. A waiting_wake row is
             // woken while its wake source exists, and an expired source turns
             // into an explicit question for the user instead of silence.
-            let thin_sessions: Result<Vec<String>, _> = sqlx::query_scalar(
-                "SELECT id FROM sessions WHERE delivery_mode='thin'",
-            ).fetch_all(&pool).await;
+            let thin_sessions: Result<Vec<String>, _> =
+                sqlx::query_scalar("SELECT id FROM sessions WHERE delivery_mode='thin'")
+                    .fetch_all(&pool)
+                    .await;
             if let Ok(sessions) = thin_sessions {
                 for session in sessions {
-                    if let Err(error) = super::thin_derive::heartbeat_external(&pool, &session).await {
+                    if let Err(error) =
+                        super::thin_derive::heartbeat_external(&pool, &session).await
+                    {
                         tracing::warn!(%error, session, "thin external observation heartbeat failed");
                     }
                     if let Err(error) = super::thin_derive::refresh(&pool, &session).await {
@@ -1569,14 +1570,12 @@ mod tests {
     /// supervisor sweep must reap it without any restart.
     #[tokio::test]
     async fn supervisor_reaps_an_active_objective_whose_run_control_already_settled() {
-        let root = std::env::temp_dir().join(format!("codefactory-u23-r7-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("codefactory-u23-r7-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let pool = crate::storage::db::connect(&format!(
-            "sqlite:{}",
-            root.join("r7.db").display()
-        ))
-        .await
-        .expect("open the production-configured database");
+        let pool = crate::storage::db::connect(&format!("sqlite:{}", root.join("r7.db").display()))
+            .await
+            .expect("open the production-configured database");
         let store = ObjectiveStore::new(pool.clone());
         let now = chrono::Utc::now().timestamp_millis();
 
@@ -1757,7 +1756,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            reaped.iter().map(|objective| objective.id.clone()).collect::<Vec<_>>(),
+            reaped
+                .iter()
+                .map(|objective| objective.id.clone())
+                .collect::<Vec<_>>(),
             vec![orphan.id.clone()],
             "only the Objective whose run control already settled is reaped"
         );
@@ -2702,14 +2704,12 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        sqlx::query(
-            "UPDATE objective_remediations SET lease_expires_at=? WHERE id=?",
-        )
-        .bind(now - 1)
-        .bind(&first_claim.remediation_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE objective_remediations SET lease_expires_at=? WHERE id=?")
+            .bind(now - 1)
+            .bind(&first_claim.remediation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("UPDATE objectives SET lease_expires_at=? WHERE id=?")
             .bind(now - 1)
             .bind(&objective.id)
@@ -2730,16 +2730,25 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(attempts_before_execute, 0, "lease takeover is not execution");
+        assert_eq!(
+            attempts_before_execute, 0,
+            "lease takeover is not execution"
+        );
 
         let adapter = DEFAULT_ADAPTER_REGISTRY
             .adapter_for(RecoveryDomain::Browser)
             .unwrap();
         let permit = mutation_permit(&replacement, "browser-owner-new");
-        drive_adapter(adapter, &store, &replacement, &permit, |executor| async move {
-            assert_eq!(executor, AdapterExecutor::Browser);
-            Ok(())
-        })
+        drive_adapter(
+            adapter,
+            &store,
+            &replacement,
+            &permit,
+            |executor| async move {
+                assert_eq!(executor, AdapterExecutor::Browser);
+                Ok(())
+            },
+        )
         .await
         .unwrap();
         let attempts_after_execute: i64 = sqlx::query_scalar(
@@ -3574,7 +3583,12 @@ mod tests {
         // The turn that died: a POST went out, nothing came back.
         open_run("run-chat-inflight-1", now).await;
         let permit1 = ProviderOwnerPermit::chat_run(
-            &objective.id, 1, "binding-chat-inflight", 1, "run-chat-inflight-1", 1,
+            &objective.id,
+            1,
+            "binding-chat-inflight",
+            1,
+            "run-chat-inflight-1",
+            1,
         );
         provider
             .open_episode(&permit1, &episode_spec("episode-chat-inflight-1"), now)
@@ -3606,7 +3620,12 @@ mod tests {
         // A resume that does NOT settle the attempt first is fenced — correctly.
         open_run("run-chat-inflight-2", now + 4).await;
         let permit2 = ProviderOwnerPermit::chat_run(
-            &objective.id, 1, "binding-chat-inflight", 1, "run-chat-inflight-2", 1,
+            &objective.id,
+            1,
+            "binding-chat-inflight",
+            1,
+            "run-chat-inflight-2",
+            1,
         );
         let fenced = provider
             .open_episode(&permit2, &episode_spec("episode-chat-inflight-2"), now + 5)
@@ -3637,7 +3656,12 @@ mod tests {
         // With the attempt settled, the very same resume now proceeds.
         open_run("run-chat-inflight-3", now + 7).await;
         let permit3 = ProviderOwnerPermit::chat_run(
-            &objective.id, 1, "binding-chat-inflight", 1, "run-chat-inflight-3", 1,
+            &objective.id,
+            1,
+            "binding-chat-inflight",
+            1,
+            "run-chat-inflight-3",
+            1,
         );
         let opened = provider
             .open_episode(&permit3, &episode_spec("episode-chat-inflight-3"), now + 8)
@@ -3725,8 +3749,7 @@ mod tests {
                     candidate_snapshot_digest:
                         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                             .into(),
-                    candidate_snapshot_json:
-                        r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
+                    candidate_snapshot_json: r#"[{"endpoint":"test","model":"test-model"}]"#.into(),
                     resume_cursor: objective.root_turn_id.clone().unwrap(),
                 },
                 now,
@@ -4261,13 +4284,12 @@ mod tests {
         let old_remediation_id = claim.remediation_id.clone();
         let heartbeat_remediation_id = old_remediation_id.clone();
 
-        let initial_expires_at: i64 = sqlx::query_scalar(
-            "SELECT lease_expires_at FROM objective_remediations WHERE id=?",
-        )
-        .bind(&claim.remediation_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let initial_expires_at: i64 =
+            sqlx::query_scalar("SELECT lease_expires_at FROM objective_remediations WHERE id=?")
+                .bind(&claim.remediation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         // The adapter must stay pending across several heartbeats and the
         // renewals have to be *observed*. The old body slept 4.5s of wall clock
         // and trusted that the heartbeat task had been scheduled inside that

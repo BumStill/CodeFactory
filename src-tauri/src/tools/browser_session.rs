@@ -815,10 +815,14 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             // Thin task resources survive command/argument errors. Only a
             // failed creation or explicit close ends the lease here; task
             // settlement and the 20-minute idle TTL remain cleanup owners.
-            if thin && session_kind == BrowserSessionKind::Managed
-                && !matches!(args.action.as_str(), "open" | "close") {
-                if let Some(mut lease) = read_leases().into_iter()
-                    .find(|lease| lease.session_id == session_id) {
+            if thin
+                && session_kind == BrowserSessionKind::Managed
+                && !matches!(args.action.as_str(), "open" | "close")
+            {
+                if let Some(mut lease) = read_leases()
+                    .into_iter()
+                    .find(|lease| lease.session_id == session_id)
+                {
                     lease.updated_at_unix_secs = now_secs();
                     write_lease(&lease);
                 }
@@ -1528,10 +1532,17 @@ mod tests {
 
     async fn mode_ctx(mode: &str) -> ExecCtx {
         let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::raw_sql("CREATE TABLE sessions (id TEXT PRIMARY KEY, kind TEXT, delivery_mode TEXT);")
-            .execute(&db).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, kind TEXT, delivery_mode TEXT);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO sessions VALUES ('synthetic-browser', 'anonymous', ?)")
-            .bind(mode).execute(&db).await.unwrap();
+            .bind(mode)
+            .execute(&db)
+            .await
+            .unwrap();
         let mut ctx = ExecCtx::new(std::env::temp_dir(), Some(db));
         ctx.session_id = Some("synthetic-browser".into());
         ctx
@@ -1555,7 +1566,9 @@ mod tests {
                     // Read the request before replying, rather than treating
                     // WouldBlock as an HTTP request and racing Chrome.
                     stream.set_nonblocking(false).unwrap();
-                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
                     let mut request = [0; 4096];
                     let _ = stream.read(&mut request);
                     let body = "<html><head><title>Thin Browser Fixture</title></head><body><h1>Receipt-free navigation works</h1></body></html>";
@@ -1565,27 +1578,74 @@ mod tests {
                 }
             }
         });
-        let output = execute(json!({"action":"open", "url":format!("http://{address}/fixture")}), &ctx).await.unwrap();
+        let output = execute(
+            json!({"action":"open", "url":format!("http://{address}/fixture")}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let followup_ctx = mode_ctx("thin").await;
-        let tabs = execute(json!({"action":"tabs"}), &followup_ctx).await.unwrap();
-        let invalid = execute(json!({"action":"find"}), &followup_ctx).await.unwrap();
-        let snapshot = execute(json!({"action":"snapshot"}), &followup_ctx).await.unwrap();
-        let read = execute(json!({"action":"read"}), &followup_ctx).await.unwrap();
-        let closed = execute(json!({"action":"close"}), &followup_ctx).await.unwrap();
+        let tabs = execute(json!({"action":"tabs"}), &followup_ctx)
+            .await
+            .unwrap();
+        let invalid = execute(json!({"action":"find"}), &followup_ctx)
+            .await
+            .unwrap();
+        let snapshot = execute(json!({"action":"snapshot"}), &followup_ctx)
+            .await
+            .unwrap();
+        let read = execute(json!({"action":"read"}), &followup_ctx)
+            .await
+            .unwrap();
+        let closed = execute(json!({"action":"close"}), &followup_ctx)
+            .await
+            .unwrap();
         let cleanup = close_all_for_owner_session("synthetic-browser").await;
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
-        assert_eq!(output.status, super::super::ToolExecutionStatus::Done, "{output:?}");
-        assert!(output.content.contains("Thin Browser Fixture"), "{output:?}");
+        assert_eq!(
+            output.status,
+            super::super::ToolExecutionStatus::Done,
+            "{output:?}"
+        );
+        assert!(
+            output.content.contains("Thin Browser Fixture"),
+            "{output:?}"
+        );
         assert!(output.content.contains("Receipt-free navigation works"));
-        assert_eq!(tabs.status, super::super::ToolExecutionStatus::Done, "{tabs:?}");
-        assert!(tabs.content.contains("0 | Thin Browser Fixture (active)"), "{tabs:?}");
-        assert!(tabs.content.contains(&format!("http://{address}/fixture")), "{tabs:?}");
+        assert_eq!(
+            tabs.status,
+            super::super::ToolExecutionStatus::Done,
+            "{tabs:?}"
+        );
+        assert!(
+            tabs.content.contains("0 | Thin Browser Fixture (active)"),
+            "{tabs:?}"
+        );
+        assert!(
+            tabs.content.contains(&format!("http://{address}/fixture")),
+            "{tabs:?}"
+        );
         assert_eq!(invalid.status, super::super::ToolExecutionStatus::Error);
-        assert_eq!(snapshot.status, super::super::ToolExecutionStatus::Done, "{snapshot:?}");
-        assert_eq!(read.status, super::super::ToolExecutionStatus::Done, "{read:?}");
-        assert!(read.content.contains("Receipt-free navigation works"), "{read:?}");
-        assert_eq!(closed.status, super::super::ToolExecutionStatus::Done, "{closed:?}");
+        assert_eq!(
+            snapshot.status,
+            super::super::ToolExecutionStatus::Done,
+            "{snapshot:?}"
+        );
+        assert_eq!(
+            read.status,
+            super::super::ToolExecutionStatus::Done,
+            "{read:?}"
+        );
+        assert!(
+            read.content.contains("Receipt-free navigation works"),
+            "{read:?}"
+        );
+        assert_eq!(
+            closed.status,
+            super::super::ToolExecutionStatus::Done,
+            "{closed:?}"
+        );
         assert_eq!(cleanup, 0);
     }
 
@@ -1610,21 +1670,45 @@ mod tests {
                 let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         });
-        let first = execute(json!({"action":"open", "url":format!("http://{address}/repeat")}), &ctx)
-            .await
-            .unwrap();
-        let second = execute(json!({"action":"open", "url":format!("http://{address}/repeat")}), &ctx)
-            .await
-            .unwrap();
+        let first = execute(
+            json!({"action":"open", "url":format!("http://{address}/repeat")}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let second = execute(
+            json!({"action":"open", "url":format!("http://{address}/repeat")}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let cleanup = close_all_for_owner_session("synthetic-browser").await;
         // Each `open` owns its own Managed session — the second open is a
         // second session, not a re-use — so two are torn down here.
         assert_eq!(cleanup, 2);
-        assert_eq!(first.status, super::super::ToolExecutionStatus::Done, "{first:?}");
-        assert_eq!(second.status, super::super::ToolExecutionStatus::Done, "{second:?}");
+        assert_eq!(
+            first.status,
+            super::super::ToolExecutionStatus::Done,
+            "{first:?}"
+        );
+        assert_eq!(
+            second.status,
+            super::super::ToolExecutionStatus::Done,
+            "{second:?}"
+        );
         assert!(first.content.contains("Same document twice"), "{first:?}");
-        let body = |content: &str| content.splitn(2, "\n---\n").nth(1).unwrap_or_default().to_string();
-        assert_eq!(body(&first.content), body(&second.content), "repeated open must be stable");
+        let body = |content: &str| {
+            content
+                .splitn(2, "\n---\n")
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            body(&first.content),
+            body(&second.content),
+            "repeated open must be stable"
+        );
         drop(server);
     }
 
@@ -1653,7 +1737,9 @@ mod tests {
                     // leave that second socket unread for the whole body delay.
                     std::thread::spawn(move || {
                         stream.set_nonblocking(false).unwrap();
-                        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
                         let mut request = [0; 4096];
                         // A preconnect with no request is not an HTTP request.
                         let count = match stream.read(&mut request) {
@@ -1673,18 +1759,30 @@ mod tests {
                 }
             }
         });
-        let output = execute(json!({"action":"open", "url":format!("http://{address}/slow")}), &ctx)
-            .await
-            .unwrap();
+        let output = execute(
+            json!({"action":"open", "url":format!("http://{address}/slow")}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let cleanup = close_all_for_owner_session("synthetic-browser").await;
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         server.join().unwrap();
-        assert_eq!(output.status, super::super::ToolExecutionStatus::Done, "{output:?}");
+        assert_eq!(
+            output.status,
+            super::super::ToolExecutionStatus::Done,
+            "{output:?}"
+        );
         assert!(
             output.content.contains("Slow Fixture Committed"),
             "open must read the committed document, not about:blank: {output:?}"
         );
-        assert!(output.content.contains("Navigation settled before the read"), "{output:?}");
+        assert!(
+            output
+                .content
+                .contains("Navigation settled before the read"),
+            "{output:?}"
+        );
         assert_eq!(cleanup, 1);
     }
 
@@ -1696,13 +1794,27 @@ mod tests {
                 for action in ["open", "attach", "click", "fill", "press", "close"] {
                     let output = execute(json!({"action":action}), &ctx).await.unwrap();
                     assert_eq!(output.status, super::super::ToolExecutionStatus::Waiting);
-                    assert_eq!(output.metadata.unwrap()["code"], "browser_observation_contract_required");
+                    assert_eq!(
+                        output.metadata.unwrap()["code"],
+                        "browser_observation_contract_required"
+                    );
                 }
             }
             for action in ["tabs", "read", "find", "snapshot"] {
-                let output = execute(json!({"action":action,"session_id":"codefactory-absent-fixture"}), &ctx).await.unwrap();
-                assert_eq!(output.status, super::super::ToolExecutionStatus::Error, "{output:?}");
-                assert!(output.content.contains("unknown or has already been reclaimed"));
+                let output = execute(
+                    json!({"action":action,"session_id":"codefactory-absent-fixture"}),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    output.status,
+                    super::super::ToolExecutionStatus::Error,
+                    "{output:?}"
+                );
+                assert!(output
+                    .content
+                    .contains("unknown or has already been reclaimed"));
             }
         }
     }

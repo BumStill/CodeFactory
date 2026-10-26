@@ -46,9 +46,7 @@ fn list_dir_confined(root: &Path, path: &Path, depth: u32) -> Result<Vec<FileNod
     let canon_path = std::fs::canonicalize(path)
         .map_err(|e| AppError::Other(format!("path unavailable: {e}")))?;
     if !canon_path.starts_with(&canon_root) {
-        return Err(AppError::Other(
-            "path is outside the workspace root".into(),
-        ));
+        return Err(AppError::Other("path is outside the workspace root".into()));
     }
     read_dir_recursive(&canon_path, depth)
 }
@@ -259,12 +257,7 @@ mod tests {
 
         // A path outside the workspace root is rejected, not enumerated.
         let outside = TempDir::new().unwrap();
-        let bad = list_dir(
-            outside.path().to_string_lossy().to_string(),
-            root_s,
-            1,
-        )
-        .await;
+        let bad = list_dir(outside.path().to_string_lossy().to_string(), root_s, 1).await;
         assert!(bad.is_err());
     }
 }

@@ -419,8 +419,8 @@ impl ProviderRecoveryStore {
             let attempt_status: Option<String> = prior.try_get("attempt_status")?;
             let historical_side_effect = prior.get::<i64, _>("binding_side_effect_started") != 0
                 || prior.get::<i64, _>("objective_side_effect_started") != 0;
-            let settled_receipts_prove_history = !historical_side_effect
-                || prior.get::<i64, _>("settled_receipt_count") > 0;
+            let settled_receipts_prove_history =
+                !historical_side_effect || prior.get::<i64, _>("settled_receipt_count") > 0;
             // Episode/binding/objective output latches are intentionally
             // monotonic across model rounds. Recovery safety is therefore
             // decided by the latest request plus exact side-effect receipts,
@@ -536,13 +536,23 @@ impl ProviderRecoveryStore {
                    WHERE receipt.objective_id=provider_route_attempts.objective_id
                      AND receipt.status IN ('started','unknown'))",
         )
-        .bind(now).bind(now).bind(&permit.objective_id).bind(&permit.binding_id)
-        .bind(permit.resource_generation).bind(permit.objective_revision)
-        .bind(permit.objective_revision).bind(&permit.owner_kind)
-        .bind(&permit.owner_id).bind(permit.owner_epoch)
-        .bind(permit.objective_revision).bind(&permit.owner_kind)
-        .bind(&permit.owner_id).bind(permit.owner_epoch)
-        .execute(&mut *tx).await?.rows_affected();
+        .bind(now)
+        .bind(now)
+        .bind(&permit.objective_id)
+        .bind(&permit.binding_id)
+        .bind(permit.resource_generation)
+        .bind(permit.objective_revision)
+        .bind(permit.objective_revision)
+        .bind(&permit.owner_kind)
+        .bind(&permit.owner_id)
+        .bind(permit.owner_epoch)
+        .bind(permit.objective_revision)
+        .bind(&permit.owner_kind)
+        .bind(&permit.owner_id)
+        .bind(permit.owner_epoch)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         let unsafe_attempt: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM provider_route_attempts a
              WHERE a.objective_id=? AND a.binding_id=? AND a.resource_generation=?
@@ -595,9 +605,14 @@ impl ProviderRecoveryStore {
                    WHERE receipt.objective_id=provider_route_attempts.objective_id
                      AND receipt.status IN ('started','unknown'))",
         )
-        .bind(now).bind(now).bind(&spec.episode_id)
-        .bind(&permit.owner_kind).bind(&permit.owner_id).bind(permit.owner_epoch)
-        .execute(&mut *tx).await?;
+        .bind(now)
+        .bind(now)
+        .bind(&spec.episode_id)
+        .bind(&permit.owner_kind)
+        .bind(&permit.owner_id)
+        .bind(permit.owner_epoch)
+        .execute(&mut *tx)
+        .await?;
 
         // M98: the provider round before an upgrade restart already committed
         // its response and persisted the text, but the old owner never settled
@@ -616,9 +631,14 @@ impl ProviderRecoveryStore {
                    WHERE receipt.objective_id=provider_route_attempts.objective_id
                      AND receipt.status IN ('started','unknown'))",
         )
-        .bind(now).bind(now).bind(&spec.episode_id)
-        .bind(&permit.owner_kind).bind(&permit.owner_id).bind(permit.owner_epoch)
-        .execute(&mut *tx).await?;
+        .bind(now)
+        .bind(now)
+        .bind(&spec.episode_id)
+        .bind(&permit.owner_kind)
+        .bind(&permit.owner_id)
+        .bind(permit.owner_epoch)
+        .execute(&mut *tx)
+        .await?;
 
         if let Some(existing) = load_attempt(&mut tx, &spec.id).await? {
             ensure_existing_attempt_matches(&existing, permit, spec)?;
@@ -1705,8 +1725,7 @@ impl ProviderRecoveryStore {
                     || row.get::<i64, _>("objective_side_effect") != 0;
                 let has_side_effect = row.get::<i64, _>("episode_side_effect") != 0
                     || row.get::<i64, _>("unresolved_receipt_count") != 0
-                    || (historical_side_effect
-                        && row.get::<i64, _>("settled_receipt_count") == 0)
+                    || (historical_side_effect && row.get::<i64, _>("settled_receipt_count") == 0)
                     || row
                         .try_get::<Option<i64>, _>("attempt_side_effect")?
                         .unwrap_or_default()

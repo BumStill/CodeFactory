@@ -99,8 +99,8 @@ pub(super) fn local_write(root: &Path, path: &str) -> bool {
 /// module does not fully understand.
 fn tokenize(command: &str) -> Option<Vec<String>> {
     const REJECTED: &[&str] = &[
-        ";", "&&", "||", "|", "&", ">", "<", "`", "$", "(", ")", "{", "}", "*", "?", "[", "]",
-        "~", "\n", "\r", "\"", "'", "\\", "!", "#",
+        ";", "&&", "||", "|", "&", ">", "<", "`", "$", "(", ")", "{", "}", "*", "?", "[", "]", "~",
+        "\n", "\r", "\"", "'", "\\", "!", "#",
     ];
     if command.trim().is_empty() || REJECTED.iter().any(|token| command.contains(token)) {
         return None;
@@ -199,11 +199,7 @@ mod tests {
             std::fs::create_dir_all(&outside).unwrap();
             std::fs::write(root.join("build.sh"), "#!/bin/sh\necho ok\n").unwrap();
             std::fs::write(root.join("notes.txt"), "draft\n").unwrap();
-            Fixture {
-                dir,
-                root,
-                outside,
-            }
+            Fixture { dir, root, outside }
         }
     }
 
@@ -318,7 +314,11 @@ mod tests {
         {
             std::os::unix::fs::symlink(&fixture.outside, fixture.root.join("escape")).unwrap();
             std::fs::write(fixture.outside.join("seed.txt"), "x\n").unwrap();
-            for command in ["rm -rf escape", "rm -rf escape/new", "bash escape/script.sh"] {
+            for command in [
+                "rm -rf escape",
+                "rm -rf escape/new",
+                "bash escape/script.sh",
+            ] {
                 assert!(
                     !local_delete(&fixture.root, command),
                     "symlink escape must ask: {command}"

@@ -182,12 +182,11 @@ mod tests {
         assert!(out.content.contains("3 个并行子任务"));
         assert!(out.content.contains("调度器运行中"));
 
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT session_id, status, cwd FROM task_runs ORDER BY created_at",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT session_id, status, cwd FROM task_runs ORDER BY created_at")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows.len(), 3);
         for (session_id, status, cwd) in rows {
             assert_eq!(session_id, "session-1");

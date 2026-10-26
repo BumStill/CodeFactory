@@ -30,7 +30,10 @@ impl OpenRouterClient {
             .header("X-Title", "CodeFactory")
             .send()
             .await?;
-        let resp: ModelsResponse = crate::http_util::check_status(response).await?.json().await?;
+        let resp: ModelsResponse = crate::http_util::check_status(response)
+            .await?
+            .json()
+            .await?;
         Ok(resp.data)
     }
 

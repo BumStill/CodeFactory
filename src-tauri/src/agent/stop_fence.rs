@@ -298,12 +298,19 @@ pub fn stop_pending_pr_actions(
 
 /// Persist one user-facing notice per input turn, even when stop is invoked
 /// concurrently through the menu and dispatch entry. Audit notes stay in logs.
-pub async fn persist_stop_notice(pool: &SqlitePool, session_id: &str, notice: &str) -> sqlx::Result<()> {
+pub async fn persist_stop_notice(
+    pool: &SqlitePool,
+    session_id: &str,
+    notice: &str,
+) -> sqlx::Result<()> {
     let mut tx = crate::storage::db::begin_write(pool).await?;
     let root: Option<String> = sqlx::query_scalar(
         "SELECT id FROM messages WHERE session_id=? AND role='user' ORDER BY created_at DESC, rowid DESC LIMIT 1"
     ).bind(session_id).fetch_optional(&mut *tx).await?;
-    let id = format!("stop-notice:{session_id}:{}", root.as_deref().unwrap_or("before-input"));
+    let id = format!(
+        "stop-notice:{session_id}:{}",
+        root.as_deref().unwrap_or("before-input")
+    );
     sqlx::query("INSERT INTO messages (id,session_id,role,content,created_at) VALUES (?,?,'assistant',?,?) ON CONFLICT(id) DO UPDATE SET content=excluded.content WHERE messages.session_id=excluded.session_id")
         .bind(id).bind(session_id).bind(notice).bind(chrono::Utc::now().timestamp_millis())
         .execute(&mut *tx).await?;
@@ -403,8 +410,11 @@ pub async fn stop_session_delivery(
     workspace_hint: Option<&std::path::Path>,
 ) -> Result<StopDisarmReport, sqlx::Error> {
     let pr_number = latest_session_pr(pool, session_id).await;
-    let has_delivery: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_runs WHERE session_id=?")
-        .bind(session_id).fetch_one(pool).await?;
+    let has_delivery: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM delivery_runs WHERE session_id=?")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await?;
     record_stop(
         pool,
         session_id,
@@ -443,23 +453,40 @@ mod tests {
 
     #[tokio::test]
     async fn m144_stop_without_delivery_is_plain_and_idempotent_per_turn() {
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at) VALUES ('m144-stop','synthetic','/tmp','model',1,1)").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('root-a','m144-stop','user','synthetic',1)").execute(&pool).await.unwrap();
-        let report = stop_session_delivery(&pool, "m144-stop", "user_stop", None).await.unwrap();
+        let report = stop_session_delivery(&pool, "m144-stop", "user_stop", None)
+            .await
+            .unwrap();
         assert!(!report.notice.contains("PR"));
         assert!(!report.notice.contains("编排方"));
         let (first, second) = tokio::join!(
             persist_stop_notice(&pool, "m144-stop", &report.notice),
             persist_stop_notice(&pool, "m144-stop", &report.notice)
         );
-        first.unwrap(); second.unwrap();
-        let rows: Vec<String> = sqlx::query_scalar("SELECT content FROM messages WHERE session_id='m144-stop' AND role='assistant'").fetch_all(&pool).await.unwrap();
+        first.unwrap();
+        second.unwrap();
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT content FROM messages WHERE session_id='m144-stop' AND role='assistant'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(rows, vec![report.notice]);
         assert!(stop_fence(&pool, "m144-stop").await.unwrap().is_some());
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('root-b','m144-stop','user','synthetic again',2)").execute(&pool).await.unwrap();
-        persist_stop_notice(&pool, "m144-stop", "已停止。").await.unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id='m144-stop' AND role='assistant'").fetch_one(&pool).await.unwrap();
+        persist_stop_notice(&pool, "m144-stop", "已停止。")
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE session_id='m144-stop' AND role='assistant'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 2, "a new user turn must get its own stop receipt");
         pool.close().await;
     }

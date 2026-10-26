@@ -55,7 +55,11 @@ async fn candidates() -> Vec<&'static str> {
 }
 
 async fn command_exists(name: &str) -> bool {
-    let probe = if cfg!(target_os = "windows") { "where" } else { "which" };
+    let probe = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
     Command::new(probe)
         .no_window()
         .arg(name)
@@ -100,7 +104,13 @@ pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// 把像素坐标归一化到 0-1（原点左上）。
-pub fn normalize(left: f32, top: f32, width: f32, height: f32, image: (f32, f32)) -> (f32, f32, f32, f32) {
+pub fn normalize(
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    image: (f32, f32),
+) -> (f32, f32, f32, f32) {
     let (image_w, image_h) = image;
     if image_w <= 0.0 || image_h <= 0.0 {
         return (0.0, 0.0, 0.0, 0.0);
@@ -142,7 +152,12 @@ pub fn parse_tesseract_tsv(tsv: &str) -> Vec<OcrWord> {
         });
     }
     // tesseract 的 tsv 不带画布尺寸；用最大外接矩形近似，避免把坐标丢掉。
-    if words.iter().any(|word| word.width > 1.0 || word.height > 1.0) && extent.0 > 0.0 && extent.1 > 0.0 {
+    if words
+        .iter()
+        .any(|word| word.width > 1.0 || word.height > 1.0)
+        && extent.0 > 0.0
+        && extent.1 > 0.0
+    {
         for word in &mut words {
             let (x, y, w, h) = normalize(word.x, word.y, word.width, word.height, extent);
             word.x = x;
@@ -446,9 +461,18 @@ mod tests {
 
     #[test]
     fn normalize_clamps_and_handles_zero_canvas() {
-        assert_eq!(normalize(50.0, 25.0, 100.0, 50.0, (200.0, 100.0)), (0.25, 0.25, 0.5, 0.5));
-        assert_eq!(normalize(1.0, 1.0, 1.0, 1.0, (0.0, 0.0)), (0.0, 0.0, 0.0, 0.0));
-        assert_eq!(normalize(1000.0, 1000.0, 10.0, 10.0, (100.0, 100.0)), (1.0, 1.0, 0.1, 0.1));
+        assert_eq!(
+            normalize(50.0, 25.0, 100.0, 50.0, (200.0, 100.0)),
+            (0.25, 0.25, 0.5, 0.5)
+        );
+        assert_eq!(
+            normalize(1.0, 1.0, 1.0, 1.0, (0.0, 0.0)),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            normalize(1000.0, 1000.0, 10.0, 10.0, (100.0, 100.0)),
+            (1.0, 1.0, 0.1, 0.1)
+        );
     }
 
     #[test]
@@ -474,7 +498,9 @@ mod tests {
             eprintln!("skipping live OCR check: thumbnail render unavailable");
             return;
         };
-        let result = recognize(&png_path).await.expect("local OCR must read rendered text");
+        let result = recognize(&png_path)
+            .await
+            .expect("local OCR must read rendered text");
         let upper = result.text.to_uppercase();
         assert!(
             upper.contains("HELLO") && upper.contains("42"),

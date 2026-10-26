@@ -9,9 +9,9 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
+use crate::util::command_activity::{self, CommandActivityFailure};
 use crate::util::command_env;
 use crate::util::no_window::NoWindow;
-use crate::util::command_activity::{self, CommandActivityFailure};
 
 // `emit`/`path` are trait methods: without these in scope the non-test build
 // fails with E0599 on every platform that compiles the branch below (the
@@ -434,14 +434,28 @@ async fn execute_inner(
         .unwrap_or(configured_timeout_secs);
     let timeout_duration = timeout_override.unwrap_or(Duration::from_secs(timeout_secs));
     let started = std::time::Instant::now();
-    let activity = ctx.session_id.as_deref().map(|session| command_activity::track_command(session, &a.command));
-    let result = command_activity::output_with_activity(cmd, timeout_duration, activity.as_ref()).await;
+    let activity = ctx
+        .session_id
+        .as_deref()
+        .map(|session| command_activity::track_command(session, &a.command));
+    let result =
+        command_activity::output_with_activity(cmd, timeout_duration, activity.as_ref()).await;
     let duration_ms = started.elapsed().as_millis() as u64;
 
     match result {
         Err(reason @ (CommandActivityFailure::InputRequired | CommandActivityFailure::Stopped)) => {
-            let message = if reason == CommandActivityFailure::InputRequired { command_env::INPUT_REQUIRED_MESSAGE } else { "命令已被停止，进程树已清理；可以继续当前回合。" };
-            Ok(ToolOutput::err(message).with_process_outcome(None, String::new(), message.into(), Some(message.into()), duration_ms))
+            let message = if reason == CommandActivityFailure::InputRequired {
+                command_env::INPUT_REQUIRED_MESSAGE
+            } else {
+                "命令已被停止，进程树已清理；可以继续当前回合。"
+            };
+            Ok(ToolOutput::err(message).with_process_outcome(
+                None,
+                String::new(),
+                message.into(),
+                Some(message.into()),
+                duration_ms,
+            ))
         }
         Err(CommandActivityFailure::Timeout) => {
             let message = format!("Command timed out after {timeout_secs}s");
@@ -452,7 +466,13 @@ async fn execute_inner(
                     &ctx.cwd,
                     timeout_secs,
                 ))
-                .with_process_outcome(None, String::new(), message.clone(), Some(message), duration_ms))
+                .with_process_outcome(
+                    None,
+                    String::new(),
+                    message.clone(),
+                    Some(message),
+                    duration_ms,
+                ))
         }
         Err(CommandActivityFailure::Unavailable | CommandActivityFailure::Failed) => {
             let message = format!(
@@ -467,7 +487,13 @@ async fn execute_inner(
                     &ctx.cwd,
                     timeout_secs,
                 ))
-                .with_process_outcome(None, String::new(), message.clone(), Some(message), duration_ms))
+                .with_process_outcome(
+                    None,
+                    String::new(),
+                    message.clone(),
+                    Some(message),
+                    duration_ms,
+                ))
         }
         Ok(output) => {
             // The guard before launch only knows whether the docker CLI is
@@ -508,7 +534,10 @@ async fn execute_inner(
                 combined.push_str("\n[output truncated]");
             }
             if !output.status.success() {
-                combined.push_str(command_env::shell_failure_hint(&launched_program, &combined));
+                combined.push_str(command_env::shell_failure_hint(
+                    &launched_program,
+                    &combined,
+                ));
             }
             append_audit(
                 &mut combined,
@@ -565,8 +594,8 @@ async fn execute_inner(
 mod pr_body_guard {
     use std::path::{Path, PathBuf};
 
-    use crate::agent::delivery::{self, ReleaseUrgency};
     use super::super::ExecCtx;
+    use crate::agent::delivery::{self, ReleaseUrgency};
 
     /// A rewritten command, plus the audit line and the temp copies it owns.
     pub(super) struct Guarded {
@@ -649,7 +678,9 @@ mod pr_body_guard {
                         // receives.
                         iter.next();
                         match iter.peek().copied() {
-                            Some((escape_index, escaped)) if matches!(escaped, '"' | '\\' | '$' | '`') => {
+                            Some((escape_index, escaped))
+                                if matches!(escaped, '"' | '\\' | '$' | '`') =>
+                            {
                                 text.push(escaped);
                                 iter.next();
                                 end = escape_index + escaped.len_utf8();
@@ -728,13 +759,22 @@ mod pr_body_guard {
     /// Test-facing view of the tokenizer: the unquoted text of every word.
     /// Lets tests assert word boundaries without exposing `Token` internals.
     pub(super) fn token_words(command: &str) -> Vec<String> {
-        tokenize(command).into_iter().map(|token| token.text).collect()
+        tokenize(command)
+            .into_iter()
+            .map(|token| token.text)
+            .collect()
     }
 
     /// Rewrite `gh pr edit` so the body it writes still carries the session trailer.
-    pub(super) fn guard_command(command: &str, cwd: &Path, urgency: ReleaseUrgency) -> Option<Guarded> {
+    pub(super) fn guard_command(
+        command: &str,
+        cwd: &Path,
+        urgency: ReleaseUrgency,
+    ) -> Option<Guarded> {
         let tokens = tokenize(command);
-        let gh = tokens.iter().position(|token| is_program(&token.text, "gh"))?;
+        let gh = tokens
+            .iter()
+            .position(|token| is_program(&token.text, "gh"))?;
         // Tolerate `gh -R owner/repo pr edit`; anything else is not the shape we guard.
         let mut index = gh + 1;
         while let Some(token) = tokens.get(index) {
@@ -774,7 +814,11 @@ mod pr_body_guard {
                     None => break,
                 },
             };
-            position = if inline.is_some() { position + 1 } else { position + 2 };
+            position = if inline.is_some() {
+                position + 1
+            } else {
+                position + 2
+            };
             let updated = delivery::append_release_urgency(value.clone(), Some(urgency));
             if updated == value {
                 continue;
@@ -824,8 +868,8 @@ mod pr_body_guard {
 #[cfg(test)]
 mod guard_tests {
     use super::pr_body_guard::*;
-    use crate::util::no_window::NoWindow;
     use crate::agent::delivery::ReleaseUrgency;
+    use crate::util::no_window::NoWindow;
 
     fn immediate() -> ReleaseUrgency {
         ReleaseUrgency::Immediate
@@ -836,10 +880,26 @@ mod guard_tests {
         let cwd = std::env::temp_dir();
         let guarded = guard_command("gh pr edit 818 --body \"plain body\"", &cwd, immediate())
             .expect("a gh pr edit --body without the trailer must be rewritten");
-        assert!(guarded.command.contains("Release-Urgency: immediate"), "{}", guarded.command);
-        assert!(guarded.command.contains("plain body"), "{}", guarded.command);
-        assert!(guarded.command.starts_with("gh pr edit 818 --body "), "{}", guarded.command);
-        assert!(guarded.note.contains("Release-Urgency: immediate"), "{}", guarded.note);
+        assert!(
+            guarded.command.contains("Release-Urgency: immediate"),
+            "{}",
+            guarded.command
+        );
+        assert!(
+            guarded.command.contains("plain body"),
+            "{}",
+            guarded.command
+        );
+        assert!(
+            guarded.command.starts_with("gh pr edit 818 --body "),
+            "{}",
+            guarded.command
+        );
+        assert!(
+            guarded.note.contains("Release-Urgency: immediate"),
+            "{}",
+            guarded.note
+        );
     }
 
     #[test]
@@ -848,7 +908,10 @@ mod guard_tests {
         // A real body arrives with real newlines inside the quoted word (a shell
         // passes them through), so the guard must see the trailer and stand down.
         let command = "gh pr edit 818 --body \"plain body\n\nRelease-Urgency: immediate\"";
-        assert!(guard_command(command, &cwd, immediate()).is_none(), "{command}");
+        assert!(
+            guard_command(command, &cwd, immediate()).is_none(),
+            "{command}"
+        );
     }
 
     #[test]
@@ -862,7 +925,11 @@ mod guard_tests {
             immediate(),
         )
         .expect("a body file without the trailer must be rewritten");
-        assert!(!guarded.command.contains(&source.display().to_string()), "{}", guarded.command);
+        assert!(
+            !guarded.command.contains(&source.display().to_string()),
+            "{}",
+            guarded.command
+        );
         let copy = guarded
             .command
             .split_once("--body-file ")
@@ -887,8 +954,16 @@ mod guard_tests {
             immediate(),
         )
         .expect("the command must still be recognised");
-        assert!(!guarded.command.contains(&source.display().to_string()), "{}", guarded.command);
-        assert!(guarded.command.contains("--body-file "), "{}", guarded.command);
+        assert!(
+            !guarded.command.contains(&source.display().to_string()),
+            "{}",
+            guarded.command
+        );
+        assert!(
+            guarded.command.contains("--body-file "),
+            "{}",
+            guarded.command
+        );
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "plain body");
     }
 
@@ -899,7 +974,10 @@ mod guard_tests {
         if cfg!(windows) {
             // PowerShell: `\` is a path separator, not an escape, so the path must
             // reach the guard intact or its canonicalize step silently gives up.
-            assert_eq!(words.last().map(String::as_str), Some(r"C:\Users\dev\body.md"));
+            assert_eq!(
+                words.last().map(String::as_str),
+                Some(r"C:\Users\dev\body.md")
+            );
         } else {
             // POSIX shells strip the backslashes — which is exactly why a real
             // command has to quote the path (covered by the case above).
@@ -916,7 +994,6 @@ mod guard_tests {
         assert_eq!(words.last().map(String::as_str), Some("a b/c.md"));
     }
 
-
     #[test]
     fn m147b_unrelated_commands_are_never_rewritten() {
         let cwd = std::env::temp_dir();
@@ -926,7 +1003,10 @@ mod guard_tests {
             "gh pr edit 818 --add-label 'merge-queue: armed'",
             "echo 'gh pr edit 818 --body plain'",
         ] {
-            assert!(guard_command(command, &cwd, immediate()).is_none(), "{command}");
+            assert!(
+                guard_command(command, &cwd, immediate()).is_none(),
+                "{command}"
+            );
         }
     }
 
@@ -939,19 +1019,30 @@ mod guard_tests {
         let fake = dir.path().join("gh");
         std::fs::write(
             &fake,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n", args_file.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                args_file.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let guarded = guard_command("gh pr edit 818 --body 'plain body'", dir.path(), immediate())
-            .expect("the command must be rewritten");
+        let guarded = guard_command(
+            "gh pr edit 818 --body 'plain body'",
+            dir.path(),
+            immediate(),
+        )
+        .expect("the command must be rewritten");
         let status = std::process::Command::new("/bin/sh")
             .no_window()
             .arg("-c")
             .arg(&guarded.command)
             .env(
                 "PATH",
-                format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap_or_default()),
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
             )
             .current_dir(dir.path())
             .status()
@@ -959,7 +1050,10 @@ mod guard_tests {
         assert!(status.success());
         let received = std::fs::read_to_string(&args_file).unwrap();
         assert!(received.contains("plain body"), "{received}");
-        assert!(received.contains("Release-Urgency: immediate"), "{received}");
+        assert!(
+            received.contains("Release-Urgency: immediate"),
+            "{received}"
+        );
     }
 }
 
@@ -991,10 +1085,17 @@ mod tests {
     async fn m143_windows_foreground_outputs_chinese_and_chains() {
         let cwd = tempfile::tempdir().unwrap();
         let ctx = crate::tools::ExecCtx::new(cwd.path().to_path_buf(), None);
-        let out = super::execute(serde_json::json!({"command": "echo 中文"}), &ctx).await.unwrap();
+        let out = super::execute(serde_json::json!({"command": "echo 中文"}), &ctx)
+            .await
+            .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(out.stdout.trim(), "中文");
-        let out = super::execute(serde_json::json!({"command": "echo first && echo second"}), &ctx).await.unwrap();
+        let out = super::execute(
+            serde_json::json!({"command": "echo first && echo second"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         if crate::util::command_env::shell_invocation("").program == "pwsh.exe" {
             assert!(!out.is_error, "{}", out.content);
             assert!(out.content.contains("first") && out.content.contains("second"));

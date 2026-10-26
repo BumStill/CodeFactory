@@ -329,12 +329,11 @@ pub(crate) async fn record_tool_call_metadata(
     // rebuilds history from `messages`, not from an in-memory ToolOutput, so a
     // typed command-repair obligation must travel with the exact tool result.
     let replay_message_id = format!("{id}:result");
-    if let Some(content) = sqlx::query_scalar::<_, String>(
-        "SELECT content FROM messages WHERE id = ?",
-    )
-    .bind(&replay_message_id)
-    .fetch_optional(&mut *transaction)
-    .await?
+    if let Some(content) =
+        sqlx::query_scalar::<_, String>("SELECT content FROM messages WHERE id = ?")
+            .bind(&replay_message_id)
+            .fetch_optional(&mut *transaction)
+            .await?
     {
         if let Ok(mut envelope) = serde_json::from_str::<Value>(&content) {
             if let Some(fields) = envelope.as_object_mut() {

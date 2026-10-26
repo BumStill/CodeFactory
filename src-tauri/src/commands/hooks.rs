@@ -14,10 +14,19 @@ use crate::AppState;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HookAction {
-    LogToFile { path: String },
-    RunCommand { command: String, cwd: Option<String> },
-    EmitEvent { event_name: String },
-    AutoGitCommit { message_template: String },
+    LogToFile {
+        path: String,
+    },
+    RunCommand {
+        command: String,
+        cwd: Option<String>,
+    },
+    EmitEvent {
+        event_name: String,
+    },
+    AutoGitCommit {
+        message_template: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +110,10 @@ pub async fn test_hook(id: String, state: State<'_, AppState>) -> Result<String,
 
     match &hook.action {
         HookAction::LogToFile { path } => {
-            let line = format!("{}\n", serde_json::to_string(&mock_event).unwrap_or_default());
+            let line = format!(
+                "{}\n",
+                serde_json::to_string(&mock_event).unwrap_or_default()
+            );
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -123,9 +135,9 @@ pub async fn test_hook(id: String, state: State<'_, AppState>) -> Result<String,
                 output.status.code().unwrap_or(-1)
             ))
         }
-        HookAction::EmitEvent { event_name } => {
-            Ok(format!("Would emit Tauri event '{event_name}' with mock payload"))
-        }
+        HookAction::EmitEvent { event_name } => Ok(format!(
+            "Would emit Tauri event '{event_name}' with mock payload"
+        )),
         HookAction::AutoGitCommit { message_template } => {
             let msg = message_template
                 .replace("{task_title}", "test-task")
@@ -144,15 +156,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hook_commands_use_the_platform_shell_and_preserve_exit_status() {
-        let cwd = std::env::temp_dir().join(format!(
-            "codefactory-hook-shell-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let cwd =
+            std::env::temp_dir().join(format!("codefactory-hook-shell-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&cwd).unwrap();
 
         let allowed = run_hook_command("printf codefactory-hook-ok", Some(&cwd)).unwrap();
         assert!(allowed.status.success());
-        assert_eq!(String::from_utf8_lossy(&allowed.stdout), "codefactory-hook-ok");
+        assert_eq!(
+            String::from_utf8_lossy(&allowed.stdout),
+            "codefactory-hook-ok"
+        );
 
         let cancelled = run_hook_command("exit 7", Some(&cwd)).unwrap();
         assert_eq!(cancelled.status.code(), Some(7));

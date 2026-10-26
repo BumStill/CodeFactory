@@ -18,13 +18,19 @@ pub struct DocumentPreview {
 fn resolve_document_path(cwd: &Path, requested: &str) -> Result<(PathBuf, String), AppError> {
     let raw = requested.strip_prefix("file://").unwrap_or(requested);
     let path = Path::new(raw);
-    let candidate = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
     let root = std::fs::canonicalize(cwd)
         .map_err(|e| AppError::Other(format!("workspace root unavailable: {e}")))?;
     let resolved = std::fs::canonicalize(&candidate)
         .map_err(|e| AppError::Other(format!("document unavailable: {e}")))?;
     if !resolved.starts_with(&root) {
-        return Err(AppError::Other("document is outside the workspace root".into()));
+        return Err(AppError::Other(
+            "document is outside the workspace root".into(),
+        ));
     }
     if !resolved.is_file() {
         return Err(AppError::Other("document is not a file".into()));
@@ -44,7 +50,8 @@ pub async fn read_document(cwd: String, path: String) -> Result<DocumentPreview,
     let bytes = tokio::fs::read(&resolved).await?;
     const MAX_PREVIEW_BYTES: usize = 512 * 1024;
     let truncated = bytes.len() > MAX_PREVIEW_BYTES;
-    let content = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_PREVIEW_BYTES)]).into_owned();
+    let content =
+        String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_PREVIEW_BYTES)]).into_owned();
     let name = resolved
         .file_name()
         .and_then(|value| value.to_str())

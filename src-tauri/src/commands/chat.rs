@@ -673,16 +673,12 @@ pub async fn cancel_chat(
     // CF-STOP-R1/R2：把"停止"落成**交付自己也能读到**的事实（会话级栅栏），
     // 并顺手关掉这个 PR 还没发生的自动合并：仓库合并队列授权标签 + GitHub
     // auto-merge。已经发生的事不回滚；关不掉的会在报告里如实写出来。
-    match crate::agent::stop_fence::stop_session_delivery(
-        &pool,
-        &session_id,
-        "user_stop",
-        None,
-    )
-    .await
+    match crate::agent::stop_fence::stop_session_delivery(&pool, &session_id, "user_stop", None)
+        .await
     {
         Ok(report) => {
-            crate::agent::stop_fence::persist_stop_notice(&pool, &session_id, &report.notice).await?;
+            crate::agent::stop_fence::persist_stop_notice(&pool, &session_id, &report.notice)
+                .await?;
             tracing::info!(session_id, pr_number = ?report.pr_number,
                 complete = report.is_complete(), notes = ?report.notes,
                 "cancel_chat: 停止栅栏及 PR 撤回结果已写入会话");
@@ -830,7 +826,8 @@ async fn request_chat_run_cancel(
     // This function is the explicit stop entry, not internal fencing. Persist
     // its intent before the control row so setup/registration races retain it.
     crate::agent::objective::ObjectiveStore::new(pool.clone())
-        .request_chat_session_cancel(session_id).await
+        .request_chat_session_cancel(session_id)
+        .await
         .map_err(|error| AppError::Other(error.to_string()))?;
     let now = Utc::now().timestamp_millis();
     let mut tx = crate::storage::db::begin_write(pool).await?;
@@ -1167,7 +1164,9 @@ async fn settle_finished_turn_provider_episodes(
     else {
         return Ok(());
     };
-    if crate::agent::thin::is_thin(pool, &session_id).await { return Ok(()); }
+    if crate::agent::thin::is_thin(pool, &session_id).await {
+        return Ok(());
+    }
     crate::agent::provider_recovery::ProviderRecoveryStore::new(pool.clone())
         .settle_finished_turn_episodes(&session_id, &root_turn_id, now)
         .await
@@ -1276,13 +1275,18 @@ async fn close_objective_in_pool_with_live_run(
         let event_id = uuid::Uuid::new_v4().to_string();
         let changed = sqlx::query("UPDATE objectives SET status='completed',decision_type='complete',revision=revision+1,requires_user_action=0,failure_code=NULL,recovery_owner=NULL,remediation_id=NULL,next_observation_at=NULL,lease_owner=NULL,lease_expires_at=NULL,attention_request_json=NULL,evidence_ref=?,completed_at=?,updated_at=? WHERE id=? AND status='waiting_system' AND reached_acceptance='merged' AND (lease_expires_at IS NULL OR lease_expires_at<=?)")
             .bind(format!("objective_events:{event_id}")).bind(now).bind(now).bind(&id).bind(now).execute(&mut *tx).await?;
-        anyhow::ensure!(changed.rows_affected() == 1, "task is currently owned by a running executor");
+        anyhow::ensure!(
+            changed.rows_affected() == 1,
+            "task is currently owned by a running executor"
+        );
         sqlx::query("INSERT INTO objective_events (id,objective_id,revision,event_type,status,decision_type,domain,detail_json,created_at) SELECT ?,id,revision,'acceptance_confirmed',status,decision_type,domain,?,? FROM objectives WHERE id=?")
             .bind(&event_id).bind(serde_json::json!({"outcome":outcome,"source":"explicit_acceptance"}).to_string()).bind(now).bind(&id).execute(&mut *tx).await?;
         crate::agent::execution_workspace::mark_objective_terminal_in_tx(&mut tx, &id, now).await?;
     }
     tx.commit().await?;
-    crate::agent::objective::ObjectiveStore::new(pool.clone()).get(&id).await?
+    crate::agent::objective::ObjectiveStore::new(pool.clone())
+        .get(&id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("objective disappeared"))
 }
 
@@ -1294,7 +1298,10 @@ pub async fn close_objective(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<crate::agent::objective::ObjectiveSnapshot, AppError> {
-    if objective_id.as_deref().is_some_and(|id| id.trim().is_empty()) {
+    if objective_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+    {
         return Err(AppError::Other(
             "objective_id must be a non-empty string".into(),
         ));
@@ -1324,7 +1331,9 @@ pub async fn is_chat_running(
     }
     let pool = state.db.read().await.clone();
     if crate::agent::thin::is_thin(&pool, &session_id).await {
-        return Ok(crate::agent::thin_derive::refresh(&pool, &session_id).await?.state
+        return Ok(crate::agent::thin_derive::refresh(&pool, &session_id)
+            .await?
+            .state
             == crate::agent::thin_state::SessionState::Running);
     }
     has_progressing_system_chat_run(&pool, &session_id).await
@@ -1404,10 +1413,23 @@ pub(crate) async fn thin_executor_liveness_smoke() -> anyhow::Result<serde_json:
         .bind(&session).bind(fixture.path().to_string_lossy().as_ref()).execute(&pool).await?;
     let control = Arc::new(crate::ChatRunControl::pending());
     let runs: crate::ChatCancelMap = Default::default();
-    admit_chat_run(&runs, &std::sync::atomic::AtomicBool::new(false), &session, control.clone()).await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let admission = admit_persisted_chat_turn(&pool, &control, &session, None, "只读回答 synthetic greeting，不需要编程或交付。")
-        .await.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    admit_chat_run(
+        &runs,
+        &std::sync::atomic::AtomicBool::new(false),
+        &session,
+        control.clone(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let admission = admit_persisted_chat_turn(
+        &pool,
+        &control,
+        &session,
+        None,
+        "只读回答 synthetic greeting，不需要编程或交付。",
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let base = format!("http://{}", listener.local_addr()?);
     listener.set_nonblocking(true)?;
@@ -1421,107 +1443,188 @@ pub(crate) async fn thin_executor_liveness_smoke() -> anyhow::Result<serde_json:
     let server = std::thread::spawn(move || -> anyhow::Result<()> {
         let mut arrived_tx = Some(arrived_tx);
         for round in 0..2 {
-        let deadline = std::time::Instant::now() + Duration::from_secs(45);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    anyhow::ensure!(std::time::Instant::now() < deadline, "model request never arrived");
-                    std::thread::sleep(Duration::from_millis(10));
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        anyhow::ensure!(
+                            std::time::Instant::now() < deadline,
+                            "model request never arrived"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk)?;
+                anyhow::ensure!(count > 0, "truncated model request");
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            if key.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
             }
-        };
-        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-        let mut request = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let count = stream.read(&mut chunk)?;
-            anyhow::ensure!(count > 0, "truncated model request");
-            request.extend_from_slice(&chunk[..count]);
-            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&request[..end]);
-                let length = headers.lines().find_map(|line| {
-                    let (key, value) = line.split_once(':')?;
-                    if key.eq_ignore_ascii_case("content-length") { value.trim().parse::<usize>().ok() } else { None }
-                }).unwrap_or(0);
-                if request.len() >= end + 4 + length { break; }
+            if round == 0 {
+                let _ = arrived_tx.take().expect("first request").send(());
+                release_rx.recv_timeout(Duration::from_secs(30))?;
+                let delta = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"synthetic-fetch","type":"function","function":{"name":"bash","arguments":serde_json::json!({"command":tool_command,"description":"synthetic read-only liveness wait","timeout_sec":15}).to_string()}}]},"finish_reason":null}]});
+                let body = format!("data: {delta}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n");
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)?;
+                continue;
             }
-        }
-        if round == 0 {
-            let _ = arrived_tx.take().expect("first request").send(());
-            release_rx.recv_timeout(Duration::from_secs(30))?;
-            let delta = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"synthetic-fetch","type":"function","function":{"name":"bash","arguments":serde_json::json!({"command":tool_command,"description":"synthetic read-only liveness wait","timeout_sec":15}).to_string()}}]},"finish_reason":null}]});
-            let body = format!("data: {delta}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n");
+            let body = "data: {\"id\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic greeting complete.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)?;
-            continue;
-        }
-        let body = "data: {\"id\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic greeting complete.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)?;
         }
         Ok(())
     });
     let history = crate::storage::load_agent_history(&pool, &session).await?;
     let sink = Arc::new(crate::agent::events::CollectingEventSink::new());
     let mut agent = crate::agent::AgentLoop::new_headless(
-        sink.clone(), pool.clone(), session.clone(),
-        "synthetic-endpoint".into(), "synthetic-model".into(), base, "synthetic-key".into(),
-        crate::config::settings::ApiStyle::Openai, fixture.path().to_path_buf(),
-        Arc::new(tokio::sync::RwLock::new(crate::config::settings::Settings::default())),
+        sink.clone(),
+        pool.clone(),
+        session.clone(),
+        "synthetic-endpoint".into(),
+        "synthetic-model".into(),
+        base,
+        "synthetic-key".into(),
+        crate::config::settings::ApiStyle::Openai,
+        fixture.path().to_path_buf(),
+        Arc::new(tokio::sync::RwLock::new(
+            crate::config::settings::Settings::default(),
+        )),
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        Arc::new(crate::mcp::McpManager::new()), None, crate::agent::AgentMode::Interactive,
-    ).with_cancel(control.cancel.clone());
+        Arc::new(crate::mcp::McpManager::new()),
+        None,
+        crate::agent::AgentMode::Interactive,
+    )
+    .with_cancel(control.cancel.clone());
     let runner = tokio::spawn(async move { agent.run(history).await });
     tokio::time::timeout(Duration::from_secs(30), arrived_rx).await??;
     for _ in 0..3 {
         anyhow::ensure!(!runner.is_finished(), "model wait was not exercised");
         let state = crate::agent::thin_derive::refresh(&pool, &session).await?;
-        anyhow::ensure!(state.state == crate::agent::thin_state::SessionState::Running, "heartbeat ended a live model wait");
-        for grace in [0, crate::agent::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS] {
+        anyhow::ensure!(
+            state.state == crate::agent::thin_state::SessionState::Running,
+            "heartbeat ended a live model wait"
+        );
+        for grace in [
+            0,
+            crate::agent::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS,
+        ] {
             let selected = crate::agent::thin_restart::running_without_executor(
-                &pool, Utc::now().timestamp_millis() + 3_600_000, grace,
+                &pool,
+                Utc::now().timestamp_millis() + 3_600_000,
+                grace,
                 |id| crate::session_executor_alive(id) != Some(false),
-            ).await?;
-            anyhow::ensure!(!selected.contains(&session), "recovery selected a live model wait");
+            )
+            .await?;
+            anyhow::ensure!(
+                !selected.contains(&session),
+                "recovery selected a live model wait"
+            );
         }
-        anyhow::ensure!(!control.cancel.load(Ordering::SeqCst), "heartbeat cancelled the run");
+        anyhow::ensure!(
+            !control.cancel.load(Ordering::SeqCst),
+            "heartbeat cancelled the run"
+        );
     }
     release_tx.send(())?;
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            if sink.events().iter().any(|event| matches!(event,
-                crate::openrouter::types::StreamEvent::ToolCallStart { name, .. } if name == "bash")) { break; }
-            anyhow::ensure!(!runner.is_finished(), "run ended before tool wait: {:?}", sink.events());
+            if sink.events().iter().any(|event| {
+                matches!(event,
+                crate::openrouter::types::StreamEvent::ToolCallStart { name, .. } if name == "bash")
+            }) {
+                break;
+            }
+            anyhow::ensure!(
+                !runner.is_finished(),
+                "run ended before tool wait: {:?}",
+                sink.events()
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         Ok::<_, anyhow::Error>(())
-    }).await??;
+    })
+    .await??;
     for _ in 0..3 {
         anyhow::ensure!(!runner.is_finished(), "tool wait was not exercised");
-        anyhow::ensure!(crate::agent::thin_derive::refresh(&pool, &session).await?.state == crate::agent::thin_state::SessionState::Running, "heartbeat ended tool wait");
-        for grace in [0, crate::agent::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS] {
-            let selected = crate::agent::thin_restart::running_without_executor(&pool,
-                Utc::now().timestamp_millis() + 3_600_000, grace,
-                |id| crate::session_executor_alive(id) != Some(false)).await?;
-            anyhow::ensure!(!selected.contains(&session), "recovery selected live tool wait");
+        anyhow::ensure!(
+            crate::agent::thin_derive::refresh(&pool, &session)
+                .await?
+                .state
+                == crate::agent::thin_state::SessionState::Running,
+            "heartbeat ended tool wait"
+        );
+        for grace in [
+            0,
+            crate::agent::thin_restart::RUNNING_WITHOUT_EXECUTOR_GRACE_MS,
+        ] {
+            let selected = crate::agent::thin_restart::running_without_executor(
+                &pool,
+                Utc::now().timestamp_millis() + 3_600_000,
+                grace,
+                |id| crate::session_executor_alive(id) != Some(false),
+            )
+            .await?;
+            anyhow::ensure!(
+                !selected.contains(&session),
+                "recovery selected live tool wait"
+            );
         }
-        anyhow::ensure!(!control.cancel.load(Ordering::SeqCst), "heartbeat cancelled tool wait");
+        anyhow::ensure!(
+            !control.cancel.load(Ordering::SeqCst),
+            "heartbeat cancelled tool wait"
+        );
     }
-    let outcome = tokio::time::timeout(Duration::from_secs(45), runner).await??
+    let outcome = tokio::time::timeout(Duration::from_secs(45), runner)
+        .await??
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    anyhow::ensure!(outcome.final_text == "Synthetic greeting complete.", "wrong final answer: {:?}", outcome.final_text);
-    server.join().map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
+    anyhow::ensure!(
+        outcome.final_text == "Synthetic greeting complete.",
+        "wrong final answer: {:?}",
+        outcome.final_text
+    );
+    server
+        .join()
+        .map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
     crate::agent::thin_state::settle_final(&pool, &session, &admission.root_turn_id, None).await?;
     clear_chat_running_if_current(&runs, &session, &control).await;
     let state = crate::agent::thin_derive::refresh(&pool, &session).await?;
-    anyhow::ensure!(state.state == crate::agent::thin_state::SessionState::Ended, "answer did not settle");
+    anyhow::ensure!(
+        state.state == crate::agent::thin_state::SessionState::Ended,
+        "answer did not settle"
+    );
     let answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant' AND content='Synthetic greeting complete.'")
         .bind(&session).fetch_one(&pool).await?;
-    anyhow::ensure!(answers == 1, "expected exactly one persisted answer, got {answers}");
+    anyhow::ensure!(
+        answers == 1,
+        "expected exactly one persisted answer, got {answers}"
+    );
     let tool_results: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='tool' AND content LIKE '%Synthetic greeting complete.%'")
         .bind(&session).fetch_one(&pool).await?;
     anyhow::ensure!(tool_results == 1, "real bash result was not persisted");
-    Ok(serde_json::json!({"ok":true,"model_transport":"real_http_sse_synthetic_provider","heartbeat_ticks":6,"startup_and_heartbeat_scans":12,"final_state":"ended","answers":answers,"dispatch_exercised":false,"tool_wait_exercised":true,"bash_results":tool_results}))
+    Ok(
+        serde_json::json!({"ok":true,"model_transport":"real_http_sse_synthetic_provider","heartbeat_ticks":6,"startup_and_heartbeat_scans":12,"final_state":"ended","answers":answers,"dispatch_exercised":false,"tool_wait_exercised":true,"bash_results":tool_results}),
+    )
 }
 
 fn chat_settlement_status(objective: &crate::agent::objective::ObjectiveSnapshot) -> &'static str {
@@ -1658,15 +1761,29 @@ where
 
 pub(crate) fn explicitly_requests_live_acceptance(content: &str) -> bool {
     let normalized = content.to_ascii_lowercase();
-    ["本任务要求真机验收", "本任务要求真机验证", "要求上线验证", "acceptance: live_verification", "ceiling: through_release", "ceiling: released"]
-        .iter().any(|cue| normalized.contains(cue))
+    [
+        "本任务要求真机验收",
+        "本任务要求真机验证",
+        "要求上线验证",
+        "acceptance: live_verification",
+        "ceiling: through_release",
+        "ceiling: released",
+    ]
+    .iter()
+    .any(|cue| normalized.contains(cue))
 }
 
-fn chat_requested_acceptance(kind: crate::agent::objective::ObjectiveKind, content: &str) -> &'static str {
+fn chat_requested_acceptance(
+    kind: crate::agent::objective::ObjectiveKind,
+    content: &str,
+) -> &'static str {
     if kind == crate::agent::objective::ObjectiveKind::Delivery
-        && content.to_ascii_lowercase().contains("ceiling: merged") {
+        && content.to_ascii_lowercase().contains("ceiling: merged")
+    {
         "merged"
-    } else { requested_acceptance(kind) }
+    } else {
+        requested_acceptance(kind)
+    }
 }
 
 fn chat_objective_kind(
@@ -1679,8 +1796,7 @@ fn chat_objective_kind(
         crate::agent::TurnCapability::Implement => ObjectiveKind::LocalMutation,
         crate::agent::TurnCapability::Deliver => {
             let explicit_live = explicitly_requests_live_acceptance(content);
-            if explicit_live
-            {
+            if explicit_live {
                 ObjectiveKind::Live
             } else {
                 ObjectiveKind::Delivery
@@ -1788,7 +1904,11 @@ async fn project_chat_objective(
             let projected = match objective.status {
                 ObjectiveStatus::Active => ("working", "thin_running", "运行中"),
                 ObjectiveStatus::WaitingSystem => ("waiting", "thin_waiting_wake", "等唤醒"),
-                ObjectiveStatus::WaitingCoreInput | ObjectiveStatus::WaitingAuthorization | ObjectiveStatus::WaitingBusinessDecision => ("waiting", "thin_waiting_user", "等用户"),
+                ObjectiveStatus::WaitingCoreInput
+                | ObjectiveStatus::WaitingAuthorization
+                | ObjectiveStatus::WaitingBusinessDecision => {
+                    ("waiting", "thin_waiting_user", "等用户")
+                }
                 _ => ("finalizing", "thin_ended", "已结束；原因与成果见本会话记录"),
             };
             (phase, activity_kind, activity_label) = projected;
@@ -1942,9 +2062,14 @@ async fn apply_chat_objective_outcome(
             // final answer — including a bounded `Blocked` stop — ends the
             // session; only a run with no answer at all counts as a technical
             // failure, so a final answer can never leave the row `running`.
-            let external = if crate::agent::thin::external_wait_hint(db, session).await.is_some() {
+            let external = if crate::agent::thin::external_wait_hint(db, session)
+                .await
+                .is_some()
+            {
                 Some("外部交付（PR/CI）".to_string())
-            } else { None };
+            } else {
+                None
+            };
             let thin = crate::agent::thin_state::settle_outcome(
                 db,
                 session,
@@ -1958,7 +2083,8 @@ async fn apply_chat_objective_outcome(
             .await
             .map_err(|error| AppError::Other(error.to_string()))?;
             crate::agent::thin_state::close_objective(db, objective_id, &thin)
-                .await.map_err(|error| AppError::Other(error.to_string()))?;
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))?;
             return Ok(current);
         }
     }
@@ -1983,15 +2109,20 @@ async fn apply_chat_objective_outcome(
     let thin_waiting = thin
         && outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished
         && crate::agent::background_tasks::wake_source_cover(
-            db, current.session_id.as_deref().unwrap_or_default(),
-        ).await.is_covered();
+            db,
+            current.session_id.as_deref().unwrap_or_default(),
+        )
+        .await
+        .is_covered();
     let unwatched = if thin && !thin_waiting {
         crate::agent::thin::unwatched_wait(db, current.session_id.as_deref().unwrap_or_default())
             .await
             // R5：外部事项（PR/CI/发版/部署）是模型自己能监视的对象，挂监视的提示
             // 发生在工具结果层面；不能再用一条「需要你决定」的决策行去问用户。
             .filter(|what| !crate::agent::thin::is_external_object(what))
-    } else { None };
+    } else {
+        None
+    };
     let decision = if let Some(waiting_for) = unwatched.filter(|_| outcome.stop_reason == codefactory_agent_loop::run::StopReason::Finished) {
         let prompt = format!("需要你决定是否继续等待 {waiting_for}；目前没有唤醒源。请决定继续等待并挂监视，或结束等待。");
         let mut decision = crate::agent::objective::DecisionRouter::route(
@@ -2164,10 +2295,13 @@ async fn settle_chat_objective_from_error(
     // no model is a wait for the model's own recovery, not a failure.
     if let Some(session) = current.session_id.as_deref() {
         if crate::agent::thin::is_thin(db, session).await {
-            let thin = crate::agent::thin_state::settle_error(db, session, root_turn_id, error_text)
-                .await.map_err(|error| AppError::Other(error.to_string()))?;
+            let thin =
+                crate::agent::thin_state::settle_error(db, session, root_turn_id, error_text)
+                    .await
+                    .map_err(|error| AppError::Other(error.to_string()))?;
             crate::agent::thin_state::close_objective(db, objective_id, &thin)
-                .await.map_err(|error| AppError::Other(error.to_string()))?;
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))?;
             project_chat_objective(db, app, event_name, root_turn_id, &current).await?;
             return Ok(current);
         }
@@ -2190,7 +2324,9 @@ async fn settle_chat_objective_from_error(
             .await?;
         }
         // Project the objective's current root, not the stale runner's root.
-        let live_root = current.resume_cursor.as_deref()
+        let live_root = current
+            .resume_cursor
+            .as_deref()
             .filter(|root| !root.is_empty())
             .or(current.root_turn_id.as_deref())
             .unwrap_or(root_turn_id);
@@ -2271,7 +2407,8 @@ async fn settle_chat_objective_from_error(
         unavailable.decision(&current, root_turn_id)
     } else {
         DecisionRouter::route(&current, signal)
-    }.map_err(|error| AppError::Other(error.to_string()))?;
+    }
+    .map_err(|error| AppError::Other(error.to_string()))?;
     // R6 (U23): this write is what schedules the next recovery step. When it was
     // lost to the SQLite write lock, the Objective stayed `active` with nothing
     // scheduled and no owner — the limbo the 2026-10-08 sessions got stuck in,
@@ -2288,7 +2425,11 @@ async fn settle_chat_objective_from_error(
                         .apply_claimed_decision(current.revision, decision.clone(), permit)
                         .await
                 }
-                None => store.apply_decision(current.revision, decision.clone()).await,
+                None => {
+                    store
+                        .apply_decision(current.revision, decision.clone())
+                        .await
+                }
             };
             match outcome {
                 Ok(revised) => break revised,
@@ -2324,10 +2465,22 @@ async fn settle_chat_objective_from_error(
                 .bind(format!("model-availability:{}:{}", revised.id, revised.revision))
                 .bind(session).bind(&unavailable.notice).bind(Utc::now().timestamp_millis())
                 .execute(db).await?;
-            app.emit(event_name, StreamEvent::TransportRetry {
-                label: if unavailable.resume_at_ms.is_some() { "等唤醒" } else { "已结束" }.into(),
-                attempt: 0, max_attempts: 0, delay_ms: 0, reason: unavailable.notice.clone(),
-            }).ok();
+            app.emit(
+                event_name,
+                StreamEvent::TransportRetry {
+                    label: if unavailable.resume_at_ms.is_some() {
+                        "等唤醒"
+                    } else {
+                        "已结束"
+                    }
+                    .into(),
+                    attempt: 0,
+                    max_attempts: 0,
+                    delay_ms: 0,
+                    reason: unavailable.notice.clone(),
+                },
+            )
+            .ok();
         }
     }
     project_chat_objective(db, app, event_name, root_turn_id, &revised).await?;
@@ -2355,8 +2508,7 @@ fn setup_failure_reason(error: &AppError) -> String {
                 历史和摘要都还在，重试即可继续。"
             .to_string();
     }
-    "系统没能准备好这个会话的工作区，这一轮没有开始；历史和摘要都还在，重试即可继续。"
-        .to_string()
+    "系统没能准备好这个会话的工作区，这一轮没有开始；历史和摘要都还在，重试即可继续。".to_string()
 }
 
 /// A detached foreground runner cannot return a settlement error to its IPC
@@ -2398,7 +2550,10 @@ async fn recover_chat_settlement_failure(
     let revised = {
         let mut attempt = 0_u32;
         loop {
-            match store.apply_decision(expected_revision, decision.clone()).await {
+            match store
+                .apply_decision(expected_revision, decision.clone())
+                .await
+            {
                 Ok(revised) => break revised,
                 Err(error)
                     if crate::storage::db::is_contention_anyhow(&error)
@@ -2543,9 +2698,7 @@ async fn converge_aborted_chat_setup(
         let failure_code = "chat_setup_aborted";
         let failure_signature = format!(
             "sha256:{:x}",
-            Sha256::digest(
-                format!("chat_setup_aborted:{}", control.run_instance_id).as_bytes()
-            )
+            Sha256::digest(format!("chat_setup_aborted:{}", control.run_instance_id).as_bytes())
         );
         // The signature makes repeats countable; it does not make them
         // readable. Keep this abort's own text beside the decision that acted
@@ -2684,8 +2837,10 @@ pub(crate) async fn admit_headless_chat_turn(
     // Boxed: this entry runs on a spawned worker's 1 MB Windows main thread
     // where the whole admission state machine would otherwise be embedded in
     // the caller's future.
-    let admission =
-        Box::pin(admit_persisted_chat_turn(pool, &control, session_id, None, content)).await?;
+    let admission = Box::pin(admit_persisted_chat_turn(
+        pool, &control, session_id, None, content,
+    ))
+    .await?;
     Ok(HeadlessChatAdmission {
         root_turn_id: admission.root_turn_id,
         objective: admission.objective,
@@ -2883,8 +3038,12 @@ async fn admit_persisted_chat_turn_with_origin(
     // Best effort: recovery must never fail or serialize an otherwise valid
     // admission (a concurrent writer can hold SQLite's single write lock).
     if let Err(error) = crate::agent::execution_workspace::repair_session_split(
-        pool, session_id, &crate::agent::objective::current_process_instance(),
-    ).await {
+        pool,
+        session_id,
+        &crate::agent::objective::current_process_instance(),
+    )
+    .await
+    {
         tracing::warn!(%error, "split workspace recovery deferred");
     }
     let root_turn_id = requested_root_turn_id
@@ -3068,8 +3227,7 @@ async fn admit_persisted_chat_turn_with_origin(
     let legacy_continuation = if matches!(
         resolution,
         ChatContinuationResolution::None | ChatContinuationResolution::Ambiguous
-    )
-        && crate::agent::is_contextual_approval(content)
+    ) && crate::agent::is_contextual_approval(content)
     {
         sqlx::query_as::<_, (String, String)>(
             "SELECT segment.id, segment.goal_root_turn_id
@@ -3111,7 +3269,9 @@ async fn admit_persisted_chat_turn_with_origin(
         },
         ChatContinuationResolution::None | ChatContinuationResolution::Ambiguous => {
             ChatContinuationSetup {
-                continuation_root_turn_id: legacy_continuation.as_ref().map(|(_, root)| root.clone()),
+                continuation_root_turn_id: legacy_continuation
+                    .as_ref()
+                    .map(|(_, root)| root.clone()),
                 previous_segment_id: legacy_continuation.map(|(segment, _)| segment),
                 expected_objective_id: None,
                 driver: None,
@@ -3308,7 +3468,9 @@ async fn admit_persisted_chat_turn_with_origin(
     // Background recovery and late writes cannot clear the cancellation.
     let has_thin_state: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_session_state'",
-    ).fetch_one(&mut *tx).await?;
+    )
+    .fetch_one(&mut *tx)
+    .await?;
     if fresh_user_message && control_status != "cancel_requested" && has_thin_state == 1 {
         sqlx::query("DELETE FROM thin_session_state WHERE session_id=? AND state='ended' AND reason LIKE 'cancelled%'")
             .bind(session_id).execute(&mut *tx).await?;
@@ -3552,7 +3714,11 @@ async fn send_message_with_origin(
         origin,
     )
     .await?;
-    tracing::debug!(stage = "admission", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "first request preparation");
+    tracing::debug!(
+        stage = "admission",
+        elapsed_ms = preparation_started.elapsed().as_millis() as u64,
+        "first request preparation"
+    );
     let setup_started = std::time::Instant::now();
     let root_turn_id = admission.root_turn_id;
     let objective = admission.objective;
@@ -3717,7 +3883,11 @@ async fn send_message_with_origin(
         }
     }
 
-    tracing::debug!(stage = "workspace_checkpoint", elapsed_ms = setup_started.elapsed().as_millis() as u64, "first request preparation");
+    tracing::debug!(
+        stage = "workspace_checkpoint",
+        elapsed_ms = setup_started.elapsed().as_millis() as u64,
+        "first request preparation"
+    );
     let route_started = std::time::Instant::now();
     // Freeze all locally usable routes for this turn. This is a runtime
     // availability plan only: it never overwrites the user's preferred
@@ -3735,15 +3905,21 @@ async fn send_message_with_origin(
         settings: turn_settings,
         plan: route_plan,
         excluded: excluded_routes,
-    } = setup_or_recover!(resolve_turn_route(
-        &settings,
-        session.endpoint_id.as_deref(),
-        &session.model_id,
-        &session.model_policy,
-        requires_vision,
-    )
-    .await);
-    tracing::debug!(stage = "route_quota", elapsed_ms = route_started.elapsed().as_millis() as u64, "first request preparation");
+    } = setup_or_recover!(
+        resolve_turn_route(
+            &settings,
+            session.endpoint_id.as_deref(),
+            &session.model_id,
+            &session.model_policy,
+            requires_vision,
+        )
+        .await
+    );
+    tracing::debug!(
+        stage = "route_quota",
+        elapsed_ms = route_started.elapsed().as_millis() as u64,
+        "first request preparation"
+    );
     let primary_route = route_plan
         .candidates()
         .first()
@@ -4135,7 +4311,8 @@ pub(crate) async fn resume_thin_running_session(
         return Ok(());
     }
     let thin = crate::agent::thin_state::load(&db, &session_id)
-        .await.map_err(|error| AppError::Other(error.to_string()))?
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
         .unwrap_or_else(crate::agent::thin_state::ThinState::running);
     if thin.state != crate::agent::thin_state::SessionState::Running {
         return Ok(());
@@ -4282,7 +4459,8 @@ pub(crate) async fn resume_thin_running_session(
         .first()
         .ok_or_else(|| AppError::Other("thin restart has no model route".into()))?
         .clone();
-    let structured_read_only = crate::storage::tasks::sub_session_read_only(&db, &session_id).await?;
+    let structured_read_only =
+        crate::storage::tasks::sub_session_read_only(&db, &session_id).await?;
     let contract = crate::agent::decide_chat_contract_with_intent(
         None,
         &original_content,
@@ -4465,10 +4643,7 @@ async fn push_thin_resume_prompt(
         .map(|(name, arguments, at, status)| {
             let arguments = arguments.chars().take(500).collect::<String>();
             if matches!(status.as_str(), "pending" | "approved") {
-                (
-                    format!("{name}: {arguments}（中断，结果未知）"),
-                    at,
-                )
+                (format!("{name}: {arguments}（中断，结果未知）"), at)
             } else {
                 (format!("{name}: {arguments}"), at)
             }
@@ -4476,7 +4651,8 @@ async fn push_thin_resume_prompt(
         .unwrap_or_else(|| ("模型请求（结果未知）".into(), interrupted_at));
     // 阶段 2 P0/R2：重启后不可能再拿到真实结果的工具调用必须显式标成中断，
     // 而不是继续挂在 pending 上让界面显示“正在执行”。
-    if let Err(error) = crate::agent::thin_restart::mark_interrupted_tool_calls(db, session_id).await
+    if let Err(error) =
+        crate::agent::thin_restart::mark_interrupted_tool_calls(db, session_id).await
     {
         tracing::warn!(%error, session = %session_id, "thin restart: failed to mark interrupted tool calls");
     }
@@ -4648,7 +4824,10 @@ async fn resume_chat_objective_inner(
         objective.failure_code.as_deref(),
     ) {
         history.push(crate::storage::Message {
-            id: format!("system-continuation:{}:{}", objective.id, objective.revision),
+            id: format!(
+                "system-continuation:{}:{}",
+                objective.id, objective.revision
+            ),
             session_id: session_id.clone(),
             role: "system".into(),
             content: continuation.into(),
@@ -5112,74 +5291,124 @@ mod tests {
 
     #[tokio::test]
     async fn live_executor_without_durable_registration_survives_three_ticks() {
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('live-no-row','synthetic','/synthetic','model',1,1,'thin')")
             .execute(&pool).await.unwrap();
         let runs: crate::ChatCancelMap = Default::default();
         let reserved = std::sync::atomic::AtomicBool::new(false);
         let control = Arc::new(crate::ChatRunControl::pending());
-        admit_chat_run(&runs, &reserved, "live-no-row", control.clone()).await.unwrap();
+        admit_chat_run(&runs, &reserved, "live-no-row", control.clone())
+            .await
+            .unwrap();
         for _phase in ["admission", "model_wait", "tool_wait"] {
-            let state = crate::agent::thin_derive::refresh(&pool, "live-no-row").await.unwrap();
+            let state = crate::agent::thin_derive::refresh(&pool, "live-no-row")
+                .await
+                .unwrap();
             assert_eq!(state.state, crate::agent::thin_state::SessionState::Running);
             assert!(!control.cancel.load(Ordering::SeqCst));
             let candidates = crate::agent::thin_restart::running_without_executor(
-                &pool, Utc::now().timestamp_millis(), 0,
+                &pool,
+                Utc::now().timestamp_millis(),
+                0,
                 |id| runs.try_lock().unwrap().contains_key(id),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             assert!(candidates.is_empty());
         }
         sqlx::query("INSERT INTO chat_session_cancel_intents(session_id,status,requested_at,updated_at) VALUES ('live-no-row','requested',?,?)")
             .bind(Utc::now().timestamp_millis()).bind(Utc::now().timestamp_millis())
             .execute(&pool).await.unwrap();
-        assert_eq!(crate::agent::thin_derive::refresh(&pool, "live-no-row").await.unwrap().state,
+        assert_eq!(
+            crate::agent::thin_derive::refresh(&pool, "live-no-row")
+                .await
+                .unwrap()
+                .state,
             crate::agent::thin_state::SessionState::Ended,
-            "a live task unwinding after stop must not reopen the session");
+            "a live task unwinding after stop must not reopen the session"
+        );
         clear_chat_running_if_current(&runs, "live-no-row", &control).await;
         drop(control);
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('live-answer','live-no-row','assistant','Synthetic answer',?)")
             .bind(Utc::now().timestamp_millis()).execute(&pool).await.unwrap();
-        let state = crate::agent::thin_derive::refresh(&pool, "live-no-row").await.unwrap();
+        let state = crate::agent::thin_derive::refresh(&pool, "live-no-row")
+            .await
+            .unwrap();
         assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
         assert!(state.reason.as_deref().unwrap().starts_with("cancelled"));
     }
 
-
     #[tokio::test]
     async fn thin_settlement_persists_completed_or_nonfailure_wake_wait() {
-        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain};
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStatus, ObjectiveStore, RecoveryDomain,
+        };
         use codefactory_agent_loop::run::{RunOutcome, StopReason};
         for (kind, waiting) in [
-            (ObjectiveKind::LocalMutation, false), (ObjectiveKind::LocalMutation, true),
-            (ObjectiveKind::Delivery, false), (ObjectiveKind::Live, false),
+            (ObjectiveKind::LocalMutation, false),
+            (ObjectiveKind::LocalMutation, true),
+            (ObjectiveKind::Delivery, false),
+            (ObjectiveKind::Live, false),
         ] {
-            let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+            let pool = crate::storage::db::connect("sqlite::memory:")
+                .await
+                .unwrap();
             sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('synthetic-settle','synthetic','/synthetic','model',1,1,'thin')")
                 .execute(&pool).await.unwrap();
             let store = ObjectiveStore::new(pool.clone());
-            let current = store.create(CreateObjective {
-                id: "synthetic-settle-objective".into(), kind,
-                session_id: Some("synthetic-settle".into()), root_turn_id: Some("synthetic-root".into()),
-                domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
-            }).await.unwrap();
+            let current = store
+                .create(CreateObjective {
+                    id: "synthetic-settle-objective".into(),
+                    kind,
+                    session_id: Some("synthetic-settle".into()),
+                    root_turn_id: Some("synthetic-root".into()),
+                    domain: RecoveryDomain::Chat,
+                    requested_acceptance: "answer".into(),
+                    created_surface: "synthetic-test".into(),
+                })
+                .await
+                .unwrap();
             crate::agent::background_tasks::wake_source_cover(&pool, "synthetic-settle").await;
             if waiting {
                 sqlx::query("INSERT INTO wakeup_schedules (id,session_id,prompt,source,every_sec,next_at,status,created_at) VALUES ('synthetic-watch','synthetic-settle','check PR','agent_decided',180,9999999999999,'pending',1)")
                     .execute(&pool).await.unwrap();
             }
             let outcome = RunOutcome {
-                final_text: "读取浏览器标题后已关闭会话".into(), final_message_id: None,
-                completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0,
+                final_text: "读取浏览器标题后已关闭会话".into(),
+                final_message_id: None,
+                completion_evidence: Default::default(),
+                input_tokens: 0,
+                output_tokens: 0,
                 stop_reason: StopReason::Finished,
             };
-            let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "synthetic-root", &outcome, None).await.unwrap();
-            let thin = crate::agent::thin_state::load(&pool, "synthetic-settle").await.unwrap().unwrap();
+            let settled = apply_chat_objective_outcome(
+                &pool,
+                &current.id,
+                current.revision,
+                "synthetic-root",
+                &outcome,
+                None,
+            )
+            .await
+            .unwrap();
+            let thin = crate::agent::thin_state::load(&pool, "synthetic-settle")
+                .await
+                .unwrap()
+                .unwrap();
             if waiting {
-                assert_eq!(thin.state, crate::agent::thin_state::SessionState::WaitingWake);
+                assert_eq!(
+                    thin.state,
+                    crate::agent::thin_state::SessionState::WaitingWake
+                );
                 assert_eq!(settled.status, ObjectiveStatus::Active);
             } else {
                 assert_eq!(thin.state, crate::agent::thin_state::SessionState::Ended);
-                assert_eq!(store.get(&current.id).await.unwrap().unwrap().status, ObjectiveStatus::LegacyOrphan);
+                assert_eq!(
+                    store.get(&current.id).await.unwrap().unwrap().status,
+                    ObjectiveStatus::LegacyOrphan
+                );
             }
             assert!(settled.failure_code.is_none());
             pool.close().await;
@@ -5192,33 +5421,69 @@ mod tests {
     /// PR / CI，但这不是我能自己确认的对象」）。
     #[tokio::test]
     async fn thin_external_wait_settles_waiting_wake_instead_of_asking_the_user() {
-        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
+        };
         use codefactory_agent_loop::run::{RunOutcome, StopReason};
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('unwatched','synthetic','/synthetic','model',1,1,'thin')")
             .execute(&pool).await.unwrap();
         let store = ObjectiveStore::new(pool.clone());
-        let current = store.create(CreateObjective {
-            id: "unwatched-objective".into(), kind: ObjectiveKind::Delivery,
-            session_id: Some("unwatched".into()), root_turn_id: Some("unwatched-root".into()),
-            domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
-        }).await.unwrap();
-        crate::agent::thin::record_unwatched_wait(&pool, "unwatched", "交付 PR / CI").await.unwrap();
+        let current = store
+            .create(CreateObjective {
+                id: "unwatched-objective".into(),
+                kind: ObjectiveKind::Delivery,
+                session_id: Some("unwatched".into()),
+                root_turn_id: Some("unwatched-root".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        crate::agent::thin::record_unwatched_wait(&pool, "unwatched", "交付 PR / CI")
+            .await
+            .unwrap();
         let outcome = RunOutcome {
-            final_text: "PR 已开，等 CI".into(), final_message_id: None,
-            completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0, stop_reason: StopReason::Finished,
+            final_text: "PR 已开，等 CI".into(),
+            final_message_id: None,
+            completion_evidence: Default::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::Finished,
         };
-        let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "unwatched-root", &outcome, None).await.unwrap();
-        let thin = crate::agent::thin_state::load(&pool, "unwatched").await.unwrap().unwrap();
+        let settled = apply_chat_objective_outcome(
+            &pool,
+            &current.id,
+            current.revision,
+            "unwatched-root",
+            &outcome,
+            None,
+        )
+        .await
+        .unwrap();
+        let thin = crate::agent::thin_state::load(&pool, "unwatched")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             thin.state,
             crate::agent::thin_state::SessionState::WaitingWake,
             "等 PR/CI 是模型能自己监视的外部事项，不能变成等用户"
         );
-        assert!(thin.question.is_none(), "不得向用户发问：{:?}", thin.question);
+        assert!(
+            thin.question.is_none(),
+            "不得向用户发问：{:?}",
+            thin.question
+        );
         assert_eq!(thin.waiting_for.as_deref(), Some("交付 PR / CI"));
         assert!(
-            thin.reason.as_deref().unwrap_or_default().contains("background_task_start"),
+            thin.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("background_task_start"),
             "外部事项无唤醒源时必须指明挂监视的做法：{:?}",
             thin.reason
         );
@@ -5229,25 +5494,57 @@ mod tests {
     /// R5 的另一半：真正「等一个人/一次确认」的等待仍然必须让用户看见。
     #[tokio::test]
     async fn thin_person_wait_still_requires_a_visible_user_question() {
-        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
+        };
         use codefactory_agent_loop::run::{RunOutcome, StopReason};
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('person','synthetic','/synthetic','model',1,1,'thin')")
             .execute(&pool).await.unwrap();
         let store = ObjectiveStore::new(pool.clone());
-        let current = store.create(CreateObjective {
-            id: "person-objective".into(), kind: ObjectiveKind::Delivery,
-            session_id: Some("person".into()), root_turn_id: Some("person-root".into()),
-            domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic-test".into(),
-        }).await.unwrap();
-        crate::agent::thin::record_unwatched_wait(&pool, "person", "等你确认用哪个文件夹").await.unwrap();
+        let current = store
+            .create(CreateObjective {
+                id: "person-objective".into(),
+                kind: ObjectiveKind::Delivery,
+                session_id: Some("person".into()),
+                root_turn_id: Some("person-root".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        crate::agent::thin::record_unwatched_wait(&pool, "person", "等你确认用哪个文件夹")
+            .await
+            .unwrap();
         let outcome = RunOutcome {
-            final_text: "需要你选一个目录".into(), final_message_id: None,
-            completion_evidence: Default::default(), input_tokens: 0, output_tokens: 0, stop_reason: StopReason::Finished,
+            final_text: "需要你选一个目录".into(),
+            final_message_id: None,
+            completion_evidence: Default::default(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::Finished,
         };
-        let settled = apply_chat_objective_outcome(&pool, &current.id, current.revision, "person-root", &outcome, None).await.unwrap();
-        let thin = crate::agent::thin_state::load(&pool, "person").await.unwrap().unwrap();
-        assert_eq!(thin.state, crate::agent::thin_state::SessionState::WaitingUser);
+        let settled = apply_chat_objective_outcome(
+            &pool,
+            &current.id,
+            current.revision,
+            "person-root",
+            &outcome,
+            None,
+        )
+        .await
+        .unwrap();
+        let thin = crate::agent::thin_state::load(&pool, "person")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            thin.state,
+            crate::agent::thin_state::SessionState::WaitingUser
+        );
         assert!(thin.question.unwrap().contains("等你确认用哪个文件夹"));
         assert!(settled.failure_code.is_none());
         assert!(settled.remediation_id.is_none());
@@ -5255,24 +5552,52 @@ mod tests {
 
     #[tokio::test]
     async fn m84_close_objective_is_guarded_audited_and_idempotent() {
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-close','synthetic','/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
         let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
-        store.create(crate::agent::objective::CreateObjective {
-            id: "synthetic-close-objective".into(), kind: crate::agent::objective::ObjectiveKind::Live,
-            session_id: Some("synthetic-close".into()), root_turn_id: Some("synthetic-root".into()),
-            domain: crate::agent::objective::RecoveryDomain::Delivery,
-            requested_acceptance: "live_verification".into(), created_surface: "synthetic-test".into(),
-        }).await.unwrap();
-        assert!(close_objective_in_pool(&pool, "synthetic-close", "accepted", None).await.is_err());
+        store
+            .create(crate::agent::objective::CreateObjective {
+                id: "synthetic-close-objective".into(),
+                kind: crate::agent::objective::ObjectiveKind::Live,
+                session_id: Some("synthetic-close".into()),
+                root_turn_id: Some("synthetic-root".into()),
+                domain: crate::agent::objective::RecoveryDomain::Delivery,
+                requested_acceptance: "live_verification".into(),
+                created_surface: "synthetic-test".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            close_objective_in_pool(&pool, "synthetic-close", "accepted", None)
+                .await
+                .is_err()
+        );
         sqlx::query("UPDATE objectives SET status='waiting_system',decision_type='waiting',reached_acceptance='merged'").execute(&pool).await.unwrap();
-        let closed = close_objective_in_pool(&pool, "synthetic-close", "accepted", None).await.unwrap();
-        assert_eq!(closed.status, crate::agent::objective::ObjectiveStatus::Completed);
-        let repeated = close_objective_in_pool(&pool, "synthetic-close", "accepted", None).await.unwrap();
+        let closed = close_objective_in_pool(&pool, "synthetic-close", "accepted", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            closed.status,
+            crate::agent::objective::ObjectiveStatus::Completed
+        );
+        let repeated = close_objective_in_pool(&pool, "synthetic-close", "accepted", None)
+            .await
+            .unwrap();
         assert_eq!(repeated.revision, closed.revision);
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objective_events WHERE event_type='acceptance_confirmed'").fetch_one(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM objective_events WHERE event_type='acceptance_confirmed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 1);
-        assert!(close_objective_in_pool(&pool, "synthetic-close", "unknown", None).await.is_err());
+        assert!(
+            close_objective_in_pool(&pool, "synthetic-close", "unknown", None)
+                .await
+                .is_err()
+        );
     }
 
     /// M112-1 (真机 2026-10-18): `fd8fe429` 的 PR 已合并，objective 停在
@@ -5281,7 +5606,9 @@ mod tests {
     /// 编排方只能改用 stop 收尾。已完成的尝试必须能从正门结案。
     #[tokio::test]
     async fn m112_merged_objective_is_closable_while_a_chat_control_lingers() {
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-m112','synthetic','/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
         let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
         store
@@ -5318,7 +5645,9 @@ mod tests {
     /// so acceptance can never be confirmed while a run may still be writing.
     #[tokio::test]
     async fn m112_unfinished_objective_still_refuses_a_live_chat_run() {
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-m112-open','synthetic','/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
         let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
         store
@@ -5349,14 +5678,18 @@ mod tests {
         // confirmed while the work is unfinished, which is the behaviour under
         // test. The M112 relaxation above only ever applies to a merged row.
         assert!(
-            error.to_string().contains("merged task awaiting acceptance"),
+            error
+                .to_string()
+                .contains("merged task awaiting acceptance"),
             "{error}"
         );
     }
 
     #[tokio::test]
     async fn m90_close_objective_selects_the_merged_awaiting_acceptance_objective() {
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('synthetic-multi','synthetic','/synthetic','synthetic',1,1)").execute(&pool).await.unwrap();
         let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
         for (id, root_turn_id, created_at) in [
@@ -5393,11 +5726,12 @@ mod tests {
             closed.status,
             crate::agent::objective::ObjectiveStatus::Completed
         );
-        let failed: (String, Option<String>) =
-            sqlx::query_as("SELECT status,failure_code FROM objectives WHERE id='synthetic-multi-failed'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let failed: (String, Option<String>) = sqlx::query_as(
+            "SELECT status,failure_code FROM objectives WHERE id='synthetic-multi-failed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(failed.0, "failed");
         assert_eq!(failed.1.as_deref(), Some("technical_recovery_exhausted"));
     }
@@ -5439,7 +5773,9 @@ mod tests {
 
     #[tokio::test]
     async fn m90_close_objective_requires_an_explicit_id_when_several_await_acceptance() {
-        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let pool = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         for session in ["synthetic-ambiguous", "synthetic-elsewhere"] {
             sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES (?,?,?,?,1,1)")
                 .bind(session)
@@ -5451,18 +5787,39 @@ mod tests {
                 .unwrap();
         }
         seed_multi_objective(
-            &pool, "synthetic-ambiguous", "synthetic-await-1", "root-await-1", 100,
-            "waiting_system", "waiting", Some("merged"), Some("delivered_awaiting_ci"),
+            &pool,
+            "synthetic-ambiguous",
+            "synthetic-await-1",
+            "root-await-1",
+            100,
+            "waiting_system",
+            "waiting",
+            Some("merged"),
+            Some("delivered_awaiting_ci"),
         )
         .await;
         seed_multi_objective(
-            &pool, "synthetic-ambiguous", "synthetic-await-2", "root-await-2", 200,
-            "waiting_system", "waiting", Some("merged"), Some("delivered_awaiting_ci"),
+            &pool,
+            "synthetic-ambiguous",
+            "synthetic-await-2",
+            "root-await-2",
+            200,
+            "waiting_system",
+            "waiting",
+            Some("merged"),
+            Some("delivered_awaiting_ci"),
         )
         .await;
         seed_multi_objective(
-            &pool, "synthetic-elsewhere", "synthetic-elsewhere-await", "root-elsewhere", 300,
-            "waiting_system", "waiting", Some("merged"), Some("delivered_awaiting_ci"),
+            &pool,
+            "synthetic-elsewhere",
+            "synthetic-elsewhere-await",
+            "root-elsewhere",
+            300,
+            "waiting_system",
+            "waiting",
+            Some("merged"),
+            Some("delivered_awaiting_ci"),
         )
         .await;
 
@@ -5529,16 +5886,24 @@ mod tests {
 
     #[test]
     fn m84_merged_authorization_does_not_infer_live_from_delivery_or_template() {
-        use crate::agent::{TurnCapability, objective::ObjectiveKind};
+        use crate::agent::{objective::ObjectiveKind, TurnCapability};
         for text in [
             "授权交付（ceiling: merged）：按 truthful-delivery-state.md 修复。",
             "授权交付（ceiling: merged）；模板说生产发版后由用户真机验证，不在本任务做。",
             "授权交付（ceiling: merged）。fix live defect; delivery receipt",
         ] {
-            assert_eq!(chat_objective_kind(TurnCapability::Deliver, text), ObjectiveKind::Delivery);
+            assert_eq!(
+                chat_objective_kind(TurnCapability::Deliver, text),
+                ObjectiveKind::Delivery
+            );
         }
-        assert_eq!(chat_objective_kind(TurnCapability::Deliver,
-            "授权交付（ceiling: merged），本任务要求真机验收"), ObjectiveKind::Live);
+        assert_eq!(
+            chat_objective_kind(
+                TurnCapability::Deliver,
+                "授权交付（ceiling: merged），本任务要求真机验收"
+            ),
+            ObjectiveKind::Live
+        );
     }
 
     /// U21 (2026-10-07). The provider episode fence reaches the chat runner
@@ -5838,15 +6203,10 @@ mod tests {
         .unwrap();
 
         let control = crate::ChatRunControl::pending();
-        let receipt = admit_persisted_chat_turn(
-            &pool,
-            &control,
-            "m169-session",
-            None,
-            "CI 红了，继续修它",
-        )
-        .await
-        .expect("a follow-up message in a session with an open delivery must be admitted");
+        let receipt =
+            admit_persisted_chat_turn(&pool, &control, "m169-session", None, "CI 红了，继续修它")
+                .await
+                .expect("a follow-up message in a session with an open delivery must be admitted");
 
         assert_eq!(
             receipt.objective.id, "m169-prior-objective",
@@ -6083,26 +6443,25 @@ mod tests {
         .unwrap();
 
         let control = crate::ChatRunControl::pending();
-        let receipt = admit_persisted_chat_turn(
-            &pool,
-            &control,
-            "m129-session",
-            None,
-            "把上面 5 项都执行了",
-        )
-        .await
-        .expect("a contextual approval after an ended turn must be admitted");
+        let receipt =
+            admit_persisted_chat_turn(&pool, &control, "m129-session", None, "把上面 5 项都执行了")
+                .await
+                .expect("a contextual approval after an ended turn must be admitted");
 
         assert_ne!(
             receipt.objective.id, "m129-prior-objective",
             "the approval must own a new objective instead of reopening the settled one"
         );
-        assert_eq!(receipt.objective.session_id.as_deref(), Some("m129-session"));
-        let (status, decision): (String, String) =
-            sqlx::query_as("SELECT status, decision_type FROM objectives WHERE id='m129-prior-objective'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        assert_eq!(
+            receipt.objective.session_id.as_deref(),
+            Some("m129-session")
+        );
+        let (status, decision): (String, String) = sqlx::query_as(
+            "SELECT status, decision_type FROM objectives WHERE id='m129-prior-objective'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             (status.as_str(), decision.as_str()),
             ("completed", "complete"),
@@ -6114,7 +6473,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(history, 2, "the new turn must carry the earlier user message");
+        assert_eq!(
+            history, 2,
+            "the new turn must carry the earlier user message"
+        );
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6196,7 +6558,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(still_open, 2, "both candidates must stay for system reconciliation");
+        assert_eq!(
+            still_open, 2,
+            "both candidates must stay for system reconciliation"
+        );
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6205,7 +6570,9 @@ mod tests {
     async fn m144_admission_retries_a_real_concurrent_writer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chat.sqlite");
-        let initialized = crate::storage::db::connect(path.to_str().unwrap()).await.unwrap();
+        let initialized = crate::storage::db::connect(path.to_str().unwrap())
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('m144','synthetic','/tmp','model',1,1)")
             .execute(&initialized).await.unwrap();
         initialized.close().await;
@@ -6216,18 +6583,33 @@ mod tests {
         // runs. Connection setup therefore keeps a real timeout, and every
         // established connection drops it back to zero so a contended
         // `BEGIN IMMEDIATE` still fails fast exactly as production would.
-        let pool = SqlitePoolOptions::new().min_connections(3).max_connections(3)
-            .after_connect(|connection: &mut sqlx::SqliteConnection, _meta: sqlx::pool::PoolConnectionMetadata| {
-                Box::pin(async move {
-                    sqlx::query("PRAGMA busy_timeout = 0").execute(&mut *connection).await?;
-                    Ok(())
-                })
-            })
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path)
-                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                .busy_timeout(std::time::Duration::from_secs(5))).await.unwrap();
+        let pool = SqlitePoolOptions::new()
+            .min_connections(3)
+            .max_connections(3)
+            .after_connect(
+                |connection: &mut sqlx::SqliteConnection,
+                 _meta: sqlx::pool::PoolConnectionMetadata| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA busy_timeout = 0")
+                            .execute(&mut *connection)
+                            .await?;
+                        Ok(())
+                    })
+                },
+            )
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                    .busy_timeout(std::time::Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
         let mut held = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
-        sqlx::query("UPDATE sessions SET updated_at=2 WHERE id='m144'").execute(&mut *held).await.unwrap();
+        sqlx::query("UPDATE sessions SET updated_at=2 WHERE id='m144'")
+            .execute(&mut *held)
+            .await
+            .unwrap();
         // Establish the precondition without relying on wall time: this
         // transaction really does own SQLite's write lock, and a second
         // connection cannot write through it (zero busy_timeout => code 5).
@@ -6236,14 +6618,24 @@ mod tests {
             .await
             .expect_err("the held write lock must block an independent writer");
         assert_eq!(
-            blocked.as_database_error().and_then(|error| error.code()).as_deref(),
+            blocked
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
             Some("5"),
             "the precondition must be SQLITE_BUSY, not an unrelated database error"
         );
         let contender = pool.clone();
         let admission_started = std::time::Instant::now();
         let admission = tokio::spawn(async move {
-            admit_persisted_chat_turn(&contender, &crate::ChatRunControl::pending(), "m144", Some("m144-root"), "继续 synthetic").await
+            admit_persisted_chat_turn(
+                &contender,
+                &crate::ChatRunControl::pending(),
+                "m144",
+                Some("m144-root"),
+                "继续 synthetic",
+            )
+            .await
         });
         // The old deferred transaction fails immediately while this lock is held;
         // the shared bounded retry survives until the lock is released. Release
@@ -6267,17 +6659,26 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
             runtime.block_on(async move { held.rollback().await.unwrap() });
         });
-        let receipt = admission.await.unwrap().expect("send must recover lock contention in place");
+        let receipt = admission
+            .await
+            .unwrap()
+            .expect("send must recover lock contention in place");
         // Guard against a vacuous pass: a run that never met the held lock would
         // finish before the retry's first 50ms backoff could elapse.
         assert!(
             admission_started.elapsed() >= std::time::Duration::from_millis(45),
             "admission must have met the held write lock and retried instead of sailing through"
         );
-        release.join().expect("the lock holder must release cleanly");
+        release
+            .join()
+            .expect("the lock holder must release cleanly");
         assert_eq!(receipt.root_turn_id, "m144-root");
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id='m144-root' AND content='继续 synthetic'")
-            .fetch_one(&pool).await.unwrap();
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE id='m144-root' AND content='继续 synthetic'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(rows, 1);
         pool.close().await;
     }
@@ -6354,7 +6755,10 @@ mod tests {
             .await
             .expect_err("an independent writer must encounter the held SQLite write lock");
         assert_eq!(
-            blocked.as_database_error().and_then(|error| error.code()).as_deref(),
+            blocked
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
             Some("5"),
             "the precondition must be SQLITE_BUSY, not an unrelated database error"
         );
@@ -6399,15 +6803,35 @@ mod tests {
     #[tokio::test]
     async fn m47_explicit_new_delivery_authorization_clears_the_stop() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = crate::storage::db::connect(dir.path().join("synthetic.sqlite").to_str().unwrap()).await.unwrap();
+        let pool =
+            crate::storage::db::connect(dir.path().join("synthetic.sqlite").to_str().unwrap())
+                .await
+                .unwrap();
         sqlx::query("INSERT INTO sessions (id, title, cwd, model_id, created_at, updated_at) VALUES ('m47-session', 'synthetic', '/tmp', 'model', 1, 1)")
             .execute(&pool).await.unwrap();
-        crate::agent::stop_fence::record_stop(&pool, "m47-session", "user_stop", None).await.unwrap();
-        let receipt = admit_persisted_chat_turn(&pool, &crate::ChatRunControl::pending(), "m47-session", None,
-            "开始实施修复，授权交付（ceiling: merged）").await.unwrap();
-        assert_eq!(receipt.contract.capability, crate::agent::TurnCapability::Implement);
-        assert!(crate::agent::stop_fence::stop_fence(&pool, "m47-session").await.unwrap().is_some(),
-            "R1: wording cannot clear a delivery stop or grant remote authority");
+        crate::agent::stop_fence::record_stop(&pool, "m47-session", "user_stop", None)
+            .await
+            .unwrap();
+        let receipt = admit_persisted_chat_turn(
+            &pool,
+            &crate::ChatRunControl::pending(),
+            "m47-session",
+            None,
+            "开始实施修复，授权交付（ceiling: merged）",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt.contract.capability,
+            crate::agent::TurnCapability::Implement
+        );
+        assert!(
+            crate::agent::stop_fence::stop_fence(&pool, "m47-session")
+                .await
+                .unwrap()
+                .is_some(),
+            "R1: wording cannot clear a delivery stop or grant remote authority"
+        );
         pool.close().await;
     }
 
@@ -6886,9 +7310,8 @@ mod tests {
         .fetch_optional(&pool)
         .await
         .unwrap();
-        let detail = detail.expect(
-            "an aborted chat setup must keep the failure text, not only its signature",
-        );
+        let detail = detail
+            .expect("an aborted chat setup must keep the failure text, not only its signature");
         let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
         assert_eq!(
             detail["error_text"].as_str(),
@@ -7177,10 +7600,11 @@ mod tests {
         .await
         .unwrap();
 
-        let settled = converge_aborted_chat_setup(&pool, &control, "session-continuation-setup", None)
-            .await
-            .expect("the durable continuation identity should converge")
-            .expect("the continuation keeps its Objective receipt");
+        let settled =
+            converge_aborted_chat_setup(&pool, &control, "session-continuation-setup", None)
+                .await
+                .expect("the durable continuation identity should converge")
+                .expect("the continuation keeps its Objective receipt");
         assert_eq!(settled.root_turn_id, "turn-continuation-root");
         assert_eq!(settled.objective.id, objective.id);
         assert_eq!(settled.objective.status, ObjectiveStatus::WaitingSystem);
@@ -7277,7 +7701,9 @@ mod tests {
 
         // Exactly what a background settlement does: raise the run's stop flag
         // from an actor that is not the user.
-        assert!(crate::request_chat_run_stop_internal(&control.run_instance_id));
+        assert!(crate::request_chat_run_stop_internal(
+            &control.run_instance_id
+        ));
 
         let _ = converge_aborted_chat_setup(&pool, &control, "session-internal-stop", None)
             .await
@@ -7295,7 +7721,9 @@ mod tests {
             "internal settlement must not persist a user stop intent"
         );
         assert!(
-            !store.has_durable_stop_request("session-internal-stop", 0).await,
+            !store
+                .has_durable_stop_request("session-internal-stop", 0)
+                .await,
             "internal settlement must not be observable as a durable user stop"
         );
         let settled = store.get(&objective.id).await.unwrap().unwrap();
@@ -7321,8 +7749,14 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY)").execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO sessions VALUES ('session-setup-cancel')").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sessions VALUES ('session-setup-cancel')")
+            .execute(&pool)
+            .await
+            .unwrap();
         crate::agent::delivery_run::ensure_schema(&pool)
             .await
             .unwrap();
@@ -7493,17 +7927,29 @@ mod tests {
     async fn m80_expired_wait_does_not_block_but_future_retry_and_claim_do() {
         let (pool, objective) = durable_cancel_test_objective("m80-stalled").await;
         let session_id = objective.session_id.as_deref().unwrap();
-        assert!(!has_progressing_system_chat_run(&pool, session_id).await.unwrap());
+        assert!(!has_progressing_system_chat_run(&pool, session_id)
+            .await
+            .unwrap());
         sqlx::query("UPDATE objectives SET next_observation_at=? WHERE id=?")
-            .bind(Utc::now().timestamp_millis() + 60_000).bind(&objective.id)
-            .execute(&pool).await.unwrap();
-        assert!(has_progressing_system_chat_run(&pool, session_id).await.unwrap());
+            .bind(Utc::now().timestamp_millis() + 60_000)
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(has_progressing_system_chat_run(&pool, session_id)
+            .await
+            .unwrap());
         sqlx::query("UPDATE objectives SET next_observation_at=0 WHERE id=?")
-            .bind(&objective.id).execute(&pool).await.unwrap();
+            .bind(&objective.id)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("UPDATE objective_remediations SET status='claimed', lease_expires_at=? WHERE objective_id=?")
             .bind(Utc::now().timestamp_millis() + 60_000).bind(&objective.id)
             .execute(&pool).await.unwrap();
-        assert!(has_progressing_system_chat_run(&pool, session_id).await.unwrap());
+        assert!(has_progressing_system_chat_run(&pool, session_id)
+            .await
+            .unwrap());
     }
 
     /// S2: a failed Objective is terminal, so it is not live work the composer
@@ -7514,7 +7960,10 @@ mod tests {
         let (pool, objective) = durable_cancel_test_objective("failed-not-live").await;
         let session_id = objective.session_id.clone().unwrap();
         assert_eq!(
-            live_chat_objectives(&pool, &session_id).await.unwrap().len(),
+            live_chat_objectives(&pool, &session_id)
+                .await
+                .unwrap()
+                .len(),
             1,
             "the fixture starts with exactly one live objective"
         );
@@ -7653,14 +8102,39 @@ mod tests {
         let control = crate::ChatRunControl::pending();
         let session = waiting.session_id.as_deref().unwrap();
         let root = waiting.root_turn_id.as_deref().unwrap();
-        register_chat_run_control(&pool, &control, session).await.unwrap();
-        bind_chat_run_root(&pool, &control.run_instance_id, session, root).await.unwrap();
-        bind_chat_run_objective(&pool, &control.run_instance_id, session, root, &waiting.id, waiting.revision).await.unwrap();
+        register_chat_run_control(&pool, &control, session)
+            .await
+            .unwrap();
+        bind_chat_run_root(&pool, &control.run_instance_id, session, root)
+            .await
+            .unwrap();
+        bind_chat_run_objective(
+            &pool,
+            &control.run_instance_id,
+            session,
+            root,
+            &waiting.id,
+            waiting.revision,
+        )
+        .await
+        .unwrap();
         sqlx::query("UPDATE chat_run_controls SET status='cancel_requested', cancel_requested_at=1 WHERE run_instance_id=?")
             .bind(&control.run_instance_id).execute(&pool).await.unwrap();
-        assert!(consume_requested_chat_cancel(&pool, &control.run_instance_id).await.unwrap().is_none());
-        let after = crate::agent::objective::ObjectiveStore::new(pool).get(&waiting.id).await.unwrap().unwrap();
-        assert_eq!(after.status, crate::agent::objective::ObjectiveStatus::WaitingSystem);
+        assert!(
+            consume_requested_chat_cancel(&pool, &control.run_instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let after = crate::agent::objective::ObjectiveStore::new(pool)
+            .get(&waiting.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status,
+            crate::agent::objective::ObjectiveStatus::WaitingSystem
+        );
         assert!(after.cancellation_provenance.is_none());
     }
 
@@ -8056,7 +8530,8 @@ mod tests {
     /// OpenRouter 从来没有保存过凭据。续跑走了另一套选路切到 OpenRouter，传输层
     /// 立刻 AUTH_MISSING，而回合已经被准入，于是永远停在运行中。
     #[tokio::test]
-    async fn restart_route_keeps_the_usable_endpoint_and_never_targets_a_credential_less_fallback() {
+    async fn restart_route_keeps_the_usable_endpoint_and_never_targets_a_credential_less_fallback()
+    {
         let mut settings = Settings::default();
         settings.default_endpoint = "chatgpt".into();
         settings.default_model = "gpt-6.1-sol".into();
@@ -8093,9 +8568,10 @@ mod tests {
         );
 
         // 续跑与正常回合共用同一条入口：同一个会话必然得到同一份计划。
-        let resumed = resolve_turn_route(&settings, Some("chatgpt"), "gpt-6.1-sol", "prefer", false)
-            .await
-            .expect("restart route resolves");
+        let resumed =
+            resolve_turn_route(&settings, Some("chatgpt"), "gpt-6.1-sol", "prefer", false)
+                .await
+                .expect("restart route resolves");
         let normal = resolve_turn_route(&settings, Some("chatgpt"), "gpt-6.1-sol", "prefer", false)
             .await
             .expect("normal route resolves");
@@ -8235,16 +8711,14 @@ mod tests {
         .await
         .unwrap();
 
-        let reason = "首选端点失败：AUTH_MISSING: openrouter 尚未配置凭据\n所有可用模型端点均不可用".to_string();
-        let settled = converge_aborted_chat_setup(
-            &pool,
-            &control,
-            "session-route-failure",
-            Some(&reason),
-        )
-        .await
-        .expect("the admitted turn converges")
-        .expect("the objective carries the receipt");
+        let reason =
+            "首选端点失败：AUTH_MISSING: openrouter 尚未配置凭据\n所有可用模型端点均不可用"
+                .to_string();
+        let settled =
+            converge_aborted_chat_setup(&pool, &control, "session-route-failure", Some(&reason))
+                .await
+                .expect("the admitted turn converges")
+                .expect("the objective carries the receipt");
         assert_ne!(
             settled.objective.status,
             ObjectiveStatus::Active,
@@ -8421,7 +8895,10 @@ mod tests {
         let change = state
             .take_initial_route_change()
             .expect("quota handover is announced");
-        assert_eq!(change.kind, crate::agent::failover::RouteChangeKind::QuotaCap);
+        assert_eq!(
+            change.kind,
+            crate::agent::failover::RouteChangeKind::QuotaCap
+        );
         assert!(change.notice().contains("已用 85%"), "{}", change.notice());
         assert!(change.notice().contains("DeepSeek"), "{}", change.notice());
 
@@ -8501,7 +8978,10 @@ mod tests {
             plan.quota_notice("quota-gpt").is_none(),
             "M152: 缺凭据的备选不能承载留余量切走"
         );
-        assert!(plan.quota_keep_notice().is_none(), "M164：不得提示继续使用已达上限的 GPT");
+        assert!(
+            plan.quota_keep_notice().is_none(),
+            "M164：不得提示继续使用已达上限的 GPT"
+        );
 
         let state = ActiveRouteState::from_plan_with_health(
             plan,
@@ -8649,7 +9129,8 @@ pub mod chat_links {
             .to_ascii_lowercase();
         let passive = matches!(
             extension.as_str(),
-            "txt" | "md"
+            "txt"
+                | "md"
                 | "markdown"
                 | "pdf"
                 | "docx"
@@ -8740,7 +9221,10 @@ pub mod chat_links {
             }
             use tauri_plugin_shell::ShellExt;
             #[allow(deprecated)]
-            return app.shell().open(url.as_str(), None).map_err(|e| e.to_string());
+            return app
+                .shell()
+                .open(url.as_str(), None)
+                .map_err(|e| e.to_string());
         }
         let local = normalize_local(&target)?;
         let mut path = PathBuf::from(local);
@@ -8753,8 +9237,7 @@ pub mod chat_links {
             };
             path = base.join(path);
         }
-        let path =
-            std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let path = std::fs::canonicalize(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
         if metadata.is_file() {
             std::fs::File::open(&path).map_err(|e| e.to_string())?;
@@ -8767,7 +9250,9 @@ pub mod chat_links {
             let mut c = std::process::Command::new("/usr/bin/open").no_window();
             if reveal
                 && (!metadata.is_dir()
-                    || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")))
+                    || path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("app")))
             {
                 c.arg("-R");
             }
@@ -8872,7 +9357,10 @@ pub mod chat_links {
                     expected
                 );
             }
-            assert!(must_reveal(dir.path(), &std::fs::metadata(dir.path()).unwrap()));
+            assert!(must_reveal(
+                dir.path(),
+                &std::fs::metadata(dir.path()).unwrap()
+            ));
         }
     }
 }
@@ -8905,8 +9393,12 @@ mod m154_resume_after_midturn_kill_tests {
     /// 仍然是最后一条（不会变成 system，也不会被当成 tool 往返）。
     #[test]
     fn m154_resume_message_is_a_user_turn() {
-        let message = thin_resume_message("root-1", "session-1", 1_792_654_969_927, "bash: sleep 60");
-        assert_eq!(message.role, "user", "resume prompt must not be a system turn");
+        let message =
+            thin_resume_message("root-1", "session-1", 1_792_654_969_927, "bash: sleep 60");
+        assert_eq!(
+            message.role, "user",
+            "resume prompt must not be a system turn"
+        );
         assert_eq!(message.id, "thin-resume:root-1");
         assert!(message.tool_calls.is_none());
 
@@ -8915,7 +9407,9 @@ mod m154_resume_after_midturn_kill_tests {
         let repaired = codefactory_agent_loop::history_repair::repair_interrupted_history(vec![
             codefactory_agent_loop::types::ChatMessage {
                 role: "system".into(),
-                content: codefactory_agent_loop::types::MessageContent::Text("you are codefactory".into()),
+                content: codefactory_agent_loop::types::MessageContent::Text(
+                    "you are codefactory".into(),
+                ),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -8923,7 +9417,9 @@ mod m154_resume_after_midturn_kill_tests {
             },
             codefactory_agent_loop::types::ChatMessage {
                 role: "user".into(),
-                content: codefactory_agent_loop::types::MessageContent::Text("只读演练：sleep 60".into()),
+                content: codefactory_agent_loop::types::MessageContent::Text(
+                    "只读演练：sleep 60".into(),
+                ),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -8931,7 +9427,9 @@ mod m154_resume_after_midturn_kill_tests {
             },
             codefactory_agent_loop::types::ChatMessage {
                 role: message.role.clone(),
-                content: codefactory_agent_loop::types::MessageContent::Text(message.content.clone()),
+                content: codefactory_agent_loop::types::MessageContent::Text(
+                    message.content.clone(),
+                ),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,

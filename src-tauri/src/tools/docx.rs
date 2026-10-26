@@ -43,12 +43,20 @@ pub enum DocxBlock {
         level: u8,
         text: String,
     },
-    Paragraph { text: String },
-    Bullet    { text: String },
-    Numbered  { text: String },
+    Paragraph {
+        text: String,
+    },
+    Bullet {
+        text: String,
+    },
+    Numbered {
+        text: String,
+    },
 }
 
-fn default_heading_level() -> u8 { 1 }
+fn default_heading_level() -> u8 {
+    1
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -66,7 +74,8 @@ pub fn definition() -> ToolDefinition {
             description: "Generate a real .docx Word file from a list of structured blocks. \
 Block kinds: heading (level 1-6), paragraph, bullet, numbered. Opens in Word, Pages, \
 LibreOffice Writer, Google Docs. Use this when the user wants a report / memo / \
-spec / RFC synthesized — pair with kb_search to pull source content first.".into(),
+spec / RFC synthesized — pair with kb_search to pull source content first."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -118,7 +127,9 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
 
     if a.blocks.is_empty() {
-        return Ok(ToolOutput::err("write_docx requires at least one block".to_string()));
+        return Ok(ToolOutput::err(
+            "write_docx requires at least one block".to_string(),
+        ));
     }
     if a.blocks.len() > 1000 {
         return Ok(ToolOutput::err(format!(
@@ -135,17 +146,21 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
         return Ok(ToolOutput::err("path must end with .docx".to_string()));
     }
     if let Some(s) = path_sanity::check(&abs_path) {
-        return Ok(ToolOutput::err(path_sanity::format_error(&s, &abs_path, "write_docx")));
+        return Ok(ToolOutput::err(path_sanity::format_error(
+            &s,
+            &abs_path,
+            "write_docx",
+        )));
     }
     if let Some(parent) = abs_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| crate::errors::AppError::Other(format!("mkdir failed: {e}")))?;
     }
 
-    let bytes = build_docx_bytes(&a.blocks).map_err(|e| {
-        crate::errors::AppError::Other(format!("docx build failed: {e}"))
-    })?;
-    super::file_lock::atomic_write(&abs_path, &bytes).await
+    let bytes = build_docx_bytes(&a.blocks)
+        .map_err(|e| crate::errors::AppError::Other(format!("docx build failed: {e}")))?;
+    super::file_lock::atomic_write(&abs_path, &bytes)
+        .await
         .map_err(|e| crate::errors::AppError::Other(format!("write failed: {e}")))?;
 
     Ok(ToolOutput::ok(format!(
@@ -228,9 +243,7 @@ fn block_xml(b: &DocxBlock) -> String {
         }
         DocxBlock::Paragraph { text } => {
             let t = xml_escape(text);
-            format!(
-                "<w:p><w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p>\n"
-            )
+            format!("<w:p><w:r><w:t xml:space=\"preserve\">{t}</w:t></w:r></w:p>\n")
         }
         DocxBlock::Bullet { text } => {
             let t = xml_escape(text);
@@ -327,17 +340,31 @@ mod tests {
     #[test]
     fn generates_valid_zip_with_expected_parts() {
         let bytes = build_docx_bytes(&[
-            DocxBlock::Heading { level: 1, text: "Title".into() },
-            DocxBlock::Paragraph { text: "Body sentence.".into() },
-            DocxBlock::Bullet { text: "first bullet".into() },
-            DocxBlock::Numbered { text: "first number".into() },
-        ]).unwrap();
+            DocxBlock::Heading {
+                level: 1,
+                text: "Title".into(),
+            },
+            DocxBlock::Paragraph {
+                text: "Body sentence.".into(),
+            },
+            DocxBlock::Bullet {
+                text: "first bullet".into(),
+            },
+            DocxBlock::Numbered {
+                text: "first number".into(),
+            },
+        ])
+        .unwrap();
         let cursor = std::io::Cursor::new(&bytes);
         let mut zip = ZipArchive::new(cursor).expect("must be valid zip");
         for required in [
-            "[Content_Types].xml", "_rels/.rels",
-            "docProps/app.xml", "docProps/core.xml",
-            "word/document.xml", "word/styles.xml", "word/numbering.xml",
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "docProps/app.xml",
+            "docProps/core.xml",
+            "word/document.xml",
+            "word/styles.xml",
+            "word/numbering.xml",
             "word/_rels/document.xml.rels",
         ] {
             assert!(zip.by_name(required).is_ok(), "missing {required}");
@@ -347,10 +374,18 @@ mod tests {
     #[test]
     fn content_round_trips_through_document_xml() {
         let bytes = build_docx_bytes(&[
-            DocxBlock::Heading { level: 2, text: "Section".into() },
-            DocxBlock::Paragraph { text: "Hello world".into() },
-            DocxBlock::Bullet { text: "first bullet".into() },
-        ]).unwrap();
+            DocxBlock::Heading {
+                level: 2,
+                text: "Section".into(),
+            },
+            DocxBlock::Paragraph {
+                text: "Hello world".into(),
+            },
+            DocxBlock::Bullet {
+                text: "first bullet".into(),
+            },
+        ])
+        .unwrap();
         let cursor = std::io::Cursor::new(&bytes);
         let mut zip = ZipArchive::new(cursor).unwrap();
         let doc = read_part(&mut zip, "word/document.xml");
@@ -358,14 +393,18 @@ mod tests {
         assert!(doc.contains("Hello world"));
         assert!(doc.contains("first bullet"));
         assert!(doc.contains("Heading2"));
-        assert!(doc.contains("numId w:val=\"1\""), "bullet should reference numId=1");
+        assert!(
+            doc.contains("numId w:val=\"1\""),
+            "bullet should reference numId=1"
+        );
     }
 
     #[test]
     fn special_xml_chars_are_escaped() {
-        let bytes = build_docx_bytes(&[
-            DocxBlock::Paragraph { text: "A < B & C > D \"q\" 'a'".into() },
-        ]).unwrap();
+        let bytes = build_docx_bytes(&[DocxBlock::Paragraph {
+            text: "A < B & C > D \"q\" 'a'".into(),
+        }])
+        .unwrap();
         let cursor = std::io::Cursor::new(&bytes);
         let mut zip = ZipArchive::new(cursor).unwrap();
         let doc = read_part(&mut zip, "word/document.xml");
@@ -377,9 +416,16 @@ mod tests {
     #[test]
     fn heading_level_clamped_to_1_6() {
         let bytes = build_docx_bytes(&[
-            DocxBlock::Heading { level: 9, text: "Over".into() },
-            DocxBlock::Heading { level: 0, text: "Under".into() },
-        ]).unwrap();
+            DocxBlock::Heading {
+                level: 9,
+                text: "Over".into(),
+            },
+            DocxBlock::Heading {
+                level: 0,
+                text: "Under".into(),
+            },
+        ])
+        .unwrap();
         let cursor = std::io::Cursor::new(&bytes);
         let mut zip = ZipArchive::new(cursor).unwrap();
         let doc = read_part(&mut zip, "word/document.xml");
@@ -391,16 +437,38 @@ mod tests {
     #[ignore]
     fn smoke_write_to_tmp() {
         let bytes = build_docx_bytes(&[
-            DocxBlock::Heading { level: 1, text: "CodeFactory write_docx 验证".into() },
-            DocxBlock::Paragraph { text: "这是一段中文正文，验证 OOXML 在 macOS QuickLook 渲染。".into() },
-            DocxBlock::Heading { level: 2, text: "要点".into() },
-            DocxBlock::Bullet { text: "纯 Rust 实现，零外部依赖".into() },
-            DocxBlock::Bullet { text: "Word / Pages / LibreOffice / Google Docs 都能打开".into() },
-            DocxBlock::Heading { level: 2, text: "用法".into() },
-            DocxBlock::Numbered { text: "AI 调用 kb_search 读取源文档".into() },
-            DocxBlock::Numbered { text: "AI 综合大纲".into() },
-            DocxBlock::Numbered { text: "AI 调用 write_docx 出文件".into() },
-        ]).unwrap();
+            DocxBlock::Heading {
+                level: 1,
+                text: "CodeFactory write_docx 验证".into(),
+            },
+            DocxBlock::Paragraph {
+                text: "这是一段中文正文，验证 OOXML 在 macOS QuickLook 渲染。".into(),
+            },
+            DocxBlock::Heading {
+                level: 2,
+                text: "要点".into(),
+            },
+            DocxBlock::Bullet {
+                text: "纯 Rust 实现，零外部依赖".into(),
+            },
+            DocxBlock::Bullet {
+                text: "Word / Pages / LibreOffice / Google Docs 都能打开".into(),
+            },
+            DocxBlock::Heading {
+                level: 2,
+                text: "用法".into(),
+            },
+            DocxBlock::Numbered {
+                text: "AI 调用 kb_search 读取源文档".into(),
+            },
+            DocxBlock::Numbered {
+                text: "AI 综合大纲".into(),
+            },
+            DocxBlock::Numbered {
+                text: "AI 调用 write_docx 出文件".into(),
+            },
+        ])
+        .unwrap();
         std::fs::write("/tmp/codefactory-docx-smoke.docx", &bytes).unwrap();
         eprintln!("wrote {} bytes", bytes.len());
     }

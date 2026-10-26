@@ -31,10 +31,10 @@ pub struct UserPreference {
 /// placeholders the Profile page used to hard-code so existing users
 /// don't see an empty preferences pane after upgrade.
 pub const DEFAULT_PREFERENCES: &[(&str, &str)] = &[
-    ("autonomy_level",    "medium"),
+    ("autonomy_level", "medium"),
     ("communication_style", "concise"),
-    ("testing_habit",     "tdd"),
-    ("code_style",        ""),
+    ("testing_habit", "tdd"),
+    ("code_style", ""),
 ];
 
 /// Sentinel cwd value for the global scope. Preferences stored under this
@@ -45,16 +45,11 @@ pub const GLOBAL_CWD: &str = "_global_";
 
 /// Ensure default rows exist for a cwd. Idempotent — runs on every
 /// list_user_preferences call so first-time projects auto-populate.
-async fn seed_defaults_if_empty(
-    pool: &sqlx::SqlitePool,
-    cwd: &str,
-) -> Result<(), AppError> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM user_preferences WHERE cwd = ?",
-    )
-    .bind(cwd)
-    .fetch_one(pool)
-    .await?;
+async fn seed_defaults_if_empty(pool: &sqlx::SqlitePool, cwd: &str) -> Result<(), AppError> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_preferences WHERE cwd = ?")
+        .bind(cwd)
+        .fetch_one(pool)
+        .await?;
     if count > 0 {
         return Ok(());
     }
@@ -91,7 +86,11 @@ pub async fn list_user_preferences(
     Ok(rows
         .into_iter()
         .map(|(cwd, key, value, source, updated_at)| UserPreference {
-            cwd, key, value, source, updated_at,
+            cwd,
+            key,
+            value,
+            source,
+            updated_at,
         })
         .collect())
 }
@@ -229,7 +228,9 @@ mod tests {
         let row: (String, String) = sqlx::query_as(
             "SELECT value, source FROM user_preferences WHERE cwd='/proj' AND key='autonomy_level'",
         )
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(row.0, "high");
         assert_eq!(row.1, "user");
     }

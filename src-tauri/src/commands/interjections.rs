@@ -57,9 +57,17 @@ pub async fn queue_interjection(
     if crate::agent::is_delivery_revocation(&message) {
         let db = state.db.read().await.clone();
         sqlx::query("UPDATE sessions SET delivery_authorized=0, delivery_ceiling=NULL WHERE id=?")
-            .bind(&session_id).execute(&db).await?;
+            .bind(&session_id)
+            .execute(&db)
+            .await?;
     }
-    enqueue_interjection(&state.interjections, &session_id, &message, client_message_id.as_deref()).await
+    enqueue_interjection(
+        &state.interjections,
+        &session_id,
+        &message,
+        client_message_id.as_deref(),
+    )
+    .await
 }
 
 /// The queueing rule itself, free of `AppState` so it stays directly testable.
@@ -80,10 +88,7 @@ pub async fn enqueue_interjection(
     };
     let mut q = queue.lock().await;
     let session = q.entry(session_id.to_string()).or_default();
-    if let Some(id) = client_message_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
+    if let Some(id) = client_message_id.map(str::trim).filter(|id| !id.is_empty()) {
         if !session.delivered_ids.insert(id.to_string()) {
             return Ok(false);
         }
@@ -95,10 +100,7 @@ pub async fn enqueue_interjection(
 /// Drain (return + clear) the pending queue for a session. Used by the
 /// scheduler at the start of each task dispatch. The delivered-id set stays:
 /// draining means "the message was handed over", not "it may come again".
-pub async fn drain_for_session(
-    queue: &InterjectionQueue,
-    session_id: &str,
-) -> Vec<Interjection> {
+pub async fn drain_for_session(queue: &InterjectionQueue, session_id: &str) -> Vec<Interjection> {
     let mut q = queue.lock().await;
     let Some(session) = q.get_mut(session_id) else {
         return Vec::new();
@@ -149,11 +151,14 @@ mod tests {
         let q: InterjectionQueue = Arc::new(Mutex::new(HashMap::new()));
         {
             let mut g = q.lock().await;
-            g.entry("s1".into()).or_default().pending.push(Interjection {
-                session_id: "s1".into(),
-                message: "hi".into(),
-                at: 0,
-            });
+            g.entry("s1".into())
+                .or_default()
+                .pending
+                .push(Interjection {
+                    session_id: "s1".into(),
+                    message: "hi".into(),
+                    at: 0,
+                });
         }
         let drained = drain_for_session(&q, "s1").await;
         assert_eq!(drained.len(), 1);
@@ -166,9 +171,11 @@ mod tests {
     #[tokio::test]
     async fn the_same_client_message_is_never_handed_over_twice() {
         let q: InterjectionQueue = Arc::new(Mutex::new(HashMap::new()));
-        assert!(enqueue_interjection(&q, "s1", "改用 chrome channel", Some("m-1"))
-            .await
-            .unwrap());
+        assert!(
+            enqueue_interjection(&q, "s1", "改用 chrome channel", Some("m-1"))
+                .await
+                .unwrap()
+        );
         assert!(
             !enqueue_interjection(&q, "s1", "改用 chrome channel", Some("m-1"))
                 .await
@@ -182,7 +189,10 @@ mod tests {
 
         let drained = drain_for_session(&q, "s1").await;
         assert_eq!(
-            drained.iter().map(|i| i.message.as_str()).collect::<Vec<_>>(),
+            drained
+                .iter()
+                .map(|i| i.message.as_str())
+                .collect::<Vec<_>>(),
             vec!["改用 chrome channel", "然后跑测试"],
             "重复的一条只能落一次"
         );
@@ -196,9 +206,11 @@ mod tests {
         );
         assert!(drain_for_session(&q, "s1").await.is_empty());
         // 另一个会话不受影响：id 是会话内身份，不是全局身份。
-        assert!(enqueue_interjection(&q, "s2", "改用 chrome channel", Some("m-1"))
-            .await
-            .unwrap());
+        assert!(
+            enqueue_interjection(&q, "s2", "改用 chrome channel", Some("m-1"))
+                .await
+                .unwrap()
+        );
     }
 
     /// The inbox is where the 2026-09-08 regression actually bit: it asked
@@ -213,18 +225,12 @@ mod tests {
             session_id: "s1".into(),
             delivery_authorized: true,
         };
-        assert_eq!(
-            authorized.capability_override("继续"),
-            None,
-        );
+        assert_eq!(authorized.capability_override("继续"), None,);
         let unauthorized = SessionSteerInbox {
             queue: Arc::new(Mutex::new(HashMap::new())),
             session_id: "s1".into(),
             delivery_authorized: false,
         };
-        assert_eq!(
-            unauthorized.capability_override("继续"),
-            None,
-        );
+        assert_eq!(unauthorized.capability_override("继续"), None,);
     }
 }

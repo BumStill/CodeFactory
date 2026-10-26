@@ -37,10 +37,18 @@ pub fn apply_noninteractive(cmd: &mut Command) {
 
 /// Only the final nonempty output line can be an outstanding input prompt.
 pub fn waiting_for_input(output: &str) -> bool {
-    let line = output.trim_end().rsplit('\n').next().unwrap_or("").trim().to_lowercase();
+    let line = output
+        .trim_end()
+        .rsplit('\n')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     line.contains("press any key")
-        || line.ends_with("(y/n)") || line.ends_with("[y/n]")
-        || line.ends_with("(y/n):") || line.ends_with("[y/n]:")
+        || line.ends_with("(y/n)")
+        || line.ends_with("[y/n]")
+        || line.ends_with("(y/n):")
+        || line.ends_with("[y/n]:")
         || (line.starts_with("read-host") && line.ends_with(':'))
 }
 
@@ -177,7 +185,11 @@ fn windows_shell_availability() -> (bool, bool) {
 }
 
 #[cfg(any(windows, test))]
-pub(crate) fn windows_shell_invocation(command: &str, pwsh: bool, powershell: bool) -> ShellInvocation {
+pub(crate) fn windows_shell_invocation(
+    command: &str,
+    pwsh: bool,
+    powershell: bool,
+) -> ShellInvocation {
     if pwsh || powershell {
         ShellInvocation {
             program: if pwsh { "pwsh.exe" } else { "powershell.exe" },
@@ -185,7 +197,14 @@ pub(crate) fn windows_shell_invocation(command: &str, pwsh: bool, powershell: bo
                 format!("[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); $OutputEncoding=[Console]::OutputEncoding; {command}")],
         }
     } else {
-        ShellInvocation { program: "cmd.exe", args: vec!["/D".into(), "/C".into(), format!("chcp 65001 >nul & {command}")] }
+        ShellInvocation {
+            program: "cmd.exe",
+            args: vec![
+                "/D".into(),
+                "/C".into(),
+                format!("chcp 65001 >nul & {command}"),
+            ],
+        }
     }
 }
 
@@ -202,7 +221,10 @@ pub fn shell_description() -> String {
         return "Current shell: cmd.exe; &&/|| supported; double-quote paths; environment variables: %NAME%.".into();
     }
     #[cfg(not(windows))]
-    format!("Current shell: {} (POSIX syntax).", shell_invocation("").program)
+    format!(
+        "Current shell: {} (POSIX syntax).",
+        shell_invocation("").program
+    )
 }
 
 /// Keep original command and exit status; never rewrite arbitrary script syntax.
@@ -237,22 +259,43 @@ pub(crate) fn decode_output_for_code_page(bytes: &[u8], code_page: u32) -> Strin
         // MultiByteToWideChar(CP_ACP) uses GetACP semantics without assuming CP936.
         #[link(name = "kernel32")]
         extern "system" {
-            fn MultiByteToWideChar(cp: u32, flags: u32, input: *const u8, len: i32, output: *mut u16, size: i32) -> i32;
+            fn MultiByteToWideChar(
+                cp: u32,
+                flags: u32,
+                input: *const u8,
+                len: i32,
+                output: *mut u16,
+                size: i32,
+            ) -> i32;
         }
         if let Ok(len) = i32::try_from(bytes.len()) {
             unsafe {
-                let size = MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+                let size =
+                    MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
                 if size > 0 {
                     let mut wide = vec![0u16; size as usize];
-                    let written = MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), size);
-                    if written > 0 { return String::from_utf16_lossy(&wide[..written as usize]); }
+                    let written = MultiByteToWideChar(
+                        code_page,
+                        0,
+                        bytes.as_ptr(),
+                        len,
+                        wide.as_mut_ptr(),
+                        size,
+                    );
+                    if written > 0 {
+                        return String::from_utf16_lossy(&wide[..written as usize]);
+                    }
                 }
             }
         }
     }
     #[cfg(not(windows))]
     {
-        let encoding = if code_page == 936 { encoding_rs::GBK } else { encoding_rs::WINDOWS_1252 };
+        let encoding = if code_page == 936 {
+            encoding_rs::GBK
+        } else {
+            encoding_rs::WINDOWS_1252
+        };
         return encoding.decode(bytes).0.into_owned();
     }
     #[cfg(windows)]
@@ -267,15 +310,30 @@ mod m143_tests {
     fn m143_noninteractive_environment_and_prompt_detection() {
         let mut cmd = Command::new("unused").no_window();
         apply_noninteractive(&mut cmd);
-        let env: std::collections::HashMap<_, _> = cmd.as_std().get_envs().map(|(k,v)| (k.to_string_lossy().to_string(), v.unwrap().to_string_lossy().to_string())).collect();
+        let env: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.unwrap().to_string_lossy().to_string(),
+                )
+            })
+            .collect();
         assert_eq!(env["CI"], "1");
         assert_eq!(env["npm_config_yes"], "true");
         assert_eq!(env["GIT_TERMINAL_PROMPT"], "0");
         assert_eq!(env["GCM_INTERACTIVE"], "never");
-        for prompt in ["Press any key to continue . . .", "Continue? (y/N)", "Read-Host: enter name:"] {
+        for prompt in [
+            "Press any key to continue . . .",
+            "Continue? (y/N)",
+            "Read-Host: enter name:",
+        ] {
             assert!(waiting_for_input(prompt), "{prompt}");
         }
-        assert!(!waiting_for_input("Read-Host documentation\nall tests passed\n"));
+        assert!(!waiting_for_input(
+            "Read-Host documentation\nall tests passed\n"
+        ));
         assert!(!waiting_for_input("ordinary build output"));
     }
 
@@ -283,10 +341,21 @@ mod m143_tests {
     fn m143_windows_shell_prefers_pwsh_and_initializes_utf8() {
         let modern = windows_shell_invocation("echo 中文 && echo ok", true, true);
         assert_eq!(modern.program, "pwsh.exe");
-        assert!(modern.args.last().unwrap().contains("[Console]::OutputEncoding"));
+        assert!(modern
+            .args
+            .last()
+            .unwrap()
+            .contains("[Console]::OutputEncoding"));
         assert!(modern.args.last().unwrap().contains("$OutputEncoding"));
-        assert!(modern.args.last().unwrap().ends_with("echo 中文 && echo ok"));
-        assert_eq!(windows_shell_invocation("echo 中文", false, true).program, "powershell.exe");
+        assert!(modern
+            .args
+            .last()
+            .unwrap()
+            .ends_with("echo 中文 && echo ok"));
+        assert_eq!(
+            windows_shell_invocation("echo 中文", false, true).program,
+            "powershell.exe"
+        );
         let cmd = windows_shell_invocation("echo 中文", false, false);
         assert_eq!(cmd.program, "cmd.exe");
         assert!(cmd.args.last().unwrap().starts_with("chcp 65001 >nul & "));
@@ -294,8 +363,14 @@ mod m143_tests {
 
     #[test]
     fn m143_decodes_utf8_and_legacy_chinese_without_replacement() {
-        assert_eq!(decode_output_for_code_page("中文🙂".as_bytes(), 936), "中文🙂");
-        assert_eq!(decode_output_for_code_page(&[0xd6, 0xd0, 0xce, 0xc4], 936), "中文");
+        assert_eq!(
+            decode_output_for_code_page("中文🙂".as_bytes(), 936),
+            "中文🙂"
+        );
+        assert_eq!(
+            decode_output_for_code_page(&[0xd6, 0xd0, 0xce, 0xc4], 936),
+            "中文"
+        );
         assert_eq!(decode_output_for_code_page(&[0xe9], 1252), "é");
     }
 

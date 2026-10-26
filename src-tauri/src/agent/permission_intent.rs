@@ -215,16 +215,25 @@ pub(crate) enum PermissionPromptResponse {
 }
 
 async fn grant_remote_delivery_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, intent: &PermissionIntentSnapshot,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    intent: &PermissionIntentSnapshot,
 ) -> anyhow::Result<()> {
     let remote = intent.tool_name == "deliver_changes"
-        || (intent.tool_name == "bash" && intent.prompt_args.get("command")
-            .and_then(Value::as_str).is_some_and(codefactory_agent_loop::policy::is_delivery_command));
+        || (intent.tool_name == "bash"
+            && intent
+                .prompt_args
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(codefactory_agent_loop::policy::is_delivery_command));
     if remote {
         sqlx::query("UPDATE sessions SET delivery_authorized=1 WHERE id=?")
-            .bind(&intent.session_id).execute(&mut **tx).await?;
+            .bind(&intent.session_id)
+            .execute(&mut **tx)
+            .await?;
         sqlx::query("DELETE FROM delivery_stop_fences WHERE session_id=?")
-            .bind(&intent.session_id).execute(&mut **tx).await?;
+            .bind(&intent.session_id)
+            .execute(&mut **tx)
+            .await?;
     }
     Ok(())
 }
@@ -1013,12 +1022,18 @@ impl PermissionIntentStore {
             "SELECT COUNT(*) FROM permission_intents i JOIN objectives o ON o.id=i.objective_id
              WHERE i.intent_id=? AND i.created_process_instance=? AND o.status='active'
                AND o.revision=i.objective_revision",
-        ).bind(intent_id).bind(super::objective::current_process_instance())
-            .fetch_one(&mut *tx).await?;
+        )
+        .bind(intent_id)
+        .bind(super::objective::current_process_instance())
+        .fetch_one(&mut *tx)
+        .await?;
         if live == 1 {
             let (status, failure) = match response {
                 PermissionPromptResponse::Allow => (PermissionIntentStatus::Allowed, None),
-                PermissionPromptResponse::Deny => (PermissionIntentStatus::Denied, Some("permission_denied_by_user")),
+                PermissionPromptResponse::Deny => (
+                    PermissionIntentStatus::Denied,
+                    Some("permission_denied_by_user"),
+                ),
             };
             if update_pending_intent_response(&mut tx, &intent, status, failure, now).await? != 1 {
                 bail!("permission response lost its prompt CAS");
@@ -2213,7 +2228,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-            sqlx::query("CREATE TABLE delivery_stop_fences (session_id TEXT PRIMARY KEY)").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE delivery_stop_fences (session_id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, delivery_authorized INTEGER NOT NULL DEFAULT 0)").execute(&pool).await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE objectives (
@@ -2433,17 +2451,29 @@ mod tests {
     #[tokio::test]
     async fn m130_durable_allow_atomically_grants_delivery_only_for_remote_action() {
         let pool = database().await;
-        sqlx::query("INSERT INTO sessions (id) VALUES ('session-a')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id) VALUES ('session-a')")
+            .execute(&pool)
+            .await
+            .unwrap();
         let store = PermissionIntentStore::new(pool.clone());
         let mut req = request(OBJECTIVE_ID, BINDING_ID, "synthetic-remote");
         req.tool_name = "deliver_changes".into();
         req.args = serde_json::json!({"ceiling":"pr_only"});
         let intent = store.create_pending(&req, 1000).await.unwrap();
-        store.record_user_response(&intent.prompt_key(), PermissionPromptResponse::Allow, 1100).await.unwrap();
+        store
+            .record_user_response(&intent.prompt_key(), PermissionPromptResponse::Allow, 1100)
+            .await
+            .unwrap();
         assert!(crate::agent::fetch_session_delivery_authorized(&pool, "session-a").await);
         crate::agent::set_session_delivery_authorized(&pool, "session-a", false).await;
-        store.record_user_response(&intent.prompt_key(), PermissionPromptResponse::Allow, 1101).await.unwrap();
-        assert!(!crate::agent::fetch_session_delivery_authorized(&pool, "session-a").await, "replayed allow cannot undo revocation");
+        store
+            .record_user_response(&intent.prompt_key(), PermissionPromptResponse::Allow, 1101)
+            .await
+            .unwrap();
+        assert!(
+            !crate::agent::fetch_session_delivery_authorized(&pool, "session-a").await,
+            "replayed allow cannot undo revocation"
+        );
     }
 
     #[tokio::test]
@@ -3113,20 +3143,34 @@ mod tests {
     async fn m72_entry_allow_keeps_the_current_owner_and_revision() {
         let (pool, store, intent, objective) = pending_active_permission("m72-entry").await;
         sqlx::query("UPDATE permission_intents SET created_process_instance=? WHERE intent_id=?")
-            .bind(super::super::objective::current_process_instance()).bind(&intent.intent_id)
-            .execute(&pool).await.unwrap();
-        let settlement = store.settle_projected_response(
-            &intent.intent_id, PermissionPromptResponse::Allow, 10_010,
-        ).await.unwrap();
+            .bind(super::super::objective::current_process_instance())
+            .bind(&intent.intent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let settlement = store
+            .settle_projected_response(&intent.intent_id, PermissionPromptResponse::Allow, 10_010)
+            .await
+            .unwrap();
         assert!(!settlement.recovery_scheduled);
-        let after = ObjectiveStore::new(pool).get(&objective.id).await.unwrap().unwrap();
+        let after = ObjectiveStore::new(pool)
+            .get(&objective.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(after.revision, objective.revision);
         assert_eq!(after.status, ObjectiveStatus::Active);
         assert_eq!(after.remediation_id, objective.remediation_id);
         assert_eq!(after.lease_owner, objective.lease_owner);
         assert!(after.cancellation_provenance.is_none());
-        assert!(store.consume_exact_allow(&intent.prompt_key(), 10_011).await.unwrap());
-        assert!(!store.consume_exact_allow(&intent.prompt_key(), 10_012).await.unwrap());
+        assert!(store
+            .consume_exact_allow(&intent.prompt_key(), 10_011)
+            .await
+            .unwrap());
+        assert!(!store
+            .consume_exact_allow(&intent.prompt_key(), 10_012)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

@@ -369,7 +369,7 @@ mod tests {
         let pool = fresh_pool().await;
         for index in 0..LEARNING_EVENTS_LIMIT {
             sqlx::query(
-                 "INSERT INTO learning_events
+                "INSERT INTO learning_events
                  (id,session_id,cwd,observation,suggestion,status,created_at,decided_at)
                  VALUES (?, 's1', '/proj', 'obs', ?, 'accepted', ?, ?)",
             )

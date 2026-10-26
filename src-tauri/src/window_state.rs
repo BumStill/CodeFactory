@@ -69,7 +69,9 @@ pub fn fully_inside_monitor(state: SavedWindowState, monitor: MonitorRect) -> bo
 
 /// True when any currently connected display contains the saved rectangle.
 pub fn is_saved_state_usable(state: SavedWindowState, monitors: &[MonitorRect]) -> bool {
-    monitors.iter().any(|monitor| fully_inside_monitor(state, *monitor))
+    monitors
+        .iter()
+        .any(|monitor| fully_inside_monitor(state, *monitor))
 }
 
 /// A fully visible position on the primary display, keeping the window's own
@@ -79,7 +81,10 @@ pub fn is_saved_state_usable(state: SavedWindowState, monitors: &[MonitorRect]) 
 /// default size. The result is always inside `primary` — never off screen, never
 /// wider than the display — because a rescued position that is itself invisible
 /// would repeat the defect this module exists to fix.
-pub fn fallback_state(primary: Option<MonitorRect>, preferred: Option<SavedWindowState>) -> SavedWindowState {
+pub fn fallback_state(
+    primary: Option<MonitorRect>,
+    preferred: Option<SavedWindowState>,
+) -> SavedWindowState {
     // No monitor reported at all: still hand back a usable, non-degenerate
     // window rather than a zero-sized one.
     let display = primary.unwrap_or(MonitorRect {
@@ -158,7 +163,12 @@ pub fn temporary_state_path(path: &Path) -> PathBuf {
 fn monitor_rect(monitor: &tauri::Monitor) -> MonitorRect {
     let position = monitor.position();
     let size = monitor.size();
-    MonitorRect { x: position.x, y: position.y, width: size.width, height: size.height }
+    MonitorRect {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    }
 }
 
 /// Put the main window back, then keep the saved state current.
@@ -190,7 +200,10 @@ pub fn restore_and_track_main_window(app: &tauri::App) -> tauri::Result<()> {
     let tracked = window.clone();
     let last_written = std::sync::Mutex::new(Some(placement));
     window.on_window_event(move |event| {
-        if !matches!(event, tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)) {
+        if !matches!(
+            event,
+            tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+        ) {
             return;
         }
         let (Ok(position), Ok(size)) = (tracked.outer_position(), tracked.inner_size()) else {
@@ -218,17 +231,32 @@ mod tests {
     use super::*;
 
     fn main_display() -> MonitorRect {
-        MonitorRect { x: 0, y: 0, width: 1440, height: 900 }
+        MonitorRect {
+            x: 0,
+            y: 0,
+            width: 1440,
+            height: 900,
+        }
     }
 
     fn secondary_display() -> MonitorRect {
-        MonitorRect { x: 1440, y: 0, width: 1920, height: 1080 }
+        MonitorRect {
+            x: 1440,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }
     }
 
     #[test]
     fn accepts_window_fully_on_one_monitor() {
         assert!(fully_inside_monitor(
-            SavedWindowState { x: 20, y: 30, width: 800, height: 600 },
+            SavedWindowState {
+                x: 20,
+                y: 30,
+                width: 800,
+                height: 600
+            },
             main_display()
         ));
     }
@@ -236,20 +264,38 @@ mod tests {
     #[test]
     fn rejects_disconnected_monitor_and_offscreen_positions() {
         assert!(!fully_inside_monitor(
-            SavedWindowState { x: 1500, y: 30, width: 800, height: 600 },
+            SavedWindowState {
+                x: 1500,
+                y: 30,
+                width: 800,
+                height: 600
+            },
             main_display()
         ));
         assert!(!fully_inside_monitor(
-            SavedWindowState { x: -100, y: 0, width: 800, height: 600 },
+            SavedWindowState {
+                x: -100,
+                y: 0,
+                width: 800,
+                height: 600
+            },
             main_display()
         ));
     }
 
     #[test]
     fn rejects_window_spanning_displays() {
-        let straddling = SavedWindowState { x: 1200, y: 30, width: 800, height: 600 };
+        let straddling = SavedWindowState {
+            x: 1200,
+            y: 30,
+            width: 800,
+            height: 600,
+        };
         assert!(!fully_inside_monitor(straddling, main_display()));
-        assert!(!is_saved_state_usable(straddling, &[main_display(), secondary_display()]));
+        assert!(!is_saved_state_usable(
+            straddling,
+            &[main_display(), secondary_display()]
+        ));
     }
 
     #[test]

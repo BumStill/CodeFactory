@@ -62,7 +62,12 @@ pub fn check(target: &Path) -> Option<TypoSuggestion> {
     // The first missing segment relative to real_ancestor — that's what
     // we suspect is the typo.
     let rel = parent.strip_prefix(real_ancestor).ok()?;
-    let bad_segment = rel.components().next()?.as_os_str().to_string_lossy().into_owned();
+    let bad_segment = rel
+        .components()
+        .next()?
+        .as_os_str()
+        .to_string_lossy()
+        .into_owned();
 
     if bad_segment.len() < MIN_NAME_LEN {
         return None;
@@ -150,7 +155,7 @@ mod tests {
 
     #[test]
     fn levenshtein_basics() {
-        assert_eq!(levenshtein("__init__", "__iniy"), 3);  // del, sub, del? Let's count carefully
+        assert_eq!(levenshtein("__init__", "__iniy"), 3); // del, sub, del? Let's count carefully
         assert_eq!(levenshtein("infrastructure", "infrastru"), 5);
         assert_eq!(levenshtein("kitten", "sitting"), 3);
         assert_eq!(levenshtein("abc", "abc"), 0);

@@ -129,7 +129,8 @@ impl ToolRecoveryStore {
                     Some(ToolRecoveryPlan {
                         resource_kind: "workspace_git",
                         replay_policy: "never_after_dispatch",
-                        safe_locator_json: serde_json::json!({"remote_observer": observer}).to_string(),
+                        safe_locator_json: serde_json::json!({"remote_observer": observer})
+                            .to_string(),
                         precondition_digest: remote_delivery_digest(cwd, &observer).await?,
                     })
                 } else if let Some(relative) = named_file {
@@ -208,7 +209,10 @@ impl ToolRecoveryStore {
     /// Called only after the serial provider request boundary has fenced the
     /// previous request. Observe local receipts before the provider safety gate.
     pub(crate) async fn reconcile_provider_boundary(
-        &self, objective_id: &str, binding_id: &str, generation: i64,
+        &self,
+        objective_id: &str,
+        binding_id: &str,
+        generation: i64,
     ) -> Result<()> {
         let rows = sqlx::query("SELECT receipt.id, objective.session_id FROM side_effect_receipts receipt
             JOIN tool_recovery_contracts contract ON contract.receipt_id=receipt.id
@@ -219,34 +223,49 @@ impl ToolRecoveryStore {
             .bind(objective_id).bind(binding_id).bind(generation).fetch_all(&self.pool).await?;
         for row in rows {
             let receipt: String = row.get("id");
-            let finished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tool_recovery_call_links link
+            let finished: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM tool_recovery_call_links link
                 JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?
                 AND tool.status IN ('done','error')
-                AND (tool.result IS NOT NULL OR tool.error IS NOT NULL))")
-                .bind(&receipt).fetch_one(&self.pool).await?;
+                AND (tool.result IS NOT NULL OR tool.error IS NOT NULL))",
+            )
+            .bind(&receipt)
+            .fetch_one(&self.pool)
+            .await?;
             let file: bool = sqlx::query_scalar("SELECT resource_kind='workspace_file' FROM tool_recovery_contracts WHERE receipt_id=?")
                 .bind(&receipt).fetch_one(&self.pool).await?;
             if finished || file || self.local_receipt_is_bounded(&receipt).await? {
                 let session: String = row.get("session_id");
                 let cwd: String = sqlx::query_scalar("SELECT cwd FROM sessions WHERE id=?")
-                    .bind(session).fetch_one(&self.pool).await?;
-                self.settle_foreground(&receipt, Path::new(&cwd), false).await?;
+                    .bind(session)
+                    .fetch_one(&self.pool)
+                    .await?;
+                self.settle_foreground(&receipt, Path::new(&cwd), false)
+                    .await?;
             }
         }
         Ok(())
     }
 
     async fn local_receipt_is_bounded(&self, receipt_id: &str) -> Result<bool> {
-        let calls = sqlx::query("SELECT tool.tool_name, tool.arguments FROM tool_recovery_call_links link
-            JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?")
-            .bind(receipt_id).fetch_all(&self.pool).await?;
-        Ok(!calls.is_empty() && calls.iter().all(|call| {
-            let name: String = call.get("tool_name");
-            let arguments: String = call.get("arguments");
-            let args: serde_json::Value = serde_json::from_str(&arguments).unwrap_or_default();
-            name == "bash" && args.get("command").and_then(|v| v.as_str())
-                .is_some_and(command_has_bounded_local_effects)
-        }))
+        let calls = sqlx::query(
+            "SELECT tool.tool_name, tool.arguments FROM tool_recovery_call_links link
+            JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?",
+        )
+        .bind(receipt_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(!calls.is_empty()
+            && calls.iter().all(|call| {
+                let name: String = call.get("tool_name");
+                let arguments: String = call.get("arguments");
+                let args: serde_json::Value = serde_json::from_str(&arguments).unwrap_or_default();
+                name == "bash"
+                    && args
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(command_has_bounded_local_effects)
+            }))
     }
 
     pub(crate) async fn settle_foreground(
@@ -269,14 +288,19 @@ impl ToolRecoveryStore {
         let locator: String = row.try_get("safe_locator_json")?;
         let pre: String = row.try_get("precondition_digest")?;
         let current = snapshot_digest(&self.pool, cwd, &kind, &locator).await?;
-        let local = kind == "workspace_file" || (kind == "workspace_git" && self.local_receipt_is_bounded(receipt_id).await?);
+        let local = kind == "workspace_file"
+            || (kind == "workspace_git" && self.local_receipt_is_bounded(receipt_id).await?);
         // A returned foreground error is known, even for an opaque local
         // program. It is not permission to replay an external write.
-        let finished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tool_recovery_call_links link
+        let finished: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM tool_recovery_call_links link
             JOIN tool_calls tool ON tool.id=link.tool_call_id WHERE link.receipt_id=?
             AND tool.status IN ('done','error')
-                AND (tool.result IS NOT NULL OR tool.error IS NOT NULL))")
-            .bind(receipt_id).fetch_one(&self.pool).await?;
+                AND (tool.result IS NOT NULL OR tool.error IS NOT NULL))",
+        )
+        .bind(receipt_id)
+        .fetch_one(&self.pool)
+        .await?;
         let now = chrono::Utc::now().timestamp_millis();
         let mut tx = self.pool.begin().await?;
         if succeeded {
@@ -1170,33 +1194,58 @@ fn file_mutator_leaves_the_workspace(lower: &str) -> bool {
 /// verb is merely unfamiliar — which binary may run is what the permission mode
 /// decides.
 fn command_has_bounded_local_effects(command: &str) -> bool {
-    if escapes_workspace_observation(command) { return false; }
-    if codefactory_agent_core::command_is_read_only_probe(command) { return true; }
+    if escapes_workspace_observation(command) {
+        return false;
+    }
+    if codefactory_agent_core::command_is_read_only_probe(command) {
+        return true;
+    }
     // Only literal Python subprocess queries and workspace-relative Path
     // edits are admitted here. Arbitrary interpreter/program code is NOT
     // proven local merely because a workspace digest can be computed.
-    let Some((header, body)) = command.split_once("<<'PY'\n") else { return false; };
-    if !matches!(header.trim(), "python3 -" | "python -" | "cd src && python3 -" | "cd src-tauri/src/agent && python3 -") {
+    let Some((header, body)) = command.split_once("<<'PY'\n") else {
+        return false;
+    };
+    if !matches!(
+        header.trim(),
+        "python3 -" | "python -" | "cd src && python3 -" | "cd src-tauri/src/agent && python3 -"
+    ) {
         return false;
     }
-    let Some(body) = body.strip_suffix("\nPY") else { return false; };
-    let query = regex::Regex::new(r#"^(?:print\()?subprocess\.(?:check_output|run)\(\[([\w\s'",/.-]+)\]\)\)?$"#).expect("static regex");
+    let Some(body) = body.strip_suffix("\nPY") else {
+        return false;
+    };
+    let query = regex::Regex::new(
+        r#"^(?:print\()?subprocess\.(?:check_output|run)\(\[([\w\s'",/.-]+)\]\)\)?$"#,
+    )
+    .expect("static regex");
     let path = regex::Regex::new(r#"^p = Path\('([a-zA-Z0-9_./-]+)'\)$"#).expect("static regex");
-    let edit = regex::Regex::new(r#"^p\.write_text\(p\.read_text\(\)\.replace\('[a-zA-Z0-9_ ]*', '[a-zA-Z0-9_ ]*'\)\)$"#).expect("static regex");
+    let edit = regex::Regex::new(
+        r#"^p\.write_text\(p\.read_text\(\)\.replace\('[a-zA-Z0-9_ ]*', '[a-zA-Z0-9_ ]*'\)\)$"#,
+    )
+    .expect("static regex");
     let mut declared_path = false;
     let mut effect = false;
     for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if matches!(line, "import subprocess" | "from pathlib import Path") { continue; }
+        if matches!(line, "import subprocess" | "from pathlib import Path") {
+            continue;
+        }
         if let Some(capture) = query.captures(line) {
             let argv = capture[1].replace(['\'', '"', ','], " ");
-            if !codefactory_agent_core::is_forge_query_segment(&argv) { return false; }
+            if !codefactory_agent_core::is_forge_query_segment(&argv) {
+                return false;
+            }
             effect = true;
         } else if let Some(capture) = path.captures(line) {
-            if !safe_relative(Path::new(&capture[1])) { return false; }
+            if !safe_relative(Path::new(&capture[1])) {
+                return false;
+            }
             declared_path = true;
         } else if declared_path && edit.is_match(line) {
             effect = true;
-        } else { return false; }
+        } else {
+            return false;
+        }
     }
     effect
 }
@@ -1303,8 +1352,15 @@ fn fetch_output_target(command: &str) -> Option<String> {
         return None;
     }
     let lower = trimmed.to_ascii_lowercase();
-    let client = lower.split_whitespace().next().unwrap_or_default().to_owned();
-    if !matches!(client.as_str(), "curl" | "wget" | "invoke-webrequest" | "iwr") {
+    let client = lower
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    if !matches!(
+        client.as_str(),
+        "curl" | "wget" | "invoke-webrequest" | "iwr"
+    ) {
         return None;
     }
     if escapes_workspace_observation(trimmed) {
@@ -1337,9 +1393,7 @@ fn fetch_output_target(command: &str) -> Option<String> {
             // command never writes.
             let takes_path = match client.as_str() {
                 "curl" => *word == "-o" || word.eq_ignore_ascii_case("--output"),
-                "wget" => {
-                    *word == "-O" || word.eq_ignore_ascii_case("--output-document")
-                }
+                "wget" => *word == "-O" || word.eq_ignore_ascii_case("--output-document"),
                 _ => word.eq_ignore_ascii_case("-outfile"),
             };
             if takes_path {
@@ -1361,26 +1415,54 @@ fn fetch_output_target(command: &str) -> Option<String> {
 /// Only simple foreground delivery commands get a read-only remote observer.
 /// Compound shell programs remain opaque; never replay a remote mutation.
 fn remote_delivery_observer(command: &str) -> Option<Vec<String>> {
-    if command.contains(['\n', '\r', ';', '|', '&', '`', '$', '<', '>']) { return None; }
+    if command.contains(['\n', '\r', ';', '|', '&', '`', '$', '<', '>']) {
+        return None;
+    }
     let words: Vec<_> = command.split_whitespace().collect();
     let values: &[&str] = match words.as_slice() {
         ["git", "push", rest @ ..] => {
-            let remote = rest.iter().find(|value| !value.starts_with('-')).copied().unwrap_or("origin");
+            let remote = rest
+                .iter()
+                .find(|value| !value.starts_with('-'))
+                .copied()
+                .unwrap_or("origin");
             return Some(vec!["git".into(), "ls-remote".into(), remote.into()]);
         }
         ["git", "tag", ..] => &["git", "show-ref", "--tags"],
-        ["gh", "pr", "create" | "merge", ..] => &["gh", "pr", "list", "--state", "all", "--json", "number,state,headRefName,headRefOid"],
-        ["glab", "mr", "create" | "merge", ..] => &["glab", "mr", "list", "--all", "--output", "json"],
+        ["gh", "pr", "create" | "merge", ..] => &[
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--json",
+            "number,state,headRefName,headRefOid",
+        ],
+        ["glab", "mr", "create" | "merge", ..] => {
+            &["glab", "mr", "list", "--all", "--output", "json"]
+        }
         _ => return None,
     };
     Some(values.iter().map(|value| (*value).to_owned()).collect())
 }
 
 async fn remote_delivery_digest(cwd: &Path, observer: &[String]) -> Result<String> {
-    let (program, args) = observer.split_first().ok_or_else(|| anyhow!("missing remote observer"))?;
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30),
-        tokio::process::Command::new(program).no_window().args(args).current_dir(cwd).kill_on_drop(true).output()).await??;
-    if !output.status.success() { bail!("remote delivery observation failed"); }
+    let (program, args) = observer
+        .split_first()
+        .ok_or_else(|| anyhow!("missing remote observer"))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new(program)
+            .no_window()
+            .args(args)
+            .current_dir(cwd)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    if !output.status.success() {
+        bail!("remote delivery observation failed");
+    }
     Ok(format!("{:x}", Sha256::digest(output.stdout)))
 }
 
@@ -1628,15 +1710,46 @@ mod tests {
     async fn m130_remote_observer_tracks_actual_git_refs() {
         let root = tempfile::tempdir().unwrap();
         let remote = root.path().join("remote.git");
-        let init = std::process::Command::new("git").no_window().args(["init", "--bare"]).arg(&remote).output().unwrap();
+        let init = std::process::Command::new("git")
+            .no_window()
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .output()
+            .unwrap();
         assert!(init.status.success());
-        let observer = vec!["git".to_owned(), "ls-remote".to_owned(), remote.to_string_lossy().into_owned()];
-        let before = remote_delivery_digest(root.path(), &observer).await.unwrap();
-        let commit = std::process::Command::new("git").no_window().arg("-C").arg(&remote)
-            .args(["-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "hash-object", "-t", "blob", "-w", "--stdin"])
-            .output().unwrap();
+        let observer = vec![
+            "git".to_owned(),
+            "ls-remote".to_owned(),
+            remote.to_string_lossy().into_owned(),
+        ];
+        let before = remote_delivery_digest(root.path(), &observer)
+            .await
+            .unwrap();
+        let commit = std::process::Command::new("git")
+            .no_window()
+            .arg("-C")
+            .arg(&remote)
+            .args([
+                "-c",
+                "user.name=Synthetic",
+                "-c",
+                "user.email=synthetic@example.invalid",
+                "hash-object",
+                "-t",
+                "blob",
+                "-w",
+                "--stdin",
+            ])
+            .output()
+            .unwrap();
         assert!(commit.status.success());
-        assert_eq!(before, remote_delivery_digest(root.path(), &observer).await.unwrap(), "unreferenced object must not masquerade as a pushed ref");
+        assert_eq!(
+            before,
+            remote_delivery_digest(root.path(), &observer)
+                .await
+                .unwrap(),
+            "unreferenced object must not masquerade as a pushed ref"
+        );
         for command in ["gh pr create", "glab mr create", "git push origin HEAD"] {
             assert!(remote_delivery_observer(command).is_some());
         }
@@ -1675,11 +1788,21 @@ mod tests {
     }
 
     async fn replay_local_receipt(selected: Option<usize>) {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-            .connect("sqlite::memory:").await.unwrap();
-        sqlx::query("PRAGMA foreign_keys=OFF").execute(&pool).await.unwrap();
-        sqlx::raw_sql(include_str!("../../migrations/0007_unified_objective_control_plane.sql"))
-            .execute(&pool).await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0007_unified_objective_control_plane.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         ToolRecoveryStore::ensure_schema(&pool).await.unwrap();
         sqlx::query("CREATE TABLE tool_calls (id TEXT PRIMARY KEY, tool_name TEXT, arguments TEXT, status TEXT, result TEXT, error TEXT)")
             .execute(&pool).await.unwrap();
@@ -1728,14 +1851,35 @@ mod tests {
     #[test]
     fn a_download_is_observed_by_the_file_it_writes() {
         for (command, expected) in [
-            ("curl -fsSL https://example.invalid/install.sh -o install.sh", "install.sh"),
-            ("curl --output tools/cli.tar.gz https://example.invalid/cli.tar.gz", "tools/cli.tar.gz"),
-            ("curl -fsSL https://example.invalid/install.sh > install.sh", "install.sh"),
-            ("wget -O vendor/agentcenter.zip https://example.invalid/a.zip", "vendor/agentcenter.zip"),
-            ("wget --output-document=vendor/a.zip https://example.invalid/a.zip", "vendor/a.zip"),
-            ("Invoke-WebRequest https://example.invalid/a.zip -OutFile vendor/a.zip", "vendor/a.zip"),
+            (
+                "curl -fsSL https://example.invalid/install.sh -o install.sh",
+                "install.sh",
+            ),
+            (
+                "curl --output tools/cli.tar.gz https://example.invalid/cli.tar.gz",
+                "tools/cli.tar.gz",
+            ),
+            (
+                "curl -fsSL https://example.invalid/install.sh > install.sh",
+                "install.sh",
+            ),
+            (
+                "wget -O vendor/agentcenter.zip https://example.invalid/a.zip",
+                "vendor/agentcenter.zip",
+            ),
+            (
+                "wget --output-document=vendor/a.zip https://example.invalid/a.zip",
+                "vendor/a.zip",
+            ),
+            (
+                "Invoke-WebRequest https://example.invalid/a.zip -OutFile vendor/a.zip",
+                "vendor/a.zip",
+            ),
             // A query string is not a fork.
-            ("curl \"https://example.invalid/d?a=1&b=2\" -o a.bin", "a.bin"),
+            (
+                "curl \"https://example.invalid/d?a=1&b=2\" -o a.bin",
+                "a.bin",
+            ),
         ] {
             assert_eq!(
                 fetch_output_target(command).as_deref(),
@@ -1828,7 +1972,13 @@ mod tests {
     #[test]
     fn a_quoted_ampersand_is_not_a_fork() {
         assert!(contains_unquoted("sleep 1 & echo done", '&'));
-        assert!(!contains_unquoted("curl \"https://h/d?a=1&b=2\" -o a.bin", '&'));
-        assert!(!contains_unquoted("curl 'https://h/d?a=1&b=2' -o a.bin", '&'));
+        assert!(!contains_unquoted(
+            "curl \"https://h/d?a=1&b=2\" -o a.bin",
+            '&'
+        ));
+        assert!(!contains_unquoted(
+            "curl 'https://h/d?a=1&b=2' -o a.bin",
+            '&'
+        ));
     }
 }

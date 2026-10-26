@@ -54,10 +54,7 @@ const FILES: &[(&str, &str)] = &[
         "options.html",
         include_str!("../../../extension/options.html"),
     ),
-    (
-        "options.js",
-        include_str!("../../../extension/options.js"),
-    ),
+    ("options.js", include_str!("../../../extension/options.js")),
     ("content/page.js", include_str!("page.js")),
 ];
 
@@ -185,9 +182,10 @@ mod tests {
                 "{relative} must be written"
             );
         }
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.path().join("manifest.json")).unwrap())
-                .expect("the manifest must be valid JSON");
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("manifest.json")).unwrap(),
+        )
+        .expect("the manifest must be valid JSON");
         assert_eq!(manifest["manifest_version"], 3);
     }
 
@@ -218,7 +216,10 @@ mod tests {
                 .unwrap();
         assert_eq!(written["port"], 47615);
         assert_eq!(written["token"], "0123456789abcdef0123456789abcdef");
-        assert_eq!(written["protocol_version"], super::super::bridge::PROTOCOL_VERSION);
+        assert_eq!(
+            written["protocol_version"],
+            super::super::bridge::PROTOCOL_VERSION
+        );
     }
 
     #[test]

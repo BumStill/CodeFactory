@@ -34,7 +34,9 @@ use codefactory_agent_loop::transport::{
 };
 
 use super::events::EventSink;
-use super::failover::{classify_provider_failure, ActiveRouteState, ProviderFailureClass, RouteCandidate};
+use super::failover::{
+    classify_provider_failure, ActiveRouteState, ProviderFailureClass, RouteCandidate,
+};
 use super::provider_recovery::{
     OverloadBudgetDecision, ProviderAttemptSpec, ProviderEpisodeSpec, ProviderMutation,
     ProviderOwnerPermit, ProviderRecoveryStore,
@@ -163,7 +165,8 @@ impl EventSink for TrackingEventSink {
                 StreamEvent::ToolCallStart { .. } | StreamEvent::ToolResult { .. }
             ) {
                 self.round_side_effect_started.store(true, Ordering::SeqCst);
-                self.turn_uncommitted_side_effect.store(true, Ordering::SeqCst);
+                self.turn_uncommitted_side_effect
+                    .store(true, Ordering::SeqCst);
             }
         }
         self.delegate.emit(event);
@@ -428,8 +431,11 @@ impl RoutedDesktopModelTransport {
             notice: format!("模型 {} 服务过载；当前没有可用备用路由（固定模型不会切换），约 60 秒后自动观测，等待服务恢复，无需回复继续。", route.model_id),
         };
         self.events.emit(StreamEvent::TransportRetry {
-            label: "等唤醒".into(), attempt: 0, max_attempts: 0,
-            delay_ms: 60_000, reason: unavailable.notice.clone(),
+            label: "等唤醒".into(),
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: 60_000,
+            reason: unavailable.notice.clone(),
         });
         unavailable.encode()
     }
@@ -445,9 +451,19 @@ impl RoutedDesktopModelTransport {
         let Some(primary) = self.route_state.primary_failure_reason() else {
             return error;
         };
-        if matches!(classify_provider_failure(&primary), ProviderFailureClass::TransportUnreachable)
-            && self.route_state.attempt_snapshots(false).iter().filter(|attempt| attempt.status == "failed")
-                .map(|attempt| &attempt.endpoint).collect::<std::collections::HashSet<_>>().len() > 1 {
+        if matches!(
+            classify_provider_failure(&primary),
+            ProviderFailureClass::TransportUnreachable
+        ) && self
+            .route_state
+            .attempt_snapshots(false)
+            .iter()
+            .filter(|attempt| attempt.status == "failed")
+            .map(|attempt| &attempt.endpoint)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1
+        {
             TransportError::Retryable(self.route_state.exhausted_error(error.message()))
         } else {
             error
@@ -497,7 +513,9 @@ impl RoutedDesktopModelTransport {
         .bind(&active_root)
         .fetch_one(&self.db)
         .await
-        .map_err(|error| provider_transport_error("reconcile durable remediation binding", error))?;
+        .map_err(|error| {
+            provider_transport_error("reconcile durable remediation binding", error)
+        })?;
         if bound > 0 {
             return Ok(true);
         }
@@ -723,7 +741,8 @@ impl RoutedDesktopModelTransport {
         if latches.get::<i64, _>("side_effect_started") != 0
             || latches.get::<i64, _>("objective_side_effect_started") != 0
         {
-            self.turn_uncommitted_side_effect.store(true, Ordering::SeqCst);
+            self.turn_uncommitted_side_effect
+                .store(true, Ordering::SeqCst);
         }
         let root_turn_id = self.root_turn_id.as_deref().ok_or_else(|| {
             TransportError::Fatal("PROVIDER_DURABLE_IDENTITY_MISSING: root turn missing".into())
@@ -762,15 +781,22 @@ impl RoutedDesktopModelTransport {
         );
         let store = ProviderRecoveryStore::new(self.db.clone());
         super::tool_recovery::ToolRecoveryStore::new(self.db.clone())
-            .reconcile_provider_boundary(permit.objective_id(), permit.binding_id(), permit.resource_generation())
-            .await.map_err(|error| provider_transport_error("observe local tool receipts", error))?;
+            .reconcile_provider_boundary(
+                permit.objective_id(),
+                permit.binding_id(),
+                permit.resource_generation(),
+            )
+            .await
+            .map_err(|error| provider_transport_error("observe local tool receipts", error))?;
         // This transport only starts a new request after the previous request
         // future returned. Reconcile before episode admission as well as attempt
         // admission, so the same failure cannot burn the recovery ladder.
         let reconciled = store
             .reconcile_finished_request(&permit, chrono::Utc::now().timestamp_millis())
             .await
-            .map_err(|error| provider_transport_error("reconcile finished provider request", error))?;
+            .map_err(|error| {
+                provider_transport_error("reconcile finished provider request", error)
+            })?;
         require_provider_applied(reconciled, "provider request reconciliation")?;
         let episode = ProviderEpisodeSpec {
             id: episode_id.clone(),
@@ -1134,13 +1160,13 @@ impl DesktopModelTransport {
         // base URL so route planning can stop before the window is spent. The
         // headers are credential-free and only ever feed local routing.
         if let Some(quota) = crate::agent::quota_cap::parse_codex_usage_headers(
-            response
-                .headers()
-                .iter()
-                .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+            response.headers().iter().filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| (name.as_str(), value))
+            }),
             chrono::Utc::now().timestamp_millis(),
         ) {
-            crate::agent::quota_cap::shared_quota_ledger().record_server_usage(&self.base_url, quota);
+            crate::agent::quota_cap::shared_quota_ledger()
+                .record_server_usage(&self.base_url, quota);
         }
 
         // ── Parse the Responses SSE stream ──
@@ -1953,8 +1979,12 @@ impl ModelTransport for RoutedDesktopModelTransport {
         //
         // A round whose tool result is NOT yet in the history keeps the latch,
         // so an uncommitted side effect still blocks a switch.
-        if messages.last().is_some_and(|message| message.role == "tool") {
-            self.turn_uncommitted_side_effect.store(false, Ordering::SeqCst);
+        if messages
+            .last()
+            .is_some_and(|message| message.role == "tool")
+        {
+            self.turn_uncommitted_side_effect
+                .store(false, Ordering::SeqCst);
         }
         let mut transitions = self
             .route_state
@@ -1968,9 +1998,21 @@ impl ModelTransport for RoutedDesktopModelTransport {
         loop {
             let opts = downgraded_options.as_ref().unwrap_or(opts);
             let admission = if super::thin::is_thin(&self.db, &self.session_id).await {
-                self.route_state.admit_model_availability(self.cancel.as_deref(), super::usage_windows::session_ignores_windows(&self.session_id), Some(self.events.as_ref())).await
+                self.route_state
+                    .admit_model_availability(
+                        self.cancel.as_deref(),
+                        super::usage_windows::session_ignores_windows(&self.session_id),
+                        Some(self.events.as_ref()),
+                    )
+                    .await
             } else {
-                self.route_state.admit_usage_window(self.cancel.as_deref(), super::usage_windows::session_ignores_windows(&self.session_id), Some(self.events.as_ref())).await
+                self.route_state
+                    .admit_usage_window(
+                        self.cancel.as_deref(),
+                        super::usage_windows::session_ignores_windows(&self.session_id),
+                        Some(self.events.as_ref()),
+                    )
+                    .await
             };
             if let Some(change) = admission.map_err(classify_transport_error)? {
                 transitions.push(change);
@@ -1981,8 +2023,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
             // earlier rounds. Read BEFORE the stream starts, because the sink
             // below also latches `turn_uncommitted_side_effect` for events that
             // belong to *this* round.
-            let side_effect_before_round =
-                self.turn_uncommitted_side_effect.load(Ordering::SeqCst);
+            let side_effect_before_round = self.turn_uncommitted_side_effect.load(Ordering::SeqCst);
             let round_side_effect_started = Arc::new(AtomicBool::new(false));
             // U30: whether an endpoint-scoped failure on this round may continue
             // on the next configured endpoint. It requires a different usable
@@ -2027,9 +2068,10 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         None => ProviderFailureAction::RetrySafe,
                     };
                     if action == ProviderFailureAction::DurableWaiting {
-                        let error = TransportError::Retryable(
-                            format!("PROVIDER_RECOVERY_WAITING: provider overloaded；{}", self.overload_wait(&route)),
-                        );
+                        let error = TransportError::Retryable(format!(
+                            "PROVIDER_RECOVERY_WAITING: provider overloaded；{}",
+                            self.overload_wait(&route)
+                        ));
                         if !self.turn_uncommitted_side_effect.load(Ordering::SeqCst) {
                             self.route_state.record_current_failure(&reason);
                             return Err(self.failure_with_chain(error));
@@ -2042,7 +2084,8 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
                     }
-                    if self.durable_provider_required && ActiveRouteState::is_overload(&reason)
+                    if self.durable_provider_required
+                        && ActiveRouteState::is_overload(&reason)
                         && (!self.route_state.overload_switch_due(&reason)
                             || !self.route_state.has_available_fallback())
                     {
@@ -2053,7 +2096,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     }
                     let Some(change) = self.route_state.advance_after_failure(&reason) else {
                         return Err(TransportError::Retryable(
-                            self.route_state.exhausted_error(&reason),
+                            self.route_state.exhaustion_error(&reason),
                         ));
                     };
                     transitions.push(change);
@@ -2068,7 +2111,8 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     // multi-round agent turn of its configured fallbacks after
                     // round one, even for a later round that emitted nothing.
                     self.turn_uncommitted_output.store(false, Ordering::SeqCst);
-                    self.turn_uncommitted_side_effect.store(false, Ordering::SeqCst);
+                    self.turn_uncommitted_side_effect
+                        .store(false, Ordering::SeqCst);
                     if let Some(attempt) = provider_attempt.as_ref() {
                         attempt.commit_response(&response).await?;
                     }
@@ -2124,7 +2168,9 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     if let Some(attempt) = provider_attempt.as_ref() {
                         let _ = attempt.settle_failure(&error).await?;
                     }
-                    if error.to_string().contains(REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT)
+                    if error
+                        .to_string()
+                        .contains(REQUIRED_TOOL_CHOICE_NEEDS_NEW_ATTEMPT)
                         && downgraded_options.is_none()
                     {
                         // The refused attempt is settled just above; the next
@@ -2156,9 +2202,10 @@ impl ModelTransport for RoutedDesktopModelTransport {
                         None => ProviderFailureAction::RetrySafe,
                     };
                     if action == ProviderFailureAction::DurableWaiting {
-                        let error = TransportError::Retryable(
-                            format!("PROVIDER_RECOVERY_WAITING: provider overloaded；{}", self.overload_wait(&route)),
-                        );
+                        let error = TransportError::Retryable(format!(
+                            "PROVIDER_RECOVERY_WAITING: provider overloaded；{}",
+                            self.overload_wait(&route)
+                        ));
                         if !self.turn_uncommitted_side_effect.load(Ordering::SeqCst) {
                             self.route_state.record_current_failure(&reason);
                             return Err(self.failure_with_chain(error));
@@ -2188,11 +2235,13 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     // cheaper than the hours of parked waiting this replaced
                     // (production 2026-10-09, session ab2d7b0f: three
                     // TRANSPORT_UNREACHABLE retries, zero deepseek attempts).
-                    if round_side_effect_started.load(Ordering::SeqCst) || side_effect_before_round {
+                    if round_side_effect_started.load(Ordering::SeqCst) || side_effect_before_round
+                    {
                         self.route_state.record_current_failure(&reason);
                         return Err(TransportError::Retryable(reason));
                     }
-                    if self.durable_provider_required && ActiveRouteState::is_overload(&reason)
+                    if self.durable_provider_required
+                        && ActiveRouteState::is_overload(&reason)
                         && (!self.route_state.overload_switch_due(&reason)
                             || !self.route_state.has_available_fallback())
                     {
@@ -2203,7 +2252,7 @@ impl ModelTransport for RoutedDesktopModelTransport {
                     }
                     let Some(change) = self.route_state.advance_after_failure(&reason) else {
                         return Err(TransportError::Retryable(
-                            self.route_state.exhausted_error(&reason),
+                            self.route_state.exhaustion_error(&reason),
                         ));
                     };
                     transitions.push(change);
@@ -3028,9 +3077,8 @@ mod tests {
                     }
                     request.extend_from_slice(&chunk[..read]);
                     if expected_len.is_none() {
-                        if let Some(headers_end) = request
-                            .windows(4)
-                            .position(|window| window == b"\r\n\r\n")
+                        if let Some(headers_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
                         {
                             let headers = String::from_utf8_lossy(&request[..headers_end]);
                             let content_length = headers
@@ -3315,17 +3363,20 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             .await
             .expect("a refused required tool choice must downgrade, not refuse itself");
         assert!(response.text.contains("answered after downgrade"));
-        assert_eq!(hits.load(Ordering::SeqCst), 2, "refusal, then downgraded retry");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "refusal, then downgraded retry"
+        );
 
         // The rewritten request is a different request, so the write-ahead log
         // must show it as its own attempt.
-        let attempts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM provider_route_attempts WHERE objective_id=?",
-        )
-        .bind(&objective.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_route_attempts WHERE objective_id=?")
+                .bind(&objective.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(attempts, 2, "the downgrade needs its own durable attempt");
     }
 
@@ -3408,9 +3459,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
     /// NEW turn, and the live chat_run_control + binding are on that new turn.
     /// This is the exact 2026-09-08 shape — `objective.rs` reactivation keeps
     /// root_turn_id and moves the live turn into resume_cursor.
-    async fn durable_reprompt_fixture(
-        suffix: &str,
-    ) -> (SqlitePool, String, String) {
+    async fn durable_reprompt_fixture(suffix: &str) -> (SqlitePool, String, String) {
         use crate::agent::objective::{
             CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
         };
@@ -3544,16 +3593,17 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             session_id: transport.session_id.clone(),
             root_turn_id: new_root.clone(),
             policy: "prefer".into(),
-            candidate_snapshot_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            candidate_snapshot_json: r#"[{"endpoint":"reprompt-provider","model":"reprompt-model"}]"#.into(),
+            candidate_snapshot_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            candidate_snapshot_json:
+                r#"[{"endpoint":"reprompt-provider","model":"reprompt-model"}]"#.into(),
             resume_cursor: new_root.clone(),
         };
-        let opened = super::super::provider_recovery::ProviderRecoveryStore::new(
-            transport.db.clone(),
-        )
-        .open_episode(&owner, &spec, chrono::Utc::now().timestamp_millis())
-        .await
-        .expect("open_episode must not error");
+        let opened =
+            super::super::provider_recovery::ProviderRecoveryStore::new(transport.db.clone())
+                .open_episode(&owner, &spec, chrono::Utc::now().timestamp_millis())
+                .await
+                .expect("open_episode must not error");
         assert!(
             matches!(
                 opened,
@@ -3573,9 +3623,13 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                 session_id,
                 route_state: ActiveRouteState::from_plan_with_health(
                     super::super::failover::RouteCandidatePlan::new(openai_candidate(
-                        "synthetic-provider", "synthetic-model", "http://127.0.0.1:1".into(),
+                        "synthetic-provider",
+                        "synthetic-model",
+                        "http://127.0.0.1:1".into(),
                     )),
-                    super::super::failover::EndpointHealthRegistry::new(std::time::Duration::from_secs(120)),
+                    super::super::failover::EndpointHealthRegistry::new(
+                        std::time::Duration::from_secs(120),
+                    ),
                 ),
                 cancel: None,
                 turn_uncommitted_output: Arc::new(AtomicBool::new(false)),
@@ -3588,12 +3642,27 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                 durable_provider_required: true,
             };
             let objective_id = format!("reprompt-{suffix}-objective");
-            assert!(transport.stale_remediation_is_superseded_by_live_turn(&objective_id).await.unwrap(),
-                "a durable same-task binding must hand over without requiring the UI projection");
-            sqlx::query("UPDATE objectives SET session_id='different-synthetic-session' WHERE id=?")
-                .bind(&objective_id).execute(&pool).await.unwrap();
-            assert!(!transport.stale_remediation_is_superseded_by_live_turn(&objective_id).await.unwrap(),
-                "a different session must not inherit the remediation");
+            assert!(
+                transport
+                    .stale_remediation_is_superseded_by_live_turn(&objective_id)
+                    .await
+                    .unwrap(),
+                "a durable same-task binding must hand over without requiring the UI projection"
+            );
+            sqlx::query(
+                "UPDATE objectives SET session_id='different-synthetic-session' WHERE id=?",
+            )
+            .bind(&objective_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert!(
+                !transport
+                    .stale_remediation_is_superseded_by_live_turn(&objective_id)
+                    .await
+                    .unwrap(),
+                "a different session must not inherit the remediation"
+            );
         }
     }
 
@@ -3899,8 +3968,12 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             .unwrap();
         // M79: absence of the UI projection alone is recoverable. The negative
         // control must also remove the durable same-task handoff binding.
-        sqlx::query("DELETE FROM objective_bindings WHERE id='reprompt-restart-continue-binding-new'")
-            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "DELETE FROM objective_bindings WHERE id='reprompt-restart-continue-binding-new'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let unavailable = stale
             .resolve_provider_owner()
             .await
@@ -3990,10 +4063,8 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             .expect("the continued turn must surface the model's tool call")
             .clone();
         assert_eq!(tool_call.function.name, "write_file");
-        let workspace = std::env::temp_dir().join(format!(
-            "u27-continued-workspace-{}",
-            std::process::id()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("u27-continued-workspace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&workspace);
         std::fs::create_dir_all(&workspace).unwrap();
         let context = crate::tools::ExecCtx::new(workspace.clone(), None);
@@ -4225,7 +4296,10 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             0,
             "a tool call may already have started: the request must not be replayed"
         );
-        assert_eq!(transport.route_state.current().endpoint_name, "tool-primary");
+        assert_eq!(
+            transport.route_state.current().endpoint_name,
+            "tool-primary"
+        );
     }
 
     #[tokio::test]
@@ -4267,11 +4341,18 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                 .complete(&[], &[], &RoundOptions::default())
                 .await
                 .expect_err("overload must remain system-owned");
-            assert!(error.to_string().contains("等待"), "M125: fixed/no-backup explains its wait: {error}");
-            assert_eq!(transport.route_state.current().endpoint_name, "durable-overload-provider");
+            assert!(
+                error.to_string().contains("等待"),
+                "M125: fixed/no-backup explains its wait: {error}"
+            );
+            assert_eq!(
+                transport.route_state.current().endpoint_name,
+                "durable-overload-provider"
+            );
             if attempt == 3 {
-                let unavailable = super::super::failover::ModelUnavailable::parse(&error.to_string())
-                    .expect("M125: durable wait uses M123 non-failure signal");
+                let unavailable =
+                    super::super::failover::ModelUnavailable::parse(&error.to_string())
+                        .expect("M125: durable wait uses M123 non-failure signal");
                 assert!(unavailable.resume_at_ms.unwrap() > chrono::Utc::now().timestamp_millis());
                 assert!(unavailable.notice.contains("固定模型不会切换"));
                 assert!(error.to_string().contains("PROVIDER_RECOVERY_WAITING"));
@@ -4519,11 +4600,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             "a",
             primary_url,
         ));
-        plan.push_fallback(openai_candidate(
-            "turn-fallback",
-            "b",
-            fallback_url,
-        ));
+        plan.push_fallback(openai_candidate("turn-fallback", "b", fallback_url));
         let transport = RoutedDesktopModelTransport {
             http: test_client(),
             events: Arc::new(super::super::events::CollectingEventSink::new()),
@@ -4653,9 +4730,8 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                     assert_ne!(read, 0, "request must be complete before the 502");
                     request.extend_from_slice(&chunk[..read]);
                     if expected_len.is_none() {
-                        if let Some(headers_end) = request
-                            .windows(4)
-                            .position(|window| window == b"\r\n\r\n")
+                        if let Some(headers_end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
                         {
                             let headers = String::from_utf8_lossy(&request[..headers_end]);
                             let content_length = headers
@@ -4674,7 +4750,8 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                         break;
                     }
                 }
-                let response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let response =
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 stream.write_all(response).expect("write dead endpoint 502");
             }
         });
@@ -4690,7 +4767,9 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             let reason = format!(
                 "HTTP error: error sending request for url (http://127.0.0.1:{port}/chat/completions)"
             );
-            assert!(codefactory_agent_loop::context::is_provider_overloaded(&reason));
+            assert!(codefactory_agent_loop::context::is_provider_overloaded(
+                &reason
+            ));
         }
         assert!(matches!(
             super::super::provider_recovery::overload_budget_decision(3, 0),
@@ -4860,7 +4939,10 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
 
         // R5: usage attribution follows the endpoint that actually answered.
         let attempts = transport.route_state.attempt_snapshots(true);
-        assert_eq!(attempts.last().map(|a| a.endpoint.as_str()), Some("deepseek"));
+        assert_eq!(
+            attempts.last().map(|a| a.endpoint.as_str()),
+            Some("deepseek")
+        );
     }
 
     /// U30 / CF-PFB-R1. The production interception: an endpoint that answers
@@ -4917,7 +4999,10 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
         };
 
         let first = transport.complete(&[], &[], &RoundOptions::default()).await;
-        assert!(first.is_err(), "M125: first overload retains the preferred route");
+        assert!(
+            first.is_err(),
+            "M125: first overload retains the preferred route"
+        );
         assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
         let response = transport
@@ -4925,7 +5010,11 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             .await
             .expect("an overloaded preferred endpoint must not park a fallback-enabled task");
 
-        assert_eq!(primary_hits.load(Ordering::SeqCst), 2, "M125: third POST uses fallback");
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            2,
+            "M125: third POST uses fallback"
+        );
         assert_eq!(
             fallback_hits.load(Ordering::SeqCst),
             1,
@@ -4938,11 +5027,12 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                 .to_endpoint,
             "deepseek"
         );
-        let waiting_episodes: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM provider_route_episodes WHERE status='waiting'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let waiting_episodes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_route_episodes WHERE status='waiting'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             waiting_episodes, 0,
             "a switched-over turn must not leave a durably waiting objective"
@@ -5033,11 +5123,12 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             ("provider_quota_exhausted", "provider_quota_exhausted"),
             "a long, known reset window must not be charged the transient overload budget"
         );
-        let waiting_episodes: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM provider_route_episodes WHERE status='waiting'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let waiting_episodes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_route_episodes WHERE status='waiting'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             waiting_episodes, 0,
             "a switched-over turn must not leave a durably waiting objective"
@@ -5115,11 +5206,12 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
                 "the state must say which models were tried ({tried_model}): {message}"
             );
         }
-        let tried: Vec<String> =
-            sqlx::query_scalar("SELECT endpoint FROM provider_route_attempts ORDER BY attempt_order")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let tried: Vec<String> = sqlx::query_scalar(
+            "SELECT endpoint FROM provider_route_attempts ORDER BY attempt_order",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(tried, vec!["chatgpt", "deepseek", "openrouter"]);
         let failures: Vec<(String, String)> = sqlx::query_as(
             "SELECT status, failure_class FROM provider_route_attempts ORDER BY attempt_order",
@@ -5184,7 +5276,8 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
             durable_provider_required: true,
         };
         let mut assistant_with_tool_call = cm("assistant", "让我先读这个文件。");
-        assistant_with_tool_call.tool_calls = Some(vec![call("call-1", "read_file", "{\"path\":\"a.rs\"}")]);
+        assistant_with_tool_call.tool_calls =
+            Some(vec![call("call-1", "read_file", "{\"path\":\"a.rs\"}")]);
         assistant_with_tool_call.reasoning_content = Some("内部推理：需要先读文件".into());
         let history = vec![
             cm("user", "修一下 a.rs"),
@@ -5200,11 +5293,7 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":
         assert!(fallback_hits.load(Ordering::SeqCst) >= 1);
         let bodies = captured.lock().expect("capture mutex").clone();
         let request = bodies.last().expect("the fallback received the request");
-        for carried in [
-            "TOOL_RESULT_U30_SENTINEL",
-            "修一下 a.rs",
-            "read_file",
-        ] {
+        for carried in ["TOOL_RESULT_U30_SENTINEL", "修一下 a.rs", "read_file"] {
             assert!(
                 request.contains(carried),
                 "the fallback must receive the conversation already in progress ({carried} missing): {request}"

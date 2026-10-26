@@ -13,8 +13,8 @@
 use serde::Serialize;
 use std::process::Command;
 
-use git2::{BranchType, DiffFormat, DiffOptions, Repository, Status, StatusOptions};
 use crate::util::no_window::NoWindow;
+use git2::{BranchType, DiffFormat, DiffOptions, Repository, Status, StatusOptions};
 
 // ── Types serialized to the frontend ────────────────────────────────────────
 
@@ -38,8 +38,8 @@ pub struct FileChange {
 
 #[derive(Serialize, Debug, Clone)]
 pub struct GitCommit {
-    pub hash: String,         // full SHA
-    pub short_hash: String,   // first 7 chars
+    pub hash: String,       // full SHA
+    pub short_hash: String, // first 7 chars
     pub author: String,
     pub email: String,
     pub timestamp: i64,       // unix epoch (seconds)
@@ -72,7 +72,8 @@ fn empty_status() -> GitStatus {
 
 /// Try to open the repository starting at `cwd` and walking up the tree.
 fn open_repo(cwd: &str) -> Result<Repository, String> {
-    Repository::discover(cwd).map_err(|e| format!("Not a git repository ({}): {}", cwd, e.message()))
+    Repository::discover(cwd)
+        .map_err(|e| format!("Not a git repository ({}): {}", cwd, e.message()))
 }
 
 /// Convert a libgit2 status code for the index (staged) into a label.
@@ -116,7 +117,8 @@ fn classify_workdir_status(s: Status) -> Option<&'static str> {
 /// Convenience: run `git` CLI with given args in `cwd`, returning stdout on
 /// success or a combined-error string on failure.
 fn run_git(cwd: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git").no_window()
+    let output = Command::new("git")
+        .no_window()
         .current_dir(cwd)
         .args(args)
         .output()
@@ -373,21 +375,14 @@ pub async fn git_diff(cwd: String, file: Option<String>) -> Result<String, Strin
 }
 
 #[tauri::command]
-pub async fn git_file_diff(
-    cwd: String,
-    file: String,
-    staged: bool,
-) -> Result<String, String> {
+pub async fn git_file_diff(cwd: String, file: String, staged: bool) -> Result<String, String> {
     let repo = open_repo(&cwd)?;
     let mut opts = DiffOptions::new();
     opts.pathspec(&file);
 
     let diff = if staged {
         // diff between HEAD tree and index
-        let head_tree = repo
-            .head()
-            .ok()
-            .and_then(|h| h.peel_to_tree().ok());
+        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
             .map_err(|e| format!("staged diff failed: {}", e.message()))?
     } else {
@@ -444,11 +439,7 @@ pub async fn git_checkout(cwd: String, target: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn git_create_branch(
-    cwd: String,
-    name: String,
-    checkout: bool,
-) -> Result<(), String> {
+pub async fn git_create_branch(cwd: String, name: String, checkout: bool) -> Result<(), String> {
     if name.trim().is_empty() {
         return Err("Branch name cannot be empty".to_string());
     }

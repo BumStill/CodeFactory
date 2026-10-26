@@ -380,7 +380,9 @@ fn strip_blocks(html: &str, tags: &[&str]) -> String {
             // Match the complete tag name: `<head` must not consume `<header>`
             // (or `<nav` a custom `<navigation-note>` element).
             let Some(start) = lower.match_indices(&open).find_map(|(index, _)| {
-                lower.as_bytes().get(index + open.len())
+                lower
+                    .as_bytes()
+                    .get(index + open.len())
                     .filter(|next| next.is_ascii_whitespace() || **next == b'>' || **next == b'/')
                     .map(|_| index)
             }) else {
@@ -714,18 +716,21 @@ fn looks_js_only(html: &str, text: &str) -> bool {
     let has_content = ["p", "li", "pre", "article"].iter().any(|tag| {
         let open = format!("<{tag}");
         lower.match_indices(&open).any(|(index, _)| {
-            let boundary = lower.as_bytes().get(index + open.len())
+            let boundary = lower
+                .as_bytes()
+                .get(index + open.len())
                 .is_some_and(|next| next.is_ascii_whitespace() || *next == b'>');
-            boundary && lower[index..].find('>').is_some_and(|end| {
-                let rest = &html[index + end + 1..];
-                rest.find(&format!("</{tag}>")).is_some_and(|close| {
-                    rest[..close].chars().any(|c| c.is_alphanumeric())
+            boundary
+                && lower[index..].find('>').is_some_and(|end| {
+                    let rest = &html[index + end + 1..];
+                    rest.find(&format!("</{tag}>"))
+                        .is_some_and(|close| rest[..close].chars().any(|c| c.is_alphanumeric()))
                 })
-            })
         })
     });
-    !has_content && (PLACEHOLDERS.iter().any(|marker| lower.contains(marker))
-        || (characters < 40 && lower.contains("<script")))
+    !has_content
+        && (PLACEHOLDERS.iter().any(|marker| lower.contains(marker))
+            || (characters < 40 && lower.contains("<script")))
 }
 
 fn page_slice(text: &str, start: usize, max_chars: usize) -> (String, usize) {
@@ -944,7 +949,11 @@ mod tests {
         let out = fetch(&client, "http://fixture.test/wiki", json!({})).await;
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("Title: Unix philosophy - Wikipedia"));
-        assert!(out.content.contains("Write programs that do one thing"), "{}", out.content);
+        assert!(
+            out.content.contains("Write programs that do one thing"),
+            "{}",
+            out.content
+        );
         assert!(!out.content.contains("Site navigation"));
     }
 
@@ -962,16 +971,29 @@ mod tests {
                 .args(["-c", &script])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .spawn().expect("python3 fixture encoder");
-            std::io::Write::write_all(child.stdin.take().as_mut().unwrap(), WIKI.as_bytes()).unwrap();
+                .spawn()
+                .expect("python3 fixture encoder");
+            std::io::Write::write_all(child.stdin.take().as_mut().unwrap(), WIKI.as_bytes())
+                .unwrap();
             let compressed = child.wait_with_output().unwrap();
             assert!(compressed.status.success());
-            let response = http_response("200 OK", &[("Content-Type", "text/html; charset=UTF-8"), ("Content-Encoding", encoding)], &compressed.stdout);
+            let response = http_response(
+                "200 OK",
+                &[
+                    ("Content-Type", "text/html; charset=UTF-8"),
+                    ("Content-Encoding", encoding),
+                ],
+                &compressed.stdout,
+            );
             let (_, client) = fixture(vec![("/compressed", response)]).await;
             let out = fetch(&client, "http://fixture.test/compressed", json!({})).await;
             assert!(!out.is_error, "{encoding}: {}", out.content);
             assert!(out.content.contains("Title: Unix philosophy - Wikipedia"));
-            assert!(out.content.contains("Write programs that do one thing"), "{encoding}: {}", out.content);
+            assert!(
+                out.content.contains("Write programs that do one thing"),
+                "{encoding}: {}",
+                out.content
+            );
         }
     }
 
@@ -982,9 +1004,16 @@ mod tests {
         let (gbk, _, _) = encoding_rs::GBK.encode(chinese);
         let (_, client) = fixture(vec![
             ("/docs", html(docs)),
-            ("/chinese", http_response("200 OK", &[("Content-Type", "text/html")], &gbk)),
-        ]).await;
-        for (path, title, text) in [("docs", "Docs", "cargo add example"), ("chinese", "中文文档", "组合小工具，完成复杂工作。")] {
+            (
+                "/chinese",
+                http_response("200 OK", &[("Content-Type", "text/html")], &gbk),
+            ),
+        ])
+        .await;
+        for (path, title, text) in [
+            ("docs", "Docs", "cargo add example"),
+            ("chinese", "中文文档", "组合小工具，完成复杂工作。"),
+        ] {
             let out = fetch(&client, &format!("http://fixture.test/{path}"), json!({})).await;
             assert!(!out.is_error, "{}", out.content);
             assert!(out.content.contains(&format!("Title: {title}")));
@@ -1001,16 +1030,32 @@ mod tests {
             let mut buf = [0; 8192];
             let n = socket.read(&mut buf).await.unwrap();
             let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
-            socket.write_all(&html("<p>Headers accepted.</p>")).await.unwrap();
+            socket
+                .write_all(&html("<p>Headers accepted.</p>"))
+                .await
+                .unwrap();
             request
         });
-        let client = reqwest::Client::builder().no_proxy().resolve("fixture.test", addr).build().unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("fixture.test", addr)
+            .build()
+            .unwrap();
         let out = fetch(&client, "http://fixture.test/headers", json!({})).await;
         assert!(!out.is_error, "{}", out.content);
         let request = server.await.unwrap();
         assert!(request.contains("user-agent: mozilla/5.0"), "{request}");
-        assert!(request.contains("accept: text/html,application/xhtml+xml"), "{request}");
-        assert!(request.contains("accept-encoding:") && request.contains("gzip") && request.contains("br") && request.contains("deflate"), "{request}");
+        assert!(
+            request.contains("accept: text/html,application/xhtml+xml"),
+            "{request}"
+        );
+        assert!(
+            request.contains("accept-encoding:")
+                && request.contains("gzip")
+                && request.contains("br")
+                && request.contains("deflate"),
+            "{request}"
+        );
     }
 
     #[test]
@@ -1025,13 +1070,28 @@ mod tests {
     #[tokio::test]
     async fn m131c_brotli_document_is_decoded() {
         // node:zlib.brotliCompressSync of a synthetic HTML documentation page.
-        let bytes = [27,113,0,200,68,231,150,42,33,65,40,236,65,83,114,98,112,211,157,161,224,132,3,151,70,18,120,94,166,7,161,187,141,189,39,14,245,185,163,21,196,7,13,61,8,248,180,226,63,91,130,243,157,6,154,151,240,68,231,157,92,235,193,26,226,90,35,36,14,117,75,36,3];
-        let response = http_response("200 OK", &[("Content-Type", "text/html"), ("Content-Encoding", "br")], &bytes);
+        let bytes = [
+            27, 113, 0, 200, 68, 231, 150, 42, 33, 65, 40, 236, 65, 83, 114, 98, 112, 211, 157,
+            161, 224, 132, 3, 151, 70, 18, 120, 94, 166, 7, 161, 187, 141, 189, 39, 14, 245, 185,
+            163, 21, 196, 7, 13, 61, 8, 248, 180, 226, 63, 91, 130, 243, 157, 6, 154, 151, 240, 68,
+            231, 157, 92, 235, 193, 26, 226, 90, 35, 36, 14, 117, 75, 36, 3,
+        ];
+        let response = http_response(
+            "200 OK",
+            &[("Content-Type", "text/html"), ("Content-Encoding", "br")],
+            &bytes,
+        );
         let (_, client) = fixture(vec![("/br", response)]).await;
         let out = fetch(&client, "http://fixture.test/br", json!({})).await;
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("Title: Brotli docs"), "{}", out.content);
-        assert!(out.content.contains("Compressed documentation remains readable."));
+        assert!(
+            out.content.contains("Title: Brotli docs"),
+            "{}",
+            out.content
+        );
+        assert!(out
+            .content
+            .contains("Compressed documentation remains readable."));
     }
 
     #[tokio::test]
@@ -1045,12 +1105,28 @@ mod tests {
             .output().unwrap();
         assert!(compressed.status.success());
         assert!(raw.len() > 100_000);
-        let response = http_response("200 OK", &[("Content-Type", "text/html; charset=UTF-8"), ("Content-Encoding", "gzip")], &compressed.stdout);
+        let response = http_response(
+            "200 OK",
+            &[
+                ("Content-Type", "text/html; charset=UTF-8"),
+                ("Content-Encoding", "gzip"),
+            ],
+            &compressed.stdout,
+        );
         let (_, client) = fixture(vec![("/original", response)]).await;
-        let out = fetch(&client, "http://fixture.test/original", json!({"max_chars": 40000})).await;
+        let out = fetch(
+            &client,
+            "http://fixture.test/original",
+            json!({"max_chars": 40000}),
+        )
+        .await;
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("Title: Unix philosophy"));
-        assert!(out.content.contains("Write programs that do one thing"), "{}", out.content);
+        assert!(
+            out.content.contains("Write programs that do one thing"),
+            "{}",
+            out.content
+        );
         println!("original Wikipedia gzip: title and Unix philosophy paragraph verified via web_fetch only");
     }
 
@@ -1058,10 +1134,23 @@ mod tests {
     #[ignore = "local-only live web_fetch probe; CI never accesses external sites"]
     async fn m131c_live_wikipedia_web_fetch_only() {
         let ctx = ExecCtx::new(std::env::temp_dir(), None);
-        let out = execute(json!({"url": "https://en.wikipedia.org/wiki/Unix_philosophy", "max_chars": 40000}), &ctx).await.unwrap();
+        let out = execute(
+            json!({"url": "https://en.wikipedia.org/wiki/Unix_philosophy", "max_chars": 40000}),
+            &ctx,
+        )
+        .await
+        .unwrap();
         assert!(!out.is_error, "{}", out.content);
-        assert!(out.content.contains("Title: Unix philosophy"), "{}", out.content);
-        assert!(out.content.contains("Write programs that do one thing"), "{}", out.content);
+        assert!(
+            out.content.contains("Title: Unix philosophy"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("Write programs that do one thing"),
+            "{}",
+            out.content
+        );
         println!("live web_fetch only: title and principle verified; no browser_session");
     }
 

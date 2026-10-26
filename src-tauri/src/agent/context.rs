@@ -148,11 +148,7 @@ pub fn resolve_context_window(
 /// reactive strip-and-retry remains the net for wrong guesses; proactively
 /// dropping images on a false negative would be worse than one failed
 /// round-trip.
-pub fn model_supports_vision(
-    settings: &Settings,
-    endpoint_name: &str,
-    model_id: &str,
-) -> bool {
+pub fn model_supports_vision(settings: &Settings, endpoint_name: &str, model_id: &str) -> bool {
     if let Some(ep) = settings.endpoints.get(endpoint_name) {
         for cm in &ep.custom_models {
             if cm.id == model_id {
@@ -368,12 +364,20 @@ mod tests {
         // false negative would be worse than one failed round-trip.
         let settings = Settings::default();
         assert!(!model_supports_vision(&settings, "any", "deepseek-v4-pro"));
-        assert!(!model_supports_vision(&settings, "any", "deepseek-reasoner"));
+        assert!(!model_supports_vision(
+            &settings,
+            "any",
+            "deepseek-reasoner"
+        ));
         assert!(model_supports_vision(&settings, "any", "deepseek-vl2"));
         assert!(model_supports_vision(&settings, "chatgpt", "gpt-5.5"));
         assert!(model_supports_vision(&settings, "any", "gpt-5.6-sol"));
         assert!(model_supports_vision(&settings, "any", "claude-opus-4-8"));
-        assert!(model_supports_vision(&settings, "any", "totally-unknown-model"));
+        assert!(model_supports_vision(
+            &settings,
+            "any",
+            "totally-unknown-model"
+        ));
     }
 
     #[test]

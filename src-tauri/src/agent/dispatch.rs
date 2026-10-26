@@ -470,11 +470,17 @@ fn without_scoped_file_limits(lowercased: &str) -> String {
 fn has_hard_read_only_directive(user_msg: &str) -> bool {
     let text = without_scoped_file_limits(&user_msg.to_ascii_lowercase());
     // Conditional constraints govern their branch, not the entire turn.
-    let text = text.split([ '。', '；', ';' ]).filter(|clause| {
-        let clause = clause.trim_start();
-        !clause.starts_with("如果") && !clause.starts_with("若") && !clause.starts_with("if ")
-    }).collect::<Vec<_>>().join("。");
-    HARD_READ_ONLY_CJK.iter().chain(HARD_READ_ONLY_EN_PHRASES.iter())
+    let text = text
+        .split(['。', '；', ';'])
+        .filter(|clause| {
+            let clause = clause.trim_start();
+            !clause.starts_with("如果") && !clause.starts_with("若") && !clause.starts_with("if ")
+        })
+        .collect::<Vec<_>>()
+        .join("。");
+    HARD_READ_ONLY_CJK
+        .iter()
+        .chain(HARD_READ_ONLY_EN_PHRASES.iter())
         .any(|cue| text.contains(cue) && !text.contains(&format!("别{cue}")))
 }
 
@@ -529,7 +535,9 @@ fn declared_ceiling_word(lowercased: &str) -> Option<&'static str> {
 /// "授权交付（ceiling: merged）". Only an explicit delivery grant may declare a
 /// ceiling — a question about a ceiling is not an authorization — and the widest
 /// declaration in the message wins.
-pub fn declared_delivery_ceiling(user_msg: &str) -> Option<crate::config::settings::DeliveryCeiling> {
+pub fn declared_delivery_ceiling(
+    user_msg: &str,
+) -> Option<crate::config::settings::DeliveryCeiling> {
     if !is_explicit_delivery_authorization(user_msg) {
         return None;
     }
@@ -539,7 +547,9 @@ pub fn declared_delivery_ceiling(user_msg: &str) -> Option<crate::config::settin
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|word| !word.is_empty())
         .collect();
-    words.windows(2).filter(|pair| pair[0] == "ceiling")
+    words
+        .windows(2)
+        .filter(|pair| pair[0] == "ceiling")
         .filter_map(|pair| crate::config::settings::DeliveryCeiling::from_label(pair[1]))
         .max_by_key(|ceiling| ceiling.rank())
 }
@@ -978,7 +988,14 @@ pub fn resolve_turn_delivery_authorization(
     } else {
         TurnCapability::Implement
     };
-    (contract, if revoked { DeliveryAuthorizationUpdate::Revoked } else { DeliveryAuthorizationUpdate::Unchanged })
+    (
+        contract,
+        if revoked {
+            DeliveryAuthorizationUpdate::Revoked
+        } else {
+            DeliveryAuthorizationUpdate::Unchanged
+        },
+    )
 }
 
 /// A mid-run user steer can change the current action intent at the next safe
@@ -1598,7 +1615,11 @@ mod tests {
         for message in ["先分析一下，不要改代码", "只评估风险，别执行"] {
             let contract = decide_chat_contract(None, message);
             assert!(contract.grants.explicit_read_only, "{message:?}");
-            assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+            assert_eq!(
+                contract.capability,
+                TurnCapability::ReviewOnly,
+                "{message:?}"
+            );
             assert_eq!(contract.mode, AgentMode::Interactive, "{message:?}");
             let block = constraint_instruction_block(message).expect("instruction block");
             assert!(block.contains("turn-constraint"), "{message:?}");
@@ -1667,7 +1688,11 @@ mod tests {
             // β: the constraint becomes an instruction; the change request
             // keeps its write capability.
             let contract = decide_chat_contract(None, message);
-            assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+            assert_eq!(
+                contract.capability,
+                TurnCapability::ReviewOnly,
+                "{message:?}"
+            );
             assert!(contract.grants.explicit_read_only, "{message:?}");
             assert!(
                 constraint_instruction_block(message).is_some(),
@@ -1770,10 +1795,18 @@ mod tests {
 
     #[test]
     fn explicit_mid_turn_correction_can_change_the_active_capability() {
-        for message in ["先把之前批准的执行了，再回来分析原因", "别只审视了，继续实施，把刚才这个方案执行完。", "继续", "继续发布上线"] {
+        for message in [
+            "先把之前批准的执行了，再回来分析原因",
+            "别只审视了，继续实施，把刚才这个方案执行完。",
+            "继续",
+            "继续发布上线",
+        ] {
             assert_eq!(steer_capability_override(message), None);
         }
-        assert_eq!(steer_capability_override("先别修改，继续分析"), Some(TurnCapability::ReviewOnly));
+        assert_eq!(
+            steer_capability_override("先别修改，继续分析"),
+            Some(TurnCapability::ReviewOnly)
+        );
     }
 
     /// 2026-09-08 field report. Seven sessions were resumed with the single
@@ -1809,7 +1842,10 @@ mod tests {
         );
         assert!(is_delivery_revocation("先别发布"));
         // A message that steers nothing still steers nothing.
-        assert_eq!(steer_capability_override_with_authorization("嗯", true), None);
+        assert_eq!(
+            steer_capability_override_with_authorization("嗯", true),
+            None
+        );
     }
 
     /// β fixture 1 — the 2026-09-24 shape: a delivery request that ends with a
@@ -1819,7 +1855,11 @@ mod tests {
         let message =
             "先合并主干并跑测试，然后调用交付工具；如果新提交的 CI 再遇到环境抖动，不要改代码或验收脚本。";
         let contract = decide_chat_contract(None, message);
-        assert_ne!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+        assert_ne!(
+            contract.capability,
+            TurnCapability::ReviewOnly,
+            "{message:?}"
+        );
         assert!(!contract.grants.explicit_read_only, "{message:?}");
         let payload = constraint_audit_payload(message).expect("audit payload");
         assert_eq!(payload["capability_effect"], "none");
@@ -1835,9 +1875,16 @@ mod tests {
         let message = "先分析一下这个布局，不要改代码";
         let contract = decide_chat_contract(None, message);
         assert_eq!(contract.mode, AgentMode::Interactive, "{message:?}");
-        assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+        assert_eq!(
+            contract.capability,
+            TurnCapability::ReviewOnly,
+            "{message:?}"
+        );
         assert!(contract.grants.explicit_read_only, "{message:?}");
-        assert!(constraint_instruction_block(message).is_some(), "{message:?}");
+        assert!(
+            constraint_instruction_block(message).is_some(),
+            "{message:?}"
+        );
     }
 
     /// β fixture 3 — an explicitly read-only delegated subagent is the only
@@ -1896,7 +1943,11 @@ mod tests {
         let message = "只读审查当前分支的实现，不要修改文件。";
         let contract = decide_chat_contract(None, message);
         assert!(contract.grants.explicit_read_only, "{message:?}");
-        assert_eq!(contract.capability, TurnCapability::ReviewOnly, "{message:?}");
+        assert_eq!(
+            contract.capability,
+            TurnCapability::ReviewOnly,
+            "{message:?}"
+        );
     }
 
     /// β fixture 5 — a structured read-only turn must still hand back evidence:
@@ -2028,14 +2079,32 @@ mod tests {
     fn m116_declared_ceiling_is_read_from_the_dispatch_message() {
         use crate::config::settings::DeliveryCeiling;
         let cases = [
-            ("授权交付（ceiling: merged）。按分支交付。", DeliveryCeiling::ThroughMerge),
-            ("开始实施：授权交付（ceiling: through_merge）", DeliveryCeiling::ThroughMerge),
+            (
+                "授权交付（ceiling: merged）。按分支交付。",
+                DeliveryCeiling::ThroughMerge,
+            ),
+            (
+                "开始实施：授权交付（ceiling: through_merge）",
+                DeliveryCeiling::ThroughMerge,
+            ),
             ("授权交付，ceiling: pr_only。", DeliveryCeiling::PrOnly),
-            ("授权交付（ceiling: through_ci_green）", DeliveryCeiling::ThroughCiGreen),
-            ("授权交付（ceiling: through_release）", DeliveryCeiling::ThroughRelease),
-            ("Delivery authorized — ceiling: merged.", DeliveryCeiling::ThroughMerge),
+            (
+                "授权交付（ceiling: through_ci_green）",
+                DeliveryCeiling::ThroughCiGreen,
+            ),
+            (
+                "授权交付（ceiling: through_release）",
+                DeliveryCeiling::ThroughRelease,
+            ),
+            (
+                "Delivery authorized — ceiling: merged.",
+                DeliveryCeiling::ThroughMerge,
+            ),
             // The widest declaration in one message wins.
-            ("授权交付，ceiling: pr_only，最终 ceiling: merged", DeliveryCeiling::ThroughMerge),
+            (
+                "授权交付，ceiling: pr_only，最终 ceiling: merged",
+                DeliveryCeiling::ThroughMerge,
+            ),
         ];
         for (message, expected) in cases {
             assert_eq!(

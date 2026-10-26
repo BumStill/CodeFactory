@@ -147,21 +147,38 @@ async fn m107_in_flight_attempt_continues_after_reconciliation() {
     let permit = insert_claimed_provider_objective(&pool).await;
     let store = ProviderRecoveryStore::new(pool.clone());
     store.open_episode(&permit, &episode(), NOW).await.unwrap();
-    store.begin_attempt(&permit, &attempt("interrupted", "episode-1", "a"), NOW + 1).await.unwrap();
-    store.mark_in_flight(&permit, "interrupted", NOW + 2).await.unwrap();
+    store
+        .begin_attempt(&permit, &attempt("interrupted", "episode-1", "a"), NOW + 1)
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "interrupted", NOW + 2)
+        .await
+        .unwrap();
     assert_eq!(
-        store.reconcile_finished_request(&permit, NOW + 3).await.unwrap(),
+        store
+            .reconcile_finished_request(&permit, NOW + 3)
+            .await
+            .unwrap(),
         ProviderMutation::Applied(1),
         "an effect-free in-flight attempt is reconciled by its live owner",
     );
-    store.begin_attempt(&permit, &attempt("continued", "episode-1", "b"), NOW + 4)
+    store
+        .begin_attempt(&permit, &attempt("continued", "episode-1", "b"), NOW + 4)
         .await
         .expect("the reconciled episode admits the next attempt under the same owner");
-    let status: String = sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='interrupted'")
-        .fetch_one(&pool).await.unwrap();
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='interrupted'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(status, "failed_replayable");
-    let budget: i64 = sqlx::query_scalar("SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'")
-        .fetch_one(&pool).await.unwrap();
+    let budget: i64 = sqlx::query_scalar(
+        "SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(budget, 7, "reconciliation never spends recovery budget");
 }
 
@@ -173,18 +190,46 @@ async fn m107_real_push_with_unknown_receipt_stops() {
     let permit = insert_claimed_provider_objective(&pool).await;
     let store = ProviderRecoveryStore::new(pool.clone());
     store.open_episode(&permit, &episode(), NOW).await.unwrap();
-    store.begin_attempt(&permit, &attempt("push", "episode-1", "a"), NOW + 1).await.unwrap();
-    store.mark_in_flight(&permit, "push", NOW + 2).await.unwrap();
     store
-        .begin_side_effect(&permit, "push", "tool:bash", "git-push-origin-main", NOW + 3)
+        .begin_attempt(&permit, &attempt("push", "episode-1", "a"), NOW + 1)
         .await
         .unwrap();
-    let error = store.reconcile_finished_request(&permit, NOW + 4).await.unwrap_err();
-    assert!(error.to_string().contains("PROVIDER_RECONCILIATION_UNSAFE"), "{error}");
-    let status: String = sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE objective_id='objective-opaque'")
-        .fetch_one(&pool).await.unwrap();
-    assert_eq!(status, "started", "an unknown push receipt is never settled locally");
-    assert!(store.begin_attempt(&permit, &attempt("after-push", "episode-1", "b"), NOW + 5).await.is_err());
+    store
+        .mark_in_flight(&permit, "push", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .begin_side_effect(
+            &permit,
+            "push",
+            "tool:bash",
+            "git-push-origin-main",
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    let error = store
+        .reconcile_finished_request(&permit, NOW + 4)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("PROVIDER_RECONCILIATION_UNSAFE"),
+        "{error}"
+    );
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM side_effect_receipts WHERE objective_id='objective-opaque'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        status, "started",
+        "an unknown push receipt is never settled locally"
+    );
+    assert!(store
+        .begin_attempt(&permit, &attempt("after-push", "episode-1", "b"), NOW + 5)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -195,14 +240,44 @@ async fn m107_normal_committed_steps_are_not_recovery_failures() {
     store.open_episode(&permit, &episode(), NOW).await.unwrap();
     for index in 0..12 {
         let id = format!("round-{index}");
-        store.begin_attempt(&permit, &attempt(&id, "episode-1", "a"), NOW + 1).await.unwrap();
+        store
+            .begin_attempt(&permit, &attempt(&id, "episode-1", "a"), NOW + 1)
+            .await
+            .unwrap();
         store.mark_in_flight(&permit, &id, NOW + 2).await.unwrap();
-        store.commit_response(&permit, &id, &format!("sha256:{}", "a".repeat(64)), "tool step", false, NOW + 3).await.unwrap();
-        assert_eq!(store.reconcile_finished_request(&permit, NOW + 4).await.unwrap(), ProviderMutation::Applied(0), "normal committed step is not a recovery");
-        let status: String = sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id=?").bind(&id).fetch_one(&pool).await.unwrap();
+        store
+            .commit_response(
+                &permit,
+                &id,
+                &format!("sha256:{}", "a".repeat(64)),
+                "tool step",
+                false,
+                NOW + 3,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reconcile_finished_request(&permit, NOW + 4)
+                .await
+                .unwrap(),
+            ProviderMutation::Applied(0),
+            "normal committed step is not a recovery"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id=?")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "response_committed");
     }
-    let budget: i64 = sqlx::query_scalar("SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'").fetch_one(&pool).await.unwrap();
+    let budget: i64 = sqlx::query_scalar(
+        "SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(budget, 7);
 }
 
@@ -213,27 +288,58 @@ async fn m103_current_owner_reconciles_effect_free_request_at_serial_boundary() 
         let permit = insert_claimed_provider_objective(&pool).await;
         let store = ProviderRecoveryStore::new(pool.clone());
         store.open_episode(&permit, &episode(), NOW).await.unwrap();
-        store.begin_attempt(&permit, &attempt("leftover", "episode-1", "a"), NOW + 1).await.unwrap();
-        store.mark_in_flight(&permit, "leftover", NOW + 2).await.unwrap();
+        store
+            .begin_attempt(&permit, &attempt("leftover", "episode-1", "a"), NOW + 1)
+            .await
+            .unwrap();
+        store
+            .mark_in_flight(&permit, "leftover", NOW + 2)
+            .await
+            .unwrap();
         if output {
-            store.append_partial_output(&permit, "leftover", "durable partial answer", NOW + 3).await.unwrap();
+            store
+                .append_partial_output(&permit, "leftover", "durable partial answer", NOW + 3)
+                .await
+                .unwrap();
         }
         assert_eq!(
-            store.reconcile_finished_request(&permit, NOW + 4).await.unwrap(),
+            store
+                .reconcile_finished_request(&permit, NOW + 4)
+                .await
+                .unwrap(),
             ProviderMutation::Applied(1),
         );
-        store.begin_attempt(&permit, &attempt("continued", "episode-1", "b"), NOW + 4)
-            .await.expect("serial request boundary must reconcile its own effect-free leftover");
-        let status: String = sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='leftover'")
-            .fetch_one(&pool).await.unwrap();
+        store
+            .begin_attempt(&permit, &attempt("continued", "episode-1", "b"), NOW + 4)
+            .await
+            .expect("serial request boundary must reconcile its own effect-free leftover");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='leftover'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "failed_replayable");
-        let budget: i64 = sqlx::query_scalar("SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'")
-            .fetch_one(&pool).await.unwrap();
+        let budget: i64 = sqlx::query_scalar(
+            "SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(budget, 7, "reconciliation is not a recovery attempt");
-        assert_eq!(store.reconcile_finished_request(&permit, NOW + 5).await.unwrap(), ProviderMutation::Applied(0));
+        assert_eq!(
+            store
+                .reconcile_finished_request(&permit, NOW + 5)
+                .await
+                .unwrap(),
+            ProviderMutation::Applied(0)
+        );
         if output {
-            let content: String = sqlx::query_scalar("SELECT content FROM provider_output_checkpoints WHERE attempt_id='leftover'")
-                .fetch_one(&pool).await.unwrap();
+            let content: String = sqlx::query_scalar(
+                "SELECT content FROM provider_output_checkpoints WHERE attempt_id='leftover'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             assert_eq!(content, "durable partial answer");
         }
     }
@@ -246,20 +352,66 @@ async fn m103_reconciliation_closes_prior_episode_before_revision_resume() {
         let old = insert_claimed_provider_objective(&pool).await;
         let store = ProviderRecoveryStore::new(pool.clone());
         store.open_episode(&old, &episode(), NOW).await.unwrap();
-        store.begin_attempt(&old, &attempt("prior", "episode-1", "a"), NOW + 1).await.unwrap();
+        store
+            .begin_attempt(&old, &attempt("prior", "episode-1", "a"), NOW + 1)
+            .await
+            .unwrap();
         store.mark_in_flight(&old, "prior", NOW + 2).await.unwrap();
         if committed {
-            store.commit_response(&old, "prior", "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "saved response", false, NOW + 3).await.unwrap();
+            store
+                .commit_response(
+                    &old,
+                    "prior",
+                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "saved response",
+                    false,
+                    NOW + 3,
+                )
+                .await
+                .unwrap();
         }
-        sqlx::query("UPDATE objectives SET revision=5 WHERE id='objective-opaque'").execute(&pool).await.unwrap();
-        let next = ProviderOwnerPermit::remediation("objective-opaque", 5, "binding-1", 3, "remediation-1", "provider-owner", 7);
-        assert_eq!(store.reconcile_finished_request(&next, NOW + 4).await.unwrap(), ProviderMutation::Applied(1));
+        sqlx::query("UPDATE objectives SET revision=5 WHERE id='objective-opaque'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let next = ProviderOwnerPermit::remediation(
+            "objective-opaque",
+            5,
+            "binding-1",
+            3,
+            "remediation-1",
+            "provider-owner",
+            7,
+        );
+        assert_eq!(
+            store
+                .reconcile_finished_request(&next, NOW + 4)
+                .await
+                .unwrap(),
+            ProviderMutation::Applied(1)
+        );
         let mut next_episode = episode();
         next_episode.id = "episode-next".into();
-        assert!(matches!(store.open_episode(&next, &next_episode, NOW + 5).await.unwrap(), ProviderMutation::Applied(_)));
-        let old_status: String = sqlx::query_scalar("SELECT status FROM provider_route_episodes WHERE id='episode-1'").fetch_one(&pool).await.unwrap();
+        assert!(matches!(
+            store
+                .open_episode(&next, &next_episode, NOW + 5)
+                .await
+                .unwrap(),
+            ProviderMutation::Applied(_)
+        ));
+        let old_status: String =
+            sqlx::query_scalar("SELECT status FROM provider_route_episodes WHERE id='episode-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(old_status, "completed");
-        assert_eq!(store.reconcile_finished_request(&old, NOW + 6).await.unwrap(), ProviderMutation::Fenced);
+        assert_eq!(
+            store
+                .reconcile_finished_request(&old, NOW + 6)
+                .await
+                .unwrap(),
+            ProviderMutation::Fenced
+        );
     }
 }
 
@@ -269,16 +421,46 @@ async fn m103_reconciliation_refuses_unproven_side_effect() {
     let permit = insert_claimed_provider_objective(&pool).await;
     let store = ProviderRecoveryStore::new(pool.clone());
     store.open_episode(&permit, &episode(), NOW).await.unwrap();
-    store.begin_attempt(&permit, &attempt("unsafe", "episode-1", "a"), NOW + 1).await.unwrap();
-    store.mark_in_flight(&permit, "unsafe", NOW + 2).await.unwrap();
-    store.begin_side_effect(&permit, "unsafe", "tool:write_file", "synthetic-action", NOW + 3).await.unwrap();
-    let error = store.reconcile_finished_request(&permit, NOW + 4).await.unwrap_err();
+    store
+        .begin_attempt(&permit, &attempt("unsafe", "episode-1", "a"), NOW + 1)
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&permit, "unsafe", NOW + 2)
+        .await
+        .unwrap();
+    store
+        .begin_side_effect(
+            &permit,
+            "unsafe",
+            "tool:write_file",
+            "synthetic-action",
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    let error = store
+        .reconcile_finished_request(&permit, NOW + 4)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("PROVIDER_RECONCILIATION_UNSAFE"));
     assert!(error.to_string().contains("项目工作目录"));
-    let status: String = sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='unsafe'").fetch_one(&pool).await.unwrap();
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='unsafe'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_ne!(status, "failed_replayable");
-    assert!(store.begin_attempt(&permit, &attempt("forbidden", "episode-1", "b"), NOW + 5).await.is_err());
-    let budget: i64 = sqlx::query_scalar("SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'").fetch_one(&pool).await.unwrap();
+    assert!(store
+        .begin_attempt(&permit, &attempt("forbidden", "episode-1", "b"), NOW + 5)
+        .await
+        .is_err());
+    let budget: i64 = sqlx::query_scalar(
+        "SELECT attempt_index FROM objective_remediations WHERE id='remediation-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(budget, 7);
 }
 
@@ -336,20 +518,65 @@ async fn m88_same_revision_takeover_reconciles_old_in_flight() {
     let old = insert_claimed_provider_objective(&pool).await;
     let store = ProviderRecoveryStore::new(pool.clone());
     store.open_episode(&old, &episode(), NOW).await.unwrap();
-    store.begin_attempt(&old, &attempt("old-flight", "episode-1", "chatgpt"), NOW + 1).await.unwrap();
-    store.mark_in_flight(&old, "old-flight", NOW + 2).await.unwrap();
+    store
+        .begin_attempt(
+            &old,
+            &attempt("old-flight", "episode-1", "chatgpt"),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_in_flight(&old, "old-flight", NOW + 2)
+        .await
+        .unwrap();
     sqlx::query("UPDATE objectives SET lease_owner='new-owner', lease_expires_at=?")
-        .bind(NOW + 960_000).execute(&pool).await.unwrap();
+        .bind(NOW + 960_000)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE objective_remediations SET lease_owner='new-owner', attempt_index=8, lease_expires_at=?")
         .bind(NOW + 960_000).execute(&pool).await.unwrap();
-    let new = ProviderOwnerPermit::remediation("objective-opaque", 4, "binding-1", 3,
-        "remediation-1", "new-owner", 8);
-    assert!(matches!(store.open_episode(&new, &episode(), NOW + 900_000).await.unwrap(), ProviderMutation::Applied(_)));
-    assert!(matches!(store.begin_attempt(&new, &attempt("new-flight", "episode-1", "deepseek"), NOW + 900_001).await.unwrap(), ProviderMutation::Applied(_)));
-    let status: String = sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='old-flight'")
-        .fetch_one(&pool).await.unwrap();
+    let new = ProviderOwnerPermit::remediation(
+        "objective-opaque",
+        4,
+        "binding-1",
+        3,
+        "remediation-1",
+        "new-owner",
+        8,
+    );
+    assert!(matches!(
+        store
+            .open_episode(&new, &episode(), NOW + 900_000)
+            .await
+            .unwrap(),
+        ProviderMutation::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .begin_attempt(
+                &new,
+                &attempt("new-flight", "episode-1", "deepseek"),
+                NOW + 900_001
+            )
+            .await
+            .unwrap(),
+        ProviderMutation::Applied(_)
+    ));
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='old-flight'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(status, "failed_replayable");
-    assert!(matches!(store.mark_in_flight(&old, "old-flight", NOW + 900_002).await.unwrap(), ProviderMutation::Fenced));
+    assert!(matches!(
+        store
+            .mark_in_flight(&old, "old-flight", NOW + 900_002)
+            .await
+            .unwrap(),
+        ProviderMutation::Fenced
+    ));
 }
 
 /// M98-R2/R4. An upgrade restart replaces the owner after the provider round
@@ -363,7 +590,11 @@ async fn m98_restart_reconciles_committed_response_before_next_attempt() {
     let store = ProviderRecoveryStore::new(pool.clone());
     store.open_episode(&old, &episode(), NOW).await.unwrap();
     store
-        .begin_attempt(&old, &attempt("old-committed", "episode-1", "deepseek"), NOW + 1)
+        .begin_attempt(
+            &old,
+            &attempt("old-committed", "episode-1", "deepseek"),
+            NOW + 1,
+        )
         .await
         .unwrap();
     store
@@ -442,9 +673,14 @@ async fn m98_restart_reconciles_committed_response_before_next_attempt() {
     );
     // No recovery work is produced for a settled checkpoint, so the supervisor
     // never routes a technical failure (and never spends the recovery budget).
-    let candidates = store.startup_recovery_candidates(NOW + 900_002).await.unwrap();
+    let candidates = store
+        .startup_recovery_candidates(NOW + 900_002)
+        .await
+        .unwrap();
     assert!(
-        candidates.iter().all(|candidate| candidate.objective_id != "objective-opaque"),
+        candidates
+            .iter()
+            .all(|candidate| candidate.objective_id != "objective-opaque"),
         "a reconciled committed response must not be a recovery candidate"
     );
     let technical_failures: i64 = sqlx::query_scalar(
@@ -465,7 +701,11 @@ async fn m98_reconciliation_never_adopts_an_unsettled_side_effect() {
     let store = ProviderRecoveryStore::new(pool.clone());
     store.open_episode(&old, &episode(), NOW).await.unwrap();
     store
-        .begin_attempt(&old, &attempt("old-side-effect", "episode-1", "deepseek"), NOW + 1)
+        .begin_attempt(
+            &old,
+            &attempt("old-side-effect", "episode-1", "deepseek"),
+            NOW + 1,
+        )
         .await
         .unwrap();
     store
@@ -1424,7 +1664,11 @@ async fn interrupted_stream_without_side_effect_is_settled_replayable_and_resume
 
     // The same episode accepts the next attempt, and that attempt completes.
     store
-        .begin_attempt(&permit, &attempt("attempt-retry", "episode-1", "b"), NOW + 5)
+        .begin_attempt(
+            &permit,
+            &attempt("attempt-retry", "episode-1", "b"),
+            NOW + 5,
+        )
         .await
         .expect("a settled torn stream must not fence its own episode");
     store
@@ -1442,12 +1686,11 @@ async fn interrupted_stream_without_side_effect_is_settled_replayable_and_resume
         )
         .await
         .unwrap();
-    let committed: String = sqlx::query_scalar(
-        "SELECT status FROM provider_route_attempts WHERE id='attempt-retry'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let committed: String =
+        sqlx::query_scalar("SELECT status FROM provider_route_attempts WHERE id='attempt-retry'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(committed, "response_committed");
 
     // The turn ends, and system recovery mints the next Objective revision.
@@ -1549,7 +1792,10 @@ async fn interrupted_stream_with_a_started_side_effect_is_still_not_replayed() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(status, "unknown", "an unresolved side effect stays unproven");
+    assert_eq!(
+        status, "unknown",
+        "an unresolved side effect stays unproven"
+    );
     assert!(matches!(
         store.observe("objective-opaque").await.unwrap(),
         ProviderRecoveryDisposition::ObserveOnlySideEffect { .. }
@@ -1723,7 +1969,10 @@ async fn next_revision_open_settles_an_effect_free_stream_its_dead_owner_left_be
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_ne!(before, "failed_replayable", "the owner died before settling it");
+    assert_ne!(
+        before, "failed_replayable",
+        "the owner died before settling it"
+    );
 
     sqlx::query("UPDATE objectives SET revision=5 WHERE id='objective-opaque'")
         .execute(&pool)

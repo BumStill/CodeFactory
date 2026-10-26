@@ -15,7 +15,7 @@ pub struct RemoteIssue {
     pub number: u64,
     pub title: String,
     pub body: String,
-    pub state: String,       // "open" | "closed"
+    pub state: String, // "open" | "closed"
     pub labels: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -29,7 +29,7 @@ pub struct RemotePR {
     pub number: u64,
     pub title: String,
     pub body: String,
-    pub state: String,       // "open" | "closed" | "merged"
+    pub state: String, // "open" | "closed" | "merged"
     pub base_branch: String,
     pub head_branch: String,
     pub created_at: String,
@@ -39,7 +39,7 @@ pub struct RemotePR {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteRepo {
-    pub full_name: String,   // "owner/repo"
+    pub full_name: String, // "owner/repo"
     pub description: String,
     pub default_branch: String,
     pub url: String,

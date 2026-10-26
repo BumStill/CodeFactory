@@ -162,12 +162,16 @@ pub async fn ensure_schema(pool: &SqlitePool) -> sqlx::Result<()> {
     )
     .execute(pool)
     .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_background_tasks_status ON background_tasks(status)")
-        .execute(pool)
-        .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_background_tasks_wake ON background_tasks(wake_state)")
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_background_tasks_status ON background_tasks(status)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_background_tasks_wake ON background_tasks(wake_state)",
+    )
+    .execute(pool)
+    .await?;
     // R2：定时唤醒表同属本模块 schema，旧库启动时一并补齐（Compatibility）。
     ensure_wakeup_schema(pool).await?;
     Ok(())
@@ -199,7 +203,9 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> BackgroundTask {
 }
 
 pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<BackgroundTask>, String> {
-    ensure_schema(pool).await.map_err(|error| error.to_string())?;
+    ensure_schema(pool)
+        .await
+        .map_err(|error| error.to_string())?;
     let row = sqlx::query("SELECT * FROM background_tasks WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
@@ -212,7 +218,9 @@ pub async fn list_session(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Vec<BackgroundTask>, String> {
-    ensure_schema(pool).await.map_err(|error| error.to_string())?;
+    ensure_schema(pool)
+        .await
+        .map_err(|error| error.to_string())?;
     let rows = sqlx::query(
         "SELECT * FROM background_tasks WHERE session_id = ? ORDER BY created_at DESC, id",
     )
@@ -224,10 +232,11 @@ pub async fn list_session(
 }
 
 async fn running_rows(pool: &SqlitePool) -> Result<Vec<BackgroundTask>, String> {
-    let rows = sqlx::query("SELECT * FROM background_tasks WHERE status = 'running' ORDER BY created_at")
-        .fetch_all(pool)
-        .await
-        .map_err(|error| error.to_string())?;
+    let rows =
+        sqlx::query("SELECT * FROM background_tasks WHERE status = 'running' ORDER BY created_at")
+            .fetch_all(pool)
+            .await
+            .map_err(|error| error.to_string())?;
     Ok(rows.iter().map(row_to_task).collect())
 }
 
@@ -309,7 +318,10 @@ pub fn output_tail(path: &Path, limit: usize) -> String {
     #[cfg(windows)]
     {
         let shell = crate::util::command_env::shell_invocation("");
-        tail.push_str(crate::util::command_env::shell_failure_hint(shell.program, &text));
+        tail.push_str(crate::util::command_env::shell_failure_hint(
+            shell.program,
+            &text,
+        ));
     }
     tail
 }
@@ -397,14 +409,18 @@ pub fn process_start_marker(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let tail = &stat[stat.rfind(')')? + 1..];
     // 字段 3 = state，所以字段 22（starttime）在切片后的索引 19。
-    tail.split_whitespace().nth(19).map(|value| value.to_string())
+    tail.split_whitespace()
+        .nth(19)
+        .map(|value| value.to_string())
 }
 
 #[cfg(windows)]
 fn windows_process_identity(pid: u32) -> Option<(String, bool)> {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, FILETIME},
-        System::Threading::{GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        System::Threading::{
+            GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
     };
     // SAFETY: 只以查询权限打开进程；所有输出指针均为有效局部变量，句柄在返回前关闭。
     unsafe {
@@ -417,7 +433,8 @@ fn windows_process_identity(pid: u32) -> Option<(String, bool)> {
         let mut kernel: FILETIME = std::mem::zeroed();
         let mut user: FILETIME = std::mem::zeroed();
         let mut code = 0;
-        let times_ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        let times_ok =
+            GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
         let exit_ok = GetExitCodeProcess(handle, &mut code) != 0;
         CloseHandle(handle);
         if !times_ok || !exit_ok {
@@ -519,7 +536,9 @@ pub fn preflight(command: &str, timeout_sec: Option<u64>) -> Result<u64, String>
 }
 
 pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, String> {
-    ensure_schema(pool).await.map_err(|error| error.to_string())?;
+    ensure_schema(pool)
+        .await
+        .map_err(|error| error.to_string())?;
     let timeout_sec = preflight(&request.command, request.timeout_sec)?;
     admit(pool, &request.session_id).await?;
 
@@ -579,9 +598,11 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
     };
     let pid = child.id();
     #[cfg(windows)]
-    let job = match child.raw_handle()
+    let job = match child
+        .raw_handle()
         .ok_or_else(|| std::io::Error::other("missing child process handle"))
-        .and_then(crate::util::command_activity::attach_job) {
+        .and_then(crate::util::command_activity::attach_job)
+    {
         Ok(job) => job,
         Err(error) => {
             let mut child = child;
@@ -592,12 +613,13 @@ pub async fn start(pool: &SqlitePool, request: StartRequest) -> Result<Started, 
     };
     let marker = pid.and_then(process_start_marker);
     if let Some(pid) = pid {
-        let _ = sqlx::query("UPDATE background_tasks SET pid = ?, process_started_at = ? WHERE id = ?")
-            .bind(pid as i64)
-            .bind(marker)
-            .bind(&id)
-            .execute(pool)
-            .await;
+        let _ =
+            sqlx::query("UPDATE background_tasks SET pid = ?, process_started_at = ? WHERE id = ?")
+                .bind(pid as i64)
+                .bind(marker)
+                .bind(&id)
+                .execute(pool)
+                .await;
     }
 
     tokio::spawn(monitor_child(
@@ -663,7 +685,11 @@ async fn monitor_child(
 fn append_input_notice(path: &Path) {
     use std::io::Write;
     if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(path) {
-        let _ = writeln!(log, "\n{}", crate::util::command_env::INPUT_REQUIRED_MESSAGE);
+        let _ = writeln!(
+            log,
+            "\n{}",
+            crate::util::command_env::INPUT_REQUIRED_MESSAGE
+        );
     }
 }
 
@@ -701,7 +727,9 @@ fn verdict_for(task: &BackgroundTask) -> Verdict {
 
 /// D4：启动对账。幂等——重复执行只做"running → 终态"的单向转换。
 pub async fn reconcile(pool: &SqlitePool) -> Result<ReconcileReport, String> {
-    ensure_schema(pool).await.map_err(|error| error.to_string())?;
+    ensure_schema(pool)
+        .await
+        .map_err(|error| error.to_string())?;
     let mut report = ReconcileReport::default();
     for task in running_rows(pool).await? {
         match verdict_for(&task) {
@@ -731,8 +759,7 @@ async fn watch_orphan(pool: SqlitePool, task: BackgroundTask) {
         settle(&pool, &task.id, TaskStatus::Lost, None, true).await;
         return;
     };
-    let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(task.timeout_sec.max(1));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(task.timeout_sec.max(1));
     loop {
         if !process_alive(pid) {
             // After restart we can observe disappearance, not an exit receipt.
@@ -814,13 +841,19 @@ pub trait WakeSink: Send + Sync {
 /// M168：统一持久投递边界。单会话准入阻塞不能永久挂起整个投递器。
 async fn deliver_wake(sink: &dyn WakeSink, session: String, text: String, due_at: i64) -> bool {
     if now_secs().saturating_sub(due_at) >= 300 {
-        tracing::warn!(session, pending_seconds = now_secs().saturating_sub(due_at),
-            "wake pending over five minutes; retrying immediately");
+        tracing::warn!(
+            session,
+            pending_seconds = now_secs().saturating_sub(due_at),
+            "wake pending over five minutes; retrying immediately"
+        );
     }
     match tokio::time::timeout(Duration::from_secs(5), sink.enqueue(session.clone(), text)).await {
         Ok(delivered) => delivered,
         Err(_) => {
-            tracing::warn!(session, "wake admission timed out; durable wake remains pending for retry");
+            tracing::warn!(
+                session,
+                "wake admission timed out; durable wake remains pending for retry"
+            );
             false
         }
     }
@@ -840,7 +873,14 @@ pub async fn drain_pending_wakes(pool: &SqlitePool, sink: &dyn WakeSink) -> usiz
     for row in rows {
         let task = row_to_task(&row);
         let text = wake_text(&task);
-        if deliver_wake(sink, task.session_id.clone(), text, task.finished_at.unwrap_or(task.created_at)).await {
+        if deliver_wake(
+            sink,
+            task.session_id.clone(),
+            text,
+            task.finished_at.unwrap_or(task.created_at),
+        )
+        .await
+        {
             let _ = sqlx::query(
                 "UPDATE background_tasks SET wake_state = 'enqueued' WHERE id = ? AND wake_state = 'pending'",
             )
@@ -889,7 +929,10 @@ impl WakeupSchedule {
     pub fn cadence(&self) -> String {
         match self.every_sec {
             Some(every) => format!("每 {every} 秒一次"),
-            None => format!("一次性（{} 秒后）", self.after_sec.unwrap_or(MIN_WAKEUP_SECS)),
+            None => format!(
+                "一次性（{} 秒后）",
+                self.after_sec.unwrap_or(MIN_WAKEUP_SECS)
+            ),
         }
     }
 }
@@ -1004,7 +1047,11 @@ async fn ensure_wakeup_schema(pool: &SqlitePool) -> sqlx::Result<()> {
 /// 系统模型等待不受用户工具的 60 秒/6 小时输入范围约束；绝对恢复时间直接落盘。
 /// 固定 session ID 去重，避免同一等待的重复结算产生多个续跑回合。
 pub(crate) async fn persist_model_wakeup(
-    pool: &SqlitePool, session: &str, root: &str, at_ms: i64, notice: &str,
+    pool: &SqlitePool,
+    session: &str,
+    root: &str,
+    at_ms: i64,
+    notice: &str,
 ) -> sqlx::Result<()> {
     ensure_wakeup_schema(pool).await?;
     sqlx::query(
@@ -1129,10 +1176,7 @@ pub async fn list_wakeups(
     Ok(rows.iter().map(row_to_wakeup).collect())
 }
 
-pub async fn get_wakeup(
-    pool: &SqlitePool,
-    id: &str,
-) -> Result<Option<WakeupSchedule>, String> {
+pub async fn get_wakeup(pool: &SqlitePool, id: &str) -> Result<Option<WakeupSchedule>, String> {
     ensure_wakeup_schema(pool)
         .await
         .map_err(|error| error.to_string())?;
@@ -1159,11 +1203,13 @@ pub async fn cancel_wakeup(
     if !wakeup.is_pending() {
         return Ok(wakeup);
     }
-    sqlx::query("UPDATE wakeup_schedules SET status = 'cancelled' WHERE id = ? AND status = 'pending'")
-        .bind(id)
-        .execute(pool)
-        .await
-        .map_err(|error| error.to_string())?;
+    sqlx::query(
+        "UPDATE wakeup_schedules SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|error| error.to_string())?;
     tracing::info!(wakeup = %id, session = %session_id, "wakeup cancelled");
     get_wakeup(pool, id)
         .await?
@@ -1425,8 +1471,7 @@ impl WakeSink for ChatWakeSink {
             // M148/R2：系统接续走同一条入队通道，但来源是 SystemWake——只接续当前
             // 任务，不把上一回合结算成「被用户重新发起」（那会让等 PR/CI 的会话
             // 被判 ended，之后 PR 监视再也不唤醒它）。
-            match crate::commands::chat::send_system_wake(app.clone(), session_id, text).await
-            {
+            match crate::commands::chat::send_system_wake(app.clone(), session_id, text).await {
                 Ok(()) => true,
                 Err(error) => {
                     tracing::debug!(%error, "background task wake deferred");
@@ -1452,7 +1497,13 @@ mod tests {
         {
             std::fs::write(&path, [0xd6, 0xd0, 0xce, 0xc4]).unwrap();
             // Legacy bytes are tested deterministically independent of CI's ACP.
-            assert_eq!(crate::util::command_env::decode_output_for_code_page(&std::fs::read(&path).unwrap(), 936), "中文");
+            assert_eq!(
+                crate::util::command_env::decode_output_for_code_page(
+                    &std::fs::read(&path).unwrap(),
+                    936
+                ),
+                "中文"
+            );
         }
     }
 
@@ -1461,18 +1512,29 @@ mod tests {
     async fn m143_windows_background_chinese_and_legacy_parser_failure() {
         let pool = memory_pool().await;
         let dir = tempfile::tempdir().unwrap();
-        let started = start(&pool, request("m143", dir.path(), "echo 中文", Some(30))).await.unwrap();
+        let started = start(&pool, request("m143", dir.path(), "echo 中文", Some(30)))
+            .await
+            .unwrap();
         let task = wait_terminal(&pool, &started.id, 40).await;
         assert_eq!(task.exit_code, Some(0));
-        assert_eq!(output_tail(Path::new(&task.output_path), 1000).trim(), "中文");
-        let inv = crate::util::command_env::windows_shell_invocation("echo first && echo second", false, true);
+        assert_eq!(
+            output_tail(Path::new(&task.output_path), 1000).trim(),
+            "中文"
+        );
+        let inv = crate::util::command_env::windows_shell_invocation(
+            "echo first && echo second",
+            false,
+            true,
+        );
         let mut command = std::process::Command::new(inv.program).no_window();
         command.args(inv.args);
         let output = command.output().unwrap();
         assert!(!output.status.success());
         let text = crate::util::command_env::decode_output(&output.stderr);
         assert!(!text.contains('\u{fffd}'), "{text}");
-        assert!(crate::util::command_env::shell_failure_hint("powershell.exe", &text).contains("5.1"));
+        assert!(
+            crate::util::command_env::shell_failure_hint("powershell.exe", &text).contains("5.1")
+        );
     }
 
     async fn memory_pool() -> SqlitePool {
@@ -1534,15 +1596,33 @@ mod tests {
             }
         }
         let pool = memory_pool().await;
-        let wake = schedule_wakeup_at(&pool, WakeupRequest {
-            session_id: "m168-synthetic".into(), root_turn_id: None,
-            prompt: "检查窗口恢复".into(), source: TaskSource::AgentDecided,
-            after_sec: Some(60), every_sec: None,
-        }, 100).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(7),
-            drain_due_wakeups_at(&pool, &Blocked, 160)).await;
-        assert!(result.is_ok(), "one blocked enqueue must not stop the durable dispatcher");
-        assert_eq!(get_wakeup(&pool, &wake.id).await.unwrap().unwrap().status, "pending");
+        let wake = schedule_wakeup_at(
+            &pool,
+            WakeupRequest {
+                session_id: "m168-synthetic".into(),
+                root_turn_id: None,
+                prompt: "检查窗口恢复".into(),
+                source: TaskSource::AgentDecided,
+                after_sec: Some(60),
+                every_sec: None,
+            },
+            100,
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(7),
+            drain_due_wakeups_at(&pool, &Blocked, 160),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "one blocked enqueue must not stop the durable dispatcher"
+        );
+        assert_eq!(
+            get_wakeup(&pool, &wake.id).await.unwrap().unwrap().status,
+            "pending"
+        );
         let recorder = Arc::new(Recorder::default());
         assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 161).await, 1);
         assert_eq!(recorder.take().len(), 1);
@@ -1595,7 +1675,10 @@ mod tests {
         assert_eq!(task.command, "echo bg-tail-ok; echo second-line");
         assert_eq!(task.cwd, dir.to_string_lossy());
         assert!(task.pid.is_some());
-        assert!(task.process_started_at.is_some(), "process start marker recorded");
+        assert!(
+            task.process_started_at.is_some(),
+            "process start marker recorded"
+        );
         assert!(Path::new(&task.output_path).exists());
         assert!(task.created_at > 0);
         assert!(task.finished_at.is_some());
@@ -1621,12 +1704,9 @@ mod tests {
     async fn a_failing_command_wakes_with_its_nonzero_exit_code() {
         let pool = memory_pool().await;
         let dir = scratch_dir("fail");
-        let started = start(
-            &pool,
-            request("s1", &dir, "echo boom; exit 7", None),
-        )
-        .await
-        .unwrap();
+        let started = start(&pool, request("s1", &dir, "echo boom; exit 7", None))
+            .await
+            .unwrap();
         let task = wait_terminal(&pool, &started.id, 30).await;
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.exit_code, Some(7));
@@ -1695,7 +1775,10 @@ mod tests {
         let path = pid_file.to_string_lossy();
         #[cfg(unix)]
         {
-            format!("sleep 60 & echo $! > '{}'; wait", path.replace('\'', "'\"'\"'"))
+            format!(
+                "sleep 60 & echo $! > '{}'; wait",
+                path.replace('\'', "'\"'\"'")
+            )
         }
         #[cfg(windows)]
         {
@@ -1713,12 +1796,7 @@ mod tests {
         let child_pid_path = dir.join("child.pid");
         let started = start(
             &pool,
-            request(
-                "s1",
-                &dir,
-                &grandchild_command(&child_pid_path),
-                None,
-            ),
+            request("s1", &dir, &grandchild_command(&child_pid_path), None),
         )
         .await
         .unwrap();
@@ -1728,7 +1806,10 @@ mod tests {
             .map(|text| text.trim().is_empty())
             .unwrap_or(true)
         {
-            assert!(std::time::Instant::now() < deadline, "grandchild pid never appeared");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild pid never appeared"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let child_pid: u32 = std::fs::read_to_string(&child_pid_path)
@@ -1740,7 +1821,10 @@ mod tests {
 
         let stopped = stop(&pool, "s1", &started.id).await.unwrap();
         assert_eq!(stopped.status, TaskStatus::Stopped);
-        assert!(!alive(child_pid), "the grandchild must be killed with the tree");
+        assert!(
+            !alive(child_pid),
+            "the grandchild must be killed with the tree"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1750,14 +1834,25 @@ mod tests {
         let dir = scratch_dir("per-session");
         let mut ids = Vec::new();
         for _ in 0..MAX_RUNNING_PER_SESSION {
-            ids.push(start(&pool, request("s1", &dir, "sleep 60", None)).await.unwrap().id);
+            ids.push(
+                start(&pool, request("s1", &dir, "sleep 60", None))
+                    .await
+                    .unwrap()
+                    .id,
+            );
         }
         let error = start(&pool, request("s1", &dir, "sleep 60", None))
             .await
             .unwrap_err();
         assert!(error.contains("单会话上限"), "{error}");
-        assert!(error.contains(&MAX_RUNNING_PER_SESSION.to_string()), "{error}");
-        assert_eq!(list_session(&pool, "s1").await.unwrap().len() as i64, MAX_RUNNING_PER_SESSION);
+        assert!(
+            error.contains(&MAX_RUNNING_PER_SESSION.to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            list_session(&pool, "s1").await.unwrap().len() as i64,
+            MAX_RUNNING_PER_SESSION
+        );
         reclaim_session(&pool, "s1").await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1790,7 +1885,10 @@ mod tests {
 
     #[test]
     fn the_task_duration_cap_rejects_more_than_three_hours() {
-        assert_eq!(validate_timeout(Some(MAX_TASK_SECS)).unwrap(), MAX_TASK_SECS);
+        assert_eq!(
+            validate_timeout(Some(MAX_TASK_SECS)).unwrap(),
+            MAX_TASK_SECS
+        );
         let error = validate_timeout(Some(MAX_TASK_SECS + 1)).unwrap_err();
         assert!(error.contains("3 小时"), "{error}");
         assert!(validate_timeout(Some(0)).is_err());
@@ -1901,7 +1999,9 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         assert_eq!(drain_pending_wakes(&pool, sink(&recorder)).await, 2);
         let delivered = recorder.take();
-        assert!(delivered.iter().any(|(_, text)| text.contains("dead-and-gone")));
+        assert!(delivered
+            .iter()
+            .any(|(_, text)| text.contains("dead-and-gone")));
         assert!(delivered
             .iter()
             .any(|(session, text)| session == "s2" && text.contains("无法确认")));
@@ -1954,14 +2054,29 @@ mod tests {
     #[tokio::test]
     async fn external_wait_requires_a_session_owned_wake_source() {
         let pool = memory_pool().await;
-        assert!(external_wait_completion_hint(&pool, "s1", false).await.is_none());
-        assert!(external_wait_completion_hint(&pool, "s1", true).await.unwrap().contains("schedule_wakeup"));
-        schedule_wakeup_at(&pool, wakeup_request("s2", "other", Some(180)), 1000).await.unwrap();
-        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_some());
-        schedule_wakeup_at(&pool, wakeup_request("s1", "check CI", Some(180)), 1000).await.unwrap();
-        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_none());
+        assert!(external_wait_completion_hint(&pool, "s1", false)
+            .await
+            .is_none());
+        assert!(external_wait_completion_hint(&pool, "s1", true)
+            .await
+            .unwrap()
+            .contains("schedule_wakeup"));
+        schedule_wakeup_at(&pool, wakeup_request("s2", "other", Some(180)), 1000)
+            .await
+            .unwrap();
+        assert!(external_wait_completion_hint(&pool, "s1", true)
+            .await
+            .is_some());
+        schedule_wakeup_at(&pool, wakeup_request("s1", "check CI", Some(180)), 1000)
+            .await
+            .unwrap();
+        assert!(external_wait_completion_hint(&pool, "s1", true)
+            .await
+            .is_none());
         reclaim_session(&pool, "s1").await;
-        assert!(external_wait_completion_hint(&pool, "s1", true).await.is_some());
+        assert!(external_wait_completion_hint(&pool, "s1", true)
+            .await
+            .is_some());
     }
 
     /// 阶段 1 P0-3 / R3：thin 的外部事项等待必须给出两种挂监视的具体做法
@@ -2019,7 +2134,11 @@ mod tests {
         assert_eq!(delivered[0].0, "s1");
         assert!(delivered[0].1.contains("定时唤醒"), "{}", delivered[0].1);
         assert!(delivered[0].1.contains(&schedule.id), "{}", delivered[0].1);
-        assert!(delivered[0].1.contains("看一下 CI 状态"), "{}", delivered[0].1);
+        assert!(
+            delivered[0].1.contains("看一下 CI 状态"),
+            "{}",
+            delivered[0].1
+        );
 
         let stored = list_wakeups(&pool, "s1").await.unwrap();
         assert_eq!(stored.len(), 1);
@@ -2063,15 +2182,17 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_wakeup_never_fires_and_cancel_is_idempotent() {
         let pool = memory_pool().await;
-        let schedule =
-            schedule_wakeup_at(&pool, wakeup_request("s1", "不该触发", Some(60)), 1_000)
-                .await
-                .unwrap();
+        let schedule = schedule_wakeup_at(&pool, wakeup_request("s1", "不该触发", Some(60)), 1_000)
+            .await
+            .unwrap();
         let cancelled = cancel_wakeup(&pool, "s1", &schedule.id).await.unwrap();
         assert_eq!(cancelled.status, "cancelled");
         // 重复取消不报错、状态不变。
         assert_eq!(
-            cancel_wakeup(&pool, "s1", &schedule.id).await.unwrap().status,
+            cancel_wakeup(&pool, "s1", &schedule.id)
+                .await
+                .unwrap()
+                .status,
             "cancelled"
         );
 
@@ -2131,9 +2252,16 @@ mod tests {
             assert_eq!(drain_pending_wakes(&pool, sink(&recorder)).await, 1);
             assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 200).await, 1);
             let delivered = recorder.take();
-            assert_eq!(get(&pool, "bg-m168").await.unwrap().unwrap().status, TaskStatus::Lost);
-            assert!(delivered.iter().any(|(_, text)| text.contains("无法确认结果")));
-            assert!(delivered.iter().any(|(_, text)| text.contains("synthetic window")));
+            assert_eq!(
+                get(&pool, "bg-m168").await.unwrap().unwrap().status,
+                TaskStatus::Lost
+            );
+            assert!(delivered
+                .iter()
+                .any(|(_, text)| text.contains("无法确认结果")));
+            assert!(delivered
+                .iter()
+                .any(|(_, text)| text.contains("synthetic window")));
             pool.close().await;
             return;
         }
@@ -2142,20 +2270,50 @@ mod tests {
         sqlx::query("INSERT INTO background_tasks(id,session_id,command,cwd,source,status,pid,process_started_at,output_path,created_at,timeout_sec,wake_state) VALUES ('bg-m168','synthetic','exit 0',?,'agent_decided','running',4294967294,'dead',?,1,60,'none')")
             .bind(dir.to_string_lossy().as_ref()).bind(dir.join("existing.log").to_string_lossy().as_ref())
             .execute(&pool).await.unwrap();
-        std::fs::write(dir.join("existing.log"), "synthetic output without exit receipt").unwrap();
-        schedule_wakeup_at(&pool, WakeupRequest {
-            session_id: "synthetic".into(), root_turn_id: None,
-            prompt: "synthetic window".into(), source: TaskSource::AgentDecided,
-            after_sec: Some(60), every_sec: None,
-        }, 100).await.unwrap();
+        std::fs::write(
+            dir.join("existing.log"),
+            "synthetic output without exit receipt",
+        )
+        .unwrap();
+        schedule_wakeup_at(
+            &pool,
+            WakeupRequest {
+                session_id: "synthetic".into(),
+                root_turn_id: None,
+                prompt: "synthetic window".into(),
+                source: TaskSource::AgentDecided,
+                after_sec: Some(60),
+                every_sec: None,
+            },
+            100,
+        )
+        .await
+        .unwrap();
         pool.close().await;
         let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["m168_cross_process_restart_delivers_background_and_window_wakes", "--nocapture"])
-            .env(CHILD, &dir).output().await.unwrap();
-        assert!(output.status.success(), "child failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            .args([
+                "m168_cross_process_restart_delivers_background_and_window_wakes",
+                "--nocapture",
+            ])
+            .env(CHILD, &dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let reopened = file_pool(&dir).await;
-        assert_eq!(get(&reopened, "bg-m168").await.unwrap().unwrap().wake_state, "enqueued");
-        assert_eq!(drain_pending_wakes(&reopened, sink(&Arc::new(Recorder::default()))).await, 0);
+        assert_eq!(
+            get(&reopened, "bg-m168").await.unwrap().unwrap().wake_state,
+            "enqueued"
+        );
+        assert_eq!(
+            drain_pending_wakes(&reopened, sink(&Arc::new(Recorder::default()))).await,
+            0
+        );
         reopened.close().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2184,7 +2342,10 @@ mod tests {
         // 关闭期间错过 3 个周期：启动后只补一次，然后按周期继续。
         let late = 1_000 + 300 * 3;
         let recorder = Arc::new(Recorder::default());
-        assert_eq!(drain_due_wakeups_at(&reopened, sink(&recorder), late).await, 1);
+        assert_eq!(
+            drain_due_wakeups_at(&reopened, sink(&recorder), late).await,
+            1
+        );
         let delivered = recorder.take();
         assert_eq!(delivered.len(), 1);
         assert!(
@@ -2197,7 +2358,10 @@ mod tests {
         assert_eq!(after[0].next_at, late + 300);
 
         // 同一次到点不会被重复投递（幂等）。
-        assert_eq!(drain_due_wakeups_at(&reopened, sink(&recorder), late).await, 0);
+        assert_eq!(
+            drain_due_wakeups_at(&reopened, sink(&recorder), late).await,
+            0
+        );
         reopened.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2360,4 +2524,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

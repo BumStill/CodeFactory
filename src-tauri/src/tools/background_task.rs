@@ -145,7 +145,11 @@ struct StopArgs {
 pub async fn execute_start(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let args: StartArgs = match serde_json::from_value(args) {
         Ok(args) => args,
-        Err(error) => return Ok(ToolOutput::err(format!("background_task_start 参数错误：{error}"))),
+        Err(error) => {
+            return Ok(ToolOutput::err(format!(
+                "background_task_start 参数错误：{error}"
+            )))
+        }
     };
     let session_id = match session_id(ctx) {
         Ok(id) => id,
@@ -241,7 +245,11 @@ pub async fn execute_list(_args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 pub async fn execute_output(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let args: OutputArgs = match serde_json::from_value(args) {
         Ok(args) => args,
-        Err(error) => return Ok(ToolOutput::err(format!("background_task_output 参数错误：{error}"))),
+        Err(error) => {
+            return Ok(ToolOutput::err(format!(
+                "background_task_output 参数错误：{error}"
+            )))
+        }
     };
     let session_id = match session_id(ctx) {
         Ok(id) => id,
@@ -253,7 +261,12 @@ pub async fn execute_output(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
     let task = match background_tasks::get(&pool, &args.task_id).await {
         Ok(Some(task)) => task,
-        Ok(None) => return Ok(ToolOutput::err(format!("后台任务 {} 不存在。", args.task_id))),
+        Ok(None) => {
+            return Ok(ToolOutput::err(format!(
+                "后台任务 {} 不存在。",
+                args.task_id
+            )))
+        }
         Err(message) => return Ok(ToolOutput::err(message)),
     };
     if task.session_id != session_id {
@@ -262,7 +275,10 @@ pub async fn execute_output(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             args.task_id
         )));
     }
-    let limit = args.limit.unwrap_or(OUTPUT_TOOL_LIMIT).min(OUTPUT_TOOL_LIMIT);
+    let limit = args
+        .limit
+        .unwrap_or(OUTPUT_TOOL_LIMIT)
+        .min(OUTPUT_TOOL_LIMIT);
     let tail = background_tasks::output_tail(std::path::Path::new(&task.output_path), limit);
     let mut content = format!(
         "任务 {} [{}] 退出码 {}\n",
@@ -283,7 +299,11 @@ pub async fn execute_output(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
 pub async fn execute_stop(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     let args: StopArgs = match serde_json::from_value(args) {
         Ok(args) => args,
-        Err(error) => return Ok(ToolOutput::err(format!("background_task_stop 参数错误：{error}"))),
+        Err(error) => {
+            return Ok(ToolOutput::err(format!(
+                "background_task_stop 参数错误：{error}"
+            )))
+        }
     };
     let session_id = match session_id(ctx) {
         Ok(id) => id,
@@ -326,7 +346,10 @@ mod tests {
         // M149 R2：只说不允许，模型就没有下一步。可执行的形态必须出现在模型一定看得到的
         // 地方（工具描述），并说明已交付 PR 由系统监视，不必自己轮询。
         let description = start_definition().function.description;
-        assert!(description.contains("already watched by the system"), "{description}");
+        assert!(
+            description.contains("already watched by the system"),
+            "{description}"
+        );
         assert!(description.contains("sleep 180"), "{description}");
         assert!(description.contains("180 seconds"), "{description}");
         assert!(description.contains("gh --watch"), "{description}");

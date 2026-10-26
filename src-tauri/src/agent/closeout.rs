@@ -132,9 +132,7 @@ fn workspace_cache(root: &Path, raw: &str) -> CloseoutOutcome {
     for component in candidate.components() {
         match component {
             Component::CurDir | Component::Normal(_) => {}
-            _ => {
-                return CloseoutOutcome::RequiresApproval("closeout path escapes the workspace")
-            }
+            _ => return CloseoutOutcome::RequiresApproval("closeout path escapes the workspace"),
         }
     }
     let mut normal_components = candidate
@@ -209,7 +207,9 @@ fn temp_file(path: &Path, owner_token: &str) -> CloseoutOutcome {
         return CloseoutOutcome::RequiresApproval("temp artifact parent is not resolvable");
     };
     if parent != temp {
-        return CloseoutOutcome::RequiresApproval("temp artifact is outside the system temp directory");
+        return CloseoutOutcome::RequiresApproval(
+            "temp artifact is outside the system temp directory",
+        );
     }
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return CloseoutOutcome::RequiresApproval("temp artifact name is not valid UTF-8");
@@ -258,7 +258,12 @@ pub(crate) fn bash_cache_delete(root: &Path, command: &str) -> bool {
             .strip_prefix("${PWD}/")
             .or_else(|| operand.strip_prefix("$PWD/"))
             .unwrap_or(operand);
-        if !classify(root, &CloseoutArtifact::WorkspaceCache(relative.to_string())).is_allowed() {
+        if !classify(
+            root,
+            &CloseoutArtifact::WorkspaceCache(relative.to_string()),
+        )
+        .is_allowed()
+        {
             return false;
         }
         targets += 1;
@@ -335,13 +340,13 @@ mod tests {
             let outside = dir.join("checkout");
             std::fs::create_dir_all(root.join(".codefactory-cache/cargo-target-m105")).unwrap();
             std::fs::create_dir_all(&outside).unwrap();
-            std::fs::write(root.join(".codefactory-cache/cargo-target-m105/out.bin"), "x").unwrap();
+            std::fs::write(
+                root.join(".codefactory-cache/cargo-target-m105/out.bin"),
+                "x",
+            )
+            .unwrap();
             std::fs::write(root.join("notes.txt"), "draft\n").unwrap();
-            Fixture {
-                dir,
-                root,
-                outside,
-            }
+            Fixture { dir, root, outside }
         }
     }
 
@@ -406,7 +411,10 @@ mod tests {
             CloseoutOutcome::RequiresApproval("closeout path escapes the workspace")
         );
         assert!(matches!(
-            classify(&fixture.root, &CloseoutArtifact::WorkspaceCache(TASK_CACHE_DIR.into())),
+            classify(
+                &fixture.root,
+                &CloseoutArtifact::WorkspaceCache(TASK_CACHE_DIR.into())
+            ),
             CloseoutOutcome::RequiresApproval(_)
         ));
     }
@@ -531,7 +539,10 @@ mod tests {
             &CloseoutArtifact::WorkspaceCache(".codefactory-cache/cargo-target-m105".into())
         )
         .unwrap());
-        assert!(!fixture.root.join(".codefactory-cache/cargo-target-m105").exists());
+        assert!(!fixture
+            .root
+            .join(".codefactory-cache/cargo-target-m105")
+            .exists());
         assert!(fixture.root.join("notes.txt").exists());
 
         assert!(!remove(

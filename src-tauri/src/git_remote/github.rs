@@ -453,10 +453,9 @@ fn failed_check_detail(run: &Value, name: &str, conclusion: &str) -> String {
             .and_then(Value::as_str)
             .unwrap_or("")
     };
-    if ["title", "summary", "text"]
-        .iter()
-        .any(|key| output_text(key).contains(crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER))
-    {
+    if ["title", "summary", "text"].iter().any(|key| {
+        output_text(key).contains(crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER)
+    }) {
         detail.push_str(&format!(
             " ({})",
             crate::agent::objective::TRUST_ROOT_SELF_MODIFY_MARKER
@@ -636,7 +635,7 @@ pub async fn list_repos(client: &RemoteGitClient) -> Result<Vec<RemoteRepo>, Str
 #[cfg(test)]
 mod m108_ci_shape_tests {
     use super::*;
-    use crate::agent::objective::{classify_ci_checks, ci_outcome_wake_prompt, CiOutcome};
+    use crate::agent::objective::{ci_outcome_wake_prompt, classify_ci_checks, CiOutcome};
 
     fn required() -> Vec<RequiredStatusCheck> {
         vec![
@@ -697,7 +696,9 @@ mod m108_ci_shape_tests {
             observation.status
         );
         assert!(
-            observation.status.contains("windows_worktree_target_is_shared"),
+            observation
+                .status
+                .contains("windows_worktree_target_is_shared"),
             "the failing test name must reach the session: {}",
             observation.status
         );
@@ -705,7 +706,10 @@ mod m108_ci_shape_tests {
         let outcome = classify_ci_checks(&ci_check_states(&value, &required()), 0);
         match &outcome {
             CiOutcome::Failed(failures) => assert_eq!(
-                failures.iter().map(|check| check.job.as_str()).collect::<Vec<_>>(),
+                failures
+                    .iter()
+                    .map(|check| check.job.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["check-rust", "scenario-gate-pr"],
                 "both red checks belong to the failure evidence"
             ),
@@ -739,9 +743,16 @@ mod m108_ci_shape_tests {
             ]
         });
         let observation = classify_ci_observation(&value, &required());
-        assert!(observation.status.contains("cannot self-modify"), "{}", observation.status);
+        assert!(
+            observation.status.contains("cannot self-modify"),
+            "{}",
+            observation.status
+        );
         let outcome = classify_ci_checks(&ci_check_states(&value, &required()), 0);
-        assert!(matches!(outcome, CiOutcome::TrustRootOnly(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, CiOutcome::TrustRootOnly(_)),
+            "{outcome:?}"
+        );
         assert!(!outcome.is_session_repairable());
         let prompt = ci_outcome_wake_prompt("PR #713", &outcome);
         assert!(prompt.contains("等编排方放行"), "{prompt}");

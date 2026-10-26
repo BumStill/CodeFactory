@@ -161,10 +161,7 @@ impl HookRunner {
 
             HookAction::RunCommand { command, cwd } => {
                 let is_pre_tool = matches!(event, HookEvent::PreTool { .. });
-                let result = run_hook_command(
-                    command,
-                    cwd.as_deref().map(std::path::Path::new),
-                );
+                let result = run_hook_command(command, cwd.as_deref().map(std::path::Path::new));
 
                 if is_pre_tool {
                     // Non-zero exit = cancel. A configured pre-tool guard that

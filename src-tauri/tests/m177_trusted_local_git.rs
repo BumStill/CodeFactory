@@ -9,14 +9,24 @@
 //! although every segment stays inside the session workspace.
 #[path = "../src/util/no_window.rs"]
 pub mod no_window;
-mod util { pub use crate::no_window; }
+mod util {
+    pub use crate::no_window;
+}
 #[path = "../src/agent/trusted_git.rs"]
 mod trusted_git;
 use std::{path::Path, path::PathBuf, process::Command};
 
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").current_dir(root).args(args).output().unwrap();
-    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
@@ -25,12 +35,18 @@ fn fixture() -> PathBuf {
         "cf-m177-{}-{:?}-{}",
         std::process::id(),
         std::thread::current().id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     std::fs::create_dir_all(root.join("src")).unwrap();
     git(&root, &["init", "-q"]);
     git(&root, &["config", "user.name", "Synthetic"]);
-    git(&root, &["config", "user.email", "synthetic@example.invalid"]);
+    git(
+        &root,
+        &["config", "user.email", "synthetic@example.invalid"],
+    );
     std::fs::write(root.join("tracked.txt"), "original").unwrap();
     std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
     git(&root, &["add", "."]);
@@ -54,7 +70,8 @@ fn m177_incident_composition_is_provable_without_approval() {
         trusted_git::local_rewrite(&root, INCIDENT),
         "the 2026-10-26 incident composition must be provable inside the session workspace"
     );
-    let backup = trusted_git::backup(&root, INCIDENT).expect("M159 snapshot must still precede the rewrite");
+    let backup =
+        trusted_git::backup(&root, INCIDENT).expect("M159 snapshot must still precede the rewrite");
     assert!(backup.starts_with("refs/codefactory/backup/"), "{backup}");
 }
 
@@ -92,10 +109,17 @@ fn m177_sync_compositions_from_the_incident_family_are_provable() {
 fn m177_previously_blocked_read_only_commands_do_not_ask() {
     // 10-23 .. 10-26 recorded false positives: read-only, no rewrite at all.
     let script = "node -e 'const r=require(\"./docs/testing/scenario-registry.json\");console.log(r.scenarios.length)' | head -5";
-    assert!(!trusted_git::sensitive(script), "quoted script data must not ask");
+    assert!(
+        !trusted_git::sensitive(script),
+        "quoted script data must not ask"
+    );
     assert!(!trusted_git::sensitive("cat src/main.rs"));
-    assert!(!trusted_git::sensitive("cat tracked.txt && git status --short"));
-    assert!(!trusted_git::sensitive("git add -A && git commit -m \"m177 sync\""));
+    assert!(!trusted_git::sensitive(
+        "cat tracked.txt && git status --short"
+    ));
+    assert!(!trusted_git::sensitive(
+        "git add -A && git commit -m \"m177 sync\""
+    ));
     // M159 still requires a snapshot before a local rewrite is allowed; M177
     // only removes the *approval prompt* for workspace-local compositions.
     assert!(trusted_git::sensitive(INCIDENT));

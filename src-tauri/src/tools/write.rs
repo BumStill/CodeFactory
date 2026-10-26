@@ -131,12 +131,26 @@ mod tests {
     #[tokio::test]
     async fn m144_write_file_invalid_fields_are_actionable_tool_results() {
         let cwd = temp_dir();
-        for args in [json!({"path":"a.txt", "content":null}), json!({"path":"a.txt"}), json!({"path":null,"content":"ok"}), json!(null)] {
-            let output = execute(args, &ExecCtx::new(cwd.clone(), None)).await.unwrap();
+        for args in [
+            json!({"path":"a.txt", "content":null}),
+            json!({"path":"a.txt"}),
+            json!({"path":null,"content":"ok"}),
+            json!(null),
+        ] {
+            let output = execute(args, &ExecCtx::new(cwd.clone(), None))
+                .await
+                .unwrap();
             assert!(output.is_error);
-            assert!(output.content.contains("expected string"), "{}", output.content);
+            assert!(
+                output.content.contains("expected string"),
+                "{}",
+                output.content
+            );
             assert!(output.content.contains("path") || output.content.contains("content"));
-            assert!(!output.content.contains("Received:"), "must not echo payload");
+            assert!(
+                !output.content.contains("Received:"),
+                "must not echo payload"
+            );
         }
         assert!(!cwd.join("a.txt").exists());
         std::fs::remove_dir_all(cwd).unwrap();

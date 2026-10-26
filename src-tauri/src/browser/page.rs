@@ -128,7 +128,13 @@ mod tests {
 
     #[test]
     fn quotes_newlines_and_unicode_survive_as_data() {
-        for value in ["say \"hi\"", "line\nbreak", "反斜杠\\结尾", "emoji 🎯", "</script>"] {
+        for value in [
+            "say \"hi\"",
+            "line\nbreak",
+            "反斜杠\\结尾",
+            "emoji 🎯",
+            "</script>",
+        ] {
             let expression = find_expression(value, 5);
             assert_eq!(argument_of(&expression, ".find("), value);
         }

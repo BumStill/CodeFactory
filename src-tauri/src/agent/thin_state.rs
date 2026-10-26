@@ -53,10 +53,15 @@ impl SessionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitNeed {
     None,
-    External { what: String, covered: bool },
+    External {
+        what: String,
+        covered: bool,
+    },
     /// The answer waits on a person or an invented confirmation. The user must
     /// see the question; there is no wake source to invent for them.
-    Unwatched { what: String },
+    Unwatched {
+        what: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,13 +111,19 @@ fn now() -> i64 {
 pub fn after_final(need: WaitNeed, outcome_location: &str) -> ThinState {
     match need {
         WaitNeed::None => ThinState::ended("任务已结束", outcome_location),
-        WaitNeed::External { what, covered: true } => ThinState {
+        WaitNeed::External {
+            what,
+            covered: true,
+        } => ThinState {
             state: SessionState::WaitingWake,
             waiting_for: Some(what.clone()),
             wake_source: Some(format!("已登记的唤醒源：{what}")),
             ..ThinState::running()
         },
-        WaitNeed::External { what, covered: false } => ThinState {
+        WaitNeed::External {
+            what,
+            covered: false,
+        } => ThinState {
             state: SessionState::WaitingWake,
             waiting_for: Some(what.clone()),
             // R5：外部事项（PR/CI/发版）是模型自己能监视的对象。没有唤醒源时，
@@ -159,11 +170,30 @@ pub fn after_failure(streak: i64, what: &str) -> ThinState {
 /// R5/M123: no model is a wait with a real wake source (the model coming back),
 /// not a technical failure and not a prompt for the user.
 pub fn after_no_model(lead_ms: i64) -> ThinState {
+    after_no_model_because(lead_ms, "所有模型端点暂时不可用")
+}
+
+/// M178/R2: a model wait always carries a plain-language `reason`.
+///
+/// A `waiting_wake` row with an empty reason reads as "nothing happened" — the
+/// 17:42 session looked like a silent hang right before it ended. The reason
+/// says what is unavailable and when the system continues on its own.
+pub fn after_no_model_because(lead_ms: i64, what: &str) -> ThinState {
     let at = now().saturating_add(lead_ms.max(1_000));
+    let clock = chrono::DateTime::from_timestamp_millis(at)
+        .map(|at| {
+            at.with_timezone(&chrono_tz::Asia::Shanghai)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "稍后".to_string());
     ThinState {
         state: SessionState::WaitingWake,
         waiting_for: Some("模型恢复可用".to_string()),
         wake_source: Some(format!("模型恢复时间 {}", at)),
+        reason: Some(format!(
+            "{what}系统将在 {clock} 自动继续（系统自动重试，不需要你操作）。"
+        )),
         ..ThinState::running()
     }
 }
@@ -209,26 +239,47 @@ pub async fn save(db: &SqlitePool, session_id: &str, state: &ThinState) -> sqlx:
 
 pub async fn load(db: &SqlitePool, session_id: &str) -> sqlx::Result<Option<ThinState>> {
     ensure(db).await?;
-    let row: Option<(String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, i64, i64)> =
-        sqlx::query_as(
-            "SELECT state, waiting_for, wake_source, question, reason,
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT state, waiting_for, wake_source, question, reason,
                     outcome_location, failure_signature, consecutive_failures, updated_at
              FROM thin_session_state WHERE session_id=?",
-        )
-        .bind(session_id)
-        .fetch_optional(db)
-        .await?;
-    Ok(row.map(|(state, waiting_for, wake_source, question, reason, outcome_location, failure_signature, consecutive_failures, updated_at)| ThinState {
-        state: SessionState::parse(&state).unwrap_or(SessionState::Running),
-        waiting_for,
-        wake_source,
-        question,
-        reason,
-        outcome_location,
-        failure_signature,
-        consecutive_failures,
-        updated_at,
-    }))
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(
+        |(
+            state,
+            waiting_for,
+            wake_source,
+            question,
+            reason,
+            outcome_location,
+            failure_signature,
+            consecutive_failures,
+            updated_at,
+        )| ThinState {
+            state: SessionState::parse(&state).unwrap_or(SessionState::Running),
+            waiting_for,
+            wake_source,
+            question,
+            reason,
+            outcome_location,
+            failure_signature,
+            consecutive_failures,
+            updated_at,
+        },
+    ))
 }
 
 /// Count one real technical failure against the same signature, resetting the
@@ -238,7 +289,9 @@ pub async fn record_technical_failure(
     session_id: &str,
     what: &str,
 ) -> sqlx::Result<ThinState> {
-    let previous = load(db, session_id).await?.unwrap_or_else(ThinState::running);
+    let previous = load(db, session_id)
+        .await?
+        .unwrap_or_else(ThinState::running);
     let streak = if previous.failure_signature.as_deref() == Some(what) {
         previous.consecutive_failures + 1
     } else {
@@ -250,7 +303,9 @@ pub async fn record_technical_failure(
 }
 
 pub async fn clear_failure(db: &SqlitePool, session_id: &str) -> sqlx::Result<()> {
-    let mut state = load(db, session_id).await?.unwrap_or_else(ThinState::running);
+    let mut state = load(db, session_id)
+        .await?
+        .unwrap_or_else(ThinState::running);
     state.failure_signature = None;
     state.consecutive_failures = 0;
     state.updated_at = now();
@@ -262,13 +317,19 @@ pub async fn clear_failure(db: &SqlitePool, session_id: &str) -> sqlx::Result<()
 /// is asked what to do instead of the session waiting invisibly.
 pub async fn sweep(db: &SqlitePool, now_ms: i64) -> sqlx::Result<usize> {
     ensure(db).await?;
-    let rows: Vec<(String, Option<String>, String, Option<String>, Option<String>, i64)> =
-        sqlx::query_as(
-            "SELECT session_id, waiting_for, state, question, reason, updated_at
+    let rows: Vec<(
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT session_id, waiting_for, state, question, reason, updated_at
              FROM thin_session_state WHERE state='waiting_wake'",
-        )
-        .fetch_all(db)
-        .await?;
+    )
+    .fetch_all(db)
+    .await?;
     let mut surfaced = 0;
     for (session_id, waiting_for, _state, _question, _reason, updated_at) in rows {
         let cover = super::background_tasks::wake_source_cover(db, &session_id).await;
@@ -301,7 +362,10 @@ pub async fn settle_final(
 ) -> sqlx::Result<ThinState> {
     if let Some(state) = load(db, session_id).await?.filter(|state| {
         state.state == SessionState::Ended
-            && state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled"))
+            && state
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("cancelled"))
     }) {
         return Ok(state);
     }
@@ -332,29 +396,55 @@ pub async fn settle_final(
     Ok(state)
 }
 
-pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str, error_text: &str) -> sqlx::Result<ThinState> {
+pub async fn settle_error(
+    db: &SqlitePool,
+    session_id: &str,
+    root_turn_id: &str,
+    error_text: &str,
+) -> sqlx::Result<ThinState> {
     if let Some(state) = load(db, session_id).await?.filter(|state| {
         state.state == SessionState::Ended
-            && state.reason.as_deref().is_some_and(|reason| reason.starts_with("cancelled"))
+            && state
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("cancelled"))
     }) {
         return Ok(state);
     }
     let state = if error_text == "agent loop stopped: Cancelled" {
         ThinState::ended("cancelled：回合已取消", "本会话记录")
     } else if let Some(unavailable) = super::failover::ModelUnavailable::parse(error_text) {
-        if let Some(at) = unavailable.resume_at_ms {
-            super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, &unavailable.notice).await?;
-            ThinState {
-                waiting_for: Some(unavailable.notice),
-                wake_source: Some(format!("model-availability-{session_id}")),
-                ..after_no_model(at.saturating_sub(now()))
-            }
-        } else {
-            ThinState::ended(&unavailable.notice, "本会话记录")
+        // M178/R2: availability exhaustion is a wait with a real wake source —
+        // with or without a known resume time — never the third identical
+        // "technical failure" that ends the session. Without a resume time the
+        // system re-checks on a bounded one-minute cadence instead of guessing.
+        let at = unavailable
+            .resume_at_ms
+            .unwrap_or_else(|| now().saturating_add(60_000));
+        super::background_tasks::persist_model_wakeup(
+            db,
+            session_id,
+            root_turn_id,
+            at,
+            &unavailable.notice,
+        )
+        .await?;
+        ThinState {
+            waiting_for: Some(unavailable.notice.clone()),
+            wake_source: Some(format!("model-availability-{session_id}")),
+            reason: Some(unavailable.notice.clone()),
+            ..after_no_model_because(at.saturating_sub(now()), &unavailable.notice)
         }
     } else if error_text.contains("no_model_available") {
         let at = now().saturating_add(60_000);
-        super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, "模型暂不可用").await?;
+        super::background_tasks::persist_model_wakeup(
+            db,
+            session_id,
+            root_turn_id,
+            at,
+            "模型暂不可用",
+        )
+        .await?;
         after_no_model(60_000)
     } else {
         record_technical_failure(db, session_id, &first_line(error_text)).await?
@@ -413,7 +503,11 @@ pub async fn settle_outcome(
 }
 
 /// 阶段 2 P0/R2：没有任何可续跑的回合时，thin 会话必须发问，不能留在 `running`。
-pub async fn ask_user(db: &SqlitePool, session_id: &str, question: &str) -> sqlx::Result<ThinState> {
+pub async fn ask_user(
+    db: &SqlitePool,
+    session_id: &str,
+    question: &str,
+) -> sqlx::Result<ThinState> {
     let mut state = ThinState::running();
     state.state = SessionState::WaitingUser;
     state.question = Some(question.to_string());
@@ -423,17 +517,38 @@ pub async fn ask_user(db: &SqlitePool, session_id: &str, question: &str) -> sqlx
 }
 
 fn first_line(text: &str) -> String {
-    text.lines().next().unwrap_or("agent loop error").chars().take(160).collect()
+    text.lines()
+        .next()
+        .unwrap_or("agent loop error")
+        .chars()
+        .take(160)
+        .collect()
 }
 
 async fn project_turn(db: &SqlitePool, root_turn_id: &str, state: &ThinState) -> sqlx::Result<()> {
     let (phase, kind, label) = match state.state {
         SessionState::Running => ("working", "thin_running", "运行中".to_string()),
-        SessionState::WaitingWake => ("waiting", "thin_waiting_wake", format!("等唤醒：{}", state.waiting_for.clone().unwrap_or_default())),
-        SessionState::WaitingUser => ("waiting", "thin_waiting_user", state.question.clone().unwrap_or_else(|| "需要你决定下一步".into())),
-        SessionState::Ended => ("finalizing", "thin_ended", state.reason.clone().unwrap_or_else(|| "已结束".into())),
+        SessionState::WaitingWake => (
+            "waiting",
+            "thin_waiting_wake",
+            format!("等唤醒：{}", state.waiting_for.clone().unwrap_or_default()),
+        ),
+        SessionState::WaitingUser => (
+            "waiting",
+            "thin_waiting_user",
+            state
+                .question
+                .clone()
+                .unwrap_or_else(|| "需要你决定下一步".into()),
+        ),
+        SessionState::Ended => (
+            "finalizing",
+            "thin_ended",
+            state.reason.clone().unwrap_or_else(|| "已结束".into()),
+        ),
     };
-    let terminal = (state.state == SessionState::Ended).then(|| state.reason.clone().unwrap_or_else(|| "已结束".into()));
+    let terminal = (state.state == SessionState::Ended)
+        .then(|| state.reason.clone().unwrap_or_else(|| "已结束".into()));
     sqlx::query(
         "UPDATE chat_turn_state SET revision=revision+1, phase=?, status=?,
            recent_activity_kind=?, recent_activity_label=?, waiting_reason=?,
@@ -452,8 +567,14 @@ async fn project_turn(db: &SqlitePool, root_turn_id: &str, state: &ThinState) ->
     Ok(())
 }
 
-pub async fn close_objective(db: &SqlitePool, objective_id: &str, state: &ThinState) -> sqlx::Result<()> {
-    if state.state != SessionState::Ended { return Ok(()); }
+pub async fn close_objective(
+    db: &SqlitePool,
+    objective_id: &str,
+    state: &ThinState,
+) -> sqlx::Result<()> {
+    if state.state != SessionState::Ended {
+        return Ok(());
+    }
     sqlx::query(
         // `legacy_orphan` is the only terminal status that claims no legacy
         // completion evidence. The four-state row above is the actual outcome.
@@ -461,7 +582,12 @@ pub async fn close_objective(db: &SqlitePool, objective_id: &str, state: &ThinSt
            failure_code=NULL, failure_signature=NULL, remediation_id=NULL,
            next_observation_at=NULL, completed_at=?, updated_at=?
          WHERE id=? AND status NOT IN ('completed','cancelled','legacy_orphan')",
-    ).bind(now()).bind(now()).bind(objective_id).execute(db).await?;
+    )
+    .bind(now())
+    .bind(now())
+    .bind(objective_id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -491,37 +617,81 @@ mod settle_tests {
     async fn m160_delivery_limit_is_waiting_user_not_completed() {
         let db = db().await;
         sqlx::query("UPDATE chat_turn_state SET terminal_reason='delivery_pending', waiting_reason='交付仍未完成，改动保留' WHERE root_turn_id='root-1'").execute(&db).await.unwrap();
-        let state = settle_outcome(&db, "s-1", "root-1", false, true, "not delivered", "Blocked", None).await.unwrap();
+        let state = settle_outcome(
+            &db,
+            "s-1",
+            "root-1",
+            false,
+            true,
+            "not delivered",
+            "Blocked",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(state.state, SessionState::WaitingUser);
         assert_eq!(state.question.as_deref(), Some("交付仍未完成，改动保留"));
-        assert_eq!(load(&db, "s-1").await.unwrap().unwrap().state, SessionState::WaitingUser);
+        assert_eq!(
+            load(&db, "s-1").await.unwrap().unwrap().state,
+            SessionState::WaitingUser
+        );
         close_objective(&db, "o-1", &state).await.unwrap();
-        let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id='o-1'").fetch_one(&db).await.unwrap();
-        assert_eq!(status, "active", "pending delivery must not terminalize the objective");
+        let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id='o-1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "active",
+            "pending delivery must not terminalize the objective"
+        );
     }
 
     #[tokio::test]
     async fn m164_model_wait_persists_exact_wake_across_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}?mode=rwc", dir.path().join("restart.db").display());
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("restart.db").display()
+        );
         let db = crate::storage::db::connect(&url).await.unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m164','synthetic','/synthetic','model',1,1,'thin')").execute(&db).await.unwrap();
         let due = now() + 7_200_250;
         let unavailable = super::super::failover::ModelUnavailable {
-            resume_at_ms: Some(due), notice: "GPT 已到你设的 80% 上限，约到点自动继续".into(),
+            resume_at_ms: Some(due),
+            notice: "GPT 已到你设的 80% 上限，约到点自动继续".into(),
         };
-        let state = settle_error(&db, "m164", "root-m164", &unavailable.encode()).await.unwrap();
+        let state = settle_error(&db, "m164", "root-m164", &unavailable.encode())
+            .await
+            .unwrap();
         assert_eq!(state.state, SessionState::WaitingWake);
-        let wakes = super::super::background_tasks::list_wakeups(&db, "m164").await.unwrap();
-        assert_eq!(wakes.len(), 1, "waiting_wake 必须有真实落盘调度，而非仅 wake_source 文本");
+        let wakes = super::super::background_tasks::list_wakeups(&db, "m164")
+            .await
+            .unwrap();
+        assert_eq!(
+            wakes.len(),
+            1,
+            "waiting_wake 必须有真实落盘调度，而非仅 wake_source 文本"
+        );
         assert_eq!(wakes[0].next_at, (due + 999) / 1000);
-        settle_error(&db, "m164", "root-m164", &unavailable.encode()).await.unwrap();
-        assert_eq!(super::super::background_tasks::list_wakeups(&db, "m164").await.unwrap().len(), 1);
+        settle_error(&db, "m164", "root-m164", &unavailable.encode())
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::background_tasks::list_wakeups(&db, "m164")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         db.close().await;
         let db = crate::storage::db::connect(&url).await.unwrap();
         struct Sink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl super::super::background_tasks::WakeSink for Sink {
-            fn enqueue(&self, session: String, text: String) -> super::super::background_tasks::WakeFuture {
+            fn enqueue(
+                &self,
+                session: String,
+                text: String,
+            ) -> super::super::background_tasks::WakeFuture {
                 assert_eq!(session, "m164");
                 assert!(text.contains("系统自动重试/自愈"));
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -531,33 +701,51 @@ mod settle_tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sink = Sink(calls.clone());
         let at = (due + 999) / 1000;
-        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at - 1).await, 0);
-        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at).await, 1);
-        assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at + 1).await, 0);
+        assert_eq!(
+            super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at - 1).await,
+            0
+        );
+        assert_eq!(
+            super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at).await,
+            1
+        );
+        assert_eq!(
+            super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at + 1).await,
+            0
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         db.close().await;
     }
 
     #[tokio::test]
     async fn r6_stop_ends_thin_sessions_and_late_errors_cannot_reopen_them() {
-        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let db = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let store = crate::agent::objective::ObjectiveStore::new(db.clone());
         for mode in ["thin", "legacy"] {
             sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?, 'synthetic', '/synthetic', 'model', 1, 1, ?)")
                 .bind(mode).bind(mode).execute(&db).await.unwrap();
-            if mode == "thin" { save(&db, mode, &ThinState::running()).await.unwrap(); }
+            if mode == "thin" {
+                save(&db, mode, &ThinState::running()).await.unwrap();
+            }
             store.request_chat_session_cancel(mode).await.unwrap();
             if mode == "thin" {
                 let stopped = load(&db, mode).await.unwrap().unwrap();
                 assert_eq!(stopped.state, SessionState::Ended);
                 assert_eq!(stopped.reason.as_deref(), Some("cancelled：用户已停止会话"));
-                let late = settle_error(&db, mode, "missing-root", "late transport error").await.unwrap();
+                let late = settle_error(&db, mode, "missing-root", "late transport error")
+                    .await
+                    .unwrap();
                 assert_eq!(late.state, SessionState::Ended);
                 assert_eq!(late.reason, stopped.reason);
                 let late_final = settle_final(&db, mode, "missing-root", None).await.unwrap();
                 assert_eq!(late_final.reason, stopped.reason);
                 save(&db, mode, &ThinState::running()).await.unwrap();
-                assert_eq!(load(&db, mode).await.unwrap().unwrap().reason, stopped.reason);
+                assert_eq!(
+                    load(&db, mode).await.unwrap().unwrap().reason,
+                    stopped.reason
+                );
             } else {
                 assert!(load(&db, mode).await.unwrap().is_none());
             }
@@ -567,20 +755,34 @@ mod settle_tests {
 
     #[tokio::test]
     async fn r6_exact_objective_cancel_ends_thin_state() {
-        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let db = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('exact','synthetic','/synthetic','model',1,1,'thin')")
             .execute(&db).await.unwrap();
-        use crate::agent::objective::{CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain};
+        use crate::agent::objective::{
+            CreateObjective, ObjectiveKind, ObjectiveStore, RecoveryDomain,
+        };
         let store = ObjectiveStore::new(db.clone());
-        store.create(CreateObjective {
-            id: "exact-objective".into(), kind: ObjectiveKind::Informational,
-            session_id: Some("exact".into()), root_turn_id: Some("exact-root".into()),
-            domain: RecoveryDomain::Chat, requested_acceptance: "answer".into(), created_surface: "synthetic".into(),
-        }).await.unwrap();
+        store
+            .create(CreateObjective {
+                id: "exact-objective".into(),
+                kind: ObjectiveKind::Informational,
+                session_id: Some("exact".into()),
+                root_turn_id: Some("exact-root".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "answer".into(),
+                created_surface: "synthetic".into(),
+            })
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO chat_turn_state (root_turn_id,session_id,objective_id,phase,status,started_at,updated_at) VALUES ('exact-root','exact','exact-objective','working','active',1,1)")
             .execute(&db).await.unwrap();
         save(&db, "exact", &ThinState::running()).await.unwrap();
-        store.cancel_chat_exact("exact", "exact-root", "exact-objective").await.unwrap();
+        store
+            .cancel_chat_exact("exact", "exact-root", "exact-objective")
+            .await
+            .unwrap();
         let ended = load(&db, "exact").await.unwrap().unwrap();
         assert_eq!(ended.state, SessionState::Ended);
         assert!(ended.reason.unwrap().contains("cancelled"));
@@ -589,7 +791,9 @@ mod settle_tests {
     #[tokio::test]
     async fn r6_cancelled_outcome_is_terminal_not_a_technical_failure() {
         let db = db().await;
-        let state = settle_outcome(&db, "s-1", "root-1", false, false, "", "Cancelled", None).await.unwrap();
+        let state = settle_outcome(&db, "s-1", "root-1", false, false, "", "Cancelled", None)
+            .await
+            .unwrap();
         assert_eq!(state.state, SessionState::Ended);
         assert!(state.reason.as_deref().unwrap().contains("cancelled"));
         assert_eq!(state.consecutive_failures, 0);
@@ -606,22 +810,106 @@ mod settle_tests {
             .fetch_one(&db).await.unwrap();
         assert_eq!(kind, "thin_ended");
         assert_eq!(terminal.as_deref(), Some("任务已结束"));
-        let failure: Option<String> = sqlx::query_scalar("SELECT failure_code FROM objectives WHERE id='o-1'")
-            .fetch_one(&db).await.unwrap();
-        assert!(failure.is_none(), "thin settlement must not project a legacy failure code");
+        let failure: Option<String> =
+            sqlx::query_scalar("SELECT failure_code FROM objectives WHERE id='o-1'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(
+            failure.is_none(),
+            "thin settlement must not project a legacy failure code"
+        );
     }
 
     #[tokio::test]
     async fn second_and_third_identical_failure_are_visible_and_terminal() {
         let db = db().await;
-        let first = settle_error(&db, "s-1", "root-1", "bash exited 1").await.unwrap();
+        let first = settle_error(&db, "s-1", "root-1", "bash exited 1")
+            .await
+            .unwrap();
         assert_eq!(first.state, SessionState::Running);
-        let second = settle_error(&db, "s-1", "root-1", "bash exited 1").await.unwrap();
+        let second = settle_error(&db, "s-1", "root-1", "bash exited 1")
+            .await
+            .unwrap();
         assert_eq!(second.state, SessionState::Running);
-        let third = settle_error(&db, "s-1", "root-1", "bash exited 1").await.unwrap();
+        let third = settle_error(&db, "s-1", "root-1", "bash exited 1")
+            .await
+            .unwrap();
         assert_eq!(third.state, SessionState::Ended);
         assert!(third.reason.unwrap().contains("bash exited 1"));
-        let model = settle_error(&db, "s-1", "root-1", "no endpoints are available: no_model_available").await.unwrap();
+        let model = settle_error(
+            &db,
+            "s-1",
+            "root-1",
+            "no endpoints are available: no_model_available",
+        )
+        .await
+        .unwrap();
         assert_eq!(model.state, SessionState::WaitingWake);
+    }
+
+    /// M178/R3: the 17:42 shape — ChatGPT at its cap, DeepSeek outside its
+    /// window, OpenRouter without credentials — lands in one durable wait that
+    /// survives a restart, keeps the turn resumable, and never counts as a
+    /// technical failure (three of those used to end the session).
+    #[tokio::test]
+    async fn m178_availability_exhaustion_waits_across_restart_without_a_technical_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("m178.db").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m178','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        save(&db, "m178", &ThinState::running()).await.unwrap();
+        let notice = "当前没有可用模型：ChatGPT / gpt-6.1 已到你设的 85% 上限，10-26 23:00 重置；DeepSeek / deepseek-v4-pro 不在允许使用时段，10-26 18:00 起可用；OpenRouter / gpt-5.5 还没有保存凭据（在模型设置里保存后立刻恢复）。10-26 18:00 起自动继续，不需要你操作。";
+        // No known resume time: the incident's own case before the window opened.
+        let unavailable = super::super::failover::ModelUnavailable {
+            resume_at_ms: None,
+            notice: notice.into(),
+        };
+        let state = settle_error(&db, "m178", "root-m178", &unavailable.encode())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.state,
+            SessionState::WaitingWake,
+            "没有已知恢复时间也必须是可恢复的等待，而不是结束"
+        );
+        assert_eq!(state.consecutive_failures, 0, "可用性耗尽不得计技术失败");
+        assert!(
+            state.failure_signature.is_none(),
+            "{:?}",
+            state.failure_signature
+        );
+        let reason = state.reason.clone().unwrap_or_default();
+        assert!(reason.contains("还没有保存凭据"), "{reason}");
+        assert!(reason.contains("自动继续"), "{reason}");
+        assert!(
+            !reason.contains("AUTH_MISSING"),
+            "内部错误码不得出现在界面原因里：{reason}"
+        );
+        assert!(!reason.starts_with("已结束"), "{reason}");
+        let wakes = super::super::background_tasks::list_wakeups(&db, "m178")
+            .await
+            .unwrap();
+        assert_eq!(wakes.len(), 1, "waiting_wake 必须有真实落盘调度");
+        db.close().await;
+
+        // 跨进程：只靠落盘状态恢复，不带任何内存态。
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        let resumed = load(&db, "m178").await.unwrap().unwrap();
+        assert_eq!(resumed.state, SessionState::WaitingWake);
+        assert!(resumed
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("自动继续")));
+        assert_eq!(
+            super::super::background_tasks::list_wakeups(&db, "m178")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "唤醒行必须还在，重启后照样自动续跑"
+        );
+        db.close().await;
     }
 }

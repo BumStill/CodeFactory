@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{AppHandle, State};
 
-use crate::util::no_window::NoWindow;
 use crate::util::command_activity::{self, CommandActivityFailure};
+use crate::util::no_window::NoWindow;
 use crate::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

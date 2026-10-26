@@ -114,12 +114,17 @@ pub fn profiles_root() -> Option<PathBuf> {
     profiles_root_from_dirs(dirs::data_local_dir(), dirs::home_dir())
 }
 
-fn profiles_root_from_dirs(local_data_dir: Option<PathBuf>, home_dir: Option<PathBuf>) -> Option<PathBuf> {
+fn profiles_root_from_dirs(
+    local_data_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         local_data_dir
             .map(|dir| dir.join("CodeFactory").join("browser").join("profiles"))
-            .or_else(|| home_dir.map(|home| home.join(".codefactory").join("browser").join("profiles")))
+            .or_else(|| {
+                home_dir.map(|home| home.join(".codefactory").join("browser").join("profiles"))
+            })
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -153,7 +158,9 @@ fn now_secs() -> u64 {
 pub enum LockOutcome {
     Acquired,
     /// Another live session already holds this profile.
-    Busy { holder: String },
+    Busy {
+        holder: String,
+    },
 }
 
 /// Claim a persistent profile for `session_id`.
@@ -208,7 +215,9 @@ fn parse_lock(raw: &str) -> Option<(String, u64)> {
 /// dead end, so the app sweeps once at startup rather than making them wait out
 /// the TTL. Returns how many were released.
 pub fn sweep_stale_locks() -> usize {
-    let Some(root) = profiles_root() else { return 0 };
+    let Some(root) = profiles_root() else {
+        return 0;
+    };
     let Ok(entries) = std::fs::read_dir(&root) else {
         return 0;
     };
@@ -233,7 +242,6 @@ pub fn sweep_stale_locks() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn profile_root_policy_uses_windows_local_app_data_when_available() {
@@ -264,7 +272,8 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let local = cwd.join("Program Files").join("CodeFactory");
         let home = PathBuf::from(r"C:\Users\Ada");
-        let root = profiles_root_from_dirs(Some(local.clone()), Some(home.clone())).expect("profiles root");
+        let root = profiles_root_from_dirs(Some(local.clone()), Some(home.clone()))
+            .expect("profiles root");
 
         #[cfg(target_os = "windows")]
         {

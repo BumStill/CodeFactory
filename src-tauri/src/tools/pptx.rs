@@ -82,7 +82,8 @@ pub fn definition() -> ToolDefinition {
 Each slide has a title and an optional list of bullets. Opens in PowerPoint, \
 Keynote, Google Slides, LibreOffice Impress. Use this when the user wants a \
 deck synthesized from references — pair with kb_search to pull source content \
-first, then call this with the synthesized outline.".into(),
+first, then call this with the synthesized outline."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -134,7 +135,9 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     };
 
     if a.slides.is_empty() {
-        return Ok(ToolOutput::err("write_pptx requires at least one slide".to_string()));
+        return Ok(ToolOutput::err(
+            "write_pptx requires at least one slide".to_string(),
+        ));
     }
     if a.slides.len() > 200 {
         return Ok(ToolOutput::err(
@@ -152,17 +155,21 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
     }
     // Hallucinated-path guard — same pattern as write_file.
     if let Some(s) = path_sanity::check(&abs_path) {
-        return Ok(ToolOutput::err(path_sanity::format_error(&s, &abs_path, "write_pptx")));
+        return Ok(ToolOutput::err(path_sanity::format_error(
+            &s,
+            &abs_path,
+            "write_pptx",
+        )));
     }
     if let Some(parent) = abs_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| crate::errors::AppError::Other(format!("mkdir failed: {e}")))?;
     }
 
-    let bytes = build_pptx_bytes(&a.slides).map_err(|e| {
-        crate::errors::AppError::Other(format!("pptx build failed: {e}"))
-    })?;
-    super::file_lock::atomic_write(&abs_path, &bytes).await
+    let bytes = build_pptx_bytes(&a.slides)
+        .map_err(|e| crate::errors::AppError::Other(format!("pptx build failed: {e}")))?;
+    super::file_lock::atomic_write(&abs_path, &bytes)
+        .await
         .map_err(|e| crate::errors::AppError::Other(format!("write failed: {e}")))?;
 
     Ok(ToolOutput::ok(format!(
@@ -224,33 +231,54 @@ fn build_pptx_bytes(slides: &[PptxSlide]) -> std::result::Result<Vec<u8>, String
     let notes_indexes: Vec<usize> = slides
         .iter()
         .enumerate()
-        .filter_map(|(i, s)| if !s.notes.trim().is_empty() { Some(i) } else { None })
+        .filter_map(|(i, s)| {
+            if !s.notes.trim().is_empty() {
+                Some(i)
+            } else {
+                None
+            }
+        })
         .collect();
     let has_notes = !notes_indexes.is_empty();
 
     // ── Static infrastructure ─────────────────────────────────────────
-    write_part!("[Content_Types].xml", content_types_xml(slides.len(), &notes_indexes));
+    write_part!(
+        "[Content_Types].xml",
+        content_types_xml(slides.len(), &notes_indexes)
+    );
     write_part!("_rels/.rels", REL_TOP);
     write_part!("docProps/app.xml", APP_XML);
     write_part!("docProps/core.xml", CORE_XML);
     write_part!("ppt/presentation.xml", presentation_xml(slides.len()));
-    write_part!("ppt/_rels/presentation.xml.rels", presentation_rels(slides.len(), has_notes));
+    write_part!(
+        "ppt/_rels/presentation.xml.rels",
+        presentation_rels(slides.len(), has_notes)
+    );
     write_part!("ppt/theme/theme1.xml", THEME_XML);
     write_part!("ppt/slideMasters/slideMaster1.xml", SLIDE_MASTER_XML);
-    write_part!("ppt/slideMasters/_rels/slideMaster1.xml.rels", SLIDE_MASTER_RELS);
+    write_part!(
+        "ppt/slideMasters/_rels/slideMaster1.xml.rels",
+        SLIDE_MASTER_RELS
+    );
     write_part!("ppt/slideLayouts/slideLayout1.xml", SLIDE_LAYOUT_XML);
-    write_part!("ppt/slideLayouts/_rels/slideLayout1.xml.rels", SLIDE_LAYOUT_RELS);
+    write_part!(
+        "ppt/slideLayouts/_rels/slideLayout1.xml.rels",
+        SLIDE_LAYOUT_RELS
+    );
 
     if has_notes {
         write_part!("ppt/notesMasters/notesMaster1.xml", NOTES_MASTER_XML);
-        write_part!("ppt/notesMasters/_rels/notesMaster1.xml.rels", NOTES_MASTER_RELS);
+        write_part!(
+            "ppt/notesMasters/_rels/notesMaster1.xml.rels",
+            NOTES_MASTER_RELS
+        );
     }
 
     // ── Per-slide files ───────────────────────────────────────────────
     for (i, slide) in slides.iter().enumerate() {
         let n = i + 1;
         let slide_path = format!("ppt/slides/slide{n}.xml");
-        let rels_path  = format!("ppt/slides/_rels/slide{n}.xml.rels");
+        let rels_path = format!("ppt/slides/_rels/slide{n}.xml.rels");
         write_part!(&slide_path, slide_xml(slide));
         // Only this slide's rels reference its notesSlide when notes exist.
         let needs_notes = !slide.notes.trim().is_empty();
@@ -639,14 +667,26 @@ mod tests {
             ..Default::default()
         }])
         .unwrap();
-        assert!(bytes.len() > 1000, "expected a non-trivial pptx, got {}", bytes.len());
+        assert!(
+            bytes.len() > 1000,
+            "expected a non-trivial pptx, got {}",
+            bytes.len()
+        );
     }
 
     #[test]
     fn generated_pptx_is_valid_zip_with_expected_parts() {
         let bytes = build_pptx_bytes(&[
-            PptxSlide { title: "First".into(),  bullets: vec!["a".into(), "b".into()], ..Default::default() },
-            PptxSlide { title: "Second".into(), bullets: vec![], ..Default::default() },
+            PptxSlide {
+                title: "First".into(),
+                bullets: vec!["a".into(), "b".into()],
+                ..Default::default()
+            },
+            PptxSlide {
+                title: "Second".into(),
+                bullets: vec![],
+                ..Default::default()
+            },
         ])
         .unwrap();
 
@@ -670,21 +710,39 @@ mod tests {
             "ppt/slides/_rels/slide1.xml.rels",
             "ppt/slides/_rels/slide2.xml.rels",
         ] {
-            assert!(names.iter().any(|n| n == required),
-                "expected {required} in archive, got {:?}", names);
+            assert!(
+                names.iter().any(|n| n == required),
+                "expected {required} in archive, got {:?}",
+                names
+            );
         }
 
         // Slide 1 must contain the user's text. This is the verification
         // that protects against silently producing an "empty pptx".
         let mut slide1 = String::new();
-        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut slide1).unwrap();
-        assert!(slide1.contains("First"), "slide 1 missing title text: {slide1}");
-        assert!(slide1.contains("<a:t>a</a:t>"), "slide 1 missing bullet 'a'");
-        assert!(slide1.contains("<a:t>b</a:t>"), "slide 1 missing bullet 'b'");
+        zip.by_name("ppt/slides/slide1.xml")
+            .unwrap()
+            .read_to_string(&mut slide1)
+            .unwrap();
+        assert!(
+            slide1.contains("First"),
+            "slide 1 missing title text: {slide1}"
+        );
+        assert!(
+            slide1.contains("<a:t>a</a:t>"),
+            "slide 1 missing bullet 'a'"
+        );
+        assert!(
+            slide1.contains("<a:t>b</a:t>"),
+            "slide 1 missing bullet 'b'"
+        );
 
         // Title-only slide (no bullets) still well-formed.
         let mut slide2 = String::new();
-        zip.by_name("ppt/slides/slide2.xml").unwrap().read_to_string(&mut slide2).unwrap();
+        zip.by_name("ppt/slides/slide2.xml")
+            .unwrap()
+            .read_to_string(&mut slide2)
+            .unwrap();
         assert!(slide2.contains("Second"));
     }
 
@@ -699,7 +757,10 @@ mod tests {
         let cursor = std::io::Cursor::new(&bytes);
         let mut zip = ZipArchive::new(cursor).unwrap();
         let mut s = String::new();
-        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut s).unwrap();
+        zip.by_name("ppt/slides/slide1.xml")
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         // Raw < / & / > / " / ' MUST NOT appear in the text payload.
         assert!(s.contains("A &lt; B &amp; C &gt; D"));
         assert!(s.contains("&quot;quoted&quot; &amp; &apos;apos&apos;"));
@@ -716,12 +777,21 @@ mod tests {
         let cursor = std::io::Cursor::new(&bytes);
         let mut zip = ZipArchive::new(cursor).unwrap();
         let mut s = String::new();
-        zip.by_name("ppt/slides/slide1.xml").unwrap().read_to_string(&mut s).unwrap();
+        zip.by_name("ppt/slides/slide1.xml")
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         // Section uses ctrTitle placeholder + algn="ctr".
-        assert!(s.contains("ctrTitle"),  "expected center-title placeholder, got: {s}");
+        assert!(
+            s.contains("ctrTitle"),
+            "expected center-title placeholder, got: {s}"
+        );
         assert!(s.contains("Chapter 1"), "title text missing");
         // No content placeholder on a section slide.
-        assert!(!s.contains("name=\"Content\""), "section slide must not carry content shape");
+        assert!(
+            !s.contains("name=\"Content\""),
+            "section slide must not carry content shape"
+        );
     }
 
     #[test]
@@ -733,7 +803,10 @@ mod tests {
                 notes: "remember to talk slower here".into(),
                 ..Default::default()
             },
-            PptxSlide { title: "No notes".into(), ..Default::default() },
+            PptxSlide {
+                title: "No notes".into(),
+                ..Default::default()
+            },
         ])
         .unwrap();
         let cursor = std::io::Cursor::new(&bytes);
@@ -748,16 +821,31 @@ mod tests {
 
         // Notes content carried through.
         let mut n = String::new();
-        zip.by_name("ppt/notesSlides/notesSlide1.xml").unwrap().read_to_string(&mut n).unwrap();
+        zip.by_name("ppt/notesSlides/notesSlide1.xml")
+            .unwrap()
+            .read_to_string(&mut n)
+            .unwrap();
         assert!(n.contains("remember to talk slower"), "notes text missing");
 
         // Slide 1 rels reference the notesSlide; slide 2 rels do not.
         let mut r1 = String::new();
-        zip.by_name("ppt/slides/_rels/slide1.xml.rels").unwrap().read_to_string(&mut r1).unwrap();
-        assert!(r1.contains("notesSlide"), "slide 1 should link to its notes");
+        zip.by_name("ppt/slides/_rels/slide1.xml.rels")
+            .unwrap()
+            .read_to_string(&mut r1)
+            .unwrap();
+        assert!(
+            r1.contains("notesSlide"),
+            "slide 1 should link to its notes"
+        );
         let mut r2 = String::new();
-        zip.by_name("ppt/slides/_rels/slide2.xml.rels").unwrap().read_to_string(&mut r2).unwrap();
-        assert!(!r2.contains("notesSlide"), "slide 2 should NOT link to a notes file it doesn't have");
+        zip.by_name("ppt/slides/_rels/slide2.xml.rels")
+            .unwrap()
+            .read_to_string(&mut r2)
+            .unwrap();
+        assert!(
+            !r2.contains("notesSlide"),
+            "slide 2 should NOT link to a notes file it doesn't have"
+        );
     }
 
     /// Smoke: write a real .pptx to /tmp so a developer can open it
@@ -802,18 +890,27 @@ mod tests {
     #[test]
     fn many_slides_generate_unique_slide_ids() {
         let slides: Vec<PptxSlide> = (0..10)
-            .map(|i| PptxSlide { title: format!("Slide {i}"), bullets: vec![], ..Default::default() })
+            .map(|i| PptxSlide {
+                title: format!("Slide {i}"),
+                bullets: vec![],
+                ..Default::default()
+            })
             .collect();
         let bytes = build_pptx_bytes(&slides).unwrap();
         let cursor = std::io::Cursor::new(&bytes);
         let mut zip = ZipArchive::new(cursor).unwrap();
         let mut pres = String::new();
-        zip.by_name("ppt/presentation.xml").unwrap().read_to_string(&mut pres).unwrap();
+        zip.by_name("ppt/presentation.xml")
+            .unwrap()
+            .read_to_string(&mut pres)
+            .unwrap();
         // Slide IDs must be unique (256..265) — duplicates make Office
         // silently drop slides on open.
         for sid in 256..266 {
-            assert!(pres.contains(&format!("id=\"{sid}\"")),
-                "missing slide id {sid} in presentation.xml");
+            assert!(
+                pres.contains(&format!("id=\"{sid}\"")),
+                "missing slide id {sid} in presentation.xml"
+            );
         }
     }
 }

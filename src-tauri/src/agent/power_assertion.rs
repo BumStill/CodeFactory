@@ -3,8 +3,11 @@
 use sqlx::SqlitePool;
 
 pub(super) async fn has_background_work(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objectives WHERE status IN ('active','waiting_system')")
-        .fetch_one(pool).await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objectives WHERE status IN ('active','waiting_system')",
+    )
+    .fetch_one(pool)
+    .await?;
     Ok(count > 0)
 }
 
@@ -18,13 +21,22 @@ pub(super) struct PowerAssertion {
 #[cfg(target_os = "macos")]
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
-    fn IOPMAssertionCreateWithName(kind: *const std::ffi::c_void, level: u32, name: *const std::ffi::c_void, id: *mut u32) -> i32;
+    fn IOPMAssertionCreateWithName(
+        kind: *const std::ffi::c_void,
+        level: u32,
+        name: *const std::ffi::c_void,
+        id: *mut u32,
+    ) -> i32;
     fn IOPMAssertionRelease(id: u32) -> i32;
 }
 #[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
-    fn CFStringCreateWithCString(allocator: *const std::ffi::c_void, text: *const std::ffi::c_char, encoding: u32) -> *const std::ffi::c_void;
+    fn CFStringCreateWithCString(
+        allocator: *const std::ffi::c_void,
+        text: *const std::ffi::c_char,
+        encoding: u32,
+    ) -> *const std::ffi::c_void;
     fn CFRelease(value: *const std::ffi::c_void);
 }
 #[cfg(windows)]
@@ -37,24 +49,42 @@ impl PowerAssertion {
     // Called from a dedicated OS thread: Windows execution-state assertions
     // belong to the calling thread, not to a migratable async task.
     pub(super) fn update(&mut self, needed: bool) -> Result<(), String> {
-        if needed == self.held { return Ok(()); }
+        if needed == self.held {
+            return Ok(());
+        }
         #[cfg(target_os = "macos")]
         unsafe {
             if needed {
-                let kind = CFStringCreateWithCString(std::ptr::null(), c"PreventUserIdleSystemSleep".as_ptr(), 0x08000100);
-                let reason = CFStringCreateWithCString(std::ptr::null(), c"CodeFactory background objectives".as_ptr(), 0x08000100);
+                let kind = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    c"PreventUserIdleSystemSleep".as_ptr(),
+                    0x08000100,
+                );
+                let reason = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    c"CodeFactory background objectives".as_ptr(),
+                    0x08000100,
+                );
                 if kind.is_null() || reason.is_null() {
-                    if !kind.is_null() { CFRelease(kind); }
-                    if !reason.is_null() { CFRelease(reason); }
+                    if !kind.is_null() {
+                        CFRelease(kind);
+                    }
+                    if !reason.is_null() {
+                        CFRelease(reason);
+                    }
                     return Err("cannot allocate power assertion strings".into());
                 }
                 let result = IOPMAssertionCreateWithName(kind, 255, reason, &mut self.id);
                 CFRelease(kind);
                 CFRelease(reason);
-                if result != 0 { return Err(format!("IOPMAssertionCreateWithName: {result}")); }
+                if result != 0 {
+                    return Err(format!("IOPMAssertionCreateWithName: {result}"));
+                }
             } else {
                 let result = IOPMAssertionRelease(self.id);
-                if result != 0 { return Err(format!("IOPMAssertionRelease: {result}")); }
+                if result != 0 {
+                    return Err(format!("IOPMAssertionRelease: {result}"));
+                }
             }
         }
         #[cfg(windows)]
@@ -68,7 +98,9 @@ impl PowerAssertion {
     }
 }
 impl Drop for PowerAssertion {
-    fn drop(&mut self) { let _ = self.update(false); }
+    fn drop(&mut self) {
+        let _ = self.update(false);
+    }
 }
 
 pub(super) fn spawn(pool: SqlitePool) {
@@ -92,19 +124,47 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn m89_power_assertion_tracks_only_background_objectives() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-            .connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE objectives (status TEXT)").execute(&pool).await.unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE objectives (status TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
         let mut assertion = PowerAssertion::default();
-        for status in ["active", "waiting_system", "waiting_user", "completed", "cancelled", "failed"] {
-            sqlx::query("DELETE FROM objectives").execute(&pool).await.unwrap();
-            sqlx::query("INSERT INTO objectives VALUES (?)").bind(status).execute(&pool).await.unwrap();
+        for status in [
+            "active",
+            "waiting_system",
+            "waiting_user",
+            "completed",
+            "cancelled",
+            "failed",
+        ] {
+            sqlx::query("DELETE FROM objectives")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO objectives VALUES (?)")
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
             let needed = has_background_work(&pool).await.unwrap();
             assertion.update(needed).unwrap();
-            assert_eq!(assertion.held, matches!(status, "active" | "waiting_system"));
+            assert_eq!(
+                assertion.held,
+                matches!(status, "active" | "waiting_system")
+            );
         }
-        sqlx::query("DELETE FROM objectives").execute(&pool).await.unwrap();
-        assertion.update(has_background_work(&pool).await.unwrap()).unwrap();
+        sqlx::query("DELETE FROM objectives")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assertion
+            .update(has_background_work(&pool).await.unwrap())
+            .unwrap();
         assert!(!assertion.held);
     }
 }

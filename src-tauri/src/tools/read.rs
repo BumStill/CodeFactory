@@ -23,7 +23,8 @@ pub fn definition() -> ToolDefinition {
             name: "read_file".into(),
             description: "Read a file from disk. Returns line-numbered content. For Office \
 documents (.docx / .pptx / .pdf) it auto-extracts the plain text instead of raw bytes \
-(lossy — to edit a .pptx while preserving its design, use read_pptx + edit_pptx).".into(),
+(lossy — to edit a .pptx while preserving its design, use read_pptx + edit_pptx)."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

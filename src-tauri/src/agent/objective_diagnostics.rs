@@ -62,7 +62,10 @@ pub(crate) async fn live_run_control(db: &SqlitePool, session_id: &str) -> sqlx:
 ///
 /// 这是判定「缓存里的 running 已经死了」的唯一硬证据：没有控制行的会话是
 /// **含糊**的（thin 会话并不都用控制行），含糊不得降级成终态。
-pub(crate) async fn dead_process_run_control(db: &SqlitePool, session_id: &str) -> sqlx::Result<bool> {
+pub(crate) async fn dead_process_run_control(
+    db: &SqlitePool,
+    session_id: &str,
+) -> sqlx::Result<bool> {
     if !has_table(db, "chat_run_controls").await? {
         return Ok(false);
     }
@@ -79,7 +82,10 @@ pub(crate) async fn dead_process_run_control(db: &SqlitePool, session_id: &str) 
 }
 
 /// 无主 live 控制行：会话维度上的排他锁，却没有任何活着的执行者。
-pub(crate) async fn orphan_run_control_count(db: &SqlitePool, session_id: &str) -> sqlx::Result<i64> {
+pub(crate) async fn orphan_run_control_count(
+    db: &SqlitePool,
+    session_id: &str,
+) -> sqlx::Result<i64> {
     if !has_table(db, "chat_run_controls").await? {
         return Ok(0);
     }
@@ -220,8 +226,16 @@ pub async fn collect(
             "SELECT run_instance_id,status,created_process_instance,NULL,root_turn_id,created_at,updated_at,settled_at
              FROM chat_run_controls WHERE session_id=? ORDER BY created_at DESC LIMIT 20"
         };
-        let rows: Vec<(String, String, String, Option<String>, Option<String>, i64, i64, Option<i64>)> =
-            sqlx::query_as(sql).bind(session_id).fetch_all(db).await?;
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            Option<i64>,
+        )> = sqlx::query_as(sql).bind(session_id).fetch_all(db).await?;
         run_controls = rows
             .into_iter()
             .map(|row| RunControlRow {
@@ -249,7 +263,11 @@ pub async fn collect(
         .await?;
         recent_events = rows
             .into_iter()
-            .map(|row| EventRow { kind: row.0, actor: row.1, created_at: row.2 })
+            .map(|row| EventRow {
+                kind: row.0,
+                actor: row.1,
+                created_at: row.2,
+            })
             .collect();
     }
 
@@ -278,24 +296,34 @@ pub async fn collect(
         .bind(session_id)
         .fetch_one(db)
         .await?;
-        let user_last_at: Option<i64> =
-            sqlx::query_scalar("SELECT MAX(created_at) FROM messages WHERE session_id=? AND role='user'")
-                .bind(session_id)
-                .fetch_one(db)
-                .await?;
-        MessageStats { count, first_at: first, last_at: last, assistant_finals, user_last_at }
+        let user_last_at: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(created_at) FROM messages WHERE session_id=? AND role='user'",
+        )
+        .bind(session_id)
+        .fetch_one(db)
+        .await?;
+        MessageStats {
+            count,
+            first_at: first,
+            last_at: last,
+            assistant_finals,
+            user_last_at,
+        }
     } else {
         MessageStats::default()
     };
 
-    let pending_cancel_intent_at: Option<i64> = if has_table(db, "chat_session_cancel_intents").await? {
-        sqlx::query_scalar("SELECT requested_at FROM chat_session_cancel_intents WHERE session_id=?")
+    let pending_cancel_intent_at: Option<i64> =
+        if has_table(db, "chat_session_cancel_intents").await? {
+            sqlx::query_scalar(
+                "SELECT requested_at FROM chat_session_cancel_intents WHERE session_id=?",
+            )
             .bind(session_id)
             .fetch_optional(db)
             .await?
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let pending_approvals = count(
         db,
         "SELECT COUNT(*) FROM permission_intents WHERE session_id=? AND status='pending'",
@@ -313,7 +341,9 @@ pub async fn collect(
     };
 
     let cached_row = cached.as_ref().map(StateRow::from);
-    let cache_matches_facts = cached_row.as_ref().is_some_and(|row| row.state == derived.state.as_str());
+    let cache_matches_facts = cached_row
+        .as_ref()
+        .is_some_and(|row| row.state == derived.state.as_str());
     Ok(SessionDiagnostics {
         schema: "codefactory.session_diagnostics.v1".into(),
         session_id: session_id.to_string(),
@@ -373,9 +403,18 @@ pub struct ResetOutcome {
 ///
 /// 只结算控制面（取消意图、运行控制行）与状态投影；消息、工具结果、摘要、
 /// 交付记录一行都不动。
-pub async fn reset_session_state(db: &SqlitePool, session_id: &str) -> anyhow::Result<ResetOutcome> {
+pub async fn reset_session_state(
+    db: &SqlitePool,
+    session_id: &str,
+) -> anyhow::Result<ResetOutcome> {
     let at = now_ms();
-    let messages_before = count(db, "SELECT COUNT(*) FROM messages WHERE session_id=?", session_id, "messages").await?;
+    let messages_before = count(
+        db,
+        "SELECT COUNT(*) FROM messages WHERE session_id=?",
+        session_id,
+        "messages",
+    )
+    .await?;
     let mut outcome = ResetOutcome {
         session_id: session_id.to_string(),
         reset_at: at,
@@ -386,18 +425,21 @@ pub async fn reset_session_state(db: &SqlitePool, session_id: &str) -> anyhow::R
 
     if crate::session_executor_alive(session_id) == Some(true) {
         outcome.reason = Some("会话仍有活着的执行者，请先停止该回合再重置".into());
-        outcome.resulting_state = super::thin_derive::derive_state(db, session_id).await?.state.as_str().to_string();
+        outcome.resulting_state = super::thin_derive::derive_state(db, session_id)
+            .await?
+            .state
+            .as_str()
+            .to_string();
         return Ok(outcome);
     }
 
     if has_table(db, "chat_session_cancel_intents").await? {
-        outcome.settled_cancel_intents = sqlx::query(
-            "DELETE FROM chat_session_cancel_intents WHERE session_id=?",
-        )
-        .bind(session_id)
-        .execute(db)
-        .await?
-        .rows_affected();
+        outcome.settled_cancel_intents =
+            sqlx::query("DELETE FROM chat_session_cancel_intents WHERE session_id=?")
+                .bind(session_id)
+                .execute(db)
+                .await?
+                .rows_affected();
     }
 
     if has_table(db, "chat_run_controls").await? {
@@ -427,12 +469,21 @@ pub async fn reset_session_state(db: &SqlitePool, session_id: &str) -> anyhow::R
     // 事实重算；仍被判成 running 说明缓存自持，这里直接落一个诚实的终态。
     let mut state = super::thin_derive::refresh(db, session_id).await?;
     if state.state == SessionState::Running {
-        state = ThinState::ended("已手动重置会话状态：清理了残留运行状态，可以重新发送消息", "本会话记录");
+        state = ThinState::ended(
+            "已手动重置会话状态：清理了残留运行状态，可以重新发送消息",
+            "本会话记录",
+        );
         super::thin_state::save(db, session_id, &state).await?;
     }
     outcome.reset = true;
     outcome.resulting_state = state.state.as_str().to_string();
-    outcome.messages_after = count(db, "SELECT COUNT(*) FROM messages WHERE session_id=?", session_id, "messages").await?;
+    outcome.messages_after = count(
+        db,
+        "SELECT COUNT(*) FROM messages WHERE session_id=?",
+        session_id,
+        "messages",
+    )
+    .await?;
 
     if has_table(db, "session_audit_events").await? {
         let _ = sqlx::query(
@@ -495,7 +546,11 @@ pub(crate) async fn retire_orphan_run_controls(
         .rows_affected();
     }
     if retired > 0 {
-        tracing::warn!(session = session_id, retired, "M151 准入前回收无主运行控制行");
+        tracing::warn!(
+            session = session_id,
+            retired,
+            "M151 准入前回收无主运行控制行"
+        );
     }
     Ok(retired)
 }
@@ -518,7 +573,10 @@ pub(crate) async fn reconcile_all_thin_states(db: &SqlitePool) -> sqlx::Result<u
                 continue;
             }
         };
-        if before.as_ref().is_none_or(|state| state.state != after.state) {
+        if before
+            .as_ref()
+            .is_none_or(|state| state.state != after.state)
+        {
             fixed += 1;
         }
     }
@@ -530,7 +588,9 @@ mod tests {
     use super::*;
 
     async fn fixture(session: &str) -> SqlitePool {
-        let db = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let db = crate::storage::db::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?,'synthetic','/synthetic','model',1,1,'thin')")
             .bind(session)
             .execute(&db)
@@ -548,12 +608,16 @@ mod tests {
     #[tokio::test]
     async fn m151_diagnostics_flag_poisoned_cache_and_stay_content_free() {
         let db = fixture("diag").await;
-        super::super::thin_state::save(&db, "diag", &ThinState::running()).await.unwrap();
+        super::super::thin_state::save(&db, "diag", &ThinState::running())
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO chat_run_controls(run_instance_id,session_id,status,created_process_instance,created_at,updated_at) VALUES ('left-over','diag','active','process-that-died',1,1)")
             .execute(&db)
             .await
             .unwrap();
-        let report = collect(&db, "diag", "1.0.0", "windows", "powershell").await.unwrap();
+        let report = collect(&db, "diag", "1.0.0", "windows", "powershell")
+            .await
+            .unwrap();
         assert_eq!(report.schema, "codefactory.session_diagnostics.v1");
         assert_eq!(report.thin_session_state.as_ref().unwrap().state, "running");
         assert_eq!(report.derived_state.state, "ended");
@@ -571,7 +635,9 @@ mod tests {
     #[tokio::test]
     async fn m151_reset_makes_a_stuck_session_usable_without_losing_content() {
         let db = fixture("stuck").await;
-        super::super::thin_state::save(&db, "stuck", &ThinState::running()).await.unwrap();
+        super::super::thin_state::save(&db, "stuck", &ThinState::running())
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO chat_session_cancel_intents(session_id,status,requested_at,updated_at) VALUES ('stuck','requested',900,900)")
             .execute(&db)
             .await
@@ -583,25 +649,42 @@ mod tests {
             .unwrap();
 
         let outcome = reset_session_state(&db, "stuck").await.unwrap();
-        assert!(outcome.reset, "无活执行者时必须允许重置：{:?}", outcome.reason);
+        assert!(
+            outcome.reset,
+            "无活执行者时必须允许重置：{:?}",
+            outcome.reason
+        );
         assert_eq!(outcome.settled_cancel_intents, 1);
         assert_eq!(outcome.retired_run_controls, 1);
         assert_eq!(outcome.resulting_state, "ended");
         assert_eq!(outcome.messages_before, 1);
         assert_eq!(outcome.messages_after, 1, "R9：重置绝不删除消息");
-        let intents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_session_cancel_intents WHERE session_id='stuck'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let intents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_session_cancel_intents WHERE session_id='stuck'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
         assert_eq!(intents, 0);
-        let status: String = sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id='orphan'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM chat_run_controls WHERE run_instance_id='orphan'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
         assert_eq!(status, "completed");
         // 重置后下一条消息不会再被残留状态挡住。
-        assert_eq!(super::super::thin_derive::derive_state(&db, "stuck").await.unwrap().state, SessionState::Ended);
-        let settled = super::super::thin_state::load(&db, "stuck").await.unwrap().unwrap();
+        assert_eq!(
+            super::super::thin_derive::derive_state(&db, "stuck")
+                .await
+                .unwrap()
+                .state,
+            SessionState::Ended
+        );
+        let settled = super::super::thin_state::load(&db, "stuck")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(settled.state, SessionState::Ended);
         let reason = settled.reason.unwrap_or_default();
         assert!(
@@ -614,7 +697,9 @@ mod tests {
     #[tokio::test]
     async fn m151_reset_refuses_while_the_turn_is_alive() {
         let db = fixture("live").await;
-        super::super::thin_state::save(&db, "live", &ThinState::running()).await.unwrap();
+        super::super::thin_state::save(&db, "live", &ThinState::running())
+            .await
+            .unwrap();
         let control = crate::ChatRunControl::pending();
         crate::register_session_executor("live", &control);
         let outcome = reset_session_state(&db, "live").await.unwrap();

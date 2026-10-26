@@ -145,14 +145,22 @@ pub fn build_report(
     let mut models: Vec<ModelSummary> = by_model
         .values()
         .map(|run| {
-            let passed = run.trials.iter().filter(|t| t.reward >= pass_threshold).count();
+            let passed = run
+                .trials
+                .iter()
+                .filter(|t| t.reward >= pass_threshold)
+                .count();
             let total = run.trials.len();
             ModelSummary {
                 model: run.model.clone(),
                 run_id: run.run_id.clone(),
                 total,
                 passed,
-                pass_rate: if total == 0 { 0.0 } else { passed as f64 / total as f64 },
+                pass_rate: if total == 0 {
+                    0.0
+                } else {
+                    passed as f64 / total as f64
+                },
             }
         })
         .collect();
@@ -199,7 +207,10 @@ pub fn build_report(
             if per_model.len() < 2 || !(any_pass && any_fail) {
                 return None;
             }
-            let max = per_model.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let max = per_model
+                .values()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
             let min = per_model.values().cloned().fold(f64::INFINITY, f64::min);
             Some(DivergentTask {
                 task_name,
@@ -266,7 +277,12 @@ pub fn build_report(
 mod tests {
     use super::*;
 
-    fn run(id: &str, model: &str, comparable: bool, trials: &[(&str, f64, Option<&str>)]) -> RunWithTrials {
+    fn run(
+        id: &str,
+        model: &str,
+        comparable: bool,
+        trials: &[(&str, f64, Option<&str>)],
+    ) -> RunWithTrials {
         RunWithTrials {
             run_id: id.into(),
             model: model.into(),
@@ -297,8 +313,26 @@ mod tests {
     #[test]
     fn per_model_pass_rate_and_pairwise_jaccard() {
         let runs = vec![
-            run("r1", "gpt-5.6", true, &[("t1", 1.0, None), ("t2", 1.0, None), ("t3", 0.0, Some("timeout"))]),
-            run("r2", "deepseek-v4", true, &[("t1", 1.0, None), ("t2", 0.0, Some("wrong")), ("t3", 0.0, Some("timeout"))]),
+            run(
+                "r1",
+                "gpt-5.6",
+                true,
+                &[
+                    ("t1", 1.0, None),
+                    ("t2", 1.0, None),
+                    ("t3", 0.0, Some("timeout")),
+                ],
+            ),
+            run(
+                "r2",
+                "deepseek-v4",
+                true,
+                &[
+                    ("t1", 1.0, None),
+                    ("t2", 0.0, Some("wrong")),
+                    ("t3", 0.0, Some("timeout")),
+                ],
+            ),
         ];
         let rep = build_report("terminal-bench", "2.1", &runs, DEFAULT_PASS_THRESHOLD);
         assert_eq!(rep.models.len(), 2);
@@ -309,7 +343,10 @@ mod tests {
         // Pairs use sorted model order → model_a = deepseek-v4, model_b = gpt-5.6.
         assert_eq!(rep.pairwise.len(), 1);
         let p = &rep.pairwise[0];
-        assert_eq!((p.model_a.as_str(), p.model_b.as_str()), ("deepseek-v4", "gpt-5.6"));
+        assert_eq!(
+            (p.model_a.as_str(), p.model_b.as_str()),
+            ("deepseek-v4", "gpt-5.6")
+        );
         assert!((p.jaccard - 0.5).abs() < 1e-9);
         assert_eq!((p.both_passed, p.a_only, p.b_only), (1, 0, 1));
     }
@@ -317,13 +354,27 @@ mod tests {
     #[test]
     fn divergent_tasks_only_lists_pass_fail_splits_sorted_by_spread() {
         let runs = vec![
-            run("r1", "a", true, &[("t1", 1.0, None), ("t2", 1.0, None), ("t3", 0.4, None)]),
-            run("r2", "b", true, &[("t1", 1.0, None), ("t2", 0.0, Some("x")), ("t3", 1.0, None)]),
+            run(
+                "r1",
+                "a",
+                true,
+                &[("t1", 1.0, None), ("t2", 1.0, None), ("t3", 0.4, None)],
+            ),
+            run(
+                "r2",
+                "b",
+                true,
+                &[("t1", 1.0, None), ("t2", 0.0, Some("x")), ("t3", 1.0, None)],
+            ),
         ];
         let rep = build_report("terminal-bench", "2.1", &runs, DEFAULT_PASS_THRESHOLD);
         // t1 both pass → not divergent. t2 a-pass/b-fail (spread 1.0). t3
         // a-fail(0.4)/b-pass(1.0) (spread 0.6). Sorted by spread desc.
-        let names: Vec<&str> = rep.divergent_tasks.iter().map(|d| d.task_name.as_str()).collect();
+        let names: Vec<&str> = rep
+            .divergent_tasks
+            .iter()
+            .map(|d| d.task_name.as_str())
+            .collect();
         assert_eq!(names, vec!["t2", "t3"]);
         assert!((rep.divergent_tasks[0].spread - 1.0).abs() < 1e-9);
         assert_eq!(rep.divergent_tasks[0].per_model["a"], 1.0);
@@ -337,7 +388,7 @@ mod tests {
         let runs = vec![
             run("r1", "a", true, &[("t1", 1.0, None)]),
             run("r2", "b", false, &[("t1", 0.0, Some("x"))]), // not comparable
-            other,                                             // other version
+            other,                                            // other version
         ];
         let rep = build_report("terminal-bench", "2.1", &runs, DEFAULT_PASS_THRESHOLD);
         assert_eq!(rep.models.len(), 1);
@@ -352,12 +403,25 @@ mod tests {
             "r1",
             "a",
             true,
-            &[("t1", 0.0, Some("timeout")), ("t2", 0.0, Some("timeout")), ("t3", 0.0, None), ("t4", 1.0, None)],
+            &[
+                ("t1", 0.0, Some("timeout")),
+                ("t2", 0.0, Some("timeout")),
+                ("t3", 0.0, None),
+                ("t4", 1.0, None),
+            ],
         )];
         let rep = build_report("terminal-bench", "2.1", &runs, DEFAULT_PASS_THRESHOLD);
-        let timeout = rep.failure_distribution.iter().find(|b| b.failure_class == "timeout").unwrap();
+        let timeout = rep
+            .failure_distribution
+            .iter()
+            .find(|b| b.failure_class == "timeout")
+            .unwrap();
         assert_eq!(timeout.count, 2);
-        let unclassified = rep.failure_distribution.iter().find(|b| b.failure_class == "unclassified").unwrap();
+        let unclassified = rep
+            .failure_distribution
+            .iter()
+            .find(|b| b.failure_class == "unclassified")
+            .unwrap();
         assert_eq!(unclassified.count, 1); // t3 failed with no class; t4 passed, excluded
     }
 

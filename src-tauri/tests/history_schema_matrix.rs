@@ -10,9 +10,16 @@ fn historical_schema_matrix_preserves_identity() {
         .current_dir(root.path())
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
-    let matrix = value["schema_matrix"].as_array().expect("missing old-schema matrix");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+    let matrix = value["schema_matrix"]
+        .as_array()
+        .expect("missing old-schema matrix");
     assert_eq!(matrix.len(), 4);
     for (row, version) in matrix.iter().zip([1, 6, 10, 19]) {
         assert_eq!(row["source_version"], version);

@@ -66,7 +66,9 @@ pub struct SubagentBrief {
 /// [`SubagentBrief::read_only`] into an enforced capability. `run_subagent` MUST
 /// derive the capability through this function, otherwise a delegated read-only
 /// task silently runs write-capable.
-pub fn subagent_turn_capability(brief: &SubagentBrief) -> codefactory_agent_loop::run::TurnCapability {
+pub fn subagent_turn_capability(
+    brief: &SubagentBrief,
+) -> codefactory_agent_loop::run::TurnCapability {
     if brief.read_only {
         codefactory_agent_loop::run::TurnCapability::ReviewOnly
     } else {

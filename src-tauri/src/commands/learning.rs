@@ -25,8 +25,8 @@ use std::path::Path;
 use tauri::{command, AppHandle, Emitter, State};
 use uuid::Uuid;
 
-use crate::commands::memory::ProjectMemory;
 use crate::ai_text::{run_one_shot_text, AiMessage as OneShotAiMessage};
+use crate::commands::memory::ProjectMemory;
 use crate::config::settings::ApiStyle;
 use crate::errors::AppError;
 use crate::AppState;
@@ -658,16 +658,8 @@ async fn record_job_failure(
     title: &str,
     error: &AppError,
 ) {
-    if let Err(persist_error) = persist_job_failure(
-        pool,
-        cwd,
-        job_id,
-        candidate_id,
-        stage,
-        title,
-        error,
-    )
-    .await
+    if let Err(persist_error) =
+        persist_job_failure(pool, cwd, job_id, candidate_id, stage, title, error).await
     {
         tracing::warn!("failed to persist atomic evolution job failure: {persist_error}");
     }
@@ -1631,20 +1623,16 @@ Examples:\n\
                 }
             };
             let client = Client::new();
-            let response = match crate::http_util::post_chat_completions(
-                &client,
-                &url,
-                &api_key,
-                &mut body,
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::warn!("postmortem request failed: {error}");
-                    return Ok(vec![]);
-                }
-            };
+            let response =
+                match crate::http_util::post_chat_completions(&client, &url, &api_key, &mut body)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::warn!("postmortem request failed: {error}");
+                        return Ok(vec![]);
+                    }
+                };
             let response: AiResponse = match response.json().await {
                 Ok(response) => response,
                 Err(error) => {
@@ -1661,10 +1649,7 @@ Examples:\n\
                 );
                 expand_postmortem_completion_budget(&mut body);
                 let retry_response = match crate::http_util::post_chat_completions(
-                    &client,
-                    &url,
-                    &api_key,
-                    &mut body,
+                    &client, &url, &api_key, &mut body,
                 )
                 .await
                 {
@@ -3652,16 +3637,17 @@ mod tests {
             insert_candidate(&pool, id, &cwd, kind, suggestion, pref_key, pref_value).await;
         }
         let events = list_learning_events_for_pool(&cwd, &pool).await.unwrap();
-        let accepted = auto_accept_memory_candidates_for_pool(&pool, &events).await.unwrap();
+        let accepted = auto_accept_memory_candidates_for_pool(&pool, &events)
+            .await
+            .unwrap();
         assert_eq!(accepted, vec!["auto-safe".to_string()]);
 
-        let statuses: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id, status FROM learning_events WHERE cwd=? ORDER BY id",
-        )
-        .bind(&cwd)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM learning_events WHERE cwd=? ORDER BY id")
+                .bind(&cwd)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             statuses,
             vec![
@@ -3696,12 +3682,29 @@ mod tests {
         )
         .await;
         let events = list_learning_events_for_pool(&cwd, &pool).await.unwrap();
-        assert_eq!(auto_accept_memory_candidates_for_pool(&pool, &events).await.unwrap().len(), 1);
+        assert_eq!(
+            auto_accept_memory_candidates_for_pool(&pool, &events)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         let first = std::fs::read_to_string(project.join(".codefactory/memory.md")).unwrap();
-        assert_eq!(auto_accept_memory_candidates_for_pool(&pool, &events).await.unwrap().len(), 0);
+        assert_eq!(
+            auto_accept_memory_candidates_for_pool(&pool, &events)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
         let second = std::fs::read_to_string(project.join(".codefactory/memory.md")).unwrap();
         assert_eq!(first, second);
-        assert_eq!(second.matches("codefactory-learning-event:auto-once").count(), 1);
+        assert_eq!(
+            second
+                .matches("codefactory-learning-event:auto-once")
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(project);
     }
 
@@ -4186,13 +4189,15 @@ mod tests {
         )
         .await;
 
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM evolution_jobs WHERE id='event-half-failure'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(status, "running", "terminal update must roll back with its event");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM evolution_jobs WHERE id='event-half-failure'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "running",
+            "terminal update must roll back with its event"
+        );
         let failed_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM evolution_job_events
              WHERE job_id='event-half-failure' AND status='failed'",
@@ -4249,7 +4254,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(failed_events, 0, "failed event must roll back with terminal update");
+        assert_eq!(
+            failed_events, 0,
+            "failed event must roll back with terminal update"
+        );
     }
 
     #[tokio::test]

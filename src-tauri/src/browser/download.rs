@@ -40,8 +40,8 @@
 //!     making the user download it again.
 
 use std::io::Write;
-use std::time::Duration;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::errors::{AppError, Result};
 
@@ -103,12 +103,16 @@ async fn resolve(platform: Platform, versions_url: &str) -> Result<(String, Stri
         .send()
         .await
         .map_err(|error| {
-            AppError::Other(format!("Could not reach the Chromium version index: {error}"))
+            AppError::Other(format!(
+                "Could not reach the Chromium version index: {error}"
+            ))
         })?
         .json()
         .await
         .map_err(|error| {
-            AppError::Other(format!("The Chromium version index was unreadable: {error}"))
+            AppError::Other(format!(
+                "The Chromium version index was unreadable: {error}"
+            ))
         })?;
 
     install::download_url_from_index(&index, "Stable", platform).ok_or_else(|| {
@@ -158,7 +162,8 @@ pub(crate) async fn ensure_installed_in(
         ));
     }
 
-    if let (_, install::InstallState::Ready(found)) = install::detect_in_any(&candidates, platform) {
+    if let (_, install::InstallState::Ready(found)) = install::detect_in_any(&candidates, platform)
+    {
         on_progress(Progress::Done {
             version: found.version.clone(),
         });
@@ -224,7 +229,9 @@ pub(crate) async fn ensure_installed_in(
 
 /// Take the next candidate root this process can write to, consuming the ones
 /// that were tried so a retry never lands on the same folder twice.
-fn take_writable_root(remaining: &mut Vec<PathBuf>) -> std::result::Result<PathBuf, Vec<install::RootAttempt>> {
+fn take_writable_root(
+    remaining: &mut Vec<PathBuf>,
+) -> std::result::Result<PathBuf, Vec<install::RootAttempt>> {
     let chosen = install::first_writable_root(remaining)?;
     if let Some(position) = remaining.iter().position(|root| root == &chosen) {
         remaining.drain(..=position);
@@ -328,9 +335,8 @@ fn install_archive(
     }
     make_executable(&binary);
 
-    install::write_marker(root, version).map_err(|error| {
-        StepError::io("Recording the install in", root, &error)
-    })?;
+    install::write_marker(root, version)
+        .map_err(|error| StepError::io("Recording the install in", root, &error))?;
 
     Ok(install::ChromiumInstall {
         version: version.to_string(),
@@ -346,11 +352,10 @@ async fn download(
 ) -> Result<tempfile::NamedTempFile> {
     use futures::StreamExt;
 
-    let response = http()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| AppError::Other(format!("Chromium download failed to start: {error}")))?;
+    let response =
+        http()?.get(url).send().await.map_err(|error| {
+            AppError::Other(format!("Chromium download failed to start: {error}"))
+        })?;
     if !response.status().is_success() {
         return Err(AppError::Other(format!(
             "Chromium download failed with HTTP {}",
@@ -359,8 +364,9 @@ async fn download(
     }
     let total_bytes = response.content_length();
 
-    let scratch = scratch_dir(root)
-        .map_err(|error| AppError::Other(format!("Could not prepare the download folder: {error}")))?;
+    let scratch = scratch_dir(root).map_err(|error| {
+        AppError::Other(format!("Could not prepare the download folder: {error}"))
+    })?;
     let mut file = tempfile::Builder::new()
         .prefix("chromium-")
         .suffix(".zip")
@@ -438,7 +444,10 @@ fn sweep_leftovers(root: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !LEFTOVER_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) {
+        if !LEFTOVER_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
             continue;
         }
         if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
@@ -460,9 +469,8 @@ fn extract_into_place(archive: &Path, target: &Path) -> std::result::Result<(), 
 
     let file = std::fs::File::open(archive)
         .map_err(|error| StepError::io("Reading the download", archive, &error))?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|error| {
-        StepError::other(format!("The download is not a valid zip: {error}"))
-    })?;
+    let mut zip = zip::ZipArchive::new(file)
+        .map_err(|error| StepError::other(format!("The download is not a valid zip: {error}")))?;
 
     for index in 0..zip.len() {
         let mut entry = zip
@@ -485,8 +493,8 @@ fn extract_into_place(archive: &Path, target: &Path) -> std::result::Result<(), 
             std::fs::create_dir_all(parent)
                 .map_err(|error| StepError::io("Creating", parent, &error))?;
         }
-        let mut sink = std::fs::File::create(&out)
-            .map_err(|error| StepError::io("Writing", &out, &error))?;
+        let mut sink =
+            std::fs::File::create(&out).map_err(|error| StepError::io("Writing", &out, &error))?;
         std::io::copy(&mut entry, &mut sink)
             .map_err(|error| StepError::io("Unpacking", &out, &error))?;
         #[cfg(unix)]
@@ -530,7 +538,11 @@ fn move_into_place(staging: &Path, target: &Path) -> std::result::Result<(), Ste
             if let Err(copy_error) = copy_tree(staging, target) {
                 // Leave nothing that looks installed behind.
                 let _ = crate::util::fs_cleanup::remove_dir_all_blocking(target);
-                return Err(StepError::io("Copying the browser into", target, &copy_error));
+                return Err(StepError::io(
+                    "Copying the browser into",
+                    target,
+                    &copy_error,
+                ));
             }
             let _ = crate::util::fs_cleanup::remove_dir_all_blocking(staging);
             Ok(())
@@ -570,9 +582,8 @@ fn retire(target: &Path) -> std::result::Result<(), StepError> {
         return Ok(());
     }
 
-    crate::util::fs_cleanup::remove_dir_all_blocking(target).map_err(|error| {
-        StepError::io("Replacing the previous browser in", target, &error)
-    })
+    crate::util::fs_cleanup::remove_dir_all_blocking(target)
+        .map_err(|error| StepError::io("Replacing the previous browser in", target, &error))
 }
 
 /// Rename, retrying while the failure still looks transient.
@@ -724,7 +735,10 @@ mod tests {
 
         retire(&target).expect("the old install is retired");
 
-        assert!(!target.exists(), "the path must be clear for the new install");
+        assert!(
+            !target.exists(),
+            "the path must be clear for the new install"
+        );
     }
 
     #[test]
@@ -769,7 +783,10 @@ mod tests {
             Path::new("/tmp/x.zip"),
             &std::io::Error::new(std::io::ErrorKind::NotFound, "nope"),
         );
-        assert!(!missing.try_another_root, "a missing file is not a folder problem");
+        assert!(
+            !missing.try_another_root,
+            "a missing file is not a folder problem"
+        );
     }
 
     #[test]
@@ -870,9 +887,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let archive = zip_with(&[("chrome-linux64/resources/x.pak", b"data")]);
 
-        let failure =
-            install_archive(archive.path(), root.path(), "151.0.0.1", Platform::Linux64)
-                .expect_err("no binary");
+        let failure = install_archive(archive.path(), root.path(), "151.0.0.1", Platform::Linux64)
+            .expect_err("no binary");
 
         assert!(failure.message.contains("anti-virus"));
         assert_eq!(
@@ -925,14 +941,13 @@ mod end_to_end {
             let mut writer = zip::ZipWriter::new(&mut buffer);
             let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
             writer.start_file(&binary, options).unwrap();
-            writer.write_all(b"#!/bin/sh\necho Chrome 151.0.7922.47\n").unwrap();
+            writer
+                .write_all(b"#!/bin/sh\necho Chrome 151.0.7922.47\n")
+                .unwrap();
             // A second, nested entry so the move handles a tree, not one file.
             writer
                 .start_file(
-                    format!(
-                        "chrome-{}/locales/en-GB.pak",
-                        platform.id()
-                    ),
+                    format!("chrome-{}/locales/en-GB.pak", platform.id()),
                     options,
                 )
                 .unwrap();
@@ -947,7 +962,9 @@ mod end_to_end {
     /// Written against a raw TCP listener rather than adding an HTTP test server
     /// dependency; two fixed routes need no framework.
     async fn serve(platform: Platform, archive: Vec<u8>) -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         let requested: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requested);
@@ -969,7 +986,9 @@ mod end_to_end {
 
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let index = index.clone();
                 let archive = archive.clone();
                 let seen = Arc::clone(&seen);
@@ -978,11 +997,7 @@ mod end_to_end {
                     let mut head = [0u8; 1024];
                     let read = stream.read(&mut head).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&head[..read]).to_string();
-                    let path = request
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("/")
-                        .to_string();
+                    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
                     seen.lock().unwrap().push(path.clone());
 
                     let (content_type, body) = if path.ends_with(".zip") {
@@ -1032,7 +1047,11 @@ mod end_to_end {
         .expect("install");
 
         assert_eq!(installed.version, "151.0.7922.47");
-        assert!(installed.binary.is_file(), "{:?} is missing", installed.binary);
+        assert!(
+            installed.binary.is_file(),
+            "{:?} is missing",
+            installed.binary
+        );
         assert!(installed.binary.starts_with(root.path()));
         // The marker is what makes the install visible to every other entry point.
         assert_eq!(
@@ -1060,9 +1079,13 @@ mod end_to_end {
         let root = tempfile::tempdir().unwrap();
         let roots = [root.path().to_path_buf()];
 
-        ensure_installed_in(&roots, &versions_url, &|_| {}).await.expect("first install");
+        ensure_installed_in(&roots, &versions_url, &|_| {})
+            .await
+            .expect("first install");
         let requests_after_first = requested.lock().unwrap().len();
-        ensure_installed_in(&roots, &versions_url, &|_| {}).await.expect("second call");
+        ensure_installed_in(&roots, &versions_url, &|_| {})
+            .await
+            .expect("second call");
 
         assert_eq!(
             requested.lock().unwrap().len(),
@@ -1093,7 +1116,12 @@ mod end_to_end {
 
         assert!(installed.binary.starts_with(&fallback));
         assert_eq!(
-            requested.lock().unwrap().iter().filter(|path| path.ends_with(".zip")).count(),
+            requested
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.ends_with(".zip"))
+                .count(),
             1,
             "the archive must be fetched exactly once"
         );
@@ -1120,7 +1148,9 @@ mod end_to_end {
 
         assert!(installed.binary.is_file());
         assert!(
-            !target.join(format!("chrome-{}/stale.pak", platform.id())).exists(),
+            !target
+                .join(format!("chrome-{}/stale.pak", platform.id()))
+                .exists(),
             "the previous attempt must not be merged into the new install"
         );
     }
@@ -1147,7 +1177,11 @@ mod live {
         .await
         .expect("download");
 
-        eprintln!("installed {} at {}", install.version, install.binary.display());
+        eprintln!(
+            "installed {} at {}",
+            install.version,
+            install.binary.display()
+        );
         assert!(install.binary.is_file());
 
         // The real proof is that the binary executes. `.no_window()` so this

@@ -52,11 +52,8 @@ pub const RECENT_SESSION_LIMIT: usize = 20;
 
 /// 三个权限模式:值必须与 `PermissionMode`(`safe` / `standard` / `trusted`)
 /// 一字不差,后端 `validate_permission_mode` 会拒绝其它取值。
-pub const PERMISSION_MODES: &[(&str, &str)] = &[
-    ("safe", "安全"),
-    ("standard", "标准"),
-    ("trusted", "信任"),
-];
+pub const PERMISSION_MODES: &[(&str, &str)] =
+    &[("safe", "安全"), ("standard", "标准"), ("trusted", "信任")];
 
 /// 一个普通菜单项(非勾选、非子菜单)的静态描述。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,7 +178,10 @@ mod tests {
         };
         assert_eq!(by_id(ACTION_NEW_SESSION).accelerator, Some("CmdOrCtrl+N"));
         assert_eq!(by_id(ACTION_FOCUS_INPUT).accelerator, Some("CmdOrCtrl+L"));
-        assert_eq!(by_id(ACTION_SEND_INPUT).accelerator, Some("CmdOrCtrl+Return"));
+        assert_eq!(
+            by_id(ACTION_SEND_INPUT).accelerator,
+            Some("CmdOrCtrl+Return")
+        );
         // 后台无障碍工具走的是菜单项本身,不该依赖键盘焦点以外的加速键。
         assert_eq!(by_id(ACTION_SEND_CLIPBOARD).accelerator, None);
         assert_eq!(by_id(ACTION_STOP_RUN).accelerator, None);
@@ -214,7 +214,10 @@ mod tests {
     #[test]
     fn dynamic_menu_ids_round_trip_back_to_their_action() {
         assert_eq!(action_of(&switch_item_id(7)), ACTION_SWITCH_SESSION);
-        assert_eq!(action_of(&permission_item_id("trusted")), ACTION_SET_PERMISSION_MODE);
+        assert_eq!(
+            action_of(&permission_item_id("trusted")),
+            ACTION_SET_PERMISSION_MODE
+        );
         assert_eq!(action_of(ACTION_NEW_SESSION), ACTION_NEW_SESSION);
         assert_eq!(dynamic_suffix(&switch_item_id(7)), Some("7"));
         assert_eq!(dynamic_suffix(&permission_item_id("safe")), Some("safe"));

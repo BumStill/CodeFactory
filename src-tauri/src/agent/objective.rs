@@ -319,13 +319,12 @@ async fn touch_session_in_settlement(
     session_id: &str,
     now: i64,
 ) {
-    let has_sessions: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
-    )
-    .fetch_optional(&mut **tx)
-    .await
-    .ok()
-    .flatten();
+    let has_sessions: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'")
+            .fetch_optional(&mut **tx)
+            .await
+            .ok()
+            .flatten();
     if has_sessions.is_none() {
         return;
     }
@@ -507,10 +506,7 @@ pub(crate) enum TransportOutageAction {
     /// retry ladder run.
     Retry,
     /// Unreachable for the whole window: settle honestly.
-    GiveUp {
-        unreachable_ms: i64,
-        attempts: i64,
-    },
+    GiveUp { unreachable_ms: i64, attempts: i64 },
 }
 
 pub(crate) fn transport_outage_action(
@@ -562,10 +558,12 @@ pub(crate) fn probe_target_from_error_text(text: &str) -> Option<(String, u16)> 
         443
     };
     let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() && !host.contains(']') => match port.parse::<u16>() {
-            Ok(port) => (host.to_string(), port),
-            Err(_) => (authority.to_string(), default_port),
-        },
+        Some((host, port)) if !host.is_empty() && !host.contains(']') => {
+            match port.parse::<u16>() {
+                Ok(port) => (host.to_string(), port),
+                Err(_) => (authority.to_string(), default_port),
+            }
+        }
         _ => (authority.to_string(), default_port),
     };
     (!host.is_empty()).then_some((host, port))
@@ -1466,19 +1464,20 @@ impl CompletionArbiter {
         let has = |kind| evidence.iter().any(|item| item.kind == kind);
         let satisfied = additionally_satisfied
             || match objective.kind {
-            ObjectiveKind::Informational => {
-                has(EvidenceKind::InformationalAnswer) || has(EvidenceKind::CurrentStateAcceptance)
-            }
-            ObjectiveKind::LocalMutation => {
-                has(EvidenceKind::CurrentStateAcceptance)
-                    || (has(EvidenceKind::ChangeSet) && has(EvidenceKind::PostChangeValidation))
-            }
-            ObjectiveKind::Delivery => has(EvidenceKind::DeliveryReceipt),
-            ObjectiveKind::Live => {
-                has(EvidenceKind::DeliveryReceipt) && has(EvidenceKind::LiveVerification)
-            }
-            ObjectiveKind::LegacyOrphan => false,
-        };
+                ObjectiveKind::Informational => {
+                    has(EvidenceKind::InformationalAnswer)
+                        || has(EvidenceKind::CurrentStateAcceptance)
+                }
+                ObjectiveKind::LocalMutation => {
+                    has(EvidenceKind::CurrentStateAcceptance)
+                        || (has(EvidenceKind::ChangeSet) && has(EvidenceKind::PostChangeValidation))
+                }
+                ObjectiveKind::Delivery => has(EvidenceKind::DeliveryReceipt),
+                ObjectiveKind::Live => {
+                    has(EvidenceKind::DeliveryReceipt) && has(EvidenceKind::LiveVerification)
+                }
+                ObjectiveKind::LegacyOrphan => false,
+            };
         if !satisfied {
             bail!("completion evidence does not satisfy objective kind");
         }
@@ -1548,14 +1547,15 @@ pub fn decision_for_thin_run_outcome_with_reason(
             kind: EvidenceKind::InformationalAnswer,
             scope,
             digest: format!("sha256:{:x}", Sha256::digest(outcome.final_text.as_bytes())),
-            evidence_ref: outcome
-                .final_message_id
-                .clone()
-                .unwrap_or_else(|| format!("objective-run:{}:{}", objective.id, objective.revision + 1)),
+            evidence_ref: outcome.final_message_id.clone().unwrap_or_else(|| {
+                format!("objective-run:{}:{}", objective.id, objective.revision + 1)
+            }),
             observed_at: Utc::now().timestamp_millis(),
             reached_acceptance: objective.requested_acceptance.clone(),
         };
-        if let Ok(mut decision) = CompletionArbiter::decide_thin(objective, std::slice::from_ref(&evidence)) {
+        if let Ok(mut decision) =
+            CompletionArbiter::decide_thin(objective, std::slice::from_ref(&evidence))
+        {
             decision.visible_final_message_id = outcome.final_message_id.clone();
             return Ok(decision);
         }
@@ -1871,9 +1871,7 @@ pub fn decision_for_run_outcome_with_reason(
                 match outcome.stop_reason {
                     StopReason::Finished | StopReason::Incomplete => format!(
                         ":{:x}",
-                        Sha256::digest(
-                            format!("{:?}", outcome.completion_evidence).as_bytes()
-                        )
+                        Sha256::digest(format!("{:?}", outcome.completion_evidence).as_bytes())
                     ),
                     _ => String::new(),
                 }
@@ -2161,7 +2159,9 @@ impl ObjectiveStore {
                 if *stored_revision > revision {
                     bail!(
                         "recovery contract for {} would downgrade capability revision {} to {}",
-                        domain.as_str(), stored_revision, revision
+                        domain.as_str(),
+                        stored_revision,
+                        revision
                     );
                 }
                 if *stored_revision == revision && stored_digest != &digest {
@@ -2877,11 +2877,14 @@ impl ObjectiveStore {
                 // `legacy_orphan`/`completed`. Without this the same task got a
                 // second Objective and a second worktree, and the delivery then
                 // ran on a branch nobody had edited.
-                let owns_open_delivery =
-                    open_delivery_objective_id_in_tx(tx, session_id).await?.as_deref()
-                        == Some(continuation_binding.as_str());
+                let owns_open_delivery = open_delivery_objective_id_in_tx(tx, session_id)
+                    .await?
+                    .as_deref()
+                    == Some(continuation_binding.as_str());
                 match status.as_deref() {
-                    None => tracing::warn!(%continuation_binding, "chat entry ignored a missing continuation objective"),
+                    None => {
+                        tracing::warn!(%continuation_binding, "chat entry ignored a missing continuation objective")
+                    }
                     Some(status)
                         if !matches!(status, "completed" | "cancelled" | "legacy_orphan")
                             || owns_open_delivery =>
@@ -2926,7 +2929,10 @@ impl ObjectiveStore {
         // This mirrors "continue what I was doing" without a user-visible
         // identity decision.
         if candidates.len() > 1 {
-            if let Some(bound) = current_binding.as_ref().filter(|id| candidates.contains(id)) {
+            if let Some(bound) = current_binding
+                .as_ref()
+                .filter(|id| candidates.contains(id))
+            {
                 candidates = vec![bound.clone()];
             } else {
                 candidates.truncate(1);
@@ -2975,9 +2981,10 @@ impl ObjectiveStore {
             // M169: reviving a settled Objective is only allowed for the one
             // that still owns this session's unfinished delivery, and that fact
             // was read from durable delivery state above (never from wording).
-            let revives_open_delivery =
-                open_delivery_objective_id_in_tx(tx, session_id).await?.as_deref()
-                    == Some(objective_id.as_str());
+            let revives_open_delivery = open_delivery_objective_id_in_tx(tx, session_id)
+                .await?
+                .as_deref()
+                == Some(objective_id.as_str());
             let next_revision = objective.revision + 1;
             let next_recovery_generation =
                 if objective.failure_code.as_deref() == Some(TECHNICAL_RECOVERY_EXHAUSTED) {
@@ -3475,7 +3482,9 @@ impl ObjectiveStore {
     /// chat admission may pass while this row remains `requested`.
     pub async fn request_chat_session_cancel(&self, session_id: &str) -> anyhow::Result<()> {
         let thin = super::thin::is_thin(&self.pool, session_id).await;
-        if thin { super::thin_state::ensure(&self.pool).await?; }
+        if thin {
+            super::thin_state::ensure(&self.pool).await?;
+        }
         let now = Utc::now().timestamp_millis();
         let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         sqlx::query(
@@ -3494,7 +3503,7 @@ impl ObjectiveStore {
         // R6: UI and dispatch stop share this durable entry. End the thin
         // authority atomically with the stop fence, even without a live turn.
         if thin {
-        sqlx::query(
+            sqlx::query(
             "INSERT INTO thin_session_state (session_id,state,reason,outcome_location,consecutive_failures,updated_at)
              SELECT id,'ended','cancelled：用户已停止会话','本会话记录',0,?
              FROM sessions WHERE id=? AND delivery_mode='thin'
@@ -3515,7 +3524,8 @@ impl ObjectiveStore {
         &self,
         session_id: &str,
     ) -> anyhow::Result<Vec<(String, Option<String>, ObjectiveSnapshot)>> {
-        self.consume_chat_session_cancel_until(session_id, None).await
+        self.consume_chat_session_cancel_until(session_id, None)
+            .await
     }
 
     /// M145-R1: a user message *is* the intent to continue after a stop.
@@ -3944,9 +3954,8 @@ impl ObjectiveStore {
         // gave up. The backfilled notice carries that timestamp instead of the
         // startup time, so a task that stalled three days ago does not resurface
         // as today's news.
-        let candidates =
-            sqlx::query_as::<_, (String, i64, Option<String>, Option<String>, i64)>(
-                "SELECT id, revision, session_id,
+        let candidates = sqlx::query_as::<_, (String, i64, Option<String>, Option<String>, i64)>(
+            "SELECT id, revision, session_id,
                         COALESCE(resume_cursor, root_turn_id), updated_at
              FROM objectives
              WHERE failure_code=?
@@ -3954,10 +3963,10 @@ impl ObjectiveStore {
                  (status='waiting_core_input' AND decision_type='core_input_required')
                  OR (status='waiting_system' AND decision_type='failed_internal')
                )",
-            )
-            .bind(TECHNICAL_RECOVERY_EXHAUSTED)
-            .fetch_all(&self.pool)
-            .await?;
+        )
+        .bind(TECHNICAL_RECOVERY_EXHAUSTED)
+        .fetch_all(&self.pool)
+        .await?;
         let mut reclassified = 0;
         for (objective_id, revision, session_id, terminal_root_turn_id, suspended_at) in candidates
         {
@@ -4172,9 +4181,17 @@ impl ObjectiveStore {
             let failure_signature: String = row.try_get("failure_signature")?;
             let strategy: String = row.try_get("strategy")?;
             let lease_expires_at = now + lease_ms.max(1);
-            let session: Option<String> = sqlx::query_scalar("SELECT session_id FROM objectives WHERE id=?")
-                .bind(&objective_id).fetch_optional(&self.pool).await?.flatten();
-            let thin = if let Some(session) = session { super::thin::is_thin(&self.pool, &session).await } else { false };
+            let session: Option<String> =
+                sqlx::query_scalar("SELECT session_id FROM objectives WHERE id=?")
+                    .bind(&objective_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .flatten();
+            let thin = if let Some(session) = session {
+                super::thin::is_thin(&self.pool, &session).await
+            } else {
+                false
+            };
             let mut tx = crate::storage::db::begin_write(&self.pool).await?;
             if strategy == "reconcile_then_resume" && !thin {
                 let (signature_attempts, objective_attempts): (i64, i64) = sqlx::query_as(
@@ -4435,12 +4452,25 @@ impl ObjectiveStore {
         lease_ms: i64,
     ) -> anyhow::Result<ClaimRenewal> {
         let now = Utc::now().timestamp_millis();
-        self.renew_claimed_remediation_at(objective_id, remediation_id, owner, claim_epoch, lease_ms, now).await
+        self.renew_claimed_remediation_at(
+            objective_id,
+            remediation_id,
+            owner,
+            claim_epoch,
+            lease_ms,
+            now,
+        )
+        .await
     }
 
     async fn renew_claimed_remediation_at(
-        &self, objective_id: &str, remediation_id: &str, owner: &str,
-        claim_epoch: i64, lease_ms: i64, now: i64,
+        &self,
+        objective_id: &str,
+        remediation_id: &str,
+        owner: &str,
+        claim_epoch: i64,
+        lease_ms: i64,
+        now: i64,
     ) -> anyhow::Result<ClaimRenewal> {
         let lease_expires_at = now + lease_ms.max(1);
         let mut tx = crate::storage::db::begin_write(&self.pool).await?;
@@ -4515,10 +4545,7 @@ impl ObjectiveStore {
         let Some((status, lease_owner, attempt_index)) = claim_state else {
             return ClaimRenewal::OwnershipLost;
         };
-        if lease_owner
-            .as_deref()
-            .is_some_and(|holder| holder != owner)
-        {
+        if lease_owner.as_deref().is_some_and(|holder| holder != owner) {
             return ClaimRenewal::OwnershipLost;
         }
         if *attempt_index != claim_epoch {
@@ -5269,10 +5296,7 @@ impl ObjectiveStore {
         let (first_unreachable_at, attempts, error_text) = self
             .transport_outage_series(&decision.objective_id, PROVIDER_TRANSPORT_UNREACHABLE)
             .await?;
-        let probe_reachable = match error_text
-            .as_deref()
-            .and_then(probe_target_from_error_text)
-        {
+        let probe_reachable = match error_text.as_deref().and_then(probe_target_from_error_text) {
             Some((host, port)) => probe_transport_reachability(&host, port).await,
             // Nothing to probe means nothing to learn from waiting here; keep
             // the ordinary ladder rather than inventing a wait with no signal.
@@ -5375,9 +5399,7 @@ impl ObjectiveStore {
             let (first_unreachable_at, attempts, error_text) = self
                 .transport_outage_series(&objective_id, PROVIDER_TRANSPORT_UNREACHABLE)
                 .await?;
-            let probe_reachable = match error_text
-                .as_deref()
-                .and_then(probe_target_from_error_text)
+            let probe_reachable = match error_text.as_deref().and_then(probe_target_from_error_text)
             {
                 Some((host, port)) => probe_transport_reachability(&host, port).await,
                 None => true,
@@ -5402,9 +5424,8 @@ impl ObjectiveStore {
                 .execute(&self.pool)
                 .await?
                 .rows_affected(),
-                TransportOutageAction::Retry | TransportOutageAction::GiveUp { .. } => {
-                    sqlx::query(
-                        "INSERT INTO objective_remediations
+                TransportOutageAction::Retry | TransportOutageAction::GiveUp { .. } => sqlx::query(
+                    "INSERT INTO objective_remediations
                          (id, objective_id, binding_id, domain, status, failure_code,
                           failure_signature, strategy, approach_index, attempt_index,
                           recovery_generation, resume_cursor, next_observation_at,
@@ -5427,17 +5448,16 @@ impl ObjectiveStore {
                              SELECT 1 FROM objective_remediations remediation
                              WHERE remediation.id=objective.remediation_id
                            )",
-                    )
-                    .bind(now)
-                    .bind(now)
-                    .bind(now)
-                    .bind(&objective_id)
-                    .bind(&remediation_id)
-                    .bind(PROVIDER_TRANSPORT_UNREACHABLE)
-                    .execute(&self.pool)
-                    .await?
-                    .rows_affected()
-                }
+                )
+                .bind(now)
+                .bind(now)
+                .bind(now)
+                .bind(&objective_id)
+                .bind(&remediation_id)
+                .bind(PROVIDER_TRANSPORT_UNREACHABLE)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
             };
             if changed == 1 {
                 observed += 1;
@@ -5536,12 +5556,19 @@ impl ObjectiveStore {
         if decision.failure_code.as_deref() == Some("no_model_available") {
             return Ok(decision);
         }
-        let session: Option<String> = sqlx::query_scalar("SELECT session_id FROM objectives WHERE id=?")
-            .bind(&decision.objective_id).fetch_optional(&self.pool).await?.flatten();
+        let session: Option<String> =
+            sqlx::query_scalar("SELECT session_id FROM objectives WHERE id=?")
+                .bind(&decision.objective_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
         if let Some(session) = session {
             if super::thin::is_thin(&self.pool, &session).await {
                 if decision.failure_code.as_deref() == Some(COMPLETION_EVIDENCE_INCOMPLETE) {
-                    if super::background_tasks::wake_source_cover(&self.pool, &session).await.is_covered() {
+                    if super::background_tasks::wake_source_cover(&self.pool, &session)
+                        .await
+                        .is_covered()
+                    {
                         decision.failure_code = Some("thin_waiting_for_wake".into());
                         decision.failure_signature = None;
                         decision.decision_type = DecisionType::Waiting;
@@ -5574,7 +5601,10 @@ impl ObjectiveStore {
             // to spend the recovery budget on a path that is simply down.
             return self.bound_transport_outage(decision).await;
         }
-        if matches!(decision.failure_code.as_deref(), Some(CHAT_IDENTITY_UNRECONCILABLE | "provider_reconciliation_unsafe")) {
+        if matches!(
+            decision.failure_code.as_deref(),
+            Some(CHAT_IDENTITY_UNRECONCILABLE | "provider_reconciliation_unsafe")
+        ) {
             // U18/R3: the remediation's turn identity cannot be reconciled with
             // the Objective's live turn, so replaying the same call returns the
             // same answer. Waiting for a budget to run out would only make the
@@ -5621,7 +5651,10 @@ impl ObjectiveStore {
             // the delivery's own workspace still holds an uncommitted edit or an
             // unpushed commit, the honest state is "delivery unfinished" —
             // parking on CI would wait for a head that never moves.
-            if let Some(reason) = self.pending_local_delivery_work(&decision.objective_id).await {
+            if let Some(reason) = self
+                .pending_local_delivery_work(&decision.objective_id)
+                .await
+            {
                 tracing::warn!(
                     objective_id = %decision.objective_id,
                     reason = %reason,
@@ -5634,7 +5667,9 @@ impl ObjectiveStore {
                 ));
             }
             let reference = pull_request_reference(&url).unwrap_or_else(|| "已经开好的 PR".into());
-            let elapsed = Utc::now().timestamp_millis().saturating_sub(last_progress_at);
+            let elapsed = Utc::now()
+                .timestamp_millis()
+                .saturating_sub(last_progress_at);
             let prompt = if elapsed >= SIGNATURE_RECOVERY_WINDOW_MS {
                 format!("{reference} 已开出，CI / 合并队列在 {} 分钟内仍未完成；系统已停止重复重试，交付记录会按实际结果更新。", elapsed / 60_000)
             } else {
@@ -5676,7 +5711,11 @@ impl ObjectiveStore {
         // CF-MSP-R3 / M65: attempts recorded before the Objective's last durable
         // progress do not count, so a session that keeps producing new work
         // never spends its recovery budget on effort.
-        .bind(self.recovery_progress_watermark(&decision.objective_id).await.unwrap_or(0))
+        .bind(
+            self.recovery_progress_watermark(&decision.objective_id)
+                .await
+                .unwrap_or(0),
+        )
         .fetch_one(&self.pool)
         .await?;
         if signature_attempts < max_signature_attempts_for(decision.failure_code.as_deref())
@@ -5708,13 +5747,17 @@ impl ObjectiveStore {
         // landed. Any system wait or internal failure that reaches this fork
         // with a canonical PR parks in the same non-failed delivered wait and
         // names the closing step that did not finish.
-        if let Some((reference, unfinished)) =
-            self.delivered_pr_closing_state(&decision.objective_id).await
+        if let Some((reference, unfinished)) = self
+            .delivered_pr_closing_state(&decision.objective_id)
+            .await
         {
             // M109/R2+R4: the same rule for the path that trusts *any* historical
             // canonical PR. A closing step that failed while local work is still
             // unpushed is an unfinished delivery, not a delivered CI wait.
-            if let Some(reason) = self.pending_local_delivery_work(&decision.objective_id).await {
+            if let Some(reason) = self
+                .pending_local_delivery_work(&decision.objective_id)
+                .await
+            {
                 tracing::warn!(
                     objective_id = %decision.objective_id,
                     reason = %reason,
@@ -6066,7 +6109,9 @@ impl ObjectiveStore {
         let failure_summary_message = if decision.is_parked_system_incident() {
             let thin = if let Some(session) = current.session_id.as_deref() {
                 super::thin::is_thin(&self.pool, session).await
-            } else { false };
+            } else {
+                false
+            };
             if thin {
                 // Phase 2 P0 / R2: only `thin_session_state` may tell a thin
                 // session that the work ended. The fabricated
@@ -6086,8 +6131,12 @@ impl ObjectiveStore {
                 Some(session) => super::thin::is_thin(&self.pool, session).await,
                 None => false,
             }
-        } else { false };
-        if cancelled_thin { super::thin_state::ensure(&self.pool).await?; }
+        } else {
+            false
+        };
+        if cancelled_thin {
+            super::thin_state::ensure(&self.pool).await?;
+        }
         let mut tx = crate::storage::db::begin_write(&self.pool).await?;
         // The decision transaction may be the only SQLite connection in a
         // deterministic test or embedded deployment. Inspect schema through
@@ -7485,10 +7534,14 @@ impl ObjectiveStore {
             // is scheduled at the caller's flat +5s, so five identical errors —
             // under a minute of a transient condition — exhaust the budget and
             // park the Objective for good.
-            let repeat_signature = if model_wait { "model_availability" } else { decision
-                .failure_signature
-                .as_deref()
-                .ok_or_else(|| anyhow!("waiting_system failure signature missing"))? };
+            let repeat_signature = if model_wait {
+                "model_availability"
+            } else {
+                decision
+                    .failure_signature
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("waiting_system failure signature missing"))?
+            };
             let prior_attempts: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM objective_remediations
                  WHERE objective_id=? AND failure_signature=?
@@ -7517,7 +7570,10 @@ impl ObjectiveStore {
                 bounded_next_observation_at(
                     now,
                     requested_observation.max(
-                        now + recovery_backoff_ms_for(decision.failure_code.as_deref(), prior_attempts),
+                        now + recovery_backoff_ms_for(
+                            decision.failure_code.as_deref(),
+                            prior_attempts,
+                        ),
                     ),
                 )
             } else {
@@ -7629,9 +7685,11 @@ impl ObjectiveStore {
         // user "这件事没做成" is false. State the delivery and name what is
         // unconfirmed instead.
         if let Some(delivered) = self.delivered_unverified(current, decision, &work).await {
-            return Some(crate::agent::failure_summary::build_delivered_unverified_report(
-                &goal, &work, &delivered,
-            ));
+            return Some(
+                crate::agent::failure_summary::build_delivered_unverified_report(
+                    &goal, &work, &delivered,
+                ),
+            );
         }
         match crate::agent::failure_summary::build_failure_report(
             &goal,
@@ -7642,9 +7700,7 @@ impl ObjectiveStore {
             // The goal text comes from the user and may itself trip the
             // vocabulary guard. The report must still be delivered, so retry
             // with an unnamed goal instead of dropping the explanation.
-            Err(_) => {
-                crate::agent::failure_summary::build_failure_report("", attempts, work).ok()
-            }
+            Err(_) => crate::agent::failure_summary::build_failure_report("", attempts, work).ok(),
         }
     }
 
@@ -7666,13 +7722,15 @@ impl ObjectiveStore {
         .await
         .unwrap_or_default();
         rows.into_iter()
-            .map(|(code, domain, attempts)| crate::agent::failure_summary::AttemptSummary {
-                approach: crate::agent::failure_summary::plain_approach(Some(domain.as_str())),
-                attempts,
-                reason: crate::agent::failure_summary::plain_failure_reason(
-                    (!code.is_empty()).then_some(code.as_str()),
-                ),
-            })
+            .map(
+                |(code, domain, attempts)| crate::agent::failure_summary::AttemptSummary {
+                    approach: crate::agent::failure_summary::plain_approach(Some(domain.as_str())),
+                    attempts,
+                    reason: crate::agent::failure_summary::plain_failure_reason(
+                        (!code.is_empty()).then_some(code.as_str()),
+                    ),
+                },
+            )
             .collect()
     }
 
@@ -7830,17 +7888,17 @@ impl ObjectiveStore {
         .flatten();
         let (workspace, expected_head) = row?;
         let workspace = workspace.filter(|path| !path.trim().is_empty())?;
-        pending_delivery_local_work(
-            std::path::Path::new(&workspace),
-            expected_head.as_deref(),
-        )
+        pending_delivery_local_work(std::path::Path::new(&workspace), expected_head.as_deref())
     }
 
     /// CF-TRUTH-R1 (M67): everything the delivered park needs — the open PR the
     /// user reads, plus the closing step that did not finish, when the delivery
     /// record names one. `None` means nothing was delivered, so the ordinary
     /// failure terminal is still the honest outcome.
-    async fn delivered_pr_closing_state(&self, objective_id: &str) -> Option<(String, Option<String>)> {
+    async fn delivered_pr_closing_state(
+        &self,
+        objective_id: &str,
+    ) -> Option<(String, Option<String>)> {
         let (url, _status) = self.latest_delivery_pr(objective_id).await?;
         let reference = pull_request_reference(&url).unwrap_or_else(|| "已经开好的 PR".to_string());
         let unfinished = self.unfinished_delivery_closing_step(objective_id).await;
@@ -7962,8 +8020,7 @@ fn workspace_changes(
         .arg(root)
         .args(["diff", "--numstat"])
         .arg(base_sha);
-    if let Ok(output) = numstat.output()
-    {
+    if let Ok(output) = numstat.output() {
         if output.status.success() {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
                 let mut parts = line.splitn(3, '\t');
@@ -7987,8 +8044,7 @@ fn workspace_changes(
         .arg("-C")
         .arg(root)
         .args(["ls-files", "--others", "--exclude-standard"]);
-    if let Ok(output) = untracked.output()
-    {
+    if let Ok(output) = untracked.output() {
         if output.status.success() {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
                 let path = line.trim();
@@ -8011,15 +8067,24 @@ fn workspace_changes(
 /// Commits the execution workspace already carries beyond its baseline (U1b).
 /// Read-only, and a missing or non-repository path counts as zero: a delivery
 /// claim is only ever made on positive evidence.
-pub(crate) fn workspace_git_count(root: &std::path::Path, revision: &str, unpushed: bool) -> Option<i64> {
+pub(crate) fn workspace_git_count(
+    root: &std::path::Path,
+    revision: &str,
+    unpushed: bool,
+) -> Option<i64> {
     use crate::util::no_window::NoWindow;
     let mut command = std::process::Command::new("git").no_window();
-    command.arg("-C").arg(root).args(["rev-list", "--count", revision]);
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["rev-list", "--count", revision]);
     if unpushed {
         command.args(["--not", "--remotes"]);
     }
     let output = command.output().ok()?;
-    if !output.status.success() { return None; }
+    if !output.status.success() {
+        return None;
+    }
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
@@ -8160,7 +8225,10 @@ impl CiCheckState {
 
     fn passed(&self) -> bool {
         matches!(
-            self.conclusion.as_deref().map(str::to_ascii_lowercase).as_deref(),
+            self.conclusion
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
             Some("success" | "neutral" | "skipped")
         )
     }
@@ -8180,7 +8248,9 @@ impl CiCheckState {
 pub enum CiOutcome {
     StillRunning,
     /// R4: still unconcluded past the stall bound — say so explicitly.
-    Stalled { minutes: i64 },
+    Stalled {
+        minutes: i64,
+    },
     AllGreen,
     /// R2: every failure is the trust-root refusal; wait for the orchestrator,
     /// do not treat it as a task failure and do not spend recovery budget.
@@ -8597,7 +8667,9 @@ pub async fn ensure_objective_failed_status(pool: &SqlitePool) -> crate::errors:
             sqlx::query("INSERT INTO objectives_failed_rebuild SELECT * FROM objectives")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("DROP TABLE objectives").execute(&mut *tx).await?;
+            sqlx::query("DROP TABLE objectives")
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("ALTER TABLE objectives_failed_rebuild RENAME TO objectives")
                 .execute(&mut *tx)
                 .await?;
@@ -9099,7 +9171,10 @@ CREATE TABLE objectives (
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(triggers, 1, "the dependent trigger must survive the rebuild");
+        assert_eq!(
+            triggers, 1,
+            "the dependent trigger must survive the rebuild"
+        );
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
             .await
@@ -9194,7 +9269,10 @@ CREATE TABLE objectives (
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(rows, LEGACY_OBJECTIVES_ROWS, "the original table must be intact");
+        assert_eq!(
+            rows, LEGACY_OBJECTIVES_ROWS,
+            "the original table must be intact"
+        );
         let leftovers: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE name='objectives_failed_rebuild'",
         )
@@ -9202,11 +9280,12 @@ CREATE TABLE objectives (
         .await
         .unwrap();
         assert_eq!(leftovers, 0, "a rollback must not leave a temporary table");
-        let ddl: String =
-            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='objectives'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let ddl: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='objectives'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(
             !ddl.contains("'failed'"),
             "a rolled back migration must keep the pre-migration contract: {ddl}"
@@ -9339,16 +9418,18 @@ CREATE TABLE objectives (
             session_updated_at(&pool).await,
         ));
         store.sync_recovery_capabilities().await.unwrap();
-        steps.push(("sync_recovery_capabilities", session_updated_at(&pool).await));
+        steps.push((
+            "sync_recovery_capabilities",
+            session_updated_at(&pool).await,
+        ));
         let _ = store.reactivate_eligible_incidents(32).await.unwrap();
         steps.push((
             "reactivate_eligible_incidents",
             session_updated_at(&pool).await,
         ));
-        let _ =
-            crate::agent::objective_supervisor::reconcile_provider_recovery_on_startup(&pool)
-                .await
-                .unwrap();
+        let _ = crate::agent::objective_supervisor::reconcile_provider_recovery_on_startup(&pool)
+            .await
+            .unwrap();
         steps.push((
             "reconcile_provider_recovery_on_startup",
             session_updated_at(&pool).await,
@@ -9366,7 +9447,10 @@ CREATE TABLE objectives (
             .await
             .unwrap();
 
-        assert_eq!(reclassified, 1, "the stalled task must converge exactly once");
+        assert_eq!(
+            reclassified, 1,
+            "the stalled task must converge exactly once"
+        );
         let status: String = sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
             .bind(&objective.id)
             .fetch_one(&pool)
@@ -9393,8 +9477,8 @@ CREATE TABLE objectives (
     /// sidebar; the notice must also carry the time the task actually stalled
     /// rather than the moment the app was opened.
     #[tokio::test]
-    async fn startup_backfill_leaves_session_order_alone_and_dates_the_notice_when_the_task_stalled()
-    {
+    async fn startup_backfill_leaves_session_order_alone_and_dates_the_notice_when_the_task_stalled(
+    ) {
         let pool = pool().await;
         settlement_tables(&pool).await;
         let store = ObjectiveStore::new(pool.clone());
@@ -9461,7 +9545,10 @@ CREATE TABLE objectives (
         .unwrap();
 
         assert_eq!(
-            store.reclassify_synthetic_technical_handbacks().await.unwrap(),
+            store
+                .reclassify_synthetic_technical_handbacks()
+                .await
+                .unwrap(),
             1
         );
 
@@ -9559,21 +9646,26 @@ CREATE TABLE objectives (
         .unwrap();
 
         assert_eq!(
-            store.cancel_receipts_on_terminal_objectives().await.unwrap(),
+            store
+                .cancel_receipts_on_terminal_objectives()
+                .await
+                .unwrap(),
             1,
             "only the receipt on the terminal objective is decided"
         );
-        let decided: String =
-            sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE id='receipt-s2-failed'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let decided: String = sqlx::query_scalar(
+            "SELECT status FROM side_effect_receipts WHERE id='receipt-s2-failed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(decided, "cancelled");
-        let untouched: String =
-            sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE id='receipt-s2-live'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let untouched: String = sqlx::query_scalar(
+            "SELECT status FROM side_effect_receipts WHERE id='receipt-s2-live'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             untouched, "started",
             "a live objective must keep its unresolved receipt"
@@ -9696,11 +9788,12 @@ CREATE TABLE objectives (
             pending, 0,
             "nothing may be left that the user's next message has to queue behind"
         );
-        let bound: String =
-            sqlx::query_scalar("SELECT objective_id FROM chat_turn_state WHERE root_turn_id='turn-s3-new'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let bound: String = sqlx::query_scalar(
+            "SELECT objective_id FROM chat_turn_state WHERE root_turn_id='turn-s3-new'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(bound, objective.id);
     }
 
@@ -11759,33 +11852,63 @@ CREATE TABLE objectives (
             "CREATE TABLE chat_turn_state (
                root_turn_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
                status TEXT NOT NULL, objective_id TEXT)",
-        ).execute(&pool).await.unwrap();
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO chat_turn_state(root_turn_id, session_id, status, objective_id)
              VALUES ('turn-dangling', 'session-r10', 'active', 'objective-that-was-deleted')",
-        ).execute(&pool).await.unwrap();
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let store = ObjectiveStore::new(pool.clone());
-        let admitted = store.ensure_chat_objective(
-            "session-r10", "turn-dangling", ObjectiveKind::LocalMutation, "validated_change",
-        ).await.expect("R10: a missing bound objective must not reject the user's message");
+        let admitted = store
+            .ensure_chat_objective(
+                "session-r10",
+                "turn-dangling",
+                ObjectiveKind::LocalMutation,
+                "validated_change",
+            )
+            .await
+            .expect("R10: a missing bound objective must not reject the user's message");
         assert_ne!(admitted.id, "objective-that-was-deleted");
 
         // 歧义：两个打开的任务，其中一个绑定当前轮，另一个来自续接提示。
         sqlx::query(
             "INSERT INTO chat_turn_state(root_turn_id, session_id, status)
              VALUES ('turn-other', 'session-r10', 'active')",
-        ).execute(&pool).await.unwrap();
-        let other = store.ensure_chat_objective(
-            "session-r10", "turn-other", ObjectiveKind::LocalMutation, "validated_change",
-        ).await.unwrap();
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let other = store
+            .ensure_chat_objective(
+                "session-r10",
+                "turn-other",
+                ObjectiveKind::LocalMutation,
+                "validated_change",
+            )
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO chat_turn_state(root_turn_id, session_id, status)
              VALUES ('turn-new', 'session-r10', 'active')",
-        ).execute(&pool).await.unwrap();
-        let continued = store.ensure_or_continue_chat_objective(
-            "session-r10", "turn-new", Some("turn-other"),
-            ObjectiveKind::LocalMutation, "validated_change",
-        ).await.expect("R10: ambiguous identities must converge, not reject");
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let continued = store
+            .ensure_or_continue_chat_objective(
+                "session-r10",
+                "turn-new",
+                Some("turn-other"),
+                ObjectiveKind::LocalMutation,
+                "validated_change",
+            )
+            .await
+            .expect("R10: ambiguous identities must converge, not reject");
         assert_eq!(continued.id, other.id);
     }
 
@@ -12225,15 +12348,23 @@ CREATE TABLE objectives (
     async fn m163_three_unanchored_wakes_keep_one_objective() {
         let session = "synthetic-m163";
         let (pool, store, original, _) = m148_waiting_session_with_leftover_turn(session).await;
-        super::super::execution_workspace::ensure_schema(&pool).await.unwrap();
+        super::super::execution_workspace::ensure_schema(&pool)
+            .await
+            .unwrap();
         // Use the real allocator and real files, not an in-memory count alone.
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("source");
         std::fs::create_dir_all(&root).unwrap();
         use crate::util::no_window::NoWindow;
         let git = |args: &[&str]| {
-            assert!(std::process::Command::new("git").no_window().current_dir(&root)
-                .args(args).output().unwrap().status.success());
+            assert!(std::process::Command::new("git")
+                .no_window()
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
         };
         git(&["init", "--initial-branch=main"]);
         git(&["config", "user.name", "Synthetic"]);
@@ -12241,34 +12372,80 @@ CREATE TABLE objectives (
         std::fs::write(root.join("base.txt"), "base").unwrap();
         git(&["add", "."]);
         git(&["commit", "-m", "synthetic base"]);
-        let request = |objective: &str, process: &str| super::super::execution_workspace::ExecutionWorkspaceRequest {
-            objective_id: objective.into(), session_id: Some(session.into()),
-            source_cwd: root.clone(), workspace_container: temp.path().join("managed"),
-            process_instance: process.into(),
+        let request = |objective: &str, process: &str| {
+            super::super::execution_workspace::ExecutionWorkspaceRequest {
+                objective_id: objective.into(),
+                session_id: Some(session.into()),
+                source_cwd: root.clone(),
+                workspace_container: temp.path().join("managed"),
+                process_instance: process.into(),
+            }
         };
-        let workspace = super::super::execution_workspace::allocate_or_attach(&pool, request(&original, "first"))
-            .await.unwrap();
-        std::fs::write(workspace.worktree_path.join("draft.txt"), "visible after restart").unwrap();
+        let workspace = super::super::execution_workspace::allocate_or_attach(
+            &pool,
+            request(&original, "first"),
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            workspace.worktree_path.join("draft.txt"),
+            "visible after restart",
+        )
+        .unwrap();
         for n in 0..3 {
             let root = format!("synthetic-wake-{n}");
-            sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,status) VALUES (?,?,'active')")
-                .bind(&root).bind(session).execute(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO chat_turn_state(root_turn_id,session_id,status) VALUES (?,?,'active')",
+            )
+            .bind(&root)
+            .bind(session)
+            .execute(&pool)
+            .await
+            .unwrap();
             let mut tx = pool.begin().await.unwrap();
-            let admitted = store.ensure_or_continue_chat_objective_in_tx_with_origin(
-                &mut tx, session, &root, None, ObjectiveKind::Delivery,
-                "delivery_receipt", TurnOrigin::SystemWake,
-            ).await.unwrap();
+            let admitted = store
+                .ensure_or_continue_chat_objective_in_tx_with_origin(
+                    &mut tx,
+                    session,
+                    &root,
+                    None,
+                    ObjectiveKind::Delivery,
+                    "delivery_receipt",
+                    TurnOrigin::SystemWake,
+                )
+                .await
+                .unwrap();
             tx.commit().await.unwrap();
-            assert_eq!(admitted.id, original, "a wake without a transport anchor is still the same task");
-            let attached = super::super::execution_workspace::allocate_or_attach(&pool, request(&admitted.id, &format!("restart-{n}")))
-                .await.unwrap();
+            assert_eq!(
+                admitted.id, original,
+                "a wake without a transport anchor is still the same task"
+            );
+            let attached = super::super::execution_workspace::allocate_or_attach(
+                &pool,
+                request(&admitted.id, &format!("restart-{n}")),
+            )
+            .await
+            .unwrap();
             assert_eq!(attached.worktree_path, workspace.worktree_path);
-            assert_eq!(std::fs::read_to_string(attached.worktree_path.join("draft.txt")).unwrap(), "visible after restart");
+            assert_eq!(
+                std::fs::read_to_string(attached.worktree_path.join("draft.txt")).unwrap(),
+                "visible after restart"
+            );
         }
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces")
-            .fetch_one(&pool).await.unwrap(), 1);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM objectives")
-            .fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM objectives")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     /// M148：后台任务结束通知、定时唤醒、PR 监视心跳都走这条准入路径。它们只是
@@ -12296,7 +12473,10 @@ CREATE TABLE objectives (
             .expect("a system wake must continue the waiting objective");
         tx.commit().await.unwrap();
 
-        assert_eq!(admitted.id, objective_id, "the wake continues the same objective");
+        assert_eq!(
+            admitted.id, objective_id,
+            "the wake continues the same objective"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT status FROM chat_turn_state WHERE root_turn_id=?",
@@ -12651,46 +12831,105 @@ CREATE TABLE objectives (
     async fn m88_first_wait_is_observed_within_five_minutes() {
         let pool = pool().await;
         let store = ObjectiveStore::new(pool.clone());
-        let objective = store.create(CreateObjective {
-            id: "synthetic-first-wait".into(), kind: ObjectiveKind::LocalMutation,
-            session_id: Some("synthetic-session".into()), root_turn_id: Some("synthetic-turn".into()),
-            domain: RecoveryDomain::Chat, requested_acceptance: "synthetic".into(), created_surface: "test".into(),
-        }).await.unwrap();
+        let objective = store
+            .create(CreateObjective {
+                id: "synthetic-first-wait".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("synthetic-session".into()),
+                root_turn_id: Some("synthetic-turn".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "synthetic".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
         let now = Utc::now().timestamp_millis();
-        let waiting = DecisionRouter::route(&objective, RouteSignal::TechnicalFailure {
-            domain: RecoveryDomain::Chat, failure_code: "provider_timeout".into(),
-            failure_signature: "synthetic-first-wait".into(), next_observation_at: now + 13_000_000,
-            resume_cursor: Some("synthetic-turn".into()),
-        }).unwrap();
-        store.apply_decision(objective.revision, waiting).await.unwrap();
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "provider_timeout".into(),
+                failure_signature: "synthetic-first-wait".into(),
+                next_observation_at: now + 13_000_000,
+                resume_cursor: Some("synthetic-turn".into()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
         let (scheduled, created): (i64, i64) = sqlx::query_as(
             "SELECT next_observation_at, created_at FROM objective_remediations WHERE objective_id='synthetic-first-wait'"
         ).fetch_one(&pool).await.unwrap();
-        assert!(scheduled <= created + MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS,
-            "the first wait must be bounded too: {scheduled} > {created} + five minutes");
+        assert!(
+            scheduled <= created + MAX_WAIT_BEFORE_NEXT_ATTEMPT_MS,
+            "the first wait must be bounded too: {scheduled} > {created} + five minutes"
+        );
     }
 
     #[tokio::test]
     async fn m89_same_owner_renews_after_fifteen_minute_clock_jump() {
         let pool = pool().await;
         let store = ObjectiveStore::new(pool.clone());
-        let objective = store.create(CreateObjective {
-            id: "synthetic-wake".into(), kind: ObjectiveKind::LocalMutation,
-            session_id: Some("synthetic-session".into()), root_turn_id: Some("synthetic-turn".into()),
-            domain: RecoveryDomain::Chat, requested_acceptance: "synthetic".into(), created_surface: "test".into(),
-        }).await.unwrap();
+        let objective = store
+            .create(CreateObjective {
+                id: "synthetic-wake".into(),
+                kind: ObjectiveKind::LocalMutation,
+                session_id: Some("synthetic-session".into()),
+                root_turn_id: Some("synthetic-turn".into()),
+                domain: RecoveryDomain::Chat,
+                requested_acceptance: "synthetic".into(),
+                created_surface: "test".into(),
+            })
+            .await
+            .unwrap();
         let now = Utc::now().timestamp_millis();
-        let waiting = DecisionRouter::route(&objective, RouteSignal::TechnicalFailure {
-            domain: RecoveryDomain::Chat, failure_code: "provider_timeout".into(),
-            failure_signature: "synthetic-wake".into(), next_observation_at: now - 1,
-            resume_cursor: Some("synthetic-turn".into()),
-        }).unwrap();
-        store.apply_decision(objective.revision, waiting).await.unwrap();
-        let claim = store.claim_due_remediations("synthetic-process-owner", 1, 60_000).await.unwrap().pop().unwrap();
-        assert!(store.renew_claimed_remediation_at(&claim.objective.id, &claim.remediation_id,
-            "synthetic-process-owner", claim.claim_epoch, 60_000, now + 900_000).await.unwrap().renewed());
-        assert!(!store.renew_claimed_remediation_at(&claim.objective.id, &claim.remediation_id,
-            "synthetic-process-owner", claim.claim_epoch - 1, 60_000, now + 900_001).await.unwrap().renewed());
+        let waiting = DecisionRouter::route(
+            &objective,
+            RouteSignal::TechnicalFailure {
+                domain: RecoveryDomain::Chat,
+                failure_code: "provider_timeout".into(),
+                failure_signature: "synthetic-wake".into(),
+                next_observation_at: now - 1,
+                resume_cursor: Some("synthetic-turn".into()),
+            },
+        )
+        .unwrap();
+        store
+            .apply_decision(objective.revision, waiting)
+            .await
+            .unwrap();
+        let claim = store
+            .claim_due_remediations("synthetic-process-owner", 1, 60_000)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(store
+            .renew_claimed_remediation_at(
+                &claim.objective.id,
+                &claim.remediation_id,
+                "synthetic-process-owner",
+                claim.claim_epoch,
+                60_000,
+                now + 900_000
+            )
+            .await
+            .unwrap()
+            .renewed());
+        assert!(!store
+            .renew_claimed_remediation_at(
+                &claim.objective.id,
+                &claim.remediation_id,
+                "synthetic-process-owner",
+                claim.claim_epoch - 1,
+                60_000,
+                now + 900_001
+            )
+            .await
+            .unwrap()
+            .renewed());
     }
 
     #[tokio::test]
@@ -13032,7 +13271,10 @@ CREATE TABLE objectives (
             let decision = decision_for_thin_run_outcome(&objective, &outcome).unwrap();
             assert_eq!(decision.status, ObjectiveStatus::Completed, "{kind:?}");
             assert_eq!(decision.decision_type, DecisionType::Complete, "{kind:?}");
-            let evidence = decision.evidence.clone().expect("typed completion evidence");
+            let evidence = decision
+                .evidence
+                .clone()
+                .expect("typed completion evidence");
             assert_eq!(evidence.kind, EvidenceKind::InformationalAnswer, "{kind:?}");
             assert_eq!(evidence.reached_acceptance, acceptance);
         }
@@ -13062,17 +13304,33 @@ CREATE TABLE objectives (
     /// P0-4 R2: final answers settle every thin kind; legacy receipts stay strict.
     #[test]
     fn thin_final_answer_completes_all_kinds_after_browser_errors() {
-        for kind in [ObjectiveKind::Informational, ObjectiveKind::LocalMutation,
-                     ObjectiveKind::Delivery, ObjectiveKind::Live, ObjectiveKind::LegacyOrphan] {
+        for kind in [
+            ObjectiveKind::Informational,
+            ObjectiveKind::LocalMutation,
+            ObjectiveKind::Delivery,
+            ObjectiveKind::Live,
+            ObjectiveKind::LegacyOrphan,
+        ] {
             let objective = ObjectiveSnapshot::new(
-                "synthetic-browser-error", kind, RecoveryDomain::Chat, "answer",
+                "synthetic-browser-error",
+                kind,
+                RecoveryDomain::Chat,
+                "answer",
             );
-            let outcome = thin_outcome("Example Domain；后续浏览器工具报错，已说明。", StopReason::Finished);
+            let outcome = thin_outcome(
+                "Example Domain；后续浏览器工具报错，已说明。",
+                StopReason::Finished,
+            );
             let decision = decision_for_thin_run_outcome(&objective, &outcome).unwrap();
             assert_eq!(decision.status, ObjectiveStatus::Completed, "{kind:?}");
             if matches!(kind, ObjectiveKind::Delivery | ObjectiveKind::Live) {
-                assert_ne!(decision_for_run_outcome(&objective, &outcome).unwrap().status,
-                           ObjectiveStatus::Completed, "legacy {kind:?}");
+                assert_ne!(
+                    decision_for_run_outcome(&objective, &outcome)
+                        .unwrap()
+                        .status,
+                    ObjectiveStatus::Completed,
+                    "legacy {kind:?}"
+                );
             }
         }
     }
@@ -13405,9 +13663,12 @@ CREATE TABLE objectives (
             stop_reason: StopReason::Blocked,
         };
 
-        let pairing =
-            decision_for_run_outcome_with_reason(&objective, &outcome, Some("browser_pairing_required"))
-                .unwrap();
+        let pairing = decision_for_run_outcome_with_reason(
+            &objective,
+            &outcome,
+            Some("browser_pairing_required"),
+        )
+        .unwrap();
         assert_eq!(pairing.domain, RecoveryDomain::Browser);
         assert_eq!(pairing.status, ObjectiveStatus::WaitingCoreInput);
         assert_eq!(
@@ -13570,7 +13831,9 @@ CREATE TABLE objectives (
     #[tokio::test]
     async fn stale_stop_intent_is_settled_by_the_next_message_but_a_concurrent_stop_still_fences() {
         let pool = pool().await;
-        crate::agent::delivery_run::ensure_schema(&pool).await.unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, updated_at INTEGER)",
         )
@@ -13725,7 +13988,10 @@ CREATE TABLE objectives (
         )
         .await
         .unwrap();
-        assert_eq!(second, 0, "a second stop of the same turn adds no second line");
+        assert_eq!(
+            second, 0,
+            "a second stop of the same turn adds no second line"
+        );
         let notices: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM messages
              WHERE session_id='session-m145-notice' AND content LIKE '已停止%'",
@@ -13815,18 +14081,18 @@ CREATE TABLE objectives (
         // session-scoped fence in migration 0016), so a crash-left
         // `cancel_requested` control always has it behind it. CF-TRUTH-R3 makes
         // that record the authority for calling a stop a user cancellation.
-        sqlx::query("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, updated_at INTEGER)")
-            .execute(&pool)
-            .await
-            .unwrap();
         sqlx::query(
-            "INSERT INTO sessions (id, updated_at) VALUES (?, ?)",
+            "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, updated_at INTEGER)",
         )
-        .bind(objective.session_id.as_deref().unwrap())
-        .bind(now)
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("INSERT INTO sessions (id, updated_at) VALUES (?, ?)")
+            .bind(objective.session_id.as_deref().unwrap())
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO chat_session_cancel_intents
              (session_id, status, requested_at, settled_at, updated_at)
@@ -14043,8 +14309,13 @@ CREATE TABLE objectives (
             let decision = super::super::failover::ModelUnavailable {
                 resume_at_ms: Some(at),
                 notice: "当前没有可用模型：DeepSeek 18:00 起可用；届时自动继续。".into(),
-            }.decision(&current, "turn-synthetic-m123").unwrap();
-            current = store.apply_decision(current.revision, decision).await.unwrap();
+            }
+            .decision(&current, "turn-synthetic-m123")
+            .unwrap();
+            current = store
+                .apply_decision(current.revision, decision)
+                .await
+                .unwrap();
             assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
             assert_eq!(current.next_observation_at, Some(at));
             assert!(current.failure_signature.is_none());
@@ -14052,11 +14323,19 @@ CREATE TABLE objectives (
         let rows: Vec<(String, i64)> = sqlx::query_as("SELECT strategy, execution_attempt_index FROM objective_remediations WHERE objective_id=?")
             .bind(&current.id).fetch_all(&pool).await.unwrap();
         assert!(!rows.is_empty());
-        assert!(rows.iter().all(|(strategy, attempts)| strategy == "apply_recommended" && *attempts == 0));
+        assert!(rows
+            .iter()
+            .all(|(strategy, attempts)| strategy == "apply_recommended" && *attempts == 0));
         let decision = super::super::failover::ModelUnavailable {
-            resume_at_ms: None, notice: "已结束：没有可用模型；请配置 OpenRouter 凭据。".into(),
-        }.decision(&current, "turn-synthetic-m123").unwrap();
-        let ended = store.apply_decision(current.revision, decision).await.unwrap();
+            resume_at_ms: None,
+            notice: "已结束：没有可用模型；请配置 OpenRouter 凭据。".into(),
+        }
+        .decision(&current, "turn-synthetic-m123")
+        .unwrap();
+        let ended = store
+            .apply_decision(current.revision, decision)
+            .await
+            .unwrap();
         assert_eq!(ended.status, ObjectiveStatus::Failed);
         assert_eq!(ended.failure_code.as_deref(), Some("no_model_available"));
         assert!(ended.next_observation_at.is_none());
@@ -14075,7 +14354,10 @@ CREATE TABLE objectives (
         }
         .decision(&current, "turn-synthetic-m123-past")
         .unwrap();
-        let applied = store.apply_decision(current.revision, decision).await.unwrap();
+        let applied = store
+            .apply_decision(current.revision, decision)
+            .await
+            .unwrap();
         assert_eq!(applied.status, ObjectiveStatus::WaitingSystem);
         let at = applied.next_observation_at.expect("等待必须被排期");
         assert!(
@@ -14287,7 +14569,10 @@ CREATE TABLE objectives (
             reactivated.iter().all(|objective| objective.id != thin.id),
             "capability rearm must not resurrect a thin Objective"
         );
-        store.reclassify_synthetic_technical_handbacks().await.unwrap();
+        store
+            .reclassify_synthetic_technical_handbacks()
+            .await
+            .unwrap();
         let thin_after_ticks: String =
             sqlx::query_scalar("SELECT status FROM objectives WHERE id=?")
                 .bind(&thin.id)
@@ -14319,10 +14604,7 @@ CREATE TABLE objectives (
         let parked = seed_legacy_parked_chat_incident(&pool, "objective-capability-rearm").await;
 
         store.sync_recovery_capabilities().await.unwrap();
-        let reactivated = store
-            .reactivate_eligible_incidents(8)
-            .await
-            .unwrap();
+        let reactivated = store.reactivate_eligible_incidents(8).await.unwrap();
 
         assert_eq!(reactivated.len(), 1);
         assert_eq!(reactivated[0].id, parked.id);
@@ -14348,10 +14630,7 @@ CREATE TABLE objectives (
         .unwrap();
         assert_eq!(incident, ("resolved".into(), "admitted".into(), 1));
 
-        let second = store
-            .reactivate_eligible_incidents(8)
-            .await
-            .unwrap();
+        let second = store.reactivate_eligible_incidents(8).await.unwrap();
         assert!(
             second.is_empty(),
             "one capability revision may rearm only once"
@@ -14374,10 +14653,7 @@ CREATE TABLE objectives (
         .await
         .unwrap();
 
-        let reactivated = store
-            .reactivate_eligible_incidents(8)
-            .await
-            .unwrap();
+        let reactivated = store.reactivate_eligible_incidents(8).await.unwrap();
         assert!(
             reactivated.is_empty(),
             "restart under the same recovery contract must not buy another budget"
@@ -14387,7 +14663,10 @@ CREATE TABLE objectives (
             ObjectiveStatus::WaitingSystem,
             "the retired reactivation gate leaves the legacy row for start-up convergence"
         );
-        store.reclassify_synthetic_technical_handbacks().await.unwrap();
+        store
+            .reclassify_synthetic_technical_handbacks()
+            .await
+            .unwrap();
         assert_parked_system_incident(&store.get(&parked.id).await.unwrap().unwrap());
     }
 
@@ -14464,10 +14743,7 @@ CREATE TABLE objectives (
         .unwrap();
 
         store.sync_recovery_capabilities().await.unwrap();
-        let reactivated = store
-            .reactivate_eligible_incidents(8)
-            .await
-            .unwrap();
+        let reactivated = store.reactivate_eligible_incidents(8).await.unwrap();
         assert!(reactivated.is_empty());
 
         // The retired gate must not rearm the legacy row here. Convergence then
@@ -14477,7 +14753,10 @@ CREATE TABLE objectives (
             store.get(&parked.id).await.unwrap().unwrap().status,
             ObjectiveStatus::WaitingSystem
         );
-        store.reclassify_synthetic_technical_handbacks().await.unwrap();
+        store
+            .reclassify_synthetic_technical_handbacks()
+            .await
+            .unwrap();
         let current = store.get(&parked.id).await.unwrap().unwrap();
         assert_parked_system_incident(&current);
         let incident: (String, String) = sqlx::query_as(
@@ -14494,7 +14773,10 @@ CREATE TABLE objectives (
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(receipt, "unknown", "an unknown side effect is never replayed");
+        assert_eq!(
+            receipt, "unknown",
+            "an unknown side effect is never replayed"
+        );
     }
 
     /// R4: start-up convergence turns the retired limbo into the honest failure
@@ -14587,7 +14869,10 @@ CREATE TABLE objectives (
         .unwrap();
 
         assert_eq!(
-            store.reclassify_synthetic_technical_handbacks().await.unwrap(),
+            store
+                .reclassify_synthetic_technical_handbacks()
+                .await
+                .unwrap(),
             1
         );
         assert_parked_system_incident(&store.get(&parked.id).await.unwrap().unwrap());
@@ -14632,7 +14917,10 @@ CREATE TABLE objectives (
         crate::agent::failure_summary::assert_no_internal_vocabulary(&notice).unwrap();
 
         assert_eq!(
-            store.reclassify_synthetic_technical_handbacks().await.unwrap(),
+            store
+                .reclassify_synthetic_technical_handbacks()
+                .await
+                .unwrap(),
             0
         );
         let messages_after: i64 =
@@ -14785,14 +15073,12 @@ CREATE TABLE objectives (
 
         // Age every attempt so far well past the window, as if they happened on
         // previous days, then drive several more rounds.
-        sqlx::query(
-            "UPDATE objective_remediations SET created_at=? WHERE objective_id=?",
-        )
-        .bind(Utc::now().timestamp_millis() - (SIGNATURE_RECOVERY_WINDOW_MS * 4))
-        .bind(&current.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE objective_remediations SET created_at=? WHERE objective_id=?")
+            .bind(Utc::now().timestamp_millis() - (SIGNATURE_RECOVERY_WINDOW_MS * 4))
+            .bind(&current.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         for _ in 0..(MAX_SIGNATURE_RECOVERY_ATTEMPTS - 1) {
             current = route_technical_failure(&store, &current, "adapter_error", signature).await;
@@ -14825,7 +15111,10 @@ CREATE TABLE objectives (
         // wait for the network, then pick the same task back up.
         let transport = parked_incident_message(Some(PROVIDER_TRANSPORT_UNREACHABLE));
         assert!(!transport.contains("你不需要补充输入"), "{transport}");
-        assert!(!transport.contains("换"), "no model switch is needed: {transport}");
+        assert!(
+            !transport.contains("换"),
+            "no model switch is needed: {transport}"
+        );
         assert!(transport.contains("继续"), "{transport}");
     }
 
@@ -14946,8 +15235,15 @@ CREATE TABLE objectives (
         // The probe interval never steps past the end of the window.
         let remaining = 5_000;
         assert_eq!(
-            transport_outage_action(now, now - (TRANSPORT_OUTAGE_WINDOW_MS - remaining), 2, false),
-            TransportOutageAction::Wait { delay_ms: remaining }
+            transport_outage_action(
+                now,
+                now - (TRANSPORT_OUTAGE_WINDOW_MS - remaining),
+                2,
+                false
+            ),
+            TransportOutageAction::Wait {
+                delay_ms: remaining
+            }
         );
         assert!(
             MAX_TRANSPORT_RECOVERY_ATTEMPTS > MAX_SIGNATURE_RECOVERY_ATTEMPTS,
@@ -15022,7 +15318,10 @@ CREATE TABLE objectives (
             ),
             Some(("127.0.0.1".to_string(), 8123))
         );
-        assert_eq!(probe_target_from_error_text("connection reset by peer"), None);
+        assert_eq!(
+            probe_target_from_error_text("connection reset by peer"),
+            None
+        );
     }
 
     /// The probe is the cheap check that replaces a model turn: a local socket
@@ -15051,12 +15350,19 @@ CREATE TABLE objectives (
 
         let after = route_transport_failure(&store, &current).await;
 
-        assert_eq!(after.status, ObjectiveStatus::WaitingSystem, "the task is not over");
+        assert_eq!(
+            after.status,
+            ObjectiveStatus::WaitingSystem,
+            "the task is not over"
+        );
         assert_eq!(
             after.failure_code.as_deref(),
             Some(PROVIDER_TRANSPORT_UNREACHABLE)
         );
-        assert_ne!(after.failure_code.as_deref(), Some(TECHNICAL_RECOVERY_EXHAUSTED));
+        assert_ne!(
+            after.failure_code.as_deref(),
+            Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        );
         assert_eq!(
             queued_remediations(&pool, &after.id).await,
             0,
@@ -15088,10 +15394,9 @@ CREATE TABLE objectives (
         assert_eq!(queued_remediations(&pool, &waiting.id).await, 0);
 
         // The network is back: the very route that failed answers again.
-        let (host, port) = probe_target_from_error_text(&format!(
-            "error sending request for url ({down})"
-        ))
-        .unwrap();
+        let (host, port) =
+            probe_target_from_error_text(&format!("error sending request for url ({down})"))
+                .unwrap();
         let listener = std::net::TcpListener::bind((host.as_str(), port)).unwrap();
         // Its observation is due (the probe interval has passed).
         sqlx::query("UPDATE objectives SET next_observation_at=? WHERE id=?")
@@ -15113,7 +15418,11 @@ CREATE TABLE objectives (
             .claim_due_remediations("synthetic-owner", 1, 60_000)
             .await
             .unwrap();
-        assert_eq!(claims.len(), 1, "the claim loop must now see the waiting objective");
+        assert_eq!(
+            claims.len(),
+            1,
+            "the claim loop must now see the waiting objective"
+        );
         assert_eq!(claims[0].objective.id, waiting.id);
     }
 
@@ -15170,7 +15479,10 @@ CREATE TABLE objectives (
             ObjectiveStatus::Failed,
             "a one-minute network loss is not every approach having failed"
         );
-        assert_ne!(after.failure_code.as_deref(), Some(TECHNICAL_RECOVERY_EXHAUSTED));
+        assert_ne!(
+            after.failure_code.as_deref(),
+            Some(TECHNICAL_RECOVERY_EXHAUSTED)
+        );
         assert_eq!(
             queued_remediations(&pool, &after.id).await,
             1,
@@ -15246,7 +15558,10 @@ CREATE TABLE objectives (
                 },
             )
             .unwrap();
-            current = store.apply_decision(current.revision, decision).await.unwrap();
+            current = store
+                .apply_decision(current.revision, decision)
+                .await
+                .unwrap();
             let next: i64 = sqlx::query_scalar(
                 "SELECT next_observation_at FROM objective_remediations
                  WHERE objective_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
@@ -15369,7 +15684,13 @@ CREATE TABLE objectives (
             .unwrap();
         }
 
-        assert_eq!(store.cancel_receipts_on_terminal_objectives().await.unwrap(), 2);
+        assert_eq!(
+            store
+                .cancel_receipts_on_terminal_objectives()
+                .await
+                .unwrap(),
+            2
+        );
 
         let still_uncertain: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM side_effect_receipts
@@ -15385,16 +15706,18 @@ CREATE TABLE objectives (
 
         // A live Objective's unsettled receipt is a real open question and must
         // survive: assuming it never landed is how an effect happens twice.
-        let live_status: String = sqlx::query_scalar(
-            "SELECT status FROM side_effect_receipts WHERE id='receipt-live-1'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let live_status: String =
+            sqlx::query_scalar("SELECT status FROM side_effect_receipts WHERE id='receipt-live-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(live_status, "unknown");
 
         assert_eq!(
-            store.cancel_receipts_on_terminal_objectives().await.unwrap(),
+            store
+                .cancel_receipts_on_terminal_objectives()
+                .await
+                .unwrap(),
             0,
             "the sweep is idempotent"
         );
@@ -15505,7 +15828,10 @@ CREATE TABLE objectives (
                 },
             )
             .unwrap();
-            current = store.apply_decision(current.revision, decision).await.unwrap();
+            current = store
+                .apply_decision(current.revision, decision)
+                .await
+                .unwrap();
             let next: i64 = sqlx::query_scalar(
                 "SELECT next_observation_at FROM objective_remediations
                  WHERE objective_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
@@ -16159,9 +16485,7 @@ CREATE TABLE objectives (
         assert_eq!(reopened.status, ObjectiveStatus::Active);
 
         let mut current_generation = reopened;
-        while current_generation.failure_code.as_deref()
-            != Some(TECHNICAL_RECOVERY_EXHAUSTED)
-        {
+        while current_generation.failure_code.as_deref() != Some(TECHNICAL_RECOVERY_EXHAUSTED) {
             current_generation = route_technical_failure(
                 &store,
                 &current_generation,
@@ -16206,7 +16530,9 @@ CREATE TABLE objectives (
     async fn a_delivered_change_with_unconfirmed_checks_is_reported_as_delivered() {
         let pool = pool().await;
         settlement_tables(&pool).await;
-        crate::agent::delivery_run::ensure_schema(&pool).await.unwrap();
+        crate::agent::delivery_run::ensure_schema(&pool)
+            .await
+            .unwrap();
         let store = ObjectiveStore::new(pool.clone());
         let mut current = recovery_ceiling_objective(&pool, "objective-u1b-delivered").await;
         let now = Utc::now().timestamp_millis();
@@ -17108,11 +17434,7 @@ CREATE TABLE objectives (
         assert_eq!(
             live_turns,
             vec![
-                (
-                    "turn-ghost-new".to_string(),
-                    "active".to_string(),
-                    None
-                ),
+                ("turn-ghost-new".to_string(), "active".to_string(), None),
                 (
                     "turn-ghost-old".to_string(),
                     "completed".to_string(),
@@ -17228,10 +17550,7 @@ CREATE TABLE objectives (
         assert_eq!(
             turns,
             vec![
-                (
-                    original_root_turn_id.clone(),
-                    "completed".to_string()
-                ),
+                (original_root_turn_id.clone(), "completed".to_string()),
                 ("turn-u18-user-steer".to_string(), "active".to_string()),
             ],
             "exactly one turn stays live, in the same transaction"
@@ -17254,10 +17573,17 @@ CREATE TABLE objectives (
         let store = ObjectiveStore::new(pool.clone());
         let current = recovery_ceiling_objective(&pool, "objective-m103-unsafe").await;
         let settled = route_technical_failure(
-            &store, &current, "provider_reconciliation_unsafe", "sha256:m103-unsafe-synthetic",
-        ).await;
+            &store,
+            &current,
+            "provider_reconciliation_unsafe",
+            "sha256:m103-unsafe-synthetic",
+        )
+        .await;
         assert_eq!(settled.status, ObjectiveStatus::Failed);
-        assert_eq!(settled.failure_code.as_deref(), Some("provider_reconciliation_unsafe"));
+        assert_eq!(
+            settled.failure_code.as_deref(),
+            Some("provider_reconciliation_unsafe")
+        );
         assert_eq!(claimable_remediations(&pool, &settled.id).await, 0);
     }
 
@@ -17324,7 +17650,10 @@ CREATE TABLE objectives (
         // deterministic code, so no attempt index exists to grow.
         let stored = store.get(&settled.id).await.unwrap().unwrap();
         assert_eq!(stored.status, ObjectiveStatus::Failed);
-        assert_eq!(stored.failure_code.as_deref(), Some(CHAT_IDENTITY_UNRECONCILABLE));
+        assert_eq!(
+            stored.failure_code.as_deref(),
+            Some(CHAT_IDENTITY_UNRECONCILABLE)
+        );
         let queued: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM objective_remediations WHERE objective_id=?")
                 .bind(&stored.id)
@@ -17354,61 +17683,112 @@ CREATE TABLE objectives (
         for coverage in ["missing", "schedule", "process"] {
             let pool = pool().await;
             settlement_tables(&pool).await;
-            sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'legacy'").execute(&pool).await.unwrap();
+            sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'legacy'")
+                .execute(&pool)
+                .await
+                .unwrap();
             let store = ObjectiveStore::new(pool.clone());
             let mut current = recovery_ceiling_objective(&pool, "thin-wait").await;
             let session = current.session_id.clone().unwrap();
-            sqlx::query("INSERT INTO sessions VALUES (?, 'synthetic', '.', 'synthetic', 0, 0, 'thin')")
-                .bind(&session).execute(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO sessions VALUES (?, 'synthetic', '.', 'synthetic', 0, 0, 'thin')",
+            )
+            .bind(&session)
+            .execute(&pool)
+            .await
+            .unwrap();
             let covered = coverage != "missing";
             let process_dir = tempfile::tempdir().unwrap();
             if coverage == "process" {
-                super::super::background_tasks::start(&pool, super::super::background_tasks::StartRequest {
-                    session_id: session.clone(), root_turn_id: None,
-                    cwd: process_dir.path().to_path_buf(), output_dir: process_dir.path().join("logs"),
-                    command: "sleep 30".into(), source: super::super::background_tasks::TaskSource::AgentDecided,
-                    timeout_sec: Some(60),
-                }).await.unwrap();
+                super::super::background_tasks::start(
+                    &pool,
+                    super::super::background_tasks::StartRequest {
+                        session_id: session.clone(),
+                        root_turn_id: None,
+                        cwd: process_dir.path().to_path_buf(),
+                        output_dir: process_dir.path().join("logs"),
+                        command: "sleep 30".into(),
+                        source: super::super::background_tasks::TaskSource::AgentDecided,
+                        timeout_sec: Some(60),
+                    },
+                )
+                .await
+                .unwrap();
             }
             if coverage == "schedule" {
-                super::super::background_tasks::schedule_wakeup_at(&pool,
+                super::super::background_tasks::schedule_wakeup_at(
+                    &pool,
                     super::super::background_tasks::WakeupRequest {
-                        root_turn_id: None, session_id: session.clone(), prompt: "synthetic CI observation".into(),
-                        after_sec: Some(180), every_sec: None,
+                        root_turn_id: None,
+                        session_id: session.clone(),
+                        prompt: "synthetic CI observation".into(),
+                        after_sec: Some(180),
+                        every_sec: None,
                         source: super::super::background_tasks::TaskSource::AgentDecided,
-                    }, chrono::Utc::now().timestamp()).await.unwrap();
+                    },
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+                .unwrap();
             }
             // Phase 2 P0: this used to apply five legacy
             // `completion_evidence_incomplete` waits to a thin Objective. A thin
             // session owns `thin_session_state`, so the first legacy decision
             // retires the Objective instead — the legacy wait gate never runs
             // and there is no attempt budget left to exhaust.
-            let decision = DecisionRouter::route(&current, RouteSignal::TechnicalFailure {
-                domain: RecoveryDomain::Chat, failure_code: COMPLETION_EVIDENCE_INCOMPLETE.into(),
-                failure_signature: "synthetic:wait".into(), next_observation_at: Utc::now().timestamp_millis() + 5_000,
-                resume_cursor: current.root_turn_id.clone(),
-            }).unwrap();
-            let retired = store.apply_decision(current.revision, decision).await.unwrap();
+            let decision = DecisionRouter::route(
+                &current,
+                RouteSignal::TechnicalFailure {
+                    domain: RecoveryDomain::Chat,
+                    failure_code: COMPLETION_EVIDENCE_INCOMPLETE.into(),
+                    failure_signature: "synthetic:wait".into(),
+                    next_observation_at: Utc::now().timestamp_millis() + 5_000,
+                    resume_cursor: current.root_turn_id.clone(),
+                },
+            )
+            .unwrap();
+            let retired = store
+                .apply_decision(current.revision, decision)
+                .await
+                .unwrap();
             assert_eq!(retired.status, ObjectiveStatus::LegacyOrphan);
-            assert!(retired.failure_signature.is_none(), "waiting is not a technical failure");
-            assert!(retired.next_observation_at.is_none(), "only the wake source should resume the wait");
-            assert!(retired.remediation_id.is_none(), "no system nudge while covered");
+            assert!(
+                retired.failure_signature.is_none(),
+                "waiting is not a technical failure"
+            );
+            assert!(
+                retired.next_observation_at.is_none(),
+                "only the wake source should resume the wait"
+            );
+            assert!(
+                retired.remediation_id.is_none(),
+                "no system nudge while covered"
+            );
             let legacy_decisions: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM objective_decisions WHERE objective_id=?")
                     .bind(&retired.id)
                     .fetch_one(&pool)
                     .await
                     .unwrap();
-            assert_eq!(legacy_decisions, 0, "a thin session takes no legacy decision");
+            assert_eq!(
+                legacy_decisions, 0,
+                "a thin session takes no legacy decision"
+            );
             if covered {
                 assert!(
-                    super::super::background_tasks::wake_source_cover(&pool, &session).await.is_covered(),
+                    super::super::background_tasks::wake_source_cover(&pool, &session)
+                        .await
+                        .is_covered(),
                     "retiring the legacy Objective must leave the thin wake source intact"
                 );
             }
             if coverage == "process" {
                 super::super::background_tasks::reclaim_session(&pool, &session).await;
-                assert!(!super::super::background_tasks::wake_source_cover(&pool, &session).await.is_covered());
+                assert!(
+                    !super::super::background_tasks::wake_source_cover(&pool, &session)
+                        .await
+                        .is_covered()
+                );
             }
         }
     }
@@ -17417,11 +17797,17 @@ CREATE TABLE objectives (
     async fn thin_three_identical_failures_end_with_summary_without_legacy_budget() {
         let pool = pool().await;
         settlement_tables(&pool).await;
-        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'legacy'").execute(&pool).await.unwrap();
+        sqlx::query("ALTER TABLE sessions ADD COLUMN delivery_mode TEXT DEFAULT 'legacy'")
+            .execute(&pool)
+            .await
+            .unwrap();
         let store = ObjectiveStore::new(pool.clone());
         let mut current = recovery_ceiling_objective(&pool, "thin-failures").await;
         sqlx::query("INSERT INTO sessions VALUES (?, 'synthetic', '.', 'synthetic', 0, 0, 'thin')")
-            .bind(current.session_id.as_deref().unwrap()).execute(&pool).await.unwrap();
+            .bind(current.session_id.as_deref().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO chat_turn_state (root_turn_id,session_id,status,objective_id) VALUES (?,?,'working',?)")
             .bind(current.root_turn_id.as_deref().unwrap()).bind(current.session_id.as_deref().unwrap()).bind(&current.id)
             .execute(&pool).await.unwrap();
@@ -17430,13 +17816,31 @@ CREATE TABLE objectives (
         // legacy `route_technical_failure` rounds. Those rounds wrote
         // "已结束：连续三次遇到相同失败" into `messages` for sessions whose real
         // state was still `waiting_wake`.
-        let messages_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=?")
-            .bind(current.session_id.as_deref().unwrap()).fetch_one(&pool).await.unwrap();
-        let retired = route_technical_failure(&store, &current, "adapter_error", "sha256:same-thin-failure").await;
+        let messages_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=?")
+                .bind(current.session_id.as_deref().unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let retired = route_technical_failure(
+            &store,
+            &current,
+            "adapter_error",
+            "sha256:same-thin-failure",
+        )
+        .await;
         assert_eq!(retired.status, ObjectiveStatus::LegacyOrphan);
-        assert!(retired.failure_code.is_none(), "no legacy failure_code reaches a thin Objective");
-        let summary: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant'")
-            .bind(current.session_id.as_deref().unwrap()).fetch_one(&pool).await.unwrap();
+        assert!(
+            retired.failure_code.is_none(),
+            "no legacy failure_code reaches a thin Objective"
+        );
+        let summary: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant'",
+        )
+        .bind(current.session_id.as_deref().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             summary, messages_before,
             "the legacy path must not fabricate an ending for a thin session"
@@ -17591,7 +17995,11 @@ CREATE TABLE objectives (
 
     #[tokio::test]
     async fn m67b_merged_ceiling_wait_never_spends_recovery_attempts() {
-        for code in [COMPLETION_EVIDENCE_INCOMPLETE, "external_state_uncertain", "delivery_identity_conflict"] {
+        for code in [
+            COMPLETION_EVIDENCE_INCOMPLETE,
+            "external_state_uncertain",
+            "delivery_identity_conflict",
+        ] {
             let pool = pool().await;
             settlement_tables(&pool).await;
             ensure_chat_turn_state_columns(&pool).await;
@@ -17599,23 +18007,33 @@ CREATE TABLE objectives (
             completion_gate_fixture(&pool, "m67b", "m67b-turn", code).await;
             delivery_runs_table(&pool).await;
             sqlx::query("INSERT INTO delivery_runs (id, objective_id, run_kind, requested_ceiling, reached_ceiling, stage, status, canonical_pr_number, canonical_pr_url, last_observed_at, last_progress_at, app_version, app_build, process_instance, created_at, updated_at) VALUES ('m67b-run', 'm67b', 'objective', 'through_merge', 'pr_open', 'wait_ci', 'waiting', 671, 'https://github.com/example/project/pull/671', 1, 1, 'test', 'test', 'test', 1, 1)").execute(&pool).await.unwrap();
-            sqlx::query("DELETE FROM objective_remediations WHERE objective_id='m67b'").execute(&pool).await.unwrap();
+            sqlx::query("DELETE FROM objective_remediations WHERE objective_id='m67b'")
+                .execute(&pool)
+                .await
+                .unwrap();
             let mut current = store.get("m67b").await.unwrap().unwrap();
             for _ in 0..8 {
                 let mut decision = if code == COMPLETION_EVIDENCE_INCOMPLETE {
-                    decision_for_run_outcome(&current, &RunOutcome {
-                        final_text: "PR #671 已开出，等待 CI".into(),
-                        final_message_id: None,
-                        completion_evidence: CompletionEvidence::default(),
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        stop_reason: StopReason::Finished,
-                    }).unwrap()
+                    decision_for_run_outcome(
+                        &current,
+                        &RunOutcome {
+                            final_text: "PR #671 已开出，等待 CI".into(),
+                            final_message_id: None,
+                            completion_evidence: CompletionEvidence::default(),
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            stop_reason: StopReason::Finished,
+                        },
+                    )
+                    .unwrap()
                 } else {
                     gate_exhaustion_decision(&current, code)
                 };
                 decision.failure_code = Some(code.into());
-                current = store.apply_decision(current.revision, decision).await.unwrap();
+                current = store
+                    .apply_decision(current.revision, decision)
+                    .await
+                    .unwrap();
                 assert_eq!(current.failure_code.as_deref(), Some(DELIVERED_AWAITING_CI));
                 assert_eq!(current.status, ObjectiveStatus::WaitingSystem);
                 let prompt = &current.attention_request.as_ref().unwrap().prompt;
@@ -17630,14 +18048,22 @@ CREATE TABLE objectives (
                     .bind(stage).bind(if stage == "ci" { "pr_open" } else { "merge_queued" })
                     .bind(Utc::now().timestamp_millis()).execute(&pool).await.unwrap();
                 let decision = gate_exhaustion_decision(&current, code);
-                current = store.apply_decision(current.revision, decision).await.unwrap();
+                current = store
+                    .apply_decision(current.revision, decision)
+                    .await
+                    .unwrap();
                 let prompt = &current.attention_request.as_ref().unwrap().prompt;
                 assert!(prompt.contains("PR #671"));
                 assert!(!prompt.contains("分钟内仍未完成"));
                 assert_eq!(total_remediations(&pool, "m67b").await, 0);
             }
             // A red check is actual repair work, not a CI wait.
-            sqlx::query("UPDATE delivery_runs SET stage='ci', status='blocked' WHERE objective_id='m67b'").execute(&pool).await.unwrap();
+            sqlx::query(
+                "UPDATE delivery_runs SET stage='ci', status='blocked' WHERE objective_id='m67b'",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             let decision = gate_exhaustion_decision(&current, code);
             let bounded = store.bound_system_recovery(decision).await.unwrap();
             assert!(bounded.remediation_id.is_some());
@@ -17724,8 +18150,13 @@ CREATE TABLE objectives (
             let store = ObjectiveStore::new(pool.clone());
             let now = Utc::now().timestamp_millis();
             let signature = format!("{objective_id}:PlatformIncident:external_state_uncertain");
-            completion_gate_fixture(&pool, objective_id, &format!("{objective_id}-turn"), &signature)
-                .await;
+            completion_gate_fixture(
+                &pool,
+                objective_id,
+                &format!("{objective_id}-turn"),
+                &signature,
+            )
+            .await;
             sqlx::query(
                 "UPDATE objectives SET failure_code='external_state_uncertain',
                    failure_signature=? WHERE id=?",
@@ -17815,7 +18246,12 @@ CREATE TABLE objectives (
         let store = ObjectiveStore::new(pool.clone());
         let signature = "synthetic-takeover-failure";
         completion_gate_fixture(&pool, "m67-delivered", "m67-turn", signature).await;
-        record_delivered_pr(&pool, "m67-delivered", "https://github.com/example/project/pull/67").await;
+        record_delivered_pr(
+            &pool,
+            "m67-delivered",
+            "https://github.com/example/project/pull/67",
+        )
+        .await;
         sqlx::query("UPDATE delivery_runs SET stage='takeover_reconciliation', status='failed', reached_ceiling='pr_open' WHERE objective_id='m67-delivered'")
             .execute(&pool).await.unwrap();
         // Burn the signature budget of the *delivery* failure class, exactly as
@@ -17862,8 +18298,13 @@ CREATE TABLE objectives (
         let pool = pool().await;
         let store = ObjectiveStore::new(pool.clone());
         let signature = format!("objective-undelivered:Finished:{COMPLETION_EVIDENCE_INCOMPLETE}");
-        completion_gate_fixture(&pool, "objective-undelivered", "turn-undelivered", &signature)
-            .await;
+        completion_gate_fixture(
+            &pool,
+            "objective-undelivered",
+            "turn-undelivered",
+            &signature,
+        )
+        .await;
 
         let current = store.get("objective-undelivered").await.unwrap().unwrap();
         let decision = gate_exhaustion_decision(&current, &signature);
@@ -17880,10 +18321,15 @@ CREATE TABLE objectives (
     #[tokio::test]
     async fn m87_missing_stop_authority_is_not_user_cancel() {
         let pool = pool().await;
-        sqlx::query("DROP TABLE chat_session_cancel_intents").execute(&pool).await.unwrap();
+        sqlx::query("DROP TABLE chat_session_cancel_intents")
+            .execute(&pool)
+            .await
+            .unwrap();
         let store = ObjectiveStore::new(pool);
-        assert!(!store.has_durable_stop_request("synthetic-m87", 0).await,
-            "missing or unreadable intent evidence must not invent user intent");
+        assert!(
+            !store.has_durable_stop_request("synthetic-m87", 0).await,
+            "missing or unreadable intent evidence must not invent user intent"
+        );
     }
 
     /// CF-TRUTH-R3 acceptance case 1 (M54, 2026-10-10): a run control left in
@@ -17951,8 +18397,11 @@ CREATE TABLE objectives (
         sqlx::query("INSERT INTO chat_session_cancel_intents (session_id, status, requested_at, settled_at, updated_at) VALUES ('session-fenced', 'settled', ?, ?, ?)")
             .bind(now - 900_000).bind(now - 900_000).bind(now - 900_000)
             .execute(&pool).await.unwrap();
-        assert_eq!(store.consume_pending_chat_cancellations().await.unwrap(), 0,
-            "a historical settled stop must not cancel a later system interruption");
+        assert_eq!(
+            store.consume_pending_chat_cancellations().await.unwrap(),
+            0,
+            "a historical settled stop must not cancel a later system interruption"
+        );
         let objective = store.get("objective-fenced").await.unwrap().unwrap();
         assert_ne!(objective.status.as_str(), "cancelled");
         assert_ne!(
@@ -18079,7 +18528,10 @@ CREATE TABLE objectives (
         let truthful =
             decision_for_interrupted_run(&objective, &outcome, Some("provider_owner_fenced"))
                 .unwrap();
-        assert_eq!(truthful.failure_code.as_deref(), Some(PROVIDER_OWNER_FENCED));
+        assert_eq!(
+            truthful.failure_code.as_deref(),
+            Some(PROVIDER_OWNER_FENCED)
+        );
         assert_eq!(truthful.status.as_str(), "waiting_system");
         assert!(!truthful.status.is_terminal());
         assert!(!truthful.requires_user_action);
@@ -18089,8 +18541,8 @@ CREATE TABLE objectives (
         );
 
         // A non-fence interruption is still recoverable, with its own honest code.
-        let generic = decision_for_interrupted_run(&objective, &outcome, Some("failed_internal"))
-            .unwrap();
+        let generic =
+            decision_for_interrupted_run(&objective, &outcome, Some("failed_internal")).unwrap();
         assert_eq!(generic.failure_code.as_deref(), Some(INTERRUPTED_BY_SYSTEM));
         assert!(!generic.status.is_terminal());
     }
@@ -18257,12 +18709,8 @@ mod m104_ci_wake_tests {
         assert!(prompt.contains("等编排方放行"), "{prompt}");
         assert!(prompt.contains("不是任务失败"), "{prompt}");
 
-        let parked = park_delivered_ci_wait(
-            sample_decision(),
-            prompt,
-            outcome.failure_code(),
-            1_000_000,
-        );
+        let parked =
+            park_delivered_ci_wait(sample_decision(), prompt, outcome.failure_code(), 1_000_000);
         assert!(!parked.requires_user_action);
         assert!(parked.remediation_id.is_none());
         assert!(
@@ -18316,10 +18764,7 @@ mod m104_ci_wake_tests {
     #[test]
     fn a_pending_check_past_the_bound_is_reported_as_stalled_not_as_a_verdict() {
         let checks = vec![check("check-rust", "in_progress", None, None)];
-        assert_eq!(
-            classify_ci_checks(&checks, 60_000),
-            CiOutcome::StillRunning
-        );
+        assert_eq!(classify_ci_checks(&checks, 60_000), CiOutcome::StillRunning);
         assert_eq!(
             classify_ci_checks(&checks, DELIVERED_CI_STALLED_AFTER_MS),
             CiOutcome::Stalled { minutes: 60 }
@@ -18359,10 +18804,7 @@ mod m104_ci_wake_tests {
     /// A fixture workspace whose base commit is pushed to a bare origin.
     /// Returns `(root, worktree, pushed_head)`.
     fn m109_repo() -> (std::path::PathBuf, std::path::PathBuf, String) {
-        let root = std::env::temp_dir().join(format!(
-            "codefactory-m109-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = std::env::temp_dir().join(format!("codefactory-m109-{}", uuid::Uuid::new_v4()));
         let origin = root.join("origin.git");
         let worktree = root.join("worktree");
         std::fs::create_dir_all(&origin).unwrap();
@@ -18370,7 +18812,10 @@ mod m104_ci_wake_tests {
         std::fs::create_dir_all(&worktree).unwrap();
         m109_git(&worktree, &["init", "-q"]);
         m109_git(&worktree, &["config", "user.name", "Fixture"]);
-        m109_git(&worktree, &["config", "user.email", "fixture@example.invalid"]);
+        m109_git(
+            &worktree,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
         std::fs::write(worktree.join("README.md"), "# fixture\n").unwrap();
         m109_git(&worktree, &["add", "README.md"]);
         m109_git(&worktree, &["commit", "-q", "-m", "chore: base"]);
@@ -18565,7 +19010,10 @@ mod m108_reconcile_decision_tests {
         );
         assert_eq!(checks.len(), 1);
         let outcome = classify_ci_checks(&checks, 0);
-        assert!(matches!(outcome, CiOutcome::TrustRootOnly(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, CiOutcome::TrustRootOnly(_)),
+            "{outcome:?}"
+        );
         assert!(!outcome.is_session_repairable());
         let prompt = ci_outcome_wake_prompt("PR #713", &outcome);
         assert!(prompt.contains("等编排方放行"), "{prompt}");

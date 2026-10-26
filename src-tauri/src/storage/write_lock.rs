@@ -70,10 +70,7 @@ pub fn is_lock_contention_message(message: &str) -> bool {
     // (`DatabaseTableIsLocked`, `SQLITEBUSY`). Normalise to alphanumerics so a
     // wrapped message still classifies, while still requiring the whole phrase
     // so unrelated text cannot match.
-    let compact: String = lower
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
+    let compact: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
     compact.contains("databaseislocked")
         || compact.contains("databasetableislocked")
         || compact.contains("sqlitebusy")

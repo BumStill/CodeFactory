@@ -53,7 +53,8 @@ pub async fn build_cache_cleanup(
                 failed_idle_owners: &failed_idle_owners,
                 orphan_owners: &orphan_owners,
                 protected_owners: &protected_owners,
-                idle_before_unix: build_cache::now_unix().saturating_sub(build_cache::ORPHAN_IDLE_SECS),
+                idle_before_unix: build_cache::now_unix()
+                    .saturating_sub(build_cache::ORPHAN_IDLE_SECS),
                 limit_bytes: build_cache::configured_budget_bytes(),
                 trigger: "manual_clean",
             },

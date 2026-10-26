@@ -118,9 +118,7 @@ fn mark_output(id: Option<&str>) {
 pub(crate) struct JobGuard(std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
-pub(crate) fn attach_job(
-    child: std::os::windows::io::RawHandle,
-) -> std::io::Result<JobGuard> {
+pub(crate) fn attach_job(child: std::os::windows::io::RawHandle) -> std::io::Result<JobGuard> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -142,8 +140,7 @@ pub(crate) fn attach_job(
             std::mem::size_of_val(&limits) as u32,
         )
     };
-    let assigned = configured != 0
-        && unsafe { AssignProcessToJobObject(job, child as _) } != 0;
+    let assigned = configured != 0 && unsafe { AssignProcessToJobObject(job, child as _) } != 0;
     if !assigned {
         let error = std::io::Error::last_os_error();
         unsafe { CloseHandle(job) };
@@ -152,7 +149,9 @@ pub(crate) fn attach_job(
     // SAFETY: CreateJobObjectW returned a valid owned handle. No other owner
     // closes it on this success path; OwnedHandle closes it exactly once.
     use std::os::windows::io::FromRawHandle;
-    Ok(JobGuard(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job as _) }))
+    Ok(JobGuard(unsafe {
+        std::os::windows::io::OwnedHandle::from_raw_handle(job as _)
+    }))
 }
 
 async fn capture_stream<R: tokio::io::AsyncRead + Unpin>(
@@ -242,8 +241,12 @@ pub async fn output_with_activity(
         prompt.clone(),
         Arc::clone(&stdout_sink),
     ));
-    let mut stderr_task =
-        tokio::spawn(capture_stream(stderr, id, prompt.clone(), Arc::clone(&stderr_sink)));
+    let mut stderr_task = tokio::spawn(capture_stream(
+        stderr,
+        id,
+        prompt.clone(),
+        Arc::clone(&stderr_sink),
+    ));
     let deadline = tokio::time::Instant::now() + timeout_duration;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
@@ -377,9 +380,7 @@ mod tests {
         let activity = track_command(&session, "synthetic command");
         let id = activity.id.clone();
         assert!(command_activity(&other).is_empty());
-        assert!(command_activity(&session)
-            .iter()
-            .any(|item| item.id == id));
+        assert!(command_activity(&session).iter().any(|item| item.id == id));
         assert!(!stop_command(&other, &id));
         assert!(stop_command(&session, &id));
         assert!(activity.is_cancelled());
@@ -392,7 +393,11 @@ mod tests {
         let session = session_key("stop-running");
         let activity = track_command(&session, "long sleep");
         let id = activity.id.clone();
-        let script = if cfg!(windows) { "Start-Sleep -Seconds 30" } else { "sleep 30" };
+        let script = if cfg!(windows) {
+            "Start-Sleep -Seconds 30"
+        } else {
+            "sleep 30"
+        };
         let stopper = {
             let session = session.clone();
             tokio::spawn(async move {
