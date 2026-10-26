@@ -289,6 +289,8 @@ pub async fn run_subagent(
 
     // 3. Build the AgentLoop with the sub-session id and a one-message history.
     let history = vec![Message {
+        seq: None,
+        revision: 1,
         id: msg_id.clone(),
         session_id: sub_session_id.clone(),
         role: "user".into(),
