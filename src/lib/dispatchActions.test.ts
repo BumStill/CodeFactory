@@ -254,6 +254,24 @@ describe("CF-HDE-R0 · 带 session_id 的操作只作用于该会话", () => {
 });
 
 describe("CF-HDE-R7 · 送达如实回报", () => {
+  it("M173 optimistic bubbles without backend acknowledgement never claim delivered", async () => {
+    seed({});
+    const send = useChatStore.getState().sendMessage;
+    useChatStore.setState({ sendMessage: async (content) => {
+      useChatStore.setState((state) => ({ runtime: { ...state.runtime, A: {
+        ...state.runtime.A, streaming: true, messages: [
+          { ...userMessage("m173-root", content), createdAt: Date.now() },
+          assistantMessage("m173-assistant", "m173-root", ""),
+        ],
+      } } }));
+    } });
+    try {
+      await expect(dispatchSend({ sessionId: "A", message: "开始修复", mode: "steer" }))
+        .rejects.toMatchObject({ code: "delivery_failed" });
+    } finally {
+      useChatStore.setState({ sendMessage: send });
+    }
+  });
   it("空闲会话：立即开始新的一轮", async () => {
     seed({});
     const receipt = await dispatchSend({ sessionId: "A", message: "开始吧", mode: "steer" });

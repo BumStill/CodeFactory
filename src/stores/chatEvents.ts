@@ -50,6 +50,8 @@ export interface UIMessage {
    * Unlike plan/activity projection, it exists before the first stream event
    * and survives the brief gap created when a steer splits the bubble. */
   rootTurnId?: string;
+  /** M173: send_message acknowledged an executor or a durable wake wait. */
+  startupAcknowledged?: boolean;
   toolCalls?: ToolCallState[];
   transportRetries?: TransportRetryState[];
   /** Technical route failures retained behind an expandable disclosure when
