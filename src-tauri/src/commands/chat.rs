@@ -2951,7 +2951,13 @@ async fn admit_persisted_chat_turn_with_origin(
             "M145: 新消息结算了遗留的会话停止意图"
         );
     }
+    crate::agent::workspace_recovery_budget::ensure(pool).await?;
     let mut tx = crate::storage::db::begin_write(pool).await?;
+    // A new user intent supersedes a previous workspace-recovery conclusion.
+    if matches!(origin, crate::agent::objective::TurnOrigin::User) {
+        sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=?")
+            .bind(session_id).execute(&mut *tx).await?;
+    }
     let session_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id=?")
         .bind(session_id)
         .fetch_one(&mut *tx)
@@ -3536,6 +3542,9 @@ pub async fn send_system_wake(
 ) -> Result<(), AppError> {
     use tauri::Manager;
     let state = app.state::<AppState>();
+    let db = state.db.read().await.clone();
+    if crate::agent::execution_workspace::settle_missing_terminal_workspace(&db, &session_id)
+        .await.map_err(|error| AppError::Other(error.to_string()))? { return Ok(()); }
     let mcp = app.state::<Arc<McpManager>>();
     send_message_with_origin(
         app.clone(),

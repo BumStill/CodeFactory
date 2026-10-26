@@ -13,6 +13,31 @@ use std::process::Command;
 
 use crate::util::no_window::NoWindow;
 
+pub(crate) mod workspace_recovery_budget {
+    use sqlx::SqlitePool;
+    pub async fn ensure(pool: &SqlitePool) -> sqlx::Result<()> {
+        crate::storage::db::retry_write(|| async {
+            sqlx::query("CREATE TABLE IF NOT EXISTS workspace_recovery_budget(session_id TEXT PRIMARY KEY,attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL DEFAULT 0,last_error TEXT,settled_reason TEXT)").execute(pool).await
+        }).await?;
+        Ok(())
+    }
+    pub async fn due(pool: &SqlitePool, session: &str, now: i64) -> sqlx::Result<bool> {
+        ensure(pool).await?;
+        let row: Option<(i64, i64, Option<String>)> = sqlx::query_as("SELECT attempts,next_at,settled_reason FROM workspace_recovery_budget WHERE session_id=?").bind(session).fetch_optional(pool).await?;
+        Ok(row.is_none_or(|(attempts, next, settled)| attempts < 3 && next <= now && settled.is_none()))
+    }
+    pub async fn fail(pool: &SqlitePool, session: &str, now: i64, error: &str) -> sqlx::Result<i64> {
+        ensure(pool).await?;
+        sqlx::query_scalar("INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,last_error) VALUES (?,1,?+60,?) ON CONFLICT(session_id) DO UPDATE SET attempts=attempts+1,next_at=?+60*(1 << MIN(attempts,6)),last_error=excluded.last_error RETURNING attempts")
+            .bind(session).bind(now).bind(error).bind(now).fetch_one(pool).await
+    }
+    pub async fn clear(pool: &SqlitePool, session: &str) -> sqlx::Result<()> {
+        ensure(pool).await?;
+        sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=? AND settled_reason IS NULL").bind(session).execute(pool).await?;
+        Ok(())
+    }
+}
+
 static ALLOCATION_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
 
 const ATTACHABLE_STATES: &[&str] = &["allocating", "active", "delivering"];
@@ -843,11 +868,8 @@ fn rebuild_missing_worktree(row: &WorkspaceRow) -> Result<PathBuf> {
         bail!("repository root {} is no longer a git repository", repo_root.display());
     }
     if !branch_exists(&repo_root, &row.branch_name) {
-        bail!(
-            "registered branch {} no longer exists in {}",
-            row.branch_name,
-            repo_root.display()
-        );
+        git(&repo_root, &["fetch", "origin", &format!("refs/heads/{}:refs/heads/{}", row.branch_name, row.branch_name)])
+            .context("cannot restore registered branch from origin")?;
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2562,6 +2584,9 @@ pub(crate) fn spawn_cleanup_supervisor(
             poll_ms = CLEANUP_POLL_INTERVAL.as_millis(),
             "managed workspace cleanup supervisor started"
         );
+        if let Err(error) = reclaim_dead_repo_locks(&pool).await {
+            tracing::warn!(%error, "startup repository lock reclamation failed; automatic retry on acquisition");
+        }
         loop {
             let sessions: Result<Vec<String>, _> = sqlx::query_scalar(
                 "SELECT session_id FROM execution_workspaces
@@ -3063,12 +3088,26 @@ pub(crate) async fn mark_objective_terminal_in_tx(
     .rows_affected())
 }
 
+async fn reclaim_dead_repo_locks(pool: &SqlitePool) -> Result<()> {
+    let locks: Vec<(String, String)> = sqlx::query_as("SELECT repo_identity,lease_owner FROM execution_workspace_repo_locks").fetch_all(pool).await?;
+    for (repo, owner) in locks {
+        let Some((pid, token)) = owner.split_once(':') else { continue; };
+        let Ok(pid) = pid.parse::<u32>() else { continue; };
+        if !crate::storage::db::process_identity_is_live(pid, Some(token)) {
+            sqlx::query("DELETE FROM execution_workspace_repo_locks WHERE repo_identity=? AND lease_owner=?")
+                .bind(repo).bind(owner).execute(pool).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn acquire_repo_allocation_lock(
     pool: &SqlitePool,
     repo_identity: &str,
     process_instance: &str,
 ) -> Result<()> {
     let now = Utc::now().timestamp_millis();
+    reclaim_dead_repo_locks(pool).await?;
     let acquired = sqlx::query(
         "INSERT INTO execution_workspace_repo_locks
          (repo_identity, lease_owner, lease_expires_at, acquired_at, updated_at)
@@ -4008,6 +4047,20 @@ async fn repair_session_split_locked(pool: &SqlitePool, session: &str) -> Result
          ORDER BY created_at ASC, id ASC",
     ).bind(session).fetch_all(pool).await?;
     if rows.len() < 2 { return Ok(()); }
+    for row in &rows {
+        let path = Path::new(&row.worktree_path);
+        if !path.exists() {
+            rebuild_missing_worktree(row)?;
+            let (_, identity, _) = workspace_identity(path)?;
+            sqlx::query("UPDATE execution_workspaces SET worktree_identity=? WHERE id=?")
+                .bind(identity).bind(&row.id).execute(pool).await?;
+        }
+    }
+    // Reload identities after rebuilding stale worktree registrations.
+    for row in &mut rows {
+        row.worktree_identity = sqlx::query_scalar("SELECT worktree_identity FROM execution_workspaces WHERE id=?")
+            .bind(&row.id).fetch_one(pool).await?;
+    }
     let repo = rows[0].repo_identity.clone();
     for row in &rows {
         let path = Path::new(&row.worktree_path);
@@ -4098,15 +4151,56 @@ async fn repair_session_split_under_repo_lock(
     session: &str,
     process: &str,
 ) -> Result<()> {
-    let repo: Option<String> = sqlx::query_scalar("SELECT repo_identity FROM execution_workspaces WHERE session_id=? AND state IN ('active','allocating','delivering') LIMIT 1")
-        .bind(session).fetch_optional(pool).await?;
-    if let Some(repo) = repo {
-        acquire_repo_allocation_lock(pool, &repo, process).await?;
-        let result = repair_session_split_locked(pool, session).await;
-        release_repo_allocation_lock(pool, &repo, process).await;
-        result?;
+    let now = Utc::now().timestamp();
+    if !super::workspace_recovery_budget::due(pool, session, now).await? { return Ok(()); }
+    let result = async {
+        let repo: Option<String> = sqlx::query_scalar("SELECT repo_identity FROM execution_workspaces WHERE session_id=? AND state IN ('active','allocating','delivering') LIMIT 1")
+            .bind(session).fetch_optional(pool).await?;
+        if let Some(repo) = repo {
+            acquire_repo_allocation_lock(pool, &repo, process).await?;
+            let result = repair_session_split_locked(pool, session).await;
+            release_repo_allocation_lock(pool, &repo, process).await;
+            result?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    match result {
+        Ok(()) => super::workspace_recovery_budget::clear(pool, session).await?,
+        Err(error) => {
+            let attempts = super::workspace_recovery_budget::fail(pool, session, now, &error.to_string()).await?;
+            tracing::warn!(session, attempts, %error, "split workspace recovery failed; bounded automatic retry");
+            if attempts >= 3 {
+                super::thin_state::ask_user(pool, session, &format!("项目工作区无法恢复：{error}。请确认项目目录或远端登记分支仍可访问。")).await?;
+                super::background_tasks::cancel_session_wakeups(pool, session).await;
+            }
+        }
     }
     Ok(())
+}
+
+pub(crate) async fn settle_missing_terminal_workspace(pool: &SqlitePool, session: &str) -> Result<bool> {
+    super::workspace_recovery_budget::ensure(pool).await?;
+    let has: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_external_observations'").fetch_one(pool).await?;
+    if has == 0 { return Ok(false); }
+    let reason: Option<String> = sqlx::query_scalar("SELECT completed_reason FROM thin_external_observations WHERE session_id=? AND (completed_reason LIKE '%已合并%' OR completed_reason LIKE '%已关闭但未合并%')")
+        .bind(session).fetch_optional(pool).await?.flatten();
+    let Some(reason) = reason else { return Ok(false); };
+    let paths: Vec<String> = sqlx::query_scalar("SELECT worktree_path FROM execution_workspaces WHERE session_id=?").bind(session).fetch_all(pool).await?;
+    if paths.is_empty() || paths.iter().any(|path| Path::new(path).exists()) { return Ok(false); }
+    // A recovery receipt belongs to the current task only; a later user turn
+    // must be able to start new work in the same conversation.
+    let stale: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'").fetch_one(pool).await?;
+    if stale > 0 {
+        let newer: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user' AND created_at>COALESCE((SELECT updated_at FROM thin_session_state WHERE session_id=?),0)")
+            .bind(session).bind(session).fetch_one(pool).await?;
+        if newer > 0 { return Ok(false); }
+    }
+    let reason = format!("{reason}；登记工作区已删除，收尾已无需工作区，系统完成会话结算（不代表重新执行了 §8 文件清理）。");
+    sqlx::query("INSERT INTO workspace_recovery_budget(session_id,settled_reason) VALUES (?,?) ON CONFLICT(session_id) DO UPDATE SET settled_reason=excluded.settled_reason")
+        .bind(session).bind(&reason).execute(pool).await?;
+    super::thin_state::save(pool, session, &super::thin_state::ThinState::ended(&reason, "本会话记录")).await?;
+    super::background_tasks::cancel_session_wakeups(pool, session).await;
+    Ok(true)
 }
 
 pub(crate) async fn repair_session_split(pool: &SqlitePool, session: &str, process: &str) -> Result<()> {
@@ -4685,6 +4779,18 @@ mod tests {
             assert!(!root.join(&name).exists());
         }
         assert_eq!(git(&root, &["status", "--porcelain"]), before);
+    }
+
+    #[tokio::test]
+    async fn m184_dead_process_lock_is_reclaimed_immediately() {
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+        if cfg!(windows) { child.args(["/C", "exit 0"]); } else { child.args(["-c", "exit 0"]); }
+        let mut child = child.spawn().unwrap();
+        let owner = format!("{}:synthetic-start", child.id());
+        child.wait().unwrap();
+        acquire_repo_allocation_lock(&pool, "synthetic-dead-repo", &owner).await.unwrap();
+        acquire_repo_allocation_lock(&pool, "synthetic-dead-repo", "replacement").await.unwrap();
     }
 
     #[tokio::test]
@@ -5517,6 +5623,38 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn m184_terminal_missing_workspace_settles_without_git() {
+        let pool = pool_with_objectives(&["synthetic-terminal"]).await;
+        sqlx::query("CREATE TABLE sessions(id TEXT PRIMARY KEY)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions VALUES ('synthetic-session')").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE thin_external_observations(session_id TEXT PRIMARY KEY, completed_reason TEXT)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations VALUES ('synthetic-session','PR #42 已合并')").execute(&pool).await.unwrap();
+        let (_temp, root, _remote, container) = init_repo();
+        let workspace = allocate_or_attach(&pool, request_for_session(&root, &container, "synthetic-terminal", "synthetic-session", "synthetic")).await.unwrap();
+        std::fs::remove_dir_all(&workspace.worktree_path).unwrap();
+        assert!(super::settle_missing_terminal_workspace(&pool, "synthetic-session").await.unwrap());
+        let state = crate::agent::thin_state::load(&pool, "synthetic-session").await.unwrap().unwrap();
+        assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+        assert!(state.reason.unwrap().contains("收尾已无需工作区"));
+        assert!(!workspace.worktree_path.exists());
+    }
+
+    #[tokio::test]
+    async fn m184_missing_split_worktrees_are_rebuilt() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objectives(&["missing-a", "missing-b"]).await;
+        let a = allocate_or_attach(&pool, request_for_session(&root, &container, "missing-a", "missing-session", "a")).await.unwrap();
+        let b = allocate_or_attach(&pool, request_for_session(&root, &container, "missing-b", "other", "b")).await.unwrap();
+        std::fs::remove_dir_all(&a.worktree_path).unwrap();
+        std::fs::remove_dir_all(&b.worktree_path).unwrap();
+        sqlx::query("UPDATE execution_workspaces SET session_id='missing-session'").execute(&pool).await.unwrap();
+        super::repair_session_split(&pool, "missing-session", "restart").await.unwrap();
+        assert!(a.worktree_path.join("latest.txt").is_file());
+        assert!(b.worktree_path.join("latest.txt").is_file());
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_workspaces WHERE state='active'").fetch_one(&pool).await.unwrap(), 1);
     }
 
     #[tokio::test]
