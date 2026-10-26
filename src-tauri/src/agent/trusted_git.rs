@@ -429,6 +429,234 @@ fn record_assignment(words: &[Word], variables: &mut std::collections::HashMap<S
     }
     Some(())
 }
+/// A revision or branch word: never a flag, never a path escape, and no
+/// refspec colon that could turn a fetch into a remote write.
+fn revision(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && !word.contains([':', '\\', '*', '?', '['])
+        && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./@{}^~=".contains(c))
+}
+fn inside_or_here(root: &Path, word: &str) -> bool {
+    word == "." && root.is_dir() || inside(root, word)
+}
+
+/// M177: the grammar of a provable local rewrite. Every accepted verb keeps the
+/// M159 snapshot meaningful: reachable from the workspace, non-interactive and
+/// recoverable from the private-index backup.
+fn local_rewrite_args(root: &Path, args: &[&str]) -> bool {
+    let Some((verb, rest)) = args.split_first() else { return false };
+    match *verb {
+        // Network read: updates remote-tracking refs only.
+        "fetch" => rest.iter().all(|w| {
+            ["--prune", "--all", "--tags", "--no-tags", "-q", "--quiet", "--force"].contains(w)
+                || revision(w)
+        }),
+        "stash" => stash_args(root, rest),
+        "merge" => merge_args(rest),
+        "rebase" => rebase_args(rest),
+        "switch" | "checkout" => switch_args(root, rest),
+        "restore" => restore_args(root, rest),
+        "clean" => clean_args(root, rest),
+        "add" => add_args(root, rest),
+        "commit" => commit_args(rest),
+        _ => false,
+    }
+}
+
+fn stash_args(root: &Path, rest: &[&str]) -> bool {
+    let Some((sub, tail)) = rest.split_first() else { return true }; // bare `git stash` lists
+    match *sub {
+        "list" | "show" => true,
+        // `push`/`save` keep the work: the snapshot plus the stash itself.
+        "push" | "save" => stash_push_args(root, tail),
+        "pop" | "apply" => tail.iter().all(|w| {
+            ["-q", "--quiet", "--index"].contains(w) || revision(w)
+        }),
+        // `drop`, `clear`, `branch` and `create` discard the only remaining copy.
+        _ => false,
+    }
+}
+
+fn stash_push_args(root: &Path, tail: &[&str]) -> bool {
+    let mut index = 0;
+    while index < tail.len() {
+        let word = tail[index];
+        match word {
+            "-u" | "--include-untracked" | "-a" | "--all" | "-q" | "--quiet" | "--keep-index"
+            | "--no-keep-index" | "--" => (),
+            "-m" | "--message" => {
+                index += 1;
+                if index >= tail.len() { return false; }
+            }
+            _ if word.starts_with('-') => return false,
+            _ if !inside_or_here(root, word) => return false,
+            _ => (),
+        }
+        index += 1;
+    }
+    true
+}
+
+fn merge_args(rest: &[&str]) -> bool {
+    let mut index = 0;
+    let mut target = false;
+    // Merging a finished or aborted state touches no ref.
+    let mut state = rest.is_empty();
+    while index < rest.len() {
+        let word = rest[index];
+        match word {
+            "--abort" | "--continue" | "--quit" => state = true,
+            "--no-edit" | "--no-ff" | "--ff-only" | "--squash" | "--no-commit"
+            | "--allow-unrelated-histories" | "--autostash" | "--no-stat" | "--no-autostash"
+            | "-q" | "--quiet" => (),
+            "-m" | "--message" => {
+                index += 1;
+                if index >= rest.len() { return false; }
+            }
+            _ if word.starts_with('-') => return false,
+            _ if revision(word) => target = true,
+            _ => return false,
+        }
+        index += 1;
+    }
+    state || target
+}
+
+fn rebase_args(rest: &[&str]) -> bool {
+    let mut target = false;
+    let mut state = false;
+    for word in rest {
+        match *word {
+            "--abort" | "--continue" | "--skip" | "--quit" => state = true,
+            "--autostash" | "--no-autostash" | "--no-edit" | "--keep-empty" | "--no-verify"
+            | "-q" | "--quiet" => (),
+            // Interactive and exec rebases run arbitrary commands per commit.
+            _ if word.starts_with("-i") || *word == "--interactive" || word.starts_with("--exec")
+                || *word == "-x" || word.starts_with("-x") => return false,
+            _ if word.starts_with('-') => return false,
+            _ if revision(word) => target = true,
+            _ => return false,
+        }
+    }
+    state || target
+}
+
+fn switch_args(root: &Path, rest: &[&str]) -> bool {
+    let mut index = 0;
+    let mut named = rest.is_empty();
+    let mut paths = false;
+    let mut pathspec = false;
+    while index < rest.len() {
+        let word = rest[index];
+        if word == "--" {
+            pathspec = true;
+            index += 1;
+            continue;
+        }
+        match word {
+            "-b" | "-B" | "-c" | "-C" | "--create" | "--force-create" => {
+                index += 1;
+                if index >= rest.len() || !revision(rest[index]) { return false; }
+                named = true;
+            }
+            "-q" | "--quiet" | "-f" | "--force" | "-m" | "--merge" => (),
+            _ if word.starts_with('-') => return false,
+            _ if pathspec => {
+                if !inside_or_here(root, word) { return false; }
+                paths = true;
+            }
+            _ if revision(word) => named = true,
+            _ if inside_or_here(root, word) => paths = true,
+            _ => return false,
+        }
+        index += 1;
+    }
+    paths || named
+}
+
+fn restore_args(root: &Path, rest: &[&str]) -> bool {
+    let mut index = 0;
+    let mut paths = false;
+    while index < rest.len() {
+        let word = rest[index];
+        match word {
+            "--" | "--staged" | "--worktree" | "-q" | "--quiet" => (),
+            "-s" | "--source" => {
+                index += 1;
+                if index >= rest.len() || !revision(rest[index]) { return false; }
+            }
+            _ if word.starts_with('-') => return false,
+            _ if inside_or_here(root, word) => paths = true,
+            _ => return false,
+        }
+        index += 1;
+    }
+    paths
+}
+
+fn clean_args(root: &Path, rest: &[&str]) -> bool {
+    let mut forced = false;
+    let mut paths = false;
+    for word in rest {
+        let word = *word;
+        match word {
+            "--" => (),
+            "--force" => forced = true,
+            "--dry-run" => (),
+            _ if word.starts_with('-') && word.len() > 1 => {
+                // `-x`/`-X` delete ignored files (build caches, local state) that
+                // the snapshot cannot restore, so they stay an approval.
+                if !word.chars().skip(1).all(|c| "fdnq".contains(c)) { return false; }
+                forced |= word.contains('f');
+            }
+            _ => {
+                if root.join(word).canonicalize().is_ok_and(|p| p == root) { return false; }
+                if !inside_or_here(root, word) { return false; }
+                paths = true;
+            }
+        }
+    }
+    forced && paths
+}
+
+fn add_args(root: &Path, rest: &[&str]) -> bool {
+    let mut staged = false;
+    let mut paths = false;
+    for word in rest {
+        let word = *word;
+        match word {
+            "-A" | "--all" | "-u" | "--update" => staged = true,
+            "--" | "-n" | "--dry-run" | "-v" | "--verbose" | "-f" | "--force" => (),
+            _ if word.starts_with('-') => return false,
+            _ if inside_or_here(root, word) => paths = true,
+            _ => return false,
+        }
+    }
+    staged || paths
+}
+
+fn commit_args(rest: &[&str]) -> bool {
+    let mut index = 0;
+    while index < rest.len() {
+        let word = rest[index];
+        match word {
+            "-a" | "--all" | "--amend" | "--no-edit" | "--allow-empty"
+            | "--allow-empty-message" | "--no-verify" | "-q" | "--quiet" | "-n" => (),
+            "-m" | "--message" | "-am" | "-ma" => {
+                index += 1;
+                if index >= rest.len() { return false; }
+            }
+            _ if word.starts_with('-') => return false,
+            // Every non-flag word of a commit is either consumed as a message
+            // above or is an unexplained pathspec; refuse the latter.
+            _ => return false,
+        }
+        index += 1;
+    }
+    true
+}
+
 fn workspace_at(roots: &[std::path::PathBuf], cwd: &Path, path: &str) -> Option<std::path::PathBuf> {
     let real = cwd.join(path).canonicalize().ok()?;
     roots.iter().find(|root| **root == real).cloned()
@@ -481,13 +709,25 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
         if removed.contains(&root) { return None; }
         has_git = true;
         let readonly = match args {
-            ["status"] | ["status", "--porcelain"] | ["status", "--short"] => true,
-            ["log", rest @ ..] => rest.iter().all(|p| ["-1", "--oneline", "--no-decorate"].contains(p)),
+            ["status", rest @ ..] => rest.iter().all(|p| {
+                ["--porcelain", "--short", "-s", "-sb", "--branch", "--porcelain=v1", "--untracked-files=no"]
+                    .contains(p)
+            }),
+            ["log", rest @ ..] => rest.iter().all(|p| {
+                ["-1", "--oneline", "--no-decorate", "--graph", "--all", "--stat", "-n"].contains(p)
+                    || p.chars().all(|c| c.is_ascii_digit())
+                    || (p.len() > 1 && p.starts_with('-') && p[1..].chars().all(|c| c.is_ascii_digit()))
+            }),
             ["diff", rest @ ..] => rest.iter().all(|p| ["--stat", "--name-only", "--cached", "--staged"].contains(p)),
             _ => false,
         };
         if readonly { continue; }
         if piped { return None; }
+        // M177: a local rewrite of this workspace is proved by the argument
+        // grammar below. Network writes, out-of-workspace paths, interactive
+        // execution and snapshot-unrecoverable deletions stay unproved, so the
+        // caller still asks for approval.
+        if local_rewrite_args(&root, args) { touched.entry(root).or_default(); continue; }
         match args {
             ["fetch", "--prune", "origin", "main"] | ["fetch", "origin", "main"]
             | ["merge", "origin/main", "--no-edit"]
