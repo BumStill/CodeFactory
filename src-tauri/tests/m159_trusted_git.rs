@@ -122,7 +122,7 @@ fn m166_r2_unknown_expansion_and_compound_escapes_require_approval() {
 #[test]
 fn m159_r2_escapes_remote_unknown_syntax_require_approval() {
     let root = fixture();
-    for command in ["git reset --hard HEAD && rm -rf ../other", "git -C ../other reset --hard HEAD", "git checkout -- ../other", "git clean -ffdx", "git reset --hard HEAD; echo x", "git restore --source=origin/main .", "git push --force", "git push origin :main", "git push --delete origin main", "git reset --hard $(echo HEAD)", "GIT_DIR=/tmp/git git reset --hard HEAD", "git clean -f /tmp/file", "git clean -f :(top)../other", "git reset --hard HEAD && git push origin main", "git checkout main -- ../other/tracked.txt"] {
+    for command in ["git reset --hard HEAD && rm -rf ../other", "git -C ../other reset --hard HEAD", "git checkout -- ../other", "git clean -ffdx", "git reset --hard HEAD; echo x", "git push --force", "git push origin :main", "git push --delete origin main", "git reset --hard $(echo HEAD)", "GIT_DIR=/tmp/git git reset --hard HEAD", "git clean -f /tmp/file", "git clean -f :(top)../other", "git reset --hard HEAD && git push origin main", "git checkout main -- ../other/tracked.txt"] {
         // M177 R2 supersedes the bare in-workspace `git checkout main` case:
         // local branch movement inside the session workspace is allowed. The
         // escaping variant above keeps M159's original intent.

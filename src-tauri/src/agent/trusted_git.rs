@@ -23,7 +23,7 @@ pub(super) fn sensitive(command: &str) -> bool {
 
 /// Git subcommands that move the working tree, the index or a local branch.
 const DESTRUCTIVE_GIT_SUBCOMMANDS: &[&str] = &[
-    "reset", "restore", "checkout", "clean", "stash", "rebase", "merge",
+    "reset", "restore", "checkout", "clean", "stash", "rebase", "merge", "switch", "add", "commit", "config",
     "filter-branch", "filter-repo", "worktree", "cherry-pick", "revert", "am", "apply",
 ];
 
@@ -180,20 +180,7 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
     if DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&lower.as_str()) {
         return true;
     }
-    if lower == "push" {
-        let after = &args[index + 1..];
-        return after.iter().any(|arg| {
-            let arg = arg.to_ascii_lowercase();
-            arg.starts_with("--force")
-                || arg == "--delete"
-                || arg == "--mirror"
-                || arg == "--prune"
-                || arg == "-f"
-                || arg == "-d"
-                || arg.starts_with('+')
-                || arg.starts_with(':')
-        });
-    }
+    if lower == "push" { return true; }
     false
 }
 
@@ -264,7 +251,7 @@ console.log(reg.scenarios.map(s=>[s.id,s.change_patterns,s.restore,s.cleanup,s.w
         assert!(!sensitive("cargo test --manifest-path src-tauri/Cargo.toml"));
         assert!(!sensitive("pnpm test"));
         assert!(!sensitive("node scripts/run.mjs --dry-run"));
-        assert!(!sensitive("git push origin main"));
+        assert!(sensitive("git push origin main"), "M182 R2: every push requires remote approval");
     }
 
     #[test]
@@ -358,7 +345,7 @@ fn legacy_rewrite(root: &Path, command: &str) -> bool {
 /// A deliberately small shell grammar: no evaluation, globbing, redirection,
 /// subshells or inherited variables. Quotes retain literal vs expansion meaning.
 #[derive(Default)]
-struct Word { text: String, expanded: bool }
+struct Word { text: String, expanded: bool, redirect: bool }
 struct Segment { words: Vec<Word>, separator: char }
 fn segments(command: &str) -> Option<Vec<Segment>> {
     let mut chars = command.chars().peekable();
@@ -404,7 +391,7 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
             let separator = match c {
                 '&' if chars.next() == Some('&') => '&',
                 '&' => return None,
-                '|' if chars.peek() == Some(&'|') => return None,
+                '|' if chars.peek() == Some(&'|') => { chars.next(); 'o' },
                 other => other,
             };
             if words.is_empty() { return None; }
@@ -412,7 +399,24 @@ fn segments(command: &str) -> Option<Vec<Segment>> {
             result.push(Segment { words: std::mem::take(&mut words), separator });
             continue;
         }
-        if quote.is_none() && "<>()[{}]*?!#~".contains(c) { return None; }
+        if quote.is_none() && c == '>' {
+            // Keep redirects as explicit tokens; never execute or erase their target.
+            if started {
+                if word.text == "2" || word.text == "1" { word = Word::default(); }
+                else { words.push(std::mem::take(&mut word)); }
+                started = false;
+            }
+            if chars.peek() == Some(&'&') {
+                chars.next();
+                if chars.next() != Some('1') { return None; }
+                words.push(Word { text: "@stderr-to-stdout".into(), expanded: false, redirect: true });
+            } else {
+                if chars.peek() == Some(&'>') { chars.next(); }
+                words.push(Word { text: "@output".into(), expanded: false, redirect: true });
+            }
+            continue;
+        }
+        if quote.is_none() && "<()[{}]*?!#~".contains(c) { return None; }
         word.text.push(c);
         started = true;
     }
@@ -663,6 +667,65 @@ fn commit_args(rest: &[&str]) -> bool {
     true
 }
 
+/// M182: path confinement is independent of Git option ordering.
+fn safe_path(root: &Path, raw: &str) -> bool {
+    let normalized = raw.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    if lower.split('/').any(|p| p == ".git" || p == ".ssh" || p == ".aws" || p == ".gnupg"
+        || p == ".env" || p.starts_with(".env.") || p == "credentials" || p == "id_rsa" || p == "id_ed25519"
+        || p.ends_with(".pem") || p.ends_with(".key")) { return false; }
+    inside(root, &normalized)
+}
+
+fn bounded_args(root: &Path, args: &[&str]) -> bool {
+    args.iter().all(|word| {
+        let value = word.split_once('=').map_or(*word, |(_, value)| value);
+        if value.contains("..") || value.contains(':') || value.starts_with('/') || value.starts_with('\\') { return false; }
+        if value.contains('/') || value.contains('\\') || root.join(value).exists() {
+            safe_path(root, value)
+        } else { true }
+    })
+}
+
+fn local_denylist(root: &Path, args: &[&str]) -> bool {
+    let Some((verb, rest)) = args.split_first() else { return false };
+    // These verbs affect remote authority, command execution or configuration.
+    if ["push", "config", "filter-branch", "filter-repo", "submodule", "send-email", "credential"].contains(verb) { return false; }
+    if rest.iter().any(|w| {
+        let option = w.split('=').next().unwrap_or(w);
+        ["--interactive", "--patch", "--edit", "--exec", "--editor", "--upload-pack", "--receive-pack", "--ext-diff", "--textconv", "--output", "--output-directory", "--git-dir", "--work-tree"].contains(&option)
+            || option.starts_with("--inter") || option.starts_with("--exe")
+            || ["-i", "-p", "-e"].contains(&option)
+            || *verb == "rebase" && (w.starts_with("-i") || w.starts_with("-x"))
+    }) { return false; }
+    if *verb == "clean" && rest.iter().any(|w| w.starts_with('-') && (w.contains('x') || w.contains('X') || w.contains('i'))) { return false; }
+    // Preserve older extra-cautious stash policy: dropping the sole stash is
+    // not recoverable by a working-tree snapshot.
+    if *verb == "stash" && rest.first().is_some_and(|w| ["drop", "clear"].contains(w)) { return false; }
+    let mut message = false;
+    let mut checked = Vec::new();
+    for word in rest {
+        if message { message = false; continue; }
+        if ["-m", "--message", "-am", "-ma"].contains(word) { message = true; continue; }
+        if word.starts_with("--message=") { continue; }
+        checked.push(*word);
+    }
+    !message && bounded_args(root, &checked)
+}
+
+fn readonly_filter(root: &Path, argv: &[&str]) -> bool {
+    let Some((verb, rest)) = argv.split_first() else { return false };
+    if !bounded_args(root, rest) { return false; }
+    if rest.iter().any(|w| !w.starts_with('-') && !safe_path(root, w)) { return false; }
+    match *verb {
+        "head" | "tail" | "wc" | "uniq" | "cat" => rest.iter().all(|w| !w.starts_with('-') || w.chars().skip(1).all(|c| c.is_ascii_digit() || "nclwqbsvET".contains(c))),
+        "sort" => rest.iter().all(|w| !w.starts_with('-') || ["-n", "-r", "-u", "-f", "--numeric-sort", "--reverse", "--unique"].contains(w)),
+        "grep" => rest.iter().all(|w| !w.starts_with('-') || ["-n", "-i", "-v", "-E", "-F", "-c", "-h", "--"].contains(w)),
+        "sed" => matches!(rest, ["-n", range, paths @ ..] if range.strip_suffix('p').is_some_and(|r| !r.is_empty() && r.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))) && paths.iter().all(|p| safe_path(root, p))),
+        _ => false,
+    }
+}
+
 fn workspace_at(roots: &[std::path::PathBuf], cwd: &Path, path: &str) -> Option<std::path::PathBuf> {
     let real = cwd.join(path).canonicalize().ok()?;
     roots.iter().find(|root| **root == real).cloned()
@@ -683,9 +746,20 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
     let mut previous_pipe = false;
     let mut has_git = false;
     for segment in segments {
-        let piped = previous_pipe || segment.separator == '|';
+        let input_pipe = previous_pipe;
+        let piped = input_pipe || segment.separator == '|';
         previous_pipe = segment.separator == '|';
-        let argv: Vec<_> = segment.words.iter().map(|w| w.text.as_str()).collect();
+        let mut argv = Vec::new();
+        let mut words = segment.words.iter();
+        while let Some(word) = words.next() {
+            if word.redirect {
+                if word.text == "@output" {
+                    let target = words.next()?;
+                    if target.redirect || !safe_path(&cwd, &target.text) { return None; }
+                    touched.entry(cwd.clone()).or_default();
+                }
+            } else { argv.push(word.text.as_str()); }
+        }
         if argv.len() == 1 && argv[0].contains('=') {
             if piped || segment.separator != ';' { return None; }
             continue;
@@ -698,19 +772,7 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
             if removed.contains(&cwd) { return None; }
             continue;
         }
-        if let ["head", rest @ ..] = argv.as_slice() {
-            if !piped || !(rest.is_empty() || rest.len() == 2 && rest[0] == "-n" && rest[1].parse::<u32>().is_ok()) { return None; }
-            continue;
-        }
-        if let ["sed", "-n", range, paths @ ..] = argv.as_slice() {
-            // M180: a print-only sed suffix does not widen a Git rewrite.
-            // No scripts/options, redirection or escaping paths are accepted.
-            let print_range = range.strip_suffix('p').is_some_and(|r| {
-                !r.is_empty() && r.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-            });
-            if !print_range || paths.is_empty() || paths.iter().any(|p| !inside(&cwd, p)) { return None; }
-            continue;
-        }
+        if readonly_filter(&cwd, &argv) { continue; }
         let (root, args) = match argv.as_slice() {
             ["git", "-C", path, rest @ ..] => (workspace_at(&roots, &cwd, path)?, rest),
             ["git", rest @ ..] => (cwd.clone(), rest),
@@ -736,13 +798,34 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
             ["diff", rest @ ..] => rest.iter().all(|p| ["--stat", "--name-only", "--cached", "--staged"].contains(p)),
             _ => false,
         };
+        if args.first() == Some(&"worktree") {
+            match args {
+                ["worktree", "remove", flags @ ..] | ["worktree", "add", flags @ ..] => {
+                    if piped { return None; }
+                    let path = flags.iter().find(|w| !w.starts_with('-'))?;
+                    let target = workspace_at(&roots, &root, path)?;
+                    if target == root || target == cwd { return None; }
+                    let common = |r: &Path| git(r, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| Path::new(&p).canonicalize().ok());
+                    if common(&root).is_none() || common(&root) != common(&target) { return None; }
+                    if args[1] == "remove" {
+                        if !removed.insert(target.clone()) { return None; }
+                        touched.entry(target).or_default().push(".".into());
+                    } else { touched.entry(target).or_default(); }
+                    touched.entry(root).or_default();
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        if !local_denylist(&root, args) { return None; }
         if readonly { continue; }
-        if piped { return None; }
-        // M177: a local rewrite of this workspace is proved by the argument
-        // grammar below. Network writes, out-of-workspace paths, interactive
-        // execution and snapshot-unrecoverable deletions stay unproved, so the
-        // caller still asks for approval.
-        if local_rewrite_args(&root, args) { touched.entry(root).or_default(); continue; }
+        if input_pipe { return None; }
+        // M182: option ordering is not authority. Confined non-interactive
+        // local verbs use the shared denylist and the same durable snapshot.
+        if args.first().is_some_and(|verb| ["fetch", "stash", "merge", "rebase", "switch", "checkout", "restore", "clean", "add", "commit", "reset", "cherry-pick", "revert", "am", "apply"].contains(verb)) {
+            touched.entry(root).or_default();
+            continue;
+        }
         match args {
             ["fetch", "--prune", "origin", "main"] | ["fetch", "origin", "main"]
             | ["merge", "origin/main", "--no-edit"]
