@@ -345,36 +345,12 @@ impl DesktopPermissionGateway {
         let durable_intent = if self.anonymous {
             None
         } else {
-            let scope = match self.resolve_scope().await {
-                Ok(scope) => scope,
-                Err(error) => {
-                    tracing::error!(%error, "permission prompt refused without exact Objective scope");
-                    return PermissionOutcome::Deny(PermissionDenial {
-                        content: "Permission request could not be bound to the exact Objective revision. No action was executed; the system will reconcile the Objective identity before retrying.".into(),
-                        reason: PermissionDenialReason::ChannelClosed,
-                        duration_ms: 0,
-                    });
-                }
-            };
-            let request = PermissionIntentRequest {
-                scope,
-                session_id: self.session_id.clone(),
-                provider_tool_call_id: tc.id.clone(),
-                tool_name: tc.function.name.clone(),
-                args: args.clone(),
-                bash_command: bash_command.map(str::to_string),
-                expires_at,
-                created_process_instance: crate::agent::objective::current_process_instance(),
-            };
-            match PermissionIntentStore::new(self.db.clone())
-                .create_pending(&request, now)
-                .await
-            {
+            match self.admit_permission_intent(tc, &args, bash_command, expires_at, now).await {
                 Ok(intent) => Some(intent),
                 Err(error) => {
-                    tracing::error!(%error, "durable permission intent admission failed");
+                    tracing::error!(%error, "permission identity reconciliation exhausted one retry");
                     return PermissionOutcome::Deny(PermissionDenial {
-                        content: "Permission request could not be durably admitted. No action was executed; the system retains ownership of the interruption.".into(),
+                        content: "权限请求暂时无法与当前任务对齐，尚未执行任何操作；系统自动重试/自愈，工作区和改动保留。".into(),
                         reason: PermissionDenialReason::ChannelClosed,
                         duration_ms: 0,
                     });
@@ -544,6 +520,36 @@ impl DesktopPermissionGateway {
         path.is_dir().then_some(path)
     }
 
+    /// Resolve again once after admission loses a revision race. This never
+    /// carries an old allow forward: every attempt admits a fresh exact scope.
+    async fn admit_permission_intent(
+        &self, tc: &ToolCall, args: &serde_json::Value,
+        bash_command: Option<&str>, expires_at: i64, now: i64,
+    ) -> anyhow::Result<super::permission_intent::PermissionIntentSnapshot> {
+        let store = PermissionIntentStore::new(self.db.clone());
+        let mut failure = None;
+        for attempt in 0..2 {
+            let result = async {
+                let scope = self.resolve_scope().await?;
+                store.create_pending(&PermissionIntentRequest {
+                    scope, session_id: self.session_id.clone(),
+                    provider_tool_call_id: tc.id.clone(), tool_name: tc.function.name.clone(),
+                    args: args.clone(), bash_command: bash_command.map(str::to_string),
+                    expires_at,
+                    created_process_instance: crate::agent::objective::current_process_instance(),
+                }, now).await
+            }.await;
+            match result {
+                Ok(intent) => return Ok(intent),
+                Err(error) => {
+                    tracing::warn!(attempt, %error, "permission admission will reconcile live scope");
+                    failure = Some(error);
+                }
+            }
+        }
+        Err(failure.expect("two unsuccessful admission attempts"))
+    }
+
     async fn resolve_scope(&self) -> anyhow::Result<PermissionScope> {
         use sqlx::Row;
         let resource = if let Some(task_id) = self.task_id.as_deref() {
@@ -566,6 +572,37 @@ impl DesktopPermissionGateway {
         .bind(resource.1)
         .fetch_all(&self.db)
         .await?;
+        if row.is_empty() && resource.0 == "chat_root_turn" {
+            // A synthetic wake message need not be the persisted root turn.
+            // Recover only one active Objective in this session, never a task
+            // or a different session, and read its live revision from SQLite.
+            let candidates = sqlx::query(
+                "SELECT DISTINCT objective.id AS objective_id, objective.revision
+                 FROM objectives objective JOIN chat_turn_state turn
+                   ON turn.objective_id=objective.id AND turn.session_id=objective.session_id
+                 WHERE objective.session_id=? AND objective.status='active'",
+            ).bind(&self.session_id).fetch_all(&self.db).await?;
+            if candidates.len() == 1 {
+                let objective_id: String = candidates[0].try_get("objective_id")?;
+                let bindings = sqlx::query(
+                    "SELECT binding.id AS binding_id,binding.resource_generation
+                     FROM objective_bindings binding JOIN chat_turn_state turn
+                       ON turn.root_turn_id=binding.resource_id
+                     WHERE binding.objective_id=? AND turn.objective_id=?
+                       AND turn.session_id=? AND binding.resource_kind='chat_root_turn'
+                     ORDER BY binding.resource_generation DESC,turn.updated_at DESC LIMIT 1",
+                ).bind(&objective_id).bind(&objective_id).bind(&self.session_id)
+                    .fetch_optional(&self.db).await?;
+                if let Some(binding) = bindings {
+                    return Ok(PermissionScope {
+                        objective_id,
+                        objective_revision: candidates[0].try_get("revision")?,
+                        binding_id: binding.try_get("binding_id")?,
+                        resource_generation: binding.try_get("resource_generation")?,
+                    });
+                }
+            }
+        }
         if row.len() != 1 {
             anyhow::bail!("permission request requires one authoritative Objective binding");
         }
@@ -626,6 +663,25 @@ mod tests {
             },
             args,
         )
+    }
+
+    #[tokio::test]
+    async fn m179_rebinds_latest_active_session_revision_before_permission() {
+        let mut gateway = durable_test_gateway().await;
+        sqlx::raw_sql("ALTER TABLE objectives ADD COLUMN session_id TEXT; UPDATE objectives SET session_id='permission-test',revision=8; CREATE TABLE chat_turn_state(root_turn_id TEXT,session_id TEXT,objective_id TEXT,updated_at INTEGER); INSERT INTO chat_turn_state VALUES ('root-permission-test','permission-test','5eea633e-59f9-42bc-91f8-0a19a5c49711',1);")
+            .execute(&gateway.db).await.unwrap();
+        Arc::get_mut(&mut gateway).unwrap().root_turn_id = Some("synthetic-wake-message".into());
+        let scope = gateway.resolve_scope().await.expect("same-session active Objective must rebind");
+        assert_eq!(scope.objective_revision, 8);
+        assert_eq!(scope.binding_id, "42cfb353-5f4e-4809-8338-9b49b9806894");
+        let (call, args) = browser_call("m179-call", "click");
+        let other = gateway.clone();
+        let task = tokio::spawn(async move { other.authorize(&call, &args, None).await });
+        let intent = wait_for_durable_intent(&gateway).await;
+        assert_eq!(intent.scope.objective_revision, 8);
+        PermissionIntentStore::new(gateway.db.clone()).record_user_response(&intent.prompt_key(), PermissionPromptResponse::Allow, chrono::Utc::now().timestamp_millis()).await.unwrap();
+        take_pending_sender(&gateway).await.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), PermissionOutcome::Allow);
     }
 
     #[tokio::test]
