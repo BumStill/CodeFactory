@@ -951,6 +951,42 @@ async fn live_run_control_count(pool: &SqlitePool, session: &str) -> anyhow::Res
 
 /// 第一次「重启」：新进程必须看见被打断的会话，并把上一进程的无主控制行和
 /// 在飞工具调用结算掉——但不能把用户的输入丢掉，也不能伪造一个「已完成」。
+
+/// M170：恰好一条可见的中断说明——`role='system'` + `completion_state='turn_notice'`
+/// （前端 `MessageList` 只把这个组合渲染进正文）、含「中断」「结果未知」、不含内部词汇。
+async fn assert_one_visible_interrupt_notice(
+    pool: &SqlitePool,
+    session: &str,
+) -> anyhow::Result<()> {
+    let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT role, completion_state, content FROM messages \
+         WHERE session_id=? AND completion_state='turn_notice'",
+    )
+    .bind(session)
+    .fetch_all(pool)
+    .await?;
+    if rows.len() != 1 {
+        bail!(
+            "M170: {session} shows {} interrupt notice(s) to the user; exactly one is required \
+             (rows={rows:?})",
+            rows.len()
+        );
+    }
+    let (role, state, content) = &rows[0];
+    if role != "system" || state.as_deref() != Some("turn_notice") {
+        bail!("M170: {session} notice is not a visible runtime notice (role={role}, state={state:?})");
+    }
+    if !content.contains("中断") || !content.contains("结果未知") {
+        bail!("M170: {session} notice does not explain the interruption: {content}");
+    }
+    for banned in ["thin", "objective", "completion_state", "续跑提示", "{"] {
+        if content.contains(banned) {
+            bail!("M170: {session} notice leaks internal vocabulary `{banned}`: {content}");
+        }
+    }
+    Ok(())
+}
+
 async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
     let now = Utc::now().timestamp_millis();
     let startup = super::thin_restart::running_interrupted_by_restart(pool, now, |_| false).await?;
@@ -1016,6 +1052,22 @@ async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> 
     match note.as_deref().map(str::trim) {
         Some(text) if !text.is_empty() => {}
         _ => bail!("M157: the interrupted tool call carries no 「结果未知」note"),
+    }
+
+    // M170：续跑除了给模型一句提示，还必须在对话里留下一条**用户看得见**的人话
+    // 说明。这里走的是生产同一条落库路径，因此「用户知道上一轮被打断」不再靠真机
+    // 人工观察。
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        let thin = super::thin_state::load(pool, session)
+            .await?
+            .ok_or_else(|| anyhow!("M170: thin state vanished for {session}"))?;
+        let key = format!("thin-restart:{session}:{}", thin.updated_at);
+        if !crate::commands::chat::persist_resume_interrupt_notice(pool, session, &key).await? {
+            bail!("M170: the restart resume of {session} persisted no interrupt notice");
+        }
+        // 同一次中断再续跑一次不得出现第二行。
+        crate::commands::chat::persist_resume_interrupt_notice(pool, session, &key).await?;
+        assert_one_visible_interrupt_notice(pool, session).await?;
     }
 
     let user_messages: i64 = sqlx::query_scalar(
@@ -1087,6 +1139,8 @@ async fn verify_liveness_second_restart(pool: &SqlitePool) -> anyhow::Result<()>
         bail!("M157: tool interruption marking is not idempotent, marked={marked} on the second pass");
     }
     for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        // M170：第二次重启不得再补一条说明（同一次中断只出现一次）。
+        assert_one_visible_interrupt_notice(pool, session).await?;
         let user_messages: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'")
                 .bind(session)
