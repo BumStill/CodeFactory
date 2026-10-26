@@ -26,7 +26,7 @@
 - `pnpm build`：通过；仅已有 chunk size 提示。
 - `CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$PWD/.codefactory-cache/cargo-target-m174b" cargo test --manifest-path src-tauri/Cargo.toml m174_cross_process_merged_wait_is_closed_out -- --nocapture`：先失败、修复后通过。
 - 相同目录执行 `cargo test --manifest-path src-tauri/Cargo.toml thin_derive::tests -- --nocapture`：38 项通过。
-- workspace 全量测试首轮仅上述新回归失败；修复后全量重跑结果待回填。
+- workspace 全量测试首轮仅上述新回归失败；修复后全量重跑通过（lib 2009 passed / 12 ignored，全部 integration/workspace/doc tests 通过）。
 - `python3.11 tools/governance/run_scenario_harness_gate.py --stage local --repo . --policy-repo . --base-ref origin/main --title "fix: settle merged PR sessions through durable closeout (M174)" --body-file docs/specs/feature-specs/m174-post-merge-closeout-wake-evidence.md`：通过。
 - `python3.11 tools/governance/validate_repo_governance_baseline.py`：通过。
 - 系统 Python 缺 `tomllib`，改用本机 Python 3.11；未改 validator。
