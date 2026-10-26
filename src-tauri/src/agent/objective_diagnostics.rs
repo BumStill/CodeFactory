@@ -104,6 +104,9 @@ pub struct Evidence {
     pub orphan_run_controls: i64,
     pub background_tasks_running: i64,
     pub pending_wakeups: i64,
+    pub overdue_wakeups: i64,
+    pub oldest_wakeup_delay_secs: i64,
+    pub wakeup_retry_count: i64,
     pub pending_approvals: i64,
     pub pending_cancel_intent_at: Option<i64>,
     pub delivered_pr: Option<i64>,
@@ -343,6 +346,18 @@ pub async fn collect(
                 "wakeup_schedules",
             )
             .await?,
+            overdue_wakeups: if has_table(db, "wakeup_schedules").await? {
+                sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND next_at<?")
+                    .bind(session_id).bind(now_ms() / 1000 - 120).fetch_one(db).await?
+            } else { 0 },
+            oldest_wakeup_delay_secs: if has_table(db, "wakeup_schedules").await? {
+                sqlx::query_scalar("SELECT MAX(0,COALESCE(?-MIN(next_at),0)) FROM wakeup_schedules WHERE session_id=? AND status='pending'")
+                    .bind(now_ms() / 1000).bind(session_id).fetch_one(db).await?
+            } else { 0 },
+            wakeup_retry_count: if has_table(db, "wakeup_alerts").await? {
+                sqlx::query_scalar("SELECT retry_count FROM wakeup_alerts WHERE session_id=?")
+                    .bind(session_id).fetch_optional(db).await?.unwrap_or(0)
+            } else { 0 },
             pending_approvals,
             pending_cancel_intent_at,
             delivered_pr,
@@ -542,6 +557,22 @@ mod tests {
             .await
             .unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn m183_diagnostics_expose_overdue_wakes_without_prompt_content() {
+        let db = fixture("diag-overdue").await;
+        super::super::background_tasks::schedule_wakeup_at(&db, super::super::background_tasks::WakeupRequest {
+            session_id: "diag-overdue".into(), root_turn_id: None,
+            prompt: "synthetic-private-reason".into(),
+            source: super::super::background_tasks::TaskSource::AgentDecided,
+            after_sec: Some(60), every_sec: None,
+        }, 1).await.unwrap();
+        let report = collect(&db, "diag-overdue", "test", "test", "test").await.unwrap();
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["evidence"]["overdue_wakeups"], 1);
+        assert!(json["evidence"]["oldest_wakeup_delay_secs"].as_i64().unwrap() > 120);
+        assert!(!json.to_string().contains("synthetic-private-reason"));
     }
 
     /// R2：缓存 running 但没有任何执行者证据时，诊断要指出缓存与事实不一致。
