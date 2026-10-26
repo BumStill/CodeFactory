@@ -710,14 +710,9 @@ pub async fn reconcile(pool: &SqlitePool) -> Result<ReconcileReport, String> {
                 tokio::spawn(watch_orphan(pool.clone(), task));
             }
             Verdict::Dead => {
-                let output_present = Path::new(&task.output_path).exists();
-                let status = if output_present {
-                    TaskStatus::Exited
-                } else {
-                    TaskStatus::Lost
-                };
-                if settle(pool, &task.id, status, None, true).await {
-                    report.finished += 1;
+                // M168/R1：输出文件不是退出收据，重启后已死进程按 lost 结算。
+                if settle(pool, &task.id, TaskStatus::Lost, None, true).await {
+                    report.lost += 1;
                 }
             }
             Verdict::Unknown => {
@@ -740,13 +735,9 @@ async fn watch_orphan(pool: SqlitePool, task: BackgroundTask) {
         + Duration::from_secs(task.timeout_sec.max(1));
     loop {
         if !process_alive(pid) {
-            let present = Path::new(&task.output_path).exists();
-            let status = if present {
-                TaskStatus::Exited
-            } else {
-                TaskStatus::Lost
-            };
-            settle(&pool, &task.id, status, None, true).await;
+            // After restart we can observe disappearance, not an exit receipt.
+            // A log file may contain partial output from a failed/lost process.
+            settle(&pool, &task.id, TaskStatus::Lost, None, true).await;
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -820,6 +811,21 @@ pub trait WakeSink: Send + Sync {
 }
 
 /// D2：把待投递的唤醒交给会话入队，投递成功才标记 `enqueued`，因此重启后不会重复补发。
+/// M168：统一持久投递边界。单会话准入阻塞不能永久挂起整个投递器。
+async fn deliver_wake(sink: &dyn WakeSink, session: String, text: String, due_at: i64) -> bool {
+    if now_secs().saturating_sub(due_at) >= 300 {
+        tracing::warn!(session, pending_seconds = now_secs().saturating_sub(due_at),
+            "wake pending over five minutes; retrying immediately");
+    }
+    match tokio::time::timeout(Duration::from_secs(5), sink.enqueue(session.clone(), text)).await {
+        Ok(delivered) => delivered,
+        Err(_) => {
+            tracing::warn!(session, "wake admission timed out; durable wake remains pending for retry");
+            false
+        }
+    }
+}
+
 pub async fn drain_pending_wakes(pool: &SqlitePool, sink: &dyn WakeSink) -> usize {
     if ensure_schema(pool).await.is_err() {
         return 0;
@@ -834,7 +840,7 @@ pub async fn drain_pending_wakes(pool: &SqlitePool, sink: &dyn WakeSink) -> usiz
     for row in rows {
         let task = row_to_task(&row);
         let text = wake_text(&task);
-        if sink.enqueue(task.session_id.clone(), text).await {
+        if deliver_wake(sink, task.session_id.clone(), text, task.finished_at.unwrap_or(task.created_at)).await {
             let _ = sqlx::query(
                 "UPDATE background_tasks SET wake_state = 'enqueued' WHERE id = ? AND wake_state = 'pending'",
             )
@@ -1232,7 +1238,7 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
         let grace = wakeup.every_sec.unwrap_or(1).max(1) as i64;
         let late = now - wakeup.next_at >= grace;
         let text = wakeup_text(&wakeup, wakeup.fire_count + 1, late);
-        if !sink.enqueue(wakeup.session_id.clone(), text).await {
+        if !deliver_wake(sink, wakeup.session_id.clone(), text, wakeup.next_at).await {
             continue;
         }
         let advanced = match wakeup.every_sec {
@@ -1517,6 +1523,29 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn m168_a_blocked_sink_cannot_stall_pending_wakes() {
+        struct Blocked;
+        impl WakeSink for Blocked {
+            fn enqueue(&self, _: String, _: String) -> WakeFuture {
+                Box::pin(std::future::pending())
+            }
+        }
+        let pool = memory_pool().await;
+        let wake = schedule_wakeup_at(&pool, WakeupRequest {
+            session_id: "m168-synthetic".into(), root_turn_id: None,
+            prompt: "检查窗口恢复".into(), source: TaskSource::AgentDecided,
+            after_sec: Some(60), every_sec: None,
+        }, 100).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(7),
+            drain_due_wakeups_at(&pool, &Blocked, 160)).await;
+        assert!(result.is_ok(), "one blocked enqueue must not stop the durable dispatcher");
+        assert_eq!(get_wakeup(&pool, &wake.id).await.unwrap().unwrap().status, "pending");
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 161).await, 1);
+        assert_eq!(recorder.take().len(), 1);
     }
 
     #[derive(Default)]
@@ -1853,8 +1882,8 @@ mod tests {
 
         let report = reconcile(&pool).await.unwrap();
         assert_eq!(report.resumed, 1, "live task keeps being watched");
-        assert_eq!(report.finished, 1, "dead task gets its terminal state");
-        assert_eq!(report.lost, 1, "unverifiable task is marked lost");
+        assert_eq!(report.finished, 0, "no exit receipt after restart");
+        assert_eq!(report.lost, 2, "dead and unverifiable tasks are lost");
 
         assert_eq!(
             get(&pool, &live.id).await.unwrap().unwrap().status,
@@ -1862,7 +1891,7 @@ mod tests {
         );
         assert_eq!(
             get(&pool, "bg-dead").await.unwrap().unwrap().status,
-            TaskStatus::Exited
+            TaskStatus::Lost
         );
         assert_eq!(
             get(&pool, "bg-lost").await.unwrap().unwrap().status,
@@ -2069,6 +2098,66 @@ mod tests {
             .unwrap();
         ensure_schema(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn m168_restarted_live_orphan_without_receipt_is_lost() {
+        let pool = memory_pool().await;
+        let dir = scratch_dir("m168-live-orphan");
+        let log = dir.join("output.log");
+        std::fs::write(&log, "synthetic output, not an exit receipt").unwrap();
+        sqlx::query("INSERT INTO background_tasks(id,session_id,command,cwd,source,status,pid,process_started_at,output_path,created_at,timeout_sec,wake_state) VALUES ('orphan','synthetic','exit 0',?,'agent_decided','running',4294967294,'dead',?,1,60,'none')")
+            .bind(dir.to_string_lossy().as_ref()).bind(log.to_string_lossy().as_ref())
+            .execute(&pool).await.unwrap();
+        let task = get(&pool, "orphan").await.unwrap().unwrap();
+        watch_orphan(pool.clone(), task).await;
+        let settled = get(&pool, "orphan").await.unwrap().unwrap();
+        assert_eq!(settled.status, TaskStatus::Lost);
+        assert_eq!(settled.wake_state, "pending");
+        let recorder = Arc::new(Recorder::default());
+        assert_eq!(drain_pending_wakes(&pool, sink(&recorder)).await, 1);
+        assert!(recorder.take()[0].1.contains("无法确认结果"));
+        pool.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn m168_cross_process_restart_delivers_background_and_window_wakes() {
+        const CHILD: &str = "CODEFACTORY_M168_SYNTHETIC_DB";
+        if let Ok(path) = std::env::var(CHILD) {
+            let pool = file_pool(Path::new(&path)).await;
+            reconcile(&pool).await.unwrap();
+            let recorder = Arc::new(Recorder::default());
+            assert_eq!(drain_pending_wakes(&pool, sink(&recorder)).await, 1);
+            assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 200).await, 1);
+            let delivered = recorder.take();
+            assert_eq!(get(&pool, "bg-m168").await.unwrap().unwrap().status, TaskStatus::Lost);
+            assert!(delivered.iter().any(|(_, text)| text.contains("无法确认结果")));
+            assert!(delivered.iter().any(|(_, text)| text.contains("synthetic window")));
+            pool.close().await;
+            return;
+        }
+        let dir = scratch_dir("m168-process-restart");
+        let pool = file_pool(&dir).await;
+        sqlx::query("INSERT INTO background_tasks(id,session_id,command,cwd,source,status,pid,process_started_at,output_path,created_at,timeout_sec,wake_state) VALUES ('bg-m168','synthetic','exit 0',?,'agent_decided','running',4294967294,'dead',?,1,60,'none')")
+            .bind(dir.to_string_lossy().as_ref()).bind(dir.join("existing.log").to_string_lossy().as_ref())
+            .execute(&pool).await.unwrap();
+        std::fs::write(dir.join("existing.log"), "synthetic output without exit receipt").unwrap();
+        schedule_wakeup_at(&pool, WakeupRequest {
+            session_id: "synthetic".into(), root_turn_id: None,
+            prompt: "synthetic window".into(), source: TaskSource::AgentDecided,
+            after_sec: Some(60), every_sec: None,
+        }, 100).await.unwrap();
+        pool.close().await;
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["m168_cross_process_restart_delivers_background_and_window_wakes", "--nocapture"])
+            .env(CHILD, &dir).output().await.unwrap();
+        assert!(output.status.success(), "child failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let reopened = file_pool(&dir).await;
+        assert_eq!(get(&reopened, "bg-m168").await.unwrap().unwrap().wake_state, "enqueued");
+        assert_eq!(drain_pending_wakes(&reopened, sink(&Arc::new(Recorder::default()))).await, 0);
+        reopened.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
