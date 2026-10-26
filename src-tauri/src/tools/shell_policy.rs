@@ -100,6 +100,36 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
         return ask(reason);
     }
 
+    // M172-R2: reading a credential and rewriting repository protection are not
+    // local, reversible actions, so they keep the confirmation even in trusted
+    // mode. `gh pr merge` / `gh release *` are also caught by the remote-delivery
+    // gate; they stay listed here so a non-delivery session cannot slip a remote
+    // write through as an ordinary shell command.
+    if let Some(reason) = contains_any(
+        &normalized,
+        &[
+            ("--show-token", "credential exposure: `--show-token` prints the account token"),
+            ("gh auth token", "credential exposure: `gh auth token` prints the account token"),
+            ("gh auth login", "credential change: `gh auth login` replaces the stored credential"),
+            ("gh auth logout", "credential change: `gh auth logout` removes the stored credential"),
+            ("gh auth refresh", "credential change: `gh auth refresh` rewrites the stored credential"),
+            ("gh secret", "repository credential change: `gh secret`"),
+            ("gh variable", "repository settings change: `gh variable`"),
+            ("gh ruleset", "repository protection change: `gh ruleset`"),
+            ("gh repo delete", "remote destroy: `gh repo delete`"),
+            ("gh repo archive", "remote state change: `gh repo archive`"),
+            ("gh pr merge", "remote write: `gh pr merge`"),
+            ("gh pr close", "remote write: `gh pr close`"),
+            ("gh pr edit", "remote write: `gh pr edit`"),
+            ("gh release create", "remote write: `gh release create`"),
+            ("gh release delete", "remote write: `gh release delete`"),
+            ("gh release upload", "remote write: `gh release upload`"),
+            ("gh release edit", "remote write: `gh release edit`"),
+        ],
+    ) {
+        return ask(reason);
+    }
+
     ShellCommandPolicy::Allow {
         risk: ShellRisk::Low,
     }
@@ -237,6 +267,46 @@ pub fn touches_github_api(command: &str) -> bool {
 
 fn normalize(command: &str) -> String {
     command.to_lowercase().replace('`', "")
+}
+
+/// M172 regression tests: credential reads and remote writes keep confirmation.
+#[cfg(test)]
+mod m172_shell_policy_ask {
+    use super::{classify_command, ShellCommandPolicy};
+
+    fn asks(command: &str) -> bool {
+        matches!(classify_command(command), ShellCommandPolicy::Ask { .. })
+    }
+
+    fn allows(command: &str) -> bool {
+        matches!(classify_command(command), ShellCommandPolicy::Allow { .. })
+    }
+
+    #[test]
+    fn m172_credential_exposure_asks() {
+        assert!(asks("gh auth status --show-token"));
+        assert!(asks("gh auth token"));
+        assert!(asks("gh auth login"));
+    }
+
+    #[test]
+    fn m172_remote_writes_ask() {
+        assert!(asks("gh pr merge 12"));
+        assert!(asks("gh release delete v1.91.34"));
+        assert!(asks("gh repo delete BumStill/example"));
+        assert!(asks("gh ruleset list"));
+        assert!(asks("gh secret set TOKEN"));
+    }
+
+    #[test]
+    fn m172_read_only_forge_queries_stay_allowed() {
+        assert!(allows("gh auth status"));
+        assert!(allows("gh pr view 12"));
+        assert!(allows("gh pr checks 12"));
+        assert!(allows("git fetch --prune origin main"));
+        assert!(allows("git merge-base --is-ancestor origin/main HEAD"));
+        assert!(allows("pnpm test"));
+    }
 }
 
 fn contains_any<'a>(command: &str, needles: &[(&str, &'a str)]) -> Option<&'a str> {
