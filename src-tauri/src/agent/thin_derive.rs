@@ -273,9 +273,36 @@ pub(crate) async fn reconcile_waiting_on_startup(db: &SqlitePool) -> sqlx::Resul
     for session in &sessions {
         ensure_pr_monitor(db, session).await?;
         heartbeat_external(db, session).await?;
+        repair_waiting_wake_source(db, session).await?;
         refresh(db, session).await?;
     }
     Ok(sessions.len())
+}
+
+/// M183/R3：等待投影不是唤醒源。持久补建只发生在没有执行者和真实来源时。
+async fn repair_waiting_wake_source(db: &SqlitePool, session: &str) -> sqlx::Result<()> {
+    if crate::session_executor_alive(session) != Some(false) { return Ok(()); }
+    if super::thin_state::load(db, session).await?.is_none_or(|state| state.state != SessionState::WaitingWake) {
+        return Ok(());
+    }
+    if super::background_tasks::wake_source_cover(db, session).await.is_covered() { return Ok(()); }
+    // 未决 PR 由已有持久监视登记负责；已完成的 PR 则必须有真实收尾唤醒。
+    if has_table(db, "thin_external_observations").await? {
+        let monitor: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_external_observations WHERE session_id=? AND completed_reason IS NULL")
+            .bind(session).fetch_one(db).await?;
+        if monitor > 0 { return Ok(()); }
+    }
+    let completed = completed_external(db, session).await?;
+    if completed.is_some() && derive_state(db, session).await?.state == SessionState::Ended { return Ok(()); }
+    let reason = completed.unwrap_or_else(|| "存量 waiting_wake 缺少真实唤醒源".into());
+    let prefix = if reason.contains("已合并") { "thin-closeout-source" } else { "thin-source-repair" };
+    let at = chrono::Utc::now().timestamp();
+    sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,?,?,'agent_decided',?,'pending',?) ON CONFLICT(id) DO UPDATE SET prompt=excluded.prompt,next_at=excluded.next_at,status='pending' WHERE wakeup_schedules.status<>'pending'")
+        .bind(format!("{prefix}-{session}")).bind(session)
+        .bind(format!("{reason}。系统自动重试/自愈：核对持久事实并继续原任务；若 PR 已合并，执行任务模板 §8 收尾后给出最终回答，不重复交付。"))
+        .bind(at).bind(at).execute(db).await?;
+    tracing::warn!(session, "waiting_wake source missing; durable automatic repair queued");
+    Ok(())
 }
 
 /// 心跳先刷新事实，再由持久唤醒入口投递一次 §8 收尾。
@@ -739,6 +766,25 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn m183_startup_repairs_waiting_wake_without_a_source() {
+        let db = fixture().await;
+        super::super::thin_state::save(&db, "derive", &ThinState {
+            state: SessionState::WaitingWake,
+            waiting_for: Some("synthetic unfinished closeout".into()),
+            wake_source: Some("持久收尾投递器：系统自动重试/自愈".into()),
+            ..ThinState::running()
+        }).await.unwrap();
+        reconcile_waiting_on_startup(&db).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND status='pending'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(count, 1, "waiting_wake must have a real durable wake");
+        reconcile_waiting_on_startup(&db).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND status='pending'")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(count, 1, "startup repair must be idempotent");
+    }
+
     #[tokio::test]
     async fn m174_cross_process_merged_wait_is_closed_out() {
         use super::super::background_tasks::{WakeSink, WakeFuture, drain_due_wakeups_at};

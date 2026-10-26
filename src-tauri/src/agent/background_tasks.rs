@@ -836,20 +836,19 @@ pub async fn drain_pending_wakes(pool: &SqlitePool, sink: &dyn WakeSink) -> usiz
     .fetch_all(pool)
     .await
     .unwrap_or_default();
-    let mut delivered = 0;
+    use futures_util::{stream::FuturesUnordered, StreamExt};
+    let mut pending = FuturesUnordered::new();
     for row in rows {
         let task = row_to_task(&row);
-        let text = wake_text(&task);
-        if deliver_wake(sink, task.session_id.clone(), text, task.finished_at.unwrap_or(task.created_at)).await {
-            let _ = sqlx::query(
-                "UPDATE background_tasks SET wake_state = 'enqueued' WHERE id = ? AND wake_state = 'pending'",
-            )
-            .bind(&task.id)
-            .execute(pool)
-            .await;
-            delivered += 1;
-        }
+        pending.push(async move {
+            let text = wake_text(&task);
+            if !deliver_wake(sink, task.session_id.clone(), text, task.finished_at.unwrap_or(task.created_at)).await { return 0; }
+            sqlx::query("UPDATE background_tasks SET wake_state='enqueued' WHERE id=? AND wake_state='pending'")
+                .bind(&task.id).execute(pool).await.map_or(0, |done| done.rows_affected() as usize)
+        });
     }
+    let mut delivered = 0;
+    while let Some(count) = pending.next().await { delivered += count; }
     delivered
 }
 
@@ -998,6 +997,8 @@ async fn ensure_wakeup_schema(pool: &SqlitePool) -> sqlx::Result<()> {
     )
     .execute(pool)
     .await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS wakeup_alerts(session_id TEXT PRIMARY KEY,first_seen_at INTEGER NOT NULL,last_retry_at INTEGER NOT NULL,delay_secs INTEGER NOT NULL,retry_count INTEGER NOT NULL)")
+        .execute(pool).await?;
     Ok(())
 }
 
@@ -1220,63 +1221,61 @@ pub fn wakeup_text(wakeup: &WakeupSchedule, occurrence: i64, late: bool) -> Stri
 /// 投递失败（会话正在跑回合）保持 `pending`，下一轮重试；推进用
 /// `next_at` 做比较并交换，因此并发/重启都不会重复投递同一次到点。
 pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i64) -> usize {
-    if ensure_wakeup_schema(pool).await.is_err() {
-        return 0;
-    }
-    let rows = sqlx::query(
-        "SELECT * FROM wakeup_schedules WHERE status = 'pending' AND next_at <= ?
-          ORDER BY next_at, id LIMIT 32",
-    )
-    .bind(now)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-    let mut delivered = 0;
+    use futures_util::{stream::FuturesUnordered, StreamExt};
+    // 同一进程只有一个扫描器可推进计划；先锁再读，不能依赖入队后的 CAS 去重。
+    static SCANS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, std::sync::Weak<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+    let key = std::sync::Arc::as_ptr(&pool.connect_options()) as usize;
+    let scan = {
+        let mut scans = SCANS.get_or_init(Default::default).lock().unwrap_or_else(|poison| poison.into_inner());
+        scans.retain(|_, value| value.strong_count() > 0);
+        let scan = scans.get(&key).and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
+        scans.insert(key, std::sync::Arc::downgrade(&scan));
+        scan
+    };
+    let Ok(_scan) = scan.try_lock() else { return 0; };
+    if ensure_wakeup_schema(pool).await.is_err() { return 0; }
+    let rows = match sqlx::query(
+        "SELECT * FROM wakeup_schedules WHERE status='pending' AND next_at<=? ORDER BY next_at,id",
+    ).bind(now).fetch_all(pool).await {
+        Ok(rows) => rows,
+        Err(error) => { tracing::warn!(%error, "due wake scan failed; automatic retry next tick"); return 0; }
+    };
+    let mut sessions = std::collections::BTreeMap::<String, Vec<WakeupSchedule>>::new();
     for row in rows {
-        let wakeup = row_to_wakeup(&row);
-        // 关闭期间错过的周期只补一次：只要晚于一个周期就算迟到，文本里说明。
-        let grace = wakeup.every_sec.unwrap_or(1).max(1) as i64;
-        let late = now - wakeup.next_at >= grace;
-        let text = wakeup_text(&wakeup, wakeup.fire_count + 1, late);
-        if !deliver_wake(sink, wakeup.session_id.clone(), text, wakeup.next_at).await {
-            continue;
-        }
-        let advanced = match wakeup.every_sec {
-            Some(every) => sqlx::query(
-                "UPDATE wakeup_schedules
-                    SET next_at = ?, fire_count = fire_count + 1, last_fired_at = ?
-                  WHERE id = ? AND status = 'pending' AND next_at = ?",
-            )
-            .bind(now + every as i64)
-            .bind(now)
-            .bind(&wakeup.id)
-            .bind(wakeup.next_at)
-            .execute(pool)
-            .await
-            .map(|done| done.rows_affected() == 1),
-            None => sqlx::query(
-                "UPDATE wakeup_schedules
-                    SET status = 'done', fire_count = fire_count + 1, last_fired_at = ?
-                  WHERE id = ? AND status = 'pending' AND next_at = ?",
-            )
-            .bind(now)
-            .bind(&wakeup.id)
-            .bind(wakeup.next_at)
-            .execute(pool)
-            .await
-            .map(|done| done.rows_affected() == 1),
-        };
-        if matches!(advanced, Ok(true)) {
-            delivered += 1;
-            tracing::info!(
-                wakeup = %wakeup.id,
-                session = %wakeup.session_id,
-                occurrence = wakeup.fire_count + 1,
-                late,
-                "wakeup fired"
-            );
-        }
+        let wake = row_to_wakeup(&row);
+        sessions.entry(wake.session_id.clone()).or_default().push(wake);
     }
+    let mut pending = FuturesUnordered::new();
+    for (session, wakes) in sessions {
+        pending.push(async move {
+            let due = wakes.iter().map(|wake| wake.next_at).min().unwrap_or(now);
+            if now.saturating_sub(due) > 120 {
+                tracing::warn!(session, pending_seconds = now.saturating_sub(due), "wake overdue over two minutes; automatic retry");
+                let _ = sqlx::query("INSERT INTO wakeup_alerts(session_id,first_seen_at,last_retry_at,delay_secs,retry_count) VALUES (?,?,?,?,1) ON CONFLICT(session_id) DO UPDATE SET last_retry_at=excluded.last_retry_at,delay_secs=excluded.delay_secs,retry_count=wakeup_alerts.retry_count+1")
+                    .bind(&session).bind(now).bind(now).bind(now.saturating_sub(due)).execute(pool).await;
+            }
+            let text = wakes.iter().map(|wake| {
+                wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
+            }).collect::<Vec<_>>().join("\n\n");
+            if !deliver_wake(sink, session.clone(), text, due).await { return 0; }
+            // 至少一次：成功入队才推进；崩溃前未推进仍可重试，不丢失原因。
+            let mut advanced = false;
+            for wake in wakes {
+                let result = sqlx::query("UPDATE wakeup_schedules SET status=?,next_at=?,fire_count=fire_count+1,last_fired_at=? WHERE id=? AND status='pending' AND next_at=?")
+                    .bind(if wake.every_sec.is_some() { "pending" } else { "done" })
+                    .bind(wake.every_sec.map_or(wake.next_at, |every| now.saturating_add(every as i64)))
+                    .bind(now).bind(&wake.id).bind(wake.next_at).execute(pool).await;
+                match result {
+                    Ok(done) => advanced |= done.rows_affected() == 1,
+                    Err(error) => tracing::warn!(%error, wakeup = %wake.id, "wake receipt deferred; automatic retry"),
+                }
+            }
+            usize::from(advanced)
+        });
+    }
+    let mut delivered = 0;
+    while let Some(count) = pending.next().await { delivered += count; }
     delivered
 }
 
@@ -1394,14 +1393,13 @@ pub fn start_runtime(app: tauri::AppHandle) {
         }
         let sink = ChatWakeSink { app: app.clone() };
         loop {
-            let delivered = drain_pending_wakes(&pool, &sink).await;
-            if delivered > 0 {
-                tracing::info!(delivered, "background task wakes enqueued");
-            }
-            // R2：每秒检查一次到点唤醒（重启后错过的在启动首轮补发一次）。
-            let fired = drain_due_wakeups(&pool, &sink).await;
-            if fired > 0 {
-                tracing::info!(fired, "scheduled wakeups enqueued");
+            // 两类投递并发：后台命令积压不能阻塞定时唤醒扫描。
+            let (delivered, fired) = tokio::join!(
+                drain_pending_wakes(&pool, &sink),
+                drain_due_wakeups(&pool, &sink),
+            );
+            if delivered + fired > 0 {
+                tracing::info!(delivered, fired, "durable wakes enqueued");
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -1523,6 +1521,89 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn m183_cross_process_overdue_wakes_are_coalesced_without_starvation() {
+        const CHILD: &str = "CODEFACTORY_M183_SYNTHETIC_DB";
+        if let Ok(path) = std::env::var(CHILD) {
+            let pool = file_pool(Path::new(&path)).await;
+            let recorder = Arc::new(Recorder::default());
+            assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 10_000).await, 2);
+            let delivered = recorder.take();
+            assert_eq!(delivered.len(), 2, "one enqueue per session, not per wake row");
+            let combined = &delivered.iter().find(|(session, _)| session == "synthetic-many").unwrap().1;
+            for index in 0..40 {
+                assert!(combined.contains(&format!("reason-{index:02}")), "all overdue reasons must survive");
+            }
+            assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 10_000).await, 0);
+            assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 10_060).await, 1);
+            assert!(recorder.take()[0].1.contains("future reason"));
+            let done: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='done' AND fire_count=1")
+                .fetch_one(&pool).await.unwrap();
+            assert_eq!(done, 42);
+            pool.close().await;
+            return;
+        }
+        let dir = scratch_dir("m183-process-restart");
+        let pool = file_pool(&dir).await;
+        for index in 0..40 {
+            schedule_wakeup_at(&pool, wakeup_request("synthetic-many", &format!("reason-{index:02}"), None), 100).await.unwrap();
+            // Simulate historical backlog beyond the per-session tool cap.
+            sqlx::query("UPDATE wakeup_schedules SET session_id='synthetic-staging' WHERE session_id='synthetic-many'")
+                .execute(&pool).await.unwrap();
+        }
+        sqlx::query("UPDATE wakeup_schedules SET session_id='synthetic-many'").execute(&pool).await.unwrap();
+        schedule_wakeup_at(&pool, wakeup_request("synthetic-other", "other reason", None), 100).await.unwrap();
+        schedule_wakeup_at(&pool, wakeup_request("synthetic-future", "future reason", None), 10_000).await.unwrap();
+        pool.close().await;
+        let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["m183_cross_process_overdue_wakes_are_coalesced_without_starvation", "--nocapture"])
+            .env(CHILD, &dir).output();
+        let output = tokio::time::timeout(Duration::from_secs(30), child).await.unwrap().unwrap();
+        assert!(output.status.success(), "child failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn m183_blocked_sessions_do_not_delay_a_healthy_session() {
+        let pool = memory_pool().await;
+        for index in 0..7 {
+            schedule_wakeup_at(&pool, wakeup_request(&format!("blocked-{index}"), "blocked", None), 100).await.unwrap();
+        }
+        schedule_wakeup_at(&pool, wakeup_request("healthy", "healthy reason", None), 101).await.unwrap();
+        struct Mixed(Arc<Recorder>);
+        impl WakeSink for Mixed {
+            fn enqueue(&self, session: String, text: String) -> WakeFuture {
+                if session.starts_with("blocked-") { return Box::pin(std::future::pending()); }
+                self.0.enqueue(session, text)
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let result = tokio::time::timeout(Duration::from_secs(7), drain_due_wakeups_at(&pool, &Mixed(recorder.clone()), 200)).await;
+        assert_eq!(result.expect("blocked sessions must run concurrently, not consume 35 seconds"), 1);
+        assert_eq!(recorder.take()[0].0, "healthy");
+    }
+
+    #[tokio::test]
+    async fn m183_concurrent_scans_enqueue_a_session_only_once() {
+        let pool = memory_pool().await;
+        schedule_wakeup_at(&pool, wakeup_request("synthetic", "once", None), 100).await.unwrap();
+        struct Slow(Arc<Recorder>);
+        impl WakeSink for Slow {
+            fn enqueue(&self, session: String, text: String) -> WakeFuture {
+                let recorder = self.0.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    recorder.enqueue(session, text).await
+                })
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let slow = Slow(recorder.clone());
+        let (first, second) = tokio::join!(drain_due_wakeups_at(&pool, &slow, 200), drain_due_wakeups_at(&pool, &slow, 200));
+        assert_eq!(first + second, 1);
+        assert_eq!(recorder.take().len(), 1, "CAS after enqueue cannot prevent duplicate side effects");
     }
 
     #[tokio::test]
@@ -1993,7 +2074,7 @@ mod tests {
             root_turn_id: Some("turn-1".to_string()),
             prompt: prompt.to_string(),
             source: TaskSource::AgentDecided,
-            after_sec: None,
+            after_sec: every_sec.is_none().then_some(60),
             every_sec,
         }
     }
