@@ -1364,6 +1364,19 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
         if let Err(error) = super::thin_derive::reconcile_waiting_on_startup(&pool).await {
             tracing::warn!(%error, "startup: waiting PR closeout reconciliation deferred to heartbeat");
         }
+        // M186/R4: a merged PR whose wake was cancelled must settle within the
+        // first minute after start, not after a 30-minute heartbeat.
+        match super::thin_derive::settle_merged_sessions(&pool).await {
+            Ok(summary) if summary.settled + summary.asked_user > 0 => tracing::info!(
+                settled = summary.settled,
+                asked_user = summary.asked_user,
+                "startup: merged/closed sessions settled"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "startup: merged-session settlement deferred to heartbeat")
+            }
+        }
         let store = ObjectiveStore::new(pool.clone());
         let mut polls_since_stall_sweep = 0_u32;
         loop {
@@ -1520,6 +1533,18 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                         tracing::warn!(%error, "provider attempt sweep failed");
                     }
                 }
+            }
+            // M186/R3: budgeted backstop for a merged session whose wake was
+            // cancelled — the session must never sit in `waiting_wake` with no
+            // owner. The gate keeps this to at most one real pass per minute.
+            match super::thin_derive::safety_tick(&pool).await {
+                Ok(summary) if summary.settled + summary.asked_user > 0 => tracing::info!(
+                    settled = summary.settled,
+                    asked_user = summary.asked_user,
+                    "merged/closed sessions settled by safety tick"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "merged-session safety tick deferred"),
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }

@@ -968,6 +968,13 @@ fn row_to_wakeup(row: &sqlx::sqlite::SqliteRow) -> WakeupSchedule {
     }
 }
 
+/// M186: the same schema guard, callable from the settlement path that cancels
+/// wakeups inside its own transaction, and from tests that build a restart
+/// fixture.
+pub(crate) async fn ensure_wake_schema(pool: &SqlitePool) -> sqlx::Result<()> {
+    ensure_wakeup_schema(pool).await
+}
+
 async fn ensure_wakeup_schema(pool: &SqlitePool) -> sqlx::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS wakeup_schedules (
