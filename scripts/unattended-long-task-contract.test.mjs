@@ -240,7 +240,9 @@ test("history-derived scenarios use the unified synthetic registry", async () =>
   // M164 adds real quota-admission and durable-wake tests in these modules.
   const modelAvailability = await source("src-tauri/src/agent/failover.rs");
   const thinState = await source("src-tauri/src/agent/thin_state.rs");
-  const implementation = `${modelAvailability}\n${thinState}\n${thinDelivery}\n${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${thinDerive}\n${thinRestart}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}\n${commandEnv}\n${processTree}\n${backgroundTasks}\n${bashTool}`;
+  const dispatch = await source("src-tauri/src/agent/dispatch.rs");
+  const executionWorkspace = await source("src-tauri/src/agent/execution_workspace.rs");
+  const implementation = `${dispatch}\n${executionWorkspace}\n${modelAvailability}\n${thinState}\n${thinDelivery}\n${agent}\n${delivery}\n${deliveryRun}\n${deliveryTool}\n${objective}\n${toolBackend}\n${chat}\n${thinDerive}\n${thinRestart}\n${trajectory}\n${skills}\n${loop}\n${ci}\n${nightly}\n${release}\n${commandEnv}\n${processTree}\n${backgroundTasks}\n${bashTool}`;
   for (const scenario of parsed.scenarios.filter((item) => legacy.scenario_ids.includes(item.id))) {
     for (const automation of scenario.automated_by) {
       const target = automation.slice(automation.indexOf(":") + 1);

@@ -4666,6 +4666,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m175_authorized_dispatch_writes_only_in_managed_workspace() {
+        let (_temp, root, _remote, container) = init_repo();
+        let pool = pool_with_objective("objective-dirty-root").await;
+        let before = git(&root, &["status", "--porcelain"]);
+        for (index, wording) in ["开始实施：修复合成问题。", "修复合成问题。\n\n# 模板\n只读审查一下，不要修改代码；不要推送。"].iter().enumerate() {
+            let (contract, _) = crate::agent::resolve_turn_delivery_authorization(
+                None, wording, crate::agent::TurnIntent::default(), true,
+            );
+            assert_eq!(contract.mode, crate::agent::AgentMode::Execute);
+            assert_eq!(contract.capability, crate::agent::TurnCapability::Deliver);
+            let workspace = allocate_or_attach(&pool, request(&root, &container, "synthetic-m175")).await.unwrap();
+            assert_ne!(workspace.worktree_path, root);
+            assert!(workspace.worktree_path.starts_with(container.canonicalize().unwrap()));
+            let name = format!("synthetic-m175-{index}.txt");
+            std::fs::write(workspace.worktree_path.join(&name), "synthetic managed output").unwrap();
+            assert_eq!(std::fs::read_to_string(workspace.worktree_path.join(&name)).unwrap(), "synthetic managed output");
+            assert!(!root.join(&name).exists());
+        }
+        assert_eq!(git(&root, &["status", "--porcelain"]), before);
+    }
+
+    #[tokio::test]
     async fn repository_allocation_lease_serializes_processes() {
         let pool = pool_with_objective("objective-dirty-root").await;
         acquire_repo_allocation_lock(&pool, "repo-one", "process-a")

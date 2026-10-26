@@ -4283,12 +4283,13 @@ pub(crate) async fn resume_thin_running_session(
         .ok_or_else(|| AppError::Other("thin restart has no model route".into()))?
         .clone();
     let structured_read_only = crate::storage::tasks::sub_session_read_only(&db, &session_id).await?;
-    let contract = crate::agent::decide_chat_contract_with_intent(
+    let (contract, _) = crate::agent::resolve_turn_delivery_authorization(
         None,
         &original_content,
         crate::agent::TurnIntent {
             structured_read_only,
         },
+        crate::agent::fetch_session_delivery_authorized(&db, &session_id).await,
     );
     let effective_cwd = match resolve_chat_execution_cwd(
         &app,
