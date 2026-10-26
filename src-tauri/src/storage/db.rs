@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#[cfg(test)]
+#[path = "m185_sequence_upgrade.rs"]
+mod m185_sequence_upgrade;
+
 use chrono::Utc;
 use sqlx::{
     migrate::MigrateDatabase,
