@@ -3,13 +3,287 @@
 use std::{path::{Component, Path}, process::{Command, Stdio}, io::Write};
 use crate::util::no_window::NoWindow;
 
+/// M172-R1: ask for the M159 proof/snapshot only when an **executable segment**
+/// runs a Git action that can discard local work.
+///
+/// The previous version scanned the whole command text for words such as
+/// `clean`, `restore` or `git fetch`. That made two kinds of read-only call
+/// prompt on 2026-10-26 in a trusted session: `git fetch --prune origin main`
+/// together with `git merge-base --is-ancestor` (both listed as git *queries*
+/// in `agent-core`), and `node -e '<script>'` whose script *data* mentioned one
+/// of those words — quoted text is data, not a statement.
+///
+/// So: tokenize into segments (quotes keep their content inside one word),
+/// then judge the segment's own subcommand. Anything we cannot parse safely
+/// stays sensitive (fail closed).
 pub(super) fn sensitive(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    let words: Vec<_> = lower.split_whitespace().map(|w| w.trim_matches(['\'', '"'])).collect();
-    ["reset", "restore", "checkout", "clean", "stash", "rebase", "filter-branch", "filter-repo"].iter().any(|w| lower.contains(w))
-        || lower.contains("worktree") || lower.contains("git -c") || lower.contains("git merge") || lower.contains("git fetch")
-        || (lower.contains("push") && words.iter().any(|w| w.starts_with("--force") || *w == "--delete" || *w == "-f" || *w == "-d" || w.starts_with(':') || w.starts_with('+')))
+    let Some(segments) = executable_segments(command) else { return true };
+    segments.iter().any(|words| segment_is_sensitive(words))
 }
+
+/// Git subcommands that move the working tree, the index or a local branch.
+const DESTRUCTIVE_GIT_SUBCOMMANDS: &[&str] = &[
+    "reset", "restore", "checkout", "clean", "stash", "rebase", "merge",
+    "filter-branch", "filter-repo", "worktree", "cherry-pick", "revert", "am", "apply",
+];
+
+/// Words that only wrap another command.
+const WRAPPER_WORDS: &[&str] = &["sudo", "command", "exec", "env", "nohup", "time", "builtin"];
+
+/// Interpreters that take inline shell code and therefore must be re-scanned.
+const SHELL_INTERPRETERS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "ash"];
+
+/// Interpreters that take inline code in another language: their payload is
+/// data unless it visibly shells out to a destructive Git command.
+const INLINE_CODE_INTERPRETERS: &[&str] = &["node", "nodejs", "deno", "bun", "python", "python3", "perl", "ruby"];
+
+fn executable_segments(command: &str) -> Option<Vec<Vec<String>>> {
+    fn finish_word(words: &mut Vec<String>, word: &mut String, in_word: &mut bool) {
+        if *in_word {
+            words.push(std::mem::take(word));
+            *in_word = false;
+        }
+    }
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for ch in command.chars() {
+        if let Some(opening) = quote {
+            if ch == opening {
+                quote = None;
+            } else {
+                word.push(ch);
+            }
+            in_word = true;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            ';' | '|' | '&' | '>' | '<' | '\n' | '\r' => {
+                finish_word(&mut words, &mut word, &mut in_word);
+                if !words.is_empty() {
+                    segments.push(std::mem::take(&mut words));
+                }
+            }
+            c if c.is_whitespace() => finish_word(&mut words, &mut word, &mut in_word),
+            c => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    finish_word(&mut words, &mut word, &mut in_word);
+    if !words.is_empty() {
+        segments.push(words);
+    }
+    Some(segments)
+}
+
+fn segment_is_sensitive(words: &[String]) -> bool {
+    let mut start = 0;
+    while start < words.len() {
+        let word = words[start].as_str();
+        let assignment = word
+            .split_once('=')
+            .is_some_and(|(name, _)| !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        if assignment || WRAPPER_WORDS.contains(&word.to_ascii_lowercase().as_str()) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    let rest = &words[start..];
+    let Some(binary) = rest.first() else { return false };
+    let lowered = rest.iter().map(|w| w.to_ascii_lowercase()).collect::<Vec<_>>();
+    // A dynamic command word or argument can expand into anything: keep the
+    // snapshot when the segment visibly names Git or a destructive verb.
+    let dynamic = rest.iter().any(|w| w.contains('$') || w.contains('`'));
+    if dynamic
+        && lowered.iter().any(|w| {
+            w == "git"
+                || w.contains("push")
+                || DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&w.as_str())
+        })
+    {
+        return true;
+    }
+    let name = binary
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(binary)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    let args = &rest[1..];
+    if name == "git" {
+        return git_segment_is_sensitive(args);
+    }
+    if SHELL_INTERPRETERS.contains(&name.as_str()) {
+        return inline_payload(args, &["-c", "-lc", "-ec", "-ic"]).is_some_and(|p| sensitive(&p));
+    }
+    if INLINE_CODE_INTERPRETERS.contains(&name.as_str()) {
+        return inline_payload(args, &["-e", "-c", "-p", "--eval", "--print"])
+            .is_some_and(|p| payload_shells_out_to_destructive_git(&p));
+    }
+    // `cargo clean` deletes build output: previously caught by the "clean"
+    // substring, so keep it explicit rather than losing the coverage.
+    name == "cargo" && args.iter().any(|a| a.eq_ignore_ascii_case("clean"))
+}
+
+fn git_segment_is_sensitive(args: &[String]) -> bool {
+    let mut index = 0;
+    let mut rewrites_config = false;
+    let mut subcommand: Option<&str> = None;
+    while index < args.len() {
+        // `-C <path>` takes a value and is not a config rewrite; compare the raw
+        // argument because lowercasing makes it indistinguishable from `-c`.
+        if args[index] == "-C" {
+            index += 2;
+            continue;
+        }
+        let lower = args[index].to_ascii_lowercase();
+        if lower == "-c" || lower == "--config-env" {
+            rewrites_config = true;
+            index += 1;
+            continue;
+        }
+        if matches!(lower.as_str(), "--git-dir" | "--work-tree" | "--namespace" | "--exec-path") {
+            index += 2;
+            continue;
+        }
+        if lower.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        subcommand = Some(args[index].as_str());
+        break;
+    }
+    if rewrites_config {
+        return true;
+    }
+    let Some(subcommand) = subcommand else { return false };
+    let lower = subcommand.to_ascii_lowercase();
+    if DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&lower.as_str()) {
+        return true;
+    }
+    if lower == "push" {
+        let after = &args[index + 1..];
+        return after.iter().any(|arg| {
+            let arg = arg.to_ascii_lowercase();
+            arg.starts_with("--force")
+                || arg == "--delete"
+                || arg == "--mirror"
+                || arg == "--prune"
+                || arg == "-f"
+                || arg == "-d"
+                || arg.starts_with('+')
+                || arg.starts_with(':')
+        });
+    }
+    false
+}
+
+fn inline_payload(args: &[String], flags: &[&str]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        if flags.contains(&args[index].to_ascii_lowercase().as_str()) {
+            return args.get(index + 1).cloned();
+        }
+        index += 1;
+    }
+    None
+}
+
+fn payload_shells_out_to_destructive_git(payload: &str) -> bool {
+    let lower = payload.to_ascii_lowercase();
+    let shells_out = [
+        "execsync", "spawnsync", "exec(", "spawn(", "subprocess", "os.system", "popen",
+        "child_process", "system(",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    shells_out
+        && [
+            "git reset", "git clean", "git checkout", "git restore", "git stash", "git rebase",
+            "git merge", "git worktree", "git push", "git -c",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+/// M172 regression tests.
+#[cfg(test)]
+mod m172_trusted_git_sensitive {
+    use super::sensitive;
+
+    /// The exact shape that prompted on 2026-10-26 in a trusted session: only
+    /// read-only git queries, discovery commands and `gh auth status`.
+    const READ_ONLY_EVIDENCE_COMMAND: &str = "git fetch --prune origin main && \
+git merge-base --is-ancestor origin/main HEAD; \
+find src-tauri/src -iname '*deliver*'; \
+grep -R -n 'merge-queue' src-tauri/src | head -90; \
+ls src-tauri; \
+command -v pnpm; \
+command -v cargo; \
+gh auth status";
+
+    #[test]
+    fn m172_read_only_git_queries_are_not_sensitive() {
+        assert!(!sensitive(READ_ONLY_EVIDENCE_COMMAND), "read-only evidence command must not ask");
+        assert!(!sensitive("git fetch --prune origin main"));
+        assert!(!sensitive("git merge-base --is-ancestor origin/main HEAD"));
+        assert!(!sensitive("git log --oneline -5"));
+        assert!(!sensitive("git status --short && git rev-parse HEAD"));
+    }
+
+    #[test]
+    fn m172_quoted_script_data_is_not_a_git_action() {
+        // The second prompt on 2026-10-26: a read-only script whose *data*
+        // mentions the words the old substring scan treated as destructive.
+        let script = "node -e 'const reg=require(\"./docs/testing/scenario-registry.json\");\
+console.log(reg.scenarios.map(s=>[s.id,s.change_patterns,s.restore,s.cleanup,s.worktree]).join(\"\\n\"))' | head -20";
+        assert!(!sensitive(script), "quoted script data must not trigger the git snapshot");
+    }
+
+    #[test]
+    fn m172_local_interpreter_and_build_commands_are_not_sensitive() {
+        assert!(!sensitive("python3 -"));
+        assert!(!sensitive("cargo test --manifest-path src-tauri/Cargo.toml"));
+        assert!(!sensitive("pnpm test"));
+        assert!(!sensitive("node scripts/run.mjs --dry-run"));
+        assert!(!sensitive("git push origin main"));
+    }
+
+    #[test]
+    fn m172_destructive_git_actions_still_ask() {
+        assert!(sensitive("git reset --hard"));
+        assert!(sensitive("git checkout -- src/main.rs"));
+        assert!(sensitive("git -C /tmp/ws reset --hard HEAD~1"));
+        assert!(sensitive("git merge origin/main"));
+        assert!(sensitive("git push --force origin main"));
+        assert!(sensitive("git push origin :refs/heads/old"));
+        assert!(sensitive("cd src-tauri && git clean -fdx"));
+        assert!(sensitive("cargo clean"));
+    }
+
+    #[test]
+    fn m172_shell_payload_is_rescanned_but_plain_script_is_not() {
+        assert!(sensitive("bash -c \"git reset --hard\""));
+        assert!(sensitive("sh -lc 'git stash drop'"));
+        assert!(
+            sensitive("node -e 'require(\"child_process\").execSync(\"git reset --hard\")'"),
+            "a script that actually shells out to a destructive git command must ask"
+        );
+    }
+}
+
 fn git(root: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git").no_window().current_dir(root).args(args).stdin(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())

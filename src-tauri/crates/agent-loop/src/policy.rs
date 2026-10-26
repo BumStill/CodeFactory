@@ -722,6 +722,51 @@ mod m130_tests {
 pub fn is_delivery_command(command: &str) -> bool {
     // Read-only searches may quote delivery commands as data, not execute them.
     if codefactory_agent_core::command_is_read_only_probe(command) { return false; }
+    // M172-R1: judge each executable segment on its own. Before this, one
+    // word anywhere in the pipeline decided for the whole command, so a mixed
+    // read-only command (`git fetch … && gh pr view 12`) asked for remote
+    // authorization it did not need.
+    let segments = codefactory_agent_core::command_executable_segments(command);
+    if segments.is_empty() { return delivery_command_words(command); }
+    segments.iter().any(|segment| {
+        !codefactory_agent_core::command_segment_is_read_only_probe(segment)
+            && delivery_command_words(segment)
+    })
+}
+
+/// M172 regression tests: a read-only segment must not launder, or be laundered
+/// by, a remote write elsewhere in the same command.
+#[cfg(test)]
+mod m172_delivery_segments {
+    use super::is_delivery_command;
+
+    #[test]
+    fn m172_mixed_read_only_command_is_not_a_delivery_request() {
+        assert!(!is_delivery_command("git fetch --prune origin main && gh pr view 12"));
+        assert!(!is_delivery_command(
+            "git fetch --prune origin main && git merge-base --is-ancestor origin/main HEAD"
+        ));
+        assert!(!is_delivery_command("gh pr view 12"));
+        assert!(!is_delivery_command("gh auth status"));
+        assert!(!is_delivery_command("ls src-tauri"));
+    }
+
+    #[test]
+    fn m172_remote_write_in_any_segment_is_a_delivery_request() {
+        assert!(is_delivery_command("gh pr view 12 && gh pr merge 12"));
+        assert!(is_delivery_command("gh pr merge 12"));
+        assert!(is_delivery_command("git push origin main"));
+        assert!(is_delivery_command("gh release delete v1.0.0"));
+    }
+
+    #[test]
+    fn m172_credential_read_is_never_delivery_or_probe() {
+        assert!(!is_delivery_command("gh auth status --show-token"));
+        assert!(!is_delivery_command("gh auth token"));
+    }
+}
+
+fn delivery_command_words(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let normalized = lower.replace(['\'', '"', '\t', '\n', ';', '|', '&', ',', '[', ']', '(', ')'], " ");
     let words = normalized.split_whitespace().collect::<Vec<_>>();

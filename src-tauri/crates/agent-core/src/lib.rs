@@ -787,6 +787,11 @@ pub fn is_forge_query_segment(segment: &str) -> bool {
     match binary {
         "gh" => {
             let rest = skip_gh_global_flags(&rest);
+            // M172-R2: `gh auth status --show-token` prints the account token:
+            // a credential read is never a read-only observation.
+            if rest.contains(&"--show-token") {
+                return false;
+            }
             let Some((subcommand, tail)) = rest.split_first() else {
                 return false;
             };
@@ -883,6 +888,12 @@ fn is_forge_mutation_segment(segment: &str) -> bool {
     match binary {
         "gh" => {
             let rest = skip_gh_global_flags(&rest);
+            // M172-R2: `gh auth status --show-token` prints the account token.
+            // It is not a read-only observation, so on this side of the mirror
+            // it must stay a gated action rather than be admitted as a probe.
+            if rest.contains(&"--show-token") {
+                return true;
+            }
             let Some((subcommand, tail)) = rest.split_first() else {
                 return false;
             };
@@ -1046,6 +1057,53 @@ fn review_shell_words(command: &str) -> Vec<String> {
     }
     if !word.is_empty() { words.push(word); }
     words
+}
+
+/// M172 regression tests.
+#[cfg(test)]
+mod m172_command_segments {
+    use super::{
+        command_executable_segments, command_is_read_only_probe, command_segment_is_read_only_probe,
+    };
+
+    #[test]
+    fn m172_segments_are_split_per_executable_statement() {
+        let segments = command_executable_segments(
+            "git fetch --prune origin main && gh pr view 12 | head -5",
+        );
+        assert!(segments.len() >= 2, "{segments:?}");
+        assert_eq!(segments[0], "git fetch --prune origin main");
+        assert!(segments.iter().any(|segment| segment == "gh pr view 12"), "{segments:?}");
+    }
+
+    #[test]
+    fn m172_show_token_is_not_a_read_only_probe() {
+        assert!(!command_is_read_only_probe("gh auth status --show-token"));
+        assert!(!command_segment_is_read_only_probe("gh auth status --show-token"));
+        assert!(command_segment_is_read_only_probe("gh auth status"));
+        assert!(!command_segment_is_read_only_probe("gh pr merge 12"));
+    }
+}
+
+/// Every executable segment of a shell command, with wrapper prefixes removed.
+///
+/// M172-R1: a caller that needs to know "what does this command actually run"
+/// must ask per segment. Scanning the whole text for words lets a word in one
+/// segment — or a word inside quoted data, e.g. a `node -e` script body —
+/// decide the meaning of a command that never runs it.
+pub fn command_executable_segments(command: &str) -> Vec<String> {
+    let control = shell_control_text(command);
+    shell_verification_segments(&control)
+        .iter()
+        .flat_map(|statement| shell_pipeline_segments(statement))
+        .map(|segment| execution_payload(segment.as_str()).trim().to_string())
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+/// Segment-level form of [`command_is_read_only_probe`].
+pub fn command_segment_is_read_only_probe(segment: &str) -> bool {
+    probe_segment(segment.trim().to_ascii_lowercase().as_str())
 }
 
 pub fn command_is_read_only_probe(command: &str) -> bool {

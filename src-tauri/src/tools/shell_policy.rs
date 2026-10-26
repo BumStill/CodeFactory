@@ -100,6 +100,36 @@ pub fn classify_command(command: &str) -> ShellCommandPolicy {
         return ask(reason);
     }
 
+    // M172-R2: reading a credential and rewriting repository protection are not
+    // local, reversible actions, so they keep the confirmation even in trusted
+    // mode. `gh pr merge` / `gh release *` are also caught by the remote-delivery
+    // gate; they stay listed here so a non-delivery session cannot slip a remote
+    // write through as an ordinary shell command.
+    if let Some(reason) = contains_any(
+        &normalized,
+        &[
+            ("--show-token", "credential exposure: `--show-token` prints the account token"),
+            ("gh auth token", "credential exposure: `gh auth token` prints the account token"),
+            ("gh auth login", "credential change: `gh auth login` replaces the stored credential"),
+            ("gh auth logout", "credential change: `gh auth logout` removes the stored credential"),
+            ("gh auth refresh", "credential change: `gh auth refresh` rewrites the stored credential"),
+            ("gh secret", "repository credential change: `gh secret`"),
+            ("gh variable", "repository settings change: `gh variable`"),
+            ("gh ruleset", "repository protection change: `gh ruleset`"),
+            ("gh repo delete", "remote destroy: `gh repo delete`"),
+            ("gh repo archive", "remote state change: `gh repo archive`"),
+            ("gh pr merge", "remote write: `gh pr merge`"),
+            ("gh pr close", "remote write: `gh pr close`"),
+            ("gh pr edit", "remote write: `gh pr edit`"),
+            ("gh release create", "remote write: `gh release create`"),
+            ("gh release delete", "remote write: `gh release delete`"),
+            ("gh release upload", "remote write: `gh release upload`"),
+            ("gh release edit", "remote write: `gh release edit`"),
+        ],
+    ) {
+        return ask(reason);
+    }
+
     ShellCommandPolicy::Allow {
         risk: ShellRisk::Low,
     }
