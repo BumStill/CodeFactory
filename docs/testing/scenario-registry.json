@@ -125,7 +125,7 @@
       "category": "long_task_continuity",
       "priority": "P0",
       "source_kind": "anonymized_history_shape",
-      "change_patterns": ["src-tauri/src/commands/chat.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
+      "change_patterns": ["src-tauri/src/commands/chat.rs", "src-tauri/migrations/0025_message_sequence.sql", "src-tauri/src/agent/memory_manifest.rs", "src-tauri/src/agent/subagent.rs", "src-tauri/src/storage/message_sequence.rs", "src/stores/chat.ts", "src/pages/Workspace/WorkspacePage.tsx"],
       "automated_by": ["rust:arbitrary_real_user_message_links_the_unique_open_objective", "rust:multiple_open_objectives_fail_closed_as_a_system_owned_incident", "binary:--history-session-smoke"],
       "required_evidence": ["L1", "L2", "L3", "L4"],
       "gates": ["pull_request", "nightly", "release_artifact"]
