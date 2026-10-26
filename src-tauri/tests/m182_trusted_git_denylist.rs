@@ -69,6 +69,10 @@ fn m182_danger_classes_stay_unproved() {
         "git merge HEAD | sort -o ../outside", "git apply --directory=../outside patch",
         "git merge HEAD; git --git-dir=../other reset --hard HEAD",
         "git merge HEAD 2>&3", "git merge HEAD & git status",
+        "git apply --unsafe-paths patch", "git commit --pathspec-from-file=.env",
+        "git merge HEAD; git worktree remove --force missing ../outside",
+        "git checkout -- .env", "git merge HEAD | cat .env.local",
+        "git clean -f --exclude=../outside",
     ] {
         assert!(!trusted_git::local_rewrite(&root, command), "must ask: {command}");
     }

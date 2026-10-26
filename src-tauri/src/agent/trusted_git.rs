@@ -686,6 +686,9 @@ fn bounded_args(root: &Path, args: &[&str]) -> bool {
     args.iter().all(|word| {
         let value = word.split_once('=').map_or(*word, |(_, value)| value);
         if value.contains("..") || value.contains(':') || value.starts_with('/') || value.starts_with('\\') { return false; }
+        if !word.starts_with('-') || word.contains('=') {
+            if !safe_path(root, value) { return false; }
+        }
         if value.contains('/') || value.contains('\\') || root.join(value).exists() {
             safe_path(root, value)
         } else { true }
@@ -698,7 +701,7 @@ fn local_denylist(root: &Path, args: &[&str]) -> bool {
     if ["push", "config", "filter-branch", "filter-repo", "submodule", "send-email", "credential"].contains(verb) { return false; }
     if rest.iter().any(|w| {
         let option = w.split('=').next().unwrap_or(w);
-        ["--interactive", "--patch", "--edit", "--exec", "--editor", "--upload-pack", "--receive-pack", "--ext-diff", "--textconv", "--output", "--output-directory", "--git-dir", "--work-tree"].contains(&option)
+        ["--interactive", "--patch", "--edit", "--exec", "--editor", "--upload-pack", "--receive-pack", "--ext-diff", "--textconv", "--output", "--output-directory", "--git-dir", "--work-tree", "--unsafe-paths", "--pathspec-from-file", "--recurse-submodules", "--separate-git-dir", "--reference", "--alternate-refs-command"].contains(&option)
             || option.starts_with("--inter") || option.starts_with("--exe")
             || ["-i", "-p", "-e"].contains(&option)
             || *verb == "rebase" && (w.starts_with("-i") || w.starts_with("-x"))
