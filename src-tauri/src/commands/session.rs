@@ -651,6 +651,9 @@ struct MessagePageRow {
     reasoning_content: Option<String>,
     completion_state: Option<String>,
     created_at: i64,
+    /// MEM-A：分页读出的消息也要带排序身份/版本，否则回执在本路径上退回 None。
+    seq: Option<i64>,
+    revision: i64,
 }
 
 impl MessagePageRow {
@@ -670,6 +673,8 @@ impl MessagePageRow {
                 reasoning_content: self.reasoning_content,
                 completion_state: self.completion_state,
                 created_at: self.created_at,
+                seq: self.seq,
+                revision: self.revision,
             },
         )
     }
@@ -784,7 +789,7 @@ async fn load_message_page_below(
                     ) THEN 'rejected_candidate'
                     ELSE m.completion_state
                 END AS completion_state,
-                m.created_at
+                m.created_at, m.seq, m.revision
          FROM messages m
          WHERE m.session_id = ? AND m.rowid >= ? AND m.rowid < ?
          ORDER BY m.rowid ASC",
@@ -1489,6 +1494,8 @@ mod tests {
                 tool_calls TEXT,
                 reasoning_content TEXT,
                 completion_state TEXT,
+                seq INTEGER,
+                revision INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
             )",

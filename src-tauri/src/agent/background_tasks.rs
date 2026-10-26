@@ -1249,6 +1249,7 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
     let mut pending = FuturesUnordered::new();
     for (session, wakes) in sessions {
         pending.push(async move {
+            if !super::workspace_recovery_budget::due(pool, &session, now).await.unwrap_or(false) { return 0; }
             let due = wakes.iter().map(|wake| wake.next_at).min().unwrap_or(now);
             if now.saturating_sub(due) > 120 {
                 tracing::warn!(session, pending_seconds = now.saturating_sub(due), "wake overdue over two minutes; automatic retry");
@@ -1258,7 +1259,15 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
             let text = wakes.iter().map(|wake| {
                 wakeup_text(wake, wake.fire_count + 1, now.saturating_sub(wake.next_at) >= wake.every_sec.unwrap_or(1).max(1) as i64)
             }).collect::<Vec<_>>().join("\n\n");
-            if !deliver_wake(sink, session.clone(), text, due).await { return 0; }
+            if !deliver_wake(sink, session.clone(), text, due).await {
+                let attempts = super::workspace_recovery_budget::fail(pool, &session, now, "唤醒投递失败；系统自动重试/自愈").await.unwrap_or(0);
+                if attempts >= 3 {
+                    let _ = super::thin_state::ask_user(pool, &session, "工作区恢复连续失败；请确认项目目录或远端登记分支仍可访问。").await;
+                    cancel_session_wakeups(pool, &session).await;
+                }
+                return 0;
+            }
+            let _ = super::workspace_recovery_budget::clear(pool, &session).await;
             // 至少一次：成功入队才推进；崩溃前未推进仍可重试，不丢失原因。
             let mut advanced = false;
             for wake in wakes {
@@ -1566,6 +1575,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m184_failed_wakes_do_not_hot_loop() {
+        struct Reject(std::sync::atomic::AtomicUsize);
+        impl WakeSink for Reject {
+            fn enqueue(&self, _: String, _: String) -> WakeFuture {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { false })
+            }
+        }
+        let pool = memory_pool().await;
+        ensure_wakeup_schema(&pool).await.unwrap();
+        sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES ('synthetic-retry','s1','retry','agent_decided',1,'pending',1)").execute(&pool).await.unwrap();
+        let sink = Reject(std::sync::atomic::AtomicUsize::new(0));
+        for at in 1000..1060 { drain_due_wakeups_at(&pool, &sink, at).await; }
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 1, "at most one failure/log per minute per session");
+        drain_due_wakeups_at(&pool, &sink, 1060).await;
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn m183_blocked_sessions_do_not_delay_a_healthy_session() {
         let pool = memory_pool().await;
         for index in 0..7 {
@@ -1625,7 +1653,8 @@ mod tests {
         assert!(result.is_ok(), "one blocked enqueue must not stop the durable dispatcher");
         assert_eq!(get_wakeup(&pool, &wake.id).await.unwrap().unwrap().status, "pending");
         let recorder = Arc::new(Recorder::default());
-        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 161).await, 1);
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 161).await, 0);
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 220).await, 1);
         assert_eq!(recorder.take().len(), 1);
     }
 

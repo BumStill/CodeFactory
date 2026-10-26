@@ -2704,13 +2704,11 @@ struct ChatAdmissionReceipt {
 /// AppHandle-free admission receipt used by formal executable system smokes.
 /// It delegates to the desktop's atomic admission transaction rather than
 /// maintaining a second test-only chat schema.
-#[cfg(not(test))]
 pub(crate) struct HeadlessChatAdmission {
     pub root_turn_id: String,
     pub objective: crate::agent::objective::ObjectiveSnapshot,
 }
 
-#[cfg(not(test))]
 pub(crate) async fn admit_headless_chat_turn(
     pool: &sqlx::SqlitePool,
     session_id: &str,
@@ -2953,7 +2951,13 @@ async fn admit_persisted_chat_turn_with_origin(
             "M145: 新消息结算了遗留的会话停止意图"
         );
     }
+    crate::agent::workspace_recovery_budget::ensure(pool).await?;
     let mut tx = crate::storage::db::begin_write(pool).await?;
+    // A new user intent supersedes a previous workspace-recovery conclusion.
+    if matches!(origin, crate::agent::objective::TurnOrigin::User) {
+        sqlx::query("DELETE FROM workspace_recovery_budget WHERE session_id=?")
+            .bind(session_id).execute(&mut *tx).await?;
+    }
     let session_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id=?")
         .bind(session_id)
         .fetch_one(&mut *tx)
@@ -3538,6 +3542,9 @@ pub async fn send_system_wake(
 ) -> Result<(), AppError> {
     use tauri::Manager;
     let state = app.state::<AppState>();
+    let db = state.db.read().await.clone();
+    if crate::agent::execution_workspace::settle_missing_terminal_workspace(&db, &session_id)
+        .await.map_err(|error| AppError::Other(error.to_string()))? { return Ok(()); }
     let mcp = app.state::<Arc<McpManager>>();
     send_message_with_origin(
         app.clone(),
@@ -4590,6 +4597,8 @@ pub(crate) fn thin_resume_message(
     summary: &str,
 ) -> crate::storage::Message {
     crate::storage::Message {
+        seq: None,
+        revision: 1,
         id: format!("thin-resume:{key}"),
         session_id: session_id.to_string(),
         role: "user".into(),
@@ -4739,6 +4748,8 @@ async fn resume_chat_objective_inner(
         objective.failure_code.as_deref(),
     ) {
         history.push(crate::storage::Message {
+            seq: None,
+            revision: 1,
             id: format!("system-continuation:{}:{}", objective.id, objective.revision),
             session_id: session_id.clone(),
             role: "system".into(),
@@ -4973,6 +4984,8 @@ fn anon_message(session_id: &str, role: String, content: String) -> crate::stora
     // Dummy id / timestamps: these Messages only feed the model this run and
     // are never written to the DB.
     crate::storage::Message {
+        seq: None,
+        revision: 1,
         id: Uuid::new_v4().to_string(),
         session_id: session_id.to_string(),
         role,

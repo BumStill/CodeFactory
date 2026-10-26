@@ -2397,6 +2397,8 @@ mod tests {
         reasoning: Option<&str>,
     ) -> crate::storage::Message {
         crate::storage::Message {
+            seq: None,
+            revision: 1,
             id: id.into(),
             session_id: "session-8f0e312c".into(),
             role: role.into(),

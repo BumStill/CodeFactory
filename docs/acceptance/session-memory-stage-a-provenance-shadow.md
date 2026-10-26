@@ -1,0 +1,12 @@
+# MEM-A（会话记忆阶段 A）验收账本
+
+规格：`docs/specs/feature-specs/session-memory-stage-a-provenance-shadow.md`
+设计：`docs/specs/feature-specs/session-memory-design.md`（§13.1 阶段 A，§13.2 已决 D1–D5）
+
+| 需求 | 状态 | 证据 |
+| --- | --- | --- |
+| R1 稳定 `seq` / `revision`：会话内单调、不与并发写冲突、旧库回填、匿名/导入会话同样适用 | done | 迁移 `src-tauri/migrations/0025_message_sequence.sql`（`ALTER TABLE messages ADD COLUMN seq/revision` + `ROW_NUMBER()` 回填 + `messages_assign_seq` / `messages_bump_revision` 触发器 + `messages_session_seq` 索引）；`cargo test --lib message_sequence` 5 例全绿：`legacy_backfill_assigns_stable_monotonic_seq`（旧库同秒多行回填 1..N 且重开不变）、`backfill_is_idempotent_across_reopen`、`concurrent_inserts_get_unique_ordered_seq`（4 写入者×5 条 = 20 条，`COUNT(DISTINCT seq)=20`、`MAX(seq)=20`、每个写入者严格递增）、`revision_increments_when_content_changes`（内容升版、token 记账不升版）、`history_order_follows_seq_not_created_at`（导入会话时间戳乱序时按 `seq` 复现写入顺序） |
+| R2 每次装配记录 assembly manifest（来源 id/`seq`/`revision`、被排除项与原因、装配期合成项、线上指纹），只记录不改变请求 | done | `src-tauri/src/agent/memory_manifest.rs`（`assemble_with_provenance` / `manifest_record` / `assembly_manifests` 表）；`cargo test --lib memory_manifest` 4 例全绿：`manifest_matches_sent_wire_item_by_item`（回执逐项 `ordinal`/`role`/`fingerprint` 等于真正发出的 `ChatMessage`，`rejected_candidate` 带 `completion_state=rejected_candidate is not replayable` 原因，`recovered-tool-*` 标 `synthesized`，落库 payload 条目数与内存一致）、`flag_defaults_off_when_absent` |
+| R3 旧路径仍是唯一执行者：单次装配、不双跑模型/工具、回执不做投影 | done | `build_openai_messages` 改为 `memory_manifest::assemble_with_provenance(..).0` 的薄包装（`src-tauri/src/agent/mod.rs`），生产调用点走 `memory_manifest::assemble_for_request(&self.db, &self.session_id, history, system_prompt)`，回执与请求出自同一次装配；`manifest_write_failure_does_not_break_assembly`（`DROP TABLE assembly_manifests` 后仍返回完整装配结果，只记 warn） |
+| R4 先失败的测试覆盖四项：旧库迁移后 `seq` 稳定单调、并发写不乱序、manifest 与发送逐项一致、flag 关/开请求字节相同 | done | 先红：`cargo check --profile test` 报 `assemble_with_provenance`/`flag_enabled`/`set_flag`/`manifest_record`/`assemble_for_request` 与 `Message.seq/revision` 不存在；后绿：`shadow_flag_off_and_on_produce_identical_request_bytes`（`serde_json::to_vec` 逐字节相等，且关闭时 `assembly_manifests` 0 行、开启时 1 行）+ 上述 R1/R2 用例；全量 `cargo test --lib` 2023 通过 0 失败 |
+| R5 迁移非破坏（只加列/加表/索引 + 回填），并补验收账本 | done | `0025_message_sequence.sql` 无 DROP/无数据改写，`backfill_is_idempotent_across_reopen` 断言重复升级不改 `seq`、不减行；`storage::tests` 三个手工 fixture 补 `seq`/`revision` 列以对齐真实 schema（非放宽断言，原断言未改）；本文件即账本 |
