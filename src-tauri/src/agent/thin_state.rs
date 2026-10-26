@@ -388,6 +388,39 @@ pub async fn settle_outcome(
     stop_label: &str,
     external_what: Option<String>,
 ) -> sqlx::Result<ThinState> {
+    // M179: permission transport/identity reconciliation is system-owned,
+    // not a real technical failure. Use the persisted typed turn fact, never
+    // model prose or the broad PlatformIncident label alone.
+    if !finished && stop_label == "PlatformIncident" {
+        let permission_wait: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat_turn_state WHERE root_turn_id=?
+             AND session_id=? AND status='waiting'
+             AND terminal_reason IN ('permission_channel_closed','permission_timed_out'))",
+        ).bind(root_turn_id).bind(session_id).fetch_one(db).await?;
+        if permission_wait {
+            // list_wakeups initializes the durable scheduler schema as well.
+            super::background_tasks::list_wakeups(db, session_id).await
+                .map_err(sqlx::Error::Protocol)?;
+            let wake_id = format!("permission-reconcile-{session_id}");
+            let notice = "权限请求与当前任务暂未对齐，未执行操作；系统自动重试/自愈，工作区和改动保留";
+            sqlx::query(
+                "INSERT INTO wakeup_schedules(id,session_id,root_turn_id,prompt,source,next_at,status,created_at)
+                 VALUES (?,?,?,?,'agent_decided',?,'pending',?)
+                 ON CONFLICT(id) DO UPDATE SET root_turn_id=excluded.root_turn_id,
+                   prompt=excluded.prompt,next_at=excluded.next_at,status='pending',last_fired_at=NULL",
+            ).bind(&wake_id).bind(session_id).bind(root_turn_id)
+                .bind(format!("{notice}。重新核对当前会话 Objective 及最新 revision，继续原任务；不得重放已执行操作或沿用失效授权。"))
+                .bind(now().div_euclid(1000) + 60).bind(now().div_euclid(1000)).execute(db).await?;
+            let state = ThinState {
+                state: SessionState::WaitingWake,
+                waiting_for: Some(notice.into()), wake_source: Some(wake_id),
+                reason: Some(notice.into()), ..ThinState::running()
+            };
+            save(db, session_id, &state).await?;
+            project_turn(db, root_turn_id, &state).await?;
+            return Ok(state);
+        }
+    }
     // M160: a bounded delivery stop is not a completed task. Read the typed
     // turn fact, never classify the model's final text.
     if blocked {
@@ -485,6 +518,25 @@ mod settle_tests {
              INSERT INTO objectives (id,status) VALUES ('o-1','active');",
         ).execute(&db).await.unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn m179_three_permission_reconciliations_keep_session_and_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("permission.db").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m179','synthetic','/synthetic','model',1,1,'thin')").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,status,phase,revision,started_at,updated_at,terminal_reason,waiting_reason) VALUES ('m179-root','m179','waiting','waiting',1,1,1,'permission_channel_closed','系统正在核对权限绑定')").execute(&db).await.unwrap();
+        for _ in 0..3 {
+            let state = settle_outcome(&db, "m179", "m179-root", false, false, "", "PlatformIncident", None).await.unwrap();
+            assert_eq!(state.state, SessionState::WaitingWake);
+            assert_eq!(state.consecutive_failures, 0);
+            assert!(state.waiting_for.as_deref().unwrap().contains("系统自动重试/自愈"));
+            assert_eq!(super::super::background_tasks::list_wakeups(&db, "m179").await.unwrap().len(), 1);
+        }
+        let completed: Option<i64> = sqlx::query_scalar("SELECT completed_at FROM chat_turn_state WHERE root_turn_id='m179-root'").fetch_one(&db).await.unwrap();
+        assert!(completed.is_none());
+        db.close().await;
     }
 
     #[tokio::test]
