@@ -11,14 +11,14 @@ R4：SQLite 合成 fixture 验证 waiting、原 root 未完成、精确唤醒时
 - R2：m173_missing_credentials_is_visible_user_wait_not_orphan：缺凭据、心跳、可见问题及未终结回合。
 - R3：M173 optimistic bubbles without backend acknowledgement never claim delivered：先失败（resolved delivered），修复后通过。
 - R4 组合与跨进程既有覆盖：m164_hard_cap_matrix_and_deepseek_boundary、m164_model_wait_persists_exact_wake_across_restart、m178_wait_has_reason_and_survives_real_process_restart。
-- 完整 Rust、前端、生产构建及治理：执行中，交付前更新结果。
+- 完整 Rust 工作区 `cargo test --manifest-path src-tauri/Cargo.toml --workspace --no-fail-fast` 退出码 0；完整前端 159 文件/1056 项通过（含 lightModeAudit）；`pnpm build`、本地统一场景门禁、场景声明、README contract 与验收账本校验均通过。
 
 ## Harness 与协作
 Spec：原需求存档 m173-first-turn-silent-abort.md；Compatibility：保留 legacy 分支、复用原 schema；Observation：可见原因和持久 wake；Release：仅合并，not live；AI Collaboration：context scope 为启动 guard/thin 状态/派单回执，assumptions 为合成数据不访问真实凭据，review point 为两项只读审查，validation result 为先红后绿及完整门禁。
 无布局变化。真机验收由编排方发版后完成：设置 GPT 超 cap、DeepSeek 时段外、其他无凭据，经 dispatch 派单，核对 waiting_wake 原因/时间，重启后到点自动继续；全部无凭据时明确错误且 waiting_user，不得 legacy_orphan。
 
 Spec Amendment: 无。
-Scenario-Test: HLT-001
+Scenario-Test: HLT-001, CXD-001, CXD-002, HLT-003, HLT-004, HLT-005, RTE-004, UI-003, UI-004, UI-005, UI-008
 README-Update: reviewed
 README-Update-Reason: 内部首轮启动可靠性修复，不改变公开产品、安装、隐私或平台承诺。
 
