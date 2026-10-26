@@ -821,6 +821,14 @@ mod tests {
                 merged_settlement::settle_merged_sessions(&db).await.unwrap();
                 let state = super::super::thin_state::load(&db, session).await.unwrap().unwrap();
                 assert_ne!(state.state, SessionState::Ended, "M187 sweep ended {session}");
+                merged_settlement::settle_ended_and_cancel(&db, session, "stale closeout", "synthetic").await.unwrap();
+                let state = super::super::thin_state::load(&db, session).await.unwrap().unwrap();
+                assert_ne!(state.state, SessionState::Ended, "M187 direct settlement ended {session}");
+                super::super::workspace_recovery_budget::ensure(&db).await.unwrap();
+                sqlx::query("INSERT INTO workspace_recovery_budget(session_id,settled_reason) VALUES (?,'stale missing workspace')")
+                    .bind(session).execute(&db).await.unwrap();
+                let state = refresh(&db, session).await.unwrap();
+                assert_ne!(state.state, SessionState::Ended, "M187 stale workspace receipt ended {session}");
             }
             return;
         }
@@ -1775,6 +1783,12 @@ pub(crate) mod merged_settlement {
         session_id: &str,
         state: &thin_state::ThinState,
     ) -> Result<()> {
+        if state.state == thin_state::SessionState::Ended
+            && super::has_active_work(db, session_id).await? {
+            tracing::warn!(session_id, "terminal settlement rejected: active work; automatic recovery retains ownership");
+            thin_state::save(db, session_id, &thin_state::ThinState::running()).await?;
+            return Ok(());
+        }
         thin_state::ensure(db).await?;
         crate::agent::background_tasks::ensure_wake_schema(db).await?;
         let mut tx = db.begin().await?;
