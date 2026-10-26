@@ -269,6 +269,46 @@ fn normalize(command: &str) -> String {
     command.to_lowercase().replace('`', "")
 }
 
+/// M172 regression tests: credential reads and remote writes keep confirmation.
+#[cfg(test)]
+mod m172_shell_policy_ask {
+    use super::{classify_command, ShellCommandPolicy};
+
+    fn asks(command: &str) -> bool {
+        matches!(classify_command(command), ShellCommandPolicy::Ask { .. })
+    }
+
+    fn allows(command: &str) -> bool {
+        matches!(classify_command(command), ShellCommandPolicy::Allow { .. })
+    }
+
+    #[test]
+    fn m172_credential_exposure_asks() {
+        assert!(asks("gh auth status --show-token"));
+        assert!(asks("gh auth token"));
+        assert!(asks("gh auth login"));
+    }
+
+    #[test]
+    fn m172_remote_writes_ask() {
+        assert!(asks("gh pr merge 12"));
+        assert!(asks("gh release delete v1.91.34"));
+        assert!(asks("gh repo delete BumStill/example"));
+        assert!(asks("gh ruleset list"));
+        assert!(asks("gh secret set TOKEN"));
+    }
+
+    #[test]
+    fn m172_read_only_forge_queries_stay_allowed() {
+        assert!(allows("gh auth status"));
+        assert!(allows("gh pr view 12"));
+        assert!(allows("gh pr checks 12"));
+        assert!(allows("git fetch --prune origin main"));
+        assert!(allows("git merge-base --is-ancestor origin/main HEAD"));
+        assert!(allows("pnpm test"));
+    }
+}
+
 fn contains_any<'a>(command: &str, needles: &[(&str, &'a str)]) -> Option<&'a str> {
     needles
         .iter()
