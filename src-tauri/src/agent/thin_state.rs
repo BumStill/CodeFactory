@@ -163,6 +163,7 @@ pub fn after_no_model(lead_ms: i64) -> ThinState {
     ThinState {
         state: SessionState::WaitingWake,
         waiting_for: Some("模型恢复可用".to_string()),
+        reason: Some("模型暂不可用，系统自动重试/自愈，到点自动继续，不需要你操作。".into()),
         wake_source: Some(format!("模型恢复时间 {}", at)),
         ..ThinState::running()
     }
@@ -342,15 +343,13 @@ pub async fn settle_error(db: &SqlitePool, session_id: &str, root_turn_id: &str,
     let state = if error_text == "agent loop stopped: Cancelled" {
         ThinState::ended("cancelled：回合已取消", "本会话记录")
     } else if let Some(unavailable) = super::failover::ModelUnavailable::parse(error_text) {
-        if let Some(at) = unavailable.resume_at_ms {
-            super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, &unavailable.notice).await?;
-            ThinState {
-                waiting_for: Some(unavailable.notice),
-                wake_source: Some(format!("model-availability-{session_id}")),
-                ..after_no_model(at.saturating_sub(now()))
-            }
-        } else {
-            ThinState::ended(&unavailable.notice, "本会话记录")
+        let at = unavailable.resume_at_ms.unwrap_or_else(|| now().saturating_add(60_000));
+        super::background_tasks::persist_model_wakeup(db, session_id, root_turn_id, at, &unavailable.notice).await?;
+        ThinState {
+            waiting_for: Some(unavailable.notice.clone()),
+            reason: Some(unavailable.notice),
+            wake_source: Some(format!("model-availability-{session_id}")),
+            ..after_no_model(at.saturating_sub(now()))
         }
     } else if error_text.contains("no_model_available") {
         let at = now().saturating_add(60_000);
@@ -501,6 +500,60 @@ pub async fn close_objective(db: &SqlitePool, objective_id: &str, state: &ThinSt
 #[cfg(test)]
 mod settle_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn m178_wait_has_reason_and_survives_real_process_restart() {
+        const ENV: &str = "CODEFACTORY_M178_SYNTHETIC_DB";
+        if let Ok(url) = std::env::var(ENV) {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            if std::env::var("CODEFACTORY_M178_PHASE").unwrap() == "write" {
+                sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m178','synthetic','/synthetic','model',1,1,'thin')").execute(&db).await.unwrap();
+                let at = chrono::Utc::now().timestamp_millis() + 60_000;
+                let error = super::super::failover::ModelUnavailable { resume_at_ms: Some(at), notice: "DeepSeek 时段外，系统自动重试/自愈，到点自动继续".into() }.encode();
+                for _ in 0..3 {
+                    let state = settle_error(&db, "m178", "m178-root", &error).await.unwrap();
+                    assert_eq!(state.state, SessionState::WaitingWake);
+                    assert_eq!(state.consecutive_failures, 0);
+                    assert!(state.failure_signature.is_none());
+                    assert!(state.reason.as_deref().is_some_and(|reason| !reason.trim().is_empty()));
+                }
+            } else {
+                let state = load(&db, "m178").await.unwrap().unwrap();
+                assert_eq!(state.state, SessionState::WaitingWake);
+                assert_eq!(state.consecutive_failures, 0);
+                assert!(state.reason.as_deref().unwrap().contains("自动继续"));
+                let wakes = super::super::background_tasks::list_wakeups(&db, "m178").await.unwrap();
+                assert_eq!(wakes.len(), 1);
+                assert_eq!(wakes[0].root_turn_id.as_deref(), Some("m178-root"));
+                struct Sink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+                impl super::super::background_tasks::WakeSink for Sink {
+                    fn enqueue(&self, session: String, text: String) -> super::super::background_tasks::WakeFuture {
+                        assert_eq!(session, "m178");
+                        assert!(text.contains("自动继续"));
+                        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Box::pin(async { true })
+                    }
+                }
+                let sink = Sink(Default::default());
+                let at = wakes[0].next_at;
+                assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at - 1).await, 0);
+                assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at).await, 1);
+                assert_eq!(super::super::background_tasks::drain_due_wakeups_at(&db, &sink, at).await, 0);
+                assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+            db.close().await;
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("m178.db").display());
+        for phase in ["write", "resume"] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "agent::thin_state::settle_tests::m178_wait_has_reason_and_survives_real_process_restart", "--nocapture"])
+                .env(ENV, &url).env("CODEFACTORY_M178_PHASE", phase).output().unwrap();
+            assert!(result.status.success(), "{phase}: {} {}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        }
+        assert!(after_no_model(60_000).reason.as_deref().is_some_and(|reason| reason.contains("自动继续")));
+    }
 
     async fn db() -> SqlitePool {
         let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
