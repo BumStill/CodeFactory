@@ -869,6 +869,22 @@ mod tests {
             assert_eq!(outcome, PermissionOutcome::Allow, "M180 trusted command: {command}");
             assert!(gateway.pending_permissions.lock().await.is_empty());
         }
+        // M182 R1/R5: exact redirect/pipeline incidents must traverse the
+        // production gateway, create durable backups and leave no prompt.
+        for command in [
+            "git fetch --prune origin main && git merge origin/main --no-edit 2>&1 | tail -25; git status --short | head -20",
+            "git reset -q --hard HEAD && git status --short && git merge --no-edit origin/main 2>&1 | tail -5",
+            "git merge --no-edit origin/main > merge.log || git status --short",
+        ] {
+            let before = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+            let args = serde_json::json!({"command": command});
+            let call = ToolCall { id: format!("m182-{}", before.lines().count()), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            let outcome = tokio::time::timeout(Duration::from_secs(10), gateway.authorize(&call, &args, Some(command))).await.expect("trusted incident must not wait for approval");
+            assert_eq!(outcome, PermissionOutcome::Allow, "{command}");
+            assert!(gateway.pending_permissions.lock().await.is_empty());
+            let after = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+            assert!(after.lines().count() > before.lines().count(), "backup must precede Allow: {command}");
+        }
         std::fs::write(root.join("tracked.txt"), "uncommitted").unwrap();
         let command = "git reset --hard HEAD";
         let args = serde_json::json!({"command": command});
