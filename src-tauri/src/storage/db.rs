@@ -276,7 +276,20 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     }
 
     // Idempotent schema sync — see ensure_schema doc-comment for the why.
-    ensure_schema(&pool).await?;
+    ensure_schema(&pool).await.map_err(|error| crate::errors::AppError::Other(
+        format!("Database startup schema repair failed (MEM-A/legacy upgrade): {error}")
+    ))?;
+    // Fail at startup, never after a user starts a turn. Preparing these
+    // statements verifies all MEM-A columns/tables before publishing the pool.
+    for statement in [
+        "SELECT seq, revision FROM messages LIMIT 0",
+        "SELECT name, enabled, updated_at FROM feature_flags LIMIT 0",
+        "SELECT id, session_id, created_at, flag_enabled, source_count, excluded_count, wire_fingerprint, payload_json FROM assembly_manifests LIMIT 0",
+    ] {
+        sqlx::query(statement).execute(&pool).await.map_err(|error|
+            crate::errors::AppError::Other(format!("Database startup schema verification failed (MEM-A): {error}"))
+        )?;
+    }
 
     // Foreign keys need no follow-up PRAGMA here: `foreign_keys(true)` in
     // `pool_connect_options` turns them on for every connection in the pool,
@@ -764,6 +777,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "messages", "reasoning_content", "TEXT").await?;
     ensure_column(pool, "messages", "completion_state", "TEXT").await?;
     ensure_column(pool, "messages", "endpoint_id", "TEXT").await?;
+    ensure_message_sequence_schema(pool).await?;
 
     // The turn-notice dedup check filters by (session_id, completion_state)
     // before its LIKE, so this turns a full conversation scan per turn into an
@@ -1651,6 +1665,38 @@ pub(crate) async fn backfill_session_activity_time(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// M185: repair MEM-A even when the migration ledger has historical checksums.
+async fn ensure_message_sequence_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
+        .fetch_all(pool).await?;
+    // Partial-table fixtures are supported by ensure_schema; connect validates
+    // the complete production shape before exposing a usable pool.
+    if !columns.iter().any(|name| name == "session_id") {
+        return Ok(());
+    }
+    ensure_column(pool, "messages", "seq", "INTEGER").await?;
+    ensure_column(pool, "messages", "revision", "INTEGER NOT NULL DEFAULT 1").await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "WITH missing AS (
+            SELECT id, COALESCE((SELECT MAX(existing.seq) FROM messages existing
+                WHERE existing.session_id = m.session_id), 0)
+                + ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at, rowid) AS assigned
+            FROM messages m WHERE seq IS NULL
+         ) UPDATE messages SET seq=(SELECT assigned FROM missing WHERE missing.id=messages.id)
+         WHERE seq IS NULL",
+    ).execute(&mut *tx).await?;
+    // Keep trigger/table definitions identical to the canonical migration,
+    // without replaying its non-idempotent ALTERs or renumbering existing rows.
+    let migration = include_str!("../../migrations/0025_message_sequence.sql");
+    let objects = migration.split_once("CREATE INDEX IF NOT EXISTS messages_session_seq")
+        .expect("MEM-A migration contains its sequence index").1;
+    let objects = format!("CREATE INDEX IF NOT EXISTS messages_session_seq{objects}");
+    sqlx::Executor::execute(&mut *tx, objects.as_str()).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn ensure_column(

@@ -422,8 +422,8 @@
       "category": "runtime_lifecycle",
       "priority": "P1",
       "source_kind": "product_contract",
-      "change_patterns": ["src-tauri/src/storage/mod.rs", "src-tauri/src/storage/db.rs", "src-tauri/src/storage/write_lock.rs", "src-tauri/src/agent/persistence.rs", "scripts/validate-write-transaction-scope.mjs"],
-      "automated_by": ["rust:begin_write_waits_for_a_contended_writer_instead_of_failing", "rust:m144_returned_raw_transaction_cannot_poison_later_writes", "rust:m144_failed_contended_write_does_not_disable_later_writes", "rust:m144_parallel_writers_all_commit_on_every_platform"],
+      "change_patterns": ["src-tauri/src/storage/mod.rs", "src-tauri/src/storage/db.rs", "src-tauri/src/storage/write_lock.rs", "src-tauri/src/storage/m185_sequence_upgrade.rs", "src-tauri/src/storage/fixtures/v1_91_44_pre_mem_a.sql", "src-tauri/src/agent/persistence.rs", "scripts/validate-write-transaction-scope.mjs"],
+      "automated_by": ["rust:m185_checksum_mismatch_repairs_sequence_before_chat_history", "rust:m185_partial_mem_a_install_is_repaired_without_renumbering", "rust:m185_empty_database_can_admit_and_replay_new_turn", "rust:begin_write_waits_for_a_contended_writer_instead_of_failing", "rust:m144_returned_raw_transaction_cannot_poison_later_writes", "rust:m144_failed_contended_write_does_not_disable_later_writes", "rust:m144_parallel_writers_all_commit_on_every_platform"],
       "required_evidence": ["L1"],
       "gates": ["pull_request"]
     },
