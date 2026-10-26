@@ -27,7 +27,7 @@ context scope：background_tasks / thin_derive / objective_diagnostics；assumpt
 3. 导出会话诊断，核对 overdue_wakeups / oldest_wakeup_delay_secs / wakeup_retry_count；阻塞项应保留 pending 并自动重试。
 4. 确认无 waiting_wake 缺 pending/活后台任务/PR 监视来源；附脱敏聚合查询结果。
 
-Scenario-Test: RTE-005, OBJ-001, RTE-004
+Scenario-Test: RTE-005, RTE-004, HLT-001, HLT-004, RTE-003
 README-Update: reviewed
 README-Update-Reason: 修复内部持久唤醒可靠性，不改变公开安装、隐私或平台承诺。
 
