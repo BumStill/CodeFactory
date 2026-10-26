@@ -1653,7 +1653,8 @@ mod tests {
         assert!(result.is_ok(), "one blocked enqueue must not stop the durable dispatcher");
         assert_eq!(get_wakeup(&pool, &wake.id).await.unwrap().unwrap().status, "pending");
         let recorder = Arc::new(Recorder::default());
-        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 161).await, 1);
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 161).await, 0);
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 220).await, 1);
         assert_eq!(recorder.take().len(), 1);
     }
 
