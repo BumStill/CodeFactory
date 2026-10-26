@@ -1,6 +1,6 @@
 # M175 交付验收记录
 
-Scenario-Test: CXD-002
+Scenario-Test: CXD-001, CXD-002, HLT-003, HLT-004, HLT-005, RTE-004
 README-Update: reviewed
 README-Update-Reason: 修复已有授权交付语义，不改变公开产品或安装承诺。
 
