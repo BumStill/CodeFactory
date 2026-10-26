@@ -458,7 +458,7 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("agent loop error").chars().take(160).collect()
 }
 
-async fn project_turn(db: &SqlitePool, root_turn_id: &str, state: &ThinState) -> sqlx::Result<()> {
+pub(crate) async fn project_turn(db: &SqlitePool, root_turn_id: &str, state: &ThinState) -> sqlx::Result<()> {
     let (phase, kind, label) = match state.state {
         SessionState::Running => ("working", "thin_running", "运行中".to_string()),
         SessionState::WaitingWake => ("waiting", "thin_waiting_wake", format!("等唤醒：{}", state.waiting_for.clone().unwrap_or_default())),

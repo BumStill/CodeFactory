@@ -160,6 +160,7 @@ function classifyDelivery(input: {
   const assistant = after.messages.find(
     (message) => message.role === "assistant" && message.rootTurnId === user.id,
   );
+  if (!assistant?.startupAcknowledged) return null;
   if (
     assistant &&
     (assistant.runtimeError || assistant.failureEvidence || /^\s*Error:/i.test(assistant.content))

@@ -2536,6 +2536,31 @@ async fn converge_aborted_chat_setup(
         ));
     }
 
+    if crate::agent::thin::is_thin(pool, session_id).await {
+        // M173: a freshly admitted thin turn has no state row yet. Passing
+        // its setup error to the legacy router retires it as legacy_orphan.
+        // Keep the opaque Objective active and settle only the thin authority.
+        if objective.status == ObjectiveStatus::Active && objective.revision == objective_revision {
+            let reason = failure_text.unwrap_or("启动阶段中断，系统自动重试/自愈，稍后自动继续");
+            let retry = crate::agent::failover::ModelUnavailable::parse(reason)
+                .map(|_| reason.to_string())
+                .or_else(|| reason.contains("no_model_available").then(|| reason.to_string()))
+                .or_else(|| failure_text.is_none().then(|| crate::agent::failover::ModelUnavailable {
+                    resume_at_ms: Some(Utc::now().timestamp_millis() + 60_000),
+                    notice: reason.into(),
+                }.encode()));
+            let thin = if let Some(retry) = retry {
+                crate::agent::thin_state::settle_error(pool, session_id, &root_turn_id, &retry).await?
+            } else {
+                crate::agent::thin_state::ask_user(pool, session_id,
+                    &format!("任务未能启动：{}。请检查模型凭据或项目配置后重试。", reason)).await?
+            };
+            crate::agent::thin_state::project_turn(pool, &root_turn_id, &thin).await?;
+        }
+        settle_chat_run_control(pool, &control.run_instance_id).await?;
+        return Ok(Some(ChatSetupConvergence { root_turn_id, objective }));
+    }
+
     if objective.status == ObjectiveStatus::Active && objective.revision == objective_revision {
         // Only the exact admitted revision may be transferred. If another
         // actor already advanced the Objective, this stale setup guard merely
@@ -2611,6 +2636,17 @@ async fn converge_and_project_aborted_chat_setup(
     let settlement = converge_aborted_chat_setup(pool, control, session_id, failure_text).await?;
     if let (Some(app), Some(settlement)) = (event_app, settlement) {
         let event_name = format!("stream:{session_id}");
+        if crate::agent::thin::is_thin(pool, session_id).await {
+            if let Some(thin) = crate::agent::thin_state::load(pool, session_id).await? {
+                let reason = thin.question.or(thin.reason).unwrap_or_else(|| "启动等待，系统自动重试/自愈".into());
+                app.emit(&event_name, StreamEvent::TransportRetry {
+                    label: "模型使用时段等待".into(), attempt: 0, max_attempts: 0,
+                    delay_ms: 0, reason,
+                }).ok();
+            }
+            clear_chat_running_if_current(chat_cancels, session_id, control).await;
+            return Ok(());
+        }
         project_chat_objective(
             pool,
             app,
@@ -3589,8 +3625,18 @@ async fn send_message_with_origin(
                             error = %convergence_error,
                             "chat setup recovery persistence deferred to guard retry"
                         );
+                        return Err(convergence_error);
                     }
-                    return Ok(());
+                    // M173: acknowledgement requires a runnable executor or
+                    // a persisted automatic wake. A visible user wait is an
+                    // explicit dispatch error, never delivered.
+                    if crate::agent::thin::is_thin(&db, &session_id).await {
+                        let thin = crate::agent::thin_state::load(&db, &session_id).await?;
+                        if thin.is_some_and(|thin| thin.state == crate::agent::thin_state::SessionState::WaitingWake) {
+                            return Ok(());
+                        }
+                    }
+                    return Err(setup_error);
                 }
             }
         };
@@ -5154,6 +5200,57 @@ fn select_chat_mode(
 mod tests {
     use super::*;
     use crate::agent::failover::{ActiveRouteState, EndpointHealthRegistry};
+
+    #[tokio::test]
+    async fn m173_thin_setup_failure_keeps_durable_wake_and_never_orphans() {
+        use crate::agent::{thin_state, background_tasks, failover::ModelUnavailable};
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m173','synthetic','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        let control = crate::ChatRunControl::pending();
+        let admission = admit_persisted_chat_turn_with_origin(&pool, &control, "m173", None, "开始修复", crate::agent::objective::TurnOrigin::User).await.unwrap();
+        let at = Utc::now().timestamp_millis() + 120_000;
+        let reason = ModelUnavailable { resume_at_ms: Some(at), notice: "GPT 达到上限，DeepSeek 时段外；系统自动重试/自愈，到点继续".into() }.encode();
+        let settled = converge_aborted_chat_setup(&pool, &control, "m173", Some(&reason)).await.unwrap().unwrap();
+        assert_ne!(settled.objective.status.as_str(), "legacy_orphan");
+        let thin = thin_state::load(&pool, "m173").await.unwrap().expect("startup must persist visible state");
+        assert_eq!(thin.state, thin_state::SessionState::WaitingWake);
+        assert!(thin.reason.as_deref().unwrap().contains("达到上限"));
+        let turn: (String, Option<i64>) = sqlx::query_as("SELECT status,completed_at FROM chat_turn_state WHERE root_turn_id=?").bind(&admission.root_turn_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(turn.0, "waiting");
+        assert_eq!(turn.1, None);
+        let wakes = background_tasks::list_wakeups(&pool, "m173").await.unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].next_at, (at + 999) / 1000);
+        struct Sink;
+        impl background_tasks::WakeSink for Sink {
+            fn enqueue(&self, session: String, text: String) -> background_tasks::WakeFuture {
+                assert_eq!(session, "m173");
+                assert!(text.contains("继续原任务"));
+                Box::pin(async { true })
+            }
+        }
+        assert_eq!(background_tasks::drain_due_wakeups_at(&pool, &Sink, wakes[0].next_at - 1).await, 0);
+        assert_eq!(background_tasks::drain_due_wakeups_at(&pool, &Sink, wakes[0].next_at).await, 1);
+        assert_eq!(background_tasks::drain_due_wakeups_at(&pool, &Sink, wakes[0].next_at).await, 0);
+    }
+
+    #[tokio::test]
+    async fn m173_missing_credentials_is_visible_user_wait_not_orphan() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('m173-auth','synthetic','/synthetic','model',1,1,'thin')").execute(&pool).await.unwrap();
+        let control = crate::ChatRunControl::pending();
+        let admission = admit_persisted_chat_turn_with_origin(&pool, &control, "m173-auth", None, "开始修复", crate::agent::objective::TurnOrigin::User).await.unwrap();
+        let reason = "所有可用模型端点均不可用：没有配置任何模型端点，请配置凭据";
+        let settled = converge_aborted_chat_setup(&pool, &control, "m173-auth", Some(reason)).await.unwrap().unwrap();
+        assert_eq!(settled.objective.status.as_str(), "active");
+        let state = crate::agent::thin_derive::refresh(&pool, "m173-auth").await.unwrap();
+        assert_eq!(state.state, crate::agent::thin_state::SessionState::WaitingUser);
+        assert!(state.question.as_deref().unwrap().contains("凭据"));
+        let turn: (String, Option<i64>) = sqlx::query_as("SELECT status,completed_at FROM chat_turn_state WHERE root_turn_id=?").bind(&admission.root_turn_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(turn, ("waiting".into(), None));
+        let status: String = sqlx::query_scalar("SELECT status FROM chat_run_controls WHERE run_instance_id=?").bind(&control.run_instance_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "completed");
+    }
 
     #[tokio::test]
     async fn live_executor_without_durable_registration_survives_three_ticks() {

@@ -743,6 +743,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           content,
           rootTurnId: exactRootTurnId,
         });
+        set((s) => {
+          const runtime = s.runtime[id];
+          if (!runtime) return {};
+          return { runtime: { ...s.runtime, [id]: { ...runtime,
+            messages: runtime.messages.map((message) => message.id === assistantMsgId
+              ? { ...message, startupAcknowledged: true } : message),
+          } } };
+        });
       }
     } catch (e) {
       if (isChatRunBusyError(e)) {
