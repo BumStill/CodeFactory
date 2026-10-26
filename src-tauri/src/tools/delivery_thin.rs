@@ -63,21 +63,28 @@ fn echoes_branch(title: &str, branch: &str) -> bool {
         || claim_lower.starts_with("objective-")
 }
 
-/// Conventional Commit subjects are what this repository releases from; a title
-/// without one gives the squash subject and the release note nothing to work with.
-fn conventional_subject(title: &str) -> bool {
-    let Some((head, rest)) = title.trim().split_once(':') else {
-        return false;
-    };
-    if rest.trim().is_empty() {
-        return false;
+/// A Conventional Commit subject split into its kind, the markers that follow it
+/// (`(scope)` and `!`) and the description the title talks about.
+fn split_subject(title: &str) -> Option<(&str, &str, &str)> {
+    let (head, description) = title.trim().split_once(':')?;
+    let description = description.trim();
+    if description.is_empty() {
+        return None;
     }
     let head = head.trim();
     let kind_end = head.find(['(', '!']).unwrap_or(head.len());
+    let kind = &head[..kind_end];
     matches!(
-        &head[..kind_end],
+        kind,
         "feat" | "fix" | "chore" | "docs" | "refactor" | "test" | "ci" | "build" | "perf" | "style"
     )
+    .then_some((kind, &head[kind_end..], description))
+}
+
+/// Conventional Commit subjects are what this repository releases from; a title
+/// without one gives the squash subject and the release note nothing to work with.
+fn conventional_subject(title: &str) -> bool {
+    split_subject(title).is_some()
 }
 
 fn usable_title(title: &str, branch: &str) -> bool {
@@ -104,6 +111,108 @@ fn recent_subjects(commands: &mut impl Commands) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// M171 — the type a PR title carries decides whether the batch ships at all:
+/// release cadence only starts a version from `feat`/`fix`. Taking it from the
+/// newest commit let a repair whose last commit was `test:` reach main as a test
+/// change (#854, #858, #828), so the type now comes from the whole change.
+/// The revision the branch forked from: a branch-scoped range, never `main`'s own
+/// history — a `feat:` commit on main must not turn this branch's repair into one.
+fn base_revision(commands: &mut impl Commands) -> String {
+    let default_branch = commands
+        .git(&["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.rsplit('/').next().map(|b| format!("origin/{b}")))
+        .unwrap_or_else(|| "origin/main".to_string());
+    commands
+        .git(&["merge-base", &default_branch, "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_branch)
+}
+
+/// Everything this delivery changes: committed on the branch, staged, unstaged,
+/// and untracked. Only the union can say what the PR really is.
+fn changed_files(commands: &mut impl Commands) -> Vec<String> {
+    let base = base_revision(commands);
+    let mut files: Vec<String> = commands
+        .git(&["diff", "--name-only", &base])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if let Ok(untracked) = commands.git(&["ls-files", "--others", "--exclude-standard"]) {
+        files.extend(
+            untracked
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn is_doc_path(path: &str) -> bool {
+    let path = path.trim_start_matches("./");
+    path.starts_with("docs/") || path.ends_with(".md")
+}
+
+/// Product code is anything a person can observe except the test suite and the
+/// docs — configuration, scripts and manifests included, so the conservative
+/// answer for them is `fix`, not a prefix that never releases.
+fn is_test_path(path: &str) -> bool {
+    let path = path.trim_start_matches("./");
+    path.starts_with("tests/") || path.starts_with("test/") || path.contains("/tests/")
+}
+
+/// An explicit `feat:`/`feat(scope):` declaration — in the branch's own commits
+/// or in the diff itself (a spec written by this delivery) — is the only signal
+/// that a change adds capability rather than repairing one.
+fn declares_feature(commands: &mut impl Commands, subjects: &[String]) -> bool {
+    if subjects
+        .iter()
+        .any(|subject| split_subject(subject).is_some_and(|(kind, _, _)| kind == "feat"))
+    {
+        return true;
+    }
+    let base = base_revision(commands);
+    commands
+        .git(&["diff", &base])
+        .unwrap_or_default()
+        .lines()
+        .map(|line| line.trim_start_matches(['+', '-']).trim())
+        .any(|line| line.starts_with("feat:") || line.starts_with("feat("))
+}
+
+fn derived_kind(commands: &mut impl Commands, subjects: &[String], fallback: &str) -> String {
+    let files = changed_files(commands);
+    if files.iter().any(|path| !is_doc_path(path) && !is_test_path(path)) {
+        return if declares_feature(commands, subjects) { "feat" } else { "fix" }.to_string();
+    }
+    if files.is_empty() {
+        return fallback.to_string();
+    }
+    if files.iter().all(|path| is_doc_path(path)) { "docs" } else { "test" }.to_string()
+}
+
+/// Keep the description and the `(scope)`/`!` markers; replace only a type that
+/// the actual change contradicts.
+fn retype(title: &str, kind: &str) -> String {
+    match split_subject(title) {
+        Some((current, markers, description)) if current != kind => {
+            format!("{kind}{markers}: {description}")
+        }
+        _ => title.trim().to_string(),
+    }
+}
+
 /// An already-open PR may carry a title a human already corrected; never lose it.
 fn open_pr_title(commands: &mut impl Commands, branch: &str) -> Option<String> {
     let listed = commands
@@ -118,30 +227,29 @@ fn open_pr_title(commands: &mut impl Commands, branch: &str) -> Option<String> {
 
 /// Resolve the PR title before anything is committed or pushed: the model's own
 /// title, then this branch's first meaningful commit subject, then a title a
-/// human already fixed on the open PR. Nothing usable means no delivery at all.
+/// human already fixed on the open PR. The description comes from that source,
+/// the type from what the whole delivery actually changes. Nothing usable means no
+/// delivery at all.
 fn resolve_title(commands: &mut impl Commands, args: &Value, branch: &str) -> Result<String, String> {
-    if let Some(title) = args
+    let subjects = recent_subjects(commands);
+    let chosen = args
         .get("title")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|title| usable_title(title, branch))
-    {
-        return Ok(title.to_string());
-    }
-    if let Some(subject) = recent_subjects(commands)
-        .into_iter()
-        .find(|subject| usable_title(subject, branch))
-    {
-        return Ok(subject);
-    }
-    if let Some(title) = open_pr_title(commands, branch).filter(|title| usable_title(title, branch)) {
-        return Ok(title);
-    }
-    Err(format!(
-        "deliver_changes 缺少可用的 PR 标题：调用没有给 title，分支 {branch} 上也没有能用作标题的提交说明。\
+        .map(str::to_owned)
+        .or_else(|| subjects.iter().find(|s| usable_title(s, branch)).cloned())
+        .or_else(|| open_pr_title(commands, branch).filter(|title| usable_title(title, branch)));
+    let Some(chosen) = chosen else {
+        return Err(format!(
+            "deliver_changes 缺少可用的 PR 标题：调用没有给 title，分支 {branch} 上也没有能用作标题的提交说明。\
 请用 title 传一句描述本次改动的 Conventional Commit 标题（如 fix: 修复标题回落成分支名），\
 本次未提交、未推送任何内容。"
-    ))
+        ));
+    };
+    // M171: the newest commit may be `test:` while the change is a repair.
+    let kind = derived_kind(commands, &subjects, split_subject(&chosen).map(|(kind, _, _)| kind).unwrap_or("fix"));
+    Ok(retype(&chosen, &kind))
 }
 
 fn run(commands: &mut impl Commands, args: &Value, ceiling: DeliveryCeiling, excludes: &[String], log: &mut Log) -> Result<Value, String> {
@@ -345,6 +453,7 @@ mod tests {
         // M132: the title the forge actually received, and the commit subjects the
         // branch carries (`git log --format=%s`, newest first).
         subjects: Vec<String>, pr_title: Option<String>,
+        changed_paths: String, spec_text: String,
         created_title: Option<String>, edited_title: Option<String>,
         // M147b: the commit message the local commit actually carried.
         commit_message: Option<String>,
@@ -370,6 +479,9 @@ mod tests {
                 "branch" => "feature".into(), "rev-parse" => "abc123".into(),
                 "ls-remote" if self.pushed => "abc123\trefs/heads/feature".into(),
                 "log" => self.subjects.join("\n"),
+                "symbolic-ref" => "origin/main".into(),
+                "merge-base" => "synthetic-base".into(),
+                "diff" => if a.contains(&"--name-only") { self.changed_paths.clone() } else { self.spec_text.clone() },
                 "commit" => {
                     self.events.push("commit");
                     self.commit_message = a.iter().position(|arg| *arg == "-m")
@@ -562,6 +674,25 @@ mod tests {
         let mut forge = Forge { pushed:true, pr:true, armed:true, ..Default::default() };
         let _ = deliver(&mut forge).unwrap();
         assert!(forge.dispatched, "re-arming an armed PR must dispatch the queue");
+    }
+
+    #[test]
+    fn m171_whole_diff_controls_title_and_commit() {
+        for (paths, subjects, explicit, spec, expected) in [
+            ("src/runtime.rs\ntests/runtime.rs", vec!["test: cover recovery", "fix: recover writes"], None, "", "fix: cover recovery"),
+            ("tests/runtime.rs", vec!["test: cover recovery"], None, "", "test: cover recovery"),
+            ("docs/guide.md", vec!["docs: explain recovery"], Some("fix: explain recovery"), "", "docs: explain recovery"),
+            ("src/runtime.rs", vec!["test: cover recovery", "feat: add recovery"], Some("test: cover recovery"), "", "feat: cover recovery"),
+            ("src/runtime.rs\ndocs/specs/feature.md", vec!["test: cover recovery"], None, "+feat: add recovery", "feat: cover recovery"),
+            ("src/runtime.rs", vec!["test: cover recovery"], None, "", "fix: cover recovery"),
+        ] {
+            let mut forge = Forge { changed_paths: paths.into(), subjects: subjects.into_iter().map(str::to_owned).collect(), spec_text: spec.into(), ..Default::default() };
+            let mut args = json!({"body":"synthetic", "release_urgency":"immediate"});
+            if let Some(title) = explicit { args["title"] = json!(title); }
+            run(&mut forge, &args, DeliveryCeiling::ThroughMerge, &[], &mut Log::default()).unwrap();
+            assert_eq!(forge.created_title.as_deref(), Some(expected), "{paths}");
+            assert_eq!(forge.commit_message.as_deref(), Some(format!("{expected}\n\nRelease-Urgency: immediate").as_str()));
+        }
     }
 
     // ---- M132: the PR title/body must describe the change, never the branch ----
