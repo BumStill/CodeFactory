@@ -272,7 +272,20 @@ pub async fn connect(db_path: &str) -> crate::errors::Result<SqlitePool> {
     }
 
     // Idempotent schema sync — see ensure_schema doc-comment for the why.
-    ensure_schema(&pool).await?;
+    ensure_schema(&pool).await.map_err(|error| crate::errors::AppError::Other(
+        format!("Database startup schema repair failed (MEM-A/legacy upgrade): {error}")
+    ))?;
+    // Fail at startup, never after a user starts a turn. Preparing these
+    // statements verifies all MEM-A columns/tables before publishing the pool.
+    for statement in [
+        "SELECT seq, revision FROM messages LIMIT 0",
+        "SELECT name, enabled, updated_at FROM feature_flags LIMIT 0",
+        "SELECT id, session_id, created_at, flag_enabled, source_count, excluded_count, wire_fingerprint, payload_json FROM assembly_manifests LIMIT 0",
+    ] {
+        sqlx::query(statement).execute(&pool).await.map_err(|error|
+            crate::errors::AppError::Other(format!("Database startup schema verification failed (MEM-A): {error}"))
+        )?;
+    }
 
     // Foreign keys need no follow-up PRAGMA here: `foreign_keys(true)` in
     // `pool_connect_options` turns them on for every connection in the pool,
@@ -760,6 +773,7 @@ async fn ensure_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
     ensure_column(pool, "messages", "reasoning_content", "TEXT").await?;
     ensure_column(pool, "messages", "completion_state", "TEXT").await?;
     ensure_column(pool, "messages", "endpoint_id", "TEXT").await?;
+    ensure_message_sequence_schema(pool).await?;
 
     // The turn-notice dedup check filters by (session_id, completion_state)
     // before its LIKE, so this turns a full conversation scan per turn into an
@@ -1647,6 +1661,38 @@ pub(crate) async fn backfill_session_activity_time(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// M185: repair MEM-A even when the migration ledger has historical checksums.
+async fn ensure_message_sequence_schema(pool: &SqlitePool) -> crate::errors::Result<()> {
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('messages')")
+        .fetch_all(pool).await?;
+    // Partial-table fixtures are supported by ensure_schema; connect validates
+    // the complete production shape before exposing a usable pool.
+    if !columns.iter().any(|name| name == "session_id") {
+        return Ok(());
+    }
+    ensure_column(pool, "messages", "seq", "INTEGER").await?;
+    ensure_column(pool, "messages", "revision", "INTEGER NOT NULL DEFAULT 1").await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "WITH missing AS (
+            SELECT id, COALESCE((SELECT MAX(existing.seq) FROM messages existing
+                WHERE existing.session_id = m.session_id), 0)
+                + ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY created_at, rowid) AS assigned
+            FROM messages m WHERE seq IS NULL
+         ) UPDATE messages SET seq=(SELECT assigned FROM missing WHERE missing.id=messages.id)
+         WHERE seq IS NULL",
+    ).execute(&mut *tx).await?;
+    // Keep trigger/table definitions identical to the canonical migration,
+    // without replaying its non-idempotent ALTERs or renumbering existing rows.
+    let migration = include_str!("../../migrations/0025_message_sequence.sql");
+    let objects = migration.split_once("CREATE INDEX IF NOT EXISTS messages_session_seq")
+        .expect("MEM-A migration contains its sequence index").1;
+    let objects = format!("CREATE INDEX IF NOT EXISTS messages_session_seq{objects}");
+    sqlx::Executor::execute(&mut *tx, objects.as_str()).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn ensure_column(
@@ -3606,5 +3652,97 @@ mod tests {
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// M185: production startup must repair checksum-divergent historical databases.
+#[cfg(test)]
+mod m185_sequence_upgrade {
+    use crate::storage;
+
+    /// Frozen v1.91.44 message/session shape, taken before the MEM-A columns.
+    /// The historical ledger intentionally differs from today's migration 1 checksum.
+    const LEGACY_PRE_MEM_A_SQL: &str = r#"
+CREATE TABLE _sqlx_migrations (
+ version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL
+);
+INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time)
+ VALUES(1,'historical init',1,X'00',0);
+CREATE TABLE sessions (
+ id TEXT PRIMARY KEY, title TEXT NOT NULL, cwd TEXT NOT NULL, model_id TEXT NOT NULL,
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ total_input_tokens INTEGER NOT NULL DEFAULT 0, total_output_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE messages (
+ id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+ role TEXT NOT NULL, content TEXT NOT NULL, endpoint_id TEXT, model_id TEXT,
+ input_tokens INTEGER, output_tokens INTEGER, created_at INTEGER NOT NULL,
+ tool_calls TEXT, reasoning_content TEXT, completion_state TEXT, usage_request_id TEXT
+);
+CREATE INDEX idx_messages_session ON messages(session_id,created_at);
+"#;
+
+    #[tokio::test]
+    async fn m185_empty_database_can_admit_and_replay_new_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}", root.path().join("fresh.db").display());
+        let pool = storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at) VALUES ('fresh','Synthetic','.','synthetic',0,0)").execute(&pool).await.unwrap();
+        crate::commands::chat::admit_headless_chat_turn(&pool, "fresh", "合成首回合").await.unwrap();
+        let history = storage::load_agent_history(&pool, "fresh").await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "合成首回合");
+        assert_eq!((history[0].seq, history[0].revision), (Some(1), 1));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn m185_checksum_mismatch_repairs_sequence_before_chat_history() {
+        check_upgrade(false).await;
+    }
+
+    #[tokio::test]
+    async fn m185_partial_mem_a_install_is_repaired_without_renumbering() {
+        check_upgrade(true).await;
+    }
+
+    async fn check_upgrade(partial: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("legacy.db");
+        let url = format!("sqlite:{}", path.display());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect_with(url.parse::<sqlx::sqlite::SqliteConnectOptions>().unwrap().create_if_missing(true))
+            .await.unwrap();
+        sqlx::raw_sql(LEGACY_PRE_MEM_A_SQL).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,title,cwd,model_id,created_at,updated_at) VALUES ('s','Synthetic','.','synthetic',0,0)").execute(&pool).await.unwrap();
+        for (id, time) in [("later", 2), ("first", 1), ("tied", 1)] {
+            sqlx::query("INSERT INTO messages (id,session_id,role,content,created_at) VALUES (?,'s','user','synthetic',?)").bind(id).bind(time).execute(&pool).await.unwrap();
+        }
+        if partial {
+            sqlx::raw_sql("ALTER TABLE messages ADD COLUMN seq INTEGER; UPDATE messages SET seq=1 WHERE id='first';").execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+        for _ in 0..2 {
+            let pool = storage::db::connect(&url).await.unwrap();
+            let history = storage::load_agent_history(&pool, "s").await.unwrap();
+            assert_eq!(history.iter().map(|m| (m.id.as_str(), m.seq, m.revision)).collect::<Vec<_>>(), vec![("first",Some(1),1),("tied",Some(2),1),("later",Some(3),1)]);
+            pool.close().await;
+        }
+        let pool = storage::db::connect(&url).await.unwrap();
+        let admitted = crate::commands::chat::admit_headless_chat_turn(&pool, "s", "合成新回合").await.unwrap();
+        assert_eq!(admitted.objective.session_id.as_deref(), Some("s"));
+        let history = storage::load_agent_history(&pool, "s").await.unwrap();
+        assert_eq!(history.last().unwrap().content, "合成新回合");
+        assert_eq!(history.last().unwrap().seq, Some(4));
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('reply','s','assistant','synthetic reply',3)").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE messages SET content='edited reply' WHERE id='reply'").execute(&pool).await.unwrap();
+        let reply: (i64,i64) = sqlx::query_as("SELECT seq,revision FROM messages WHERE id='reply'").fetch_one(&pool).await.unwrap();
+        assert_eq!(reply, (5,2));
+        for table in ["feature_flags", "assembly_manifests"] {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?").bind(table).fetch_one(&pool).await.unwrap();
+            assert_eq!(count,1);
+        }
+        pool.close().await;
     }
 }

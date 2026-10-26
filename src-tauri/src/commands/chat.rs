@@ -2704,13 +2704,11 @@ struct ChatAdmissionReceipt {
 /// AppHandle-free admission receipt used by formal executable system smokes.
 /// It delegates to the desktop's atomic admission transaction rather than
 /// maintaining a second test-only chat schema.
-#[cfg(not(test))]
 pub(crate) struct HeadlessChatAdmission {
     pub root_turn_id: String,
     pub objective: crate::agent::objective::ObjectiveSnapshot,
 }
 
-#[cfg(not(test))]
 pub(crate) async fn admit_headless_chat_turn(
     pool: &sqlx::SqlitePool,
     session_id: &str,
