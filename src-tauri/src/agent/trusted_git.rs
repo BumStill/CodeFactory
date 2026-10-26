@@ -171,6 +171,12 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
     }
     let Some(subcommand) = subcommand else { return false };
     let lower = subcommand.to_ascii_lowercase();
+    // M180: `worktree list` reads registrations; it does not move or discard
+    // work. Only the listing verb is exempt: remove/prune/add/move/lock still
+    // require the session-owned proof and snapshot.
+    if lower == "worktree" && args.get(index + 1).is_some_and(|a| a == "list") {
+        return false;
+    }
     if DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&lower.as_str()) {
         return true;
     }
@@ -694,6 +700,15 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
         }
         if let ["head", rest @ ..] = argv.as_slice() {
             if !piped || !(rest.is_empty() || rest.len() == 2 && rest[0] == "-n" && rest[1].parse::<u32>().is_ok()) { return None; }
+            continue;
+        }
+        if let ["sed", "-n", range, paths @ ..] = argv.as_slice() {
+            // M180: a print-only sed suffix does not widen a Git rewrite.
+            // No scripts/options, redirection or escaping paths are accepted.
+            let print_range = range.strip_suffix('p').is_some_and(|r| {
+                !r.is_empty() && r.split(',').all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            });
+            if !print_range || paths.is_empty() || paths.iter().any(|p| !inside(&cwd, p)) { return None; }
             continue;
         }
         let (root, args) = match argv.as_slice() {

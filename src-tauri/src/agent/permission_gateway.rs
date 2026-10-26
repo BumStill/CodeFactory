@@ -160,6 +160,14 @@ impl PermissionGateway for DesktopPermissionGateway {
                     duration_ms: 0,
                 });
             }
+            // M180: explicit deny above wins; delivery authority cannot
+            // bypass shell Ask for credentials or a direct remote merge.
+            if bash_command.is_some_and(|command| matches!(
+                crate::tools::shell_policy::classify_command(command),
+                crate::tools::shell_policy::ShellCommandPolicy::Ask { .. }
+            )) {
+                return self.request_permission(tool_call, args.clone(), bash_command).await;
+            }
             if super::fetch_session_delivery_authorized(&self.db, &self.session_id).await {
                 return PermissionOutcome::Allow;
             }
@@ -845,12 +853,29 @@ mod tests {
         sqlx::query("INSERT INTO execution_workspaces(id,objective_id,session_id,repo_identity,repo_root,git_common_dir,worktree_path,worktree_identity,branch_name,base_ref,base_sha,head_sha,state,created_at,updated_at) VALUES ('synthetic-workspace','5eea633e-59f9-42bc-91f8-0a19a5c49711','permission-test',?,?,?,?,?,?, 'HEAD',?,?,'active',1,1)")
             .bind(repo_identity).bind(root.to_string_lossy().as_ref()).bind(common).bind(root.to_string_lossy().as_ref()).bind(worktree_identity).bind(branch).bind(&head).bind(&head).execute(&gateway.db).await.unwrap();
         assert!(!gitdir.is_empty());
+        // M180: exercise the exact production gateway, not just the proof helper.
+        for command in [
+            "sed -n '175,244p' src-tauri/src/agent/usage_windows.rs; sed -n '223,257p' src-tauri/src/vision/mod.rs; sed -n '35,100p' src-tauri/src/agent/internal_text.rs; grep -n 'attach_usage_settings' src-tauri/src/agent/mod.rs src-tauri/src/agent/model_transport.rs; grep -n 'settings' src-tauri/src/agent/internal_text.rs | head -15; git worktree list; git log -1 --oneline; git log -1 --oneline origin/main",
+            "git fetch --prune origin main && git stash push -u -m x && git merge origin/main && git stash pop",
+            "git checkout origin/main -- tracked.txt && git diff --stat && git status --short && sed -n '1,10p' tracked.txt",
+            "git add -A && git commit -m synthetic",
+            "node -e 'console.log(require(\"./docs/testing/scenario-registry.json\"))' | head -20",
+            "git fetch --prune origin main; find src -name '*.rs'; grep -R settings src | head -90; ls src; command -v pnpm; gh auth status",
+            "node -e 'console.log(2 + 3)'",
+        ] {
+            let args = serde_json::json!({"command":command});
+            let call = ToolCall { id: "m180-local".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+            let outcome = gateway.authorize(&call, &args, Some(command)).await;
+            assert_eq!(outcome, PermissionOutcome::Allow, "M180 trusted command: {command}");
+            assert!(gateway.pending_permissions.lock().await.is_empty());
+        }
         std::fs::write(root.join("tracked.txt"), "uncommitted").unwrap();
         let command = "git reset --hard HEAD";
         let args = serde_json::json!({"command": command});
         let call = ToolCall { id: "m159-local".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
         assert_eq!(gateway.authorize(&call, &args, Some(command)).await, PermissionOutcome::Allow);
-        let reference = m159_git(&root, &["for-each-ref", "--format=%(refname)", "refs/codefactory/backup/"]);
+        let references = m159_git(&root, &["for-each-ref", "--sort=refname", "--format=%(refname)", "refs/codefactory/backup/"]);
+        let reference = references.lines().last().expect("snapshot exists");
         assert_eq!(m159_git(&root, &["show", &format!("{reference}:tracked.txt")]), "uncommitted");
         assert!(gateway.pending_permissions.lock().await.is_empty());
         let compound = format!("cd \"{}\"; git stash push -m prefill; git fetch --prune origin main; git merge origin/main --no-edit; git stash pop; git status --porcelain | head", root.display());
@@ -858,7 +883,7 @@ mod tests {
         let compound_call = ToolCall { id: "m166-compound".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: compound_args.to_string() } };
         assert_eq!(gateway.authorize(&compound_call, &compound_args, Some(&compound)).await, PermissionOutcome::Allow);
         assert!(gateway.pending_permissions.lock().await.is_empty());
-        for command in ["git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
+        for command in ["gh auth token", "gh pr merge 7 --squash", "git push --force origin main", "git push origin :main", "git checkout -- ../other", "git reset --hard HEAD && rm -rf ../other"] {
             let args = serde_json::json!({"command":command});
             let call = ToolCall { id: "m159-remote".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
             let other = gateway.clone();
