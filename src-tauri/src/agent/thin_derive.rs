@@ -106,7 +106,7 @@ pub(crate) async fn ensure_pr_monitor(db: &SqlitePool, session: &str) -> sqlx::R
     if let Some((number, branch, ceiling)) = delivered {
         // Actual delivery evidence wins over the session's registered worktree
         // branch (including taking over another session's PR).
-        sqlx::query("INSERT INTO thin_delivery_refs(session_id,branch,pr_number,ceiling) VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET branch=excluded.branch,pr_number=excluded.pr_number,ceiling=excluded.ceiling WHERE thin_delivery_refs.pr_number<>excluded.pr_number OR thin_delivery_refs.branch<>excluded.branch")
+        sqlx::query("INSERT INTO thin_delivery_refs(session_id,branch,pr_number,ceiling) VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET branch=excluded.branch,pr_number=excluded.pr_number,ceiling=excluded.ceiling WHERE thin_delivery_refs.pr_number<>excluded.pr_number OR thin_delivery_refs.branch<>excluded.branch OR thin_delivery_refs.ceiling<>excluded.ceiling")
             .bind(session).bind(branch).bind(number).bind(ceiling).execute(db).await?;
     }
     let existing: Option<(i64, String)> =
@@ -133,7 +133,7 @@ pub(crate) async fn ensure_pr_monitor(db: &SqlitePool, session: &str) -> sqlx::R
     };
     ensure_external(db).await?;
     sqlx::query(
-        "INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,closeout_queued) VALUES (?,?,?,0,0) ON CONFLICT(session_id) DO UPDATE SET pr_number=excluded.pr_number,ceiling=excluded.ceiling,observed_at=0,completed_reason=NULL,closeout_queued=0 WHERE thin_external_observations.pr_number<>excluded.pr_number",
+        "INSERT INTO thin_external_observations(session_id,pr_number,ceiling,observed_at,closeout_queued) VALUES (?,?,?,0,0) ON CONFLICT(session_id) DO UPDATE SET pr_number=excluded.pr_number,ceiling=excluded.ceiling,observed_at=0,completed_reason=NULL,closeout_queued=0 WHERE thin_external_observations.pr_number<>excluded.pr_number OR thin_external_observations.ceiling<>excluded.ceiling",
     )
     .bind(session)
     .bind(number)
@@ -791,8 +791,15 @@ mod tests {
                 sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('delivery-owner','adopted','assistant','',1)").execute(&db).await.unwrap();
                 sqlx::query("INSERT INTO tool_calls(id,message_id,tool_name,arguments,result,status,created_at) VALUES ('delivery-result','delivery-owner','deliver_changes','{}',?,'done',1)")
                     .bind(serde_json::json!({"pr_number":number,"branch":branch,"effective_ceiling":"ThroughMerge"}).to_string()).execute(&db).await.unwrap();
-                sqlx::query("UPDATE thin_delivery_refs SET branch='registered-worktree',pr_number=999 WHERE session_id='adopted'").execute(&db).await.unwrap();
+                sqlx::query("UPDATE thin_delivery_refs SET branch='registered-worktree',pr_number=999,ceiling='pr_only' WHERE session_id='adopted'").execute(&db).await.unwrap();
+                // Even when branch/number were repaired earlier, the actual delivery
+                // ceiling must replace the stale registered-worktree ceiling.
+                sqlx::query("UPDATE thin_delivery_refs SET branch=?,pr_number=? WHERE session_id='adopted'")
+                    .bind(branch).bind(number).execute(&db).await.unwrap();
                 assert_eq!(ensure_pr_monitor(&db, session).await.unwrap(), Some(number));
+                let ceiling: String = sqlx::query_scalar("SELECT ceiling FROM thin_delivery_refs WHERE session_id='adopted'")
+                    .fetch_one(&db).await.unwrap();
+                assert_eq!(ceiling, "ThroughMerge");
             }
             apply_observation(&db, session, number, "ThroughMerge", Some(&format!("PR #{number} 已合并")), Some(100)).await.unwrap();
             sqlx::query("UPDATE thin_external_observations SET closeout_queued=1 WHERE session_id=?")
@@ -806,6 +813,62 @@ mod tests {
             .args(["m174_cross_process_merged_wait_is_closed_out", "--nocapture"])
             .env(CHILD, &url).output().await.unwrap();
         assert!(output.status.success(), "child failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[tokio::test]
+    async fn m174_merge_during_wait_crosses_process_and_closes_out() {
+        const CHILD: &str = "CODEFACTORY_M174_LIVE_WAIT_DB";
+        if let Ok(url) = std::env::var(CHILD) {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            let stage = std::env::var("CODEFACTORY_M174_STAGE").unwrap();
+            if stage == "wait" {
+                ensure_pr_monitor(&db, "derive").await.unwrap();
+                assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::WaitingWake);
+            } else if stage == "merge" {
+                // An independent observer process writes the external merge fact
+                // while the persisted session is waiting, without an app restart.
+                let pr = serde_json::json!({"state":"MERGED","mergedAt":"2026-01-01T00:00:00Z"});
+                let reason = completion_reason(&pr, "through_merge", false, 314).unwrap();
+                apply_observation(&db, "derive", 314, "through_merge", Some(&reason), merged_at_millis(&pr)).await.unwrap();
+            } else {
+                use super::super::background_tasks::{WakeSink, WakeFuture, drain_due_wakeups_at};
+                heartbeat_external(&db, "derive").await.unwrap();
+                let state = refresh(&db, "derive").await.unwrap();
+                assert!(state.reason.as_deref().unwrap().contains("已合并"));
+                struct Sink;
+                impl WakeSink for Sink {
+                    fn enqueue(&self, _: String, text: String) -> WakeFuture {
+                        assert!(text.contains("§8 收尾"));
+                        assert!(text.contains("清理远端分支"));
+                        Box::pin(async { true })
+                    }
+                }
+                let due: i64 = sqlx::query_scalar("SELECT next_at FROM wakeup_schedules WHERE id LIKE 'thin-closeout-%'")
+                    .fetch_one(&db).await.unwrap();
+                assert_eq!(drain_due_wakeups_at(&db, &Sink, due).await, 1);
+                sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('closeout-final','derive','assistant','核查及清理完成',?)")
+                    .bind(due * 1000 + 1).execute(&db).await.unwrap();
+                assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Ended);
+                heartbeat_external(&db, "derive").await.unwrap();
+                assert_eq!(drain_due_wakeups_at(&db, &Sink, due + 1).await, 0);
+            }
+            db.close().await;
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("live.sqlite").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('derive','synthetic','/synthetic','model',1,1,'thin')")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','adopted-synthetic',314,'through_merge')")
+            .execute(&db).await.unwrap();
+        db.close().await;
+        for stage in ["wait", "merge", "closeout"] {
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["m174_merge_during_wait_crosses_process_and_closes_out", "--nocapture"])
+                .env(CHILD, &url).env("CODEFACTORY_M174_STAGE", stage).output().await.unwrap();
+            assert!(output.status.success(), "{stage}: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
     }
 
     #[tokio::test]
