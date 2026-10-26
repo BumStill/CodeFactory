@@ -2033,6 +2033,15 @@ pub(crate) mod merged_settlement {
                     workspace.worktree_path.display()
                 ));
             }
+            // M187/R3: clean does not imply published. Preserve commits that
+            // have no surviving local branch or remote-tracking reference.
+            let unpublished = git(&workspace.worktree_path, &[
+                "rev-list", "--count", "HEAD", "--not", "--remotes",
+                &format!("--exclude={}", workspace.branch_name), "--branches",
+            ])?;
+            if unpublished.trim() != "0" {
+                return Err(format!("工作区还有 {unpublished} 个未推送且未被其他分支保存的提交，系统自动重试/自愈：保留工作区"));
+            }
             let path = workspace.worktree_path.to_string_lossy().to_string();
             git(
                 &workspace.repo_root,
@@ -2352,6 +2361,20 @@ pub(crate) mod merged_settlement {
                     .await
                     .unwrap();
             assert_eq!(open, 0);
+        }
+
+        #[test]
+        fn m187_unpushed_commit_prevents_workspace_deletion() {
+            let dir = scratch_dir("m187-unpushed");
+            let (repo, _, alive, branch) = build_fixture(&dir);
+            std::fs::write(alive.join("local-only.txt"), "synthetic unpublished work").unwrap();
+            git_ok(&alive, &["add", "local-only.txt"]);
+            git_ok(&alive, &["commit", "-qm", "synthetic local-only commit"]);
+            let result = closeout_workspace(&TerminalWorkspace {
+                worktree_path: alive.clone(), repo_root: repo, branch_name: branch,
+            });
+            assert!(result.is_err(), "M187: unpublished commit must block closeout: {result:?}");
+            assert!(alive.exists(), "M187: unpublished worktree was removed");
         }
 
         /// R2: a dirty workspace is not silently deleted and not silently waited on.
