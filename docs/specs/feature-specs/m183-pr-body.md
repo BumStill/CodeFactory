@@ -13,7 +13,7 @@
 - R4：m183_diagnostics_expose_overdue_wakes_without_prompt_content。
 - R5：已有 m174_cross_process_merged_wait_is_closed_out 覆盖合并→唤醒→最终回答→ended。
 - TDD：上述五个 M183 用例已见修复前失败；一次性 fixture 缺少合法延时先修正后重跑，仍在目标断言处失败。
-- 前端 pnpm test / pnpm build 已通过。Rust 完整 workspace 与治理结果待补充，未宣称通过。
+- 前端 pnpm test / pnpm build 已通过。最终 Rust 完整 workspace（主库 2021 passed、12 ignored；集成与其他 crates 全通过）退出码 0；包含 m174_cross_process_merged_wait_is_closed_out。治理基线、验收账本、场景及 README 校验通过。
 
 ## Harness / AI Collaboration
 Spec、Compatibility、Observation、Release、AI Collaboration；无 UI 布局变更，不适用 Viewport。
