@@ -1654,3 +1654,758 @@ mod tests {
         assert!(state.wake_source.is_none() || !has_internal_wording(&state.wake_source.clone().unwrap_or_default()));
     }
 }
+
+/// M186：已合并/已关闭的等待会话必须被结算，绝不能留下「唤醒已取消 + waiting_wake」
+/// 这种既不会醒也无人负责的组合。逻辑放在这个已登记的场景文件里（HLT-004），
+/// 因为新增独立模块需要同时修改场景登记表——那是信任根，普通 PR 不得自我修改。
+pub(crate) mod merged_settlement {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use anyhow::Result;
+    use sqlx::SqlitePool;
+
+    use crate::agent::thin_state;
+    use crate::util::no_window::NoWindow;
+
+    /// M186/R3：终端状态与「取消该会话全部 pending 唤醒」在同一事务内提交。
+    /// 缺陷正是这两件事分开写造成的：cancelled 唤醒旁边留着 waiting_wake，
+    /// 既不会醒，也再没有任何路径会来结算它。
+    pub(crate) async fn settle_ended_and_cancel(
+        db: &SqlitePool,
+        session_id: &str,
+        reason: &str,
+        location: &str,
+    ) -> Result<()> {
+        write_state_and_cancel(
+            db,
+            session_id,
+            &thin_state::ThinState::ended(reason, location),
+        )
+        .await
+    }
+
+    /// M186/R3：问用户与取消唤醒同样原子，问题落定后不留陈旧唤醒。
+    pub(crate) async fn ask_user_and_cancel(
+        db: &SqlitePool,
+        session_id: &str,
+        question: &str,
+    ) -> Result<()> {
+        let next = thin_state::ThinState {
+            state: thin_state::SessionState::WaitingUser,
+            waiting_for: None,
+            wake_source: None,
+            question: Some(question.to_string()),
+            ..thin_state::ThinState::running()
+        };
+        write_state_and_cancel(db, session_id, &next).await
+    }
+
+    async fn write_state_and_cancel(
+        db: &SqlitePool,
+        session_id: &str,
+        state: &thin_state::ThinState,
+    ) -> Result<()> {
+        thin_state::ensure(db).await?;
+        crate::agent::background_tasks::ensure_wake_schema(db).await?;
+        let mut tx = db.begin().await?;
+        sqlx::query(
+            "INSERT INTO thin_session_state
+             (session_id, state, waiting_for, wake_source, question, reason,
+              outcome_location, failure_signature, consecutive_failures, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET
+               state=excluded.state, waiting_for=excluded.waiting_for,
+               wake_source=excluded.wake_source, question=excluded.question,
+               reason=excluded.reason, outcome_location=excluded.outcome_location,
+               failure_signature=excluded.failure_signature,
+               consecutive_failures=excluded.consecutive_failures,
+               updated_at=excluded.updated_at
+             WHERE NOT (thin_session_state.state='ended'
+                        AND thin_session_state.reason LIKE 'cancelled%')",
+        )
+        .bind(session_id)
+        .bind(state.state.as_str())
+        .bind(&state.waiting_for)
+        .bind(&state.wake_source)
+        .bind(&state.question)
+        .bind(&state.reason)
+        .bind(&state.outcome_location)
+        .bind(&state.failure_signature)
+        .bind(state.consecutive_failures)
+        .bind(state.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE wakeup_schedules SET status='cancelled'
+             WHERE session_id=? AND status='pending'",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// R4: the periodic sweep may run at most this often; the supervisor polls much
+    /// faster, so this is a budget gate rather than the cadence.
+    pub const SETTLE_TICK_INTERVAL_MS: i64 = 60_000;
+
+    static LAST_TICK_MS: AtomicI64 = AtomicI64::new(0);
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct SettleSummary {
+        pub settled: usize,
+        pub asked_user: usize,
+        pub skipped: usize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TerminalWorkspace {
+        worktree_path: PathBuf,
+        repo_root: PathBuf,
+        branch_name: String,
+    }
+
+    /// R3/R4: budgeted safety tick for the supervisor poll loop.
+    pub async fn safety_tick(pool: &SqlitePool) -> Result<SettleSummary> {
+        if !tick_due(chrono::Utc::now().timestamp_millis()) {
+            return Ok(SettleSummary::default());
+        }
+        settle_merged_sessions(pool).await
+    }
+
+    fn tick_due(now: i64) -> bool {
+        let last = LAST_TICK_MS.load(Ordering::SeqCst);
+        if last != 0 && now.saturating_sub(last) < SETTLE_TICK_INTERVAL_MS {
+            return false;
+        }
+        LAST_TICK_MS
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// R1/R2: settle every `waiting_wake` session whose external work concluded.
+    /// Deterministic — this never asks a model to finish the task.
+    pub async fn settle_merged_sessions(pool: &SqlitePool) -> Result<SettleSummary> {
+        thin_state::ensure(pool).await?;
+        let sessions: Vec<String> =
+            sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state='waiting_wake'")
+                .fetch_all(pool)
+                .await?;
+
+        let mut summary = SettleSummary::default();
+        for session in sessions {
+            // A live executor owns its own settlement; never race it.
+            if crate::session_executor_alive(&session) == Some(true) {
+                summary.skipped += 1;
+                continue;
+            }
+            let Some(reason) = terminal_reason(pool, &session).await? else {
+                summary.skipped += 1;
+                continue;
+            };
+            let workspaces = terminal_workspaces(pool, &session).await?;
+            match closeout_all(&workspaces) {
+                Ok(note) => {
+                    let text = format!("{reason}。系统已自动完成收尾：{note}。任务已结束。");
+                    settle_ended_and_cancel(pool, &session, &text, &note).await?;
+                    close_workspace_rows(pool, &session).await?;
+                    tracing::info!(session, %note, "merged/closed session settled after restart");
+                    summary.settled += 1;
+                }
+                Err(failure) => {
+                    let question = format!(
+                        "{reason}，但系统自动收尾没有完成：{failure}。需要你决定如何处理这个工作区。"
+                    );
+                    ask_user_and_cancel(pool, &session, &question).await?;
+                    tracing::warn!(session, %failure, "merged session closeout deferred to the user");
+                    summary.asked_user += 1;
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// R4 invariant probe: `waiting_wake` rows no wake source can ever cover.
+    pub async fn waiting_wake_without_wake_source(pool: &SqlitePool) -> Vec<String> {
+        let Ok(sessions) = sqlx::query_scalar::<_, String>(
+            "SELECT session_id FROM thin_session_state WHERE state='waiting_wake'",
+        )
+        .fetch_all(pool)
+        .await
+        else {
+            return Vec::new();
+        };
+        let mut orphaned = Vec::new();
+        for session in sessions {
+            if crate::agent::background_tasks::wake_source_cover(pool, &session)
+                .await
+                .is_covered()
+            {
+                continue;
+            }
+            orphaned.push(session);
+        }
+        orphaned
+    }
+
+    async fn terminal_reason(pool: &SqlitePool, session: &str) -> Result<Option<String>> {
+        if !has_table(pool, "thin_external_observations").await? {
+            return Ok(None);
+        }
+        let reason: Option<String> = sqlx::query_scalar(
+            "SELECT completed_reason FROM thin_external_observations
+             WHERE session_id=? AND completed_reason IS NOT NULL
+               AND (completed_reason LIKE '%已合并%' OR completed_reason LIKE '%已关闭%')
+             ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(session)
+        .fetch_optional(pool)
+        .await?;
+        Ok(reason)
+    }
+
+    async fn terminal_workspaces(pool: &SqlitePool, session: &str) -> Result<Vec<TerminalWorkspace>> {
+        if !has_table(pool, "execution_workspaces").await? {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT worktree_path, repo_root, branch_name FROM execution_workspaces
+             WHERE session_id=? AND state<>'closed'",
+        )
+        .bind(session)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(worktree_path, repo_root, branch_name)| TerminalWorkspace {
+                    worktree_path: PathBuf::from(worktree_path),
+                    repo_root: PathBuf::from(repo_root),
+                    branch_name,
+                },
+            )
+            .collect())
+    }
+
+    async fn close_workspace_rows(pool: &SqlitePool, session: &str) -> Result<()> {
+        if !has_table(pool, "execution_workspaces").await? {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE execution_workspaces
+             SET state='closed', failure_code=NULL, failure_detail=NULL,
+                 lease_owner=NULL, lease_expires_at=NULL, closed_at=?, updated_at=?
+             WHERE session_id=? AND state<>'closed'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(session)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn has_table(pool: &SqlitePool, name: &str) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+                .bind(name)
+                .fetch_one(pool)
+                .await?;
+        Ok(count > 0)
+    }
+
+    /// R1: no workspace left → nothing to close out. R2: workspace still there →
+    /// deterministic §8 closeout, or a plain reason for the user.
+    fn closeout_all(workspaces: &[TerminalWorkspace]) -> Result<String, String> {
+        if workspaces.is_empty() {
+            return Ok("本地工作区已不存在".to_string());
+        }
+        let mut notes = Vec::new();
+        for workspace in workspaces {
+            notes.push(closeout_workspace(workspace)?);
+        }
+        Ok(notes.join("；"))
+    }
+
+    fn closeout_workspace(workspace: &TerminalWorkspace) -> Result<String, String> {
+        // Destructive local Git surgery: refuse anything outside the reserved
+        // namespace or pointing at the repository itself.
+        if !workspace.branch_name.starts_with("codefactory/objective-") {
+            return Err(format!(
+                "分支 {} 不在 CodeFactory 保留命名空间内，系统不会删除",
+                workspace.branch_name
+            ));
+        }
+        let canonical_repo = workspace
+            .repo_root
+            .canonicalize()
+            .map_err(|error| format!("仓库根目录不可用：{error}"))?;
+        if let Ok(canonical_worktree) = workspace.worktree_path.canonicalize() {
+            if canonical_worktree == canonical_repo {
+                return Err("工作区路径指向仓库根目录，系统不会删除".to_string());
+            }
+        }
+
+        let mut notes = Vec::new();
+        if workspace.worktree_path.exists() {
+            let dirty = git(&workspace.worktree_path, &["status", "--porcelain"]).map_err(|error| {
+                format!(
+                    "无法确认工作区 {} 是否干净：{error}",
+                    workspace.worktree_path.display()
+                )
+            })?;
+            if !dirty.is_empty() {
+                let count = dirty.lines().count();
+                return Err(format!(
+                    "本地工作区 {} 里还有 {count} 项未提交改动",
+                    workspace.worktree_path.display()
+                ));
+            }
+            let path = workspace.worktree_path.to_string_lossy().to_string();
+            git(
+                &workspace.repo_root,
+                &["worktree", "remove", "--force", &path],
+            )
+            .or_else(|_| git(&workspace.repo_root, &["worktree", "remove", &path]))
+            .map_err(|error| {
+                format!(
+                    "删除本地工作区 {} 失败：{error}",
+                    workspace.worktree_path.display()
+                )
+            })?;
+            notes.push("已删除本地工作区".to_string());
+        } else {
+            notes.push("本地工作区已不存在".to_string());
+        }
+        let _ = git(&workspace.repo_root, &["worktree", "prune"]);
+
+        match git(
+            &workspace.repo_root,
+            &["branch", "-D", &workspace.branch_name],
+        ) {
+            Ok(_) => notes.push("已删除本地分支".to_string()),
+            Err(error) if error.contains("not found") => notes.push("本地分支已不存在".to_string()),
+            Err(error) => {
+                return Err(format!(
+                    "删除本地分支 {} 失败：{error}",
+                    workspace.branch_name
+                ))
+            }
+        }
+
+        match remote_branch_state(&workspace.repo_root, &workspace.branch_name) {
+            Some(true) => {
+                git(
+                    &workspace.repo_root,
+                    &["push", "origin", "--delete", &workspace.branch_name],
+                )
+                .map_err(|error| {
+                    format!(
+                        "删除已合并的远端分支 {} 失败：{error}",
+                        workspace.branch_name
+                    )
+                })?;
+                notes.push("已删除已合并远端分支".to_string());
+            }
+            Some(false) => notes.push("远端分支已不存在".to_string()),
+            // Offline or no `origin`: a network read must never decide a session's
+            // fate. The merge is already recorded and the local closeout is done.
+            None => notes.push("远端分支状态未知，未做远端删除".to_string()),
+        }
+        Ok(notes.join("，"))
+    }
+
+    fn remote_branch_state(repo: &Path, branch: &str) -> Option<bool> {
+        let output = Command::new("git")
+            .no_window()
+            .current_dir(repo)
+            .args(["ls-remote", "--heads", "origin", branch])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+        let output = Command::new("git")
+            .no_window()
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn scratch_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "cf-m186-{tag}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn git_ok(cwd: &Path, args: &[&str]) -> String {
+            git(cwd, args).expect("git")
+        }
+
+        /// A real repository with one worktree per synthetic session. The child
+        /// process builds it so the parent only sees durable state written by a
+        /// previous process — exactly the restart the defect needs.
+        fn build_fixture(dir: &Path) -> (PathBuf, String, PathBuf, String) {
+            let repo = dir.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_ok(&repo, &["init", "-q"]);
+            git_ok(&repo, &["config", "user.name", "Synthetic"]);
+            git_ok(
+                &repo,
+                &["config", "user.email", "synthetic@example.invalid"],
+            );
+            std::fs::write(repo.join("tracked.txt"), "base").unwrap();
+            git_ok(&repo, &["add", "."]);
+            git_ok(&repo, &["commit", "-qm", "synthetic base"]);
+
+            let missing = dir.join("ws-missing");
+            git_ok(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "codefactory/objective-m186a",
+                    &missing.to_string_lossy(),
+                    "HEAD",
+                ],
+            );
+            git_ok(
+                &repo,
+                &["worktree", "remove", "--force", &missing.to_string_lossy()],
+            );
+            let _ = std::fs::remove_dir_all(&missing);
+            assert!(!missing.exists());
+
+            let alive = dir.join("ws-alive");
+            git_ok(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "codefactory/objective-m186b",
+                    &alive.to_string_lossy(),
+                    "HEAD",
+                ],
+            );
+            (
+                repo,
+                "codefactory/objective-m186a".into(),
+                alive,
+                "codefactory/objective-m186b".into(),
+            )
+        }
+
+        async fn open_db(dir: &Path) -> SqlitePool {
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.join("app.db"))
+                .create_if_missing(true);
+            SqlitePool::connect_with(options).await.unwrap()
+        }
+
+        async fn seed_state(dir: &Path) -> SqlitePool {
+            let pool = open_db(dir).await;
+            sqlx::query("CREATE TABLE IF NOT EXISTS objectives (id TEXT PRIMARY KEY, status TEXT)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            thin_state::ensure(&pool).await.unwrap();
+            crate::agent::background_tasks::ensure_wake_schema(&pool)
+                .await
+                .unwrap();
+            crate::agent::execution_workspace::ensure_schema(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS thin_external_observations (
+                    session_id TEXT NOT NULL,
+                    completed_reason TEXT,
+                    observed_at INTEGER)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool
+        }
+
+        /// Child-process re-entry: writes the durable restart fixture and exits.
+        #[test]
+        fn fixture_writer() {
+            let Ok(dir) = std::env::var("M186_FIXTURE_DIR") else {
+                return;
+            };
+            let dir = PathBuf::from(dir);
+            let marker = dir.join("app.db");
+            let (repo, branch_a, alive, branch_b) = build_fixture(&dir);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let pool = seed_state(&dir).await;
+                for (session, objective, path, branch) in [
+                    ("sess-a", "obj-a", dir.join("ws-missing"), branch_a.as_str()),
+                    ("sess-b", "obj-b", alive.clone(), branch_b.as_str()),
+                ] {
+                    let mut state = thin_state::ThinState::running();
+                    state.state = crate::agent::thin_state::SessionState::WaitingWake;
+                    state.waiting_for = Some("PR #186 合并".into());
+                    state.wake_source = Some("已登记的唤醒源：PR #186 合并".into());
+                    thin_state::save(&pool, session, &state).await.unwrap();
+                    sqlx::query(
+                        "INSERT INTO thin_external_observations(session_id, completed_reason, observed_at)
+                         VALUES (?, 'PR #186 已合并', 1)",
+                    )
+                    .bind(session)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    // The defect signature: the wake was cancelled, `fire_count=0`.
+                    sqlx::query(
+                        "INSERT INTO wakeup_schedules(id, session_id, prompt, source, next_at, status, created_at)
+                         VALUES (?, ?, 'repair', 'agent_decided', 1, 'cancelled', 1)",
+                    )
+                    .bind(format!("thin-source-repair-{session}"))
+                    .bind(session)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    sqlx::query("INSERT INTO objectives(id, status) VALUES (?, 'completed')")
+                        .bind(objective)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    sqlx::query(
+                        "INSERT INTO execution_workspaces
+                         (id, objective_id, session_id, repo_identity, repo_root, git_common_dir,
+                          worktree_path, branch_name, base_ref, base_sha, state, created_at, updated_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'HEAD', 'deadbeef', 'active', 1, 1)",
+                    )
+                    .bind(format!("ws-{session}"))
+                    .bind(objective)
+                    .bind(session)
+                    .bind(repo.to_string_lossy().to_string())
+                    .bind(repo.to_string_lossy().to_string())
+                    .bind(repo.join(".git").to_string_lossy().to_string())
+                    .bind(path.to_string_lossy().to_string())
+                    .bind(branch)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+                pool.close().await;
+            });
+            assert!(marker.exists());
+        }
+
+        /// R4: two states built by another process, then a fresh start settles both
+        /// within the first tick (no waiting for a 30-minute heartbeat).
+        #[tokio::test]
+        async fn r1_r2_merged_sessions_settle_on_restart() {
+            let dir = scratch_dir("restart");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .env("M186_FIXTURE_DIR", &dir)
+                .args(["--test-threads", "1", "fixture_writer"])
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "fixture child failed: {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(dir.join("app.db").exists(), "child wrote no fixture db");
+
+            // Parent process: only durable state from the previous process exists.
+            let pool = open_db(&dir).await;
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.settled, 2, "{summary:?}");
+            assert_eq!(summary.asked_user, 0, "{summary:?}");
+
+            // R1: workspace already gone → ended, no model round.
+            let a = thin_state::load(&pool, "sess-a").await.unwrap().unwrap();
+            assert_eq!(a.state, crate::agent::thin_state::SessionState::Ended);
+            assert!(a.reason.unwrap().contains("已合并"));
+
+            // R2: workspace still there → system closeout, then ended.
+            assert!(!dir.join("ws-alive").exists(), "worktree not removed");
+            assert!(
+                git(
+                    &dir.join("repo"),
+                    &["rev-parse", "--verify", "codefactory/objective-m186b"]
+                )
+                .is_err(),
+                "local branch not deleted"
+            );
+            let b = thin_state::load(&pool, "sess-b").await.unwrap().unwrap();
+            assert_eq!(b.state, crate::agent::thin_state::SessionState::Ended);
+            assert!(b.reason.unwrap().contains("已删除本地工作区"));
+
+            // R3: no orphaned wait, no leftover pending wakeup, rows closed.
+            assert!(waiting_wake_without_wake_source(&pool).await.is_empty());
+            let pending: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(pending, 0);
+            let open: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM execution_workspaces WHERE state<>'closed'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(open, 0);
+        }
+
+        /// R2: a dirty workspace is not silently deleted and not silently waited on.
+        #[tokio::test]
+        async fn r2_dirty_workspace_asks_user_with_a_reason() {
+            let dir = scratch_dir("dirty");
+            let (repo, _branch_a, alive, branch_b) = build_fixture(&dir);
+            std::fs::write(alive.join("scratch.txt"), "uncommitted").unwrap();
+            let pool = seed_state(&dir).await;
+            thin_state::save(
+                &pool,
+                "sess-b",
+                &thin_state::ThinState {
+                    state: crate::agent::thin_state::SessionState::WaitingWake,
+                    waiting_for: Some("PR #186 合并".into()),
+                    ..thin_state::ThinState::running()
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO thin_external_observations(session_id, completed_reason, observed_at) VALUES ('sess-b','PR #186 已合并',1)")
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO wakeup_schedules(id, session_id, prompt, source, next_at, status, created_at) VALUES ('w-sess-b','sess-b','p','agent_decided',1,'pending',1)")
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO objectives(id, status) VALUES ('obj-b','completed')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO execution_workspaces
+                 (id, objective_id, session_id, repo_identity, repo_root, git_common_dir,
+                  worktree_path, branch_name, base_ref, base_sha, state, created_at, updated_at)
+                 VALUES ('ws-b','obj-b','sess-b',?,?,?,?,?,'HEAD','deadbeef','active',1,1)",
+            )
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.to_string_lossy().to_string())
+            .bind(repo.join(".git").to_string_lossy().to_string())
+            .bind(alive.to_string_lossy().to_string())
+            .bind(&branch_b)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let summary = settle_merged_sessions(&pool).await.unwrap();
+            assert_eq!(summary.asked_user, 1, "{summary:?}");
+            assert!(alive.exists(), "dirty worktree must be preserved");
+            let state = thin_state::load(&pool, "sess-b").await.unwrap().unwrap();
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::WaitingUser);
+            assert!(state.question.unwrap().contains("未提交"));
+            // R3: the pending wake was cancelled in the same write — and the row is
+            // no longer `waiting_wake`, so it is not an orphan either.
+            let pending: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(pending, 0);
+            assert!(waiting_wake_without_wake_source(&pool).await.is_empty());
+        }
+
+        /// R3: state write and wake cancellation are one transaction.
+        #[tokio::test]
+        async fn r3_settlement_cancels_wakes_atomically() {
+            let dir = scratch_dir("atomic");
+            let pool = seed_state(&dir).await;
+            thin_state::save(
+                &pool,
+                "sess-c",
+                &thin_state::ThinState {
+                    state: crate::agent::thin_state::SessionState::WaitingWake,
+                    waiting_for: Some("PR #1".into()),
+                    ..thin_state::ThinState::running()
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO wakeup_schedules(id, session_id, prompt, source, next_at, status, created_at) VALUES ('w-c','sess-c','p','agent_decided',1,'pending',1)")
+                .execute(&pool).await.unwrap();
+            assert_eq!(
+                waiting_wake_without_wake_source(&pool).await,
+                Vec::<String>::new()
+            );
+
+            settle_ended_and_cancel(&pool, "sess-c", "PR 已合并，任务结束", "note")
+                .await
+                .unwrap();
+            let state = thin_state::load(&pool, "sess-c").await.unwrap().unwrap();
+            assert_eq!(state.state, crate::agent::thin_state::SessionState::Ended);
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='sess-c' AND status='pending'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(pending, 0, "settlement must cancel its wake source");
+            assert!(waiting_wake_without_wake_source(&pool).await.is_empty());
+        }
+
+        /// The probe really detects an orphaned wait (otherwise R4 proves nothing).
+        #[tokio::test]
+        async fn invariant_probe_reports_waiting_wake_without_source() {
+            let dir = scratch_dir("probe");
+            let pool = seed_state(&dir).await;
+            thin_state::save(
+                &pool,
+                "sess-d",
+                &thin_state::ThinState {
+                    state: crate::agent::thin_state::SessionState::WaitingWake,
+                    waiting_for: Some("PR #1".into()),
+                    ..thin_state::ThinState::running()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                waiting_wake_without_wake_source(&pool).await,
+                vec!["sess-d".to_string()]
+            );
+        }
+    }
+}
+pub(crate) use merged_settlement::{
+    ask_user_and_cancel, safety_tick, settle_ended_and_cancel, settle_merged_sessions,
+    waiting_wake_without_wake_source,
+};

@@ -4170,8 +4170,8 @@ async fn repair_session_split_under_repo_lock(
             let attempts = super::workspace_recovery_budget::fail(pool, session, now, &error.to_string()).await?;
             tracing::warn!(session, attempts, %error, "split workspace recovery failed; bounded automatic retry");
             if attempts >= 3 {
-                super::thin_state::ask_user(pool, session, &format!("项目工作区无法恢复：{error}。请确认项目目录或远端登记分支仍可访问。")).await?;
-                super::background_tasks::cancel_session_wakeups(pool, session).await;
+                // M186/R3: asking the user and cancelling the wake are one write.
+                super::thin_derive::ask_user_and_cancel(pool, session, &format!("项目工作区无法恢复：{error}。请确认项目目录或远端登记分支仍可访问。")).await?;
             }
         }
     }
@@ -4198,8 +4198,8 @@ pub(crate) async fn settle_missing_terminal_workspace(pool: &SqlitePool, session
     let reason = format!("{reason}；登记工作区已删除，收尾已无需工作区，系统完成会话结算（不代表重新执行了 §8 文件清理）。");
     sqlx::query("INSERT INTO workspace_recovery_budget(session_id,settled_reason) VALUES (?,?) ON CONFLICT(session_id) DO UPDATE SET settled_reason=excluded.settled_reason")
         .bind(session).bind(&reason).execute(pool).await?;
-    super::thin_state::save(pool, session, &super::thin_state::ThinState::ended(&reason, "本会话记录")).await?;
-    super::background_tasks::cancel_session_wakeups(pool, session).await;
+    // M186/R3: the terminal state and the wake cancellation commit together.
+    super::thin_derive::settle_ended_and_cancel(pool, session, &reason, "本会话记录").await?;
     Ok(true)
 }
 
