@@ -189,6 +189,44 @@ class VersionManifestExemptionTest(unittest.TestCase):
         )
         self.assertEqual(errors, [], errors)
 
+    def test_m176_bump_with_other_files_keeps_only_real_impact(self):
+        for extra in ("README.md", "src/m176_unmapped.ts", WEB_FETCH_FILES[0]):
+            with self.subTest(extra=extra):
+                root, files = self._repo_with_version_only_patch()
+                target = root / extra
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("synthetic change\n", encoding="utf-8")
+                subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+                subprocess.run(
+                    ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+                     "commit", "-qm", "extra"], cwd=root, check=True,
+                )
+                impact = self.gov.scenario_impact_files(root, "HEAD~2", files + [extra])
+                self.assertEqual(impact, [extra])
+                errors = self.gov.validate_impacted_execution(
+                    self.registry, impact, "release_artifact", root,
+                    expand_global_files=False, fail_on_unmapped=True,
+                )
+                if extra == "src/m176_unmapped.ts":
+                    self.assertTrue(errors)
+                    self.assertIn(extra, "\n".join(errors))
+                elif extra == "README.md":
+                    self.assertEqual(errors, [])
+
+    def test_m176_mixed_batch_configuration_edit_is_not_exempt(self):
+        root, files = self._repo_with_version_only_patch()
+        manifest = root / "src-tauri/Cargo.toml"
+        manifest.write_text(manifest.read_text() + 'edition = "2021"\n')
+        (root / "README.md").write_text("synthetic docs\n")
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+             "commit", "-qm", "configuration"], cwd=root, check=True,
+        )
+        changed = files + ["README.md"]
+        self.assertEqual(self.gov.scenario_impact_files(root, "HEAD~2", changed), changed)
+        self.assertEqual(self.gov.scenario_impact_files(root, "missing-ref", changed), changed)
+
     def test_version_bump_with_a_product_change_is_still_a_gap(self):
         root, files = self._repo_with_version_only_patch()
         probe = root / UNMAPPED_PROBE
