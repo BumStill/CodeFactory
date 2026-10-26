@@ -487,7 +487,6 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     super::workspace_recovery_budget::ensure(db).await?;
     let settled: Option<String> = sqlx::query_scalar("SELECT settled_reason FROM workspace_recovery_budget WHERE session_id=?")
         .bind(session).fetch_optional(db).await?.flatten();
-    if let Some(reason) = settled { return Ok(ThinState::ended(&reason, "本会话记录")); }
     let at = chrono::Utc::now().timestamp_millis();
     if has_table(db, "chat_session_cancel_intents").await? {
         let stop: Option<i64> = sqlx::query_scalar("SELECT requested_at FROM chat_session_cancel_intents WHERE session_id=?")
@@ -521,6 +520,7 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         tracing::warn!(session, "active work protects session from terminal projection");
         return Ok(ThinState::running());
     }
+    if let Some(reason) = settled { return Ok(ThinState::ended(&reason, "本会话记录")); }
     match crate::session_executor_alive(session) {
         Some(true) => return Ok(ThinState::running()),
         None => return Ok(super::thin_state::load(db, session).await?.unwrap_or_else(ThinState::running)),
