@@ -180,7 +180,12 @@ fn git_segment_is_sensitive(args: &[String]) -> bool {
     if DESTRUCTIVE_GIT_SUBCOMMANDS.contains(&lower.as_str()) {
         return true;
     }
-    if lower == "push" { return true; }
+    if lower == "push" {
+        return args[index + 1..].iter().any(|arg| {
+            arg.starts_with("--force") || ["--delete", "--mirror", "--prune", "-f", "-d"].contains(&arg.as_str())
+                || arg.starts_with('+') || arg.starts_with(':')
+        });
+    }
     false
 }
 
@@ -251,7 +256,7 @@ console.log(reg.scenarios.map(s=>[s.id,s.change_patterns,s.restore,s.cleanup,s.w
         assert!(!sensitive("cargo test --manifest-path src-tauri/Cargo.toml"));
         assert!(!sensitive("pnpm test"));
         assert!(!sensitive("node scripts/run.mjs --dry-run"));
-        assert!(sensitive("git push origin main"), "M182 R2: every push requires remote approval");
+        assert!(!sensitive("git push origin main"), "ordinary push uses the separate session delivery approval, never local proof");
     }
 
     #[test]
