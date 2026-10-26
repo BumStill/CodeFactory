@@ -92,6 +92,23 @@ pub(crate) async fn ensure_pr_monitor(db: &SqlitePool, session: &str) -> sqlx::R
     if !has_table(db, "thin_delivery_refs").await? {
         return Ok(None);
     }
+    let delivered: Option<(i64, String, String)> = if has_table(db, "tool_calls").await? {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT tool.result FROM tool_calls tool JOIN messages message ON message.id=tool.message_id WHERE message.session_id=? AND tool.tool_name='deliver_changes' AND tool.result IS NOT NULL ORDER BY tool.created_at DESC LIMIT 20")
+            .bind(session).fetch_all(db).await?;
+        rows.iter().find_map(|(raw,)| {
+            let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+            let number = value["pr_number"].as_i64()?;
+            let branch = value["branch"].as_str()?.to_string();
+            let ceiling = value["effective_ceiling"].as_str().unwrap_or("ThroughMerge").to_string();
+            Some((number, branch, ceiling))
+        })
+    } else { None };
+    if let Some((number, branch, ceiling)) = delivered {
+        // Actual delivery evidence wins over the session's registered worktree
+        // branch (including taking over another session's PR).
+        sqlx::query("INSERT INTO thin_delivery_refs(session_id,branch,pr_number,ceiling) VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET branch=excluded.branch,pr_number=excluded.pr_number,ceiling=excluded.ceiling WHERE thin_delivery_refs.pr_number<>excluded.pr_number OR thin_delivery_refs.branch<>excluded.branch")
+            .bind(session).bind(branch).bind(number).bind(ceiling).execute(db).await?;
+    }
     let existing: Option<(i64, String)> =
         sqlx::query_as("SELECT pr_number,ceiling FROM thin_delivery_refs WHERE session_id=?")
             .bind(session)
@@ -216,20 +233,11 @@ async fn closeout_slot_free(db: &SqlitePool, at_ms: i64) -> sqlx::Result<bool> {
 
 /// M146/R1：收尾回合只给「交付后仍在等待」的会话。已 ended、已 close_objective、
 /// 或合并之后已经给过收尾回答的会话不唤醒，只把外部事项标记完成。
-async fn closeout_eligible(db: &SqlitePool, session: &str, merged_at: Option<i64>) -> sqlx::Result<bool> {
+async fn closeout_eligible(db: &SqlitePool, session: &str, _merged_at: Option<i64>) -> sqlx::Result<bool> {
     let state = derive_state(db, session).await?;
-    if !matches!(state.state, SessionState::WaitingWake | SessionState::WaitingUser) {
-        return Ok(false);
-    }
-    if let Some(merged_at) = merged_at {
-        let answered: i64 = if has_table(db, "messages").await? {
-            sqlx::query_scalar(
-                "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant' AND created_at>=? AND TRIM(content)<>'' AND (tool_calls IS NULL OR tool_calls='' OR tool_calls='[]')",
-            ).bind(session).bind(merged_at).fetch_one(db).await?
-        } else { 0 };
-        if answered > 0 { return Ok(false); }
-    }
-    Ok(true)
+    // Only the durable closeout wake and its final answer prove §8 was run.
+    // An arbitrary post-merge answer may still be the stale waiting message.
+    Ok(matches!(state.state, SessionState::WaitingWake | SessionState::WaitingUser))
 }
 
 // 进程内共享滚动窗口；同时计入既有全局观测计数，限额耗尽时不发请求。
@@ -256,6 +264,20 @@ fn observe_command(cwd: &str, args: &[&str]) -> Option<String> {
     super::delivery::bounded_delivery_output(super::delivery::dev_command("gh").current_dir(cwd).args(args)).ok()
 }
 
+/// M174: reconcile every persisted waiting session once per process startup.
+/// Reuse the bounded, durable observer; no parallel unbudgeted GitHub poller.
+pub(crate) async fn reconcile_waiting_on_startup(db: &SqlitePool) -> sqlx::Result<usize> {
+    super::thin_state::ensure(db).await?;
+    let sessions: Vec<String> = sqlx::query_scalar("SELECT state.session_id FROM thin_session_state state JOIN sessions session ON session.id=state.session_id WHERE state.state='waiting_wake' AND session.delivery_mode='thin'")
+        .fetch_all(db).await?;
+    for session in &sessions {
+        ensure_pr_monitor(db, session).await?;
+        heartbeat_external(db, session).await?;
+        refresh(db, session).await?;
+    }
+    Ok(sessions.len())
+}
+
 /// 心跳先刷新事实，再由持久唤醒入口投递一次 §8 收尾。
 /// 查询失败/额度不足不伪造完成；observed_at 在请求前 CAS，重启也遵守 180s。
 pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::Result<()> {
@@ -272,6 +294,13 @@ pub(crate) async fn heartbeat_external(db: &SqlitePool, session: &str) -> sqlx::
         return Ok(());
     }
     ensure_external(db).await?;
+    super::background_tasks::wake_source_cover(db, session).await;
+    // Repair the old silent-closeout receipt: queued=1 without an actual wake
+    // is not delivery. An explicit historical §8 final remains terminal.
+    if derive_state(db, session).await?.state == SessionState::WaitingWake {
+        sqlx::query("UPDATE thin_external_observations SET closeout_queued=0 WHERE session_id=? AND closeout_queued=1 AND completed_reason LIKE '%已合并%' AND NOT EXISTS (SELECT 1 FROM wakeup_schedules wake WHERE wake.session_id=? AND wake.id LIKE 'thin-closeout-%' AND wake.prompt LIKE thin_external_observations.completed_reason || '%')")
+            .bind(session).bind(session).execute(db).await?;
+    }
     if has_table(db, "chat_session_cancel_intents").await? {
         let stopped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_session_cancel_intents stop WHERE stop.session_id=? AND NOT EXISTS (SELECT 1 FROM messages user WHERE user.session_id=stop.session_id AND user.role='user' AND user.created_at>stop.requested_at)")
             .bind(session).fetch_one(db).await?;
@@ -463,6 +492,33 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             .bind(session).bind(at / 1000).fetch_one(db).await?
     } else { 0 };
     let completed = completed_external(db, session).await?;
+    // M174: terminal PR facts outrank a cached waiting_wake projection. Keep
+    // waiting for the durable closeout/closed-PR turn, never for another merge.
+    let terminal_pr: Option<(String, i64)> = if has_table(db, "thin_external_observations").await? {
+        sqlx::query_as("SELECT observation.completed_reason,observation.closeout_queued FROM thin_external_observations observation JOIN thin_delivery_refs ref ON ref.session_id=observation.session_id AND ref.pr_number=observation.pr_number AND ref.ceiling=observation.ceiling WHERE observation.session_id=? AND (observation.completed_reason LIKE '%已合并%' OR observation.completed_reason LIKE '%已关闭但未合并%')")
+            .bind(session).fetch_optional(db).await?
+    } else { None };
+    if let Some((reason, queued)) = terminal_pr {
+        let prefix = if reason.contains("已关闭但未合并") { "thin-repair-%" } else { "thin-closeout-%" };
+        let answered: i64 = if has_table(db, "wakeup_schedules").await? {
+            sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules wake JOIN messages answer ON answer.session_id=wake.session_id AND answer.role='assistant' AND answer.created_at>=wake.last_fired_at*1000 AND TRIM(answer.content)<>'' AND (answer.tool_calls IS NULL OR answer.tool_calls='' OR answer.tool_calls='[]') AND (answer.completion_state IS NULL OR answer.completion_state='' OR answer.completion_state='final') WHERE wake.session_id=? AND wake.id LIKE ? AND wake.status='done' AND wake.prompt LIKE ? AND NOT EXISTS (SELECT 1 FROM messages user WHERE user.session_id=answer.session_id AND user.role='user' AND user.created_at>answer.created_at)")
+                .bind(session).bind(prefix).bind(format!("{reason}%")).fetch_one(db).await?
+        } else { 0 };
+        let legacy_closed_out: i64 = if reason.contains("已合并") && has_table(db, "messages").await? {
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages answer JOIN thin_external_observations observation ON observation.session_id=answer.session_id WHERE answer.session_id=? AND observation.merged_at IS NOT NULL AND answer.created_at>=observation.merged_at AND answer.role='assistant' AND answer.content LIKE '%§8 收尾完成%' AND (answer.tool_calls IS NULL OR answer.tool_calls='' OR answer.tool_calls='[]') AND (answer.completion_state IS NULL OR answer.completion_state='' OR answer.completion_state='final') AND NOT EXISTS (SELECT 1 FROM messages user WHERE user.session_id=answer.session_id AND user.role='user' AND user.created_at>answer.created_at)")
+                .bind(session).fetch_one(db).await?
+        } else { 0 };
+        if legacy_closed_out > 0 || (queued == 1 && answered > 0) {
+            return Ok(ThinState::ended(&reason, "本会话记录"));
+        }
+        return Ok(ThinState {
+            state: SessionState::WaitingWake,
+            waiting_for: Some(format!("{reason}，等待 §8 收尾")),
+            wake_source: Some("持久收尾投递器：系统自动重试/自愈".into()),
+            reason: Some(format!("{reason}；系统自动重试/自愈：接续收尾")),
+            ..ThinState::running()
+        });
+    }
     if let Some(reason) = completed.as_ref().filter(|reason| !is_external_failure(reason)) {
         let final_after_wake: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules wake JOIN messages answer ON answer.session_id=wake.session_id AND answer.role='assistant' AND answer.created_at>=wake.last_fired_at*1000 AND TRIM(answer.content)<>'' AND (answer.tool_calls IS NULL OR answer.tool_calls='' OR answer.tool_calls='[]') AND (answer.completion_state IS NULL OR answer.completion_state='' OR answer.completion_state='final') WHERE wake.session_id=? AND wake.id LIKE 'thin-closeout-%' AND wake.status='done' AND NOT EXISTS (SELECT 1 FROM messages user WHERE user.session_id=answer.session_id AND user.role='user' AND user.created_at>answer.created_at)")
             .bind(session).fetch_one(db).await?;
@@ -683,6 +739,90 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn m174_cross_process_merged_wait_is_closed_out() {
+        use super::super::background_tasks::{WakeSink, WakeFuture, drain_due_wakeups_at};
+        const CHILD: &str = "CODEFACTORY_M174_SYNTHETIC_DB";
+        if let Ok(url) = std::env::var(CHILD) {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            super::super::background_tasks::wake_source_cover(&db, "derive").await;
+            assert_eq!(reconcile_waiting_on_startup(&db).await.unwrap(), 2);
+            for session in ["derive", "adopted"] {
+                heartbeat_external(&db, session).await.unwrap();
+                let waiting = refresh(&db, session).await.unwrap();
+                assert_eq!(waiting.state, SessionState::WaitingWake);
+                assert!(!waiting.reason.as_deref().unwrap_or("").contains("还没合并"), "{waiting:?}");
+            }
+            struct Sink;
+            impl WakeSink for Sink {
+                fn enqueue(&self, _: String, text: String) -> WakeFuture {
+                    assert!(text.contains("§8 收尾"));
+                    assert!(text.contains("已合并"));
+                    Box::pin(async { true })
+                }
+            }
+            let due: i64 = sqlx::query_scalar("SELECT MAX(next_at) FROM wakeup_schedules WHERE status='pending'")
+                .fetch_one(&db).await.unwrap();
+            assert_eq!(drain_due_wakeups_at(&db, &Sink, due).await, 2);
+            for session in ["derive", "adopted"] {
+                sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES (?,?, 'assistant','§8 收尾完成',?)")
+                    .bind(format!("final-{session}")).bind(session).bind(due * 1000 + 1).execute(&db).await.unwrap();
+                let ended = refresh(&db, session).await.unwrap();
+                assert_eq!(ended.state, SessionState::Ended, "{ended:?}");
+                assert!(ended.reason.unwrap().contains("已合并"));
+                heartbeat_external(&db, session).await.unwrap();
+            }
+            assert_eq!(drain_due_wakeups_at(&db, &Sink, due + 1).await, 0);
+            db.close().await;
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("fixture.sqlite").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        for (session, branch, number) in [("derive", "own-branch", 174), ("adopted", "another-delivered-branch", 175)] {
+            sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?, 'synthetic','/synthetic','model',1,1,'thin')")
+                .bind(session).execute(&db).await.unwrap();
+            super::super::thin_state::save(&db, session, &super::super::thin_state::after_final(
+                super::super::thin_state::WaitNeed::External { what: "PR / CI".into(), covered: false }, "")).await.unwrap();
+            sqlx::query("INSERT INTO thin_delivery_refs VALUES (?,?,?,'ThroughMerge')")
+                .bind(session).bind(branch).bind(number).execute(&db).await.unwrap();
+            ensure_pr_monitor(&db, session).await.unwrap();
+            if session == "adopted" {
+                sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('delivery-owner','adopted','assistant','',1)").execute(&db).await.unwrap();
+                sqlx::query("INSERT INTO tool_calls(id,message_id,tool_name,arguments,result,status,created_at) VALUES ('delivery-result','delivery-owner','deliver_changes','{}',?,'done',1)")
+                    .bind(serde_json::json!({"pr_number":number,"branch":branch,"effective_ceiling":"ThroughMerge"}).to_string()).execute(&db).await.unwrap();
+                sqlx::query("UPDATE thin_delivery_refs SET branch='registered-worktree',pr_number=999 WHERE session_id='adopted'").execute(&db).await.unwrap();
+                assert_eq!(ensure_pr_monitor(&db, session).await.unwrap(), Some(number));
+            }
+            apply_observation(&db, session, number, "ThroughMerge", Some(&format!("PR #{number} 已合并")), Some(100)).await.unwrap();
+            sqlx::query("UPDATE thin_external_observations SET closeout_queued=1 WHERE session_id=?")
+                .bind(session).execute(&db).await.unwrap();
+            // A final answer after merge is not proof that §8 was executed.
+            sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES (?,?, 'assistant','继续等待系统自动跟进',101)")
+                .bind(format!("stale-{session}")).bind(session).execute(&db).await.unwrap();
+        }
+        db.close().await;
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["m174_cross_process_merged_wait_is_closed_out", "--nocapture"])
+            .env(CHILD, &url).output().await.unwrap();
+        assert!(output.status.success(), "child failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[tokio::test]
+    async fn m174_closed_pr_final_settles_instead_of_waiting_forever() {
+        let db = fixture().await;
+        sqlx::query("INSERT INTO thin_delivery_refs VALUES ('derive','adopted',176,'ThroughMerge')").execute(&db).await.unwrap();
+        ensure_pr_monitor(&db, "derive").await.unwrap();
+        super::super::background_tasks::wake_source_cover(&db, "derive").await;
+        apply_observation(&db, "derive", 176, "ThroughMerge", Some("PR #176 已关闭但未合并"), None).await.unwrap();
+        sqlx::query("UPDATE thin_external_observations SET closeout_queued=1").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,after_sec,next_at,status,created_at,last_fired_at) VALUES ('thin-repair-closed','derive','PR #176 已关闭但未合并','agent_decided',60,1,'done',1,1)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('closed-final','derive','assistant','PR 已关闭，核查完成，结束任务',1001)").execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_eq!(state.state, SessionState::Ended, "{state:?}");
+        assert!(state.reason.unwrap().contains("已关闭但未合并"));
+    }
+
     #[tokio::test]
     async fn m168_pending_pr_wake_without_executor_is_not_running() {
         let db = fixture().await;
