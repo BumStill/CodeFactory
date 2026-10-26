@@ -4231,14 +4231,15 @@ pub(crate) async fn resume_thin_running_session(
     } else {
         thin.updated_at
     };
-    push_thin_resume_prompt(
-        &db,
-        &session_id,
-        &format!("thin-restart:{session_id}:{interrupt_at}"),
-        interrupt_at,
-        &mut history,
-    )
-    .await?;
+    let resume_key = format!("thin-restart:{session_id}:{interrupt_at}");
+    push_thin_resume_prompt(&db, &session_id, &resume_key, interrupt_at, &mut history).await?;
+    // M170：模型拿到了续跑提示，用户也必须看到「上一轮被中断」——否则一次进程
+    // 退出会被对话完全隐藏，只剩一段莫名晚到的答案。
+    if let Err(error) =
+        persist_resume_interrupt_notice(&db, &session_id, &resume_key).await
+    {
+        tracing::warn!(%error, session = %session_id, "thin restart: failed to persist the interrupt notice");
+    }
 
     let requires_vision = history.iter().any(|message| {
         !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
@@ -4483,6 +4484,49 @@ async fn push_thin_resume_prompt(
     }
     history.push(thin_resume_message(key, session_id, at, &summary));
     Ok(())
+}
+
+/// M170 R1：重启续跑时对话里那句人话说明。
+///
+/// 只描述「哪一步 + 结果未知 + 已自动继续」，**不复述工具原始参数**（命令、路径、
+/// JSON 都不进对话），也不出现 `thin`/`objective`/`completion_state` 这类内部词汇。
+pub(crate) fn interrupt_notice_text(tool_name: Option<&str>) -> String {
+    match tool_name {
+        Some(tool) => format!(
+            "上一轮执行在 {tool} 这一步被应用重启中断（结果未知），系统已自动继续，不需要你再补一句。"
+        ),
+        None => "上一轮执行在模型回复阶段被应用重启中断（结果未知），系统已自动继续，不需要你再补一句。"
+            .to_string(),
+    }
+}
+
+/// M170 R1/R2：把「上一轮被中断」写成一条可见的系统消息，同一次中断只写一次。
+///
+/// `key` 是本次中断在续跑侧的稳定标识（重启续跑用 `thin-restart:<session>:<at>`）；
+/// 同一 key 再次续跑不会追加第二行（`storage::persist_turn_notice_once` 的
+/// marker 去重）。返回是否真的写下了这一行。
+pub(crate) async fn persist_resume_interrupt_notice(
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    key: &str,
+) -> Result<bool, AppError> {
+    let tool: Option<String> = sqlx::query_scalar(
+        "SELECT tool.tool_name FROM tool_calls tool \
+         JOIN messages message ON message.id=tool.message_id \
+         WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await?;
+    let content = interrupt_notice_text(tool.as_deref());
+    let wrote = crate::storage::persist_turn_notice_once(
+        db,
+        session_id,
+        &format!("resume-interrupt:{key}"),
+        &content,
+    )
+    .await?;
+    Ok(wrote)
 }
 
 /// M154：续跑提示必须是 `user` 角色，见 `m154_resume_message_is_a_user_turn`。
@@ -8895,6 +8939,106 @@ mod stack_probe {
             bytes <= 16 * 1024,
             "admission future grew to {bytes} bytes; box heavy awaits (budget 16384)"
         );
+    }
+}
+
+#[cfg(test)]
+mod m170_resume_interrupt_notice_tests {
+    use super::*;
+
+    /// R1：文案是人话，说清哪一步、结果未知、已自动继续，且不夹带内部词汇。
+    #[test]
+    fn m170_interrupt_notice_is_human_and_names_the_step() {
+        let text = interrupt_notice_text(Some("write_file"));
+        assert!(text.contains("中断"), "notice must say the turn was interrupted: {text}");
+        assert!(text.contains("结果未知"), "notice must say the outcome is unknown: {text}");
+        assert!(text.contains("write_file"), "notice must name the step: {text}");
+        assert!(text.contains("自动继续"), "notice must say the system continued: {text}");
+        let generic = interrupt_notice_text(None);
+        assert!(generic.contains("中断") && generic.contains("自动继续"), "{generic}");
+        for text in [text, generic] {
+            for banned in ["thin", "objective", "completion_state", "续跑提示", "{"] {
+                assert!(
+                    !text.contains(banned),
+                    "internal vocabulary `{banned}` leaked into the notice: {text}"
+                );
+            }
+        }
+    }
+
+    /// R2/R4：落库一条可见系统消息，同一次中断重复续跑不追加第二行。
+    #[tokio::test]
+    async fn m170_restart_resume_persists_exactly_one_visible_notice() {
+        let pool = crate::storage::db::connect("sqlite::memory:").await.unwrap();
+        let session = "m170-session";
+        sqlx::query(
+            "INSERT INTO sessions(id, title, cwd, model_id, created_at, updated_at) \
+             VALUES (?, 'M170 resume notice', '/tmp', 'test-model', 1, 1)",
+        )
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, role, content, created_at) \
+             VALUES ('m170-user', ?, 'user', '前台任务：sleep 60', 1)",
+        )
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages(id, session_id, role, content, created_at) \
+             VALUES ('m170-assistant', ?, 'assistant', '我跑一下这一步。', 2)",
+        )
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_calls(id, message_id, tool_name, arguments, status, created_at) \
+             VALUES ('m170-tool', 'm170-assistant', 'write_file', '{\"path\":\"a.txt\"}', 'pending', 3)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let key = format!("thin-restart:{session}:4");
+        assert!(
+            persist_resume_interrupt_notice(&pool, session, &key).await.unwrap(),
+            "the first resume must persist the interrupt notice"
+        );
+        assert!(
+            !persist_resume_interrupt_notice(&pool, session, &key).await.unwrap(),
+            "resuming the same interruption twice must not add a second notice"
+        );
+
+        let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT role, completion_state, content FROM messages \
+             WHERE session_id=? AND completion_state='turn_notice'",
+        )
+        .bind(session)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "expected exactly one visible notice, got {rows:?}");
+        assert_eq!(rows[0].0, "system", "the notice must be a system message: {rows:?}");
+        assert_eq!(rows[0].1.as_deref(), Some("turn_notice"), "{rows:?}");
+        assert!(rows[0].2.contains("中断"), "{rows:?}");
+        assert!(
+            !rows[0].2.contains("a.txt"),
+            "the notice must not dump raw tool arguments: {}",
+            rows[0].2
+        );
+
+        // 它不能变成用户的新目标：用户消息计数不变。
+        let users: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id=? AND role='user'")
+                .bind(session)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(users, 1, "the notice must not be persisted as a user turn");
     }
 }
 

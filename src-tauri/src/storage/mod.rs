@@ -108,6 +108,53 @@ pub struct Message {
 ///
 /// UI reads (`get_messages`, `get_message_page`) deliberately do NOT use this —
 /// the transcript shows everything the agent actually did.
+
+/// M170：把一条**用户可见**的运行时说明写进对话，同一次事件只写一次。
+///
+/// `turn_notice` 是仓库既有的「运行时提示」通道：`role='system'` +
+/// `completion_state='turn_notice'`。前端 `MessageList` 把这个组合渲染成居中
+/// 提示，而 `agent::replayable_history` 与 `latest_user_instruction` 都会跳过它，
+/// 所以它既不会伪装成用户的新目标，也不会污染模型上下文。
+/// 去重靠 `gate_events` 里同一条 marker（与 agent-loop 的
+/// `persist_gate_message_once` 同语义）；返回是否真的写下了这一行。
+pub async fn persist_turn_notice_once(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    marker: &str,
+    content: &str,
+) -> Result<bool, sqlx::Error> {
+    let marker_id = format!("notice-marker:{session_id}:{marker}");
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut tx = crate::storage::db::begin_write(pool).await?;
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO gate_events (id, session_id, kind, content, message_id, created_at) \
+         VALUES (?,?,'notice_marker',?,NULL,?)",
+    )
+    .bind(&marker_id)
+    .bind(session_id)
+    .bind(marker)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO messages (id, session_id, role, content, completion_state, created_at) \
+         VALUES (?,?,'system',?,'turn_notice',?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(session_id)
+    .bind(content)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 pub async fn load_agent_history(
     pool: &sqlx::SqlitePool,
     session_id: &str,
