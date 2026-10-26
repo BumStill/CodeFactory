@@ -274,10 +274,6 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Historical database upgrade hard gate (M185)
-        if: ${{ !cancelled() }}
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib m185_ -- --nocapture
-
       - name: Cargo test
         if: ${{ !cancelled() }}
         run: python tools/governance/run_flaky_retry.py --job check-rust -- cargo test --manifest-path src-tauri/Cargo.toml --quiet

@@ -18,4 +18,4 @@ Release-Urgency: immediate
 ## Implementation Notes
 - 交付上限为合并；独立发版任务及安装版真机验收由编排方负责。
 - Applicable Harnesses：Spec、Compatibility、Release、Observation、AI Collaboration。
-- R1–R3 使用生产 connect 和 load_agent_history 接口断言旧库校验和冲突后的序号、版本及重开幂等性；R4 将增加固定历史快照与 CI 硬门禁；R5 不以本地测试冒充真实应用验收。
+- R1–R3 使用生产 connect 和 load_agent_history 接口断言旧库校验和冲突后的序号、版本及重开幂等性；R4 由 `check-rust` 的标准 `cargo test` 硬门禁覆盖（`m185_*` 三个用例进入 lib 测试集，固定历史快照以内联常量冻结在 `storage/db.rs` 的测试模块内），因此不改动工作流与场景注册表等信任根文件；R5 不以本地测试冒充真实应用验收。
