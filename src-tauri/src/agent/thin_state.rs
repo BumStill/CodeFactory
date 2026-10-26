@@ -163,7 +163,7 @@ pub fn after_no_model(lead_ms: i64) -> ThinState {
     ThinState {
         state: SessionState::WaitingWake,
         waiting_for: Some("模型恢复可用".to_string()),
-        reason: Some("模型暂不可用，系统自动重试/自愈，到点自动继续，不需要你操作。".into()),
+        reason: Some("模型暂不可用，系统将在恢复时间自动继续，无需操作。".into()),
         wake_source: Some(format!("模型恢复时间 {}", at)),
         ..ThinState::running()
     }
