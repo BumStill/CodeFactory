@@ -988,6 +988,15 @@ async fn assert_one_visible_interrupt_notice(
 }
 
 async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
+    // M187/R4: inspect durable active facts BEFORE retiring the old executor or
+    // marking its pending tool unknown. This is the pre-restart liveness oracle
+    // that M157 previously omitted; it runs in a different worker from seeding.
+    for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        let state = super::thin_derive::refresh(pool, session).await?;
+        if state.state != super::thin_state::SessionState::Running {
+            bail!("M187: active turn/tool became {:?} before recovery: {session}", state.state);
+        }
+    }
     let now = Utc::now().timestamp_millis();
     let startup = super::thin_restart::running_interrupted_by_restart(pool, now, |_| false).await?;
     for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
