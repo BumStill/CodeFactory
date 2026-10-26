@@ -68,6 +68,13 @@ pub(crate) async fn generate_bounded_text(
     max_output_tokens: u32,
     deadline: Duration,
 ) -> Result<InternalTextOutput, String> {
+    if !route.has_usable_credential() {
+        return Err("模型尚未配置凭据，系统自动重试/自愈，暂不发送辅助模型请求".into());
+    }
+    let config = crate::config::settings::load();
+    if let Some(cause) = route.unavailable_cause(&config, super::usage_windows::now_ms(), super::usage_windows::session_ignores_windows(session_id)) {
+        return Err(format!("{}；系统自动重试/自愈，辅助调用暂缓", cause.sentence()));
+    }
     let route_for_request = route.clone();
     let session_id = session_id.to_string();
     let response = tokio::time::timeout(deadline, async move {

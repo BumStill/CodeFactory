@@ -200,7 +200,7 @@ pub fn vision_routes(settings: &Settings) -> Vec<RouteCandidate> {
     });
     routes
         .into_iter()
-        .filter(|(_, route)| route_is_usable(route))
+        .filter(|(_, route)| route.unavailable_cause(settings, crate::agent::usage_windows::now_ms(), false).is_none())
         .map(|(_, route)| route)
         .collect()
 }

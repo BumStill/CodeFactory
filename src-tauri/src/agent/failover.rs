@@ -33,6 +33,32 @@ impl RouteCandidate {
     /// 或 credential ref。过去没有凭据的端点会被"选中"，然后在传输层变成
     /// `AUTH_MISSING`——于是失败说明只写得出真正尝试过的环节，被门禁预先
     /// 过滤掉的端点反而看不见。现在它是一步**记录在案**的预过滤。
+    /// The single credential/window/quota filter used by admission and failover.
+    pub(crate) fn unavailable_cause(&self, config: &crate::config::settings::Settings, now: i64, ignore_windows: bool) -> Option<super::usage_windows::WaitCause> {
+        use super::usage_windows::{WaitCause, WaitCauseKind};
+        let label = endpoint_label(&self.endpoint_name);
+        if !self.has_usable_credential() {
+            return Some(WaitCause::new(label, WaitCauseKind::MissingCredential, None));
+        }
+        // Both restrictions may apply: this candidate is only usable after BOTH recover.
+        let window = super::usage_windows::effective_rule(config, &self.endpoint_name, &self.model_id)
+            .map(|rule| rule.evaluate(now)).filter(|status| !status.available && !ignore_windows);
+        let quota = if config.endpoint_is_subscription(&self.endpoint_name) {
+            let ledger = super::quota_cap::shared_quota_ledger();
+            let cap = config.quota_cap_for(&self.endpoint_name);
+            let budget = super::quota_cap::SubscriptionBudget::default();
+            ledger.evaluate(&self.endpoint_name, cap, budget, now)
+                .or_else(|| ledger.evaluate(&self.base_url, cap, budget, now))
+        } else { None };
+        match (window, quota) {
+            (Some(window), Some(quota)) => Some(WaitCause::new(format!("{label} 不在允许使用时段且"), WaitCauseKind::QuotaCap,
+                window.next_transition_ms.zip(quota.resets_at_ms).map(|(a,b)| a.max(b)))),
+            (Some(window), None) => Some(WaitCause::new(label, WaitCauseKind::UsageWindow, window.next_transition_ms)),
+            (None, Some(quota)) => Some(WaitCause::new(label, WaitCauseKind::QuotaCap, quota.resets_at_ms)),
+            (None, None) => None,
+        }
+    }
+
     pub fn has_usable_credential(&self) -> bool {
         matches!(self.api_style, ApiStyle::Chatgpt)
             || self.legacy_inline_api_key.as_ref().is_some_and(|key| !key.trim().is_empty())
@@ -449,9 +475,9 @@ impl ModelUnavailable {
         Self {
             resume_at_ms: decision.earliest_ms.map(|at| at.saturating_add(250)),
             notice: if decision.waitable {
-                format!("当前没有可用模型：{reasons}；届时自动继续。")
+                format!("当前没有可用模型：{reasons}；系统自动重试/自愈，届时自动继续。")
             } else {
-                format!("已结束：没有可用模型（{reasons}）；请在设置中配置凭据、调整使用时段或选择可用模型。")
+                format!("当前没有可用模型：{reasons}；系统自动重试/自愈，约 1 分钟后自动继续。")
             },
         }
     }
@@ -613,48 +639,22 @@ impl ActiveRouteState {
             let selected = inner.candidates.iter().enumerate().find_map(|(index, route)| {
                 let label = endpoint_label(&route.endpoint_name);
                 if inner.failed_indices.contains(&index) || !self.health.is_available(&route.endpoint_name) { return None; }
-                // M164：忽略使用时段不是绕过凭据的授权；缺凭据端点也不贡献唤醒时间。
-                if !route.has_usable_credential() {
-                    skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some("route_prefilter:missing_credential".into()) });
-                    causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
-                    return None;
-                }
-                if let Some(rule) = super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id) {
-                    let status = rule.evaluate(now);
-                    if !status.available && !ignore_windows {
-                        skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(format!("outside_usage_window:{}", serde_json::json!({"rule":rule,"next_available_ms":status.next_transition_ms}))) });
-                        if let Some(next) = status.next_transition_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
-                        causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::UsageWindow, status.next_transition_ms));
-                        window_blocked.push(route.model_id.clone());
-                        return None;
-                    }
-                }
-                if config.endpoint_is_subscription(&route.endpoint_name) {
-                    let ledger = super::quota_cap::shared_quota_ledger();
-                    let cap = config.quota_cap_for(&route.endpoint_name);
-                    let budget = super::quota_cap::SubscriptionBudget::default();
-                    if let Some(breach) = ledger.evaluate(&route.endpoint_name, cap, budget, now).or_else(|| ledger.evaluate(&route.base_url, cap, budget, now)) {
-                        // M152/R2：没有凭据的端点先被排除，绝不能让"留余量"把
-                        // 这一轮交给一个只会在传输层变成 AUTH_MISSING 的路由。
-                        if !route.has_usable_credential() && !ignore_windows {
-                            skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some("route_prefilter:missing_credential".into()) });
-                            causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
-                            return None;
+                if let Some(cause) = route.unavailable_cause(&config, now, ignore_windows) {
+                    use super::usage_windows::WaitCauseKind;
+                    let code = match cause.kind {
+                        WaitCauseKind::MissingCredential => "route_prefilter:missing_credential".to_string(),
+                        WaitCauseKind::UsageWindow => {
+                            window_blocked.push(route.model_id.clone());
+                            format!("outside_usage_window:{}", serde_json::json!({"rule":super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id),"next_available_ms":cause.until_ms}))
                         }
-                        // M164：达到用户上限即不可用，不允许无备选时软兜底。
-                        // M86：额度门禁的预过滤同样是一步要写进路由记录的动作。
-                        skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":breach.resets_at_ms}))) });
-                        if let Some(next) = breach.resets_at_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
-                        causes.push(super::usage_windows::WaitCause::new(format!("{label} 已到你设的 {}% 上限", breach.cap_percent), super::usage_windows::WaitCauseKind::QuotaCap, breach.resets_at_ms));
-                        quota_blocked.push(route.model_id.clone());
-                        return None;
-                    }
-                }
-                // M86：没有凭据的端点在这里就被挡下，并且留下记录——而不是
-                // 被"选中"后在传输层变成 AUTH_MISSING，让失败说明只剩它一条。
-                if !route.has_usable_credential() && !ignore_windows {
-                    skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some("route_prefilter:missing_credential".into()) });
-                    causes.push(super::usage_windows::WaitCause::new(label, super::usage_windows::WaitCauseKind::MissingCredential, None));
+                        WaitCauseKind::QuotaCap => {
+                            quota_blocked.push(route.model_id.clone());
+                            format!("subscription_quota_cap:{}", serde_json::json!({"resets_at_ms":cause.until_ms}))
+                        }
+                    };
+                    if let Some(next) = cause.until_ms { next_available = Some(next_available.map_or(next, |old: i64| old.min(next))); }
+                    skipped.push(RouteAttemptSnapshot { endpoint: route.endpoint_name.clone(), model: route.model_id.clone(), status: "skipped".into(), failure_code: Some(code) });
+                    causes.push(cause);
                     return None;
                 }
                 Some(index)
@@ -765,17 +765,7 @@ impl ActiveRouteState {
         let Some(settings) = &inner.usage_settings else { return true; };
         // Fail closed while settings are being edited; admission rechecks before POST.
         let Ok(config) = settings.try_read() else { return false; };
-        let now = super::usage_windows::now_ms();
-        if super::usage_windows::effective_rule(&config, &route.endpoint_name, &route.model_id)
-            .is_some_and(|rule| !rule.evaluate(now).available) { return false; }
-        if config.endpoint_is_subscription(&route.endpoint_name) {
-            let ledger = super::quota_cap::shared_quota_ledger();
-            let cap = config.quota_cap_for(&route.endpoint_name);
-            let budget = super::quota_cap::SubscriptionBudget::default();
-            if ledger.evaluate(&route.endpoint_name, cap, budget, now)
-                .or_else(|| ledger.evaluate(&route.base_url, cap, budget, now)).is_some() { return false; }
-        }
-        true
+        route.unavailable_cause(&config, super::usage_windows::now_ms(), false).is_none()
     }
 
     pub fn has_available_fallback(&self) -> bool {
@@ -906,6 +896,24 @@ impl ActiveRouteState {
     }
 
     pub fn exhausted_error(&self, final_reason: &str) -> String {
+        // Re-evaluate live restrictions: headers can update quota in the middle
+        // of a turn, before any admission skip was recorded.
+        {
+            let inner = self.inner.lock().expect("active route mutex poisoned");
+            let config = inner.usage_settings.as_ref().and_then(|settings| settings.try_read().ok());
+            let default_config = crate::config::settings::Settings::default();
+            let config = config.as_deref().unwrap_or(&default_config);
+            let causes: Vec<_> = inner.candidates.iter().filter_map(|route| {
+                route.unavailable_cause(config, super::usage_windows::now_ms(), false)
+            }).collect();
+            if !causes.is_empty() {
+                let mut unavailable = ModelUnavailable::from_decision(super::usage_windows::availability_decision(causes));
+                if unavailable.resume_at_ms.is_none() {
+                    unavailable.resume_at_ms = Some(super::usage_windows::now_ms().saturating_add(60_000));
+                }
+                return unavailable.encode();
+            }
+        }
         let mut inner = self.inner.lock().expect("active route mutex poisoned");
         let current = inner.candidates[inner.current_index].clone();
         if inner
@@ -1327,6 +1335,75 @@ mod tests {
         assert_eq!(change.to_endpoint, "available");
         assert!(state.inner.lock().unwrap().failed_indices.is_empty());
         super::super::usage_windows::set_clock_override_ms(None);
+    }
+
+    #[tokio::test]
+    async fn m178_midturn_exhaustion_uses_live_availability() {
+        let _serial = super::super::usage_windows::clock_test_lock();
+        let clock = |hour| chrono::DateTime::parse_from_rfc3339(&format!("2026-10-13T{hour}:00:00+08:00")).unwrap().timestamp_millis();
+        super::super::usage_windows::set_clock_override_ms(Some(clock("17")));
+        let mut primary = route("m178-gpt", "gpt");
+        primary.api_style = ApiStyle::Chatgpt;
+        let mut plan = RouteCandidatePlan::new(primary.clone());
+        plan.push_fallback(route("deepseek", "pro"));
+        let mut missing = route("openrouter", "synthetic");
+        missing.credential_ref = None;
+        missing.legacy_inline_api_key = None;
+        plan.push_fallback(missing);
+        let state = ActiveRouteState::from_plan_with_health(plan, EndpointHealthRegistry::new(Duration::from_secs(120)));
+        let mut config = crate::config::settings::Settings::default();
+        config.endpoints.insert(primary.endpoint_name.clone(), crate::config::settings::Endpoint {
+            base_url: primary.base_url.clone(), key_ref: None, api_style: ApiStyle::Chatgpt,
+            custom_models: vec![], active_model: None,
+        });
+        config.model_usage_windows.insert(super::super::usage_windows::model_key("deepseek", "pro"), super::super::usage_windows::presets().remove("deepseek_off_peak").unwrap());
+        state.attach_usage_settings(Arc::new(tokio::sync::RwLock::new(config)));
+        // The quota arrives after the turn's initial admission, as with real response headers.
+        let ledger = super::super::quota_cap::shared_quota_ledger();
+        ledger.record_server_usage(&primary.base_url, super::super::quota_cap::EndpointQuota {
+            source: super::super::quota_cap::UsageSource::ServerReported,
+            five_hour: super::super::quota_cap::WindowUsage { used_ratio: 0.9, resets_at_ms: Some(clock("23")) },
+            weekly: super::super::quota_cap::WindowUsage::empty(), observed_at_ms: clock("17"),
+        });
+        assert!(state.advance_after_failure("HTTP 429 quota exhausted").is_none());
+        let error = state.exhausted_error("HTTP 429 quota exhausted");
+        let parsed = ModelUnavailable::parse(&error);
+        ledger.clear(&primary.base_url);
+        super::super::usage_windows::set_clock_override_ms(None);
+        let unavailable = parsed.expect("midturn availability must yield a durable wait");
+        assert_eq!(unavailable.resume_at_ms, Some(clock("18") + 250));
+        for label in ["DeepSeek", "凭据", "上限", "自动继续"] {
+            assert!(unavailable.notice.contains(label), "{}", unavailable.notice);
+        }
+        assert!(!unavailable.notice.contains("AUTH_MISSING"));
+        assert_eq!(state.current().endpoint_name, "m178-gpt");
+    }
+
+    #[test]
+    fn m178_route_construction_has_no_unreviewed_entry() {
+        fn scan(root: &std::path::Path, base: &std::path::Path) {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { scan(&path, base); continue; }
+                if path.extension().and_then(|x| x.to_str()) != Some("rs") { continue; }
+                let relative = path.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+                let text = std::fs::read_to_string(&path).unwrap();
+                let production = text.split("#[cfg(test)]").next().unwrap();
+                for line in production.lines().filter(|line| !line.trim_start().starts_with("//")) {
+                    if line.contains("push_fallback(") && !line.contains("pub fn") {
+                        assert_eq!(relative, "commands/chat.rs", "unreviewed fallback: {relative}");
+                    }
+                    if line.contains("RouteCandidate {") && !line.contains("impl ") && !line.contains("struct ") && !line.contains("->") {
+                        assert!(["commands/chat.rs", "vision/mod.rs", "agent/mod.rs"].contains(&relative.as_str()), "unreviewed route literal: {relative}");
+                    }
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        scan(&root, &root);
+        let route = RouteCandidate { credential_ref: Some("  ".into()), legacy_inline_api_key: None, ..route("synthetic", "model") };
+        assert!(!route.has_usable_credential());
+        assert!(route.unavailable_cause(&Default::default(), 0, true).is_some(), "ignore_windows must not bypass credentials");
     }
 
     fn route(name: &str, model: &str) -> RouteCandidate {
