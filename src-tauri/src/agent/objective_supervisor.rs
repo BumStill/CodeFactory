@@ -1361,6 +1361,9 @@ pub fn spawn_objective_recovery_supervisor(app: AppHandle, pool: SqlitePool) {
                 "startup: exact installed build identity unavailable; Update remains fenced"
             ),
         }
+        if let Err(error) = super::thin_derive::reconcile_waiting_on_startup(&pool).await {
+            tracing::warn!(%error, "startup: waiting PR closeout reconciliation deferred to heartbeat");
+        }
         let store = ObjectiveStore::new(pool.clone());
         let mut polls_since_stall_sweep = 0_u32;
         loop {
