@@ -959,15 +959,41 @@ fn command_has_forge_mutation(command: &str) -> bool {
         .any(|segment| is_forge_mutation_segment(&segment))
 }
 
-/// M52-R1/R2: is this command a pure read-only probe?
-///
-/// The rule is structural, not a keyword scan of the raw string: split the
-/// command into statements and pipeline segments, take what each segment
-/// actually executes, and require EVERY segment to be a query verb without an
-/// exit-status assertion flag. That is why a probe whose *arguments* merely
-/// name a runner (`ls vitest.config*`) stays a probe, while
-/// `ls x && pnpm test` is not one — one acceptance segment is enough to make
-/// the whole command's exit status a verdict.
+/// Review authority includes local refs/config, not only tracked files.
+/// Keep this separate from completion probes: fetch is still a network probe
+/// for completion evidence, but must never run under read-only authority.
+fn review_git_writes_state(words: &[String]) -> bool {
+    let Some(verb) = words.get(1).map(String::as_str) else { return false; };
+    let tail = words.iter().skip(2).map(String::as_str).collect::<Vec<_>>();
+    match verb {
+        "fetch" => true,
+        "worktree" => tail.first() != Some(&"list"),
+        "config" => {
+            // Only explicit getters, with scope/source selectors and data
+            // operands, are admitted. A getter cannot hide a write flag.
+            let mut getter = false;
+            let mut index = 0;
+            while index < tail.len() {
+                let word = tail[index];
+                match word {
+                    "--get" | "--get-all" | "--get-regexp" | "--get-urlmatch" | "--list" | "-l" => getter = true,
+                    "--global" | "--local" | "--system" | "--worktree" | "--show-origin" | "--show-scope" | "--includes" | "--no-includes" | "--null" | "-z" => {},
+                    "--file" | "-f" | "--blob" => {
+                        index += 1;
+                        if index >= tail.len() { return true; }
+                    },
+                    flag if flag.starts_with("--file=") || flag.starts_with("--blob=") => {},
+                    flag if flag.starts_with('-') => return true,
+                    _ => {},
+                }
+                index += 1;
+            }
+            !getter
+        },
+        _ => is_forge_mutation_segment(&words.join(" ")),
+    }
+}
+
 /// Review intent is separate from completion evidence: unknown query tools are
 /// allowed, but explicit side effects in any executed segment are not.
 pub fn review_command_mutation(command: &str) -> Option<(String, &'static str)> {
@@ -1006,7 +1032,8 @@ pub fn review_command_mutation(command: &str) -> Option<(String, &'static str)> 
         });
         let reason = if redirect {
             Some("重定向会写入文件")
-        } else if is_forge_mutation_segment(&normalized_command)
+        } else if (binary == "git" && review_git_writes_state(&normalized))
+            || (binary != "git" && is_forge_mutation_segment(&normalized_command))
             || (binary == "glab" && lower.iter().skip(1).any(|word| matches!(word.as_str(), "create" | "merge" | "edit" | "close" | "delete" | "run" | "publish" | "upload")))
             || (binary == "git" && normalized.get(1).is_some_and(|verb| verb == "remote")
                 && normalized.get(2).is_some_and(|verb| !matches!(verb.as_str(), "-v" | "--verbose" | "show" | "get-url"))) {
