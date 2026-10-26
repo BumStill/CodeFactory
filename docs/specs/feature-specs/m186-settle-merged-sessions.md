@@ -61,6 +61,7 @@
 验证记录：
 
 - `cargo test merged_settlement::` → 5 passed（含跨进程重启用例）。
+- CI 修复：`production_background_commands_use_no_window` 先复现两个后台 Git 命令缺少保护的失败；补充 `NoWindow` 后，`cargo test --test no_window_regression` → 2 passed。
 - `cargo test --lib`（全量）→ 2042 passed / 0 failed / 12 ignored。
 - 相关子系统（`execution_workspace::`、`thin_state::`、`thin_derive::`、
   `background_tasks::`、`objective_supervisor::`）→ 174 passed。

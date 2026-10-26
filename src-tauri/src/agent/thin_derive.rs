@@ -1667,6 +1667,7 @@ pub(crate) mod merged_settlement {
     use sqlx::SqlitePool;
 
     use crate::agent::thin_state;
+    use crate::util::no_window::NoWindow;
 
     /// M186/R3：终端状态与「取消该会话全部 pending 唤醒」在同一事务内提交。
     /// 缺陷正是这两件事分开写造成的：cancelled 唤醒旁边留着 waiting_wake，
@@ -2020,6 +2021,7 @@ pub(crate) mod merged_settlement {
 
     fn remote_branch_state(repo: &Path, branch: &str) -> Option<bool> {
         let output = Command::new("git")
+            .no_window()
             .current_dir(repo)
             .args(["ls-remote", "--heads", "origin", branch])
             .output()
@@ -2032,6 +2034,7 @@ pub(crate) mod merged_settlement {
 
     fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
         let output = Command::new("git")
+            .no_window()
             .current_dir(cwd)
             .args(args)
             .output()
