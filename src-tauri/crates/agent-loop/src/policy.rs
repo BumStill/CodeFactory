@@ -870,7 +870,7 @@ fn is_planning_document_write(tool_name: &str, args: &serde_json::Value) -> bool
 /// Without it the model retries the same write through a heredoc, then a patch,
 /// then hands the blocker to the user (2026-07-30 field report).
 fn review_only_denial(tool_name: &str) -> String {
-    format!("当前是只读任务，已跳过 `{tool_name}`：该工具会写入或产生副作用；方案文档请用 write_file 写入 docs/，不要要求用户重复确认。")
+    format!("当前是只读任务，已跳过 `{tool_name}`：该工具会写入或产生副作用；方案文档可用 write_file 写入 docs/。")
 }
 
 /// Appended to the write tools' schema on a review turn, so the model learns the
@@ -936,7 +936,7 @@ pub fn capability_denial(
             }
             if tool_name == "bash" {
                 return codefactory_agent_core::review_command_mutation(_command).map(|(segment, reason)| {
-                    format!("当前是只读任务，已跳过片段 `{segment}`：{reason}；不要要求用户重复确认。")
+                    format!("当前是只读任务，已跳过片段 `{segment}`：{reason}。")
                 });
             }
             let mutating = matches!(kind, ToolKind::Mutation | ToolKind::BackgroundServiceStart);
@@ -1489,7 +1489,7 @@ mod tests {
         )
         .expect("mutation must be denied");
         assert!(!denial.contains("请由用户明确要求"));
-        assert!(denial.contains("不要要求用户重复确认"));
+        assert!(!denial.contains("不要要求用户重复确认"));
     }
 
     /// M131b-R2 field evidence (session `357f833f`, 2026-10-21): the user
@@ -1687,7 +1687,7 @@ mod tests {
         .expect("shell mutation must be denied");
         assert!(denial.contains("python3"), "names the denied segment");
         assert!(denial.contains("写入"), "explains the side effect");
-        assert!(denial.contains("不要要求用户重复确认"));
+        assert!(!denial.contains("不要要求用户重复确认"));
         assert!(!denial.contains("请由用户明确要求"));
         assert!(!denial.contains("本回合"));
         assert!(!denial.contains("账号权限"));
