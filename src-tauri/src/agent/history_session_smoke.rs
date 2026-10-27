@@ -988,11 +988,13 @@ async fn assert_one_visible_interrupt_notice(
 }
 
 async fn verify_liveness_after_restart(pool: &SqlitePool) -> anyhow::Result<()> {
-    // M187/R4: inspect durable active facts BEFORE retiring the old executor or
-    // marking its pending tool unknown. This is the pre-restart liveness oracle
-    // that M157 previously omitted; it runs in a different worker from seeding.
+    // M188: a pre-restart running oracle needs a real current-process owner;
+    // durable rows seeded by the exited worker are not execution evidence.
     for session in [LIVENESS_MIDTURN_SESSION, LIVENESS_STREAMING_SESSION] {
+        let control = crate::ChatRunControl::pending();
+        crate::register_session_executor(session, &control);
         let state = super::thin_derive::refresh(pool, session).await?;
+        crate::unregister_session_executor(session, &control);
         if state.state != super::thin_state::SessionState::Running {
             bail!("M187: active turn/tool became {:?} before recovery: {session}", state.state);
         }
