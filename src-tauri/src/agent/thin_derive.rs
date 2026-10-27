@@ -467,11 +467,26 @@ async fn unfinished_delivery(db: &SqlitePool, session: &str) -> sqlx::Result<Opt
     })
 }
 
+/// Durable activity must outrank cached terminal projections and old PR facts.
+async fn has_active_work(db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
+    if crate::session_executor_alive(session) != Some(false) { return Ok(true); }
+    for (table, query) in [
+        ("tool_calls", "SELECT COUNT(*) FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.session_id=? AND t.status IN ('pending','running')"),
+        ("chat_turn_state", "SELECT COUNT(*) FROM chat_turn_state WHERE session_id=? AND status IN ('active','working','running') AND terminal_reason IS NULL AND completed_at IS NULL"),
+        ("background_tasks", "SELECT COUNT(*) FROM background_tasks WHERE session_id=? AND status='running'"),
+    ] {
+        if has_table(db, table).await? {
+            let count: i64 = sqlx::query_scalar(query).bind(session).fetch_one(db).await?;
+            if count > 0 { return Ok(true); }
+        }
+    }
+    Ok(false)
+}
+
 pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> {
     super::workspace_recovery_budget::ensure(db).await?;
     let settled: Option<String> = sqlx::query_scalar("SELECT settled_reason FROM workspace_recovery_budget WHERE session_id=?")
         .bind(session).fetch_optional(db).await?.flatten();
-    if let Some(reason) = settled { return Ok(ThinState::ended(&reason, "本会话记录")); }
     let at = chrono::Utc::now().timestamp_millis();
     if has_table(db, "chat_session_cancel_intents").await? {
         let stop: Option<i64> = sqlx::query_scalar("SELECT requested_at FROM chat_session_cancel_intents WHERE session_id=?")
@@ -501,6 +516,11 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
             });
         }
     }
+    if has_active_work(db, session).await? {
+        tracing::warn!(session, "active work protects session from terminal projection");
+        return Ok(ThinState::running());
+    }
+    if let Some(reason) = settled { return Ok(ThinState::ended(&reason, "本会话记录")); }
     match crate::session_executor_alive(session) {
         Some(true) => return Ok(ThinState::running()),
         None => return Ok(super::thin_state::load(db, session).await?.unwrap_or_else(ThinState::running)),
@@ -787,6 +807,87 @@ mod tests {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id='derive' AND status='pending'")
             .fetch_one(&db).await.unwrap();
         assert_eq!(count, 1, "startup repair must be idempotent");
+    }
+
+    /// M187/R2/R4: durable activity belongs to another process, not this registry.
+    #[tokio::test]
+    async fn m187_cross_process_active_facts_prevent_terminal_projection() {
+        const CHILD: &str = "CODEFACTORY_M187_SYNTHETIC_DB";
+        if let Ok(url) = std::env::var(CHILD) {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            sqlx::query("INSERT INTO thin_delivery_refs VALUES ('new-delivery','synthetic',188,'ThroughMerge')")
+                .execute(&db).await.unwrap();
+            for index in 0..26 {
+                let session = format!("merged-idle-{index}");
+                sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?,'synthetic','/synthetic','model',1,1,'thin')")
+                    .bind(&session).execute(&db).await.unwrap();
+                let mut waiting = ThinState::running();
+                waiting.state = SessionState::WaitingWake;
+                super::super::thin_state::save(&db, &session, &waiting).await.unwrap();
+                sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES (?,187,'ThroughMerge','PR #187 已合并')")
+                    .bind(&session).execute(&db).await.unwrap();
+            }
+            let batch = merged_settlement::settle_merged_sessions(&db).await.unwrap();
+            assert_eq!(batch.settled, 26, "M187 idle merged backlog must settle: {batch:?}");
+            for index in 0..26 {
+                let state = super::super::thin_state::load(&db, &format!("merged-idle-{index}")).await.unwrap().unwrap();
+                assert_eq!(state.state, SessionState::Ended);
+            }
+            for session in ["tool-pending", "tool-running", "thinking", "background"] {
+                let state = refresh(&db, session).await.unwrap();
+                assert_ne!(state.state, SessionState::Ended, "M187 active {session}: {state:?}");
+                merged_settlement::settle_merged_sessions(&db).await.unwrap();
+                let state = super::super::thin_state::load(&db, session).await.unwrap().unwrap();
+                assert_ne!(state.state, SessionState::Ended, "M187 sweep ended {session}");
+                merged_settlement::settle_ended_and_cancel(&db, session, "stale closeout", "synthetic").await.unwrap();
+                let state = super::super::thin_state::load(&db, session).await.unwrap().unwrap();
+                assert_ne!(state.state, SessionState::Ended, "M187 direct settlement ended {session}");
+                super::super::workspace_recovery_budget::ensure(&db).await.unwrap();
+                sqlx::query("INSERT INTO workspace_recovery_budget(session_id,settled_reason) VALUES (?,'stale missing workspace')")
+                    .bind(session).execute(&db).await.unwrap();
+                let state = refresh(&db, session).await.unwrap();
+                assert_ne!(state.state, SessionState::Ended, "M187 stale workspace receipt ended {session}");
+            }
+            // A new delivery must never be settled by an older PR receipt.
+            let mut waiting = ThinState::running();
+            waiting.state = SessionState::WaitingWake;
+            super::super::thin_state::save(&db, "new-delivery", &waiting).await.unwrap();
+            merged_settlement::settle_merged_sessions(&db).await.unwrap();
+            let state = super::super::thin_state::load(&db, "new-delivery").await.unwrap().unwrap();
+            assert_ne!(state.state, SessionState::Ended, "M187 stale PR settled new delivery");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("m187.sqlite").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        for session in ["tool-pending", "tool-running", "thinking", "background", "new-delivery"] {
+            sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?, 'synthetic','/synthetic','model',1,1,'thin')")
+                .bind(session).execute(&db).await.unwrap();
+            sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES (?,?,'assistant','working',1)")
+                .bind(session).bind(session).execute(&db).await.unwrap();
+            let mut waiting = ThinState::running();
+            waiting.state = SessionState::WaitingWake;
+            super::super::thin_state::save(&db, session, &waiting).await.unwrap();
+            sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES (?,187,'ThroughMerge','PR #187 已合并')")
+                .bind(session).execute(&db).await.unwrap();
+        }
+        for (session, status) in [("tool-pending", "pending"), ("tool-running", "running")] {
+            sqlx::query("INSERT INTO tool_calls(id,message_id,tool_name,arguments,status,created_at) VALUES (?,?,'bash','{}',?,1)")
+                .bind(session).bind(session).bind(status).execute(&db).await.unwrap();
+        }
+        sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,revision,phase,status,started_at,updated_at) VALUES ('thinking','thinking',1,'model_request','active',1,1)")
+            .execute(&db).await.unwrap();
+        // A minimal historical schema is sufficient for the running-task fact.
+        sqlx::query("CREATE TABLE IF NOT EXISTS background_tasks(id TEXT PRIMARY KEY,session_id TEXT,status TEXT,wake_state TEXT)")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO background_tasks(id,session_id,status,wake_state) VALUES ('background','background','running','none')")
+            .execute(&db).await.unwrap();
+        db.close().await;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD, &url).args(["m187_cross_process_active_facts_prevent_terminal_projection", "--nocapture"])
+            .output().unwrap();
+        assert!(output.status.success(), "M187 worker failed: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     }
 
     #[tokio::test]
@@ -1707,6 +1808,12 @@ pub(crate) mod merged_settlement {
         session_id: &str,
         state: &thin_state::ThinState,
     ) -> Result<()> {
+        if state.state == thin_state::SessionState::Ended
+            && super::has_active_work(db, session_id).await? {
+            tracing::warn!(session_id, "terminal settlement rejected: active work; automatic recovery retains ownership");
+            thin_state::save(db, session_id, &thin_state::ThinState::running()).await?;
+            return Ok(());
+        }
         thin_state::ensure(db).await?;
         crate::agent::background_tasks::ensure_wake_schema(db).await?;
         let mut tx = db.begin().await?;
@@ -1798,7 +1905,7 @@ pub(crate) mod merged_settlement {
         let mut summary = SettleSummary::default();
         for session in sessions {
             // A live executor owns its own settlement; never race it.
-            if crate::session_executor_alive(&session) == Some(true) {
+            if super::has_active_work(pool, &session).await? {
                 summary.skipped += 1;
                 continue;
             }
@@ -1854,6 +1961,19 @@ pub(crate) mod merged_settlement {
     async fn terminal_reason(pool: &SqlitePool, session: &str) -> Result<Option<String>> {
         if !has_table(pool, "thin_external_observations").await? {
             return Ok(None);
+        }
+        if has_table(pool, "thin_delivery_refs").await? {
+            let mismatched: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM thin_delivery_refs ref WHERE ref.session_id=?
+                 AND NOT EXISTS (SELECT 1 FROM thin_external_observations observation
+                     WHERE observation.session_id=ref.session_id
+                       AND observation.pr_number=ref.pr_number
+                       AND observation.ceiling=ref.ceiling)",
+            ).bind(session).fetch_one(pool).await?;
+            if mismatched > 0 {
+                tracing::warn!(session, "stale terminal PR observation cannot settle current delivery");
+                return Ok(None);
+            }
         }
         let reason: Option<String> = sqlx::query_scalar(
             "SELECT completed_reason FROM thin_external_observations
@@ -1964,6 +2084,15 @@ pub(crate) mod merged_settlement {
                     "本地工作区 {} 里还有 {count} 项未提交改动",
                     workspace.worktree_path.display()
                 ));
+            }
+            // M187/R3: clean does not imply published. Preserve commits that
+            // have no surviving local branch or remote-tracking reference.
+            let unpublished = git(&workspace.worktree_path, &[
+                "rev-list", "--count", "HEAD", "--not", "--remotes",
+                &format!("--exclude={}", workspace.branch_name), "--branches",
+            ])?;
+            if unpublished.trim() != "0" {
+                return Err(format!("工作区还有 {unpublished} 个未推送且未被其他分支保存的提交，系统自动重试/自愈：保留工作区"));
             }
             let path = workspace.worktree_path.to_string_lossy().to_string();
             git(
@@ -2284,6 +2413,20 @@ pub(crate) mod merged_settlement {
                     .await
                     .unwrap();
             assert_eq!(open, 0);
+        }
+
+        #[test]
+        fn m187_unpushed_commit_prevents_workspace_deletion() {
+            let dir = scratch_dir("m187-unpushed");
+            let (repo, _, alive, branch) = build_fixture(&dir);
+            std::fs::write(alive.join("local-only.txt"), "synthetic unpublished work").unwrap();
+            git_ok(&alive, &["add", "local-only.txt"]);
+            git_ok(&alive, &["commit", "-qm", "synthetic local-only commit"]);
+            let result = closeout_workspace(&TerminalWorkspace {
+                worktree_path: alive.clone(), repo_root: repo, branch_name: branch,
+            });
+            assert!(result.is_err(), "M187: unpublished commit must block closeout: {result:?}");
+            assert!(alive.exists(), "M187: unpublished worktree was removed");
         }
 
         /// R2: a dirty workspace is not silently deleted and not silently waited on.
