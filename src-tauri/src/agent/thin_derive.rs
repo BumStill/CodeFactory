@@ -267,6 +267,7 @@ fn observe_command(cwd: &str, args: &[&str]) -> Option<String> {
 /// M174: reconcile every persisted waiting session once per process startup.
 /// Reuse the bounded, durable observer; no parallel unbudgeted GitHub poller.
 pub(crate) async fn reconcile_waiting_on_startup(db: &SqlitePool) -> sqlx::Result<usize> {
+    reconcile_orphan_turns(db).await?;
     super::thin_state::ensure(db).await?;
     let sessions: Vec<String> = sqlx::query_scalar("SELECT state.session_id FROM thin_session_state state JOIN sessions session ON session.id=state.session_id WHERE state.state='waiting_wake' AND session.delivery_mode='thin'")
         .fetch_all(db).await?;
@@ -467,20 +468,62 @@ async fn unfinished_delivery(db: &SqlitePool, session: &str) -> sqlx::Result<Opt
     })
 }
 
-/// Durable activity must outrank cached terminal projections and old PR facts.
-async fn has_active_work(db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
-    if crate::session_executor_alive(session) != Some(false) { return Ok(true); }
-    for (table, query) in [
-        ("tool_calls", "SELECT COUNT(*) FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.session_id=? AND t.status IN ('pending','running')"),
-        ("chat_turn_state", "SELECT COUNT(*) FROM chat_turn_state WHERE session_id=? AND status IN ('active','working','running') AND terminal_reason IS NULL AND completed_at IS NULL"),
-        ("background_tasks", "SELECT COUNT(*) FROM background_tasks WHERE session_id=? AND status='running'"),
-    ] {
-        if has_table(db, table).await? {
-            let count: i64 = sqlx::query_scalar(query).bind(session).fetch_one(db).await?;
-            if count > 0 { return Ok(true); }
-        }
+/// M188: only process-local ownership is execution evidence. Persisted rows
+/// survive a restart and must never manufacture an executor.
+async fn has_active_work(_db: &SqlitePool, session: &str) -> sqlx::Result<bool> {
+    // A retained cancellation handle is not an executor: callers can keep it
+    // after unregistering a completed run (including the real liveness smoke).
+    Ok(crate::session_executor_alive(session) == Some(true))
+}
+
+async fn live_background_count(db: &SqlitePool, session: &str) -> sqlx::Result<i64> {
+    if !has_table(db, "background_tasks").await?
+        || !has_column(db, "background_tasks", "pid").await?
+        || !has_column(db, "background_tasks", "process_started_at").await? { return Ok(0); }
+    let processes: Vec<(Option<i64>, Option<String>)> = sqlx::query_as("SELECT pid,process_started_at FROM background_tasks WHERE session_id=? AND status='running'")
+        .bind(session).fetch_all(db).await?;
+    Ok(processes.into_iter().filter(|(pid, marker)| {
+        pid.and_then(|pid| u32::try_from(pid).ok())
+            .and_then(super::background_tasks::process_start_marker)
+            .zip(marker.as_ref()).is_some_and(|(current, recorded)| &current == recorded)
+    }).count() as i64)
+}
+
+/// Atomically retire abandoned turns before deriving any session projection.
+/// Snapshot exact roots so concurrent admission cannot sweep a newly created turn.
+pub(crate) async fn reconcile_orphan_turns(db: &SqlitePool) -> sqlx::Result<u64> {
+    if !has_table(db, "chat_turn_state").await? { return Ok(0); }
+    let rows: Vec<(String, String, i64)> = sqlx::query_as("SELECT root_turn_id,session_id,revision FROM chat_turn_state WHERE completed_at IS NULL AND terminal_reason IS NULL")
+        .fetch_all(db).await?;
+    let mut retired = 0;
+    let mut orphaned = Vec::new();
+    for (root, session, revision) in rows {
+        if crate::session_executor_alive(&session) != Some(false)
+            || has_active_work(db, &session).await? { continue; }
+        orphaned.push((root, revision));
     }
-    Ok(false)
+    let mut tx = db.begin().await?;
+    for (root, revision) in orphaned {
+        let now = chrono::Utc::now().timestamp_millis();
+        let result = sqlx::query("UPDATE chat_turn_state SET phase='settled',status='completed',revision=revision+1,terminal_reason='orphaned_by_restart',completed_at=?,updated_at=? WHERE root_turn_id=? AND revision=? AND completed_at IS NULL AND terminal_reason IS NULL")
+            .bind(now).bind(now).bind(&root).bind(revision).execute(&mut *tx).await?;
+        retired += result.rows_affected();
+    }
+    tx.commit().await?;
+    Ok(retired)
+}
+
+/// M188: repair every phantom running projection on startup and once per minute.
+pub(crate) async fn reconcile_running_liveness(db: &SqlitePool) -> sqlx::Result<()> {
+    reconcile_orphan_turns(db).await?;
+    super::thin_state::ensure(db).await?;
+    let sessions: Vec<String> = sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state='running'").fetch_all(db).await?;
+    for session in sessions {
+        if crate::session_executor_alive(&session) != Some(false) { continue; }
+        tracing::warn!(session, "running without executor; automatic recovery rederives projection");
+        refresh(db, &session).await?;
+    }
+    Ok(())
 }
 
 pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> {
@@ -523,7 +566,12 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
     if let Some(reason) = settled { return Ok(ThinState::ended(&reason, "本会话记录")); }
     match crate::session_executor_alive(session) {
         Some(true) => return Ok(ThinState::running()),
-        None => return Ok(super::thin_state::load(db, session).await?.unwrap_or_else(ThinState::running)),
+        None => return Ok(ThinState {
+            state: SessionState::WaitingWake,
+            waiting_for: Some("系统自动重试/自愈：重新核对执行者".into()),
+            wake_source: Some("系统周期活性检查".into()),
+            ..ThinState::running()
+        }),
         Some(false) => {}
     }
     let pending_background: i64 = if has_table(db, "background_tasks").await? {
@@ -534,10 +582,12 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND next_at<=?")
             .bind(session).bind(at / 1000).fetch_one(db).await?
     } else { 0 };
-    let tasks: i64 = if has_table(db, "background_tasks").await? {
-        sqlx::query_scalar("SELECT COUNT(*) FROM background_tasks WHERE session_id=? AND status='running'")
-            .bind(session).fetch_one(db).await?
-    } else { 0 };
+    let tasks = live_background_count(db, session).await?;
+    if tasks > 0 {
+        return Ok(super::thin_state::after_final(super::thin_state::WaitNeed::External {
+            what: "后台任务".into(), covered: true,
+        }, "本会话记录"));
+    }
     let wakes: i64 = if has_table(db, "wakeup_schedules").await? {
         sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE session_id=? AND status='pending' AND next_at>?")
             .bind(session).bind(at / 1000).fetch_one(db).await?
@@ -668,7 +718,7 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
         }
         // A newly admitted message is a fact even before the transport is registered.
         if terminal.is_some() && pending_background + due_wakes == 0 {
-            return Ok(ThinState::running());
+            return Ok(executor_missing_state());
         }
     } else if let Some((_, reason)) = &terminal {
         let previous = super::thin_state::load(db, session).await?;
@@ -765,12 +815,21 @@ pub async fn derive_state(db: &SqlitePool, session: &str) -> sqlx::Result<ThinSt
                 "本会话记录",
             ));
         }
-        return Ok(previous);
+        return Ok(if previous.state == SessionState::Running { executor_missing_state() } else { previous });
     }
     if latest_user.is_some() {
-        return Ok(ThinState::running());
+        return Ok(executor_missing_state());
     }
     Ok(ThinState::ended(terminal.as_ref().map_or("无活跃执行者或未决等待", |end| end.1.as_str()), "本会话记录"))
+}
+
+fn executor_missing_state() -> ThinState {
+    ThinState {
+        state: SessionState::WaitingWake,
+        waiting_for: Some("系统自动重试/自愈：接续中断回合".into()),
+        wake_source: Some("系统周期恢复扫描".into()),
+        ..ThinState::running()
+    }
 }
 
 /// 读取端刷新缓存；不受旧缓存的取消保护约束，事实才是权威。
@@ -784,6 +843,10 @@ pub async fn refresh(db: &SqlitePool, session: &str) -> sqlx::Result<ThinState> 
     super::thin_state::ensure(db).await?;
     sqlx::query("INSERT INTO thin_session_state(session_id,state,waiting_for,wake_source,question,reason,outcome_location,consecutive_failures,updated_at) VALUES (?,?,?,?,?,?,?,0,?) ON CONFLICT(session_id) DO UPDATE SET state=excluded.state,waiting_for=excluded.waiting_for,wake_source=excluded.wake_source,question=excluded.question,reason=excluded.reason,outcome_location=excluded.outcome_location,updated_at=excluded.updated_at")
         .bind(session).bind(state.state.as_str()).bind(&state.waiting_for).bind(&state.wake_source).bind(&state.question).bind(&state.reason).bind(&state.outcome_location).bind(state.updated_at).execute(db).await?;
+    if state.state == SessionState::WaitingWake
+        && state.wake_source.as_deref() == Some("系统周期恢复扫描") {
+        repair_waiting_wake_source(db, session).await?;
+    }
     Ok(state)
 }
 
@@ -809,7 +872,70 @@ mod tests {
         assert_eq!(count, 1, "startup repair must be idempotent");
     }
 
-    /// M187/R2/R4: durable activity belongs to another process, not this registry.
+    #[tokio::test]
+    async fn m188_running_requires_executor_not_cached_or_durable_activity() {
+        let db = fixture().await;
+        super::super::thin_state::save(&db, "derive", &ThinState::running()).await.unwrap();
+        sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('m188-user','derive','user','synthetic task',100)").execute(&db).await.unwrap();
+        let state = refresh(&db, "derive").await.unwrap();
+        assert_ne!(state.state, SessionState::Running, "without executor: {state:?}");
+        assert!(state.state != SessionState::WaitingUser || state.question.as_ref().is_some_and(|text| !text.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn m188_cross_process_orphans_settle_and_live_bash_survives() {
+        use crate::util::no_window::NoWindow;
+        const CHILD: &str = "CODEFACTORY_M188_SYNTHETIC_DB";
+        if let Ok(url) = std::env::var(CHILD) {
+            let db = crate::storage::db::connect(&url).await.unwrap();
+            let started = std::time::Instant::now();
+            reconcile_waiting_on_startup(&db).await.unwrap();
+            merged_settlement::settle_merged_sessions(&db).await.unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(60));
+            assert_eq!(super::super::thin_state::load(&db, "derive").await.unwrap().unwrap().state, SessionState::Ended);
+            let reasons: Vec<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE session_id='derive'").fetch_all(&db).await.unwrap();
+            assert_eq!(reasons, vec!["orphaned_by_restart"; 18]);
+            reconcile_waiting_on_startup(&db).await.unwrap();
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_turn_state WHERE completed_at IS NULL AND session_id='derive'").fetch_one(&db).await.unwrap();
+            assert_eq!(count, 0);
+            let control = crate::ChatRunControl::pending();
+            crate::register_session_executor("derive", &control);
+            #[cfg(unix)]
+            let mut bash = tokio::process::Command::new("bash").no_window().args(["-c", "sleep 2; printf M188-LIVE"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+            #[cfg(windows)]
+            let mut bash = tokio::process::Command::new("powershell").no_window().args(["-NoProfile", "-Command", "Start-Sleep -Seconds 2; Write-Output M188-LIVE"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+            assert!(bash.try_wait().unwrap().is_none());
+            sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES ('m188-live','derive','working','active',1,1)").execute(&db).await.unwrap();
+            reconcile_waiting_on_startup(&db).await.unwrap();
+            merged_settlement::settle_ended_and_cancel(&db, "derive", "old PR 已合并", "synthetic").await.unwrap();
+            assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Running);
+            let reason: Option<String> = sqlx::query_scalar("SELECT terminal_reason FROM chat_turn_state WHERE root_turn_id='m188-live'").fetch_one(&db).await.unwrap();
+            assert!(reason.is_none());
+            let output = bash.wait_with_output().await.unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "M188-LIVE");
+            crate::unregister_session_executor("derive", &control);
+            drop(control);
+            merged_settlement::settle_merged_sessions(&db).await.unwrap();
+            assert_eq!(super::super::thin_state::load(&db, "derive").await.unwrap().unwrap().state, SessionState::Ended);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("m188.sqlite").display());
+        let db = crate::storage::db::connect(&url).await.unwrap();
+        ensure_external(&db).await.unwrap();
+        sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES ('derive','synthetic','/synthetic','model',1,1,'thin')").execute(&db).await.unwrap();
+        super::super::thin_state::save(&db, "derive", &ThinState::running()).await.unwrap();
+        sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES ('derive',188,'ThroughMerge','PR #188 已合并')").execute(&db).await.unwrap();
+        for index in 0..18 {
+            sqlx::query("INSERT INTO chat_turn_state(root_turn_id,session_id,phase,status,started_at,updated_at) VALUES (?,'derive','working','active',1,1)").bind(format!("orphan-{index}")).execute(&db).await.unwrap();
+        }
+        db.close().await;
+        let output = std::process::Command::new(std::env::current_exe().unwrap()).env(CHILD, &url).args(["m188_cross_process_orphans_settle_and_live_bash_survives", "--nocapture"]).output().unwrap();
+        assert!(output.status.success(), "M188 worker failed: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
+    /// M187/R2/R4: durable rows alone are not live; current executor owns work.
     #[tokio::test]
     async fn m187_cross_process_active_facts_prevent_terminal_projection() {
         const CHILD: &str = "CODEFACTORY_M187_SYNTHETIC_DB";
@@ -827,13 +953,18 @@ mod tests {
                 sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES (?,187,'ThroughMerge','PR #187 已合并')")
                     .bind(&session).execute(&db).await.unwrap();
             }
+            let controls: Vec<_> = ["tool-pending", "tool-running", "thinking", "background"].into_iter().map(|session| {
+                let control = crate::ChatRunControl::pending();
+                crate::register_session_executor(session, &control);
+                (session, control)
+            }).collect();
             let batch = merged_settlement::settle_merged_sessions(&db).await.unwrap();
             assert_eq!(batch.settled, 26, "M187 idle merged backlog must settle: {batch:?}");
             for index in 0..26 {
                 let state = super::super::thin_state::load(&db, &format!("merged-idle-{index}")).await.unwrap().unwrap();
                 assert_eq!(state.state, SessionState::Ended);
             }
-            for session in ["tool-pending", "tool-running", "thinking", "background"] {
+            for (session, control) in controls {
                 let state = refresh(&db, session).await.unwrap();
                 assert_ne!(state.state, SessionState::Ended, "M187 active {session}: {state:?}");
                 merged_settlement::settle_merged_sessions(&db).await.unwrap();
@@ -847,6 +978,7 @@ mod tests {
                     .bind(session).execute(&db).await.unwrap();
                 let state = refresh(&db, session).await.unwrap();
                 assert_ne!(state.state, SessionState::Ended, "M187 stale workspace receipt ended {session}");
+                crate::unregister_session_executor(session, &control);
             }
             // A new delivery must never be settled by an older PR receipt.
             let mut waiting = ThinState::running();
@@ -1344,9 +1476,9 @@ mod tests {
         let db = fixture().await;
         sqlx::query("UPDATE sessions SET id='derive-live' WHERE id='derive'").execute(&db).await.unwrap();
         super::super::thin_state::save(&db, "derive-live", &ThinState::running()).await.unwrap();
-        assert_eq!(derive_state(&db, "derive-live").await.unwrap().state, SessionState::Running);
         let control = crate::ChatRunControl::pending();
         crate::register_session_executor("derive-live", &control);
+        assert_eq!(derive_state(&db, "derive-live").await.unwrap().state, SessionState::Running);
         sqlx::query("INSERT INTO chat_run_controls(run_instance_id,session_id,status,created_process_instance,created_at,updated_at) VALUES (?,'derive-live','active',?,1,1)")
             .bind(&control.run_instance_id).bind(crate::agent::objective::current_process_instance()).execute(&db).await.unwrap();
         assert_eq!(derive_state(&db, "derive-live").await.unwrap().state, SessionState::Running);
@@ -1357,7 +1489,7 @@ mod tests {
         assert_eq!(super::super::thin_state::load(&db, "derive-live").await.unwrap().unwrap().state, SessionState::Running);
         crate::unregister_session_executor("derive-live", &control);
         drop(control);
-        assert_eq!(derive_state(&db, "derive-live").await.unwrap().state, SessionState::Running);
+        assert_eq!(derive_state(&db, "derive-live").await.unwrap().state, SessionState::WaitingWake);
     }
     #[tokio::test]
     async fn future_wakes_and_unanswered_questions_follow_fact_precedence() {
@@ -1407,8 +1539,8 @@ mod tests {
             let derived = derive_state(&db, "derive").await.unwrap();
             assert_eq!(
                 derived.state,
-                SessionState::Running,
-                "{reason} 不得结束 thin 会话（reason={:?}）",
+                SessionState::WaitingWake,
+                "{reason} 无 executor 时应等待恢复而非 ended/running（reason={:?}）",
                 derived.reason
             );
         }
@@ -1493,7 +1625,7 @@ mod tests {
         }
         sqlx::query("INSERT INTO messages(id,session_id,role,content,created_at) VALUES ('new-user','derive','user','新任务',300)")
             .execute(&db).await.unwrap();
-        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::Running);
+        assert_eq!(refresh(&db, "derive").await.unwrap().state, SessionState::WaitingWake);
     }
 
     #[tokio::test]
@@ -1502,10 +1634,11 @@ mod tests {
         let mut state = ThinState::running();
         state.updated_at = 123;
         super::super::thin_state::save(&db, "derive", &state).await.unwrap();
+        let mut repaired_at = None;
         for _ in 0..3 {
             let derived = refresh(&db, "derive").await.unwrap();
-            assert_eq!(derived.state, SessionState::Running);
-            assert_eq!(derived.updated_at, 123);
+            assert_eq!(derived.state, SessionState::WaitingWake);
+            assert_eq!(*repaired_at.get_or_insert(derived.updated_at), derived.updated_at);
         }
     }
 
@@ -1809,9 +1942,17 @@ pub(crate) mod merged_settlement {
         state: &thin_state::ThinState,
     ) -> Result<()> {
         if state.state == thin_state::SessionState::Ended
-            && super::has_active_work(db, session_id).await? {
-            tracing::warn!(session_id, "terminal settlement rejected: active work; automatic recovery retains ownership");
-            thin_state::save(db, session_id, &thin_state::ThinState::running()).await?;
+            && (super::has_active_work(db, session_id).await?
+                || super::live_background_count(db, session_id).await? > 0) {
+            tracing::warn!(session_id, "terminal settlement rejected: live work; automatic recovery retains ownership");
+            let next = if super::has_active_work(db, session_id).await? {
+                thin_state::ThinState::running()
+            } else {
+                thin_state::after_final(thin_state::WaitNeed::External {
+                    what: "后台任务".into(), covered: true,
+                }, "本会话记录")
+            };
+            thin_state::save(db, session_id, &next).await?;
             return Ok(());
         }
         thin_state::ensure(db).await?;
@@ -1880,7 +2021,9 @@ pub(crate) mod merged_settlement {
         if !tick_due(chrono::Utc::now().timestamp_millis()) {
             return Ok(SettleSummary::default());
         }
-        settle_merged_sessions(pool).await
+        let summary = settle_merged_sessions(pool).await?;
+        super::reconcile_running_liveness(pool).await?;
+        Ok(summary)
     }
 
     fn tick_due(now: i64) -> bool {
@@ -1897,15 +2040,17 @@ pub(crate) mod merged_settlement {
     /// Deterministic — this never asks a model to finish the task.
     pub async fn settle_merged_sessions(pool: &SqlitePool) -> Result<SettleSummary> {
         thin_state::ensure(pool).await?;
+        super::reconcile_orphan_turns(pool).await?;
         let sessions: Vec<String> =
-            sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state='waiting_wake'")
+            sqlx::query_scalar("SELECT session_id FROM thin_session_state WHERE state IN ('waiting_wake','running')")
                 .fetch_all(pool)
                 .await?;
 
         let mut summary = SettleSummary::default();
         for session in sessions {
             // A live executor owns its own settlement; never race it.
-            if super::has_active_work(pool, &session).await? {
+            if crate::session_executor_alive(&session) != Some(false)
+                || super::live_background_count(pool, &session).await? > 0 {
                 summary.skipped += 1;
                 continue;
             }
