@@ -815,6 +815,24 @@ mod tests {
         const CHILD: &str = "CODEFACTORY_M187_SYNTHETIC_DB";
         if let Ok(url) = std::env::var(CHILD) {
             let db = crate::storage::db::connect(&url).await.unwrap();
+            sqlx::query("INSERT INTO thin_delivery_refs VALUES ('new-delivery','synthetic',188,'ThroughMerge')")
+                .execute(&db).await.unwrap();
+            for index in 0..26 {
+                let session = format!("merged-idle-{index}");
+                sqlx::query("INSERT INTO sessions(id,title,cwd,model_id,created_at,updated_at,delivery_mode) VALUES (?,'synthetic','/synthetic','model',1,1,'thin')")
+                    .bind(&session).execute(&db).await.unwrap();
+                let mut waiting = ThinState::running();
+                waiting.state = SessionState::WaitingWake;
+                super::super::thin_state::save(&db, &session, &waiting).await.unwrap();
+                sqlx::query("INSERT INTO thin_external_observations(session_id,pr_number,ceiling,completed_reason) VALUES (?,187,'ThroughMerge','PR #187 已合并')")
+                    .bind(&session).execute(&db).await.unwrap();
+            }
+            let batch = merged_settlement::settle_merged_sessions(&db).await.unwrap();
+            assert_eq!(batch.settled, 26, "M187 idle merged backlog must settle: {batch:?}");
+            for index in 0..26 {
+                let state = super::super::thin_state::load(&db, &format!("merged-idle-{index}")).await.unwrap().unwrap();
+                assert_eq!(state.state, SessionState::Ended);
+            }
             for session in ["tool-pending", "tool-running", "thinking", "background"] {
                 let state = refresh(&db, session).await.unwrap();
                 assert_ne!(state.state, SessionState::Ended, "M187 active {session}: {state:?}");
@@ -831,8 +849,6 @@ mod tests {
                 assert_ne!(state.state, SessionState::Ended, "M187 stale workspace receipt ended {session}");
             }
             // A new delivery must never be settled by an older PR receipt.
-            sqlx::query("INSERT INTO thin_delivery_refs VALUES ('new-delivery','synthetic',188,'ThroughMerge')")
-                .execute(&db).await.unwrap();
             let mut waiting = ThinState::running();
             waiting.state = SessionState::WaitingWake;
             super::super::thin_state::save(&db, "new-delivery", &waiting).await.unwrap();

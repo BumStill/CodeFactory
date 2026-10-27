@@ -1313,6 +1313,18 @@ pub(crate) async fn run_parent() -> anyhow::Result<serde_json::Value> {
         ] {
             pids.push(run_phase(&root, phase).await?);
         }
+        // M187/R4: the PR hard gate must run the real AgentLoop/provider/tool
+        // path too, not only fixtures representing an interrupted turn.
+        let executable = std::env::current_exe()?;
+        let live = Command::new(executable).no_window()
+            .arg("--thin-executor-liveness-smoke")
+            .arg(root.join("live-executor.json"))
+            .output()?;
+        anyhow::ensure!(live.status.success(), "M187 live executor smoke failed: {}", String::from_utf8_lossy(&live.stderr));
+        let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("live-executor.json"))?)?;
+        anyhow::ensure!(receipt["ok"] == true && receipt["tool_wait_exercised"] == true
+            && receipt["answers"] == 1 && receipt["bash_results"] == 1,
+            "M187 live executor receipt failed: {receipt}");
         pids.sort_unstable();
         pids.dedup();
         if pids.len() != 14 {
