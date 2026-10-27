@@ -2,7 +2,7 @@
 
 数据库遗留回合/工具行不是活 executor。启动时先原子结算孤儿回合，再结算已合并会话，防止旧会话被恢复为 running。周期检查修复无 executor 的 running 投影并记录告警。
 
-Scenario-Test: HLT-004
+Scenario-Test: HLT-001, HLT-004, RTE-003, RTE-004
 README-Update: reviewed
 README-Update-Reason: 内部状态恢复修复，不改变公开安装、隐私或平台承诺。
 

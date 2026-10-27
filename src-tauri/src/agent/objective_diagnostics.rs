@@ -444,7 +444,7 @@ pub async fn reset_session_state(db: &SqlitePool, session_id: &str) -> anyhow::R
     if state.state == SessionState::Running
         || (state.state == SessionState::WaitingWake
             && state.wake_source.as_deref() == Some("系统周期恢复扫描")) {
-        state = ThinState::ended("已手动重置会话状态：清理了残留运行状态，可以重新发送消息", "本会话记录");
+        state = ThinState::ended("已手动重置会话状态：残留运行状态已清理", "本会话记录");
         super::thin_state::save(db, session_id, &state).await?;
     } else {
         super::thin_derive::refresh(db, session_id).await?;
