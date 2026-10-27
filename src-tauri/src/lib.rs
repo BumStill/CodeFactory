@@ -1744,6 +1744,9 @@ pub fn run() {
                     "startup: persisted chat cancellations settled before recovery admission"
                 );
             }
+            tauri::async_runtime::block_on(
+                agent::thin_restart::capture_restart_interruptions(&objective_pool),
+            )?;
             let stale_chat_runs = tauri::async_runtime::block_on(
                 objective_store.reconcile_stale_chat_run_controls(&process_instance),
             )?;

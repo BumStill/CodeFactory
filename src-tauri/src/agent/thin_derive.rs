@@ -497,7 +497,13 @@ pub(crate) async fn reconcile_orphan_turns(db: &SqlitePool) -> sqlx::Result<u64>
         .fetch_all(db).await?;
     let mut retired = 0;
     let mut orphaned = Vec::new();
+    let has_interruptions = has_table(db, "thin_restart_interruptions").await?;
     for (root, session, revision) in rows {
+        if has_interruptions {
+            let interrupted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thin_restart_interruptions WHERE root_turn_id=?")
+                .bind(&root).fetch_one(db).await?;
+            if interrupted > 0 { continue; }
+        }
         if crate::session_executor_alive(&session) != Some(false)
             || has_active_work(db, &session).await? { continue; }
         orphaned.push((root, revision));

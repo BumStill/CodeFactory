@@ -4224,6 +4224,9 @@ pub(crate) async fn resume_thin_running_session(
         .map_err(|error| AppError::Other(error.to_string()))?;
         return Ok(());
     };
+    let Some(resume_key) = crate::agent::thin_restart::claim_restart(&db, &session_id, &root_turn_id).await? else {
+        return Ok(());
+    };
     let original_content: Option<String> = sqlx::query_scalar(
         "SELECT content FROM messages WHERE id=? AND session_id=? AND role='user'",
     )
@@ -4284,15 +4287,12 @@ pub(crate) async fn resume_thin_running_session(
     } else {
         thin.updated_at
     };
-    let resume_key = format!("thin-restart:{session_id}:{interrupt_at}");
-    push_thin_resume_prompt(&db, &session_id, &resume_key, interrupt_at, &mut history).await?;
-    // M170：模型拿到了续跑提示，用户也必须看到「上一轮被中断」——否则一次进程
-    // 退出会被对话完全隐藏，只剩一段莫名晚到的答案。
-    if let Err(error) =
-        persist_resume_interrupt_notice(&db, &session_id, &resume_key).await
-    {
-        tracing::warn!(%error, session = %session_id, "thin restart: failed to persist the interrupt notice");
+    // M189: the claim is keyed by the interrupted invocation, never updated_at.
+    // Pure model-stage recovery has no interrupted tool to announce.
+    if resume_key.starts_with("tool:") {
+        persist_resume_interrupt_notice(&db, &session_id, &resume_key).await?;
     }
+    push_thin_resume_prompt(&db, &session_id, &resume_key, interrupt_at, &mut history).await?;
 
     let requires_vision = history.iter().any(|message| {
         !crate::agent::attachments::extract_openai_parts(&message.content).is_empty()
@@ -4566,9 +4566,11 @@ pub(crate) async fn persist_resume_interrupt_notice(
     let tool: Option<String> = sqlx::query_scalar(
         "SELECT tool.tool_name FROM tool_calls tool \
          JOIN messages message ON message.id=tool.message_id \
-         WHERE message.session_id=? ORDER BY tool.created_at DESC LIMIT 1",
+         WHERE message.session_id=? AND (? IS NULL OR tool.id=?) ORDER BY tool.created_at DESC LIMIT 1",
     )
     .bind(session_id)
+    .bind(key.strip_prefix("tool:"))
+    .bind(key.strip_prefix("tool:"))
     .fetch_optional(db)
     .await?;
     let content = interrupt_notice_text(tool.as_deref());
