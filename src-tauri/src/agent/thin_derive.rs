@@ -1946,6 +1946,19 @@ pub(crate) mod merged_settlement {
         if !has_table(pool, "thin_external_observations").await? {
             return Ok(None);
         }
+        if has_table(pool, "thin_delivery_refs").await? {
+            let mismatched: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM thin_delivery_refs ref WHERE ref.session_id=?
+                 AND NOT EXISTS (SELECT 1 FROM thin_external_observations observation
+                     WHERE observation.session_id=ref.session_id
+                       AND observation.pr_number=ref.pr_number
+                       AND observation.ceiling=ref.ceiling)",
+            ).bind(session).fetch_one(pool).await?;
+            if mismatched > 0 {
+                tracing::warn!(session, "stale terminal PR observation cannot settle current delivery");
+                return Ok(None);
+            }
+        }
         let reason: Option<String> = sqlx::query_scalar(
             "SELECT completed_reason FROM thin_external_observations
              WHERE session_id=? AND completed_reason IS NOT NULL
