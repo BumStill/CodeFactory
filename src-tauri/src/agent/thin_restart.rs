@@ -53,6 +53,7 @@ async fn filter_restart_candidates(
                  AND answer.role='assistant' AND answer.created_at>=turn.started_at
                  AND TRIM(answer.content)<>''
                  AND (answer.tool_calls IS NULL OR answer.tool_calls='' OR answer.tool_calls='[]')
+                 AND NOT EXISTS (SELECT 1 FROM tool_calls invocation WHERE invocation.message_id=answer.id)
                  AND (answer.completion_state IS NULL OR answer.completion_state='' OR answer.completion_state='final'))")
             .bind(&session).bind(crate::agent::objective::current_process_instance())
             .fetch_one(db).await?;
