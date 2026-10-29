@@ -1306,11 +1306,15 @@ pub async fn drain_due_wakeups(pool: &SqlitePool, sink: &dyn WakeSink) -> usize 
 pub struct WakeSourceCover {
     pub running_tasks: usize,
     pub pending_wakeups: usize,
+    /// M197/R2：系统按有界心跳（≥180s、遵守 GitHub 配额）观测的 PR/CI 事项。
+    /// 它本身就是 durable 唤醒源——心跳会把它推进到「合并/检查全绿/失败」，
+    /// 因此不能把「刚开完 PR 的正常等待」判成无源等待。
+    pub external_observations: usize,
 }
 
 impl WakeSourceCover {
     pub fn is_covered(&self) -> bool {
-        self.running_tasks + self.pending_wakeups > 0
+        self.running_tasks + self.pending_wakeups + self.external_observations > 0
     }
 
     /// 缺唤醒源时给 agent 的一句可执行提示（不针对用户、不进对话）。
@@ -1334,6 +1338,7 @@ pub async fn wake_source_cover(pool: &SqlitePool, session_id: &str) -> WakeSourc
         return WakeSourceCover {
             running_tasks: 0,
             pending_wakeups: 0,
+            external_observations: 0,
         };
     }
     let running_tasks: i64 = sqlx::query_scalar(
@@ -1354,10 +1359,35 @@ pub async fn wake_source_cover(pool: &SqlitePool, session_id: &str) -> WakeSourc
     } else {
         0
     };
+    let external_observations: i64 = if ensure_external_table(pool).await.is_ok() {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM thin_external_observations WHERE session_id = ? AND completed_reason IS NULL",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+    } else {
+        0
+    };
     WakeSourceCover {
         running_tasks: running_tasks.max(0) as usize,
         pending_wakeups: pending_wakeups.max(0) as usize,
+        external_observations: external_observations.max(0) as usize,
     }
+}
+
+/// M197/R2：观测表由 thin_derive 建立；这里只读，不存在就当没有源。
+async fn ensure_external_table(pool: &SqlitePool) -> sqlx::Result<()> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='thin_external_observations'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if exists == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
 }
 
 /// R5：只约束仍有外部等待的回合，不改变 objective 或交付状态。
@@ -1408,6 +1438,31 @@ pub fn start_runtime(app: tauri::AppHandle) {
             Err(error) => tracing::warn!(%error, "background task reconcile failed"),
         }
         let sink = ChatWakeSink { app: app.clone() };
+        // M197/R3：启动即对账一次，之后每 180 秒持续对账。`waiting_wake` 必须有
+        // 具体唤醒源；没有源的存量会话在这里被补来源 / 转人话提问 / 结束，不会再
+        // 靠在「等唤醒」里等一个永远不会来的回合。
+        if let Err(error) = crate::agent::thin_derive::reconcile_waiting_wake_sources(&pool).await {
+            tracing::warn!(%error, "waiting_wake reconcile failed at startup");
+        }
+        let guard_pool = pool.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(180)).await;
+                match crate::agent::thin_derive::reconcile_waiting_wake_sources(&guard_pool).await {
+                    Ok(report) => {
+                        if report.swept > 0 || report.still_waiting != report.scanned {
+                            tracing::info!(
+                                scanned = report.scanned,
+                                swept = report.swept,
+                                still_waiting = report.still_waiting,
+                                "waiting_wake reconcile tick"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "waiting_wake reconcile failed"),
+                }
+            }
+        });
         loop {
             // 两类投递并发：后台命令积压不能阻塞定时唤醒扫描。
             let (delivered, fired) = tokio::join!(
