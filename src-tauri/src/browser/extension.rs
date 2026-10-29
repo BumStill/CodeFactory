@@ -106,6 +106,12 @@ pub struct ExtensionBridge {
     connection_changed: Notify,
     events: Mutex<Vec<serde_json::Value>>,
     extension_events: Mutex<Vec<serde_json::Value>>,
+    /// Whether any extension ever completed the handshake in this process.
+    ///
+    /// Distinguishes "never paired / not installed" from "paired before and
+    /// currently asleep": only the first needs the user, the second is a
+    /// reconnect the app can wait out on its own.
+    ever_connected: std::sync::atomic::AtomicBool,
 }
 
 impl ExtensionBridge {
@@ -120,6 +126,7 @@ impl ExtensionBridge {
             connection_changed: Notify::new(),
             events: Mutex::new(Vec::new()),
             extension_events: Mutex::new(Vec::new()),
+            ever_connected: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -198,6 +205,12 @@ impl ExtensionBridge {
             self.clear_connection(active.id).await;
         }
         self.event("reconnect_requested", serde_json::json!({})).await;
+    }
+
+    /// Whether an extension has ever paired in this process.
+    pub fn ever_connected(&self) -> bool {
+        self.ever_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether an extension is currently connected.
@@ -311,6 +324,8 @@ impl ExtensionBridge {
             let _ = superseded.sender.unbounded_send(superseded_close());
             self.clear_pending(superseded.id).await;
         }
+        self.ever_connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.connection_changed.notify_waiters();
         self.event("connected", serde_json::json!({})).await;
 
@@ -556,6 +571,23 @@ impl ExtensionBridge {
         })
     }
 
+    /// One PNG of a tab's visible area.
+    ///
+    /// The extension returns `chrome.tabs.captureVisibleTab`'s data URL; the
+    /// bytes are decoded and checked here so a malformed frame fails loudly
+    /// instead of leaving a `.png` nobody can open.
+    pub async fn capture_visible_tab(&self, tab_id: i64) -> Result<Vec<u8>> {
+        let data = self.call(Command::CaptureVisibleTab { tab_id }).await?;
+        let raw = data
+            .get("data_url")
+            .and_then(|value| value.as_str())
+            .or_else(|| data.as_str())
+            .ok_or_else(|| {
+                AppError::Other("The extension reported a capture but sent no image".into())
+            })?;
+        decode_png_data_url(raw)
+    }
+
     /// Search within a tab.
     pub async fn find(&self, tab_id: i64, query: &str) -> Result<Vec<String>> {
         let data = self
@@ -566,6 +598,24 @@ impl ExtensionBridge {
             .await?;
         Ok(super::page::parse_find(&data.to_string()))
     }
+}
+
+/// Decode a `data:image/png;base64,…` URL into bytes, rejecting anything else.
+pub(crate) fn decode_png_data_url(raw: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let encoded = raw
+        .strip_prefix("data:image/png;base64,")
+        .or_else(|| raw.strip_prefix("data:image/PNG;base64,"))
+        .unwrap_or(raw);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| AppError::Other(format!("The captured screenshot was not valid base64: {error}")))?;
+    if !bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Err(AppError::Other(
+            "The captured screenshot was not a PNG — the tab may have refused capture".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 impl Default for ExtensionBridge {

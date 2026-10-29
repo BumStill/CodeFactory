@@ -285,12 +285,35 @@ async function handle(request) {
           ok: true,
           data: await inPage(request.tab_id, "find", [request.query, 20]),
         };
+      case "capture_visible_tab":
+        return { ok: true, data: await captureVisibleTab(request.tab_id) };
       default:
         return { ok: false, error: `Unknown command: ${request.cmd}` };
     }
   } catch (error) {
     return { ok: false, error: String(error && error.message ? error.message : error) };
   }
+}
+
+/** Capture only an already-visible web tab; never change the user's UI. */
+async function captureVisibleTab(tabId) {
+  if (!Number.isInteger(tabId)) throw new Error("TAB_NOT_FOUND: A tab id is required");
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab || !/^https?:\/\//.test(tab.url || "")) {
+    throw new Error(`TAB_NOT_FOUND: Tab ${tabId} is not a readable web page`);
+  }
+  const matches = (tabs) => tabs.length === 1 && tabs[0].id === tabId && tabs[0].url === tab.url;
+  if (!tab.active || !matches(await chrome.tabs.query({ active: true, windowId: tab.windowId }))) {
+    throw new Error("TAB_NOT_VISIBLE: Select this tab yourself in the browser before requesting a screenshot; CodeFactory will not activate it.");
+  }
+  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+  if (!matches(await chrome.tabs.query({ active: true, windowId: tab.windowId }))) {
+    throw new Error("TAB_NOT_VISIBLE: The visible tab changed during capture; image discarded.");
+  }
+  if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/png")) {
+    throw new Error("The browser refused to capture that tab");
+  }
+  return { data_url: dataUrl, tab_id: tabId };
 }
 
 /**

@@ -2583,11 +2583,13 @@ pub async fn run_agent_loop(
                         );
                     } else {
                         blocked_tool_result = true;
-                        if output.metadata.as_ref().is_some_and(|metadata| {
-                            metadata.get("code").and_then(serde_json::Value::as_str)
-                                == Some("browser_pairing_required")
+                        if let Some(code) = output.metadata.as_ref().and_then(|metadata| {
+                            metadata.get("terminal_reason").or_else(|| metadata.get("code"))
+                                .and_then(serde_json::Value::as_str)
                         }) {
-                            blocker_terminal_reason = Some("browser_pairing_required".into());
+                            if matches!(code, "browser_pairing_required" | "LOGIN_REQUIRED") {
+                                blocker_terminal_reason = Some(code.into());
+                            }
                         }
                         if tc.function.name == "deliver_changes" {
                             structured_delivery_blocker = output

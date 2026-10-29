@@ -44,7 +44,72 @@ static LOCAL: Lazy<ChromiumDriver> = Lazy::new(ChromiumDriver::new);
 pub static BRIDGE: Lazy<Arc<ExtensionBridge>> = Lazy::new(|| Arc::new(ExtensionBridge::new()));
 
 const LEASE_TTL: Duration = Duration::from_secs(20 * 60);
+/// How long a bridge with no extension at all may take before the attach flow
+/// asks the user to install and pair it.
 const ATTACH_RECONNECT_GRACE: Duration = Duration::from_secs(6);
+/// How long a previously paired extension may take to come back.
+///
+/// A parked MV3 service worker only wakes on its own 30-second alarm, so the
+/// six-second window reported "the extension isn't connected" for an
+/// installation that was merely asleep — and a `read` right after a successful
+/// `select_tab` looked like a broken capability instead of a sleeping tab.
+const ATTACHED_WAKE_GRACE: Duration = Duration::from_secs(35);
+
+/// Machine-readable failure codes for the attached (extension) channel.
+///
+/// Prose alone made a recoverable transport gap, a missing permission and a
+/// page that needs the user's password look identical, so the model concluded
+/// the capability did not exist. Each code names its own owner and remedy.
+mod codes {
+    pub const EXTENSION_NOT_INSTALLED: &str = "EXTENSION_NOT_INSTALLED";
+    pub const EXTENSION_NOT_PAIRED: &str = "EXTENSION_NOT_PAIRED";
+    pub const EXTENSION_DISCONNECTED: &str = "EXTENSION_DISCONNECTED";
+    pub const TAB_NOT_FOUND: &str = "TAB_NOT_FOUND";
+    pub const ACTION_UNSUPPORTED_IN_ATTACH_MODE: &str = "ACTION_UNSUPPORTED_IN_ATTACH_MODE";
+    pub const LOGIN_REQUIRED: &str = "LOGIN_REQUIRED";
+}
+
+const CODED_ERRORS: [&str; 6] = [
+    codes::EXTENSION_NOT_INSTALLED,
+    codes::EXTENSION_NOT_PAIRED,
+    codes::EXTENSION_DISCONNECTED,
+    codes::TAB_NOT_FOUND,
+    codes::ACTION_UNSUPPORTED_IN_ATTACH_MODE,
+    codes::LOGIN_REQUIRED,
+];
+
+/// What the attached session can actually do, in the words the tool accepts.
+const ATTACHED_ACTIONS: [&str; 6] = [
+    "tabs",
+    "select_tab",
+    "read",
+    "find",
+    "snapshot",
+    "screenshot",
+];
+/// What it deliberately cannot do, so "unsupported" never reads as "broken".
+const ATTACHED_REFUSED_ACTIONS: [&str; 3] = ["click", "fill", "press"];
+
+/// Attach a code to a message without hiding the cause behind it.
+fn coded(code: &str, message: impl AsRef<str>) -> String {
+    format!("{code}: {}", message.as_ref())
+}
+
+/// The structured code carried by an error message, if it has one.
+fn error_code(error: &str) -> Option<&'static str> {
+    CODED_ERRORS
+        .iter()
+        .copied()
+        .find(|code| error.starts_with(code) && error[code.len()..].starts_with(':'))
+}
+
+fn describe_attached_capabilities() -> String {
+    format!(
+        "This attached session can: {} — all read-only. It cannot: {} — it never acts as you in your own browser; use browser_session.open when a step needs clicking or typing.",
+        ATTACHED_ACTIONS.join(", "),
+        ATTACHED_REFUSED_ACTIONS.join(", ")
+    )
+}
 
 fn recovery_digest(parts: &[&str]) -> String {
     let mut digest = Sha256::new();
@@ -557,7 +622,7 @@ pub fn definition() -> ToolDefinition {
                     "action": {"type":"string", "enum":["open","attach","tabs","select_tab","read","find","snapshot","click","fill","press","screenshot","close"]},
                     "session_id": {"type":"string"},
                     "url": {"type":"string"},
-                    "target": {"type":"string", "description":"Fresh snapshot element reference for click/fill, key for press, or zero-based tab index for select_tab"},
+        "target": {"type":"string", "description":"Tab id from tabs for select_tab/read/find/snapshot/screenshot. Unambiguous zero-based positions are accepted; on ambiguity use id:<id> or index:<position>. Element ref for click/fill, key for press."},
                     "text": {"type":"string", "description":"Text for fill"},
                     "path": {"type":"string", "description":"Project-relative screenshot path"},
                     "query": {"type":"string", "description":"Text to search for, for find"}
@@ -767,7 +832,10 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 } else {
                     output
                 };
-                Ok(ToolOutput::ok(format!("{heading}{output}")))
+                let result = ToolOutput::ok(format!("{heading}{output}"));
+                Ok(if args.action == "attach" {
+                    result.with_metadata(json!({"capabilities": ATTACHED_ACTIONS, "read_only": true}))
+                } else { result })
             }
         }
         Err(error) => {
@@ -775,7 +843,10 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                 Some(authorizer) => authorizer.dispatched().await,
                 None => false,
             };
-            if durable_dispatch_started {
+            if durable_dispatch_started
+                && !(session_kind == BrowserSessionKind::AttachedChrome
+                    && matches!(args.action.as_str(), "select_tab" | "attach"))
+            {
                 return Ok(ToolOutput::waiting(
                     "浏览器事件可能已经发出；系统已保留会话并将只读核对，绝不盲目重放。",
                 )
@@ -787,6 +858,28 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             }
             if preserve_attached_lease_after_error(&args.action, session_kind) {
                 let transport_error = is_extension_transport_error(&error);
+                // A sign-in wall is the user's call, not a fault: the lease is
+                // kept and the run waits for them with a visible hand-off
+                // instead of looking like the read crashed.
+                if error_code(&error) == Some(codes::LOGIN_REQUIRED) {
+                    if let Some(mut lease) = read_leases()
+                        .into_iter()
+                        .find(|lease| lease.session_id == session_id)
+                    {
+                        lease.status = "waiting_for_user".into();
+                        lease.updated_at_unix_secs = now_secs();
+                        write_lease(&lease);
+                    }
+                    return Ok(ToolOutput::blocked(error).with_metadata(json!({
+                        "code": codes::LOGIN_REQUIRED,
+                        "attention_owner": "user",
+                        "request_key": "browser-login",
+                        "recoverable": true,
+                        "session_preserved": true,
+                        "session_id": session_id,
+                        "next_action": "sign_in_in_your_browser",
+                    })));
+                }
                 if transport_error {
                     if let Some(mut lease) = read_leases()
                         .into_iter()
@@ -801,12 +894,13 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
                         write_lease(&lease);
                     }
                 }
+                let precise = error_code(&error);
                 return Ok(ToolOutput::err(error).with_metadata(json!({
-                    "code": if transport_error {
-                        "browser_extension_transport_failed"
+                    "code": precise.unwrap_or(if transport_error {
+                        codes::EXTENSION_DISCONNECTED
                     } else {
-                        "browser_extension_command_rejected"
-                    },
+                        "BROWSER_COMMAND_REJECTED"
+                    }),
                     "recoverable": transport_error,
                     "session_preserved": true,
                     "session_id": session_id,
@@ -832,12 +926,24 @@ pub async fn execute(args: Value, ctx: &ExecCtx) -> Result<ToolOutput> {
             if args.action == "attach" {
                 // No longer a Chrome setting to flip: the extension replaces
                 // remote debugging, so the fix is to install and pair it.
+                let code = error_code(&error).unwrap_or(codes::EXTENSION_NOT_PAIRED);
+                if code == codes::EXTENSION_DISCONNECTED {
+                    return Ok(ToolOutput::waiting(
+                        "浏览器扩展暂时断开，系统自动重试/自愈；无需重新安装或配对。"
+                    ).with_metadata(json!({
+                        "code": code, "system_owned": true, "recoverable": true,
+                    })));
+                }
                 return Ok(
                     ToolOutput::blocked(attach_blocked_guidance(&error)).with_metadata(json!({
-                        "code": "browser_pairing_required",
+                        "code": code,
+                        // Downstream terminal-reason mapping stays stable: the
+                        // user still has to install or pair the extension.
+                        "terminal_reason": "browser_pairing_required",
                         "attention_owner": "user",
                         "request_key": "browser-pairing",
                         "recoverable": true,
+                        "capabilities": ATTACHED_ACTIONS,
                     })),
                 );
             }
@@ -885,12 +991,19 @@ where
         Err(error) => error,
     };
     if kind != BrowserSessionKind::AttachedChrome
-        || !matches!(action, "tabs" | "read" | "find" | "snapshot")
+        || !matches!(
+            action,
+            "tabs" | "read" | "find" | "snapshot" | "select_tab" | "screenshot"
+        )
         || !is_extension_transport_error(&error)
     {
         return Err(error);
     }
-    if !wait_for_connection(ATTACH_RECONNECT_GRACE).await {
+    // A parked service worker only wakes on its own 30-second alarm, so the
+    // retry waits long enough for a real reconnect instead of concluding that
+    // the capability is gone.
+    let woke = wait_for_connection(ATTACHED_WAKE_GRACE).await;
+    if !woke {
         return Err(error);
     }
     retry().await
@@ -927,6 +1040,281 @@ fn screenshot_path(args: &Args, cwd: &Path) -> std::result::Result<PathBuf, Stri
     Ok(cwd.join(path))
 }
 
+/// Observe only leases already waiting for login. No navigation or form input.
+/// Called by the existing background bridge observer, including after restart.
+pub(crate) async fn resume_login_objectives(pool: &sqlx::SqlitePool) -> anyhow::Result<usize> {
+    let store = crate::agent::objective::ObjectiveStore::new(pool.clone());
+    let mut resumed = 0;
+    for mut lease in read_leases().into_iter().filter(|lease| {
+        lease.kind == BrowserSessionKind::AttachedChrome && lease.status == "waiting_for_user"
+    }) {
+        let Some(tab) = lease.selected_tab else { continue };
+        let Ok(page) = BRIDGE.read(tab).await else { continue };
+        if login_redirect_host(&page, lease.current_host.as_deref()).is_some()
+            || page.markdown.trim().is_empty()
+        { continue; }
+        // Match the exact owner and root turn, not every browser-login wait.
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM objectives WHERE status='waiting_core_input' AND domain='browser'
+             AND session_id=? AND request_key LIKE 'browser-login:%'
+             AND (root_turn_id=? OR task_id=?)",
+        )
+        .bind(&lease.owner_session_id).bind(&lease.task_id).bind(&lease.task_id)
+        .fetch_all(pool).await?;
+        for id in rows {
+            resumed += store.resume_waiting_core_inputs(
+                crate::agent::objective::RecoveryDomain::Browser,
+                &format!("browser-login:{id}:"), "browser_login_restored",
+            ).await?;
+        }
+        lease.status = "active".into();
+        lease.updated_at_unix_secs = now_secs();
+        write_lease(&lease);
+    }
+    Ok(resumed)
+}
+
+/// Wait for an extension, budgeting by whether one has ever paired.
+async fn wait_for_extension_bridge() -> bool {
+    if BRIDGE.connected().await {
+        return true;
+    }
+    if BRIDGE.ever_connected() {
+        BRIDGE.wait_until_connected(ATTACHED_WAKE_GRACE).await
+    } else {
+        BRIDGE.wait_until_connected(ATTACH_RECONNECT_GRACE).await
+    }
+}
+
+/// Why the attach flow found no extension, in the caller's own terms.
+fn attach_failure_code() -> &'static str {
+    let known = BRIDGE.ever_connected();
+    if known {
+        codes::EXTENSION_DISCONNECTED
+    } else {
+        // Chrome installation cannot be inferred from a prepared app folder.
+        // Without an authenticated handshake only pairing is unconfirmed.
+        codes::EXTENSION_NOT_PAIRED
+    }
+}
+
+fn attach_failure_detail() -> String {
+    match attach_failure_code() {
+        codes::EXTENSION_DISCONNECTED => "浏览器扩展暂时断开，系统自动重连后即可继续（保留已选标签）。The extension dropped off the bridge; the app reconnects on its own, so calling attach again in a few seconds is enough.".to_string(),
+        codes::EXTENSION_NOT_INSTALLED => "The CodeFactory browser extension is not installed, so there is no channel to the user's browser. Install it from 设置 → 浏览器会话 → 准备并加载扩展, then attach again.".to_string(),
+        _ => "The CodeFactory browser extension is installed but not paired with this app, or Chrome has not started it yet. Open the extension popup, keep the pairing shown in 设置 → 浏览器会话, then attach again.".to_string(),
+    }
+}
+
+/// Turn a bridge failure into a code the model can act on.
+fn classify_extension_error(action: &str, error: crate::errors::AppError) -> String {
+    let message = error.to_string();
+    if error_code(&message).is_some() {
+        return message;
+    }
+    if is_extension_transport_error(&message) {
+        return coded(
+            codes::EXTENSION_DISCONNECTED,
+            format!(
+                "The extension connection dropped during {action} ({message}). 系统自动重试一次，最多等待扩展唤醒约 35 秒；若仍失败，请确认扩展图标显示已连接。"
+            ),
+        );
+    }
+    let lower = message.to_lowercase();
+    if lower.contains("no tab with id")
+        || lower.contains("invalid tab")
+        || lower.contains("no longer open")
+        || lower.contains("cannot be scripted")
+        || lower.contains("cannot access")
+        || lower.contains("no tab")
+    {
+        return coded(
+            codes::TAB_NOT_FOUND,
+            format!("{message}. Call browser_session.tabs to see the tab ids that are open now."),
+        );
+    }
+    message
+}
+
+/// The tab a `target` argument names, resolved against a live tab list.
+///
+/// The schema used to promise a zero-based index while the implementation
+/// parsed an id. Both readings are supported now, but the id wins: it is what
+/// `tabs` prints and what stays true across reordering.
+#[derive(Debug, Clone, PartialEq)]
+struct TabSelection {
+    tab_id: i64,
+    title: String,
+    url: String,
+    /// Appended to the answer when the number needed interpreting.
+    note: String,
+}
+
+fn resolve_tab_reference(
+    raw: &str,
+    tabs: &[crate::browser::extension::Tab],
+) -> std::result::Result<TabSelection, String> {
+    let raw = raw.trim();
+    let explicit_id = raw.strip_prefix("id:");
+    let explicit_index = raw.strip_prefix("index:");
+    let numeric = explicit_id.or(explicit_index).unwrap_or(raw);
+    if tabs.is_empty() {
+        return Err(coded(
+            codes::TAB_NOT_FOUND,
+            "No readable tabs are open in the user's browser — call browser_session.tabs again; the page may have been closed, or it may be a chrome:// page",
+        ));
+    }
+    let available = || {
+        tabs.iter()
+            .take(10)
+            .map(|tab| format!("{} {} {}", tab.tab_id, tab.title, tab.url))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let Ok(number) = numeric.parse::<i64>() else {
+        return Err(coded(
+            codes::TAB_NOT_FOUND,
+            format!(
+                "'{raw}' is not a tab id from browser_session.tabs. Open tabs: {}",
+                available()
+            ),
+        ));
+    };
+    if explicit_index.is_none() {
+      if let Some(tab) = tabs.iter().find(|tab| tab.tab_id == number) {
+        if explicit_id.is_none() && usize::try_from(number).ok()
+            .and_then(|index| tabs.get(index)).is_some_and(|indexed| indexed.tab_id != number) {
+            return Err(coded(codes::TAB_NOT_FOUND, format!(
+                "ambiguous target {number}: use id:{number} for the tab id, or index:{number} for the zero-based position; no selection changed"
+            )));
+        }
+        return Ok(TabSelection {
+            tab_id: tab.tab_id,
+            title: tab.title.clone(),
+            url: tab.url.clone(),
+            note: String::new(),
+        });
+      }
+    }
+    if explicit_id.is_none() {
+      if let Ok(position) = usize::try_from(number) {
+        if position < tabs.len() {
+            let tab = &tabs[position];
+            return Ok(TabSelection {
+                tab_id: tab.tab_id,
+                title: tab.title.clone(),
+                url: tab.url.clone(),
+                note: format!(
+                    " ({number} was read as the zero-based position in the tabs listing; its tab id is {}.)",
+                    tab.tab_id
+                ),
+            });
+        }
+      }
+    }
+    Err(coded(
+        codes::TAB_NOT_FOUND,
+        format!("There is no tab {number}. Open tabs: {}", available()),
+    ))
+}
+
+/// Host of the tab the session is already on, if one is recorded.
+fn selected_host(session_id: &str) -> Option<String> {
+    read_leases()
+        .into_iter()
+        .find(|lease| lease.session_id == session_id)
+        .and_then(|lease| lease.current_host)
+}
+
+/// Record what a read actually observed, without disturbing the selection.
+fn remember_page(session_id: &str, page: &PageContent, ctx: &ExecCtx, kind: BrowserSessionKind) {
+    let Some(mut lease) = read_leases()
+        .into_iter()
+        .find(|lease| lease.session_id == session_id)
+    else {
+        return;
+    };
+    lease.pane_url = Some(page.url.clone());
+    lease.current_host = host_of(&page.url).or(lease.current_host);
+    lease.page_title = Some(page.title.clone());
+    lease.kind = kind;
+    lease.task_id = ctx.task_id.clone();
+    lease.updated_at_unix_secs = now_secs();
+    write_lease(&lease);
+}
+
+/// The host to name when the page we landed on is a sign-in wall.
+///
+/// Redirects into SSO are normal, so a URL marker alone is not enough: the page
+/// must also look like a form that wants a password, or be titled as a login.
+fn login_redirect_host(page: &PageContent, previous_host: Option<&str>) -> Option<String> {
+    let host = host_of(&page.url)?;
+    let url = page.url.to_lowercase();
+    let title = page.title.to_lowercase();
+    let body = page.markdown.to_lowercase();
+    let url_marker = [
+        "/login",
+        "/signin",
+        "/sign-in",
+        "/log-in",
+        "/sso",
+        "/oauth",
+        "/authorize",
+        "/auth/",
+        "/session/new",
+        "/passwd",
+        "/account/verify",
+    ]
+    .iter()
+    .any(|marker| url.contains(marker));
+    let title_marker = ["sign in", "log in", "login", "登录", "登入", "authenticate"]
+        .iter()
+        .any(|marker| title.contains(marker));
+    let password_form =
+        (body.contains("password") || body.contains("密码")) && body.chars().count() < 2000;
+    let moved_host = previous_host.is_some_and(|previous| previous != host);
+    if url_marker && (password_form || title_marker) {
+        return Some(host);
+    }
+    if title_marker && password_form {
+        return Some(host);
+    }
+    if moved_host && password_form {
+        return Some(host);
+    }
+    None
+}
+
+/// The sentence the user sees when the page needs them, not the agent.
+fn login_handoff_sentence(host: &str) -> String {
+    format!(
+        "需要你在浏览器里登录 {host}。Log in to {host} in your own browser, then continue — CodeFactory never types credentials, and the read resumes once you are signed in."
+    )
+}
+
+/// Below this many characters a page that rendered itself into pixels is
+/// indistinguishable from an empty one.
+const CANVAS_PAGE_MAX_CHARS: usize = 400;
+
+/// Point the model at the pixels when the page has no text by construction.
+///
+/// A slide preview, a PDF viewer or a chart app yields a title and a canvas:
+/// the text channel is empty on purpose, which used to look like a failed
+/// extractor instead of a page that has nothing to extract.
+fn canvas_hint(page: &PageContent, tab_id: i64) -> Option<String> {
+    let text = page.markdown.trim();
+    if page.truncated || text.chars().count() >= CANVAS_PAGE_MAX_CHARS {
+        return None;
+    }
+    if !page.url.starts_with("http") {
+        return None;
+    }
+    Some(format!(
+        "Only {} characters came back from this page — it is probably rendered into a canvas (slide preview, chart, PDF viewer). Call browser_session with action=screenshot, target={tab_id}, path=<project-relative .png>, then view_image on that path to read it.",
+        text.chars().count()
+    ))
+}
+
 /// Which tab of the user's browser this session is working with.
 ///
 /// Kept on the lease rather than in memory so it survives the same way the
@@ -939,7 +1327,13 @@ fn selected_tab(session_id: &str) -> Option<i64> {
         .and_then(|lease| lease.selected_tab)
 }
 
-fn remember_selected_tab(session_id: &str, tab_id: i64, ctx: &ExecCtx, kind: BrowserSessionKind) {
+fn remember_selected_tab(
+    session_id: &str,
+    tab_id: i64,
+    page: Option<&PageContent>,
+    ctx: &ExecCtx,
+    kind: BrowserSessionKind,
+) {
     let existing = read_leases()
         .into_iter()
         .find(|lease| lease.session_id == session_id);
@@ -951,9 +1345,18 @@ fn remember_selected_tab(session_id: &str, tab_id: i64, ctx: &ExecCtx, kind: Bro
         owner_start_token: crate::storage::db::current_process_start_token(),
         kind,
         selected_tab: Some(tab_id),
-        pane_url: None,
-        current_host: None,
-        page_title: None,
+        // A selection is not evidence that the page changed: keep what the
+        // lease already knows unless this call actually observed the page, so
+        // re-selecting no longer erases the url/title/host of the tab in hand.
+        pane_url: page
+            .map(|page| page.url.clone())
+            .or_else(|| existing.as_ref().and_then(|lease| lease.pane_url.clone())),
+        current_host: page
+            .and_then(|page| host_of(&page.url))
+            .or_else(|| existing.as_ref().and_then(|lease| lease.current_host.clone())),
+        page_title: page
+            .map(|page| page.title.clone())
+            .or_else(|| existing.as_ref().and_then(|lease| lease.page_title.clone())),
         connection_endpoint: existing
             .as_ref()
             .and_then(|lease| lease.connection_endpoint.clone()),
@@ -985,9 +1388,11 @@ async fn dispatch(
 
     match (kind, args.action.as_str()) {
         // ── The user's own browser, through the extension ──────────────────
+        // Keeping the screenshot branch above `close` keeps the read-only set
+        // and the refused set in one contiguous block, where it is reviewable.
         (_, "attach") => {
-            if !BRIDGE.wait_until_connected(ATTACH_RECONNECT_GRACE).await {
-                return Err("browser_pairing_required".into());
+            if !wait_for_extension_bridge().await {
+                return Err(coded(attach_failure_code(), attach_failure_detail()));
             }
             authorizer.authorize().await.map_err(to_message)?;
             let tabs = match BRIDGE.list_tabs().await {
@@ -999,12 +1404,16 @@ async fn dispatch(
             };
             authorizer.acknowledge(None).await.map_err(to_message)?;
             if tabs.is_empty() {
-                return Ok("Connected to the user's browser. No readable tabs are open.".into());
+                return Ok(format!(
+                    "Connected to the user's browser. No readable tabs are open.\n{}",
+                    describe_attached_capabilities()
+                ));
             }
             Ok(format!(
-                "Connected to the user's browser. {} tab(s) open:\n{}",
+                "Connected to the user's browser. {} tab(s) open:\n{}\n{}",
                 tabs.len(),
-                format_tabs(&tabs)
+                format_tabs(&tabs),
+                describe_attached_capabilities()
             ))
         }
         (BrowserSessionKind::AttachedChrome, "tabs") => {
@@ -1012,22 +1421,53 @@ async fn dispatch(
             Ok(format_tabs(&tabs))
         }
         (BrowserSessionKind::AttachedChrome, "select_tab") => {
-            let raw = args
-                .target
-                .as_deref()
-                .ok_or("browser_session.select_tab requires the tab id in `target`")?;
-            let tab_id: i64 = raw
-                .parse()
-                .map_err(|_| format!("'{raw}' is not a tab id from browser_session.tabs"))?;
+            let raw = args.target.as_deref().ok_or_else(|| {
+                coded(
+                    codes::TAB_NOT_FOUND,
+                    "browser_session.select_tab requires the tab id in `target` — call browser_session.tabs first",
+                )
+            })?;
+            // Selecting is only a promise if the extension confirms it: the
+            // old path stored whatever number it was handed and answered
+            // "ok", so a wrong id surfaced one call later as a broken
+            // connection.
+            let tabs = BRIDGE
+                .list_tabs()
+                .await
+                .map_err(|error| classify_extension_error("select_tab", error))?;
+            let selection = resolve_tab_reference(raw, &tabs)?;
+            let content = BRIDGE
+                .read(selection.tab_id)
+                .await
+                .map_err(|error| classify_extension_error("select_tab", error))?;
             authorizer.authorize().await.map_err(to_message)?;
-            remember_selected_tab(session_id, tab_id, ctx, kind);
+            remember_selected_tab(session_id, selection.tab_id, Some(&content), ctx, kind);
             authorizer.acknowledge(None).await.map_err(to_message)?;
-            Ok(format!("Working with tab {tab_id}."))
+            Ok(format!(
+                "Working with tab {} | {} | {}.{}",
+                selection.tab_id,
+                if content.title.is_empty() { selection.title.as_str() } else { content.title.as_str() },
+                content.url,
+                selection.note
+            ))
         }
         (BrowserSessionKind::AttachedChrome, "read" | "snapshot") => {
             let tab_id = resolve_tab(session_id, args).await?;
-            let content = BRIDGE.read(tab_id).await.map_err(to_message)?;
-            Ok(render_page(&content))
+            let previous_host = selected_host(session_id);
+            let content = BRIDGE
+                .read(tab_id)
+                .await
+                .map_err(|error| classify_extension_error("read", error))?;
+            if let Some(host) = login_redirect_host(&content, previous_host.as_deref()) {
+                return Err(coded(codes::LOGIN_REQUIRED, login_handoff_sentence(&host)));
+            }
+            remember_page(session_id, &content, ctx, kind);
+            let mut rendered = render_page(&content);
+            if let Some(hint) = canvas_hint(&content, tab_id) {
+                rendered.push_str("\n\n");
+                rendered.push_str(&hint);
+            }
+            Ok(rendered)
         }
         (BrowserSessionKind::AttachedChrome, "find") => {
             let tab_id = resolve_tab(session_id, args).await?;
@@ -1035,8 +1475,32 @@ async fn dispatch(
                 .query
                 .as_deref()
                 .ok_or("browser_session.find requires a query")?;
-            let hits = BRIDGE.find(tab_id, query).await.map_err(to_message)?;
+            let hits = BRIDGE
+                .find(tab_id, query)
+                .await
+                .map_err(|error| classify_extension_error("find", error))?;
             Ok(format_hits(&hits, query))
+        }
+        (BrowserSessionKind::AttachedChrome, "screenshot") => {
+            // A capture reads pixels; it never touches the page, so it stays
+            // inside the attached channel's read-only boundary.
+            let path = screenshot_path(args, &ctx.cwd)?;
+            let tab_id = resolve_tab(session_id, args).await?;
+            let png = BRIDGE
+                .capture_visible_tab(tab_id)
+                .await
+                .map_err(|error| classify_extension_error("screenshot", error))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!("Could not create {}: {error}", parent.display())
+                })?;
+            }
+            std::fs::write(&path, &png)
+                .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+            Ok(format!(
+                "Captured tab {tab_id} to {}. Use view_image on that path to read it (the page itself renders no text).",
+                path.display()
+            ))
         }
         (BrowserSessionKind::AttachedChrome, "close") => {
             authorizer.authorize().await.map_err(to_message)?;
@@ -1044,9 +1508,14 @@ async fn dispatch(
             Ok(String::new())
         }
         // Acting as the user in their own browser is deliberately not offered.
-        (BrowserSessionKind::AttachedChrome, action) => Err(format!(
-            "browser_session.{action} is not available in the user's own browser — it is \
-             read-only. Use browser_session.open for a browser CodeFactory controls."
+        (BrowserSessionKind::AttachedChrome, action) => Err(coded(
+            codes::ACTION_UNSUPPORTED_IN_ATTACH_MODE,
+            format!(
+                "browser_session.{action} is not available in the user's own browser — the \
+                 attached channel is read-only. Useable now: {}. Use browser_session.open \
+                 with a url when a step needs clicking or typing.",
+                ATTACHED_ACTIONS.join(", ")
+            ),
         )),
 
         // ── The browser CodeFactory manages ────────────────────────────────
@@ -1163,9 +1632,8 @@ async fn dispatch(
 /// Pick the tab to work with: the one named in this call, else the remembered one.
 async fn resolve_tab(session_id: &str, args: &Args) -> std::result::Result<i64, String> {
     if let Some(raw) = args.target.as_deref() {
-        return raw
-            .parse()
-            .map_err(|_| format!("'{raw}' is not a tab id from browser_session.tabs"));
+        let tabs = BRIDGE.list_tabs().await.map_err(|error| classify_extension_error("tabs", error))?;
+        return resolve_tab_reference(raw, &tabs).map(|selection| selection.tab_id);
     }
     selected_tab(session_id).ok_or_else(|| {
         "No tab selected. Call browser_session.tabs, then select_tab, or pass the tab id in \
@@ -1894,7 +2362,7 @@ mod tests {
         // is another, and this backend deliberately does not offer the second.
         let ctx = ExecCtx::new(std::env::temp_dir(), None);
         let authorizer = AllowBrowserMutation;
-        for action in ["click", "fill", "press", "screenshot", "open"] {
+        for action in ["click", "fill", "press", "open"] {
             let error = dispatch(
                 &args_for(action),
                 &ctx,
@@ -1908,7 +2376,189 @@ mod tests {
                 error.contains("read-only"),
                 "{action} should be refused as read-only, got: {error}"
             );
+            assert_eq!(
+                error_code(&error),
+                Some(codes::ACTION_UNSUPPORTED_IN_ATTACH_MODE),
+                "{action} must carry a structural code, not prose only"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn an_attached_screenshot_is_a_read_that_still_stays_in_the_project() {
+        // Capturing pixels never touches the page, so it belongs to the
+        // read-only set — but it writes a file, so the path rule still applies.
+        let ctx = ExecCtx::new(std::env::temp_dir(), None);
+        let authorizer = AllowBrowserMutation;
+        let error = dispatch(
+            &args_for("screenshot"),
+            &ctx,
+            "codefactory-test",
+            BrowserSessionKind::AttachedChrome,
+            &authorizer,
+        )
+        .await
+        .expect_err("a capture needs a destination");
+        assert!(
+            error.contains("project-relative"),
+            "screenshot must ask for a project path, got: {error}"
+        );
+        assert!(
+            !error.contains("read-only"),
+            "screenshot is not part of the refused set: {error}"
+        );
+    }
+
+    fn tab(id: i64, title: &str, url: &str) -> crate::browser::extension::Tab {
+        crate::browser::extension::Tab {
+            tab_id: id,
+            title: title.into(),
+            url: url.into(),
+            active: false,
+        }
+    }
+
+    #[test]
+    fn m194_ambiguous_reference_fails_instead_of_selecting_another_page() {
+        let tabs = vec![tab(1, "First", "https://one.example"), tab(700, "Second", "https://two.example")];
+        let error = resolve_tab_reference("1", &tabs).expect_err("ambiguous number must not silently select");
+        assert!(error.contains("ambiguous") && error.contains("id:1") && error.contains("index:1"));
+        assert_eq!(resolve_tab_reference("id:1", &tabs).unwrap().tab_id, 1);
+        assert_eq!(resolve_tab_reference("index:1", &tabs).unwrap().tab_id, 700);
+    }
+
+    #[test]
+    fn a_tab_id_wins_over_a_zero_based_position() {
+        let tabs = vec![
+            tab(4821, "Deck", "https://slides.example/deck"),
+            tab(4822, "Inbox", "https://mail.example/inbox"),
+        ];
+        let by_id = resolve_tab_reference("4822", &tabs).expect("id resolves");
+        assert_eq!(by_id.tab_id, 4822);
+        assert_eq!(by_id.title, "Inbox");
+        assert!(by_id.note.is_empty(), "an exact id needs no explanation");
+
+        // The schema used to promise a position, so a small number stays
+        // usable — and says how it was read so the caller can correct it.
+        let by_position = resolve_tab_reference("1", &tabs).expect("position resolves");
+        assert_eq!(by_position.tab_id, 4822);
+        assert!(
+            by_position.note.contains("zero-based position"),
+            "got: {}",
+            by_position.note
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_number_says_which_reading_it_used() {
+        // 1 is both the id of the first tab and the position of the second.
+        let tabs = vec![
+            tab(1, "First", "https://one.example/a"),
+            tab(700, "Second", "https://two.example/b"),
+        ];
+        let error = resolve_tab_reference("1", &tabs).expect_err("R1 requires ambiguity to fail closed");
+        assert!(error.contains("ambiguous") && error.contains("id:1") && error.contains("index:1"));
+    }
+
+    #[test]
+    fn a_tab_that_is_not_there_fails_loudly_and_lists_what_is() {
+        let tabs = vec![tab(4821, "Deck", "https://slides.example/deck")];
+        let missing = resolve_tab_reference("999", &tabs).expect_err("no such tab");
+        assert_eq!(error_code(&missing), Some(codes::TAB_NOT_FOUND));
+        assert!(missing.contains("4821"), "must list the open ids: {missing}");
+
+        let nonsense = resolve_tab_reference("deck", &tabs).expect_err("not a tab");
+        assert_eq!(error_code(&nonsense), Some(codes::TAB_NOT_FOUND));
+
+        let none = resolve_tab_reference("0", &[]).expect_err("no tabs at all");
+        assert_eq!(error_code(&none), Some(codes::TAB_NOT_FOUND));
+    }
+
+    #[test]
+    fn selecting_a_tab_keeps_the_page_facts_it_already_knew() {
+        let ctx = ExecCtx::new(std::env::temp_dir(), None);
+        let session = format!("codefactory-test-keep-{}", std::process::id());
+        let page = crate::browser::PageContent {
+            url: "https://slides.example/deck/1".into(),
+            title: "Deck".into(),
+            markdown: "slide text".into(),
+            truncated: false,
+        };
+        remember_selected_tab(&session, 7, Some(&page), &ctx, BrowserSessionKind::AttachedChrome);
+        assert_eq!(selected_host(&session).as_deref(), Some("slides.example"));
+        // Re-selecting with no observation must not blank what we already knew.
+        remember_selected_tab(&session, 9, None, &ctx, BrowserSessionKind::AttachedChrome);
+        assert_eq!(selected_tab(&session), Some(9));
+        assert_eq!(selected_host(&session).as_deref(), Some("slides.example"));
+        remove_lease(&session);
+    }
+
+    #[test]
+    fn a_sign_in_wall_is_handed_to_the_user_not_retried() {
+        let login = crate::browser::PageContent {
+            url: "https://sso.example/login?next=/deck".into(),
+            title: "Sign in".into(),
+            markdown: "Sign in to continue\nEmail\nPassword".into(),
+            truncated: false,
+        };
+        let host = login_redirect_host(&login, Some("slides.example")).expect("login wall");
+        assert_eq!(host, "sso.example");
+        let sentence = login_handoff_sentence(&host);
+        assert!(
+            sentence.contains("需要你在浏览器里登录 sso.example"),
+            "the user must be told in their own words: {sentence}"
+        );
+
+        let article = crate::browser::PageContent {
+            url: "https://news.example/story".into(),
+            title: "The password reset that broke prod".into(),
+            markdown: "A long article about password resets and sessions.".into(),
+            truncated: false,
+        };
+        assert_eq!(login_redirect_host(&article, Some("news.example")), None);
+
+        // A URL that merely mentions /auth/ is not a wall on its own.
+        let docs = crate::browser::PageContent {
+            url: "https://docs.example/auth/overview".into(),
+            title: "Auth overview".into(),
+            markdown: "How tokens are issued.".into(),
+            truncated: false,
+        };
+        assert_eq!(login_redirect_host(&docs, None), None);
+    }
+
+    #[test]
+    fn a_page_with_no_text_points_at_its_pixels() {
+        let canvas = crate::browser::PageContent {
+            url: "https://slides.example/preview/abc".into(),
+            title: "Deck".into(),
+            markdown: "".into(),
+            truncated: false,
+        };
+        let hint = canvas_hint(&canvas, 42).expect("canvas hint");
+        assert!(hint.contains("screenshot") && hint.contains("view_image"), "{hint}");
+        assert!(hint.contains("target=42"), "the hint names the tab: {hint}");
+
+        let article = crate::browser::PageContent {
+            url: "https://news.example/story".into(),
+            title: "Story".into(),
+            markdown: "word ".repeat(200),
+            truncated: false,
+        };
+        assert_eq!(canvas_hint(&article, 42), None);
+    }
+
+    #[test]
+    fn structured_codes_survive_the_trip_through_a_message() {
+        let error = coded(codes::EXTENSION_DISCONNECTED, "bridge went away");
+        assert_eq!(error_code(&error), Some(codes::EXTENSION_DISCONNECTED));
+        assert!(error.contains("bridge went away"), "the cause is not hidden");
+        assert_eq!(error_code("just prose"), None);
+        // A legacy pairing error still maps to the pairing code the app uses.
+        assert_eq!(
+            error_code("browser_pairing_required: install it").unwrap_or(codes::EXTENSION_NOT_PAIRED),
+            codes::EXTENSION_NOT_PAIRED
+        );
     }
 
     #[test]
