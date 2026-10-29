@@ -763,6 +763,45 @@ fn local_denylist(root: &Path, args: &[&str]) -> bool {
     !message && bounded_args(root, &checked)
 }
 
+/// Workspace task runners already allowed independently in trusted mode.
+/// Validate parsed argv, not reconstructed shell text: arguments stay data.
+fn workspace_runner(root: &Path, argv: &[&str]) -> bool {
+    let Some((program, args)) = argv.split_first() else { return false; };
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program).trim_end_matches(".exe");
+    if ["python", "python3", "node"].contains(&name) {
+        let Some((script, rest)) = args.split_first() else { return false; };
+        return !script.starts_with('-') && safe_path(root, script)
+            && root.join(script).is_file() && bounded_args(root, rest);
+    }
+    if name == "pnpm" {
+        let (task, rest) = match args {
+            ["run", task, rest @ ..] => (*task, rest),
+            [task, rest @ ..] => (*task, rest),
+            _ => return false,
+        };
+        if !bounded_args(root, rest) { return false; }
+        let manifest = root.join("package.json");
+        if !safe_path(root, "package.json") { return false; }
+        return std::fs::read(manifest).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|json| json["scripts"][task].is_string());
+    }
+    false
+}
+
+/// Fetch reads a remote, unlike push. Ref specs and URLs are not local paths.
+/// Keep executable transport overrides and external remote helpers fenced.
+fn fetch_args(rest: &[&str]) -> bool {
+    rest.iter().all(|word| {
+        if word.starts_with('-') {
+            ["--prune", "--all", "--tags", "--no-tags", "--prune-tags", "--no-recurse-submodules", "--force", "-f", "--quiet", "-q", "--verbose", "-v", "--dry-run"].contains(word)
+        } else {
+            !word.is_empty() && !word.contains("::") && !word.starts_with('|')
+                && !word.chars().any(|c| c.is_control() || c.is_whitespace())
+        }
+    })
+}
+
 fn readonly_filter(root: &Path, argv: &[&str]) -> bool {
     let Some((verb, rest)) = argv.split_first() else { return false };
     if !bounded_args(root, rest) { return false; }
@@ -841,6 +880,10 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
             continue;
         }
         if readonly_filter(&cwd, &argv) { continue; }
+        if !piped && !removed.contains(&cwd) && workspace_runner(&cwd, &argv) {
+            touched.entry(cwd.clone()).or_default();
+            continue;
+        }
         let (root, args) = match argv.as_slice() {
             ["git", "-C", path, rest @ ..] => (workspace_at(&roots, &cwd, path)?, rest),
             ["git", rest @ ..] => (cwd.clone(), rest),
@@ -888,6 +931,11 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
                 }
                 _ => return None,
             }
+        }
+        if let ["fetch", rest @ ..] = args {
+            if input_pipe || !fetch_args(rest) { return None; }
+            touched.entry(root).or_default();
+            continue;
         }
         if !local_denylist(&root, args) { return None; }
         if readonly { continue; }

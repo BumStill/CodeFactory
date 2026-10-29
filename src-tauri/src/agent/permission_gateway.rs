@@ -172,8 +172,15 @@ impl PermissionGateway for DesktopPermissionGateway {
             }
             if let (Some(root), Some(command)) = (self.managed_workspace_root().await, bash_command) {
                 if let Some(roots) = registered_git_roots(&self.db, &self.session_id).await {
-                    if super::trusted_git::backup_registered(&roots, &root, command).is_some() {
-                        return PermissionOutcome::Allow;
+                    if super::trusted_git::registered_rewrite(&roots, &root, command) {
+                        if super::trusted_git::backup_registered(&roots, &root, command).is_some() {
+                            return PermissionOutcome::Allow;
+                        }
+                        return PermissionOutcome::Deny(PermissionDenial {
+                            content: "trusted.git.backup_failed：工作区命令已证明，但无法创建可恢复 Git 备份（请检查冲突索引、磁盘空间或 Git 写权限）；命令未执行，系统自动重试/自愈，不转为用户审批。".into(),
+                            reason: PermissionDenialReason::PolicyDenied,
+                            duration_ms: 0,
+                        });
                     }
                 }
             }
@@ -960,7 +967,56 @@ mod tests {
         }
         // M198 family regressions: mixed discovery must not make a local
         // synchronization or the mandated local hook configuration prompt.
+        let m204_original = "git fetch --prune origin main && git merge origin/main; /opt/homebrew/bin/python3 tools/governance/validate_scenario_test_governance.py --ci --base-ref origin/main --title 'synthetic'";
+        std::fs::create_dir_all(root.join("tools/governance")).unwrap();
+        std::fs::write(root.join("tools/governance/validate_scenario_test_governance.py"), "print('synthetic validation')\n").unwrap();
+        std::fs::write(root.join("check.py"), "open('checked.txt','w').write('verified')\n").unwrap();
+        std::fs::write(root.join("package.json"), r#"{"scripts":{"check":"python3 check.py"}}"#).unwrap();
+        let m198_family: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/m198-trusted-family.json")).unwrap();
+        let intents_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        for base in m198_family.as_array().unwrap().iter().filter(|case| case["allow"] == true).map(|case| case["command"].as_str().unwrap()).chain(std::iter::once(m204_original)) {
+            for suffix in ["", "; git status --short", " && python3 check.py", " && pnpm run check"] {
+                let command = format!("{base}{suffix}");
+                let args = serde_json::json!({"command":command});
+                let call = ToolCall { id: "m204-family".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+                assert_eq!(gateway.authorize(&call, &args, Some(&command)).await, PermissionOutcome::Allow, "{command}");
+            }
+        }
+        for left in [" && ", "; ", " || "] {
+            for right in [" && ", "; ", " || "] {
+                let command = format!("git fetch --prune mirror '+refs/heads/*:refs/remotes/mirror/*'{left}git merge --autostash --no-edit origin/trunk{right}python3 check.py");
+                let args = serde_json::json!({"command":command});
+                let call = ToolCall { id: "m204-separators".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+                assert_eq!(gateway.authorize(&call, &args, Some(&command)).await, PermissionOutcome::Allow, "{command}");
+            }
+        }
+        for case in m198_family.as_array().unwrap().iter().filter(|case| case["allow"] == false) {
+            for suffix in ["; git status --short", " && python3 check.py", " && pnpm run check"] {
+                let command = format!("{}{suffix}", case["command"].as_str().unwrap());
+                assert!(!super::super::trusted_git::registered_rewrite(&[root.clone()], &root, &command), "negative family must stay fenced: {command}");
+            }
+        }
+        for command in ["git merge HEAD; python3 ../outside.py", "git merge HEAD; pnpm --dir ../outside run check", "git merge HEAD; python3 -c 'print(1)'", "git fetch --upload-pack=evil origin; git merge HEAD", "git fetch 'ext::evil'; git merge HEAD", "git merge HEAD; git push origin other", "git merge HEAD; git branch -D someone-else"] {
+            assert!(!super::super::trusted_git::registered_rewrite(&[root.clone()], &root, command), "must remain unproved: {command}");
+        }
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), intents_before);
+        // M204-R3: a real unmerged index makes write-tree fail. This is a
+        // technical backup failure, not a decision that approval can repair.
+        let blob = m159_git(&root, &["rev-parse", "HEAD:tracked.txt"]);
+        let mut child = std::process::Command::new("git").no_window().current_dir(&root).args(["update-index", "--index-info"])
+            .stdin(std::process::Stdio::piped()).spawn().unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(format!("0 0000000000000000000000000000000000000000\ttracked.txt\n100644 {blob} 1\ttracked.txt\n100644 {blob} 2\ttracked.txt\n100644 {blob} 3\ttracked.txt\n").as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+        let command = "git merge --no-edit origin/main; python3 check.py";
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m204-backup-failure".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        let outcome = gateway.authorize(&call, &args, Some(command)).await;
+        assert!(matches!(outcome, PermissionOutcome::Deny(ref denial) if denial.content.contains("trusted.git.backup_failed")), "{outcome:?}");
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), intents_before);
+        m159_git(&root, &["reset", "--mixed", "HEAD"]);
         for command in [
+            m204_original,
             "git fetch --prune origin main && git merge-base --is-ancestor origin/main HEAD; rg trusted src; cat docs/repo-governance-profile.md; ls src; git config core.hooksPath .githooks",
             "git fetch --prune origin main && git merge origin/main && git diff --check",
             "git merge --autostash origin/main && git status --short && git diff --check",
@@ -1010,6 +1066,20 @@ mod tests {
         m159_git(&root, &["add", "."]);
         m159_git(&root, &["commit", "-qm", "synthetic source"]);
         m159_git(&root, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        // M204: execute a real compound against a local bare remote and a
+        // real interpreter, rather than treating authorization as execution.
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let command = format!("git fetch --prune origin main && git merge --autostash --no-edit origin/main; {python} check.py");
+        let count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap();
+        let args = serde_json::json!({"command":command});
+        let call = ToolCall { id: "m204-execute".into(), r#type: "function".into(), function: FunctionCall { name: "bash".into(), arguments: args.to_string() } };
+        assert_eq!(gateway.authorize(&call, &args, Some(&command)).await, PermissionOutcome::Allow);
+        assert!(!root.join("checked.txt").exists());
+        let output = std::process::Command::new(&shell).no_window().current_dir(&root).args(["-c", &command]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(std::fs::read_to_string(root.join("checked.txt")).unwrap(), "verified");
+        assert_eq!(m159_git(&root, &["rev-parse", "origin/main"]), m159_git(&root, &["rev-parse", "HEAD"]));
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM permission_intents").fetch_one(&gateway.db).await.unwrap(), count_before);
         let r5 = [
             "git fetch --prune origin main && git merge origin/main --no-edit 2>&1 | tail -25; git status --short | head -20",
             "git fetch --prune origin main && git stash push -u -m x && git merge origin/main && git stash pop",
