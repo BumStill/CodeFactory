@@ -17,8 +17,43 @@ use crate::util::no_window::NoWindow;
 /// then judge the segment's own subcommand. Anything we cannot parse safely
 /// stays sensitive (fail closed).
 pub(super) fn sensitive(command: &str) -> bool {
+    if command.contains("<<") {
+        return !python_heredoc_proved(None, command);
+    }
     let Some(segments) = executable_segments(command) else { return true };
     segments.iter().any(|words| segment_is_sensitive(words))
+}
+
+/// M198: recognize one complete, expansion-disabled Python stdin program.
+/// No shell suffix, custom executable, wrapper, substitution or redirection is
+/// accepted. The validator parses AST only; it never evaluates model code.
+pub(super) fn python_heredoc_proved(root: Option<&Path>, command: &str) -> bool {
+    if command.len() > 256 * 1024 { return false; }
+    let Some((header, rest)) = command.split_once('\n') else { return false; };
+    let header = header.trim().strip_prefix("cd \"$(pwd)\"; ").unwrap_or(header.trim());
+    let Some((runner, delimiter)) = header.split_once(" <<") else { return false; };
+    if !["python3 -", "python -"].contains(&runner) { return false; }
+    let Some(delimiter) = delimiter.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else { return false; };
+    if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') { return false; }
+    let mut body = String::new();
+    let mut lines = rest.lines();
+    let mut closed = false;
+    while let Some(line) = lines.next() {
+        if line == delimiter {
+            closed = true;
+            if lines.any(|l| !l.trim().is_empty()) { return false; }
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if !closed { return false; }
+    let mut cmd = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    cmd.args(["-I", "-c", include_str!("trusted_python_ast.py")]);
+    if let Some(root) = root { cmd.arg(root); }
+    let Ok(mut child) = cmd.no_window().stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { return false; };
+    let written = child.stdin.take().is_some_and(|mut input| input.write_all(body.as_bytes()).is_ok());
+    written && child.wait().is_ok_and(|s| s.success())
 }
 
 /// Git subcommands that move the working tree, the index or a local branch.

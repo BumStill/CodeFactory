@@ -4,6 +4,9 @@
     {
       "pattern": "scripts/delivery-scenario-body.py",
       "scenario_id": "CXD-002"
-    }
+    },
+    { "pattern": "src-tauri/src/agent/trusted_python_ast.py", "scenario_id": "UI-009" },
+    { "pattern": "src-tauri/src/agent/permission_intent.rs", "scenario_id": "UI-009" },
+    { "pattern": "src/acceptance/m198-permission.tsx", "scenario_id": "UI-009" }
   ]
 }

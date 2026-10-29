@@ -90,6 +90,10 @@ export function PermissionDialog({
   onDeny,
   onAllowFullAccess,
 }: Props) {
+  const diagnostic = request.args && typeof request.args === "object"
+    ? (request.args as Record<string, unknown>)._permission : null;
+  const explanation = diagnostic && typeof diagnostic === "object"
+    ? diagnostic as Record<string, unknown> : null;
   const remoteDelivery = request.toolName === "deliver_changes"
     || (request.toolName === "bash" && /\b(git\s+(push|tag)|gh\s+(pr\s+(create|merge)|release)|glab\s+mr\s+(create|merge))\b/.test(formatToolArgs(request.args)));
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -162,6 +166,10 @@ export function PermissionDialog({
         </div>
 
         <div className="max-h-[45vh] overflow-auto px-4 py-3">
+          <div data-testid="permission-reason" className="mb-3 break-words text-label text-gray-500">
+            <p>{typeof explanation?.reason === "string" ? explanation.reason : "此请求未记录详细拦截理由（旧版记录）；请核对操作范围。"}</p>
+            <code>{typeof explanation?.rule === "string" ? explanation.rule : "legacy.reason_missing"}</code>
+          </div>
           <div className="mb-2 text-label text-gray-600">参数</div>
           <ToolArgsPreview request={request} />
           <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-label text-amber-800 dark:text-amber-200">
