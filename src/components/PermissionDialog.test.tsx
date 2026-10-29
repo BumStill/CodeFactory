@@ -19,6 +19,11 @@ function baseRequest(overrides: Partial<PendingPermission>): PendingPermission {
 const noop = { onAllow: vi.fn(), onDeny: vi.fn(), onAllowFullAccess: vi.fn() };
 
 describe("PermissionDialog tool-args preview", () => {
+  it("M198 renders the persisted interception reason and rule", () => {
+    render(<PermissionDialog request={baseRequest({ args: { command: "python3 -", _permission: { rule: "trusted.heredoc.unproved", reason: "无法证明解释器仅访问已登记工作区内的文件。" } } })} trusted={true} {...noop} />);
+    expect(screen.getByTestId("permission-reason")).toHaveTextContent("无法证明解释器仅访问已登记工作区内的文件。");
+    expect(screen.getByTestId("permission-reason")).toHaveTextContent("trusted.heredoc.unproved");
+  });
   it("M130 asks once for session delivery without a trust shortcut", async () => {
     const allow = vi.fn();
     render(<PermissionDialog request={baseRequest({ toolName: "deliver_changes", args: { ceiling: "pr_only" } })} trusted={false} {...noop} onAllow={allow} />);

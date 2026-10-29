@@ -443,7 +443,9 @@ pub async fn reset_session_state(db: &SqlitePool, session_id: &str) -> anyhow::R
     let mut state = super::thin_derive::derive_state(db, session_id).await?;
     if state.state == SessionState::Running
         || (state.state == SessionState::WaitingWake
-            && state.wake_source.as_deref() == Some("系统周期恢复扫描")) {
+            && (state.wake_source.as_deref() == Some("系统周期恢复扫描")
+                || state.waiting_for.as_deref() == Some("系统自动重试/自愈：接续中断回合"))) {
+        super::background_tasks::cancel_session_wakeups(db, session_id).await;
         state = ThinState::ended("已手动重置会话状态：残留运行状态已清理", "本会话记录");
         super::thin_state::save(db, session_id, &state).await?;
     } else {

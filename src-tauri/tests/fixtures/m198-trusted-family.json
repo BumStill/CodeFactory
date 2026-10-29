@@ -1,0 +1,10 @@
+[
+  {"command":"git fetch --prune origin main && git merge-base --is-ancestor origin/main HEAD; rg trusted src; cat docs/repo-governance-profile.md; ls src; git config core.hooksPath .githooks","allow":true,"reason":"只读取证与仓库规定的本地 hooks 配置"},
+  {"command":"git fetch --prune origin main && git merge origin/main && git diff --check","allow":true,"reason":"仓库规定的同步基线与只读差异检查"},
+  {"command":"git merge --autostash origin/main && git status --short && git diff --check","allow":true,"reason":"本地可恢复的同步基线"},
+  {"command":"git config --global core.hooksPath /tmp/hooks","allow":false,"reason":"修改会话工作区外全局配置"},
+  {"command":"git push --force origin main","allow":false,"reason":"破坏性远端写入"},
+  {"command":"git push origin :main","allow":false,"reason":"删除远端分支"},
+  {"command":"git reset --hard HEAD && rm -rf ../outside","allow":false,"reason":"删除工作区外路径"},
+  {"command":"git merge HEAD; gh auth token","allow":false,"reason":"凭据外泄"}
+]
