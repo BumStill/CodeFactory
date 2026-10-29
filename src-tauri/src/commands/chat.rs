@@ -8864,6 +8864,7 @@ pub mod chat_links {
         let bytes = general_purpose::STANDARD
             .decode(&data_base64)
             .map_err(|e| format!("base64 decode failed: {e}"))?;
+        crate::clipboard_attachments::check_size(&filename, bytes.len())?;
         let ext = PathBuf::from(&filename)
             .extension()
             .and_then(|s| s.to_str())

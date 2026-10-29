@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { ToolCallCard } from "./ToolCallCard";
 import { ImagePreview } from "./ImagePreview";
+import { formatAttachmentSize } from "./attachmentPresentation";
 import { MessageFileArtifactCard, isDocumentPath } from "./MessageFileArtifactCard";
 import { WelcomeScreen } from "./WelcomeScreen";
 import { useStickyAutoScroll } from "./useStickyAutoScroll";
@@ -230,12 +231,24 @@ function MarkdownContent({ content, onOpenDocument }: { content: string; onOpenD
 
 function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
   const [failed, setFailed] = useState(false);
+  const [sizeBytes, setSizeBytes] = useState<number | null>(null);
+  useEffect(() => {
+    let active = true;
+    setSizeBytes(null); setFailed(false);
+    if (src?.startsWith("file://") && "__TAURI_INTERNALS__" in window) {
+      void invoke<{ size_bytes: number } | null>("attachment_metadata", { path: localFilePathFromUrl(src) })
+        .then((data) => { if (active && data) setSizeBytes(data.size_bytes); })
+        .catch(() => { if (active) setFailed(true); });
+    }
+    return () => { active = false; };
+  }, [src]);
   const label = alt || "图片附件";
   const previewSrc = previewImageSrc(src);
   if (failed) {
     return (
       <span className="my-2 inline-flex max-w-full items-center gap-2 rounded-lg border border-dashed border-border/70 bg-surface-2 px-3 py-2 text-label text-gray-500 align-top">
         <span className="font-medium text-gray-400">图片预览失败</span>
+        <span className="text-caption">文件可能已删除或无法访问</span>
         <span className="max-w-[220px] truncate font-mono text-caption">{label}</span>
       </span>
     );
@@ -246,7 +259,7 @@ function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
         src={previewSrc}
         alt={label}
         thumbnailClassName="max-h-80 max-w-full rounded-lg border border-border bg-surface-2 object-contain transition-opacity hover:opacity-90"
-        caption={alt}
+        caption={sizeBytes !== null ? `${label} · ${formatAttachmentSize(sizeBytes)}` : alt}
         onError={() => setFailed(true)}
       />
     </span>
@@ -314,11 +327,9 @@ const markdownComponents: Components = {
     <td className="border border-border px-2 py-1 text-gray-300">{children}</td>
   ),
   img: ({ src, alt }) => <MarkdownImage src={src} alt={alt} />,
-  a: ({ children, href }) => (
-    <a href={href} target="_blank" rel="noreferrer" className="text-accent hover:underline">
-      {children}
-    </a>
-  ),
+  a: ({ children, href }) => href?.startsWith("file://") && href.includes("/attachments/")
+    ? <MessageFileArtifactCard path={href} name={typeof children === "string" ? children : undefined} compact />
+    : <a href={href} target="_blank" rel="noreferrer" className="text-accent hover:underline">{children}</a>,
   strong: ({ children }) => <strong className="font-semibold text-gray-100">{children}</strong>,
   em: ({ children }) => <em className="italic text-gray-200">{children}</em>,
 };
