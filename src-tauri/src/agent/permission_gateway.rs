@@ -837,6 +837,8 @@ mod tests {
         m159_git(&root, &["init", "-q"]);
         m159_git(&root, &["config", "user.name", "Synthetic"]);
         m159_git(&root, &["config", "user.email", "synthetic@example.invalid"]);
+        // Synthetic byte assertions must not inherit runner-global CRLF conversion.
+        m159_git(&root, &["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("tracked.txt"), "base").unwrap();
         m159_git(&root, &["add", "."]);
         m159_git(&root, &["commit", "-qm", "synthetic"]);
