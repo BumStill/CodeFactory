@@ -1227,6 +1227,34 @@ pub fn wakeup_text(wakeup: &WakeupSchedule, occurrence: i64, late: bool) -> Stri
 /// `now` 注入以便 headless 测试精确推进时间；生产由运行时循环传 `now_secs()`。
 /// 投递失败（会话正在跑回合）保持 `pending`，下一轮重试；推进用
 /// `next_at` 做比较并交换，因此并发/重启都不会重复投递同一次到点。
+/// M205：恢复预算耗尽不是无限等待的许可。拒绝、终态与取消在同一事务提交。
+async fn reject_exhausted_wakes(pool: &SqlitePool, session: &str, wakes: &[WakeupSchedule], now: i64) -> sqlx::Result<bool> {
+    let budget: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT attempts,settled_reason,last_error FROM workspace_recovery_budget WHERE session_id=?")
+        .bind(session).fetch_optional(pool).await?;
+    let Some((attempts, settled, error)) = budget else { return Ok(false); };
+    if attempts < 3 && settled.is_none() { return Ok(false); }
+    // 活执行者仍拥有回合，绝不能被定时器结算。
+    if crate::session_executor_alive(session) != Some(false) { return Ok(false); }
+    if wake_source_cover(pool, session).await.running_tasks > 0 { return Ok(false); }
+    super::thin_state::ensure(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_audit_events(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,kind TEXT NOT NULL,actor TEXT NOT NULL,detail_json TEXT NOT NULL,created_at INTEGER NOT NULL)").execute(pool).await?;
+    let reason = format!("{}。系统自动恢复已结束：{}；本次唤醒未执行，不代表已完成 §8 文件清理。", wakes[0].prompt,
+        settled.or(error).unwrap_or_else(|| "工作区恢复连续失败，已达到重试上限".into()));
+    let mut tx = pool.begin().await?;
+    sqlx::query("INSERT INTO thin_session_state(session_id,state,reason,outcome_location,updated_at) VALUES (?,'ended',?,'本会话记录',?) ON CONFLICT(session_id) DO UPDATE SET state='ended',reason=excluded.reason,waiting_for=NULL,wake_source=NULL,question=NULL,updated_at=excluded.updated_at WHERE thin_session_state.state<>'ended'")
+        .bind(session).bind(&reason).bind(now.saturating_mul(1000)).execute(&mut *tx).await?;
+    for wake in wakes {
+        let detail = serde_json::json!({"wakeup_id":wake.id,"next_at":wake.next_at,"reason":reason,"attempts":attempts}).to_string();
+        sqlx::query("INSERT OR IGNORE INTO session_audit_events(id,session_id,kind,actor,detail_json,created_at) VALUES (?,?,'wakeup_rejected','system',?,?)")
+            .bind(format!("wake-rejected-{}-{}", wake.id, wake.next_at)).bind(session).bind(detail).bind(now.saturating_mul(1000)).execute(&mut *tx).await?;
+    }
+    sqlx::query("UPDATE wakeup_schedules SET status='cancelled' WHERE session_id=? AND status='pending'")
+        .bind(session).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i64) -> usize {
     use futures_util::{stream::FuturesUnordered, StreamExt};
     // 同一进程只有一个扫描器可推进计划；先锁再读，不能依赖入队后的 CAS 去重。
@@ -1256,7 +1284,19 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
     let mut pending = FuturesUnordered::new();
     for (session, wakes) in sessions {
         pending.push(async move {
-            if !super::workspace_recovery_budget::due(pool, &session, now).await.unwrap_or(false) { return 0; }
+            match super::workspace_recovery_budget::due(pool, &session, now).await {
+                Ok(true) => {},
+                Ok(false) => {
+                    if let Err(error) = reject_exhausted_wakes(pool, &session, &wakes, now).await {
+                        tracing::warn!(%error, session, "wake rejection persistence failed; system automatic recovery next tick");
+                    }
+                    return 0;
+                },
+                Err(error) => {
+                    tracing::warn!(%error, session, "wake budget unavailable; system automatic recovery next tick");
+                    return 0;
+                }
+            }
             let due = wakes.iter().map(|wake| wake.next_at).min().unwrap_or(now);
             if now.saturating_sub(due) > 120 {
                 tracing::warn!(session, pending_seconds = now.saturating_sub(due), "wake overdue over two minutes; automatic retry");
@@ -1269,8 +1309,9 @@ pub async fn drain_due_wakeups_at(pool: &SqlitePool, sink: &dyn WakeSink, now: i
             if !deliver_wake(sink, session.clone(), text, due).await {
                 let attempts = super::workspace_recovery_budget::fail(pool, &session, now, "唤醒投递失败；系统自动重试/自愈").await.unwrap_or(0);
                 if attempts >= 3 {
-                    let _ = super::thin_state::ask_user(pool, &session, "工作区恢复连续失败；请确认项目目录或远端登记分支仍可访问。").await;
-                    cancel_session_wakeups(pool, &session).await;
+                    if let Err(error) = reject_exhausted_wakes(pool, &session, &wakes, now).await {
+                        tracing::warn!(%error, session, "wake rejection persistence failed; system automatic recovery next tick");
+                    }
                 }
                 return 0;
             }
@@ -1438,26 +1479,18 @@ pub fn start_runtime(app: tauri::AppHandle) {
             tracing::warn!(%error, "background task schema unavailable");
             return;
         }
-        match reconcile(&pool).await {
-            Ok(report) => tracing::info!(
-                resumed = report.resumed,
-                finished = report.finished,
-                lost = report.lost,
-                "background task reconcile finished"
-            ),
-            Err(error) => tracing::warn!(%error, "background task reconcile failed"),
-        }
+        // M205：对账含进程恢复/外部观测，不能成为首次到期扫描的前置屏障。
+        let reconcile_pool = pool.clone();
+        tauri::async_runtime::spawn(async move {
+            match reconcile(&reconcile_pool).await {
+                Ok(report) => tracing::info!(resumed = report.resumed, finished = report.finished, lost = report.lost, "background task reconcile finished"),
+                Err(error) => tracing::warn!(%error, "background task reconcile failed"),
+            }
+        });
         let sink = ChatWakeSink { app: app.clone() };
-        // M197/R3：启动即对账一次，之后每 180 秒持续对账。`waiting_wake` 必须有
-        // 具体唤醒源；没有源的存量会话在这里被补来源 / 转人话提问 / 结束，不会再
-        // 靠在「等唤醒」里等一个永远不会来的回合。
-        if let Err(error) = crate::agent::thin_derive::reconcile_waiting_wake_sources(&pool).await {
-            tracing::warn!(%error, "waiting_wake reconcile failed at startup");
-        }
         let guard_pool = pool.clone();
         tauri::async_runtime::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(180)).await;
                 match crate::agent::thin_derive::reconcile_waiting_wake_sources(&guard_pool).await {
                     Ok(report) => {
                         if report.swept > 0 || report.still_waiting != report.scanned {
@@ -1471,6 +1504,7 @@ pub fn start_runtime(app: tauri::AppHandle) {
                     }
                     Err(error) => tracing::warn!(%error, "waiting_wake reconcile failed"),
                 }
+                tokio::time::sleep(Duration::from_secs(180)).await;
             }
         });
         loop {
@@ -2339,6 +2373,49 @@ mod tests {
         assert_eq!(get(&reopened, "bg-m168").await.unwrap().unwrap().wake_state, "enqueued");
         assert_eq!(drain_pending_wakes(&reopened, sink(&Arc::new(Recorder::default()))).await, 0);
         reopened.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn m205_restart_backlog_never_silently_skips_exhausted_recovery() {
+        let dir = scratch_dir("m205-backlog");
+        let pool = file_pool(&dir).await;
+        super::super::thin_state::ensure(&pool).await.unwrap();
+        super::super::workspace_recovery_budget::ensure(&pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE sessions(id TEXT PRIMARY KEY,delivery_mode TEXT);
+            CREATE TABLE thin_external_observations(session_id TEXT PRIMARY KEY,completed_reason TEXT);
+            CREATE TABLE session_audit_events(id TEXT PRIMARY KEY,session_id TEXT,kind TEXT,actor TEXT,detail_json TEXT,created_at INTEGER);").execute(&pool).await.unwrap();
+        for index in 0..5 {
+            let session = format!("synthetic-backlog-{index}");
+            sqlx::query("INSERT INTO sessions VALUES (?,'thin')").bind(&session).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO thin_external_observations VALUES (?,'PR #42 已合并')").bind(&session).execute(&pool).await.unwrap();
+            super::super::thin_state::save(&pool, &session, &super::super::thin_state::after_final(
+                super::super::thin_state::WaitNeed::External { what: "PR #42 收尾".into(), covered: true }, "")).await.unwrap();
+            sqlx::query("INSERT INTO workspace_recovery_budget(session_id,attempts,next_at,settled_reason) VALUES (?,?,0,?)")
+                .bind(&session).bind(if index == 0 { 0 } else { 3 })
+                .bind(if index == 4 { Some("登记工作区已删除") } else { None }).execute(&pool).await.unwrap();
+            let prefix = if index < 3 { "thin-closeout" } else { "thin-repair" };
+            sqlx::query("INSERT INTO wakeup_schedules(id,session_id,prompt,source,next_at,status,created_at) VALUES (?,?, 'PR #42 已合并，执行收尾','agent_decided',100,'pending',1)")
+                .bind(format!("{prefix}-{index}")).bind(&session).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+        let pool = file_pool(&dir).await;
+        let recorder = Arc::new(Recorder::default());
+        drain_due_wakeups_at(&pool, sink(&recorder), 20_000).await;
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wakeup_schedules WHERE status='pending' AND next_at < ?-120")
+            .bind(20_000_i64).fetch_one(&pool).await.unwrap();
+        assert_eq!(pending, 0, "one startup scan must dispose all overdue closeout/repair wakes, including exhausted budgets");
+        let audit: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT session_id) FROM session_audit_events WHERE kind IN ('wakeup_overdue_recovered','wakeup_rejected')")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(audit, 5, "every overdue wake must have a durable delivery or rejection receipt");
+        for index in 1..5 {
+            let state = super::super::thin_state::load(&pool, &format!("synthetic-backlog-{index}")).await.unwrap().unwrap();
+            assert_eq!(state.state, super::super::thin_state::SessionState::Ended);
+            assert!(state.reason.as_deref().is_some_and(|reason| reason.contains("PR #42") && reason.contains("恢复")));
+        }
+        assert_eq!(recorder.take().len(), 1);
+        assert_eq!(drain_due_wakeups_at(&pool, sink(&recorder), 20_001).await, 0);
+        pool.close().await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 
