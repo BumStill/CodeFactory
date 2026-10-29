@@ -296,9 +296,21 @@ class ScenarioRegistryTests(unittest.TestCase):
     def test_release_gate_requires_exact_artifact_evidence_level(self) -> None:
         registry = load_registry(REGISTRY_PATH)
         broken = json.loads(json.dumps(registry))
-        broken["scenarios"][0]["required_evidence"].remove("L4")
+        target = next(
+            scenario
+            for scenario in broken["scenarios"]
+            if "release_artifact" in scenario["gates"]
+            and "L4" in scenario["required_evidence"]
+        )
+        target["required_evidence"].remove("L4")
         errors = validate_registry(broken, REPO_ROOT)
-        self.assertTrue(any("release_artifact gate requires L4" in error for error in errors))
+        self.assertTrue(
+            any(
+                f"{target['id']} release_artifact gate requires L4 evidence" in error
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_every_automation_target_is_bound_to_a_declared_gate_stage(self) -> None:
         registry = load_registry(REGISTRY_PATH)
