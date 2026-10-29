@@ -79,6 +79,34 @@ fn m182_danger_classes_stay_unproved() {
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
+fn m182_worktree_add_checks_every_path_operand() {
+    let root = fixture();
+    let target = root.with_extension("owned");
+    git(&root, &["worktree", "add", "-qb", "synthetic-owned", target.to_str().unwrap()]);
+    let roots = vec![root.clone(), target.clone()];
+    let valid = format!("git worktree add --force --force '{}' HEAD", target.display());
+    assert!(trusted_git::registered_rewrite(&roots, &root, &valid));
+    let references = trusted_git::backup_registered(&roots, &root, &valid).expect("registered add needs snapshots");
+    assert!(references.split(',').count() >= 2);
+    for suffix in ["-- ../outside", "--checkout -- ../outside", "--orphan ../outside", "--force ../outside"] {
+        let command = format!("git worktree add '{}' {suffix}", target.display());
+        assert!(!trusted_git::registered_rewrite(&roots, &root, &command), "{command}");
+    }
+    let recreate = format!("git worktree remove --force '{}' && git worktree add --detach '{}' HEAD", target.display(), target.display());
+    let backups = trusted_git::backup_registered(&roots, &root, &recreate).expect("same-session remove/add needs backups");
+    assert!(backups.split(',').count() >= 2);
+    let shell = if cfg!(windows) {
+        let exec = std::path::PathBuf::from(git(&root, &["--exec-path"]));
+        exec.ancestors().map(|p| p.join("bin/bash.exe")).find(|p| p.is_file()).expect("Git Bash")
+    } else { "sh".into() };
+    let output = Command::new(shell).current_dir(&root).args(["-c", &recreate]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read_to_string(target.join("src/main.rs")).unwrap(), "original");
+    git(&root, &["worktree", "remove", "--force", target.to_str().unwrap()]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn m182_snapshot_failure_never_allows() {
     let root = fixture();
     std::fs::write(root.join(".git/index.lock"), "synthetic lock").unwrap();

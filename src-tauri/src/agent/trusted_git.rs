@@ -810,7 +810,10 @@ fn prove(roots: &[std::path::PathBuf], cwd: &Path, command: &str) -> Option<Vec<
             match args {
                 ["worktree", "remove", flags @ ..] | ["worktree", "add", flags @ ..] => {
                     if piped { return None; }
-                    let path = flags.iter().find(|w| !w.starts_with('-'))?;
+                    let path_index = flags.iter().position(|w| !w.starts_with('-'))?;
+                    let path = flags[path_index];
+                    if !flags.iter().enumerate().all(|(index, word)| index == path_index || bounded_args(&root, &[*word])) { return None; }
+                    if flags.iter().any(|word| word.starts_with("--orphan") || word.starts_with("--detach=") || word.starts_with("--reason")) { return None; }
                     let target = workspace_at(&roots, &root, path)?;
                     if target == root || target == cwd { return None; }
                     let common = |r: &Path| git(r, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| Path::new(&p).canonicalize().ok());
